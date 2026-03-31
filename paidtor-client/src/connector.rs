@@ -11,8 +11,10 @@ use http::{Method, Request, Uri};
 use paidtor_common::h2stream::H2ConnectStream;
 use paidtor_common::noise::{self, NoiseStream};
 use std::io;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tracing::info;
 
 /// A hop in the tunnel chain: server address and its Noise public key.
@@ -25,7 +27,22 @@ pub struct Hop {
 /// An established connection to a PaidTor server, ready to open H2 streams.
 pub struct ServerConnection {
     /// The H2 client send handle — use this to open new streams (CONNECT, etc.)
-    pub h2_client: client::SendRequest<Bytes>,
+    pub h2_client: Arc<tokio::sync::Mutex<client::SendRequest<Bytes>>>,
+    driver_handles: Vec<JoinHandle<()>>,
+}
+
+impl ServerConnection {
+    /// Shut down the hop chain cleanly by dropping the shared H2 client handle
+    /// and waiting for all per-hop H2 driver tasks to exit.
+    pub async fn shutdown(self) {
+        drop(self.h2_client);
+
+        for handle in self.driver_handles {
+            if let Err(e) = handle.await {
+                tracing::error!("H2 driver task panicked: {e}");
+            }
+        }
+    }
 }
 
 /// Connect to a PaidTor server directly (single hop).
@@ -80,7 +97,7 @@ fn chain_from_stream<S>(
     mut stream: S,
     hops: &[Hop],
     hop_idx: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<ServerConnection>> + Send>>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<ServerConnection>> + Send>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -110,7 +127,7 @@ where
     info!("hop {}/{}: H2 connection established", hop_idx + 1, hops.len());
 
     // Spawn background task to drive this H2 connection
-    tokio::spawn(async move {
+    let driver_handle = tokio::spawn(async move {
         if let Err(e) = h2_conn.await {
             tracing::error!("H2 connection error at hop: {e}");
         }
@@ -129,11 +146,16 @@ where
         let h2_connect_stream = open_h2_connect(h2_client, &next.addr).await?;
 
         // Recurse: perform Noise + H2 over this tunnel for the next hop
-        chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await
+        let mut conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;
+        conn.driver_handles.push(driver_handle);
+        Ok(conn)
     } else {
         // Last hop — return the H2 client for actual use
         info!("tunnel chain established ({} hops)", hops.len());
-        Ok(ServerConnection { h2_client })
+        Ok(ServerConnection {
+            h2_client: Arc::new(tokio::sync::Mutex::new(h2_client)),
+            driver_handles: vec![driver_handle],
+        })
     }
     }) // close Box::pin(async move { ... })
 }
