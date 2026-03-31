@@ -250,6 +250,64 @@ MONAD currently provides:
 
 MONAD does not currently provide Tor-style shared relay-to-relay traffic mixing. Each client maintains its own hop chain, so this is closer to a layered multi-hop paid proxy than a full anonymity network.
 
+## Future: Shared Relay-to-Relay Links
+
+The current nesting model creates a dedicated relay-to-relay tunnel for each client chain.
+
+For example, if many clients route through the same pair of relays:
+
+```text
+Client A -> Relay 1 -> Relay 2 -> ...
+Client B -> Relay 1 -> Relay 2 -> ...
+Client C -> Relay 1 -> Relay 2 -> ...
+```
+
+then today, Relay 1 opens a separate nested tunnel to Relay 2 for each client.
+
+A future design would allow Relay 1 and Relay 2 to maintain one long-lived shared QUIC connection between them and multiplex many client-carried nested sessions over QUIC streams.
+
+Conceptually:
+
+```text
+many client sessions
+        |
+        v
+Relay 1 == one shared QUIC connection == Relay 2
+                 with many streams
+```
+
+In this model:
+
+- one QUIC connection is kept open between a relay pair
+- many bidirectional QUIC streams are opened inside that connection
+- each stream carries one nested MONAD session or other relay-to-relay tunnel unit
+
+The client-carried inner MONAD sessions would still remain encrypted between the relevant hops. The shared relay-to-relay QUIC link would provide outer transport multiplexing and batching, not visibility into the nested payloads.
+
+Authentication and encryption for the shared inter-relay link would come from QUIC/TLS. Relays would use pinned self-signed certificates or pinned public keys rather than external certificate authorities. An initiator would verify that the relay presented the expected pinned identity before sending application data.
+
+This authentication is intentionally one-way: the server authenticates itself to the initiator, but the initiator does not authenticate itself at the QUIC layer. That keeps the shared-link model aligned with MONAD's current Noise `NK` approach, where the initiator knows the server identity in advance and the server proves possession of the corresponding private key.
+
+This means the same QUIC system can be used by an ordinary client or by another relay acting as the initiator. In both cases, the initiator only needs to know the true pinned identity of the MONAD server it is contacting. The server does not need to distinguish whether the initiator is a client or a relay in order to complete the QUIC handshake.
+
+If the opposite traffic direction ever needs its own initiator-driven shared link, that should be modeled as a separate independent QUIC connection in the reverse direction rather than by introducing mutual QUIC authentication or trying to make one connection serve two initiator roles. This keeps connection ownership, authentication rules, and future implementation state machines simpler.
+
+This QUIC identity is separate from the current MONAD Noise static key. The existing direct and nested MONAD transport can continue using `Noise_NK_25519_ChaChaPoly_BLAKE2s`, while the future shared relay link uses QUIC's native transport security.
+
+Why this is interesting:
+- fewer per-client relay-to-relay connections
+- lower handshake and connection setup overhead between relays
+- better traffic mixing between relays
+- small writes from multiple streams can be coalesced into encrypted QUIC packets
+- closer to the anonymity properties of a shared relay fabric
+
+Initial constraints for such a design would likely include:
+- disable QUIC 0-RTT at first to avoid replay complexity
+- keep current direct and nested MONAD modes working unchanged
+- treat this as a relay-to-relay transport optimization, not a change to the inner MONAD session model
+
+This is not implemented yet. The current system still uses per-client nested relay tunnels.
+
 ## Current Limitations
 
 - payment protocol is not implemented beyond control-channel scaffolding
