@@ -141,3 +141,41 @@ pub async fn send_reply(
     reply.extend_from_slice(&bind_port.to_be_bytes());
     stream.write_all(&reply).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_socks5_handshake_ipv6_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let target = socks5_handshake(&mut stream).await.unwrap();
+            assert_eq!(target.authority, "[::1]:7777");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+
+            // Greeting: VER=5, NMETHODS=1, METHODS=[NO AUTH]
+            stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+
+            let mut method_select = [0u8; 2];
+            stream.read_exact(&mut method_select).await.unwrap();
+            assert_eq!(method_select, [0x05, 0x00]);
+
+            // Request: VER=5, CMD=CONNECT, RSV=0, ATYP=IPv6, DST.ADDR=::1, DST.PORT=7777
+            let mut request = vec![0x05, 0x01, 0x00, 0x04];
+            request.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+            request.extend_from_slice(&7777u16.to_be_bytes());
+            stream.write_all(&request).await.unwrap();
+        });
+
+        server.await.unwrap();
+        client.await.unwrap();
+    }
+}

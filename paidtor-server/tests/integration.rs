@@ -18,6 +18,7 @@ use paidtor_common::h2stream::H2ConnectStream;
 use paidtor_common::noise::{self, NoiseStream};
 use paidtor_common::protocol::{ClientMessage, ServerMessage};
 use paidtor_server::listener::ServerConfig;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -69,6 +70,38 @@ async fn start_paidtor_server() -> (std::net::SocketAddr, Vec<u8>) {
     tokio::spawn(paidtor_server::listener::run(listener, config));
 
     (addr, pubkey)
+}
+
+/// Spin up a PaidTor server bound to a specific address and return (server_addr, pubkey).
+async fn start_paidtor_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Vec<u8>)> {
+    let (privkey, pubkey) = noise::generate_keypair();
+
+    let listener = match TcpListener::bind(bind_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("skipping IPv6 test: failed to bind {bind_addr}: {e}");
+            return None;
+        }
+    };
+    let addr = listener.local_addr().unwrap();
+
+    let config = Arc::new(ServerConfig {
+        private_key: privkey,
+    });
+
+    tokio::spawn(paidtor_server::listener::run(listener, config));
+
+    Some((addr, pubkey))
+}
+
+async fn bind_ipv6_listener() -> Option<TcpListener> {
+    match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await {
+        Ok(listener) => Some(listener),
+        Err(e) => {
+            eprintln!("skipping IPv6 test: IPv6 loopback unavailable: {e}");
+            None
+        }
+    }
 }
 
 /// Connect to a PaidTor server and return an H2 client handle.
@@ -411,4 +444,77 @@ async fn test_three_hop_tunnel() {
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"three hops").await;
     assert_eq!(result, b"THREE HOPS");
+}
+
+#[tokio::test]
+async fn test_connect_to_ipv6_target() {
+    let Some(upper_listener) = bind_ipv6_listener().await else {
+        return;
+    };
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_paidtor_server().await;
+    let mut h2 = connect_client(server_addr, &pubkey).await;
+
+    let target = format!("[::1]:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2, &target, b"ipv6 target").await;
+    assert_eq!(result, b"IPV6 TARGET");
+}
+
+#[tokio::test]
+async fn test_connect_to_ipv6_server() {
+    let Some((server_addr, pubkey)) =
+        start_paidtor_server_at(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await
+    else {
+        return;
+    };
+
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mut h2 = connect_client(server_addr, &pubkey).await;
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2, &target, b"ipv6 server").await;
+    assert_eq!(result, b"IPV6 SERVER");
+}
+
+#[tokio::test]
+async fn test_mixed_ipv4_ipv6_hops() {
+    let Some((ipv6_hop_addr, ipv6_hop_pubkey)) =
+        start_paidtor_server_at(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await
+    else {
+        return;
+    };
+
+    let (ipv4_hop_addr, ipv4_hop_pubkey) = start_paidtor_server().await;
+
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mut h2 = connect_through_hops(&[
+        (ipv4_hop_addr, ipv4_hop_pubkey),
+        (ipv6_hop_addr, ipv6_hop_pubkey),
+    ])
+    .await;
+
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2, &target, b"mixed hops").await;
+    assert_eq!(result, b"MIXED HOPS");
+}
+
+#[tokio::test]
+async fn test_connect_with_hostname_resolution() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_paidtor_server().await;
+    let mut h2 = connect_client(server_addr, &pubkey).await;
+
+    let target = format!("localhost:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2, &target, b"hostname test").await;
+    assert_eq!(result, b"HOSTNAME TEST");
 }
