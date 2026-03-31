@@ -1,10 +1,10 @@
 [package]
-name = "paidtor-client"
+name = "monad-client"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-paidtor-common = { path = "../paidtor-common" }
+monad-common = { path = "../monad-common" }
 h2 = "0.4"
 tokio = { version = "1", features = ["full"] }
 bytes = "1"

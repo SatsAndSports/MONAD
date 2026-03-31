@@ -1,8 +1,8 @@
-//! Integration test: exercises the full PaidTor stack.
+//! Integration test: exercises the full MONAD stack.
 //!
 //! Spins up three components in a single tokio runtime:
 //!   1. An "uppercase" TCP server (simulates an external target)
-//!   2. A PaidTor server (Noise NK + H2)
+//!   2. A MONAD server (Noise NK + H2)
 //!   3. A test client that opens both a control channel and a data tunnel
 //!
 //! Validates:
@@ -14,11 +14,11 @@
 use bytes::Bytes;
 use h2::client;
 use http::{Method, Request};
-use paidtor_common::h2stream::wait_for_send_capacity;
-use paidtor_common::noise;
-use paidtor_client::connector::{self, Hop, ServerConnection};
-use paidtor_common::protocol::{ClientMessage, ServerMessage};
-use paidtor_server::listener::ServerConfig;
+use monad_common::h2stream::wait_for_send_capacity;
+use monad_common::noise;
+use monad_client::connector::{self, Hop, ServerConnection};
+use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_server::listener::ServerConfig;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,8 +57,8 @@ async fn run_uppercase_server(listener: TcpListener) {
     }
 }
 
-/// Spin up a PaidTor server and return (server_addr, pubkey).
-async fn start_paidtor_server() -> (std::net::SocketAddr, Vec<u8>) {
+/// Spin up a MONAD server and return (server_addr, pubkey).
+async fn start_monad_server() -> (std::net::SocketAddr, Vec<u8>) {
     let (privkey, pubkey) = noise::generate_keypair();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -68,13 +68,13 @@ async fn start_paidtor_server() -> (std::net::SocketAddr, Vec<u8>) {
         private_key: privkey,
     });
 
-    tokio::spawn(paidtor_server::listener::run(listener, config));
+    tokio::spawn(monad_server::listener::run(listener, config));
 
     (addr, pubkey)
 }
 
-/// Spin up a PaidTor server bound to a specific address and return (server_addr, pubkey).
-async fn start_paidtor_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Vec<u8>)> {
+/// Spin up a MONAD server bound to a specific address and return (server_addr, pubkey).
+async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Vec<u8>)> {
     let (privkey, pubkey) = noise::generate_keypair();
 
     let listener = match TcpListener::bind(bind_addr).await {
@@ -90,7 +90,7 @@ async fn start_paidtor_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, V
         private_key: privkey,
     });
 
-    tokio::spawn(paidtor_server::listener::run(listener, config));
+    tokio::spawn(monad_server::listener::run(listener, config));
 
     Some((addr, pubkey))
 }
@@ -105,7 +105,7 @@ async fn bind_ipv6_listener() -> Option<TcpListener> {
     }
 }
 
-/// Connect to a PaidTor server through the real client connector.
+/// Connect to a MONAD server through the real client connector.
 async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &[u8]) -> ServerConnection {
     connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
@@ -228,8 +228,8 @@ async fn test_control_and_data_channels() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    // PaidTor server
-    let (server_addr, pubkey) = start_paidtor_server().await;
+    // MONAD server
+    let (server_addr, pubkey) = start_monad_server().await;
 
     // Client
     let conn = connect_client(server_addr, &pubkey).await;
@@ -254,7 +254,7 @@ async fn test_concurrent_channels() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey) = start_paidtor_server().await;
+    let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
     let h2 = clone_h2_client(&conn).await;
 
@@ -285,7 +285,7 @@ async fn test_multiple_tunnels() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey) = start_paidtor_server().await;
+    let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
     let h2 = clone_h2_client(&conn).await;
 
@@ -319,7 +319,7 @@ async fn test_multiple_tunnels() {
 /// Test nested tunneling: Client → Server T → Server S → uppercase server.
 ///
 /// T only sees encrypted Noise bytes heading to S. It has no idea that
-/// inside those bytes is another PaidTor session asking S to connect
+/// inside those bytes is another MONAD session asking S to connect
 /// to the uppercase server.
 #[tokio::test]
 async fn test_nested_tunnel() {
@@ -329,10 +329,10 @@ async fn test_nested_tunnel() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     // Server S (final hop — will proxy to uppercase server)
-    let (s_addr, s_pubkey) = start_paidtor_server().await;
+    let (s_addr, s_pubkey) = start_monad_server().await;
 
     // Server T (intermediate hop — will proxy to S)
-    let (t_addr, t_pubkey) = start_paidtor_server().await;
+    let (t_addr, t_pubkey) = start_monad_server().await;
 
     // Client connects through T → S
     let conn = connector::connect_through_chain(&[
@@ -357,9 +357,9 @@ async fn test_three_hop_tunnel() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (a_addr, a_pubkey) = start_paidtor_server().await;
-    let (b_addr, b_pubkey) = start_paidtor_server().await;
-    let (c_addr, c_pubkey) = start_paidtor_server().await;
+    let (a_addr, a_pubkey) = start_monad_server().await;
+    let (b_addr, b_pubkey) = start_monad_server().await;
+    let (c_addr, c_pubkey) = start_monad_server().await;
 
     let conn = connector::connect_through_chain(&[
         Hop { addr: a_addr.to_string(), pubkey: a_pubkey },
@@ -384,7 +384,7 @@ async fn test_connect_to_ipv6_target() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey) = start_paidtor_server().await;
+    let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
     let mut h2 = clone_h2_client(&conn).await;
 
@@ -399,7 +399,7 @@ async fn test_connect_to_ipv6_target() {
 #[tokio::test]
 async fn test_connect_to_ipv6_server() {
     let Some((server_addr, pubkey)) =
-        start_paidtor_server_at(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await
+        start_monad_server_at(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await
     else {
         return;
     };
@@ -421,12 +421,12 @@ async fn test_connect_to_ipv6_server() {
 #[tokio::test]
 async fn test_mixed_ipv4_ipv6_hops() {
     let Some((ipv6_hop_addr, ipv6_hop_pubkey)) =
-        start_paidtor_server_at(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await
+        start_monad_server_at(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await
     else {
         return;
     };
 
-    let (ipv4_hop_addr, ipv4_hop_pubkey) = start_paidtor_server().await;
+    let (ipv4_hop_addr, ipv4_hop_pubkey) = start_monad_server().await;
 
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
@@ -452,7 +452,7 @@ async fn test_connect_with_hostname_resolution() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey) = start_paidtor_server().await;
+    let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
     let mut h2 = clone_h2_client(&conn).await;
 

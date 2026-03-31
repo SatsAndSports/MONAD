@@ -1,12 +1,12 @@
 use clap::{Parser, Subcommand};
-use paidtor_common::noise;
-use paidtor_server::listener;
+use monad_common::noise;
+use monad_server::listener;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "paidtor-server", about = "PaidTor tunnel server")]
+#[command(name = "monad-server", about = "MONAD tunnel server")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
             println!();
             println!("Run the server with:");
             println!(
-                "  paidtor-server run --private-key {}",
+                "  monad-server run --private-key {}",
                 hex::encode(&privkey)
             );
             println!();

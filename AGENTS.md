@@ -1,0 +1,143 @@
+# AGENTS.md
+
+This repository is the MONAD (Monetized Onion Network Access Daemon) Rust workspace for a multi-hop TCP tunneling system.
+
+## Build and Test
+
+Use:
+
+```bash
+cargo test
+```
+
+For binaries during development:
+
+```bash
+cargo run -p monad-server -- ...
+cargo run -p monad-client -- ...
+```
+
+## Repo Shape
+
+- `monad-common`
+  - shared transport and helper code
+  - `NoiseStream`
+  - `H2ConnectStream`
+- `monad-client`
+  - reusable library code plus binary entrypoint
+  - SOCKS5 listener
+  - multi-hop connector
+  - tunnel proxying
+- `monad-server`
+  - reusable library code plus binary entrypoint
+  - listener
+  - H2 session handling
+  - TCP proxying
+
+## Current Protocol Model
+
+- Outer transport: TCP
+- Encryption: Noise NK
+- Multiplexing: HTTP/2
+- Control stream: `POST /control`
+- Data stream: `CONNECT host:port`
+- Nesting: another full Noise+H2 session can run on top of an H2 CONNECT tunnel via `H2ConnectStream`
+
+## Important Invariants
+
+### 1. Keep direct and nested modes working
+
+Do not break:
+- single-hop client → server usage
+- multi-hop nested usage
+- simultaneous multiple CONNECT tunnels
+
+### 2. Preserve address-family support
+
+Do not regress:
+- IPv4 targets
+- IPv6 targets
+- hostname targets
+- mixed IPv4/IPv6 hop chains
+
+If you change connection logic, update tests accordingly.
+
+### 3. Control and data streams are distinct
+
+Do not collapse `POST /control` and `CONNECT` behavior together.
+
+The control stream is reserved for metadata/payment/session management.
+
+### 4. Avoid spin-polling
+
+Use proper async wakeups, not `yield_now()` loops.
+
+The shared helper for H2 flow control is:
+
+```rust
+monad_common::h2stream::wait_for_send_capacity
+```
+
+Use it instead of open-coded `poll_capacity` boilerplate where practical.
+
+## Logging Conventions
+
+### Plaintext tunnel logs
+
+Use:
+- `outbound`
+- `inbound`
+- `total`
+
+for per-tunnel proxied byte counts.
+
+### Encrypted hop logs
+
+Use:
+- `wire_read`
+- `wire_written`
+- `wire_total`
+
+for per-hop encrypted byte counts from `NoiseStream`.
+
+### CONNECT logs
+
+Each server logs received CONNECT requests like:
+
+```text
+CONNECT example.com:22
+```
+
+Keep this simple and readable.
+
+## Shutdown Behavior
+
+The client and server both implement graceful shutdown.
+
+If you change shutdown logic:
+- keep task tracking explicit
+- prefer `JoinSet` / awaited tasks over heuristic sleeps
+- preserve reliable `NoiseStream` drop logging
+
+## Test Expectations
+
+The test suite currently covers:
+- Noise transport correctness
+- large payload chunking
+- control + data channel behavior
+- concurrent tunnels
+- nested 2-hop and 3-hop routes
+- IPv6 targets and IPv6 listeners
+- mixed-family hop chains
+- hostname resolution at the final hop
+- SOCKS5 IPv6 parsing
+
+If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
+
+## Documentation Expectations
+
+If you change externally visible behavior, update:
+- `README.md` for usage
+- `ARCHITECTURE.md` for protocol / layering details
+
+Keep README practical and Architecture conceptual.

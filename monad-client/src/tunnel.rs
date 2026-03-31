@@ -5,7 +5,7 @@ use crate::socks;
 use bytes::Bytes;
 use h2::client::SendRequest;
 use http::{Method, Request, Uri};
-use paidtor_common::h2stream::wait_for_send_capacity;
+use monad_common::h2stream::wait_for_send_capacity;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
-/// Open a tunnel to `target_authority` (e.g., "example.com:443") through the PaidTor server
+/// Open a tunnel to `target_authority` (e.g., "example.com:443") through the MONAD server
 /// and proxy data bidirectionally between the local `client_stream` and the remote target.
 ///
 /// Sends the SOCKS5 success reply to the local client before starting the proxy.

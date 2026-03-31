@@ -494,6 +494,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "monad-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "h2",
+ "hex",
+ "http",
+ "monad-common",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "monad-common"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "h2",
+ "hex",
+ "http",
+ "serde",
+ "serde_json",
+ "snow",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "monad-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "h2",
+ "hex",
+ "http",
+ "monad-client",
+ "monad-common",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -519,56 +569,6 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
-
-[[package]]
-name = "paidtor-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "h2",
- "hex",
- "http",
- "paidtor-common",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "paidtor-common"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "h2",
- "hex",
- "http",
- "serde",
- "serde_json",
- "snow",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "paidtor-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "h2",
- "hex",
- "http",
- "paidtor-client",
- "paidtor-common",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "parking_lot"

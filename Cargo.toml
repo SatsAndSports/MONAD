@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "paidtor-common",
-    "paidtor-server",
-    "paidtor-client",
+    "monad-common",
+    "monad-server",
+    "monad-client",
 ]
 resolver = "2"

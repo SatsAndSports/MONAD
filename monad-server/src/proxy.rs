@@ -7,7 +7,7 @@
 use bytes::Bytes;
 use h2::RecvStream;
 use h2::SendStream;
-use paidtor_common::h2stream::wait_for_send_capacity;
+use monad_common::h2stream::wait_for_send_capacity;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

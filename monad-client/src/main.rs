@@ -1,15 +1,15 @@
 use clap::Parser;
-use paidtor_client::connector;
-use paidtor_client::connector::Hop;
-use paidtor_client::socks;
-use paidtor_client::tunnel;
+use monad_client::connector;
+use monad_client::connector::Hop;
+use monad_client::socks;
+use monad_client::tunnel;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
-#[command(name = "paidtor-client", about = "PaidTor tunnel client")]
+#[command(name = "monad-client", about = "MONAD tunnel client")]
 struct Cli {
     /// Server hop(s) in order: addr,pubkey_hex
     ///

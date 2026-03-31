@@ -1,8 +1,8 @@
 //! TCP listener that accepts connections and performs the Noise NK handshake.
 
 use crate::session;
-use paidtor_common::noise;
-use paidtor_common::noise::NoiseStream;
+use monad_common::noise;
+use monad_common::noise::NoiseStream;
 use std::io;
 use std::sync::Arc;
 use tokio::net::TcpListener;

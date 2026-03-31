@@ -1,4 +1,4 @@
-//! Establishes a connection to a PaidTor server, optionally through a chain
+//! Establishes a connection to a MONAD server, optionally through a chain
 //! of intermediate hops (onion routing / nested tunneling).
 //!
 //! Single hop:   TCP → Noise(S) → H2
@@ -8,8 +8,8 @@
 use bytes::Bytes;
 use h2::client;
 use http::{Method, Request, Uri};
-use paidtor_common::h2stream::H2ConnectStream;
-use paidtor_common::noise::{self, NoiseStream};
+use monad_common::h2stream::H2ConnectStream;
+use monad_common::noise::{self, NoiseStream};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -24,7 +24,7 @@ pub struct Hop {
     pub pubkey: Vec<u8>,
 }
 
-/// An established connection to a PaidTor server, ready to open H2 streams.
+/// An established connection to a MONAD server, ready to open H2 streams.
 pub struct ServerConnection {
     /// The H2 client send handle — use this to open new streams (CONNECT, etc.)
     pub h2_client: Arc<tokio::sync::Mutex<client::SendRequest<Bytes>>>,
@@ -45,7 +45,7 @@ impl ServerConnection {
     }
 }
 
-/// Connect to a PaidTor server directly (single hop).
+/// Connect to a MONAD server directly (single hop).
 ///
 /// Equivalent to `connect_through_chain(&[hop])`.
 #[allow(dead_code)]
@@ -57,7 +57,7 @@ pub async fn connect(server_addr: &str, server_pubkey: &[u8]) -> io::Result<Serv
     .await
 }
 
-/// Connect to a PaidTor server through a chain of hops.
+/// Connect to a MONAD server through a chain of hops.
 ///
 /// `hops` must have at least one entry. The first hop is connected to via TCP.
 /// Each subsequent hop is reached by opening an H2 CONNECT tunnel through the
@@ -67,7 +67,7 @@ pub async fn connect(server_addr: &str, server_pubkey: &[u8]) -> io::Result<Serv
 ///   TCP → Noise(T) → H2 → CONNECT(S:port) → Noise(S) → H2 → (returned client)
 ///
 /// T only sees encrypted Noise bytes. It has no idea that inside those bytes
-/// is another PaidTor session asking S to proxy onward.
+/// is another MONAD session asking S to proxy onward.
 pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<ServerConnection> {
     if hops.is_empty() {
         return Err(io::Error::new(
