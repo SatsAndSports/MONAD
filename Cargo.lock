@@ -541,7 +541,9 @@ name = "paidtor-common"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "h2",
  "hex",
+ "http",
  "serde",
  "serde_json",
  "snow",

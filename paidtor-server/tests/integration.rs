@@ -13,12 +13,13 @@
 
 use bytes::Bytes;
 use h2::client;
-use http::{Method, Request};
+use http::{Method, Request, Uri};
+use paidtor_common::h2stream::H2ConnectStream;
 use paidtor_common::noise::{self, NoiseStream};
 use paidtor_common::protocol::{ClientMessage, ServerMessage};
 use paidtor_server::listener::ServerConfig;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 // ---------------------------------------------------------------------------
@@ -276,4 +277,135 @@ async fn test_multiple_tunnels() {
 
     tunnel_a.await.unwrap();
     tunnel_b.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Nested / onion routing helpers and tests
+// ---------------------------------------------------------------------------
+
+/// Open an H2 CONNECT tunnel and return an H2ConnectStream.
+async fn open_h2_connect(
+    h2_client: &mut client::SendRequest<Bytes>,
+    target_authority: &str,
+) -> H2ConnectStream {
+    let uri: Uri = target_authority.parse().unwrap();
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(uri)
+        .body(())
+        .unwrap();
+
+    let (response_future, h2_send) = h2_client.send_request(request, false).unwrap();
+    let response = response_future.await.unwrap();
+    assert!(response.status().is_success());
+
+    let h2_recv = response.into_body();
+    H2ConnectStream::new(h2_send, h2_recv)
+}
+
+/// Connect to a PaidTor server through a chain of hops.
+/// Returns an H2 client handle for the last hop.
+async fn connect_through_hops(
+    hops: &[(std::net::SocketAddr, Vec<u8>)],
+) -> client::SendRequest<Bytes> {
+    assert!(!hops.is_empty());
+
+    // TCP connect to the first hop
+    let tcp = TcpStream::connect(hops[0].0).await.unwrap();
+    connect_chain(tcp, hops, 0).await
+}
+
+/// Recursive chain builder (using Box::pin for async recursion).
+fn connect_chain<S>(
+    mut stream: S,
+    hops: &[(std::net::SocketAddr, Vec<u8>)],
+    idx: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = client::SendRequest<Bytes>> + Send>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let hops = hops.to_vec();
+    Box::pin(async move {
+        let (_, ref pubkey) = hops[idx];
+
+        // Noise handshake with this hop
+        let transport = noise::handshake_initiator(&mut stream, pubkey)
+            .await
+            .unwrap();
+        let noise_stream = NoiseStream::new(stream, transport);
+
+        // H2 handshake
+        let (mut h2_client, h2_conn) = client::handshake(noise_stream).await.unwrap();
+        tokio::spawn(async move {
+            if let Err(e) = h2_conn.await {
+                eprintln!("H2 connection error: {e}");
+            }
+        });
+
+        if idx < hops.len() - 1 {
+            // Open CONNECT tunnel to the next hop
+            let next_addr = hops[idx + 1].0.to_string();
+            let h2_connect_stream = open_h2_connect(&mut h2_client, &next_addr).await;
+
+            // Recurse: Noise + H2 over the tunnel
+            connect_chain(h2_connect_stream, &hops, idx + 1).await
+        } else {
+            // Last hop
+            h2_client
+        }
+    })
+}
+
+/// Test nested tunneling: Client → Server T → Server S → uppercase server.
+///
+/// T only sees encrypted Noise bytes heading to S. It has no idea that
+/// inside those bytes is another PaidTor session asking S to connect
+/// to the uppercase server.
+#[tokio::test]
+async fn test_nested_tunnel() {
+    // Uppercase server (final external target)
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    // Server S (final hop — will proxy to uppercase server)
+    let (s_addr, s_pubkey) = start_paidtor_server().await;
+
+    // Server T (intermediate hop — will proxy to S)
+    let (t_addr, t_pubkey) = start_paidtor_server().await;
+
+    // Client connects through T → S
+    let mut h2 = connect_through_hops(&[
+        (t_addr, t_pubkey),
+        (s_addr, s_pubkey),
+    ])
+    .await;
+
+    // Open a tunnel to the uppercase server (through S, via T)
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2, &target, b"nested hello").await;
+    assert_eq!(result, b"NESTED HELLO");
+}
+
+/// Test nested tunneling with 3 hops: Client → A → B → C → uppercase.
+#[tokio::test]
+async fn test_three_hop_tunnel() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (a_addr, a_pubkey) = start_paidtor_server().await;
+    let (b_addr, b_pubkey) = start_paidtor_server().await;
+    let (c_addr, c_pubkey) = start_paidtor_server().await;
+
+    let mut h2 = connect_through_hops(&[
+        (a_addr, a_pubkey),
+        (b_addr, b_pubkey),
+        (c_addr, c_pubkey),
+    ])
+    .await;
+
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2, &target, b"three hops").await;
+    assert_eq!(result, b"THREE HOPS");
 }
