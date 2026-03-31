@@ -1,9 +1,8 @@
-mod connector;
-mod socks;
-mod tunnel;
-
 use clap::Parser;
-use connector::Hop;
+use paidtor_client::connector;
+use paidtor_client::connector::Hop;
+use paidtor_client::socks;
+use paidtor_client::tunnel;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;

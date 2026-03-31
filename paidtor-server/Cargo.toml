@@ -15,3 +15,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 http = "1"
 anyhow = "1"
 serde_json = "1"
+
+[dev-dependencies]
+paidtor-client = { path = "../paidtor-client" }

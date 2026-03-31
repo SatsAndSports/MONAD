@@ -13,16 +13,16 @@
 
 use bytes::Bytes;
 use h2::client;
-use http::{Method, Request, Uri};
-use paidtor_common::h2stream::H2ConnectStream;
+use http::{Method, Request};
 use paidtor_common::h2stream::wait_for_send_capacity;
-use paidtor_common::noise::{self, NoiseStream};
+use paidtor_common::noise;
+use paidtor_client::connector::{self, Hop, ServerConnection};
 use paidtor_common::protocol::{ClientMessage, ServerMessage};
 use paidtor_server::listener::ServerConfig;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -105,27 +105,19 @@ async fn bind_ipv6_listener() -> Option<TcpListener> {
     }
 }
 
-/// Connect to a PaidTor server and return an H2 client handle.
-async fn connect_client(
-    server_addr: std::net::SocketAddr,
-    pubkey: &[u8],
-) -> client::SendRequest<Bytes> {
-    let mut tcp = TcpStream::connect(server_addr).await.unwrap();
-    let transport = noise::handshake_initiator(&mut tcp, pubkey)
-        .await
-        .unwrap();
-    let label = format!("test-client -> {server_addr}");
-    let noise_stream = NoiseStream::new(tcp, transport, label);
+/// Connect to a PaidTor server through the real client connector.
+async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &[u8]) -> ServerConnection {
+    connector::connect_through_chain(&[Hop {
+        addr: server_addr.to_string(),
+        pubkey: pubkey.to_vec(),
+    }])
+    .await
+    .unwrap()
+}
 
-    let (h2_client, h2_conn) = client::handshake(noise_stream).await.unwrap();
-
-    tokio::spawn(async move {
-        if let Err(e) = h2_conn.await {
-            eprintln!("H2 connection error: {e}");
-        }
-    });
-
-    h2_client
+async fn clone_h2_client(conn: &ServerConnection) -> client::SendRequest<Bytes> {
+    let client = conn.h2_client.lock().await;
+    client.clone()
 }
 
 /// Open a CONNECT tunnel, send payload, read response.
@@ -240,7 +232,8 @@ async fn test_control_and_data_channels() {
     let (server_addr, pubkey) = start_paidtor_server().await;
 
     // Client
-    let mut h2 = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client(server_addr, &pubkey).await;
+    let mut h2 = clone_h2_client(&conn).await;
 
     // Control channel: Ping/Pong
     control_ping_pong(&mut h2).await;
@@ -249,6 +242,9 @@ async fn test_control_and_data_channels() {
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"hello world").await;
     assert_eq!(result, b"HELLO WORLD");
+
+    drop(h2);
+    conn.shutdown().await;
 }
 
 /// Test control and data channels running concurrently over the same connection.
@@ -259,7 +255,8 @@ async fn test_concurrent_channels() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_paidtor_server().await;
-    let h2 = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client(server_addr, &pubkey).await;
+    let h2 = clone_h2_client(&conn).await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
 
@@ -276,6 +273,9 @@ async fn test_concurrent_channels() {
 
     control_task.await.unwrap();
     data_task.await.unwrap();
+
+    drop(h2);
+    conn.shutdown().await;
 }
 
 /// Test two data tunnels simultaneously through the same H2 connection.
@@ -286,7 +286,8 @@ async fn test_multiple_tunnels() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_paidtor_server().await;
-    let h2 = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client(server_addr, &pubkey).await;
+    let h2 = clone_h2_client(&conn).await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
 
@@ -306,86 +307,14 @@ async fn test_multiple_tunnels() {
 
     tunnel_a.await.unwrap();
     tunnel_b.await.unwrap();
+
+    drop(h2);
+    conn.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
-// Nested / onion routing helpers and tests
+// Nested / onion routing tests
 // ---------------------------------------------------------------------------
-
-/// Open an H2 CONNECT tunnel and return an H2ConnectStream.
-async fn open_h2_connect(
-    h2_client: &mut client::SendRequest<Bytes>,
-    target_authority: &str,
-) -> H2ConnectStream {
-    let uri: Uri = target_authority.parse().unwrap();
-    let request = Request::builder()
-        .method(Method::CONNECT)
-        .uri(uri)
-        .body(())
-        .unwrap();
-
-    let (response_future, h2_send) = h2_client.send_request(request, false).unwrap();
-    let response = response_future.await.unwrap();
-    assert!(response.status().is_success());
-
-    let h2_recv = response.into_body();
-    H2ConnectStream::new(h2_send, h2_recv)
-}
-
-/// Connect to a PaidTor server through a chain of hops.
-/// Returns an H2 client handle for the last hop.
-async fn connect_through_hops(
-    hops: &[(std::net::SocketAddr, Vec<u8>)],
-) -> client::SendRequest<Bytes> {
-    assert!(!hops.is_empty());
-
-    // TCP connect to the first hop
-    let tcp = TcpStream::connect(hops[0].0).await.unwrap();
-    connect_chain(tcp, hops, 0).await
-}
-
-/// Recursive chain builder (using Box::pin for async recursion).
-fn connect_chain<S>(
-    mut stream: S,
-    hops: &[(std::net::SocketAddr, Vec<u8>)],
-    idx: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = client::SendRequest<Bytes>> + Send>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let hops = hops.to_vec();
-    Box::pin(async move {
-        let (_, ref pubkey) = hops[idx];
-
-        // Noise handshake with this hop
-        let transport = noise::handshake_initiator(&mut stream, pubkey)
-            .await
-            .unwrap();
-        let (addr, _) = &hops[idx];
-        let label = format!("test-chain hop {}/{} to {}", idx + 1, hops.len(), addr);
-        let noise_stream = NoiseStream::new(stream, transport, label);
-
-        // H2 handshake
-        let (mut h2_client, h2_conn) = client::handshake(noise_stream).await.unwrap();
-        tokio::spawn(async move {
-            if let Err(e) = h2_conn.await {
-                eprintln!("H2 connection error: {e}");
-            }
-        });
-
-        if idx < hops.len() - 1 {
-            // Open CONNECT tunnel to the next hop
-            let next_addr = hops[idx + 1].0.to_string();
-            let h2_connect_stream = open_h2_connect(&mut h2_client, &next_addr).await;
-
-            // Recurse: Noise + H2 over the tunnel
-            connect_chain(h2_connect_stream, &hops, idx + 1).await
-        } else {
-            // Last hop
-            h2_client
-        }
-    })
-}
 
 /// Test nested tunneling: Client → Server T → Server S → uppercase server.
 ///
@@ -406,16 +335,19 @@ async fn test_nested_tunnel() {
     let (t_addr, t_pubkey) = start_paidtor_server().await;
 
     // Client connects through T → S
-    let mut h2 = connect_through_hops(&[
-        (t_addr, t_pubkey),
-        (s_addr, s_pubkey),
-    ])
-    .await;
+    let conn = connector::connect_through_chain(&[
+        Hop { addr: t_addr.to_string(), pubkey: t_pubkey },
+        Hop { addr: s_addr.to_string(), pubkey: s_pubkey },
+    ]).await.unwrap();
+    let mut h2 = clone_h2_client(&conn).await;
 
     // Open a tunnel to the uppercase server (through S, via T)
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"nested hello").await;
     assert_eq!(result, b"NESTED HELLO");
+
+    drop(h2);
+    conn.shutdown().await;
 }
 
 /// Test nested tunneling with 3 hops: Client → A → B → C → uppercase.
@@ -429,16 +361,19 @@ async fn test_three_hop_tunnel() {
     let (b_addr, b_pubkey) = start_paidtor_server().await;
     let (c_addr, c_pubkey) = start_paidtor_server().await;
 
-    let mut h2 = connect_through_hops(&[
-        (a_addr, a_pubkey),
-        (b_addr, b_pubkey),
-        (c_addr, c_pubkey),
-    ])
-    .await;
+    let conn = connector::connect_through_chain(&[
+        Hop { addr: a_addr.to_string(), pubkey: a_pubkey },
+        Hop { addr: b_addr.to_string(), pubkey: b_pubkey },
+        Hop { addr: c_addr.to_string(), pubkey: c_pubkey },
+    ]).await.unwrap();
+    let mut h2 = clone_h2_client(&conn).await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"three hops").await;
     assert_eq!(result, b"THREE HOPS");
+
+    drop(h2);
+    conn.shutdown().await;
 }
 
 #[tokio::test]
@@ -450,11 +385,15 @@ async fn test_connect_to_ipv6_target() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_paidtor_server().await;
-    let mut h2 = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client(server_addr, &pubkey).await;
+    let mut h2 = clone_h2_client(&conn).await;
 
     let target = format!("[::1]:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"ipv6 target").await;
     assert_eq!(result, b"IPV6 TARGET");
+
+    drop(h2);
+    conn.shutdown().await;
 }
 
 #[tokio::test]
@@ -469,10 +408,14 @@ async fn test_connect_to_ipv6_server() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let mut h2 = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client(server_addr, &pubkey).await;
+    let mut h2 = clone_h2_client(&conn).await;
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"ipv6 server").await;
     assert_eq!(result, b"IPV6 SERVER");
+
+    drop(h2);
+    conn.shutdown().await;
 }
 
 #[tokio::test]
@@ -489,15 +432,18 @@ async fn test_mixed_ipv4_ipv6_hops() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let mut h2 = connect_through_hops(&[
-        (ipv4_hop_addr, ipv4_hop_pubkey),
-        (ipv6_hop_addr, ipv6_hop_pubkey),
-    ])
-    .await;
+    let conn = connector::connect_through_chain(&[
+        Hop { addr: ipv4_hop_addr.to_string(), pubkey: ipv4_hop_pubkey },
+        Hop { addr: ipv6_hop_addr.to_string(), pubkey: ipv6_hop_pubkey },
+    ]).await.unwrap();
+    let mut h2 = clone_h2_client(&conn).await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"mixed hops").await;
     assert_eq!(result, b"MIXED HOPS");
+
+    drop(h2);
+    conn.shutdown().await;
 }
 
 #[tokio::test]
@@ -507,9 +453,13 @@ async fn test_connect_with_hostname_resolution() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_paidtor_server().await;
-    let mut h2 = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client(server_addr, &pubkey).await;
+    let mut h2 = clone_h2_client(&conn).await;
 
     let target = format!("localhost:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"hostname test").await;
     assert_eq!(result, b"HOSTNAME TEST");
+
+    drop(h2);
+    conn.shutdown().await;
 }

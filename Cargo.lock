@@ -562,6 +562,7 @@ dependencies = [
  "h2",
  "hex",
  "http",
+ "paidtor-client",
  "paidtor-common",
  "serde_json",
  "tokio",
