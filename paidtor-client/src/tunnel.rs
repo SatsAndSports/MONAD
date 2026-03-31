@@ -138,11 +138,11 @@ pub async fn open_tunnel(
     // app finishes sending, we still receive the full response from the remote.
     tokio::join!(local_to_h2, h2_to_local);
 
-    let sent = bytes_sent.load(Ordering::Relaxed);
-    let received = bytes_received.load(Ordering::Relaxed);
+    let outbound = bytes_sent.load(Ordering::Relaxed);
+    let inbound = bytes_received.load(Ordering::Relaxed);
     info!(
-        "tunnel closed: {target_authority} | sent={sent} received={received} total={}",
-        sent + received
+        "tunnel closed: {target_authority} | outbound={outbound} inbound={inbound} total={}",
+        outbound + inbound
     );
 
     Ok(())

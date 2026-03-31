@@ -111,11 +111,11 @@ pub async fn proxy_bidirectional(
     // which eventually causes tcp_to_h2 to see EOF and complete naturally.
     tokio::join!(h2_to_tcp, tcp_to_h2);
 
-    let to_target = bytes_to_target.load(Ordering::Relaxed);
-    let from_target = bytes_from_target.load(Ordering::Relaxed);
+    let outbound = bytes_to_target.load(Ordering::Relaxed);
+    let inbound = bytes_from_target.load(Ordering::Relaxed);
     info!(
-        "tunnel closed: {label} | to_target={to_target} from_target={from_target} total={}",
-        to_target + from_target
+        "tunnel closed: {label} | outbound={outbound} inbound={inbound} total={}",
+        outbound + inbound
     );
 
     Ok(())
