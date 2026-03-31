@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "paidtor-common",
+    "paidtor-server",
+    "paidtor-client",
+]
+resolver = "2"

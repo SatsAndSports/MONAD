@@ -1,0 +1,16 @@
+[package]
+name = "paidtor-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+paidtor-common = { path = "../paidtor-common" }
+h2 = "0.4"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+http = "1"
+anyhow = "1"
