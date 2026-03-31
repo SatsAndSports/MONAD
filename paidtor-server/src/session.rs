@@ -9,6 +9,7 @@ use crate::proxy;
 use bytes::Bytes;
 use h2::server;
 use http::{Method, Response, StatusCode};
+use paidtor_common::h2stream::wait_for_send_capacity;
 use paidtor_common::noise::NoiseStream;
 use paidtor_common::protocol::{ClientMessage, ServerMessage};
 use std::io;
@@ -186,21 +187,7 @@ async fn handle_control_stream(
                             frame.push(b'\n');
 
                             h2_send.reserve_capacity(frame.len());
-                            match std::future::poll_fn(|cx| h2_send.poll_capacity(cx)).await {
-                                Some(Ok(_)) => {}
-                                Some(Err(e)) => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::Other,
-                                        format!("h2 capacity error: {e}"),
-                                    ));
-                                }
-                                None => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::BrokenPipe,
-                                        "h2 send stream closed",
-                                    ));
-                                }
-                            }
+                            wait_for_send_capacity(&mut h2_send).await?;
 
                             h2_send.send_data(Bytes::from(frame), false).map_err(|e| {
                                 io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}"))
@@ -219,9 +206,8 @@ async fn handle_control_stream(
                             frame.push(b'\n');
 
                             h2_send.reserve_capacity(frame.len());
-                            match std::future::poll_fn(|cx| h2_send.poll_capacity(cx)).await {
-                                Some(Ok(_)) => {}
-                                _ => break,
+                            if wait_for_send_capacity(&mut h2_send).await.is_err() {
+                                break;
                             }
 
                             let _ = h2_send.send_data(Bytes::from(frame), false);

@@ -27,6 +27,25 @@ pub struct H2ConnectStream {
     recv_done: bool,
 }
 
+/// Wait for H2 flow control capacity on a send stream.
+///
+/// This is the async counterpart to calling `poll_capacity` directly in a
+/// `poll_*` method: it sleeps until the peer sends a WINDOW_UPDATE instead of
+/// busy-looping.
+pub async fn wait_for_send_capacity(send: &mut SendStream<Bytes>) -> io::Result<usize> {
+    match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+        Some(Ok(capacity)) => Ok(capacity),
+        Some(Err(e)) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("h2 capacity error: {e}"),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "h2 send stream closed",
+        )),
+    }
+}
+
 impl H2ConnectStream {
     /// Create a new `H2ConnectStream` from an H2 send/recv stream pair.
     ///

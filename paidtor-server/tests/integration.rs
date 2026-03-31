@@ -15,6 +15,7 @@ use bytes::Bytes;
 use h2::client;
 use http::{Method, Request, Uri};
 use paidtor_common::h2stream::H2ConnectStream;
+use paidtor_common::h2stream::wait_for_send_capacity;
 use paidtor_common::noise::{self, NoiseStream};
 use paidtor_common::protocol::{ClientMessage, ServerMessage};
 use paidtor_server::listener::ServerConfig;
@@ -152,10 +153,7 @@ async fn tunnel_roundtrip(
 
     // Send payload and close our send side
     h2_send.reserve_capacity(payload.len());
-    std::future::poll_fn(|cx| h2_send.poll_capacity(cx))
-        .await
-        .expect("stream closed")
-        .expect("capacity error");
+    wait_for_send_capacity(&mut h2_send).await.unwrap();
     h2_send
         .send_data(Bytes::copy_from_slice(payload), true)
         .unwrap();
@@ -198,10 +196,7 @@ async fn control_ping_pong(h2_client: &mut client::SendRequest<Bytes>) {
     frame.push(b'\n');
 
     h2_send.reserve_capacity(frame.len());
-    std::future::poll_fn(|cx| h2_send.poll_capacity(cx))
-        .await
-        .expect("stream closed")
-        .expect("capacity error");
+    wait_for_send_capacity(&mut h2_send).await.unwrap();
     h2_send
         .send_data(Bytes::from(frame), true)
         .unwrap();
