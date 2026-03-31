@@ -187,11 +187,20 @@ async fn handle_control_stream(
                             frame.push(b'\n');
 
                             h2_send.reserve_capacity(frame.len());
-                            loop {
-                                if h2_send.capacity() > 0 {
-                                    break;
+                            match std::future::poll_fn(|cx| h2_send.poll_capacity(cx)).await {
+                                Some(Ok(_)) => {}
+                                Some(Err(e)) => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::Other,
+                                        format!("h2 capacity error: {e}"),
+                                    ));
                                 }
-                                tokio::task::yield_now().await;
+                                None => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "h2 send stream closed",
+                                    ));
+                                }
                             }
 
                             h2_send.send_data(Bytes::from(frame), false).map_err(|e| {
@@ -211,11 +220,9 @@ async fn handle_control_stream(
                             frame.push(b'\n');
 
                             h2_send.reserve_capacity(frame.len());
-                            loop {
-                                if h2_send.capacity() > 0 {
-                                    break;
-                                }
-                                tokio::task::yield_now().await;
+                            match std::future::poll_fn(|cx| h2_send.poll_capacity(cx)).await {
+                                Some(Ok(_)) => {}
+                                _ => break,
                             }
 
                             let _ = h2_send.send_data(Bytes::from(frame), false);

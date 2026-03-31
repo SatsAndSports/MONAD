@@ -117,12 +117,10 @@ async fn tunnel_roundtrip(
 
     // Send payload and close our send side
     h2_send.reserve_capacity(payload.len());
-    loop {
-        if h2_send.capacity() > 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    std::future::poll_fn(|cx| h2_send.poll_capacity(cx))
+        .await
+        .expect("stream closed")
+        .expect("capacity error");
     h2_send
         .send_data(Bytes::copy_from_slice(payload), true)
         .unwrap();
@@ -165,12 +163,10 @@ async fn control_ping_pong(h2_client: &mut client::SendRequest<Bytes>) {
     frame.push(b'\n');
 
     h2_send.reserve_capacity(frame.len());
-    loop {
-        if h2_send.capacity() > 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    std::future::poll_fn(|cx| h2_send.poll_capacity(cx))
+        .await
+        .expect("stream closed")
+        .expect("capacity error");
     h2_send
         .send_data(Bytes::from(frame), true)
         .unwrap();

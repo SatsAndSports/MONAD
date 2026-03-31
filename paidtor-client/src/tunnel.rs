@@ -73,13 +73,19 @@ pub async fn open_tunnel(
                 Ok(n) => {
                     let data = Bytes::copy_from_slice(&buf[..n]);
 
-                    // Reserve capacity and wait for it
+                    // Wait for H2 flow control capacity (sleeps until
+                    // the peer sends a WINDOW_UPDATE — no busy-looping)
                     h2_send.reserve_capacity(data.len());
-                    loop {
-                        if h2_send.capacity() > 0 {
+                    match std::future::poll_fn(|cx| h2_send.poll_capacity(cx)).await {
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            debug!("h2 capacity error: {e}");
                             break;
                         }
-                        tokio::task::yield_now().await;
+                        None => {
+                            debug!("h2 send stream closed");
+                            break;
+                        }
                     }
 
                     if let Err(e) = h2_send.send_data(data, false) {

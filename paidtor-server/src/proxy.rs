@@ -63,14 +63,17 @@ pub async fn proxy_bidirectional(
                 Ok(n) => {
                     let data = Bytes::copy_from_slice(&buf[..n]);
 
-                    // Reserve capacity on the H2 stream before sending
+                    // Wait for H2 flow control capacity (sleeps until
+                    // the peer sends a WINDOW_UPDATE — no busy-looping)
                     h2_send.reserve_capacity(data.len());
-
-                    // Wait for capacity to be available
-                    match futures_poll_capacity(&mut h2_send).await {
-                        Ok(()) => {}
-                        Err(e) => {
+                    match std::future::poll_fn(|cx| h2_send.poll_capacity(cx)).await {
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
                             debug!("h2 capacity error: {e}");
+                            break;
+                        }
+                        None => {
+                            debug!("h2 send stream closed");
                             break;
                         }
                     }
@@ -100,15 +103,3 @@ pub async fn proxy_bidirectional(
     Ok(())
 }
 
-/// Wait for H2 send capacity to be available.
-async fn futures_poll_capacity(send: &mut SendStream<Bytes>) -> Result<(), h2::Error> {
-    loop {
-        match send.capacity() {
-            0 => {
-                // No capacity yet — yield and try again
-                tokio::task::yield_now().await;
-            }
-            _ => return Ok(()),
-        }
-    }
-}
