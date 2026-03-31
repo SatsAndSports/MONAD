@@ -80,7 +80,8 @@ async fn connect_client(
     let transport = noise::handshake_initiator(&mut tcp, pubkey)
         .await
         .unwrap();
-    let noise_stream = NoiseStream::new(tcp, transport);
+    let label = format!("test-client -> {server_addr}");
+    let noise_stream = NoiseStream::new(tcp, transport, label);
 
     let (h2_client, h2_conn) = client::handshake(noise_stream).await.unwrap();
 
@@ -332,7 +333,9 @@ where
         let transport = noise::handshake_initiator(&mut stream, pubkey)
             .await
             .unwrap();
-        let noise_stream = NoiseStream::new(stream, transport);
+        let (addr, _) = &hops[idx];
+        let label = format!("test-chain hop {}/{} to {}", idx + 1, hops.len(), addr);
+        let noise_stream = NoiseStream::new(stream, transport, label);
 
         // H2 handshake
         let (mut h2_client, h2_conn) = client::handshake(noise_stream).await.unwrap();

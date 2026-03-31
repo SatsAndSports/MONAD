@@ -52,7 +52,7 @@ pub async fn handle_session(noise_stream: NoiseStream<TcpStream>) -> io::Result<
                             continue;
                         }
 
-                        info!("opening tunnel to {authority}");
+                        info!("CONNECT {authority}");
 
                         // Connect to the external target BEFORE spawning the proxy.
                         // This ensures the 200 OK response is sent from this task,
@@ -73,13 +73,12 @@ pub async fn handle_session(noise_stream: NoiseStream<TcpStream>) -> io::Result<
                                         // Now spawn the bidirectional proxy
                                         tokio::spawn(async move {
                                             if let Err(e) = proxy::proxy_bidirectional(
-                                                h2_send, h2_recv, tcp_stream,
+                                                h2_send, h2_recv, tcp_stream, &authority,
                                             )
                                             .await
                                             {
                                                 error!("tunnel to {authority} error: {e}");
                                             }
-                                            debug!("tunnel to {authority} closed");
                                         });
                                     }
                                     Err(e) => {

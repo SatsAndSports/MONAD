@@ -90,6 +90,35 @@ async fn main() -> anyhow::Result<()> {
     let socks_listener = TcpListener::bind(&cli.socks).await?;
     info!("SOCKS5 proxy listening on {}", cli.socks);
 
+    // Run the SOCKS5 accept loop until Ctrl+C
+    tokio::select! {
+        result = accept_loop(&socks_listener, &h2_client) => {
+            if let Err(e) = result {
+                error!("accept loop error: {e}");
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("shutting down (Ctrl+C)...");
+        }
+    }
+
+    // Drop the H2 client handle. This is the last clone held by main —
+    // spawned tunnel tasks hold their own clones but will finish or abort.
+    // Dropping causes the H2 connections to close, which drops the NoiseStreams,
+    // which triggers the wire byte logging in their Drop impls.
+    drop(h2_client);
+
+    // Give spawned tasks a moment to finish and log their stats
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    info!("client shut down");
+    Ok(())
+}
+
+async fn accept_loop(
+    socks_listener: &TcpListener,
+    h2_client: &Arc<tokio::sync::Mutex<h2::client::SendRequest<bytes::Bytes>>>,
+) -> anyhow::Result<()> {
     loop {
         let (mut local_stream, peer_addr) = socks_listener.accept().await?;
         info!("SOCKS5 connection from {peer_addr}");

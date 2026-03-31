@@ -142,6 +142,9 @@ fn noise_err(e: snow::Error) -> io::Error {
 ///
 /// Wraps an inner `AsyncRead + AsyncWrite + Unpin` stream (typically a `TcpStream`)
 /// and transparently encrypts/decrypts all data using the Noise transport state.
+///
+/// Tracks total wire bytes (encrypted) read and written. On drop, logs the totals
+/// via `tracing::debug!` for debugging and bandwidth accounting.
 pub struct NoiseStream<T> {
     inner: T,
     transport: TransportState,
@@ -155,14 +158,25 @@ pub struct NoiseStream<T> {
 
     // Write side: buffer for encrypted data not yet flushed to inner stream
     write_ciphertext: BytesMut,
+
+    // Wire byte counters (encrypted bytes on the underlying transport)
+    wire_bytes_read: u64,
+    wire_bytes_written: u64,
+
+    // Human-readable label for logging (e.g., "127.0.0.1:9050 <-> 127.0.0.1:43210")
+    label: String,
 }
 
 // NoiseStream is Unpin as long as T is Unpin (which we require).
 impl<T: Unpin> Unpin for NoiseStream<T> {}
 
 impl<T> NoiseStream<T> {
-    /// Create a new `NoiseStream` from an inner stream and an established Noise transport.
-    pub fn new(inner: T, transport: TransportState) -> Self {
+    /// Create a new `NoiseStream` from an inner stream, an established Noise
+    /// transport, and a label for logging.
+    ///
+    /// The label typically describes the connection endpoints, e.g.,
+    /// `"127.0.0.1:9050 <-> 127.0.0.1:43210"` or `"tunnel to 1.2.3.4:9050"`.
+    pub fn new(inner: T, transport: TransportState, label: impl Into<String>) -> Self {
         Self {
             inner,
             transport,
@@ -170,7 +184,22 @@ impl<T> NoiseStream<T> {
             read_ciphertext: BytesMut::new(),
             read_expected_len: None,
             write_ciphertext: BytesMut::new(),
+            wire_bytes_read: 0,
+            wire_bytes_written: 0,
+            label: label.into(),
         }
+    }
+}
+
+impl<T> Drop for NoiseStream<T> {
+    fn drop(&mut self) {
+        tracing::debug!(
+            label = %self.label,
+            wire_read = self.wire_bytes_read,
+            wire_written = self.wire_bytes_written,
+            wire_total = self.wire_bytes_read + self.wire_bytes_written,
+            "NoiseStream closed"
+        );
     }
 }
 
@@ -222,6 +251,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for NoiseStream<T> {
                                 // EOF
                                 return Poll::Ready(Ok(()));
                             }
+                            me.wire_bytes_read += n as u64;
                             me.read_ciphertext
                                 .extend_from_slice(tmp_read_buf.filled());
                             continue;
@@ -265,6 +295,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for NoiseStream<T> {
                                     "connection closed mid-noise-message",
                                 )));
                             }
+                            me.wire_bytes_read += n as u64;
                             me.read_ciphertext
                                 .extend_from_slice(tmp_read_buf.filled());
                             continue;
@@ -290,6 +321,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for NoiseStream<T> {
         while !me.write_ciphertext.is_empty() {
             match Pin::new(&mut me.inner).poll_write(cx, &me.write_ciphertext) {
                 Poll::Ready(Ok(n)) => {
+                    me.wire_bytes_written += n as u64;
                     me.write_ciphertext.advance(n);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -319,6 +351,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for NoiseStream<T> {
         while !me.write_ciphertext.is_empty() {
             match Pin::new(&mut me.inner).poll_write(cx, &me.write_ciphertext) {
                 Poll::Ready(Ok(n)) => {
+                    me.wire_bytes_written += n as u64;
                     me.write_ciphertext.advance(n);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -346,6 +379,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for NoiseStream<T> {
                             "write returned 0",
                         )));
                     }
+                    me.wire_bytes_written += n as u64;
                     me.write_ciphertext.advance(n);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -369,6 +403,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for NoiseStream<T> {
                             "write returned 0",
                         )));
                     }
+                    me.wire_bytes_written += n as u64;
                     me.write_ciphertext.advance(n);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -398,7 +433,7 @@ mod tests {
             async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let transport = handshake_responder(&mut stream, &privkey).await.unwrap();
-                let mut noise_stream = NoiseStream::new(stream, transport);
+                let mut noise_stream = NoiseStream::new(stream, transport, "test-server");
 
                 let mut buf = vec![0u8; 1024];
                 let n = noise_stream.read(&mut buf).await.unwrap();
@@ -415,7 +450,7 @@ mod tests {
         let client_handle = tokio::spawn(async move {
             let mut stream = TcpStream::connect(addr).await.unwrap();
             let transport = handshake_initiator(&mut stream, &pubkey).await.unwrap();
-            let mut noise_stream = NoiseStream::new(stream, transport);
+            let mut noise_stream = NoiseStream::new(stream, transport, "test-client");
 
             noise_stream
                 .write_all(b"hello from client")
@@ -448,7 +483,7 @@ mod tests {
             async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let transport = handshake_responder(&mut stream, &privkey).await.unwrap();
-                let mut noise_stream = NoiseStream::new(stream, transport);
+                let mut noise_stream = NoiseStream::new(stream, transport, "test-server-large");
 
                 let mut received = Vec::new();
                 let mut buf = vec![0u8; 8192];
@@ -468,7 +503,7 @@ mod tests {
         let client_handle = tokio::spawn(async move {
             let mut stream = TcpStream::connect(addr).await.unwrap();
             let transport = handshake_initiator(&mut stream, &pubkey).await.unwrap();
-            let mut noise_stream = NoiseStream::new(stream, transport);
+            let mut noise_stream = NoiseStream::new(stream, transport, "test-client-large");
 
             noise_stream.write_all(&large_data).await.unwrap();
             noise_stream.flush().await.unwrap();

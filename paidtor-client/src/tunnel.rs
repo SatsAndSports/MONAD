@@ -6,6 +6,8 @@ use bytes::Bytes;
 use h2::client::SendRequest;
 use http::{Method, Request, Uri};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
@@ -14,6 +16,7 @@ use tracing::{debug, info};
 /// and proxy data bidirectionally between the local `client_stream` and the remote target.
 ///
 /// Sends the SOCKS5 success reply to the local client before starting the proxy.
+/// On completion, logs the total proxied bytes in each direction.
 pub async fn open_tunnel(
     mut h2_client: SendRequest<Bytes>,
     target_authority: &str,
@@ -57,9 +60,14 @@ pub async fn open_tunnel(
     let mut h2_recv = response.into_body();
 
     // Split the local stream for bidirectional I/O.
-    // We need to take ownership, so we use a trick: swap with a dummy and split.
-    // Actually, since we have &mut TcpStream, we can use split() (borrowed version).
     let (mut local_read, mut local_write) = tokio::io::split(local_stream);
+
+    // Byte counters
+    let bytes_sent = Arc::new(AtomicU64::new(0));
+    let bytes_received = Arc::new(AtomicU64::new(0));
+
+    let bytes_sent_ref = bytes_sent.clone();
+    let bytes_received_ref = bytes_received.clone();
 
     // Local -> H2 (data from local app going to remote target via server)
     let local_to_h2 = async {
@@ -71,6 +79,8 @@ pub async fn open_tunnel(
                     break;
                 }
                 Ok(n) => {
+                    bytes_sent_ref.fetch_add(n as u64, Ordering::Relaxed);
+
                     let data = Bytes::copy_from_slice(&buf[..n]);
 
                     // Wait for H2 flow control capacity (sleeps until
@@ -110,6 +120,8 @@ pub async fn open_tunnel(
                     let len = data.len();
                     let _ = h2_recv.flow_control().release_capacity(len);
 
+                    bytes_received_ref.fetch_add(len as u64, Ordering::Relaxed);
+
                     if let Err(e) = local_write.write_all(&data).await {
                         debug!("local write error: {e}");
                         break;
@@ -131,6 +143,13 @@ pub async fn open_tunnel(
     // Run both directions to completion (not select!) so that when the local
     // app finishes sending, we still receive the full response from the remote.
     tokio::join!(local_to_h2, h2_to_local);
+
+    let sent = bytes_sent.load(Ordering::Relaxed);
+    let received = bytes_received.load(Ordering::Relaxed);
+    info!(
+        "tunnel closed: {target_authority} | sent={sent} received={received} total={}",
+        sent + received
+    );
 
     Ok(())
 }

@@ -99,7 +99,8 @@ where
 
     // Noise NK handshake with this hop
     let transport = noise::handshake_initiator(&mut stream, &hop.pubkey).await?;
-    let noise_stream = NoiseStream::new(stream, transport);
+    let label = format!("client hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
+    let noise_stream = NoiseStream::new(stream, transport, label);
 
     // H2 handshake over the encrypted stream
     let (h2_client, h2_conn) = client::handshake(noise_stream)

@@ -8,20 +8,33 @@ use bytes::Bytes;
 use h2::RecvStream;
 use h2::SendStream;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Proxy bytes bidirectionally between an H2 send/recv stream pair and an
 /// external TCP connection.
 ///
-/// This runs until either side closes or an error occurs.
+/// `label` identifies this tunnel for logging (typically the CONNECT authority,
+/// e.g., "example.com:443").
+///
+/// On completion, logs the total proxied bytes in each direction.
 pub async fn proxy_bidirectional(
     mut h2_send: SendStream<Bytes>,
     mut h2_recv: RecvStream,
     target: TcpStream,
+    label: &str,
 ) -> io::Result<()> {
     let (mut tcp_read, mut tcp_write) = target.into_split();
+
+    // Byte counters shared between the two directions
+    let bytes_to_target = Arc::new(AtomicU64::new(0));
+    let bytes_from_target = Arc::new(AtomicU64::new(0));
+
+    let bytes_to_target_ref = bytes_to_target.clone();
+    let bytes_from_target_ref = bytes_from_target.clone();
 
     // H2 recv -> TCP write (data from client going to external target)
     let h2_to_tcp = async {
@@ -31,6 +44,8 @@ pub async fn proxy_bidirectional(
                     // Release H2 flow control capacity
                     let len = data.len();
                     let _ = h2_recv.flow_control().release_capacity(len);
+
+                    bytes_to_target_ref.fetch_add(len as u64, Ordering::Relaxed);
 
                     if let Err(e) = tcp_write.write_all(&data).await {
                         debug!("tcp write error: {e}");
@@ -61,6 +76,8 @@ pub async fn proxy_bidirectional(
                     break;
                 }
                 Ok(n) => {
+                    bytes_from_target_ref.fetch_add(n as u64, Ordering::Relaxed);
+
                     let data = Bytes::copy_from_slice(&buf[..n]);
 
                     // Wait for H2 flow control capacity (sleeps until
@@ -100,6 +117,12 @@ pub async fn proxy_bidirectional(
     // which eventually causes tcp_to_h2 to see EOF and complete naturally.
     tokio::join!(h2_to_tcp, tcp_to_h2);
 
+    let to_target = bytes_to_target.load(Ordering::Relaxed);
+    let from_target = bytes_from_target.load(Ordering::Relaxed);
+    info!(
+        "tunnel closed: {label} | to_target={to_target} from_target={from_target} total={}",
+        to_target + from_target
+    );
+
     Ok(())
 }
-
