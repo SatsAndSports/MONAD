@@ -16,11 +16,12 @@ Implemented today:
 - `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels
 - `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels
 - `monad-common`: shared Noise transport and H2 stream helpers
-- integration tests for direct, nested, IPv6, and hostname-resolution scenarios
+- `monad-quic`: standalone QUIC proof-of-concept for future shared relay-to-relay transport (pinned-key auth, echo server/client, tested with 1,000 concurrent streams)
+- integration tests for direct, nested, IPv6, hostname-resolution, and QUIC scenarios
 
 Not implemented yet:
 - payments / accounting on the control channel beyond basic Ping/Pong scaffolding
-- shared inter-relay multiplexing (Tor-style relay-to-relay shared links)
+- shared inter-relay QUIC multiplexing (standalone PoC exists in `monad-quic` but is not integrated into the main transport)
 
 ## Workspace
 
@@ -28,6 +29,7 @@ Not implemented yet:
 monad-common/     Shared transport and protocol helpers
 monad-client/     Local SOCKS5 proxy and multi-hop client
 monad-server/     Tunnel server
+monad-quic/       Standalone QUIC proof-of-concept (future relay-to-relay transport)
 ```
 
 ## Build
@@ -55,6 +57,11 @@ Current coverage includes:
 - mixed IPv4/IPv6 hop chains
 - hostname resolution at the final hop
 - SOCKS5 IPv6 parsing
+- QUIC echo with pinned-key authentication
+- QUIC pinned-key rejection (wrong key)
+- 1,000 concurrent QUIC streams over one connection
+- large (4MB) single QUIC stream payload
+- multiple independent QUIC connections
 
 ## Quick Start
 
@@ -176,6 +183,39 @@ Both client and server handle `Ctrl+C` gracefully:
 - wait briefly for active tunnels/sessions to finish
 - shut down H2 connections cleanly
 - emit `NoiseStream` wire-byte totals
+
+## QUIC Proof-of-Concept
+
+The `monad-quic` crate is a standalone PoC for the future shared relay-to-relay QUIC transport. It is not part of the main MONAD tunnel system yet.
+
+### Generate a keypair
+
+```bash
+cargo run -p monad-quic -- keygen
+```
+
+Save the private key block to `server.key`, the certificate block to `server.crt`, and note the pinned public key hex.
+
+### Start the echo server
+
+```bash
+RUST_LOG=info cargo run -p monad-quic -- server \
+  --listen 127.0.0.1:4433 \
+  --cert server.crt \
+  --key server.key
+```
+
+### Run the echo client
+
+```bash
+RUST_LOG=info cargo run -p monad-quic -- client \
+  --connect 127.0.0.1:4433 \
+  --pin <PINNED_PUBLIC_KEY_HEX> \
+  --streams 16 \
+  --bytes 65536
+```
+
+This opens 16 bidirectional QUIC streams, sends 64KB of random data on each, reads the echo, and verifies correctness.
 
 ## Further Reading
 

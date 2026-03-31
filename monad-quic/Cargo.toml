@@ -1,0 +1,18 @@
+[package]
+name = "monad-quic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.9"
+rustls-pemfile = "2"
+pem = "3"

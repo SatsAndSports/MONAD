@@ -45,6 +45,22 @@ Responsibilities:
   - `CONNECT host:port`
 - proxy bytes between H2 streams and external TCP targets
 
+### `monad-quic`
+
+Standalone QUIC proof-of-concept for the future shared relay-to-relay transport.
+
+This crate is not integrated into the main MONAD transport yet. It exists to validate QUIC fundamentals before integration:
+- Ed25519 self-signed certificate generation via `rcgen`
+- pinned public key authentication (SPKI DER comparison, no CA trust chain)
+- QUIC echo server and client using `quinn`
+- ALPN protocol identifier: `monad-relay/0`
+- 0-RTT disabled
+
+Subcommands:
+- `keygen` — generate a self-signed certificate and print the pinned public key
+- `server` — QUIC echo server that accepts connections and streams
+- `client` — connect with a pinned key, open N bidirectional streams, send/verify echoed data
+
 ## Terminology
 
 ### Hop
@@ -306,11 +322,45 @@ Initial constraints for such a design would likely include:
 - keep current direct and nested MONAD modes working unchanged
 - treat this as a relay-to-relay transport optimization, not a change to the inner MONAD session model
 
-This is not implemented yet. The current system still uses per-client nested relay tunnels.
+### QUIC Proof-of-Concept Status
+
+The `monad-quic` crate implements a standalone QUIC echo server and client to validate the core building blocks described above. It is not integrated into the main MONAD transport yet.
+
+What has been validated:
+
+- **Pinned self-signed certificate authentication works.** The client implements a custom `rustls::ServerCertVerifier` that extracts the SubjectPublicKeyInfo (SPKI) from the server's certificate and compares it byte-for-byte against a hex-encoded pinned key. Connections with a mismatched key are rejected during the TLS handshake with a clear error. This confirms the one-way, CA-free authentication model described above.
+
+- **1,000 concurrent bidirectional streams over one QUIC connection work.** Each stream sends 4KB of random data and verifies the echoed response. All 1,000 streams complete successfully. Stream creation is lightweight — the entire test runs in under a second.
+
+- **Multiple independent QUIC connections work.** Three separate connections, each carrying 10 streams, run concurrently without interference.
+
+- **Large single-stream payloads work (with tuning).** A 4MB payload on a single stream succeeds, but required increasing the QUIC flow-control windows beyond the defaults (see below).
+
+### QUIC Flow Control
+
+Quinn's default `stream_receive_window` is 1MB and the default connection-level `receive_window` is also limited. These defaults are fine for typical web traffic but can cause problems with large payloads in a write-then-read pattern.
+
+The specific issue: if a client sends a large payload (exceeding the receive window) and the server echoes it back before the client has started reading, both sides can deadlock. The client blocks trying to send because the server's receive window is full, and the server blocks trying to echo because the client's receive window is full — neither side makes progress.
+
+This is specific to the echo test pattern (sequential write-all then read-all on the same stream). In real MONAD relay usage, the two directions of a stream are handled by separate tasks reading and writing concurrently, so this deadlock does not apply. Nevertheless, the current `monad-quic` transport config sets:
+
+- `stream_receive_window`: 8MB
+- `receive_window` (connection-level): 16MB
+
+These values are generous for testing. Production tuning will depend on expected relay traffic patterns.
+
+### What Remains
+
+The shared relay-to-relay QUIC transport is not integrated into the main MONAD system yet. The current system still uses per-client nested relay tunnels.
+
+Next steps toward integration would include:
+- a `QuicStream` type in `monad-common` wrapping a QUIC bidirectional stream as `AsyncRead + AsyncWrite`
+- a connection pool in the relay that maintains shared QUIC connections to peer relays
+- routing logic to multiplex client sessions onto shared QUIC streams instead of opening per-client nested tunnels
 
 ## Current Limitations
 
 - payment protocol is not implemented beyond control-channel scaffolding
-- relay-to-relay shared multiplexing is not implemented
+- relay-to-relay shared QUIC multiplexing exists as a standalone PoC (`monad-quic`) but is not integrated into the main transport
 - no persistent route configuration file yet
 - no per-user/session accounting on the control channel yet

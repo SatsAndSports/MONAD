@@ -15,6 +15,7 @@ For binaries during development:
 ```bash
 cargo run -p monad-server -- ...
 cargo run -p monad-client -- ...
+cargo run -p monad-quic -- ...
 ```
 
 ## Repo Shape
@@ -33,6 +34,12 @@ cargo run -p monad-client -- ...
   - listener
   - H2 session handling
   - TCP proxying
+- `monad-quic`
+  - standalone QUIC proof-of-concept (not integrated into main transport yet)
+  - reusable library code plus binary entrypoint
+  - Ed25519 self-signed cert generation
+  - QUIC echo server with pinned-key auth
+  - QUIC echo client with custom `ServerCertVerifier`
 
 ## Current Protocol Model
 
@@ -131,6 +138,11 @@ The test suite currently covers:
 - mixed-family hop chains
 - hostname resolution at the final hop
 - SOCKS5 IPv6 parsing
+- QUIC echo with pinned-key authentication
+- QUIC pinned-key rejection (wrong key)
+- 1,000 concurrent QUIC streams over one connection
+- large single QUIC stream payload (4MB)
+- multiple independent QUIC connections
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
 

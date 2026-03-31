@@ -3,5 +3,6 @@ members = [
     "monad-common",
     "monad-server",
     "monad-client",
+    "monad-quic",
 ]
 resolver = "2"
