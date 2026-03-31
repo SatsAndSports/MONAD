@@ -90,10 +90,12 @@ pub async fn proxy_bidirectional(
         let _ = h2_send.send_data(Bytes::new(), true);
     };
 
-    tokio::select! {
-        _ = h2_to_tcp => {},
-        _ = tcp_to_h2 => {},
-    }
+    // Run both directions to completion. We use join (not select) because
+    // when the client finishes sending (h2_to_tcp completes), we still need
+    // tcp_to_h2 to read the response from the external target and send it back.
+    // h2_to_tcp shuts down the TCP write side, causing the target to see EOF,
+    // which eventually causes tcp_to_h2 to see EOF and complete naturally.
+    tokio::join!(h2_to_tcp, tcp_to_h2);
 
     Ok(())
 }

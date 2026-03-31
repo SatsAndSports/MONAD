@@ -122,10 +122,9 @@ pub async fn open_tunnel(
         let _ = local_write.shutdown().await;
     };
 
-    tokio::select! {
-        _ = local_to_h2 => {},
-        _ = h2_to_local => {},
-    }
+    // Run both directions to completion (not select!) so that when the local
+    // app finishes sending, we still receive the full response from the remote.
+    tokio::join!(local_to_h2, h2_to_local);
 
     Ok(())
 }

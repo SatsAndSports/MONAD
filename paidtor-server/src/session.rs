@@ -3,13 +3,14 @@
 //! After the Noise handshake, the server runs an H2 server on the encrypted stream.
 //! It accepts H2 streams and routes them:
 //!   - CONNECT requests → open TCP to target, bidirectional proxy
-//!   - POST /control → control channel (stub for now)
+//!   - POST /control → control channel (Ping/Pong, future: payments)
 
 use crate::proxy;
 use bytes::Bytes;
 use h2::server;
 use http::{Method, Response, StatusCode};
 use paidtor_common::noise::NoiseStream;
+use paidtor_common::protocol::{ClientMessage, ServerMessage};
 use std::io;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
@@ -23,51 +24,116 @@ pub async fn handle_session(noise_stream: NoiseStream<TcpStream>) -> io::Result<
     info!("H2 connection established");
 
     while let Some(result) = h2_conn.accept().await {
-        let (request, mut respond) = match result {
-            Ok(pair) => pair,
+        match result {
+            Ok((request, mut respond)) => {
+                let method = request.method().clone();
+                let uri = request.uri().clone();
+
+                debug!(
+                    "received H2 request: {method} {uri} (path={:?}, authority={:?})",
+                    uri.path(),
+                    uri.authority()
+                );
+
+                match (&method, uri.path()) {
+                    (&Method::CONNECT, _) => {
+                        let authority = uri
+                            .authority()
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| uri.to_string());
+
+                        if authority.is_empty() {
+                            warn!("CONNECT request missing authority");
+                            let resp = Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(())
+                                .unwrap();
+                            let _ = respond.send_response(resp, true);
+                            continue;
+                        }
+
+                        info!("opening tunnel to {authority}");
+
+                        // Connect to the external target BEFORE spawning the proxy.
+                        // This ensures the 200 OK response is sent from this task,
+                        // which is the same task driving the H2 connection.
+                        match TcpStream::connect(&authority).await {
+                            Ok(tcp_stream) => {
+                                info!("connected to {authority}");
+
+                                // Send 200 OK
+                                let resp = Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(())
+                                    .unwrap();
+                                match respond.send_response(resp, false) {
+                                    Ok(h2_send) => {
+                                        let (_, h2_recv) = request.into_parts();
+
+                                        // Now spawn the bidirectional proxy
+                                        tokio::spawn(async move {
+                                            if let Err(e) = proxy::proxy_bidirectional(
+                                                h2_send, h2_recv, tcp_stream,
+                                            )
+                                            .await
+                                            {
+                                                error!("tunnel to {authority} error: {e}");
+                                            }
+                                            debug!("tunnel to {authority} closed");
+                                        });
+                                    }
+                                    Err(e) => {
+                                        error!("h2 send response error: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("failed to connect to {authority}: {e}");
+                                let resp = Response::builder()
+                                    .status(StatusCode::BAD_GATEWAY)
+                                    .body(())
+                                    .unwrap();
+                                let _ = respond.send_response(resp, true);
+                            }
+                        }
+                    }
+                    (&Method::POST, "/control") => {
+                        // Send 200 OK from this task (same as CONNECT above)
+                        let resp = Response::builder()
+                            .status(StatusCode::OK)
+                            .body(())
+                            .unwrap();
+                        match respond.send_response(resp, false) {
+                            Ok(h2_send) => {
+                                let (_, h2_recv) = request.into_parts();
+
+                                // Spawn control channel handler
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        handle_control_stream(h2_send, h2_recv).await
+                                    {
+                                        error!("control channel error: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("h2 send response error for control: {e}");
+                            }
+                        }
+                    }
+                    _ => {
+                        warn!("unsupported request: {method} {}", uri.path());
+                        let resp = Response::builder()
+                            .status(StatusCode::METHOD_NOT_ALLOWED)
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(resp, true);
+                    }
+                }
+            }
             Err(e) => {
                 error!("h2 accept error: {e}");
                 break;
-            }
-        };
-
-        let method = request.method().clone();
-        let uri = request.uri().clone();
-
-        debug!("received H2 request: {method} {uri}");
-
-        match method {
-            Method::CONNECT => {
-                // Extract target from URI authority (e.g., "example.com:443")
-                let authority = match uri.authority() {
-                    Some(auth) => auth.to_string(),
-                    None => {
-                        warn!("CONNECT request missing authority");
-                        let response = Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(())
-                            .unwrap();
-                        let _ = respond.send_response(response, true);
-                        continue;
-                    }
-                };
-
-                // Spawn a task to handle this tunnel
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connect(authority, request, respond).await {
-                        error!("tunnel error: {e}");
-                    }
-                });
-            }
-            _ => {
-                // For now, reject anything that isn't CONNECT
-                // (control channel can be added later)
-                warn!("unsupported method: {method}");
-                let response = Response::builder()
-                    .status(StatusCode::METHOD_NOT_ALLOWED)
-                    .body(())
-                    .unwrap();
-                let _ = respond.send_response(response, true);
             }
         }
     }
@@ -76,43 +142,99 @@ pub async fn handle_session(noise_stream: NoiseStream<TcpStream>) -> io::Result<
     Ok(())
 }
 
-/// Handle a CONNECT tunnel request.
-async fn handle_connect(
-    target: String,
-    request: http::Request<h2::RecvStream>,
-    mut respond: h2::server::SendResponse<Bytes>,
+/// Handle a control channel stream.
+///
+/// Reads JSON-encoded ClientMessage frames, responds with ServerMessage frames.
+/// Currently supports Ping → Pong. Future: payment tokens, session management.
+async fn handle_control_stream(
+    mut h2_send: h2::SendStream<Bytes>,
+    mut h2_recv: h2::RecvStream,
 ) -> io::Result<()> {
-    info!("opening tunnel to {target}");
+    info!("control channel opened");
 
-    // Connect to the external target
-    let tcp_stream = match TcpStream::connect(&target).await {
-        Ok(stream) => {
-            info!("connected to {target}");
-            stream
+    let mut buf = Vec::new();
+
+    loop {
+        match h2_recv.data().await {
+            Some(Ok(data)) => {
+                let len = data.len();
+                let _ = h2_recv.flow_control().release_capacity(len);
+
+                buf.extend_from_slice(&data);
+
+                // Process all complete newline-delimited JSON messages
+                while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=newline_pos).collect();
+                    let line = line.trim_ascii();
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    match serde_json::from_slice::<ClientMessage>(line) {
+                        Ok(msg) => {
+                            debug!("control recv: {msg:?}");
+                            let response = match msg {
+                                ClientMessage::Ping => ServerMessage::Pong,
+                            };
+
+                            let response_bytes = serde_json::to_vec(&response).map_err(|e| {
+                                io::Error::new(io::ErrorKind::Other, format!("json error: {e}"))
+                            })?;
+
+                            let mut frame = Vec::with_capacity(response_bytes.len() + 1);
+                            frame.extend_from_slice(&response_bytes);
+                            frame.push(b'\n');
+
+                            h2_send.reserve_capacity(frame.len());
+                            loop {
+                                if h2_send.capacity() > 0 {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+
+                            h2_send.send_data(Bytes::from(frame), false).map_err(|e| {
+                                io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}"))
+                            })?;
+
+                            debug!("control sent: {response:?}");
+                        }
+                        Err(e) => {
+                            warn!("control: invalid message: {e}");
+                            let err_msg = ServerMessage::Error {
+                                message: format!("invalid message: {e}"),
+                            };
+                            let err_bytes = serde_json::to_vec(&err_msg).unwrap();
+                            let mut frame = Vec::with_capacity(err_bytes.len() + 1);
+                            frame.extend_from_slice(&err_bytes);
+                            frame.push(b'\n');
+
+                            h2_send.reserve_capacity(frame.len());
+                            loop {
+                                if h2_send.capacity() > 0 {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+
+                            let _ = h2_send.send_data(Bytes::from(frame), false);
+                        }
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                debug!("control h2 recv error: {e}");
+                break;
+            }
+            None => {
+                debug!("control channel closed by client");
+                break;
+            }
         }
-        Err(e) => {
-            warn!("failed to connect to {target}: {e}");
-            let response = Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(())
-                .unwrap();
-            let _ = respond.send_response(response, true);
-            return Err(e);
-        }
-    };
+    }
 
-    // Send 200 OK to indicate the tunnel is established
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .body(())
-        .unwrap();
-    let h2_send = respond
-        .send_response(response, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 send response error: {e}")))?;
-
-    // Get the recv stream from the request body
-    let (_, h2_recv) = request.into_parts();
-
-    // Bidirectional proxy between H2 stream and external TCP
-    proxy::proxy_bidirectional(h2_send, h2_recv, tcp_stream).await
+    let _ = h2_send.send_data(Bytes::new(), true);
+    info!("control channel closed");
+    Ok(())
 }
