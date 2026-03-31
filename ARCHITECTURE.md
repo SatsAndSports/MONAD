@@ -266,49 +266,33 @@ MONAD currently provides:
 
 MONAD does not currently provide Tor-style shared relay-to-relay traffic mixing. Each client maintains its own hop chain, so this is closer to a layered multi-hop paid proxy than a full anonymity network.
 
-## Future: Shared Relay-to-Relay Links
+## Future: QUIC Transport Between Hops
 
-The current nesting model creates a dedicated relay-to-relay tunnel for each client chain.
+### Motivation
+
+The current nesting model creates a dedicated TCP connection between relays for each client chain.
 
 For example, if many clients route through the same pair of relays:
 
 ```text
-Client A -> Relay 1 -> Relay 2 -> ...
-Client B -> Relay 1 -> Relay 2 -> ...
-Client C -> Relay 1 -> Relay 2 -> ...
+Client A -> Relay S -> Relay T -> ...
+Client B -> Relay S -> Relay T -> ...
+Client C -> Relay S -> Relay T -> ...
 ```
 
-then today, Relay 1 opens a separate nested tunnel to Relay 2 for each client.
+then today, S opens a separate TCP connection to T for each client.
 
-A future design would allow Relay 1 and Relay 2 to maintain one long-lived shared QUIC connection between them and multiplex many client-carried nested sessions over QUIC streams.
-
-Conceptually:
+QUIC solves this by letting S maintain one long-lived QUIC connection to T and multiplex many client sessions as separate QUIC streams inside it:
 
 ```text
 many client sessions
         |
         v
-Relay 1 == one shared QUIC connection == Relay 2
+Relay S == one shared QUIC connection == Relay T
                  with many streams
 ```
 
-In this model:
-
-- one QUIC connection is kept open between a relay pair
-- many bidirectional QUIC streams are opened inside that connection
-- each stream carries one nested MONAD session or other relay-to-relay tunnel unit
-
-The client-carried inner MONAD sessions would still remain encrypted between the relevant hops. The shared relay-to-relay QUIC link would provide outer transport multiplexing and batching, not visibility into the nested payloads.
-
-Authentication and encryption for the shared inter-relay link would come from QUIC/TLS. Relays would use pinned self-signed certificates or pinned public keys rather than external certificate authorities. An initiator would verify that the relay presented the expected pinned identity before sending application data.
-
-This authentication is intentionally one-way: the server authenticates itself to the initiator, but the initiator does not authenticate itself at the QUIC layer. That keeps the shared-link model aligned with MONAD's current Noise `NK` approach, where the initiator knows the server identity in advance and the server proves possession of the corresponding private key.
-
-This means the same QUIC system can be used by an ordinary client or by another relay acting as the initiator. In both cases, the initiator only needs to know the true pinned identity of the MONAD server it is contacting. The server does not need to distinguish whether the initiator is a client or a relay in order to complete the QUIC handshake.
-
-If the opposite traffic direction ever needs its own initiator-driven shared link, that should be modeled as a separate independent QUIC connection in the reverse direction rather than by introducing mutual QUIC authentication or trying to make one connection serve two initiator roles. This keeps connection ownership, authentication rules, and future implementation state machines simpler.
-
-This QUIC identity is separate from the current MONAD Noise static key. The existing direct and nested MONAD transport can continue using `Noise_NK_25519_ChaChaPoly_BLAKE2s`, while the future shared relay link uses QUIC's native transport security.
+One QUIC handshake is amortized across many clients. Stream creation is lightweight (no new network round-trips), and QUIC's native multiplexing avoids head-of-line blocking between streams.
 
 Why this is interesting:
 - fewer per-client relay-to-relay connections
@@ -317,10 +301,138 @@ Why this is interesting:
 - small writes from multiple streams can be coalesced into encrypted QUIC packets
 - closer to the anonymity properties of a shared relay fabric
 
-Initial constraints for such a design would likely include:
+### Layering: QUIC Replaces TCP, Not Noise
+
+QUIC provides the encrypted transport between relays. It does **not** replace the Noise nesting that protects client-to-hop sessions.
+
+Consider a 2-hop route where client C connects through relay S to relay T:
+
+```text
+C ---- TCP + Noise(S) + H2 ----> S ---- QUIC stream ----> T
+                                              |
+                               C ---- Noise(T) + H2 ----> T
+                               (nested inside the QUIC stream)
+```
+
+The outer layers:
+- C connects to S via TCP, establishes a Noise session (authenticating S), runs H2
+- C sends `CONNECT quic:T_addr:port,<T_quic_pin>` to S over H2
+- S opens a QUIC stream to T (authenticating T with T's pinned QUIC key)
+- S proxies bytes between the H2 CONNECT stream and the QUIC stream
+
+The inner layer:
+- C runs a nested Noise+H2 session through the tunnel to T (authenticating T with T's Noise key)
+- S sees only opaque Noise-encrypted bytes flowing through — it cannot read the C-to-T traffic
+
+T authenticates itself twice:
+- to S via QUIC/TLS (pinned self-signed certificate)
+- to C via Noise NK (Noise static key)
+
+These are separate keys serving separate purposes. The QUIC key authenticates T to its transport peer (S). The Noise key authenticates T to the client (C) with end-to-hop encryption. Both are required.
+
+### QUIC Authentication Model
+
+Authentication for the QUIC layer uses pinned self-signed certificates, not external certificate authorities. The initiator (S) verifies that the target (T) presented a certificate matching the expected pinned public key before sending any data.
+
+This authentication is intentionally one-way: the target authenticates itself to the initiator, but the initiator does not authenticate itself at the QUIC layer. This aligns with MONAD's current Noise NK approach, where the initiator knows the server identity in advance and the server proves possession of the corresponding private key.
+
+The same QUIC system can be used by an ordinary client or by another relay acting as the initiator. In both cases, the initiator only needs to know the pinned QUIC identity of the MONAD server it is contacting. The server does not need to distinguish whether the initiator is a client or a relay in order to complete the QUIC handshake.
+
+If the opposite traffic direction ever needs its own initiator-driven link, that should be modeled as a separate independent QUIC connection in the reverse direction rather than by introducing mutual authentication. This keeps connection ownership, authentication rules, and future state machines simpler.
+
+### Server Dual Listener
+
+A MONAD server that supports QUIC listens on the same port number for both TCP and UDP:
+
+- **TCP** (existing): accepts connections, performs Noise handshake, runs H2
+- **UDP** (new): accepts QUIC connections, accepts bidirectional streams
+
+TCP and UDP can share a port because they are different IP protocols at the kernel level.
+
+On the receiving side, both transports feed into the same session handler. A QUIC bidirectional stream is wrapped as `AsyncRead + AsyncWrite` (a `QuicStream` type), and the server runs the same Noise handshake and H2 session on top of it as it does for TCP:
+
+```text
+TCP listener ──> accept() ──> TcpStream ──────────┐
+                                                   ├──> Noise handshake ──> H2 session
+QUIC listener ──> accept_bi() ──> QuicStream ──────┘
+```
+
+The session handler does not know or care which transport delivered the bytes. This means the entire existing Noise+H2 protocol works unchanged over QUIC streams.
+
+A QUIC-capable server has two separate keys configured at startup:
+- its Noise static key (for Noise NK handshakes, same as today)
+- its QUIC pinned key (a self-signed Ed25519 certificate for QUIC/TLS)
+
+### CONNECT Syntax for QUIC Hops
+
+The client signals to a relay that it should use QUIC to reach the next hop by using the `quic:` prefix in the CONNECT target:
+
+```text
+CONNECT quic:host:port,<quic_pin_hex>
+```
+
+For example:
+
+```text
+CONNECT quic:10.0.0.5:9050,302a300506032b6570032100abcd...
+```
+
+The relay parses this as:
+- strip the `quic:` prefix
+- split on the last `,` to separate the address from the pinned key
+- connect to `host:port` via QUIC, verifying the server's certificate against the pinned key
+- proxy bytes between the H2 CONNECT stream (from the client) and the QUIC stream (to the target)
+
+Without the `quic:` prefix, the relay connects via TCP as it does today. The client decides which transport to use for each hop based on its knowledge of the route.
+
+The pinned QUIC key is passed by the client in the CONNECT request itself. This means the relay does not need pre-configured knowledge of other relays' QUIC identities — it is stateless with respect to the relay topology.
+
+### QUIC Connection Pool
+
+A relay that handles `CONNECT quic:...` requests maintains a connection pool keyed by `(host, port)`.
+
+- The first `CONNECT quic:T:9050,...` to a given target establishes a new QUIC connection to T
+- Subsequent requests to the same target reuse the existing QUIC connection and open new streams
+- Each client session gets its own bidirectional QUIC stream inside the shared connection
+
+This is the core scaling benefit: one QUIC handshake to T is amortized across all clients whose routes pass through S to T.
+
+### Client `--hop` Syntax for QUIC Hops
+
+The current `--hop` syntax is:
+
+```text
+--hop addr:port,<noise_key>
+```
+
+For a QUIC-capable hop, the syntax will be:
+
+```text
+--hop quic:addr:port,<noise_key>,<quic_pin>
+```
+
+The `quic:` prefix tells the client to send `CONNECT quic:addr:port,<quic_pin>` to the previous relay. The Noise key is still required because the client runs its own nested Noise+H2 session to that hop.
+
+Example 2-hop route where the second hop uses QUIC:
+
+```bash
+monad-client \
+  --hop 10.0.0.1:9050,<S_noise_key> \
+  --hop quic:10.0.0.2:9050,<T_noise_key>,<T_quic_pin>
+```
+
+The client:
+1. Connects to S at `10.0.0.1:9050` via TCP+Noise (authenticating S)
+2. Sends `CONNECT quic:10.0.0.2:9050,<T_quic_pin>` to S over H2
+3. S connects to T via QUIC (authenticating T with the pinned key)
+4. Client runs a nested Noise+H2 session to T through the tunnel (authenticating T with T's Noise key)
+
+### Design Constraints
+
 - disable QUIC 0-RTT at first to avoid replay complexity
-- keep current direct and nested MONAD modes working unchanged
-- treat this as a relay-to-relay transport optimization, not a change to the inner MONAD session model
+- keep current direct and nested MONAD modes working unchanged over TCP
+- the inner MONAD Noise+H2 session model is unchanged — QUIC is a transport optimization only
+- a MONAD server's QUIC identity (self-signed Ed25519 certificate) is separate from its Noise static key
 
 ### QUIC Proof-of-Concept Status
 
@@ -351,12 +463,17 @@ These values are generous for testing. Production tuning will depend on expected
 
 ### What Remains
 
-The shared relay-to-relay QUIC transport is not integrated into the main MONAD system yet. The current system still uses per-client nested relay tunnels.
+The QUIC transport is validated as a standalone PoC (`monad-quic`) but is not integrated into the main MONAD system yet. The current system still uses per-client TCP connections between hops.
 
-Next steps toward integration would include:
-- a `QuicStream` type in `monad-common` wrapping a QUIC bidirectional stream as `AsyncRead + AsyncWrite`
-- a connection pool in the relay that maintains shared QUIC connections to peer relays
-- routing logic to multiplex client sessions onto shared QUIC streams instead of opening per-client nested tunnels
+Integration steps:
+
+1. **`QuicStream` type in `monad-common`** — wrap a quinn bidirectional stream as `AsyncRead + AsyncWrite` so it can be used interchangeably with `TcpStream`
+2. **QUIC listener in `monad-server`** — bind a UDP socket on the same port as the TCP listener, accept QUIC connections, feed incoming streams into the existing Noise+H2 session handler
+3. **QUIC keygen in `monad-server`** — generate and load a QUIC self-signed certificate alongside the existing Noise keypair
+4. **`CONNECT quic:` parsing in `monad-server`** — detect the `quic:` prefix, extract the pinned key, connect via QUIC instead of TCP
+5. **QUIC connection pool in `monad-server`** — maintain shared QUIC connections keyed by `(host, port)`, reuse across client sessions
+6. **`--hop quic:` parsing in `monad-client`** — parse the `quic:` prefix and QUIC pinned key from the hop spec, emit `CONNECT quic:...` to the previous relay
+7. **Integration tests** — extend the existing test suite to cover QUIC hops alongside TCP hops in nested routes
 
 ## Current Limitations
 

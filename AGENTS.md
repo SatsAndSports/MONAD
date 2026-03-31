@@ -50,6 +50,16 @@ cargo run -p monad-quic -- ...
 - Data stream: `CONNECT host:port`
 - Nesting: another full Noise+H2 session can run on top of an H2 CONNECT tunnel via `H2ConnectStream`
 
+### Planned QUIC Transport (not yet integrated)
+
+- Relay-to-relay transport: QUIC (replaces TCP between hops, does not replace Noise)
+- QUIC authentication: pinned self-signed Ed25519 certificates (one-way, no CA)
+- QUIC hop signaling: `CONNECT quic:host:port,<quic_pin_hex>`
+- Client hop syntax: `--hop quic:addr:port,<noise_key>,<quic_pin>`
+- Noise nesting is preserved — the inner Noise+H2 session runs unchanged inside the QUIC stream
+- Server listens on the same port for both TCP and UDP (QUIC)
+- QUIC connection pool: shared connections reused across client sessions, keyed by `(host, port)`
+
 ## Important Invariants
 
 ### 1. Keep direct and nested modes working

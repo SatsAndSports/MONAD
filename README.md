@@ -115,6 +115,17 @@ RUST_LOG=info cargo run -p monad-client -- \
 
 The client listens locally as a SOCKS5 proxy on `127.0.0.1:1080` by default.
 
+QUIC hops (not yet implemented — see `ARCHITECTURE.md`):
+
+```bash
+RUST_LOG=info cargo run -p monad-client -- \
+  --hop 127.0.0.1:9051,<HOP1_NOISE_PUB> \
+  --hop quic:127.0.0.1:9052,<HOP2_NOISE_PUB>,<HOP2_QUIC_PIN> \
+  --socks 127.0.0.1:1080
+```
+
+The `quic:` prefix tells the client to instruct the previous hop to connect via QUIC instead of TCP. The Noise key authenticates the hop to the client; the QUIC pinned key authenticates the hop to the relay that connects to it. See `ARCHITECTURE.md` for the full layering model.
+
 ## Example Usage
 
 ### HTTP through the SOCKS proxy
