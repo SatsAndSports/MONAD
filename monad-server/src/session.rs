@@ -2,10 +2,11 @@
 //!
 //! After the Noise handshake, the server runs an H2 server on the encrypted stream.
 //! It accepts H2 streams and routes them:
-//!   - CONNECT requests → open TCP to target, bidirectional proxy
+//!   - CONNECT requests → open TCP (or QUIC) connection to target, bidirectional proxy
 //!   - POST /control → control channel (Ping/Pong, future: payments)
 
 use crate::proxy;
+use crate::quic_pool::QuicPool;
 use bytes::Bytes;
 use h2::server;
 use http::{Method, Response, StatusCode};
@@ -13,11 +14,31 @@ use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise::NoiseStream;
 use monad_common::protocol::{ClientMessage, ServerMessage};
 use std::io;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
+/// Custom header name for QUIC pinned public key in CONNECT requests.
+///
+/// When present on a CONNECT request, the server connects to the target
+/// via QUIC instead of TCP, authenticating the target with this pinned key.
+pub const QUIC_PIN_HEADER: &str = "quic-pin";
+
 /// Handle a single client session: run the H2 server and process streams.
-pub async fn handle_session(noise_stream: NoiseStream<TcpStream>) -> io::Result<()> {
+///
+/// The transport `T` can be any `AsyncRead + AsyncWrite` type (e.g., `TcpStream`
+/// or a QUIC bidirectional stream). The Noise+H2 session runs identically
+/// regardless of the underlying transport.
+///
+/// If `quic_pool` is provided, the server can forward CONNECT requests with
+/// a `quic-pin` header over shared QUIC connections instead of TCP.
+pub async fn handle_session<T>(
+    noise_stream: NoiseStream<T>,
+    quic_pool: Option<QuicPool>,
+) -> io::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut h2_conn = server::handshake(noise_stream)
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake error: {e}")))?;
@@ -53,52 +74,127 @@ pub async fn handle_session(noise_stream: NoiseStream<TcpStream>) -> io::Result<
                             continue;
                         }
 
-                        info!("CONNECT {authority}");
+                        // Check for quic-pin header → QUIC transport
+                        let quic_pin_header = request
+                            .headers()
+                            .get(QUIC_PIN_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
 
-                        // Connect to the external target BEFORE spawning the proxy.
-                        // This ensures the 200 OK response is sent from this task,
-                        // which is the same task driving the H2 connection.
-                        match TcpStream::connect(&authority).await {
-                            Ok(tcp_stream) => {
-                                info!("connected to {authority}");
+                        if let Some(pin_hex) = quic_pin_header {
+                            info!("CONNECT {authority} (via QUIC)");
 
-                                // Send 200 OK
-                                let resp = Response::builder()
-                                    .status(StatusCode::OK)
-                                    .body(())
-                                    .unwrap();
-                                match respond.send_response(resp, false) {
-                                    Ok(h2_send) => {
-                                        let (_, h2_recv) = request.into_parts();
+                            let pinned_spki = match hex::decode(&pin_hex) {
+                                Ok(b) if !b.is_empty() => b,
+                                Ok(_) => {
+                                    warn!("empty quic-pin header");
+                                    let resp = Response::builder()
+                                        .status(StatusCode::BAD_REQUEST)
+                                        .body(())
+                                        .unwrap();
+                                    let _ = respond.send_response(resp, true);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!("invalid hex in quic-pin header: {e}");
+                                    let resp = Response::builder()
+                                        .status(StatusCode::BAD_REQUEST)
+                                        .body(())
+                                        .unwrap();
+                                    let _ = respond.send_response(resp, true);
+                                    continue;
+                                }
+                            };
 
-                                        // Now spawn the bidirectional proxy
-                                        tokio::spawn(async move {
-                                            if let Err(e) = proxy::proxy_bidirectional(
-                                                h2_send, h2_recv, tcp_stream, &authority,
-                                            )
-                                            .await
-                                            {
-                                                error!("tunnel to {authority} error: {e}");
-                                            }
-                                        });
-                                    }
-                                    Err(e) => {
-                                        error!("h2 send response error: {e}");
+                            let pool = match &quic_pool {
+                                Some(p) => p.clone(),
+                                None => {
+                                    warn!("CONNECT with quic-pin but QUIC pool is not available");
+                                    let resp = Response::builder()
+                                        .status(StatusCode::BAD_GATEWAY)
+                                        .body(())
+                                        .unwrap();
+                                    let _ = respond.send_response(resp, true);
+                                    continue;
+                                }
+                            };
+
+                            match pool.open_stream(&authority, pinned_spki).await {
+                                Ok(quic_stream) => {
+                                    info!("QUIC stream opened to {authority}");
+                                    let resp = Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(())
+                                        .unwrap();
+                                    match respond.send_response(resp, false) {
+                                        Ok(h2_send) => {
+                                            let (_, h2_recv) = request.into_parts();
+                                            let label = format!("quic:{authority}");
+                                            tokio::spawn(async move {
+                                                if let Err(e) = proxy::proxy_bidirectional(
+                                                    h2_send, h2_recv, quic_stream, &label,
+                                                )
+                                                .await
+                                                {
+                                                    error!("tunnel to quic:{authority} error: {e}");
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            error!("h2 send response error: {e}");
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    warn!("failed to connect via QUIC to {authority}: {e}");
+                                    let resp = Response::builder()
+                                        .status(StatusCode::BAD_GATEWAY)
+                                        .body(())
+                                        .unwrap();
+                                    let _ = respond.send_response(resp, true);
+                                }
                             }
-                            Err(e) => {
-                                warn!("failed to connect to {authority}: {e}");
-                                let resp = Response::builder()
-                                    .status(StatusCode::BAD_GATEWAY)
-                                    .body(())
-                                    .unwrap();
-                                let _ = respond.send_response(resp, true);
+                        } else {
+                            // Plain TCP CONNECT
+                            info!("CONNECT {authority}");
+
+                            match TcpStream::connect(&authority).await {
+                                Ok(tcp_stream) => {
+                                    info!("connected to {authority}");
+                                    let resp = Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(())
+                                        .unwrap();
+                                    match respond.send_response(resp, false) {
+                                        Ok(h2_send) => {
+                                            let (_, h2_recv) = request.into_parts();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = proxy::proxy_bidirectional(
+                                                    h2_send, h2_recv, tcp_stream, &authority,
+                                                )
+                                                .await
+                                                {
+                                                    error!("tunnel to {authority} error: {e}");
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            error!("h2 send response error: {e}");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("failed to connect to {authority}: {e}");
+                                    let resp = Response::builder()
+                                        .status(StatusCode::BAD_GATEWAY)
+                                        .body(())
+                                        .unwrap();
+                                    let _ = respond.send_response(resp, true);
+                                }
                             }
                         }
                     }
                     (&Method::POST, "/control") => {
-                        // Send 200 OK from this task (same as CONNECT above)
                         let resp = Response::builder()
                             .status(StatusCode::OK)
                             .body(())
@@ -106,8 +202,6 @@ pub async fn handle_session(noise_stream: NoiseStream<TcpStream>) -> io::Result<
                         match respond.send_response(resp, false) {
                             Ok(h2_send) => {
                                 let (_, h2_recv) = request.into_parts();
-
-                                // Spawn control channel handler
                                 tokio::spawn(async move {
                                     if let Err(e) =
                                         handle_control_stream(h2_send, h2_recv).await

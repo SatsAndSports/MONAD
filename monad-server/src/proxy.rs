@@ -1,8 +1,8 @@
-//! Bidirectional proxy between an H2 stream and an external TCP connection.
+//! Bidirectional proxy between an H2 stream and an external connection.
 //!
-//! When the server receives a CONNECT request, it opens a TCP connection to the
-//! target and then copies bytes bidirectionally between the H2 stream and the
-//! external socket.
+//! When the server receives a CONNECT request, it opens a connection to the
+//! target (TCP or QUIC stream) and then copies bytes bidirectionally between
+//! the H2 stream and the external transport.
 
 use bytes::Bytes;
 use h2::RecvStream;
@@ -11,24 +11,29 @@ use monad_common::h2stream::wait_for_send_capacity;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info};
 
 /// Proxy bytes bidirectionally between an H2 send/recv stream pair and an
-/// external TCP connection.
+/// external connection.
+///
+/// The target can be any type that implements `AsyncRead + AsyncWrite` (e.g.,
+/// a `TcpStream` or a QUIC bidirectional stream).
 ///
 /// `label` identifies this tunnel for logging (typically the CONNECT authority,
 /// e.g., "example.com:443").
 ///
 /// On completion, logs the total proxied bytes in each direction.
-pub async fn proxy_bidirectional(
+pub async fn proxy_bidirectional<T>(
     mut h2_send: SendStream<Bytes>,
     mut h2_recv: RecvStream,
-    target: TcpStream,
+    target: T,
     label: &str,
-) -> io::Result<()> {
-    let (mut tcp_read, mut tcp_write) = target.into_split();
+) -> io::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let (mut tcp_read, mut tcp_write) = tokio::io::split(target);
 
     // Byte counters shared between the two directions
     let bytes_to_target = Arc::new(AtomicU64::new(0));

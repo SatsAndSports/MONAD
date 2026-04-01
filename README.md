@@ -16,12 +16,12 @@ Implemented today:
 - `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels
 - `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels
 - `monad-common`: shared Noise transport and H2 stream helpers
-- `monad-quic`: standalone QUIC proof-of-concept for future shared relay-to-relay transport (pinned-key auth, echo server/client, tested with 1,000 concurrent streams)
-- integration tests for direct, nested, IPv6, hostname-resolution, and QUIC scenarios
+- `monad-quic`: QUIC transport support — `QuicStream` wrapper, pinned-key auth, echo server/client, shared building blocks used by server and client
+- QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, `quic-pin` H2 header for CONNECT forwarding
+- integration tests for direct, nested, IPv6, hostname-resolution, QUIC single-hop, QUIC nested tunnels, and mixed TCP/QUIC hop chains
 
 Not implemented yet:
 - payments / accounting on the control channel beyond basic Ping/Pong scaffolding
-- shared inter-relay QUIC multiplexing (standalone PoC exists in `monad-quic` but is not integrated into the main transport)
 
 ## Workspace
 
@@ -62,6 +62,10 @@ Current coverage includes:
 - 1,000 concurrent QUIC streams over one connection
 - large (4MB) single QUIC stream payload
 - multiple independent QUIC connections
+- QUIC single-hop (Noise+H2 over QUIC stream)
+- QUIC control + data channels
+- nested QUIC tunnel (TCP relay forwarding to QUIC relay)
+- client connector with QUIC hop (end-to-end `--hop quic:` path)
 
 ## Quick Start
 
@@ -115,7 +119,7 @@ RUST_LOG=info cargo run -p monad-client -- \
 
 The client listens locally as a SOCKS5 proxy on `127.0.0.1:1080` by default.
 
-QUIC hops (not yet implemented — see `ARCHITECTURE.md`):
+QUIC hops (previous relay connects to next hop via QUIC instead of TCP):
 
 ```bash
 RUST_LOG=info cargo run -p monad-client -- \

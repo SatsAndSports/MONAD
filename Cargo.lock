@@ -806,6 +806,8 @@ dependencies = [
  "http",
  "monad-client",
  "monad-common",
+ "monad-quic",
+ "quinn",
  "serde_json",
  "tokio",
  "tracing",

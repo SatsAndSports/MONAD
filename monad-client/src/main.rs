@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 #[derive(Parser)]
 #[command(name = "monad-client", about = "MONAD tunnel client")]
 struct Cli {
-    /// Server hop(s) in order: addr,pubkey_hex
+    /// Server hop(s) in order: addr,pubkey_hex or quic:addr,pubkey_hex,quic_pin_hex
     ///
     /// For a direct connection, specify one hop (the server).
     /// For onion routing, specify multiple hops in order.
@@ -22,6 +22,9 @@ struct Cli {
     ///
     /// Example (nested, through T then S):
     ///   --hop T_addr:9050,<T_pubkey> --hop S_addr:9050,<S_pubkey>
+    ///
+    /// Example (QUIC hop — previous relay connects via QUIC):
+    ///   --hop T_addr:9050,<T_pubkey> --hop quic:S_addr:9050,<S_pubkey>,<S_quic_pin>
     #[arg(long, required = true)]
     hop: Vec<String>,
 
@@ -31,22 +34,56 @@ struct Cli {
 }
 
 fn parse_hop(s: &str) -> anyhow::Result<Hop> {
-    let (addr, pubkey_hex) = s
-        .rsplit_once(',')
-        .ok_or_else(|| anyhow::anyhow!("hop must be addr:port,pubkey_hex — got: {s}"))?;
+    // Check for quic: prefix
+    if let Some(rest) = s.strip_prefix("quic:") {
+        // Format: quic:addr:port,noise_pubkey_hex,quic_pin_hex
+        // Split from the right: last comma separates quic_pin, second-to-last separates noise key
+        let (addr_and_noise, quic_pin_hex) = rest
+            .rsplit_once(',')
+            .ok_or_else(|| anyhow::anyhow!("QUIC hop must be quic:addr:port,pubkey_hex,quic_pin_hex — got: {s}"))?;
 
-    let pubkey = hex::decode(pubkey_hex)?;
-    if pubkey.len() != 32 {
-        anyhow::bail!(
-            "public key must be 32 bytes (64 hex chars), got {} bytes for hop {addr}",
-            pubkey.len()
-        );
+        let (addr, noise_hex) = addr_and_noise
+            .rsplit_once(',')
+            .ok_or_else(|| anyhow::anyhow!("QUIC hop must be quic:addr:port,pubkey_hex,quic_pin_hex — got: {s}"))?;
+
+        let pubkey = hex::decode(noise_hex)?;
+        if pubkey.len() != 32 {
+            anyhow::bail!(
+                "Noise public key must be 32 bytes (64 hex chars), got {} bytes for hop {addr}",
+                pubkey.len()
+            );
+        }
+
+        let quic_pin = hex::decode(quic_pin_hex)?;
+        if quic_pin.is_empty() {
+            anyhow::bail!("QUIC pin must not be empty for hop {addr}");
+        }
+
+        Ok(Hop {
+            addr: addr.to_string(),
+            pubkey,
+            quic_pin: Some(quic_pin),
+        })
+    } else {
+        // Standard TCP hop: addr:port,noise_pubkey_hex
+        let (addr, pubkey_hex) = s
+            .rsplit_once(',')
+            .ok_or_else(|| anyhow::anyhow!("hop must be addr:port,pubkey_hex — got: {s}"))?;
+
+        let pubkey = hex::decode(pubkey_hex)?;
+        if pubkey.len() != 32 {
+            anyhow::bail!(
+                "public key must be 32 bytes (64 hex chars), got {} bytes for hop {addr}",
+                pubkey.len()
+            );
+        }
+
+        Ok(Hop {
+            addr: addr.to_string(),
+            pubkey,
+            quic_pin: None,
+        })
     }
-
-    Ok(Hop {
-        addr: addr.to_string(),
-        pubkey,
-    })
 }
 
 #[tokio::main]

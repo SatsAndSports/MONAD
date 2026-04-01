@@ -365,33 +365,33 @@ A QUIC-capable server has two separate keys configured at startup:
 
 ### CONNECT Syntax for QUIC Hops
 
-The client signals to a relay that it should use QUIC to reach the next hop by using the `quic:` prefix in the CONNECT target:
+The client signals to a relay that it should use QUIC to reach the next hop by including a `quic-pin` header in the H2 CONNECT request. The URI authority remains a standard `host:port`:
 
 ```text
-CONNECT quic:host:port,<quic_pin_hex>
+CONNECT host:port HTTP/2
+quic-pin: <quic_pin_hex>
 ```
 
 For example:
 
 ```text
-CONNECT quic:10.0.0.5:9050,302a300506032b6570032100abcd...
+CONNECT 10.0.0.5:9050 HTTP/2
+quic-pin: 302a300506032b6570032100abcd...
 ```
 
-The relay parses this as:
-- strip the `quic:` prefix
-- split on the last `,` to separate the address from the pinned key
-- connect to `host:port` via QUIC, verifying the server's certificate against the pinned key
-- proxy bytes between the H2 CONNECT stream (from the client) and the QUIC stream (to the target)
+The relay checks for the `quic-pin` header:
+- if present, connect to `host:port` via QUIC, verifying the server's certificate against the pinned key
+- if absent, connect via TCP as before
 
-Without the `quic:` prefix, the relay connects via TCP as it does today. The client decides which transport to use for each hop based on its knowledge of the route.
+The pinned key is carried as an H2 header because the CONNECT authority must be a valid HTTP authority (`host:port`). The `quic-pin` header is part of the H2 HEADERS frame that initiates the stream — it is sent once at stream creation and does not interfere with the DATA frames that carry tunneled bytes afterward.
 
-The pinned QUIC key is passed by the client in the CONNECT request itself. This means the relay does not need pre-configured knowledge of other relays' QUIC identities — it is stateless with respect to the relay topology.
+This means the relay does not need pre-configured knowledge of other relays' QUIC identities — the client passes the pinned key in each CONNECT request, keeping the relay stateless with respect to the relay topology.
 
 ### QUIC Connection Pool
 
-A relay that handles `CONNECT quic:...` requests maintains a connection pool keyed by `(host, port)`.
+A relay that handles CONNECT requests with a `quic-pin` header maintains a connection pool keyed by `(host, port)`.
 
-- The first `CONNECT quic:T:9050,...` to a given target establishes a new QUIC connection to T
+- The first CONNECT with a `quic-pin` to a given target establishes a new QUIC connection to T
 - Subsequent requests to the same target reuse the existing QUIC connection and open new streams
 - Each client session gets its own bidirectional QUIC stream inside the shared connection
 
@@ -411,7 +411,7 @@ For a QUIC-capable hop, the syntax will be:
 --hop quic:addr:port,<noise_key>,<quic_pin>
 ```
 
-The `quic:` prefix tells the client to send `CONNECT quic:addr:port,<quic_pin>` to the previous relay. The Noise key is still required because the client runs its own nested Noise+H2 session to that hop.
+The `quic:` prefix tells the client to include a `quic-pin` header in the CONNECT request to the previous relay. The Noise key is still required because the client runs its own nested Noise+H2 session to that hop.
 
 Example 2-hop route where the second hop uses QUIC:
 
@@ -423,7 +423,7 @@ monad-client \
 
 The client:
 1. Connects to S at `10.0.0.1:9050` via TCP+Noise (authenticating S)
-2. Sends `CONNECT quic:10.0.0.2:9050,<T_quic_pin>` to S over H2
+2. Sends `CONNECT 10.0.0.2:9050` with header `quic-pin: <T_quic_pin>` to S over H2
 3. S connects to T via QUIC (authenticating T with the pinned key)
 4. Client runs a nested Noise+H2 session to T through the tunnel (authenticating T with T's Noise key)
 
@@ -434,9 +434,9 @@ The client:
 - the inner MONAD Noise+H2 session model is unchanged — QUIC is a transport optimization only
 - a MONAD server's QUIC identity (self-signed Ed25519 certificate) is separate from its Noise static key
 
-### QUIC Proof-of-Concept Status
+### QUIC Implementation Status
 
-The `monad-quic` crate implements a standalone QUIC echo server and client to validate the core building blocks described above. It is not integrated into the main MONAD transport yet.
+The QUIC transport is fully integrated into the main MONAD system. The `monad-quic` crate provides shared building blocks (`QuicStream`, `build_server_config`, `build_client_config`, keygen), and the server and client use them for QUIC hop support.
 
 What has been validated:
 
@@ -461,23 +461,21 @@ This is specific to the echo test pattern (sequential write-all then read-all on
 
 These values are generous for testing. Production tuning will depend on expected relay traffic patterns.
 
-### What Remains
+### What Has Been Integrated
 
-The QUIC transport is validated as a standalone PoC (`monad-quic`) but is not integrated into the main MONAD system yet. The current system still uses per-client TCP connections between hops.
+The full QUIC transport chain is implemented and tested:
 
-Integration steps:
-
-1. **`QuicStream` type in `monad-common`** — wrap a quinn bidirectional stream as `AsyncRead + AsyncWrite` so it can be used interchangeably with `TcpStream`
-2. **QUIC listener in `monad-server`** — bind a UDP socket on the same port as the TCP listener, accept QUIC connections, feed incoming streams into the existing Noise+H2 session handler
-3. **QUIC keygen in `monad-server`** — generate and load a QUIC self-signed certificate alongside the existing Noise keypair
-4. **`CONNECT quic:` parsing in `monad-server`** — detect the `quic:` prefix, extract the pinned key, connect via QUIC instead of TCP
-5. **QUIC connection pool in `monad-server`** — maintain shared QUIC connections keyed by `(host, port)`, reuse across client sessions
-6. **`--hop quic:` parsing in `monad-client`** — parse the `quic:` prefix and QUIC pinned key from the hop spec, emit `CONNECT quic:...` to the previous relay
-7. **Integration tests** — extend the existing test suite to cover QUIC hops alongside TCP hops in nested routes
+1. **`QuicStream` type in `monad-quic`** — wraps a quinn bidirectional stream as `AsyncRead + AsyncWrite`, used interchangeably with `TcpStream`
+2. **QUIC listener in `monad-server`** — binds a UDP socket on the same port as the TCP listener, accepts QUIC connections, feeds incoming streams into the existing Noise+H2 session handler
+3. **QUIC keygen in `monad-server`** — `monad-server keygen` generates both a Noise keypair and a QUIC self-signed certificate; `--quic-cert` and `--quic-key` CLI args load them at startup
+4. **`quic-pin` header parsing in `monad-server`** — detects the `quic-pin` header on CONNECT requests, extracts the pinned key, connects via QUIC instead of TCP
+5. **QUIC connection pool in `monad-server`** — maintains shared QUIC connections keyed by `(host, port)`, reuses across client sessions
+6. **`--hop quic:` parsing in `monad-client`** — parses the `quic:` prefix and QUIC pinned key from the hop spec, emits a CONNECT request with `quic-pin` header to the previous relay
+7. **Integration tests** — cover QUIC single-hop, QUIC with control+data channels, nested QUIC tunnels (manual and via connector), alongside all existing TCP tests
 
 ## Current Limitations
 
 - payment protocol is not implemented beyond control-channel scaffolding
-- relay-to-relay shared QUIC multiplexing exists as a standalone PoC (`monad-quic`) but is not integrated into the main transport
 - no persistent route configuration file yet
 - no per-user/session accounting on the control channel yet
+- QUIC connection pool does not yet handle connection eviction or stale entry cleanup

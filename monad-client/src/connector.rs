@@ -18,17 +18,25 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 /// A hop in the tunnel chain: server address and its Noise public key.
+///
+/// If `quic_pin` is set, the previous relay in the chain will connect to this
+/// hop via QUIC instead of TCP, using the pinned public key to authenticate it.
 #[derive(Debug, Clone)]
 pub struct Hop {
     pub addr: String,
     pub pubkey: Vec<u8>,
+    /// Optional QUIC pinned public key (SPKI DER, hex-decoded).
+    /// When set, the CONNECT request to this hop includes a `quic-pin` header
+    /// so the preceding relay uses QUIC transport.
+    pub quic_pin: Option<Vec<u8>>,
 }
 
 /// An established connection to a MONAD server, ready to open H2 streams.
 pub struct ServerConnection {
     /// The H2 client send handle — use this to open new streams (CONNECT, etc.)
     pub h2_client: Arc<tokio::sync::Mutex<client::SendRequest<Bytes>>>,
-    driver_handles: Vec<JoinHandle<()>>,
+    /// Background tasks driving the H2 connection(s) in the hop chain.
+    pub driver_handles: Vec<JoinHandle<()>>,
 }
 
 impl ServerConnection {
@@ -53,6 +61,7 @@ pub async fn connect(server_addr: &str, server_pubkey: &[u8]) -> io::Result<Serv
     connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
         pubkey: server_pubkey.to_vec(),
+        quic_pin: None,
     }])
     .await
 }
@@ -143,7 +152,8 @@ where
             next.addr
         );
 
-        let h2_connect_stream = open_h2_connect(h2_client, &next.addr).await?;
+        let h2_connect_stream =
+            open_h2_connect(h2_client, &next.addr, next.quic_pin.as_deref()).await?;
 
         // Recurse: perform Noise + H2 over this tunnel for the next hop
         let mut conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;
@@ -162,17 +172,27 @@ where
 
 /// Open an H2 CONNECT tunnel to the given target authority, returning
 /// an `H2ConnectStream` that implements `AsyncRead + AsyncWrite`.
+///
+/// If `quic_pin` is provided, a `quic-pin` header is added to the CONNECT
+/// request, telling the relay to use QUIC transport to reach the target.
 async fn open_h2_connect(
     mut h2_client: client::SendRequest<Bytes>,
     target_authority: &str,
+    quic_pin: Option<&[u8]>,
 ) -> io::Result<H2ConnectStream> {
     let uri: Uri = target_authority
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad URI: {e}")))?;
 
-    let request = Request::builder()
+    let mut builder = Request::builder()
         .method(Method::CONNECT)
-        .uri(uri)
+        .uri(uri);
+
+    if let Some(pin) = quic_pin {
+        builder = builder.header("quic-pin", hex::encode(pin));
+    }
+
+    let request = builder
         .body(())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad request: {e}")))?;
 

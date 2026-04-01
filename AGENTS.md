@@ -50,11 +50,11 @@ cargo run -p monad-quic -- ...
 - Data stream: `CONNECT host:port`
 - Nesting: another full Noise+H2 session can run on top of an H2 CONNECT tunnel via `H2ConnectStream`
 
-### Planned QUIC Transport (not yet integrated)
+### QUIC Transport
 
 - Relay-to-relay transport: QUIC (replaces TCP between hops, does not replace Noise)
 - QUIC authentication: pinned self-signed Ed25519 certificates (one-way, no CA)
-- QUIC hop signaling: `CONNECT quic:host:port,<quic_pin_hex>`
+- QUIC hop signaling: `CONNECT host:port` with `quic-pin: <hex>` H2 header
 - Client hop syntax: `--hop quic:addr:port,<noise_key>,<quic_pin>`
 - Noise nesting is preserved — the inner Noise+H2 session runs unchanged inside the QUIC stream
 - Server listens on the same port for both TCP and UDP (QUIC)
@@ -153,6 +153,10 @@ The test suite currently covers:
 - 1,000 concurrent QUIC streams over one connection
 - large single QUIC stream payload (4MB)
 - multiple independent QUIC connections
+- QUIC single-hop (Noise+H2 over QUIC stream)
+- QUIC control + data channels over QUIC transport
+- nested QUIC tunnel (TCP relay forwarding via QUIC to next relay)
+- client connector with QUIC hop (`--hop quic:` end-to-end path)
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
 
