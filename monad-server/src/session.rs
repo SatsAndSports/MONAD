@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 /// Custom header name for QUIC pinned public key in CONNECT requests.
 pub const QUIC_PIN_HEADER: &str = "quic-pin";
 
+const SERVER_MIN_VERSION: u8 = 0;
 const SERVER_MAX_VERSION: u8 = 0;
 const DEFAULT_IN_BYTES_PER_MILLISAT: u64 = 1;
 const DEFAULT_OUT_BYTES_PER_MILLISAT: u64 = 1;
@@ -31,6 +32,7 @@ const DEFAULT_OUT_BYTES_PER_MILLISAT: u64 = 1;
 struct SessionSnapshot {
     session_total_in: u64,
     session_total_out: u64,
+    total_paid_millisats: u64,
     remaining_milli_sats: i64,
     paused: bool,
 }
@@ -40,6 +42,7 @@ impl SessionSnapshot {
         ServerMessage::SessionStatus {
             session_total_in: self.session_total_in,
             session_total_out: self.session_total_out,
+            total_paid_millisats: self.total_paid_millisats,
             remaining_milli_sats: self.remaining_milli_sats,
             paused: self.paused,
         }
@@ -103,6 +106,7 @@ impl SessionState {
         SessionSnapshot {
             session_total_in: inner.session_total_in,
             session_total_out: inner.session_total_out,
+            total_paid_millisats: inner.total_paid_millisats,
             remaining_milli_sats: clamp_i128_to_i64(Self::remaining_milli_sats(inner)),
             paused: inner.paused,
         }
@@ -543,6 +547,22 @@ async fn handle_control_stream(
     };
 
     let negotiated_version = client_version.min(SERVER_MAX_VERSION);
+    if negotiated_version < SERVER_MIN_VERSION {
+        warn!(
+            "control: client version {} below server minimum {}",
+            client_version, SERVER_MIN_VERSION
+        );
+        let err_msg = ServerMessage::Error {
+            message: format!(
+                "unsupported version: client offered {}, server requires at least {}",
+                client_version, SERVER_MIN_VERSION
+            ),
+        };
+        send_control_message(&mut h2_send, &err_msg).await?;
+        state.detach_control().await;
+        let _ = h2_send.send_data(Bytes::new(), true);
+        return Ok(());
+    }
     let params = state.session_params(negotiated_version).await;
     send_control_message(&mut h2_send, &params).await?;
     send_control_message(&mut h2_send, &initial_snapshot.to_message()).await?;
@@ -579,9 +599,6 @@ async fn handle_control_stream(
                                         message: "Hello already received".to_string(),
                                     };
                                     send_control_message(&mut h2_send, &err_msg).await?;
-                                }
-                                Ok(ClientMessage::Ping) => {
-                                    send_control_message(&mut h2_send, &ServerMessage::Pong).await?;
                                 }
                                 Ok(ClientMessage::GetSessionStatus) => {
                                     let snapshot = state.snapshot().await;

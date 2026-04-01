@@ -11,14 +11,9 @@ use serde::{Deserialize, Serialize};
 pub enum ClientMessage {
     /// First message on the control stream. Declares the highest
     /// protocol version the client supports.
-    Hello {
-        version: u8,
-    },
-    Ping,
+    Hello { version: u8 },
     /// Add fake credit to the current relay session.
-    FakePayment {
-        milli_sats: u64,
-    },
+    FakePayment { milli_sats: u64 },
     /// Request a fresh session status snapshot.
     GetSessionStatus,
 }
@@ -27,9 +22,6 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
-    /// Acknowledgement
-    Pong,
-
     /// Fixed pricing and other session parameters for this relay session.
     /// Sent in response to `ClientMessage::Hello`.
     SessionParams {
@@ -42,6 +34,7 @@ pub enum ServerMessage {
     SessionStatus {
         session_total_in: u64,
         session_total_out: u64,
+        total_paid_millisats: u64,
         remaining_milli_sats: i64,
         paused: bool,
     },

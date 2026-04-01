@@ -8,7 +8,7 @@
 //! Validates:
 //!   - Noise NK handshake and encrypted transport
 //!   - H2 multiplexing: control + data streams coexisting
-//!   - Control channel: Ping → Pong round-trip
+//!   - Control channel: Hello/SessionParams version negotiation, fake payment
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
 use bytes::Bytes;
@@ -219,14 +219,15 @@ async fn read_control_message(h2_recv: &mut h2::RecvStream) -> ServerMessage {
     }
 }
 
-fn expect_session_status(message: ServerMessage) -> (u64, u64, i64, bool) {
+fn expect_session_status(message: ServerMessage) -> (u64, u64, u64, i64, bool) {
     match message {
         ServerMessage::SessionStatus {
             session_total_in,
             session_total_out,
+            total_paid_millisats,
             remaining_milli_sats,
             paused,
-        } => (session_total_in, session_total_out, remaining_milli_sats, paused),
+        } => (session_total_in, session_total_out, total_paid_millisats, remaining_milli_sats, paused),
         other => panic!("expected SessionStatus, got {other:?}"),
     }
 }
@@ -247,7 +248,7 @@ fn expect_session_params(message: ServerMessage) -> (u8, u64, u64) {
 async fn control_handshake(
     h2_send: &mut h2::SendStream<Bytes>,
     h2_recv: &mut h2::RecvStream,
-) -> (u64, u64, i64, bool) {
+) -> (u64, u64, u64, i64, bool) {
     send_control_message(h2_send, &ClientMessage::Hello { version: 0 }, false).await;
 
     let (version, in_bytes_per_millisat, out_bytes_per_millisat) =
@@ -262,7 +263,7 @@ async fn control_handshake(
 async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
     let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
 
-    let (_in0, _out0, rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
+    let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
@@ -333,40 +334,6 @@ async fn tunnel_roundtrip(
     result
 }
 
-/// Send a Ping on the control channel and assert we get a Pong back.
-async fn control_ping_pong(h2_client: &mut client::SendRequest<Bytes>) {
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("http://paidtor/control")
-        .body(())
-        .unwrap();
-
-    let (response_future, mut h2_send) = h2_client.send_request(request, false).unwrap();
-
-    let response = response_future.await.unwrap();
-    assert!(
-        response.status().is_success(),
-        "control channel rejected: {}",
-        response.status()
-    );
-    
-    let mut h2_recv = response.into_body();
-
-    control_handshake(&mut h2_send, &mut h2_recv).await;
-
-    send_control_message(&mut h2_send, &ClientMessage::Ping, false).await;
-
-    match read_control_message(&mut h2_recv).await {
-        ServerMessage::Pong => {}
-        other => panic!("expected Pong, got: {other:?}"),
-    }
-
-    let _ = h2_send.send_data(Bytes::new(), true);
-    drop(h2_send);
-    drop(h2_recv);
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -377,7 +344,7 @@ async fn test_session_starts_paused() {
     let conn = connect_client(server_addr, &pubkey).await;
     let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
 
-    let (session_total_in, session_total_out, remaining_milli_sats, paused) =
+    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
         control_handshake(&mut h2_send, &mut h2_recv).await;
     assert_eq!(session_total_in, 0);
     assert_eq!(session_total_out, 0);
@@ -397,7 +364,7 @@ async fn test_second_control_stream_rejected() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut first_send, mut first_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, _rem0, paused0) = control_handshake(&mut first_send, &mut first_recv).await;
+    let (_in0, _out0, _paid0, _rem0, paused0) = control_handshake(&mut first_send, &mut first_recv).await;
     assert!(paused0);
 
     let mut h2 = conn.clone_send_request().await;
@@ -457,7 +424,7 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
+    let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
@@ -467,7 +434,7 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
         false,
     )
     .await;
-    let (_in1, _out1, rem1, paused1) = expect_session_status(read_control_message(&mut control_recv).await);
+    let (_in1, _out1, _paid1, rem1, paused1) = expect_session_status(read_control_message(&mut control_recv).await);
     assert!(!paused1);
     assert_eq!(rem1, 5);
 
@@ -490,7 +457,7 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
             .unwrap();
     }
 
-    let (_in2, out2, rem2, paused2) = expect_session_status(read_control_message(&mut control_recv).await);
+    let (_in2, out2, _paid2, rem2, paused2) = expect_session_status(read_control_message(&mut control_recv).await);
     assert!(paused2, "session should re-pause after credit is exhausted");
     assert_eq!(out2, 5);
     assert_eq!(rem2, 0);
@@ -508,7 +475,7 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
         false,
     )
     .await;
-    let (_in3, _out3, rem3, paused3) = expect_session_status(read_control_message(&mut control_recv).await);
+    let (_in3, _out3, _paid3, rem3, paused3) = expect_session_status(read_control_message(&mut control_recv).await);
     assert!(!paused3, "session should unpause after second payment");
     assert_eq!(rem3, 10);
 
@@ -522,7 +489,7 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
     assert_eq!(result, b"DONE");
 
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    let (session_total_in, session_total_out, remaining_milli_sats, paused) =
+    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert_eq!(session_total_out, 10);
     assert_eq!(session_total_in, 4);
@@ -550,7 +517,7 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
+    let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
@@ -560,7 +527,7 @@ async fn test_session_overshoot_negative_balance_and_resume() {
         false,
     )
     .await;
-    let (_in1, _out1, rem1, paused1) =
+    let (_in1, _out1, _paid1, rem1, paused1) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert!(!paused1);
     assert_eq!(rem1, 5);
@@ -580,7 +547,7 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     wait_for_send_capacity(&mut h2_send).await.unwrap();
     h2_send.send_data(Bytes::from_static(b"abcdefghij"), true).unwrap();
 
-    let (_in2, out2, rem2, paused2) =
+    let (_in2, out2, _paid2, rem2, paused2) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert!(paused2, "session should pause after overshooting credit");
     assert_eq!(out2, 10);
@@ -592,7 +559,7 @@ async fn test_session_overshoot_negative_balance_and_resume() {
         false,
     )
     .await;
-    let (_in3, _out3, rem3, paused3) =
+    let (_in3, _out3, _paid3, rem3, paused3) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert!(
         !paused3,
@@ -617,7 +584,7 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     assert_eq!(result, b"DONE");
 
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    let (session_total_in, session_total_out, remaining_milli_sats, paused) =
+    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert_eq!(session_total_out, 10);
     assert_eq!(session_total_in, 4);
@@ -645,7 +612,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
+    let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
@@ -655,7 +622,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
         false,
     )
     .await;
-    let (_in1, _out1, rem1, paused1) =
+    let (_in1, _out1, _paid1, rem1, paused1) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert!(!paused1);
     assert_eq!(rem1, 5);
@@ -675,7 +642,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     wait_for_send_capacity(&mut h2_send).await.unwrap();
     h2_send.send_data(Bytes::from_static(b"abcdefghij"), true).unwrap();
 
-    let (_in2, out2, rem2, paused2) =
+    let (_in2, out2, _paid2, rem2, paused2) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert!(paused2, "session should pause after overshooting credit");
     assert_eq!(out2, 10);
@@ -687,7 +654,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
         false,
     )
     .await;
-    let (_in3, _out3, rem3, paused3) =
+    let (_in3, _out3, _paid3, rem3, paused3) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert!(paused3, "session should stay paused while balance is non-positive");
     assert_eq!(rem3, -1);
@@ -712,7 +679,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
         false,
     )
     .await;
-    let (_in4, _out4, rem4, paused4) =
+    let (_in4, _out4, _paid4, rem4, paused4) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert!(
         !paused4,
@@ -737,7 +704,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     assert_eq!(result, b"DONE");
 
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    let (session_total_in, session_total_out, remaining_milli_sats, paused) =
+    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
         expect_session_status(read_control_message(&mut control_recv).await);
     assert_eq!(session_total_out, 10);
     assert_eq!(session_total_in, 4);
@@ -754,10 +721,9 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     conn.shutdown().await;
 }
 
-/// Test both the control channel (Ping/Pong) and a data tunnel (uppercase)
-/// sequentially over the same H2 connection.
+/// Test a funded data tunnel (uppercase) over a paid session.
 #[tokio::test]
-async fn test_control_and_data_channels() {
+async fn test_funded_data_channel() {
     // Uppercase server
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
@@ -770,44 +736,10 @@ async fn test_control_and_data_channels() {
     let conn = connect_client_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
-    // Control channel: Ping/Pong
-    control_ping_pong(&mut h2).await;
-
     // Data channel: CONNECT → uppercase
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"hello world").await;
     assert_eq!(result, b"HELLO WORLD");
-
-    drop(h2);
-    conn.shutdown().await;
-}
-
-/// Test control and data channels running concurrently over the same connection.
-#[tokio::test]
-async fn test_concurrent_channels() {
-    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upper_addr = upper_listener.local_addr().unwrap();
-    tokio::spawn(run_uppercase_server(upper_listener));
-
-    let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client_funded(server_addr, &pubkey).await;
-    let h2 = conn.clone_send_request().await;
-
-    let target = format!("127.0.0.1:{}", upper_addr.port());
-
-    let mut h2_for_control = h2.clone();
-    let control_task = tokio::spawn(async move {
-        control_ping_pong(&mut h2_for_control).await;
-    });
-
-    let mut h2_for_data = h2.clone();
-    let data_task = tokio::spawn(async move {
-        let result = tunnel_roundtrip(&mut h2_for_data, &target, b"concurrent test").await;
-        assert_eq!(result, b"CONCURRENT TEST");
-    });
-
-    control_task.await.unwrap();
-    data_task.await.unwrap();
 
     drop(h2);
     conn.shutdown().await;
@@ -1111,9 +1043,6 @@ async fn test_quic_control_and_data() {
     let (server_addr, pubkey) = start_monad_server_with_quic().await;
     let conn = connect_client_quic_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
-
-    // Control channel
-    control_ping_pong(&mut h2).await;
 
     // Data channel
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic data test").await;

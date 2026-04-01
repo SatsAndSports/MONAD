@@ -61,9 +61,6 @@ async fn run_control_task(
             let message: ServerMessage = serde_json::from_slice(line)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
             match message {
-                ServerMessage::Pong => {
-                    info!("control: pong");
-                }
                 ServerMessage::SessionParams {
                     version,
                     in_bytes_per_millisat,
@@ -89,13 +86,15 @@ async fn run_control_task(
                 ServerMessage::SessionStatus {
                     session_total_in,
                     session_total_out,
+                    total_paid_millisats,
                     remaining_milli_sats,
                     paused,
                 } => {
                     info!(
-                        "session status: paused={} balance={} in={} out={}",
+                        "session status: paused={} balance={} paid={} in={} out={}",
                         paused,
                         remaining_milli_sats,
+                        total_paid_millisats,
                         session_total_in,
                         session_total_out
                     );
