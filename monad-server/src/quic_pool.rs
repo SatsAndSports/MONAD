@@ -1,36 +1,55 @@
 //! QUIC connection pool for relay-to-relay transport.
 //!
 //! Maintains shared QUIC connections keyed by `(host, port)`. When the server
-//! receives `CONNECT quic:host:port,<pin>`, it either reuses an existing QUIC
-//! connection to that target or establishes a new one, then opens a new
-//! bidirectional stream inside it.
+//! receives a CONNECT request with a `quic-pin` header, it either reuses an
+//! existing QUIC connection to that target or establishes a new one, then
+//! opens a new bidirectional stream inside it.
+//!
+//! The pool uses per-key pending state so that:
+//! - only one QUIC handshake runs per target at a time
+//! - concurrent callers to the same target wait on the in-progress handshake
+//!   rather than blocking the entire pool
+//! - callers to different targets are never blocked by each other
+//! - failed handshakes clean up the placeholder so the next caller retries
 
 use monad_quic::stream::QuicStream;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::info;
+
+/// Result of a QUIC connection attempt, shared with waiters via a watch channel.
+type ConnResult = Option<Result<quinn::Connection, String>>;
+
+/// State of a pool entry for a given target.
+enum PoolEntry {
+    /// A QUIC handshake is in progress. Waiters clone the receiver and watch
+    /// for the result. The sender is held by the task performing the handshake.
+    Pending(watch::Receiver<ConnResult>),
+    /// An established QUIC connection ready for opening new streams.
+    Ready(quinn::Connection),
+}
 
 /// A pool of shared QUIC connections keyed by target address string.
 ///
-/// Each entry is a `quinn::Connection` that may carry many concurrent streams.
-/// The pool is shared across all sessions on the server via `Arc`.
+/// Each entry is either a pending handshake or an established connection.
+/// The pool lock is held only briefly (map lookup + insert/remove), never
+/// across network operations.
 #[derive(Clone)]
 pub struct QuicPool {
-    inner: Arc<Mutex<HashMap<String, quinn::Connection>>>,
+    inner: Arc<Mutex<HashMap<String, PoolEntry>>>,
     endpoint: Arc<quinn::Endpoint>,
 }
 
 impl QuicPool {
     /// Create a new empty QUIC connection pool.
-    ///
-    /// The endpoint is used to dial new outbound QUIC connections when no
-    /// cached connection exists for a target.
     pub fn new() -> io::Result<Self> {
         let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("QUIC endpoint error: {e}")))?;
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("QUIC endpoint error: {e}"))
+            })?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
@@ -41,28 +60,157 @@ impl QuicPool {
     /// Open a QUIC bidirectional stream to `target_addr`, reusing an existing
     /// connection if one is available, or establishing a new one using the
     /// provided pinned SPKI for server authentication.
+    ///
+    /// If another caller is already establishing a connection to the same target,
+    /// this call waits for that handshake to complete rather than starting a
+    /// duplicate connection.
     pub async fn open_stream(
         &self,
         target_addr: &str,
         pinned_spki: Vec<u8>,
     ) -> io::Result<QuicStream> {
-        let mut pool = self.inner.lock().await;
+        loop {
+            let action = {
+                let mut pool = self.inner.lock().await;
 
-        // Check for an existing connection that's still alive
-        if let Some(conn) = pool.get(target_addr) {
-            match conn.open_bi().await {
-                Ok((send, recv)) => {
-                    info!("reusing QUIC connection to {target_addr}");
-                    return Ok(QuicStream::new(send, recv));
+                match pool.get(target_addr) {
+                    Some(PoolEntry::Ready(conn)) => {
+                        // Try to open a stream on the cached connection.
+                        // Clone the connection handle (cheap Arc clone) so we
+                        // can release the lock before the async open_bi call.
+                        Action::UseExisting(conn.clone())
+                    }
+                    Some(PoolEntry::Pending(rx)) => {
+                        // Another task is connecting — wait on its result.
+                        Action::Wait(rx.clone())
+                    }
+                    None => {
+                        // No entry — we are the one to establish the connection.
+                        // Insert a Pending entry and release the lock.
+                        let (tx, rx) = watch::channel(None);
+                        pool.insert(target_addr.to_string(), PoolEntry::Pending(rx));
+                        Action::Connect(tx)
+                    }
                 }
-                Err(e) => {
-                    // Connection is dead, remove it and fall through to reconnect
-                    info!("cached QUIC connection to {target_addr} is dead ({e}), reconnecting");
-                    pool.remove(target_addr);
+            };
+            // Lock is released here.
+
+            match action {
+                Action::UseExisting(conn) => {
+                    match conn.open_bi().await {
+                        Ok((send, recv)) => {
+                            info!("reusing QUIC connection to {target_addr}");
+                            return Ok(QuicStream::new(send, recv));
+                        }
+                        Err(e) => {
+                            // Connection is dead — remove it and retry.
+                            info!(
+                                "cached QUIC connection to {target_addr} is dead ({e}), \
+                                 removing and retrying"
+                            );
+                            let mut pool = self.inner.lock().await;
+                            // Only remove if it's still the same Ready entry (not
+                            // replaced by a new Pending from another task).
+                            if matches!(pool.get(target_addr), Some(PoolEntry::Ready(_))) {
+                                pool.remove(target_addr);
+                            }
+                            // Loop back to retry — will either find a new Pending
+                            // from another task or create our own.
+                            continue;
+                        }
+                    }
+                }
+
+                Action::Wait(mut rx) => {
+                    // Wait for the in-progress handshake to complete.
+                    loop {
+                        rx.changed().await.map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::ConnectionReset,
+                                format!(
+                                    "QUIC connection task to {target_addr} dropped without result"
+                                ),
+                            )
+                        })?;
+
+                        let result = rx.borrow().clone();
+                        match result {
+                            None => {
+                                // Still pending, keep waiting.
+                                continue;
+                            }
+                            Some(Ok(_conn)) => {
+                                // Connection established by another task. It should now
+                                // be in the pool as Ready. Loop back to UseExisting.
+                                break;
+                            }
+                            Some(Err(e)) => {
+                                // The connecting task failed and cleaned up. Retry
+                                // from scratch — we might become the next connector.
+                                info!(
+                                    "waited for QUIC connection to {target_addr}, \
+                                     but it failed: {e} — retrying"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    // Loop back to check the pool again.
+                    continue;
+                }
+
+                Action::Connect(tx) => {
+                    // We are responsible for establishing the connection.
+                    match self.establish_connection(target_addr, pinned_spki).await {
+                        Ok(conn) => {
+                            // Open the first stream.
+                            let stream_result = conn.open_bi().await.map_err(|e| {
+                                io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!(
+                                        "failed to open QUIC stream to {target_addr}: {e}"
+                                    ),
+                                )
+                            });
+
+                            // Promote to Ready in the pool, notify waiters.
+                            {
+                                let mut pool = self.inner.lock().await;
+                                pool.insert(
+                                    target_addr.to_string(),
+                                    PoolEntry::Ready(conn.clone()),
+                                );
+                            }
+                            let _ = tx.send(Some(Ok(conn)));
+
+                            let (send, recv) = stream_result?;
+                            info!(
+                                "QUIC connection to {target_addr} established and cached"
+                            );
+                            return Ok(QuicStream::new(send, recv));
+                        }
+                        Err(e) => {
+                            // Remove the Pending placeholder, notify waiters of failure.
+                            {
+                                let mut pool = self.inner.lock().await;
+                                pool.remove(target_addr);
+                            }
+                            let _ = tx.send(Some(Err(e.to_string())));
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
+    }
 
+    /// Establish a new QUIC connection (DNS resolution + handshake).
+    /// Called without any lock held.
+    async fn establish_connection(
+        &self,
+        target_addr: &str,
+        pinned_spki: Vec<u8>,
+    ) -> io::Result<quinn::Connection> {
         // Resolve the target address
         let socket_addr: SocketAddr = tokio::net::lookup_host(target_addr)
             .await
@@ -80,16 +228,17 @@ impl QuicPool {
                 )
             })?;
 
-        // Build client config with pinned key verification for this specific target
-        let client_config = monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to build QUIC client config: {e}"),
-            )
-        })?;
+        // Build client config with pinned key verification
+        let client_config =
+            monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("failed to build QUIC client config: {e}"),
+                )
+            })?;
 
-        // Establish a new QUIC connection using per-connection config
         info!("establishing new QUIC connection to {target_addr} ({socket_addr})");
+
         let conn = self
             .endpoint
             .connect_with(client_config, socket_addr, "monad-relay")
@@ -107,18 +256,16 @@ impl QuicPool {
                 )
             })?;
 
-        // Open the first stream
-        let (send, recv) = conn.open_bi().await.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to open QUIC stream to {target_addr}: {e}"),
-            )
-        })?;
-
-        // Cache the connection for future reuse
-        pool.insert(target_addr.to_string(), conn);
-
-        info!("QUIC connection to {target_addr} established and cached");
-        Ok(QuicStream::new(send, recv))
+        Ok(conn)
     }
+}
+
+/// Internal action determined under the pool lock, executed after releasing it.
+enum Action {
+    /// Found a Ready connection — try to open a stream on it.
+    UseExisting(quinn::Connection),
+    /// Found a Pending entry — wait on this watch receiver for the result.
+    Wait(watch::Receiver<ConnResult>),
+    /// No entry — we establish the connection and signal via this sender.
+    Connect(watch::Sender<ConnResult>),
 }

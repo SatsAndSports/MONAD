@@ -698,3 +698,68 @@ async fn test_connector_quic_hop() {
     drop(h2);
     conn.shutdown().await;
 }
+
+/// Test: multiple clients simultaneously request QUIC forwarding to the same target.
+///
+/// This exercises the QUIC connection pool's concurrent access path:
+/// - only one QUIC handshake should occur to T
+/// - the other clients should wait and then reuse the same connection
+/// - all clients should successfully tunnel data through
+#[tokio::test]
+async fn test_concurrent_quic_pool_access() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    // Server T (QUIC-enabled, shared target)
+    let (t_addr, t_noise_pubkey, t_quic_pin) = start_monad_server_with_quic().await;
+
+    // Server S (intermediate, all clients connect through this)
+    let (s_addr, s_noise_pubkey) = start_monad_server().await;
+
+    let quic_pin_bytes = hex::decode(&t_quic_pin).unwrap();
+    let t_port = t_addr.port();
+    let upper_port = upper_addr.port();
+
+    // Spawn 5 clients concurrently, all routing through S → QUIC → T → uppercase
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let s_addr = s_addr;
+        let s_noise_pubkey = s_noise_pubkey.clone();
+        let t_noise_pubkey = t_noise_pubkey.clone();
+        let quic_pin_bytes = quic_pin_bytes.clone();
+
+        handles.push(tokio::spawn(async move {
+            let conn = connector::connect_through_chain(&[
+                Hop {
+                    addr: s_addr.to_string(),
+                    pubkey: s_noise_pubkey,
+                    quic_pin: None,
+                },
+                Hop {
+                    addr: format!("127.0.0.1:{t_port}"),
+                    pubkey: t_noise_pubkey,
+                    quic_pin: Some(quic_pin_bytes),
+                },
+            ])
+            .await
+            .unwrap();
+            let mut h2 = {
+                let client = conn.h2_client.lock().await;
+                client.clone()
+            };
+
+            let payload = format!("concurrent client {i}");
+            let target = format!("127.0.0.1:{upper_port}");
+            let result = tunnel_roundtrip(&mut h2, &target, payload.as_bytes()).await;
+            assert_eq!(result, payload.to_ascii_uppercase().into_bytes());
+
+            drop(h2);
+            conn.shutdown().await;
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}
