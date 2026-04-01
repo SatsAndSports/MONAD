@@ -5,13 +5,10 @@ use crate::socks;
 use bytes::Bytes;
 use h2::client::SendRequest;
 use http::{Method, Request, Uri};
-use monad_common::h2stream::wait_for_send_capacity;
+use monad_common::proxy::proxy_bidirectional;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Open a tunnel to `target_authority` (e.g., "example.com:443") through the MONAD server
 /// and proxy data bidirectionally between the local `client_stream` and the remote target.
@@ -37,7 +34,7 @@ pub async fn open_tunnel(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad request: {e}")))?;
 
     // Send the CONNECT request
-    let (response_future, mut h2_send) = h2_client
+    let (response_future, h2_send) = h2_client
         .send_request(request, false)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}")))?;
 
@@ -58,92 +55,10 @@ pub async fn open_tunnel(
     // Send SOCKS5 success reply to local client
     socks::send_reply(local_stream, 0x00, "0.0.0.0", 0).await?;
 
-    let mut h2_recv = response.into_body();
+    let h2_recv = response.into_body();
 
-    // Split the local stream for bidirectional I/O.
-    let (mut local_read, mut local_write) = tokio::io::split(local_stream);
-
-    // Byte counters
-    let bytes_sent = Arc::new(AtomicU64::new(0));
-    let bytes_received = Arc::new(AtomicU64::new(0));
-
-    let bytes_sent_ref = bytes_sent.clone();
-    let bytes_received_ref = bytes_received.clone();
-
-    // Local -> H2 (data from local app going to remote target via server)
-    let local_to_h2 = async {
-        let mut buf = vec![0u8; 16384];
-        loop {
-            match local_read.read(&mut buf).await {
-                Ok(0) => {
-                    debug!("local read EOF");
-                    break;
-                }
-                Ok(n) => {
-                    bytes_sent_ref.fetch_add(n as u64, Ordering::Relaxed);
-
-                    let data = Bytes::copy_from_slice(&buf[..n]);
-
-                    // Wait for H2 flow control capacity (sleeps until
-                    // the peer sends a WINDOW_UPDATE — no busy-looping)
-                    h2_send.reserve_capacity(data.len());
-                    if let Err(e) = wait_for_send_capacity(&mut h2_send).await {
-                        debug!("{e}");
-                        break;
-                    }
-
-                    if let Err(e) = h2_send.send_data(data, false) {
-                        debug!("h2 send error: {e}");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    debug!("local read error: {e}");
-                    break;
-                }
-            }
-        }
-        let _ = h2_send.send_data(Bytes::new(), true);
-    };
-
-    // H2 -> Local (data from remote target coming through server to local app)
-    let h2_to_local = async {
-        loop {
-            match h2_recv.data().await {
-                Some(Ok(data)) => {
-                    let len = data.len();
-                    let _ = h2_recv.flow_control().release_capacity(len);
-
-                    bytes_received_ref.fetch_add(len as u64, Ordering::Relaxed);
-
-                    if let Err(e) = local_write.write_all(&data).await {
-                        debug!("local write error: {e}");
-                        break;
-                    }
-                }
-                Some(Err(e)) => {
-                    debug!("h2 recv error: {e}");
-                    break;
-                }
-                None => {
-                    debug!("h2 recv stream ended");
-                    break;
-                }
-            }
-        }
-        let _ = local_write.shutdown().await;
-    };
-
-    // Run both directions to completion (not select!) so that when the local
-    // app finishes sending, we still receive the full response from the remote.
-    tokio::join!(local_to_h2, h2_to_local);
-
-    let outbound = bytes_sent.load(Ordering::Relaxed);
-    let inbound = bytes_received.load(Ordering::Relaxed);
-    info!(
-        "tunnel closed: {target_authority} | outbound={outbound} inbound={inbound} total={}",
-        outbound + inbound
-    );
-
-    Ok(())
+    // Proxy data bidirectionally between the H2 stream and the local socket.
+    // `&mut TcpStream` implements AsyncRead + AsyncWrite, so the shared proxy
+    // function works directly without transferring ownership.
+    proxy_bidirectional(h2_send, h2_recv, &mut *local_stream, target_authority).await
 }

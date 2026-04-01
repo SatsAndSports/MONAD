@@ -14,6 +14,134 @@ use ring::signature::KeyPair as _;
 use sha2::{Digest, Sha512};
 use std::io;
 
+// ---------------------------------------------------------------------------
+// Ed25519Pubkey — validated 32-byte public key newtype
+// ---------------------------------------------------------------------------
+
+/// A validated 32-byte Ed25519 public key.
+///
+/// This is the unified identity for a MONAD server. From it, the X25519
+/// public key (for Noise) and SPKI DER (for QUIC pinning) are derived
+/// on demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ed25519Pubkey([u8; 32]);
+
+impl Ed25519Pubkey {
+    /// Wrap a raw 32-byte array.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Validate and wrap a byte slice (must be exactly 32 bytes).
+    pub fn from_slice(bytes: &[u8]) -> io::Result<Self> {
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Ed25519 public key must be 32 bytes, got {}", bytes.len()),
+            )
+        })?;
+        Ok(Self(arr))
+    }
+
+    /// Decode a hex string into an `Ed25519Pubkey`.
+    pub fn from_hex(hex: &str) -> io::Result<Self> {
+        let bytes = hex::decode(hex)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid hex: {e}")))?;
+        Self::from_slice(&bytes)
+    }
+
+    /// The raw 32-byte key.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Derive the X25519 public key for Noise NK handshakes.
+    pub fn to_x25519(&self) -> io::Result<[u8; 32]> {
+        ed25519_pubkey_to_x25519_pubkey(&self.0)
+    }
+
+    /// Derive the SPKI DER blob for QUIC pinned-key verification.
+    pub fn to_spki_der(&self) -> Vec<u8> {
+        ed25519_pubkey_to_spki_der(&self.0)
+    }
+}
+
+impl std::fmt::Display for Ed25519Pubkey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ServerIdentity — unified server identity derived from an Ed25519 seed
+// ---------------------------------------------------------------------------
+
+/// A server's unified identity, derived from a single Ed25519 seed.
+///
+/// From this seed, the X25519 private key (for Noise) and Ed25519 public key
+/// (for client verification / QUIC pinning) are derived and cached.
+pub struct ServerIdentity {
+    seed: [u8; 32],
+    ed25519_pubkey: Ed25519Pubkey,
+    x25519_private: [u8; 32],
+}
+
+impl ServerIdentity {
+    /// Generate a new random server identity.
+    pub fn generate() -> io::Result<Self> {
+        let (seed, pubkey) = generate_identity()?;
+        let x25519_private = ed25519_seed_to_x25519_private(&seed);
+        Ok(Self {
+            seed,
+            ed25519_pubkey: pubkey,
+            x25519_private,
+        })
+    }
+
+    /// Derive a server identity from a known Ed25519 seed.
+    pub fn from_seed(seed: [u8; 32]) -> io::Result<Self> {
+        let pubkey = Ed25519Pubkey(ed25519_seed_to_pubkey(&seed)?);
+        let x25519_private = ed25519_seed_to_x25519_private(&seed);
+        Ok(Self {
+            seed,
+            ed25519_pubkey: pubkey,
+            x25519_private,
+        })
+    }
+
+    /// Decode a hex-encoded Ed25519 seed into a `ServerIdentity`.
+    pub fn from_hex(hex: &str) -> io::Result<Self> {
+        let bytes = hex::decode(hex)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid hex: {e}")))?;
+        let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("seed must be 32 bytes, got {}", bytes.len()),
+            )
+        })?;
+        Self::from_seed(seed)
+    }
+
+    /// The raw 32-byte Ed25519 seed (private key material).
+    pub fn seed(&self) -> &[u8; 32] {
+        &self.seed
+    }
+
+    /// The server's Ed25519 public key (its published identity).
+    pub fn ed25519_pubkey(&self) -> &Ed25519Pubkey {
+        &self.ed25519_pubkey
+    }
+
+    /// The derived X25519 private key for Noise NK handshakes.
+    pub fn x25519_private(&self) -> &[u8; 32] {
+        &self.x25519_private
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Low-level key derivation functions
+// ---------------------------------------------------------------------------
+
 /// The fixed ASN.1 DER header for an Ed25519 SubjectPublicKeyInfo (SPKI).
 ///
 /// SEQUENCE {
@@ -49,15 +177,15 @@ const ED25519_PKCS8_HEADER: [u8; 16] = [
 
 /// Generate a new Ed25519 identity.
 ///
-/// Returns `(seed, public_key)` where both are 32 bytes.
-/// The seed is the private key material; the public key is the server's identity.
-pub fn generate_identity() -> io::Result<([u8; 32], [u8; 32])> {
+/// Returns `(seed, public_key)` where seed is 32 bytes of private key material
+/// and public_key is the server's identity.
+pub fn generate_identity() -> io::Result<([u8; 32], Ed25519Pubkey)> {
     let rng = ring::rand::SystemRandom::new();
     let mut seed = [0u8; 32];
     ring::rand::SecureRandom::fill(&rng, &mut seed)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to generate random seed"))?;
 
-    let pubkey = ed25519_seed_to_pubkey(&seed)?;
+    let pubkey = Ed25519Pubkey(ed25519_seed_to_pubkey(&seed)?);
     Ok((seed, pubkey))
 }
 
@@ -140,7 +268,7 @@ mod tests {
 
         // Verify we can derive the same pubkey from the seed
         let pubkey2 = ed25519_seed_to_pubkey(&seed).unwrap();
-        assert_eq!(pubkey, pubkey2);
+        assert_eq!(pubkey.as_bytes(), &pubkey2);
 
         // Verify X25519 conversion produces valid-looking keys
         let x25519_priv = ed25519_seed_to_x25519_private(&seed);
@@ -149,17 +277,17 @@ mod tests {
             "X25519 private key should not be all zeros"
         );
 
-        let x25519_pub = ed25519_pubkey_to_x25519_pubkey(&pubkey).unwrap();
+        let x25519_pub = pubkey.to_x25519().unwrap();
         assert_ne!(
             x25519_pub, [0u8; 32],
             "X25519 public key should not be all zeros"
         );
 
         // Verify SPKI DER has the right structure
-        let spki = ed25519_pubkey_to_spki_der(&pubkey);
+        let spki = pubkey.to_spki_der();
         assert_eq!(spki.len(), 44);
         assert_eq!(&spki[..12], &ED25519_SPKI_HEADER);
-        assert_eq!(&spki[12..], &pubkey);
+        assert_eq!(&spki[12..], pubkey.as_bytes());
 
         // Verify PKCS#8 DER has the right structure
         let pkcs8 = ed25519_seed_to_pkcs8_der(&seed);
@@ -175,7 +303,7 @@ mod tests {
         let (seed, pubkey) = generate_identity().unwrap();
 
         let x25519_priv = ed25519_seed_to_x25519_private(&seed);
-        let x25519_pub = ed25519_pubkey_to_x25519_pubkey(&pubkey).unwrap();
+        let x25519_pub = pubkey.to_x25519().unwrap();
 
         // Build a Noise responder with the derived X25519 private key
         let builder = snow::Builder::new("Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
@@ -200,7 +328,7 @@ mod tests {
         let (seed, pubkey) = generate_identity().unwrap();
 
         let x25519_priv = ed25519_seed_to_x25519_private(&seed);
-        let x25519_pub_from_ed = ed25519_pubkey_to_x25519_pubkey(&pubkey).unwrap();
+        let x25519_pub_from_ed = pubkey.to_x25519().unwrap();
 
         // Ask snow to derive the X25519 public key from the private key
         let builder = snow::Builder::new("Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());

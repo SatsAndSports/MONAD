@@ -5,7 +5,7 @@
 //! Two hops:     TCP → Noise(T) → H2 → CONNECT(S) → Noise(S) → H2
 //! N hops:       Each hop wraps the previous one via H2ConnectStream.
 
-use monad_common::identity;
+use monad_common::identity::Ed25519Pubkey;
 use monad_common::noise::{self, NoiseStream};
 use monad_common::session::RelayConnection;
 use monad_quic::stream::QuicStream;
@@ -25,8 +25,8 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub struct Hop {
     pub addr: String,
-    /// Ed25519 public key (32 bytes) — the server's unified identity.
-    pub pubkey: Vec<u8>,
+    /// Ed25519 public key — the server's unified identity.
+    pub pubkey: Ed25519Pubkey,
     /// Whether the previous relay should connect to this hop via QUIC.
     pub use_quic: bool,
 }
@@ -35,10 +35,10 @@ pub struct Hop {
 ///
 /// Equivalent to `connect_through_chain(&[hop])`.
 #[allow(dead_code)]
-pub async fn connect(server_addr: &str, server_pubkey: &[u8]) -> io::Result<RelayConnection> {
+pub async fn connect(server_addr: &str, server_pubkey: Ed25519Pubkey) -> io::Result<RelayConnection> {
     connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
-        pubkey: server_pubkey.to_vec(),
+        pubkey: server_pubkey,
         use_quic: false,
     }])
     .await
@@ -69,13 +69,7 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
         // Connect to the first hop via QUIC
         info!("connecting to first hop via QUIC: {}", first.addr);
 
-        let ed25519_pub: [u8; 32] = first.pubkey.as_slice().try_into().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("public key must be 32 bytes, got {}", first.pubkey.len()),
-            )
-        })?;
-        let pinned_spki = identity::ed25519_pubkey_to_spki_der(&ed25519_pub);
+        let pinned_spki = first.pubkey.to_spki_der();
 
         let client_config =
             monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
@@ -160,13 +154,7 @@ where
     );
 
     // Derive X25519 public key from the Ed25519 public key for Noise
-    let ed25519_pub: [u8; 32] = hop.pubkey.as_slice().try_into().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("public key must be 32 bytes, got {}", hop.pubkey.len()),
-        )
-    })?;
-    let x25519_pub = identity::ed25519_pubkey_to_x25519_pubkey(&ed25519_pub)?;
+    let x25519_pub = hop.pubkey.to_x25519()?;
 
     // Noise NK handshake with this hop
     let transport = noise::handshake_initiator(&mut stream, &x25519_pub).await?;
@@ -190,13 +178,7 @@ where
 
         // Open the CONNECT tunnel, with QUIC pin if the next hop uses QUIC
         let h2_connect_stream = if next.use_quic {
-            let next_ed25519: [u8; 32] = next.pubkey.as_slice().try_into().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "next hop public key must be 32 bytes",
-                )
-            })?;
-            let spki = identity::ed25519_pubkey_to_spki_der(&next_ed25519);
+            let spki = next.pubkey.to_spki_der();
             conn.open_tunnel_quic(&next.addr, &spki).await?
         } else {
             conn.open_tunnel(&next.addr).await?

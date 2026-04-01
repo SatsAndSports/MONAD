@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use monad_common::identity;
+use monad_common::identity::ServerIdentity;
 use monad_server::listener;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -48,49 +48,41 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Keygen => {
-            let (seed, pubkey) = identity::generate_identity()?;
+            let identity = ServerIdentity::generate()?;
 
             // Generate QUIC certificate from the same seed
-            let quic_km = monad_quic::keygen::generate_from_seed(
-                &seed,
-            )?;
+            let quic_km = monad_quic::keygen::generate_from_seed(identity.seed())?;
 
+            let pubkey = identity.ed25519_pubkey();
             println!("# MONAD server identity (unified Ed25519 key)");
             println!("#");
             println!("# One key is used for both Noise and QUIC authentication.");
             println!();
-            println!("Private key (Ed25519 seed): {}", hex::encode(&seed));
-            println!("Public key (Ed25519):       {}", hex::encode(&pubkey));
+            println!("Private key (Ed25519 seed): {}", hex::encode(identity.seed()));
+            println!("Public key (Ed25519):       {pubkey}");
             println!();
             println!("# --- QUIC certificate (derived from the same key) ---");
             println!("{}", quic_km.cert_pem);
             println!("# Run the server with:");
-            println!("#   monad-server run --private-key {} --quic", hex::encode(&seed));
+            println!("#   monad-server run --private-key {} --quic", hex::encode(identity.seed()));
             println!("#");
             println!("# Give the public key to clients:");
-            println!("#   {}", hex::encode(&pubkey));
+            println!("#   {pubkey}");
             println!("#");
             println!("# For a QUIC hop, clients use the same key:");
-            println!("#   --hop quic:addr:port,{}", hex::encode(&pubkey));
+            println!("#   --hop quic:addr:port,{pubkey}");
         }
         Command::Run {
             listen,
             private_key,
             quic,
         } => {
-            let seed_bytes = hex::decode(&private_key)?;
-            if seed_bytes.len() != 32 {
-                anyhow::bail!("private key must be 32 bytes (64 hex chars)");
-            }
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&seed_bytes);
-
-            // Derive X25519 private key for Noise handshakes
-            let x25519_private = identity::ed25519_seed_to_x25519_private(&seed);
+            let identity = ServerIdentity::from_hex(&private_key)
+                .map_err(|e| anyhow::anyhow!("bad private key: {e}"))?;
 
             // Optionally set up QUIC listener from the same seed
             let quic_config = if quic {
-                let quic_km = monad_quic::keygen::generate_from_seed(&seed)?;
+                let quic_km = monad_quic::keygen::generate_from_seed(identity.seed())?;
                 let server_config =
                     monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem)?;
                 Some(server_config)
@@ -98,9 +90,7 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
 
-            let config = Arc::new(listener::ServerConfig {
-                private_key: x25519_private.to_vec(),
-            });
+            let config = Arc::new(listener::ServerConfig { identity });
 
             let tcp_listener = TcpListener::bind(&listen).await?;
 

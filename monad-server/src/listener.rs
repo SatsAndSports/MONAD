@@ -2,6 +2,7 @@
 
 use crate::quic_pool::QuicPool;
 use crate::session::RelaySession;
+use monad_common::identity::ServerIdentity;
 use monad_common::noise;
 use monad_common::noise::NoiseStream;
 use monad_quic::stream::QuicStream;
@@ -13,8 +14,8 @@ use tracing::{error, info};
 
 /// Server configuration.
 pub struct ServerConfig {
-    /// Server's Noise static private key (32 bytes).
-    pub private_key: Vec<u8>,
+    /// The server's unified identity (Ed25519 seed + derived keys).
+    pub identity: ServerIdentity,
 }
 
 /// Run the server: listen for TCP and optionally QUIC connections, perform Noise
@@ -53,7 +54,7 @@ pub async fn run(
                 sessions.spawn(async move {
                     // Noise NK handshake (server is responder)
                     let transport =
-                        match noise::handshake_responder(&mut tcp_stream, &config.private_key).await {
+                        match noise::handshake_responder(&mut tcp_stream, config.identity.x25519_private()).await {
                             Ok(t) => {
                                 info!("noise handshake complete with {peer_addr} (TCP)");
                                 t
@@ -125,7 +126,7 @@ pub async fn run(
 
                                     let transport = match noise::handshake_responder(
                                         &mut quic_stream,
-                                        &config.private_key,
+                                        config.identity.x25519_private(),
                                     )
                                     .await
                                     {

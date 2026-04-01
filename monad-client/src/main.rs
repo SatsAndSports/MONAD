@@ -3,6 +3,7 @@ use monad_client::connector;
 use monad_client::connector::Hop;
 use monad_client::socks;
 use monad_client::tunnel;
+use monad_common::identity::Ed25519Pubkey;
 use monad_common::session::RelayConnection;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -45,13 +46,8 @@ fn parse_hop(s: &str) -> anyhow::Result<Hop> {
         .rsplit_once(',')
         .ok_or_else(|| anyhow::anyhow!("hop must be addr:port,pubkey_hex — got: {s}"))?;
 
-    let pubkey = hex::decode(pubkey_hex)?;
-    if pubkey.len() != 32 {
-        anyhow::bail!(
-            "public key must be 32 bytes (64 hex chars), got {} bytes for hop {addr}",
-            pubkey.len()
-        );
-    }
+    let pubkey = Ed25519Pubkey::from_hex(pubkey_hex)
+        .map_err(|e| anyhow::anyhow!("bad public key for hop {addr}: {e}"))?;
 
     Ok(Hop {
         addr: addr.to_string(),
