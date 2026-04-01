@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    /// First message on the control stream. Declares the highest
+    /// protocol version the client supports.
+    Hello {
+        version: u8,
+    },
     Ping,
     /// Add fake credit to the current relay session.
     FakePayment {
@@ -26,7 +31,9 @@ pub enum ServerMessage {
     Pong,
 
     /// Fixed pricing and other session parameters for this relay session.
+    /// Sent in response to `ClientMessage::Hello`.
     SessionParams {
+        version: u8,
         in_bytes_per_millisat: u64,
         out_bytes_per_millisat: u64,
     },

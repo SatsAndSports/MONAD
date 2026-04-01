@@ -8,6 +8,8 @@ use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+const CLIENT_VERSION: u8 = 0;
+
 fn encode_client_message(message: &ClientMessage) -> io::Result<Bytes> {
     let bytes = serde_json::to_vec(message)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
@@ -39,6 +41,9 @@ async fn run_control_task(
     let mut buf = Vec::new();
     let mut ready_tx = Some(ready_tx);
 
+    // Send Hello as the first message on the control stream.
+    send_control_message(&mut h2_send, &ClientMessage::Hello { version: CLIENT_VERSION }).await?;
+
     while let Some(chunk) = h2_recv.data().await {
         let data = chunk
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 recv error: {e}")))?;
@@ -60,15 +65,18 @@ async fn run_control_task(
                     info!("control: pong");
                 }
                 ServerMessage::SessionParams {
+                    version,
                     in_bytes_per_millisat,
                     out_bytes_per_millisat,
                 } => {
                     let pricing = SessionPricing::new(
+                        version,
                         in_bytes_per_millisat,
                         out_bytes_per_millisat,
                     );
                     info!(
-                        "session params: in_bytes_per_millisat={} out_bytes_per_millisat={} lcm={}",
+                        "session params: version={} in_bytes_per_millisat={} out_bytes_per_millisat={} lcm={}",
+                        pricing.version,
                         pricing.in_bytes_per_millisat,
                         pricing.out_bytes_per_millisat,
                         pricing.pricing_lcm,

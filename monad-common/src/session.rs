@@ -52,19 +52,23 @@ pub fn clamp_i128_to_i64(value: i128) -> i64 {
 /// use integer arithmetic without recomputing it per chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionPricing {
+    /// Negotiated protocol version for this session.
+    pub version: u8,
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
     pub pricing_lcm: u64,
 }
 
 impl SessionPricing {
-    /// Create a `SessionPricing` from the raw directional rates.
+    /// Create a `SessionPricing` from the negotiated version and raw
+    /// directional rates.
     ///
     /// Computes and caches `lcm(in_bytes_per_millisat, out_bytes_per_millisat)`.
-    pub fn new(in_bytes_per_millisat: u64, out_bytes_per_millisat: u64) -> Self {
+    pub fn new(version: u8, in_bytes_per_millisat: u64, out_bytes_per_millisat: u64) -> Self {
         let in_rate = in_bytes_per_millisat.max(1);
         let out_rate = out_bytes_per_millisat.max(1);
         Self {
+            version,
             in_bytes_per_millisat: in_rate,
             out_bytes_per_millisat: out_rate,
             pricing_lcm: lcm_u64(in_rate, out_rate),

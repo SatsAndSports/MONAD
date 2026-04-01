@@ -231,35 +231,40 @@ fn expect_session_status(message: ServerMessage) -> (u64, u64, i64, bool) {
     }
 }
 
-fn expect_session_params(message: ServerMessage) -> (u64, u64) {
+fn expect_session_params(message: ServerMessage) -> (u8, u64, u64) {
     match message {
         ServerMessage::SessionParams {
+            version,
             in_bytes_per_millisat,
             out_bytes_per_millisat,
-        } => (in_bytes_per_millisat, out_bytes_per_millisat),
+        } => (version, in_bytes_per_millisat, out_bytes_per_millisat),
         other => panic!("expected SessionParams, got {other:?}"),
     }
+}
+
+/// Send Hello, read SessionParams, read initial SessionStatus.
+/// Returns the initial session status fields.
+async fn control_handshake(
+    h2_send: &mut h2::SendStream<Bytes>,
+    h2_recv: &mut h2::RecvStream,
+) -> (u64, u64, i64, bool) {
+    send_control_message(h2_send, &ClientMessage::Hello { version: 0 }, false).await;
+
+    let (version, in_bytes_per_millisat, out_bytes_per_millisat) =
+        expect_session_params(read_control_message(h2_recv).await);
+    assert_eq!(version, 0);
+    assert_eq!(in_bytes_per_millisat, 1);
+    assert_eq!(out_bytes_per_millisat, 1);
+
+    expect_session_status(read_control_message(h2_recv).await)
 }
 
 async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
     let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
 
-    let (in_bytes_per_millisat, out_bytes_per_millisat) =
-        expect_session_params(read_control_message(&mut h2_recv).await);
-    assert_eq!(in_bytes_per_millisat, 1);
-    assert_eq!(out_bytes_per_millisat, 1);
-
-    match read_control_message(&mut h2_recv).await {
-        ServerMessage::SessionStatus {
-            paused,
-            remaining_milli_sats,
-            ..
-        } => {
-            assert!(paused);
-            assert_eq!(remaining_milli_sats, 0);
-        }
-        other => panic!("expected initial SessionStatus, got {other:?}"),
-    }
+    let (_in0, _out0, rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
+    assert!(paused0);
+    assert_eq!(rem0, 0);
 
     send_control_message(
         &mut h2_send,
@@ -347,15 +352,7 @@ async fn control_ping_pong(h2_client: &mut client::SendRequest<Bytes>) {
     
     let mut h2_recv = response.into_body();
 
-    let (in_bytes_per_millisat, out_bytes_per_millisat) =
-        expect_session_params(read_control_message(&mut h2_recv).await);
-    assert_eq!(in_bytes_per_millisat, 1);
-    assert_eq!(out_bytes_per_millisat, 1);
-
-    match read_control_message(&mut h2_recv).await {
-        ServerMessage::SessionStatus { .. } => {}
-        other => panic!("expected initial SessionStatus, got {other:?}"),
-    }
+    control_handshake(&mut h2_send, &mut h2_recv).await;
 
     send_control_message(&mut h2_send, &ClientMessage::Ping, false).await;
 
@@ -380,25 +377,12 @@ async fn test_session_starts_paused() {
     let conn = connect_client(server_addr, &pubkey).await;
     let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
 
-    let (in_bytes_per_millisat, out_bytes_per_millisat) =
-        expect_session_params(read_control_message(&mut h2_recv).await);
-    assert_eq!(in_bytes_per_millisat, 1);
-    assert_eq!(out_bytes_per_millisat, 1);
-
-    match read_control_message(&mut h2_recv).await {
-        ServerMessage::SessionStatus {
-            session_total_in,
-            session_total_out,
-            remaining_milli_sats,
-            paused,
-        } => {
-            assert_eq!(session_total_in, 0);
-            assert_eq!(session_total_out, 0);
-            assert_eq!(remaining_milli_sats, 0);
-            assert!(paused);
-        }
-        other => panic!("expected initial SessionStatus, got {other:?}"),
-    }
+    let (session_total_in, session_total_out, remaining_milli_sats, paused) =
+        control_handshake(&mut h2_send, &mut h2_recv).await;
+    assert_eq!(session_total_in, 0);
+    assert_eq!(session_total_out, 0);
+    assert_eq!(remaining_milli_sats, 0);
+    assert!(paused);
 
     let _ = h2_send.send_data(Bytes::new(), true);
     drop(h2_send);
@@ -413,14 +397,8 @@ async fn test_second_control_stream_rejected() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut first_send, mut first_recv) = conn.open_control().await.unwrap();
-    let (in_bytes_per_millisat, out_bytes_per_millisat) =
-        expect_session_params(read_control_message(&mut first_recv).await);
-    assert_eq!(in_bytes_per_millisat, 1);
-    assert_eq!(out_bytes_per_millisat, 1);
-    match read_control_message(&mut first_recv).await {
-        ServerMessage::SessionStatus { paused, .. } => assert!(paused),
-        other => panic!("expected initial SessionStatus, got {other:?}"),
-    }
+    let (_in0, _out0, _rem0, paused0) = control_handshake(&mut first_send, &mut first_recv).await;
+    assert!(paused0);
 
     let mut h2 = conn.clone_send_request().await;
     let request = Request::builder()
@@ -479,11 +457,7 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (in_bytes_per_millisat, out_bytes_per_millisat) =
-        expect_session_params(read_control_message(&mut control_recv).await);
-    assert_eq!(in_bytes_per_millisat, 1);
-    assert_eq!(out_bytes_per_millisat, 1);
-    let (_in0, _out0, rem0, paused0) = expect_session_status(read_control_message(&mut control_recv).await);
+    let (_in0, _out0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
@@ -576,12 +550,7 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (in_bytes_per_millisat, out_bytes_per_millisat) =
-        expect_session_params(read_control_message(&mut control_recv).await);
-    assert_eq!(in_bytes_per_millisat, 1);
-    assert_eq!(out_bytes_per_millisat, 1);
-    let (_in0, _out0, rem0, paused0) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+    let (_in0, _out0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
@@ -676,12 +645,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (in_bytes_per_millisat, out_bytes_per_millisat) =
-        expect_session_params(read_control_message(&mut control_recv).await);
-    assert_eq!(in_bytes_per_millisat, 1);
-    assert_eq!(out_bytes_per_millisat, 1);
-    let (_in0, _out0, rem0, paused0) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+    let (_in0, _out0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
