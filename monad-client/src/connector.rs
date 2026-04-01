@@ -5,18 +5,13 @@
 //! Two hops:     TCP → Noise(T) → H2 → CONNECT(S) → Noise(S) → H2
 //! N hops:       Each hop wraps the previous one via H2ConnectStream.
 
-use bytes::Bytes;
-use h2::client;
-use http::{Method, Request, Uri};
-use monad_common::h2stream::H2ConnectStream;
 use monad_common::identity;
 use monad_common::noise::{self, NoiseStream};
+use monad_common::session::RelayConnection;
 use monad_quic::stream::QuicStream;
 use std::io;
-use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
 use tracing::info;
 
 /// A hop in the tunnel chain: server address and its Ed25519 public key.
@@ -36,33 +31,11 @@ pub struct Hop {
     pub use_quic: bool,
 }
 
-/// An established connection to a MONAD server, ready to open H2 streams.
-pub struct ServerConnection {
-    /// The H2 client send handle — use this to open new streams (CONNECT, etc.)
-    pub h2_client: Arc<tokio::sync::Mutex<client::SendRequest<Bytes>>>,
-    /// Background tasks driving the H2 connection(s) in the hop chain.
-    pub driver_handles: Vec<JoinHandle<()>>,
-}
-
-impl ServerConnection {
-    /// Shut down the hop chain cleanly by dropping the shared H2 client handle
-    /// and waiting for all per-hop H2 driver tasks to exit.
-    pub async fn shutdown(self) {
-        drop(self.h2_client);
-
-        for handle in self.driver_handles {
-            if let Err(e) = handle.await {
-                tracing::error!("H2 driver task panicked: {e}");
-            }
-        }
-    }
-}
-
 /// Connect to a MONAD server directly (single hop).
 ///
 /// Equivalent to `connect_through_chain(&[hop])`.
 #[allow(dead_code)]
-pub async fn connect(server_addr: &str, server_pubkey: &[u8]) -> io::Result<ServerConnection> {
+pub async fn connect(server_addr: &str, server_pubkey: &[u8]) -> io::Result<RelayConnection> {
     connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
         pubkey: server_pubkey.to_vec(),
@@ -75,14 +48,14 @@ pub async fn connect(server_addr: &str, server_pubkey: &[u8]) -> io::Result<Serv
 ///
 /// `hops` must have at least one entry. The first hop is connected to via TCP.
 /// Each subsequent hop is reached by opening an H2 CONNECT tunnel through the
-/// previous hop. The returned `ServerConnection` is for the *last* hop in the chain.
+/// previous hop. The returned `RelayConnection` is for the *last* hop in the chain.
 ///
 /// Example with 2 hops [T, S]:
 ///   TCP → Noise(T) → H2 → CONNECT(S:port) → Noise(S) → H2 → (returned client)
 ///
 /// T only sees encrypted Noise bytes. It has no idea that inside those bytes
 /// is another MONAD session asking S to proxy onward.
-pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<ServerConnection> {
+pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> {
     if hops.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -169,7 +142,7 @@ fn chain_from_stream<S>(
     mut stream: S,
     hops: &[Hop],
     hop_idx: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<ServerConnection>> + Send>>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<RelayConnection>> + Send>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -201,18 +174,9 @@ where
     let noise_stream = NoiseStream::new(stream, transport, label);
 
     // H2 handshake over the encrypted stream
-    let (h2_client, h2_conn) = client::handshake(noise_stream)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake error: {e}")))?;
+    let (conn, driver) = RelayConnection::from_noise_stream(noise_stream).await?;
 
     info!("hop {}/{}: H2 connection established", hop_idx + 1, hops.len());
-
-    // Spawn background task to drive this H2 connection
-    let driver_handle = tokio::spawn(async move {
-        if let Err(e) = h2_conn.await {
-            tracing::error!("H2 connection error at hop: {e}");
-        }
-    });
 
     if hop_idx < hops.len() - 1 {
         // Not the last hop — open a CONNECT tunnel to the next hop
@@ -224,78 +188,31 @@ where
             next.addr
         );
 
-        // If the next hop uses QUIC, compute the SPKI DER for the quic-pin header
-        let quic_pin = if next.use_quic {
+        // Open the CONNECT tunnel, with QUIC pin if the next hop uses QUIC
+        let h2_connect_stream = if next.use_quic {
             let next_ed25519: [u8; 32] = next.pubkey.as_slice().try_into().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "next hop public key must be 32 bytes",
                 )
             })?;
-            Some(identity::ed25519_pubkey_to_spki_der(&next_ed25519))
+            let spki = identity::ed25519_pubkey_to_spki_der(&next_ed25519);
+            conn.open_tunnel_quic(&next.addr, &spki).await?
         } else {
-            None
+            conn.open_tunnel(&next.addr).await?
         };
 
-        let h2_connect_stream =
-            open_h2_connect(h2_client, &next.addr, quic_pin.as_deref()).await?;
-
-        // Recurse: perform Noise + H2 over this tunnel for the next hop
-        let mut conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;
-        conn.driver_handles.push(driver_handle);
-        Ok(conn)
+        // Recurse: perform Noise + H2 over this tunnel for the next hop.
+        // Attach this hop's driver to the final connection.
+        let mut next_conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;
+        next_conn.add_driver(driver);
+        Ok(next_conn)
     } else {
-        // Last hop — return the H2 client for actual use
+        // Last hop — attach the driver and return for actual use
+        let mut conn = conn;
+        conn.add_driver(driver);
         info!("tunnel chain established ({} hops)", hops.len());
-        Ok(ServerConnection {
-            h2_client: Arc::new(tokio::sync::Mutex::new(h2_client)),
-            driver_handles: vec![driver_handle],
-        })
+        Ok(conn)
     }
     }) // close Box::pin(async move { ... })
-}
-
-/// Open an H2 CONNECT tunnel to the given target authority, returning
-/// an `H2ConnectStream` that implements `AsyncRead + AsyncWrite`.
-///
-/// If `quic_pin` is provided, a `quic-pin` header is added to the CONNECT
-/// request, telling the relay to use QUIC transport to reach the target.
-async fn open_h2_connect(
-    mut h2_client: client::SendRequest<Bytes>,
-    target_authority: &str,
-    quic_pin: Option<&[u8]>,
-) -> io::Result<H2ConnectStream> {
-    let uri: Uri = target_authority
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad URI: {e}")))?;
-
-    let mut builder = Request::builder()
-        .method(Method::CONNECT)
-        .uri(uri);
-
-    if let Some(pin) = quic_pin {
-        builder = builder.header("quic-pin", hex::encode(pin));
-    }
-
-    let request = builder
-        .body(())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad request: {e}")))?;
-
-    let (response_future, h2_send) = h2_client
-        .send_request(request, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}")))?;
-
-    let response = response_future
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 response error: {e}")))?;
-
-    if !response.status().is_success() {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("CONNECT rejected: {}", response.status()),
-        ));
-    }
-
-    let h2_recv = response.into_body();
-    Ok(H2ConnectStream::new(h2_send, h2_recv))
 }

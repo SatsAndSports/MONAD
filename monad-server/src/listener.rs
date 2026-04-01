@@ -1,7 +1,7 @@
 //! TCP and QUIC listener that accepts connections and performs the Noise NK handshake.
 
 use crate::quic_pool::QuicPool;
-use crate::session;
+use crate::session::RelaySession;
 use monad_common::noise;
 use monad_common::noise::NoiseStream;
 use monad_quic::stream::QuicStream;
@@ -68,8 +68,15 @@ pub async fn run(
                     let noise_stream = NoiseStream::new(tcp_stream, transport, label);
 
                     // Run the H2 session
-                    if let Err(e) = session::handle_session(noise_stream, quic_pool).await {
-                        error!("session error with {peer_addr}: {e}");
+                    match RelaySession::from_noise_stream(noise_stream, quic_pool).await {
+                        Ok(session) => {
+                            if let Err(e) = session.run().await {
+                                error!("session error with {peer_addr}: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            error!("H2 handshake failed with {peer_addr}: {e}");
+                        }
                     }
 
                     info!("connection with {peer_addr} closed (TCP)");
@@ -137,8 +144,15 @@ pub async fn run(
                                     let noise_stream =
                                         NoiseStream::new(quic_stream, transport, label);
 
-                                    if let Err(e) = session::handle_session(noise_stream, quic_pool).await {
-                                        error!("session error with {remote} (QUIC {stream_id:?}): {e}");
+                                    match RelaySession::from_noise_stream(noise_stream, quic_pool).await {
+                                        Ok(session) => {
+                                            if let Err(e) = session.run().await {
+                                                error!("session error with {remote} (QUIC {stream_id:?}): {e}");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("H2 handshake failed with {remote} (QUIC {stream_id:?}): {e}");
+                                        }
                                     }
 
                                     info!("QUIC stream {stream_id:?} from {remote} closed");

@@ -3,7 +3,7 @@ use monad_client::connector;
 use monad_client::connector::Hop;
 use monad_client::socks;
 use monad_client::tunnel;
-use std::sync::Arc;
+use monad_common::session::RelayConnection;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     let socks_listener = TcpListener::bind(&cli.socks).await?;
     info!("SOCKS5 proxy listening on {}", cli.socks);
 
-    if let Err(e) = accept_loop(&socks_listener, conn.h2_client.clone()).await {
+    if let Err(e) = accept_loop(&socks_listener, &conn).await {
         error!("accept loop error: {e}");
     }
 
@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn accept_loop(
     socks_listener: &TcpListener,
-    h2_client: Arc<tokio::sync::Mutex<h2::client::SendRequest<bytes::Bytes>>>,
+    conn: &RelayConnection,
 ) -> anyhow::Result<()> {
     let mut tunnels = JoinSet::new();
 
@@ -124,7 +124,8 @@ async fn accept_loop(
                 let (mut local_stream, peer_addr) = result?;
                 info!("SOCKS5 connection from {peer_addr}");
 
-                let h2_client = h2_client.clone();
+                // Clone the H2 client for this tunnel (before spawning)
+                let h2 = conn.clone_send_request().await;
 
                 tunnels.spawn(async move {
                     // Perform SOCKS5 handshake to learn the target
@@ -137,12 +138,6 @@ async fn accept_loop(
                     };
 
                     info!("SOCKS5 CONNECT to {} from {peer_addr}", target.authority);
-
-                    // Clone the H2 client for this tunnel
-                    let h2 = {
-                        let client = h2_client.lock().await;
-                        client.clone()
-                    };
 
                     // Open tunnel and proxy
                     match tunnel::open_tunnel(h2, &target.authority, &mut local_stream).await {
@@ -204,8 +199,6 @@ async fn accept_loop(
             error!("tunnel task panicked: {e}");
         }
     }
-
-    drop(h2_client);
 
     Ok(())
 }

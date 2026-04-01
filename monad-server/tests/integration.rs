@@ -17,7 +17,8 @@ use http::{Method, Request};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::identity;
 use monad_common::noise;
-use monad_client::connector::{self, Hop, ServerConnection};
+use monad_common::session::RelayConnection;
+use monad_client::connector::{self, Hop};
 use monad_common::protocol::{ClientMessage, ServerMessage};
 use monad_server::listener::ServerConfig;
 use monad_quic::stream::QuicStream;
@@ -110,7 +111,7 @@ async fn bind_ipv6_listener() -> Option<TcpListener> {
 }
 
 /// Connect to a MONAD server through the real client connector.
-async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &[u8]) -> ServerConnection {
+async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &[u8]) -> RelayConnection {
     connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
         pubkey: pubkey.to_vec(),
@@ -118,11 +119,6 @@ async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &[u8]) -> Ser
     }])
     .await
     .unwrap()
-}
-
-async fn clone_h2_client(conn: &ServerConnection) -> client::SendRequest<Bytes> {
-    let client = conn.h2_client.lock().await;
-    client.clone()
 }
 
 /// Open a CONNECT tunnel, send payload, read response.
@@ -238,7 +234,7 @@ async fn test_control_and_data_channels() {
 
     // Client
     let conn = connect_client(server_addr, &pubkey).await;
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     // Control channel: Ping/Pong
     control_ping_pong(&mut h2).await;
@@ -261,7 +257,7 @@ async fn test_concurrent_channels() {
 
     let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
-    let h2 = clone_h2_client(&conn).await;
+    let h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
 
@@ -292,7 +288,7 @@ async fn test_multiple_tunnels() {
 
     let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
-    let h2 = clone_h2_client(&conn).await;
+    let h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
 
@@ -344,7 +340,7 @@ async fn test_nested_tunnel() {
         Hop { addr: t_addr.to_string(), pubkey: t_pubkey, use_quic: false },
         Hop { addr: s_addr.to_string(), pubkey: s_pubkey, use_quic: false },
     ]).await.unwrap();
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     // Open a tunnel to the uppercase server (through S, via T)
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -371,7 +367,7 @@ async fn test_three_hop_tunnel() {
         Hop { addr: b_addr.to_string(), pubkey: b_pubkey, use_quic: false },
         Hop { addr: c_addr.to_string(), pubkey: c_pubkey, use_quic: false },
     ]).await.unwrap();
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"three hops").await;
@@ -391,7 +387,7 @@ async fn test_connect_to_ipv6_target() {
 
     let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     let target = format!("[::1]:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"ipv6 target").await;
@@ -414,7 +410,7 @@ async fn test_connect_to_ipv6_server() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let conn = connect_client(server_addr, &pubkey).await;
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"ipv6 server").await;
     assert_eq!(result, b"IPV6 SERVER");
@@ -441,7 +437,7 @@ async fn test_mixed_ipv4_ipv6_hops() {
         Hop { addr: ipv4_hop_addr.to_string(), pubkey: ipv4_hop_pubkey, use_quic: false },
         Hop { addr: ipv6_hop_addr.to_string(), pubkey: ipv6_hop_pubkey, use_quic: false },
     ]).await.unwrap();
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"mixed hops").await;
@@ -459,7 +455,7 @@ async fn test_connect_with_hostname_resolution() {
 
     let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     let target = format!("localhost:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"hostname test").await;
@@ -502,12 +498,12 @@ async fn start_monad_server_with_quic() -> (SocketAddr, Vec<u8>) {
 }
 
 /// Connect to a MONAD server over QUIC, run a Noise+H2 session,
-/// and return an H2 client handle.
+/// and return a RelayConnection.
 /// Takes a single Ed25519 public key — derives X25519 for Noise and SPKI for QUIC.
 async fn connect_client_quic(
     server_addr: SocketAddr,
     ed25519_pubkey: &[u8],
-) -> ServerConnection {
+) -> RelayConnection {
     let ed25519_pub: [u8; 32] = ed25519_pubkey.try_into().unwrap();
 
     // Derive SPKI DER for QUIC pinned key verification
@@ -538,19 +534,10 @@ async fn connect_client_quic(
     let noise_stream =
         noise::NoiseStream::new(quic_stream, transport, "test-quic-client".to_string());
 
-    // H2 client handshake over the Noise stream
-    let (h2_client, h2_conn) = h2::client::handshake(noise_stream).await.unwrap();
-
-    let driver_handle = tokio::spawn(async move {
-        if let Err(e) = h2_conn.await {
-            eprintln!("H2 driver error (QUIC): {e}");
-        }
-    });
-
-    ServerConnection {
-        h2_client: Arc::new(tokio::sync::Mutex::new(h2_client)),
-        driver_handles: vec![driver_handle],
-    }
+    // Create RelayConnection from the Noise stream
+    let (mut conn, driver) = RelayConnection::from_noise_stream(noise_stream).await.unwrap();
+    conn.add_driver(driver);
+    conn
 }
 
 /// Test: connect to a MONAD server over QUIC, open a CONNECT tunnel,
@@ -563,7 +550,7 @@ async fn test_quic_single_hop() {
 
     let (server_addr, pubkey) = start_monad_server_with_quic().await;
     let conn = connect_client_quic(server_addr, &pubkey).await;
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"hello via quic").await;
     assert_eq!(result, b"HELLO VIA QUIC");
@@ -581,7 +568,7 @@ async fn test_quic_control_and_data() {
 
     let (server_addr, pubkey) = start_monad_server_with_quic().await;
     let conn = connect_client_quic(server_addr, &pubkey).await;
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     // Control channel
     control_ping_pong(&mut h2).await;
@@ -615,7 +602,7 @@ async fn test_nested_quic_tunnel() {
 
     // Client connects to S via TCP (first hop)
     let conn_to_s = connect_client(s_addr, &s_pubkey).await;
-    let mut h2_to_s = clone_h2_client(&conn_to_s).await;
+    let mut h2_to_s = conn_to_s.clone_send_request().await;
 
     // Derive QUIC pin (SPKI DER hex) from T's Ed25519 public key
     let t_ed25519: [u8; 32] = t_pubkey.as_slice().try_into().unwrap();
@@ -656,13 +643,10 @@ async fn test_nested_quic_tunnel() {
     let noise_stream =
         noise::NoiseStream::new(stream, transport, "test-nested-quic-client".to_string());
 
-    // H2 handshake to T
-    let (mut h2_to_t, h2_conn_to_t) = h2::client::handshake(noise_stream).await.unwrap();
-    tokio::spawn(async move {
-        if let Err(e) = h2_conn_to_t.await {
-            eprintln!("H2 driver error (nested QUIC): {e}");
-        }
-    });
+    // Create RelayConnection to T
+    let (mut conn_to_t, driver) = RelayConnection::from_noise_stream(noise_stream).await.unwrap();
+    conn_to_t.add_driver(driver);
+    let mut h2_to_t = conn_to_t.clone_send_request().await;
 
     // Open a CONNECT tunnel to the uppercase server through T
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -671,6 +655,7 @@ async fn test_nested_quic_tunnel() {
 
     drop(h2_to_t);
     drop(h2_to_s);
+    conn_to_t.shutdown().await;
     conn_to_s.shutdown().await;
 }
 
@@ -706,7 +691,7 @@ async fn test_connector_quic_hop() {
     ])
     .await
     .unwrap();
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"connector quic hop").await;
@@ -759,10 +744,7 @@ async fn test_concurrent_quic_pool_access() {
             ])
             .await
             .unwrap();
-            let mut h2 = {
-                let client = conn.h2_client.lock().await;
-                client.clone()
-            };
+            let mut h2 = conn.clone_send_request().await;
 
             let payload = format!("concurrent client {i}");
             let target = format!("127.0.0.1:{upper_port}");
@@ -796,7 +778,7 @@ async fn test_quic_first_hop() {
     }])
     .await
     .unwrap();
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic first hop").await;
     assert_eq!(result, b"QUIC FIRST HOP");
@@ -830,7 +812,7 @@ async fn test_quic_first_hop_then_tcp() {
     ])
     .await
     .unwrap();
-    let mut h2 = clone_h2_client(&conn).await;
+    let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"quic then tcp").await;
