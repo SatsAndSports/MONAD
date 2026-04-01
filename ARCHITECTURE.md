@@ -14,17 +14,27 @@ The client exposes a local SOCKS5 proxy to applications. Internally, it converts
 
 ### `monad-common`
 
-Shared transport and protocol helpers.
+Shared transport, protocol, and session helpers.
 
 Important types:
-- `NoiseStream<T>`
+- `NoiseStream<T>` (`noise.rs`)
   - wraps an `AsyncRead + AsyncWrite` transport
   - performs encrypted Noise transport framing
   - tracks encrypted wire bytes
-- `H2ConnectStream`
+- `H2ConnectStream` (`h2stream.rs`)
   - wraps an H2 `SendStream + RecvStream` pair as a bidirectional async stream
   - allows another Noise+H2 session to run on top of an existing CONNECT tunnel
-- control message enums in `protocol.rs`
+- `ClientMessage` / `ServerMessage` (`protocol.rs`)
+  - wire protocol enums for the control stream (Hello, SessionParams, FakePayment, GetSessionStatus, SessionStatus, Error)
+- `RelayConnection` (`session.rs`)
+  - client-side handle to an established Noise+H2 session
+  - manages H2 client, driver handles, task handles, session pricing
+- `SessionPricing` (`session.rs`)
+  - local billing metadata with precomputed LCM for integer-only arithmetic
+- `proxy_bidirectional` (`proxy.rs`)
+  - shared generic bidirectional proxy used by client tunnels
+- `Ed25519Pubkey` / `ServerIdentity` (`identity.rs`)
+  - unified server identity; derives X25519 (for Noise) and SPKI DER (for QUIC) from one Ed25519 key
 
 ### `monad-client`
 
@@ -47,16 +57,16 @@ Responsibilities:
 
 ### `monad-quic`
 
-Standalone QUIC proof-of-concept for the future shared relay-to-relay transport.
+Shared QUIC transport building blocks, fully integrated into the main MONAD system. Provides `QuicStream`, `build_server_config`, `build_client_config`, and keygen helpers used by both `monad-server` and `monad-client` for QUIC hop support.
 
-This crate is not integrated into the main MONAD transport yet. It exists to validate QUIC fundamentals before integration:
+Core functionality:
 - Ed25519 self-signed certificate generation via `rcgen`
 - pinned public key authentication (SPKI DER comparison, no CA trust chain)
-- QUIC echo server and client using `quinn`
+- `QuicStream` type wrapping quinn bidirectional streams as `AsyncRead + AsyncWrite`
 - ALPN protocol identifier: `monad-relay/0`
 - 0-RTT disabled
 
-Subcommands:
+Also includes standalone echo tooling for transport testing:
 - `keygen` — generate a self-signed certificate and print the pinned public key
 - `server` — QUIC echo server that accepts connections and streams
 - `client` — connect with a pinned key, open N bidirectional streams, send/verify echoed data
@@ -81,7 +91,7 @@ An H2 stream using:
 POST /control
 ```
 
-Currently used for Ping/Pong scaffolding. This is where payment and metadata messages are intended to live.
+Used for session management: version negotiation (Hello/SessionParams), payments (FakePayment), and session status queries (GetSessionStatus/SessionStatus). See the "Control Protocol and Session Billing" section below for details.
 
 ### Data stream
 
@@ -223,6 +233,64 @@ This means:
 
 At intermediate hops in a nested route, the inner hop connection is itself just one long-lived CONNECT tunnel.
 
+## Control Protocol and Session Billing
+
+### Wire Format
+
+Control messages are JSON objects, newline-delimited, exchanged over the H2 control stream (`POST /control`). Each message is a single JSON line terminated by `\n`.
+
+### Message Types
+
+Client to server (`ClientMessage`):
+- `Hello { version }` — first message; declares the highest protocol version the client supports
+- `FakePayment { milli_sats }` — add fake credit to the session (placeholder for real payments)
+- `GetSessionStatus` — request a fresh session status snapshot
+
+Server to client (`ServerMessage`):
+- `SessionParams { version, in_bytes_per_millisat, out_bytes_per_millisat }` — sent in response to Hello; contains the negotiated version and pricing rates
+- `SessionStatus { session_total_in, session_total_out, total_paid_millisats, remaining_milli_sats, paused }` — current session accounting snapshot
+- `Error { message }` — server-initiated error or rejection
+
+### Version Negotiation
+
+The client sends `Hello { version }` as the first control message. The server computes `negotiated = min(client_version, SERVER_MAX_VERSION)`. If `negotiated < SERVER_MIN_VERSION`, the server sends an `Error` and closes the control stream. Otherwise it responds with `SessionParams` containing the negotiated version and pricing rates.
+
+### Paused-by-Default
+
+Sessions start paused with zero balance. While paused:
+- The control stream is always usable (free)
+- `CONNECT` requests are rejected with HTTP 402
+- The session unpauses only when the remaining balance becomes strictly positive
+
+### Billing Formula
+
+The amount due in millisats is computed as:
+
+```text
+amount_due = ceil(session_total_in / in_bytes_per_millisat + session_total_out / out_bytes_per_millisat)
+```
+
+The remaining balance is derived from totals:
+
+```text
+remaining = total_paid_millisats - amount_due
+```
+
+This is implemented with integer-only arithmetic via a precomputed `lcm(in_rate, out_rate)` and `u128` intermediate values to avoid overflow.
+
+### Chunk-Boundary Overshoot
+
+The balance can go negative between billing checks (a proxy chunk may push usage past the paid amount). When the server detects negative balance, it pauses the session and sends a `SessionStatus`. The client can then send another payment to resume.
+
+### Two Pricing Structures
+
+- **Wire**: `ServerMessage::SessionParams` carries the raw rates (no LCM). This is what crosses the network.
+- **Local**: `SessionPricing` (in `monad-common/src/session.rs`) includes the precomputed LCM and negotiated version. Both client and server construct this from `SessionParams` for billing math.
+
+### Client Auto-Funding
+
+The client opens a control stream immediately after connecting and sends `Hello`. When it receives `SessionStatus { paused: true, remaining_milli_sats <= 0, .. }`, it automatically sends a `FakePayment`. The client waits for the session to become unpaused before accepting SOCKS traffic. Intermediate hops in multi-hop chains each get their own control task with automatic funding.
+
 ## Shutdown Model
 
 Both client and server use graceful shutdown:
@@ -266,7 +334,7 @@ MONAD currently provides:
 
 MONAD does not currently provide Tor-style shared relay-to-relay traffic mixing. Each client maintains its own hop chain, so this is closer to a layered multi-hop paid proxy than a full anonymity network.
 
-## Future: QUIC Transport Between Hops
+## QUIC Transport Between Hops
 
 ### Motivation
 
@@ -474,7 +542,7 @@ The full QUIC transport chain is implemented and tested:
 
 ## Current Limitations
 
-- payment protocol is not implemented beyond control-channel scaffolding
+- real payment integration (Lightning or similar) is not yet implemented — currently using `FakePayment`
 - no persistent route configuration file yet
-- no per-user/session accounting on the control channel yet
 - QUIC connection pool does not yet handle connection eviction or stale entry cleanup
+- asymmetric pricing (rates other than 1/1) is not yet tested

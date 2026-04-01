@@ -13,15 +13,17 @@ It provides:
 ## Status
 
 Implemented today:
-- `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels
-- `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels
-- `monad-common`: shared Noise transport and H2 stream helpers
+- `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume
+- `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels, auto-funds sessions via the control stream
+- `monad-common`: shared Noise transport, H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, pinned-key auth, echo server/client, and shared config/keygen helpers used by server and client
 - QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, `quic-pin` H2 header for CONNECT forwarding
-- integration tests for direct, nested, IPv6, hostname-resolution, QUIC single-hop, QUIC nested tunnels, and mixed TCP/QUIC hop chains
+- session payment system: paused-by-default sessions, Hello/SessionParams version negotiation, fake payments, totals-based billing with directional pricing, pause/resume enforcement
+- integration tests for direct, nested, IPv6, hostname-resolution, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and session payment lifecycle
 
 Not implemented yet:
-- payments / accounting on the control channel beyond basic Ping/Pong scaffolding
+- real payment integration (Lightning or similar) — currently using `FakePayment`
+- persistent route configuration file
 
 ## Workspace
 
@@ -48,8 +50,13 @@ cargo test
 
 Current coverage includes:
 - Noise handshake and large-payload transport tests
-- direct single-hop tunneling
-- concurrent H2 control + data channels
+- session starts paused by default
+- second control stream rejected
+- CONNECT rejected while paused (402)
+- funded data channel (payment unpauses, then data flows)
+- session repauses and resumes after second payment
+- session overshoot with negative balance and resume
+- underpayment stays paused until balance is positive
 - multiple simultaneous tunnels
 - 2-hop and 3-hop nested routing
 - IPv6 final targets
@@ -66,6 +73,7 @@ Current coverage includes:
 - QUIC control + data channels
 - nested QUIC tunnel (TCP relay forwarding to QUIC relay)
 - client connector with QUIC hop (end-to-end `--hop quic:` path)
+- concurrent QUIC pool access
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
 
@@ -131,6 +139,8 @@ RUST_LOG=info cargo run -p monad-client -- \
 ```
 
 The client listens locally as a SOCKS5 proxy on `127.0.0.1:1080` by default.
+
+Sessions start paused with zero balance. The client automatically opens a control stream and sends a fake payment to fund the session before accepting SOCKS traffic. The default funding amount is 1024 millisats per payment; override with `--fake-payment-millisats`.
 
 QUIC hops:
 

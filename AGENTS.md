@@ -21,19 +21,25 @@ cargo run -p monad-quic -- ...
 ## Repo Shape
 
 - `monad-common`
-  - shared transport and helper code
-  - `NoiseStream`
-  - `H2ConnectStream`
+  - shared transport, protocol, and session code
+  - `NoiseStream` (`noise.rs`)
+  - `H2ConnectStream` (`h2stream.rs`)
+  - `ClientMessage` / `ServerMessage` wire protocol (`protocol.rs`)
+  - `RelayConnection`, `SessionPricing`, billing math (`session.rs`)
+  - `proxy_bidirectional` shared proxy (`proxy.rs`)
+  - `Ed25519Pubkey`, `ServerIdentity`, key derivation (`identity.rs`)
 - `monad-client`
   - reusable library code plus binary entrypoint
   - SOCKS5 listener
-  - multi-hop connector
-  - tunnel proxying
+  - multi-hop connector (`connector.rs`)
+  - tunnel proxying (`tunnel.rs`)
+  - client control task with auto-payment (`control.rs`)
 - `monad-server`
   - reusable library code plus binary entrypoint
-  - listener
-  - H2 session handling
-  - TCP proxying
+  - TCP+QUIC listener (`listener.rs`)
+  - `RelaySession<T>`, billing, control stream handler, version negotiation (`session.rs`)
+  - `proxy_bidirectional_accounted` with pause/resume enforcement (`proxy.rs`)
+  - QUIC connection pool (`quic_pool.rs`)
 - `monad-quic`
   - shared QUIC transport code plus standalone echo tooling
   - reusable library code plus binary entrypoint
@@ -49,6 +55,19 @@ cargo run -p monad-quic -- ...
 - Control stream: `POST /control`
 - Data stream: `CONNECT host:port`
 - Nesting: another full Noise+H2 session can run on top of an H2 CONNECT tunnel via `H2ConnectStream`
+
+### Control Protocol
+
+- Wire format: JSON newline-delimited messages on the H2 control stream (`POST /control`)
+- Handshake: client sends `Hello { version }`, server responds with `SessionParams { version, in_bytes_per_millisat, out_bytes_per_millisat }`
+- Version negotiation: `min(client_version, SERVER_MAX_VERSION)`, reject if < `SERVER_MIN_VERSION`
+- Sessions start paused-by-default with zero balance; control stream is always free while paused
+- Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, integer-only via precomputed LCM
+- `FakePayment` credits the session; server unpauses when balance > 0 and sends `SessionStatus`
+- `CONNECT` rejected with 402 while paused
+- Balance can go negative (chunk-boundary overshoot); session repauses
+- `GetSessionStatus` requests a fresh `SessionStatus` snapshot
+- `Error` for server-initiated rejections (e.g. version mismatch)
 
 ### QUIC Transport
 
@@ -142,7 +161,13 @@ If you change shutdown logic:
 The test suite currently covers:
 - Noise transport correctness
 - large payload chunking
-- control + data channel behavior
+- session starts paused by default
+- second control stream rejected
+- CONNECT rejected while paused (402)
+- funded data channel (payment unpauses, then data flows)
+- session repauses and resumes after second payment
+- session overshoot with negative balance and resume
+- underpayment stays paused until balance is positive
 - concurrent tunnels
 - nested 2-hop and 3-hop routes
 - IPv6 targets and IPv6 listeners
