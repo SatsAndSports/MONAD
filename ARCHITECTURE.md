@@ -325,10 +325,10 @@ The inner layer:
 - S sees only opaque Noise-encrypted bytes flowing through — it cannot read the C-to-T traffic
 
 T authenticates itself twice:
-- to S via QUIC/TLS (pinned self-signed certificate)
-- to C via Noise NK (Noise static key)
+- to S via QUIC/TLS (pinned self-signed certificate derived from T's Ed25519 key)
+- to C via Noise NK (X25519 key derived from T's Ed25519 key)
 
-These are separate keys serving separate purposes. The QUIC key authenticates T to its transport peer (S). The Noise key authenticates T to the client (C) with end-to-hop encryption. Both are required.
+Both authentications derive from the same Ed25519 identity. The X25519 key for Noise is computed as `SHA-512(seed)[0..32]`, and the QUIC certificate is a self-signed Ed25519 cert. Clients and relays only need to know one public key per server.
 
 ### QUIC Authentication Model
 
@@ -359,9 +359,11 @@ QUIC listener ──> accept_bi() ──> QuicStream ──────┘
 
 The session handler does not know or care which transport delivered the bytes. This means the entire existing Noise+H2 protocol works unchanged over QUIC streams.
 
-A QUIC-capable server has two separate keys configured at startup:
-- its Noise static key (for Noise NK handshakes, same as today)
-- its QUIC pinned key (a self-signed Ed25519 certificate for QUIC/TLS)
+A QUIC-capable server has one Ed25519 identity configured at startup. From it, two keys are derived internally:
+- X25519 private key for Noise NK handshakes: `SHA-512(seed)[0..32]`
+- self-signed Ed25519 certificate for QUIC/TLS
+
+The `--quic` flag enables the QUIC listener; the QUIC certificate is generated from the same `--private-key` seed.
 
 ### CONNECT Syntax for QUIC Hops
 
@@ -399,40 +401,35 @@ This is the core scaling benefit: one QUIC handshake to T is amortized across al
 
 ### Client `--hop` Syntax for QUIC Hops
 
-The current `--hop` syntax is:
+The `--hop` syntax uses a single Ed25519 public key per hop:
 
 ```text
---hop addr:port,<noise_key>
+--hop addr:port,<pubkey>
+--hop quic:addr:port,<pubkey>
 ```
 
-For a QUIC-capable hop, the syntax will be:
-
-```text
---hop quic:addr:port,<noise_key>,<quic_pin>
-```
-
-The `quic:` prefix tells the client to include a `quic-pin` header in the CONNECT request to the previous relay. The Noise key is still required because the client runs its own nested Noise+H2 session to that hop.
+The `quic:` prefix tells the client to include a `quic-pin` header in the CONNECT request to the previous relay. The client derives both the X25519 public key (for its own Noise session) and the SPKI DER (for the `quic-pin` header) from the same Ed25519 public key.
 
 Example 2-hop route where the second hop uses QUIC:
 
 ```bash
 monad-client \
-  --hop 10.0.0.1:9050,<S_noise_key> \
-  --hop quic:10.0.0.2:9050,<T_noise_key>,<T_quic_pin>
+  --hop 10.0.0.1:9050,<S_pubkey> \
+  --hop quic:10.0.0.2:9050,<T_pubkey>
 ```
 
 The client:
-1. Connects to S at `10.0.0.1:9050` via TCP+Noise (authenticating S)
-2. Sends `CONNECT 10.0.0.2:9050` with header `quic-pin: <T_quic_pin>` to S over H2
+1. Connects to S at `10.0.0.1:9050` via TCP+Noise (authenticating S using X25519 derived from S's Ed25519 key)
+2. Sends `CONNECT 10.0.0.2:9050` with header `quic-pin: <SPKI derived from T's Ed25519 key>` to S over H2
 3. S connects to T via QUIC (authenticating T with the pinned key)
-4. Client runs a nested Noise+H2 session to T through the tunnel (authenticating T with T's Noise key)
+4. Client runs a nested Noise+H2 session to T through the tunnel (authenticating T using X25519 derived from T's Ed25519 key)
 
 ### Design Constraints
 
 - disable QUIC 0-RTT at first to avoid replay complexity
 - keep current direct and nested MONAD modes working unchanged over TCP
 - the inner MONAD Noise+H2 session model is unchanged — QUIC is a transport optimization only
-- a MONAD server's QUIC identity (self-signed Ed25519 certificate) is separate from its Noise static key
+- a MONAD server's QUIC certificate and Noise key are both derived from a single Ed25519 identity
 
 ### QUIC Implementation Status
 
@@ -467,10 +464,10 @@ The full QUIC transport chain is implemented and tested:
 
 1. **`QuicStream` type in `monad-quic`** — wraps a quinn bidirectional stream as `AsyncRead + AsyncWrite`, used interchangeably with `TcpStream`
 2. **QUIC listener in `monad-server`** — binds a UDP socket on the same port as the TCP listener, accepts QUIC connections, feeds incoming streams into the existing Noise+H2 session handler
-3. **QUIC keygen in `monad-server`** — `monad-server keygen` generates both a Noise keypair and a QUIC self-signed certificate; `--quic-cert` and `--quic-key` CLI args load them at startup
+3. **Unified identity in `monad-server`** — `monad-server keygen` generates a single Ed25519 identity; the X25519 key for Noise and the QUIC certificate are derived from it. The `--quic` flag enables the QUIC listener at startup.
 4. **`quic-pin` header parsing in `monad-server`** — detects the `quic-pin` header on CONNECT requests, extracts the pinned key, connects via QUIC instead of TCP
 5. **QUIC connection pool in `monad-server`** — maintains shared QUIC connections keyed by `(host, port)`, reuses across client sessions
-6. **`--hop quic:` parsing in `monad-client`** — parses the `quic:` prefix and QUIC pinned key from the hop spec, emits a CONNECT request with `quic-pin` header to the previous relay
+6. **`--hop quic:` parsing in `monad-client`** — parses the `quic:` prefix from the hop spec, derives the SPKI from the Ed25519 public key, emits a CONNECT request with `quic-pin` header to the previous relay
 7. **Integration tests** — cover QUIC single-hop, QUIC with control+data channels, nested QUIC tunnels (manual and via connector), alongside all existing TCP tests
 
 ## Current Limitations

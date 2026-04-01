@@ -76,12 +76,15 @@ cargo run -p monad-server -- keygen
 ```
 
 This prints:
-- a private key for the server process
-- a public key to give to clients
+- a private key (Ed25519 seed) for the server process
+- a public key (Ed25519) to give to clients
+- a QUIC certificate (derived from the same key)
+
+One key is used for both Noise and QUIC authentication.
 
 ### 2. Start one or more servers
 
-Single hop:
+Single hop (TCP only):
 
 ```bash
 RUST_LOG=info cargo run -p monad-server -- run \
@@ -89,12 +92,20 @@ RUST_LOG=info cargo run -p monad-server -- run \
   --private-key <SERVER_PRIVATE_KEY>
 ```
 
+With QUIC enabled (add `--quic`):
+
+```bash
+RUST_LOG=info cargo run -p monad-server -- run \
+  --listen 127.0.0.1:9050 \
+  --private-key <SERVER_PRIVATE_KEY> --quic
+```
+
 Multi-hop example:
 
 ```bash
 RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9051 --private-key <HOP1_PRIV>
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9052 --private-key <HOP2_PRIV>
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9053 --private-key <HOP3_PRIV>
+RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9052 --private-key <HOP2_PRIV> --quic
+RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9053 --private-key <HOP3_PRIV> --quic
 ```
 
 ### 3. Start the client
@@ -123,12 +134,12 @@ QUIC hops (previous relay connects to next hop via QUIC instead of TCP):
 
 ```bash
 RUST_LOG=info cargo run -p monad-client -- \
-  --hop 127.0.0.1:9051,<HOP1_NOISE_PUB> \
-  --hop quic:127.0.0.1:9052,<HOP2_NOISE_PUB>,<HOP2_QUIC_PIN> \
+  --hop 127.0.0.1:9051,<HOP1_PUB> \
+  --hop quic:127.0.0.1:9052,<HOP2_PUB> \
   --socks 127.0.0.1:1080
 ```
 
-The `quic:` prefix tells the client to instruct the previous hop to connect via QUIC instead of TCP. The Noise key authenticates the hop to the client; the QUIC pinned key authenticates the hop to the relay that connects to it. See `ARCHITECTURE.md` for the full layering model.
+The `quic:` prefix tells the client to instruct the previous hop to connect via QUIC instead of TCP. Each hop uses a single Ed25519 public key — the Noise X25519 key and QUIC pinned key are both derived from it. See `ARCHITECTURE.md` for the full layering model.
 
 ## Example Usage
 

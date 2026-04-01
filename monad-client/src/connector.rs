@@ -9,6 +9,7 @@ use bytes::Bytes;
 use h2::client;
 use http::{Method, Request, Uri};
 use monad_common::h2stream::H2ConnectStream;
+use monad_common::identity;
 use monad_common::noise::{self, NoiseStream};
 use std::io;
 use std::sync::Arc;
@@ -17,18 +18,21 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-/// A hop in the tunnel chain: server address and its Noise public key.
+/// A hop in the tunnel chain: server address and its Ed25519 public key.
 ///
-/// If `quic_pin` is set, the previous relay in the chain will connect to this
-/// hop via QUIC instead of TCP, using the pinned public key to authenticate it.
+/// The Ed25519 public key is the server's unified identity. The X25519 public
+/// key for Noise and the SPKI DER for QUIC pinning are derived from it
+/// automatically.
+///
+/// If `use_quic` is true, the previous relay in the chain will connect to this
+/// hop via QUIC instead of TCP.
 #[derive(Debug, Clone)]
 pub struct Hop {
     pub addr: String,
+    /// Ed25519 public key (32 bytes) — the server's unified identity.
     pub pubkey: Vec<u8>,
-    /// Optional QUIC pinned public key (SPKI DER, hex-decoded).
-    /// When set, the CONNECT request to this hop includes a `quic-pin` header
-    /// so the preceding relay uses QUIC transport.
-    pub quic_pin: Option<Vec<u8>>,
+    /// Whether the previous relay should connect to this hop via QUIC.
+    pub use_quic: bool,
 }
 
 /// An established connection to a MONAD server, ready to open H2 streams.
@@ -61,7 +65,7 @@ pub async fn connect(server_addr: &str, server_pubkey: &[u8]) -> io::Result<Serv
     connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
         pubkey: server_pubkey.to_vec(),
-        quic_pin: None,
+        use_quic: false,
     }])
     .await
 }
@@ -123,8 +127,17 @@ where
         hop.addr
     );
 
+    // Derive X25519 public key from the Ed25519 public key for Noise
+    let ed25519_pub: [u8; 32] = hop.pubkey.as_slice().try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("public key must be 32 bytes, got {}", hop.pubkey.len()),
+        )
+    })?;
+    let x25519_pub = identity::ed25519_pubkey_to_x25519_pubkey(&ed25519_pub)?;
+
     // Noise NK handshake with this hop
-    let transport = noise::handshake_initiator(&mut stream, &hop.pubkey).await?;
+    let transport = noise::handshake_initiator(&mut stream, &x25519_pub).await?;
     let label = format!("client hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
     let noise_stream = NoiseStream::new(stream, transport, label);
 
@@ -152,8 +165,21 @@ where
             next.addr
         );
 
+        // If the next hop uses QUIC, compute the SPKI DER for the quic-pin header
+        let quic_pin = if next.use_quic {
+            let next_ed25519: [u8; 32] = next.pubkey.as_slice().try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "next hop public key must be 32 bytes",
+                )
+            })?;
+            Some(identity::ed25519_pubkey_to_spki_der(&next_ed25519))
+        } else {
+            None
+        };
+
         let h2_connect_stream =
-            open_h2_connect(h2_client, &next.addr, next.quic_pin.as_deref()).await?;
+            open_h2_connect(h2_client, &next.addr, quic_pin.as_deref()).await?;
 
         // Recurse: perform Noise + H2 over this tunnel for the next hop
         let mut conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;

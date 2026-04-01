@@ -11,20 +11,19 @@ use tracing::{error, info, warn};
 #[derive(Parser)]
 #[command(name = "monad-client", about = "MONAD tunnel client")]
 struct Cli {
-    /// Server hop(s) in order: addr,pubkey_hex or quic:addr,pubkey_hex,quic_pin_hex
+    /// Server hop(s) in order: addr:port,pubkey_hex or quic:addr:port,pubkey_hex
     ///
-    /// For a direct connection, specify one hop (the server).
-    /// For onion routing, specify multiple hops in order.
-    /// The last hop is the server that proxies to external targets.
+    /// Each hop uses a single Ed25519 public key (32 bytes, 64 hex chars).
+    /// The key is used for both Noise authentication and QUIC pinning.
     ///
-    /// Example (direct):
-    ///   --hop 1.2.3.4:9050,<pubkey_hex>
+    /// For a direct connection, specify one hop:
+    ///   --hop 1.2.3.4:9050,<pubkey>
     ///
-    /// Example (nested, through T then S):
-    ///   --hop T_addr:9050,<T_pubkey> --hop S_addr:9050,<S_pubkey>
+    /// For onion routing, specify multiple hops:
+    ///   --hop T:9050,<T_pubkey> --hop S:9050,<S_pubkey>
     ///
-    /// Example (QUIC hop — previous relay connects via QUIC):
-    ///   --hop T_addr:9050,<T_pubkey> --hop quic:S_addr:9050,<S_pubkey>,<S_quic_pin>
+    /// For QUIC hops (previous relay connects via QUIC):
+    ///   --hop T:9050,<T_pubkey> --hop quic:S:9050,<S_pubkey>
     #[arg(long, required = true)]
     hop: Vec<String>,
 
@@ -35,55 +34,30 @@ struct Cli {
 
 fn parse_hop(s: &str) -> anyhow::Result<Hop> {
     // Check for quic: prefix
-    if let Some(rest) = s.strip_prefix("quic:") {
-        // Format: quic:addr:port,noise_pubkey_hex,quic_pin_hex
-        // Split from the right: last comma separates quic_pin, second-to-last separates noise key
-        let (addr_and_noise, quic_pin_hex) = rest
-            .rsplit_once(',')
-            .ok_or_else(|| anyhow::anyhow!("QUIC hop must be quic:addr:port,pubkey_hex,quic_pin_hex — got: {s}"))?;
-
-        let (addr, noise_hex) = addr_and_noise
-            .rsplit_once(',')
-            .ok_or_else(|| anyhow::anyhow!("QUIC hop must be quic:addr:port,pubkey_hex,quic_pin_hex — got: {s}"))?;
-
-        let pubkey = hex::decode(noise_hex)?;
-        if pubkey.len() != 32 {
-            anyhow::bail!(
-                "Noise public key must be 32 bytes (64 hex chars), got {} bytes for hop {addr}",
-                pubkey.len()
-            );
-        }
-
-        let quic_pin = hex::decode(quic_pin_hex)?;
-        if quic_pin.is_empty() {
-            anyhow::bail!("QUIC pin must not be empty for hop {addr}");
-        }
-
-        Ok(Hop {
-            addr: addr.to_string(),
-            pubkey,
-            quic_pin: Some(quic_pin),
-        })
+    let (rest, use_quic) = if let Some(rest) = s.strip_prefix("quic:") {
+        (rest, true)
     } else {
-        // Standard TCP hop: addr:port,noise_pubkey_hex
-        let (addr, pubkey_hex) = s
-            .rsplit_once(',')
-            .ok_or_else(|| anyhow::anyhow!("hop must be addr:port,pubkey_hex — got: {s}"))?;
+        (s, false)
+    };
 
-        let pubkey = hex::decode(pubkey_hex)?;
-        if pubkey.len() != 32 {
-            anyhow::bail!(
-                "public key must be 32 bytes (64 hex chars), got {} bytes for hop {addr}",
-                pubkey.len()
-            );
-        }
+    // Format: addr:port,pubkey_hex (one comma, pubkey is always last)
+    let (addr, pubkey_hex) = rest
+        .rsplit_once(',')
+        .ok_or_else(|| anyhow::anyhow!("hop must be addr:port,pubkey_hex — got: {s}"))?;
 
-        Ok(Hop {
-            addr: addr.to_string(),
-            pubkey,
-            quic_pin: None,
-        })
+    let pubkey = hex::decode(pubkey_hex)?;
+    if pubkey.len() != 32 {
+        anyhow::bail!(
+            "public key must be 32 bytes (64 hex chars), got {} bytes for hop {addr}",
+            pubkey.len()
+        );
     }
+
+    Ok(Hop {
+        addr: addr.to_string(),
+        pubkey,
+        use_quic,
+    })
 }
 
 #[tokio::main]
@@ -112,7 +86,11 @@ async fn main() -> anyhow::Result<()> {
         "connecting through {} hop(s): {}",
         hops.len(),
         hops.iter()
-            .map(|h| h.addr.as_str())
+            .map(|h| if h.use_quic {
+                format!("quic:{}", h.addr)
+            } else {
+                h.addr.clone()
+            })
             .collect::<Vec<_>>()
             .join(" → ")
     );

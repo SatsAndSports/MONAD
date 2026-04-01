@@ -15,6 +15,7 @@ use bytes::Bytes;
 use h2::client;
 use http::{Method, Request};
 use monad_common::h2stream::wait_for_send_capacity;
+use monad_common::identity;
 use monad_common::noise;
 use monad_client::connector::{self, Hop, ServerConnection};
 use monad_common::protocol::{ClientMessage, ServerMessage};
@@ -58,25 +59,27 @@ async fn run_uppercase_server(listener: TcpListener) {
     }
 }
 
-/// Spin up a MONAD server and return (server_addr, pubkey).
+/// Spin up a MONAD server and return (server_addr, ed25519_pubkey).
 async fn start_monad_server() -> (std::net::SocketAddr, Vec<u8>) {
-    let (privkey, pubkey) = noise::generate_keypair();
+    let (seed, pubkey) = identity::generate_identity().unwrap();
+    let x25519_priv = identity::ed25519_seed_to_x25519_private(&seed);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let config = Arc::new(ServerConfig {
-        private_key: privkey,
+        private_key: x25519_priv.to_vec(),
     });
 
     tokio::spawn(monad_server::listener::run(listener, None, config));
 
-    (addr, pubkey)
+    (addr, pubkey.to_vec())
 }
 
-/// Spin up a MONAD server bound to a specific address and return (server_addr, pubkey).
+/// Spin up a MONAD server bound to a specific address and return (server_addr, ed25519_pubkey).
 async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Vec<u8>)> {
-    let (privkey, pubkey) = noise::generate_keypair();
+    let (seed, pubkey) = identity::generate_identity().unwrap();
+    let x25519_priv = identity::ed25519_seed_to_x25519_private(&seed);
 
     let listener = match TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
@@ -88,12 +91,12 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Vec
     let addr = listener.local_addr().unwrap();
 
     let config = Arc::new(ServerConfig {
-        private_key: privkey,
+        private_key: x25519_priv.to_vec(),
     });
 
     tokio::spawn(monad_server::listener::run(listener, None, config));
 
-    Some((addr, pubkey))
+    Some((addr, pubkey.to_vec()))
 }
 
 async fn bind_ipv6_listener() -> Option<TcpListener> {
@@ -111,7 +114,7 @@ async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &[u8]) -> Ser
     connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
         pubkey: pubkey.to_vec(),
-        quic_pin: None,
+        use_quic: false,
     }])
     .await
     .unwrap()
@@ -338,8 +341,8 @@ async fn test_nested_tunnel() {
 
     // Client connects through T → S
     let conn = connector::connect_through_chain(&[
-        Hop { addr: t_addr.to_string(), pubkey: t_pubkey, quic_pin: None },
-        Hop { addr: s_addr.to_string(), pubkey: s_pubkey, quic_pin: None },
+        Hop { addr: t_addr.to_string(), pubkey: t_pubkey, use_quic: false },
+        Hop { addr: s_addr.to_string(), pubkey: s_pubkey, use_quic: false },
     ]).await.unwrap();
     let mut h2 = clone_h2_client(&conn).await;
 
@@ -364,9 +367,9 @@ async fn test_three_hop_tunnel() {
     let (c_addr, c_pubkey) = start_monad_server().await;
 
     let conn = connector::connect_through_chain(&[
-        Hop { addr: a_addr.to_string(), pubkey: a_pubkey, quic_pin: None },
-        Hop { addr: b_addr.to_string(), pubkey: b_pubkey, quic_pin: None },
-        Hop { addr: c_addr.to_string(), pubkey: c_pubkey, quic_pin: None },
+        Hop { addr: a_addr.to_string(), pubkey: a_pubkey, use_quic: false },
+        Hop { addr: b_addr.to_string(), pubkey: b_pubkey, use_quic: false },
+        Hop { addr: c_addr.to_string(), pubkey: c_pubkey, use_quic: false },
     ]).await.unwrap();
     let mut h2 = clone_h2_client(&conn).await;
 
@@ -435,8 +438,8 @@ async fn test_mixed_ipv4_ipv6_hops() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let conn = connector::connect_through_chain(&[
-        Hop { addr: ipv4_hop_addr.to_string(), pubkey: ipv4_hop_pubkey, quic_pin: None },
-        Hop { addr: ipv6_hop_addr.to_string(), pubkey: ipv6_hop_pubkey, quic_pin: None },
+        Hop { addr: ipv4_hop_addr.to_string(), pubkey: ipv4_hop_pubkey, use_quic: false },
+        Hop { addr: ipv6_hop_addr.to_string(), pubkey: ipv6_hop_pubkey, use_quic: false },
     ]).await.unwrap();
     let mut h2 = clone_h2_client(&conn).await;
 
@@ -471,10 +474,12 @@ async fn test_connect_with_hostname_resolution() {
 // ---------------------------------------------------------------------------
 
 /// Spin up a MONAD server with both TCP and QUIC listeners.
-/// Returns (server_addr, noise_pubkey, quic_pin_hex).
-async fn start_monad_server_with_quic() -> (SocketAddr, Vec<u8>, String) {
-    let (privkey, pubkey) = noise::generate_keypair();
-    let quic_km = monad_quic::keygen::generate().unwrap();
+/// Returns (server_addr, ed25519_pubkey).
+/// Both Noise and QUIC use the same Ed25519 identity.
+async fn start_monad_server_with_quic() -> (SocketAddr, Vec<u8>) {
+    let (seed, pubkey) = identity::generate_identity().unwrap();
+    let x25519_priv = identity::ed25519_seed_to_x25519_private(&seed);
+    let quic_km = monad_quic::keygen::generate_from_seed(&seed).unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -484,7 +489,7 @@ async fn start_monad_server_with_quic() -> (SocketAddr, Vec<u8>, String) {
     let quic_endpoint = quinn::Endpoint::server(quic_config, addr).unwrap();
 
     let config = Arc::new(ServerConfig {
-        private_key: privkey,
+        private_key: x25519_priv.to_vec(),
     });
 
     tokio::spawn(monad_server::listener::run(
@@ -493,18 +498,20 @@ async fn start_monad_server_with_quic() -> (SocketAddr, Vec<u8>, String) {
         config,
     ));
 
-    (addr, pubkey, quic_km.pin_hex)
+    (addr, pubkey.to_vec())
 }
 
 /// Connect to a MONAD server over QUIC, run a Noise+H2 session,
 /// and return an H2 client handle.
+/// Takes a single Ed25519 public key — derives X25519 for Noise and SPKI for QUIC.
 async fn connect_client_quic(
     server_addr: SocketAddr,
-    noise_pubkey: &[u8],
-    quic_pin_hex: &str,
+    ed25519_pubkey: &[u8],
 ) -> ServerConnection {
-    // Build QUIC client config with pinned key verification
-    let pinned_spki = hex::decode(quic_pin_hex).unwrap();
+    let ed25519_pub: [u8; 32] = ed25519_pubkey.try_into().unwrap();
+
+    // Derive SPKI DER for QUIC pinned key verification
+    let pinned_spki = identity::ed25519_pubkey_to_spki_der(&ed25519_pub);
     let client_config = monad_quic::client::build_client_config(pinned_spki).unwrap();
 
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
@@ -521,8 +528,11 @@ async fn connect_client_quic(
     let (send, recv) = conn.open_bi().await.unwrap();
     let mut quic_stream = QuicStream::new(send, recv);
 
+    // Derive X25519 public key for Noise handshake
+    let x25519_pub = identity::ed25519_pubkey_to_x25519_pubkey(&ed25519_pub).unwrap();
+
     // Noise handshake over the QUIC stream
-    let transport = noise::handshake_initiator(&mut quic_stream, noise_pubkey)
+    let transport = noise::handshake_initiator(&mut quic_stream, &x25519_pub)
         .await
         .unwrap();
     let noise_stream =
@@ -551,8 +561,8 @@ async fn test_quic_single_hop() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey, quic_pin) = start_monad_server_with_quic().await;
-    let conn = connect_client_quic(server_addr, &pubkey, &quic_pin).await;
+    let (server_addr, pubkey) = start_monad_server_with_quic().await;
+    let conn = connect_client_quic(server_addr, &pubkey).await;
     let mut h2 = clone_h2_client(&conn).await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"hello via quic").await;
@@ -569,8 +579,8 @@ async fn test_quic_control_and_data() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey, quic_pin) = start_monad_server_with_quic().await;
-    let conn = connect_client_quic(server_addr, &pubkey, &quic_pin).await;
+    let (server_addr, pubkey) = start_monad_server_with_quic().await;
+    let conn = connect_client_quic(server_addr, &pubkey).await;
     let mut h2 = clone_h2_client(&conn).await;
 
     // Control channel
@@ -598,14 +608,19 @@ async fn test_nested_quic_tunnel() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     // Server T (final hop — QUIC-enabled, will proxy to uppercase server)
-    let (t_addr, t_noise_pubkey, t_quic_pin) = start_monad_server_with_quic().await;
+    let (t_addr, t_pubkey) = start_monad_server_with_quic().await;
 
     // Server S (intermediate hop — TCP only, will forward via QUIC to T)
-    let (s_addr, s_noise_pubkey) = start_monad_server().await;
+    let (s_addr, s_pubkey) = start_monad_server().await;
 
     // Client connects to S via TCP (first hop)
-    let conn_to_s = connect_client(s_addr, &s_noise_pubkey).await;
+    let conn_to_s = connect_client(s_addr, &s_pubkey).await;
     let mut h2_to_s = clone_h2_client(&conn_to_s).await;
+
+    // Derive QUIC pin (SPKI DER hex) from T's Ed25519 public key
+    let t_ed25519: [u8; 32] = t_pubkey.as_slice().try_into().unwrap();
+    let t_spki = identity::ed25519_pubkey_to_spki_der(&t_ed25519);
+    let t_quic_pin = hex::encode(&t_spki);
 
     // Ask S to CONNECT to T via QUIC (using quic-pin header)
     let t_authority = format!("127.0.0.1:{}", t_addr.port());
@@ -630,9 +645,12 @@ async fn test_nested_quic_tunnel() {
     let h2_connect_stream =
         monad_common::h2stream::H2ConnectStream::new(h2_send_to_t, h2_recv_from_t);
 
+    // Derive X25519 public key from T's Ed25519 key for the Noise handshake
+    let t_x25519_pub = identity::ed25519_pubkey_to_x25519_pubkey(&t_ed25519).unwrap();
+
     // Noise handshake to T (nested inside the QUIC-forwarded tunnel)
     let mut stream = h2_connect_stream;
-    let transport = noise::handshake_initiator(&mut stream, &t_noise_pubkey)
+    let transport = noise::handshake_initiator(&mut stream, &t_x25519_pub)
         .await
         .unwrap();
     let noise_stream =
@@ -668,23 +686,22 @@ async fn test_connector_quic_hop() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     // Server T (final hop — QUIC-enabled)
-    let (t_addr, t_noise_pubkey, t_quic_pin) = start_monad_server_with_quic().await;
+    let (t_addr, t_pubkey) = start_monad_server_with_quic().await;
 
     // Server S (intermediate hop — TCP only)
-    let (s_addr, s_noise_pubkey) = start_monad_server().await;
+    let (s_addr, s_pubkey) = start_monad_server().await;
 
-    // Use the client connector with a QUIC hop
-    let quic_pin_bytes = hex::decode(&t_quic_pin).unwrap();
+    // Use the client connector with a QUIC hop (single key per hop)
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: s_addr.to_string(),
-            pubkey: s_noise_pubkey,
-            quic_pin: None,
+            pubkey: s_pubkey,
+            use_quic: false,
         },
         Hop {
             addr: format!("127.0.0.1:{}", t_addr.port()),
-            pubkey: t_noise_pubkey,
-            quic_pin: Some(quic_pin_bytes),
+            pubkey: t_pubkey,
+            use_quic: true,
         },
     ])
     .await
@@ -712,12 +729,11 @@ async fn test_concurrent_quic_pool_access() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     // Server T (QUIC-enabled, shared target)
-    let (t_addr, t_noise_pubkey, t_quic_pin) = start_monad_server_with_quic().await;
+    let (t_addr, t_pubkey) = start_monad_server_with_quic().await;
 
     // Server S (intermediate, all clients connect through this)
-    let (s_addr, s_noise_pubkey) = start_monad_server().await;
+    let (s_addr, s_pubkey) = start_monad_server().await;
 
-    let quic_pin_bytes = hex::decode(&t_quic_pin).unwrap();
     let t_port = t_addr.port();
     let upper_port = upper_addr.port();
 
@@ -725,21 +741,20 @@ async fn test_concurrent_quic_pool_access() {
     let mut handles = Vec::new();
     for i in 0..5 {
         let s_addr = s_addr;
-        let s_noise_pubkey = s_noise_pubkey.clone();
-        let t_noise_pubkey = t_noise_pubkey.clone();
-        let quic_pin_bytes = quic_pin_bytes.clone();
+        let s_pubkey = s_pubkey.clone();
+        let t_pubkey = t_pubkey.clone();
 
         handles.push(tokio::spawn(async move {
             let conn = connector::connect_through_chain(&[
                 Hop {
                     addr: s_addr.to_string(),
-                    pubkey: s_noise_pubkey,
-                    quic_pin: None,
+                    pubkey: s_pubkey,
+                    use_quic: false,
                 },
                 Hop {
                     addr: format!("127.0.0.1:{t_port}"),
-                    pubkey: t_noise_pubkey,
-                    quic_pin: Some(quic_pin_bytes),
+                    pubkey: t_pubkey,
+                    use_quic: true,
                 },
             ])
             .await

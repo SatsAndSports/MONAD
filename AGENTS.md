@@ -55,7 +55,7 @@ cargo run -p monad-quic -- ...
 - Relay-to-relay transport: QUIC (replaces TCP between hops, does not replace Noise)
 - QUIC authentication: pinned self-signed Ed25519 certificates (one-way, no CA)
 - QUIC hop signaling: `CONNECT host:port` with `quic-pin: <hex>` H2 header
-- Client hop syntax: `--hop quic:addr:port,<noise_key>,<quic_pin>`
+- Client hop syntax: `--hop quic:addr:port,<ed25519_pubkey>`
 - Noise nesting is preserved — the inner Noise+H2 session runs unchanged inside the QUIC stream
 - Server listens on the same port for both TCP and UDP (QUIC)
 - QUIC connection pool: shared connections reused across client sessions, keyed by `(host, port)`

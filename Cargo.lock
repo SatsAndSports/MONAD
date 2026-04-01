@@ -765,11 +765,14 @@ name = "monad-common"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "curve25519-dalek",
  "h2",
  "hex",
  "http",
+ "ring",
  "serde",
  "serde_json",
+ "sha2",
  "snow",
  "thiserror 1.0.69",
  "tokio",
@@ -783,6 +786,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "monad-common",
  "pem",
  "quinn",
  "rand",
