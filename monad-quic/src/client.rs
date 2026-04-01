@@ -138,6 +138,10 @@ pub fn build_client_config(pinned_spki: Vec<u8>) -> Result<quinn::ClientConfig> 
     let mut transport = quinn::TransportConfig::default();
     transport.stream_receive_window(8_000_000u32.into());
     transport.receive_window(16_000_000u32.into());
+    // Send QUIC PINGs every 15 seconds to keep idle connections alive.
+    // Without this, Quinn's default 30-second idle timeout would close
+    // connections that have no active data flow.
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
     client_config.transport_config(Arc::new(transport));
 
     Ok(client_config)

@@ -408,7 +408,7 @@ The `--hop` syntax uses a single Ed25519 public key per hop:
 --hop quic:addr:port,<pubkey>
 ```
 
-The `quic:` prefix tells the client to include a `quic-pin` header in the CONNECT request to the previous relay. The client derives both the X25519 public key (for its own Noise session) and the SPKI DER (for the `quic-pin` header) from the same Ed25519 public key.
+The `quic:` prefix on any hop after the first tells the client to include a `quic-pin` header in the CONNECT request to the previous relay. On the first hop, `quic:` tells the client to connect directly via QUIC instead of TCP. In both cases, the client derives the X25519 public key (for Noise) and the SPKI DER (for QUIC pinning) from the same Ed25519 public key.
 
 Example 2-hop route where the second hop uses QUIC:
 

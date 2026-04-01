@@ -11,6 +11,7 @@ use http::{Method, Request, Uri};
 use monad_common::h2stream::H2ConnectStream;
 use monad_common::identity;
 use monad_common::noise::{self, NoiseStream};
+use monad_quic::stream::QuicStream;
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -89,14 +90,72 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<ServerConnection>
         ));
     }
 
-    // Connect to the first hop via TCP
     let first = &hops[0];
-    info!("connecting to first hop: {}", first.addr);
-    let tcp_stream = TcpStream::connect(&first.addr).await?;
-    info!("TCP connected to {}", first.addr);
 
-    // Perform Noise + H2 on the first hop, then chain through the rest
-    chain_from_stream(tcp_stream, hops, 0).await
+    if first.use_quic {
+        // Connect to the first hop via QUIC
+        info!("connecting to first hop via QUIC: {}", first.addr);
+
+        let ed25519_pub: [u8; 32] = first.pubkey.as_slice().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("public key must be 32 bytes, got {}", first.pubkey.len()),
+            )
+        })?;
+        let pinned_spki = identity::ed25519_pubkey_to_spki_der(&ed25519_pub);
+
+        let client_config =
+            monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("failed to build QUIC client config: {e}"),
+                )
+            })?;
+
+        // Resolve the target address
+        let socket_addr = tokio::net::lookup_host(&first.addr)
+            .await?
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("no addresses found for {}", first.addr),
+                )
+            })?;
+
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("QUIC endpoint: {e}")))?;
+        endpoint.set_default_client_config(client_config);
+
+        let conn = endpoint
+            .connect(socket_addr, "monad-relay")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("QUIC connect: {e}")))?
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("QUIC handshake failed with {}: {e}", first.addr),
+                )
+            })?;
+
+        let (send, recv) = conn.open_bi().await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to open QUIC stream: {e}"),
+            )
+        })?;
+        let quic_stream = QuicStream::new(send, recv);
+        info!("QUIC connected to {}", first.addr);
+
+        chain_from_stream(quic_stream, hops, 0).await
+    } else {
+        // Connect to the first hop via TCP
+        info!("connecting to first hop: {}", first.addr);
+        let tcp_stream = TcpStream::connect(&first.addr).await?;
+        info!("TCP connected to {}", first.addr);
+
+        chain_from_stream(tcp_stream, hops, 0).await
+    }
 }
 
 /// Recursively build the tunnel chain starting from a given stream and hop index.

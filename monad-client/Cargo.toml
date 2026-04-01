@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 monad-common = { path = "../monad-common" }
+monad-quic = { path = "../monad-quic" }
+quinn = "0.11"
 h2 = "0.4"
 tokio = { version = "1", features = ["full"] }
 bytes = "1"

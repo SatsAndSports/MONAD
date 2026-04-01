@@ -66,6 +66,8 @@ Current coverage includes:
 - QUIC control + data channels
 - nested QUIC tunnel (TCP relay forwarding to QUIC relay)
 - client connector with QUIC hop (end-to-end `--hop quic:` path)
+- client QUIC first hop (direct QUIC connection from client)
+- QUIC first hop then TCP second hop
 
 ## Quick Start
 

@@ -755,6 +755,8 @@ dependencies = [
  "hex",
  "http",
  "monad-common",
+ "monad-quic",
+ "quinn",
  "tokio",
  "tracing",
  "tracing-subscriber",

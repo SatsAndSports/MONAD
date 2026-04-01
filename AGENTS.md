@@ -157,6 +157,8 @@ The test suite currently covers:
 - QUIC control + data channels over QUIC transport
 - nested QUIC tunnel (TCP relay forwarding via QUIC to next relay)
 - client connector with QUIC hop (`--hop quic:` end-to-end path)
+- client QUIC first hop (direct QUIC connection from client)
+- QUIC first hop then TCP second hop
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
 

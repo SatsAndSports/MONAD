@@ -778,3 +778,64 @@ async fn test_concurrent_quic_pool_access() {
         handle.await.unwrap();
     }
 }
+
+/// Test: client connects to first hop via QUIC (single hop).
+#[tokio::test]
+async fn test_quic_first_hop() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_monad_server_with_quic().await;
+
+    // Client connects directly via QUIC (use_quic on the first hop)
+    let conn = connector::connect_through_chain(&[Hop {
+        addr: server_addr.to_string(),
+        pubkey: pubkey.clone(),
+        use_quic: true,
+    }])
+    .await
+    .unwrap();
+    let mut h2 = clone_h2_client(&conn).await;
+
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic first hop").await;
+    assert_eq!(result, b"QUIC FIRST HOP");
+
+    drop(h2);
+    conn.shutdown().await;
+}
+
+/// Test: client connects to first hop via QUIC, then TCP to second hop.
+#[tokio::test]
+async fn test_quic_first_hop_then_tcp() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (s_addr, s_pubkey) = start_monad_server_with_quic().await;
+    let (t_addr, t_pubkey) = start_monad_server().await;
+
+    // Client connects to S via QUIC, then S forwards to T via TCP
+    let conn = connector::connect_through_chain(&[
+        Hop {
+            addr: s_addr.to_string(),
+            pubkey: s_pubkey,
+            use_quic: true,
+        },
+        Hop {
+            addr: t_addr.to_string(),
+            pubkey: t_pubkey,
+            use_quic: false,
+        },
+    ])
+    .await
+    .unwrap();
+    let mut h2 = clone_h2_client(&conn).await;
+
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2, &target, b"quic then tcp").await;
+    assert_eq!(result, b"QUIC THEN TCP");
+
+    drop(h2);
+    conn.shutdown().await;
+}
