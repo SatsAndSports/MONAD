@@ -316,7 +316,7 @@ C ---- TCP + Noise(S) + H2 ----> S ---- QUIC stream ----> T
 
 The outer layers:
 - C connects to S via TCP, establishes a Noise session (authenticating S), runs H2
-- C sends `CONNECT quic:T_addr:port,<T_quic_pin>` to S over H2
+- C sends `CONNECT T_addr:port` with `quic-pin: <SPKI derived from T's Ed25519 key>` to S over H2
 - S opens a QUIC stream to T (authenticating T with T's pinned QUIC key)
 - S proxies bytes between the H2 CONNECT stream and the QUIC stream
 
@@ -457,6 +457,8 @@ This is specific to the echo test pattern (sequential write-all then read-all on
 - `receive_window` (connection-level): 16MB
 
 These values are generous for testing. Production tuning will depend on expected relay traffic patterns.
+
+Initiator-side QUIC connections also enable periodic keep-alives so idle client-to-hop and relay-to-relay QUIC links stay up past the default Quinn idle timeout.
 
 ### What Has Been Integrated
 

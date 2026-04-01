@@ -35,7 +35,7 @@ cargo run -p monad-quic -- ...
   - H2 session handling
   - TCP proxying
 - `monad-quic`
-  - standalone QUIC proof-of-concept (not integrated into main transport yet)
+  - shared QUIC transport code plus standalone echo tooling
   - reusable library code plus binary entrypoint
   - Ed25519 self-signed cert generation
   - QUIC echo server with pinned-key auth
@@ -43,7 +43,7 @@ cargo run -p monad-quic -- ...
 
 ## Current Protocol Model
 
-- Outer transport: TCP
+- Outer transport: TCP or QUIC
 - Encryption: Noise NK
 - Multiplexing: HTTP/2
 - Control stream: `POST /control`
@@ -56,6 +56,7 @@ cargo run -p monad-quic -- ...
 - QUIC authentication: pinned self-signed Ed25519 certificates (one-way, no CA)
 - QUIC hop signaling: `CONNECT host:port` with `quic-pin: <hex>` H2 header
 - Client hop syntax: `--hop quic:addr:port,<ed25519_pubkey>`
+- Client can also use QUIC directly to the first hop with the same `--hop quic:` syntax
 - Noise nesting is preserved — the inner Noise+H2 session runs unchanged inside the QUIC stream
 - Server listens on the same port for both TCP and UDP (QUIC)
 - QUIC connection pool: shared connections reused across client sessions, keyed by `(host, port)`

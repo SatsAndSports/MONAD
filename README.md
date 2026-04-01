@@ -16,7 +16,7 @@ Implemented today:
 - `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels
 - `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels
 - `monad-common`: shared Noise transport and H2 stream helpers
-- `monad-quic`: QUIC transport support — `QuicStream` wrapper, pinned-key auth, echo server/client, shared building blocks used by server and client
+- `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, pinned-key auth, echo server/client, and shared config/keygen helpers used by server and client
 - QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, `quic-pin` H2 header for CONNECT forwarding
 - integration tests for direct, nested, IPv6, hostname-resolution, QUIC single-hop, QUIC nested tunnels, and mixed TCP/QUIC hop chains
 
@@ -29,7 +29,7 @@ Not implemented yet:
 monad-common/     Shared transport and protocol helpers
 monad-client/     Local SOCKS5 proxy and multi-hop client
 monad-server/     Tunnel server
-monad-quic/       Standalone QUIC proof-of-concept (future relay-to-relay transport)
+monad-quic/       Shared QUIC transport code plus standalone echo tooling
 ```
 
 ## Build
@@ -132,7 +132,7 @@ RUST_LOG=info cargo run -p monad-client -- \
 
 The client listens locally as a SOCKS5 proxy on `127.0.0.1:1080` by default.
 
-QUIC hops (previous relay connects to next hop via QUIC instead of TCP):
+QUIC hops:
 
 ```bash
 RUST_LOG=info cargo run -p monad-client -- \
@@ -142,6 +142,16 @@ RUST_LOG=info cargo run -p monad-client -- \
 ```
 
 The `quic:` prefix tells the client to instruct the previous hop to connect via QUIC instead of TCP. Each hop uses a single Ed25519 public key — the Noise X25519 key and QUIC pinned key are both derived from it. See `ARCHITECTURE.md` for the full layering model.
+
+QUIC first hop:
+
+```bash
+RUST_LOG=info cargo run -p monad-client -- \
+  --hop quic:127.0.0.1:9051,<HOP1_PUB> \
+  --socks 127.0.0.1:1080
+```
+
+The client connects directly to the first hop via QUIC, then runs the same Noise+H2 session on top.
 
 ## Example Usage
 
@@ -212,9 +222,9 @@ Both client and server handle `Ctrl+C` gracefully:
 - shut down H2 connections cleanly
 - emit `NoiseStream` wire-byte totals
 
-## QUIC Proof-of-Concept
+## QUIC Echo Tool
 
-The `monad-quic` crate is a standalone PoC for the future shared relay-to-relay QUIC transport. It is not part of the main MONAD tunnel system yet.
+The `monad-quic` crate also includes a standalone QUIC echo server/client for transport testing and experimentation. The main MONAD client and server now use shared code from this crate for QUIC support.
 
 ### Generate a keypair
 
