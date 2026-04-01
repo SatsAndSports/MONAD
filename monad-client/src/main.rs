@@ -1,6 +1,7 @@
 use clap::Parser;
 use monad_client::connector;
 use monad_client::connector::Hop;
+use monad_client::control;
 use monad_client::socks;
 use monad_client::tunnel;
 use monad_common::identity::Ed25519Pubkey;
@@ -31,6 +32,11 @@ struct Cli {
     /// Local SOCKS5 proxy address to listen on
     #[arg(long, default_value = "127.0.0.1:1080")]
     socks: String,
+
+    /// Fake session funding amount sent whenever the relay reports the session
+    /// is paused with a non-positive balance.
+    #[arg(long, default_value_t = 1024)]
+    fake_payment_millisats: u64,
 }
 
 fn parse_hop(s: &str) -> anyhow::Result<Hop> {
@@ -92,7 +98,16 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Connect through the hop chain
-    let conn = connector::connect_through_chain(&hops).await?;
+    let mut conn = connector::connect_through_chain(&hops).await?;
+
+    // Open the long-lived control stream before accepting SOCKS traffic.
+    let (control_task, ready_rx) =
+        control::start_fake_payment_controller(&conn, cli.fake_payment_millisats).await?;
+    conn.add_task(control_task);
+
+    ready_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("control task exited before session was funded"))?;
 
     // Start the local SOCKS5 proxy
     let socks_listener = TcpListener::bind(&cli.socks).await?;

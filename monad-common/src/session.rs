@@ -24,6 +24,9 @@ pub struct RelayConnection {
     h2_client: Arc<tokio::sync::Mutex<client::SendRequest<Bytes>>>,
     /// Background tasks driving the H2 connection(s) in the hop chain.
     driver_handles: Vec<JoinHandle<()>>,
+    /// Abortable background tasks associated with this relay connection, such as
+    /// client-side control stream tasks.
+    task_handles: Vec<JoinHandle<()>>,
 }
 
 impl RelayConnection {
@@ -55,6 +58,7 @@ impl RelayConnection {
         let conn = Self {
             h2_client: Arc::new(tokio::sync::Mutex::new(h2_client)),
             driver_handles: Vec::new(),
+            task_handles: Vec::new(),
         };
 
         Ok((conn, driver_handle))
@@ -85,15 +89,63 @@ impl RelayConnection {
         client.clone()
     }
 
+    /// Open the long-lived control stream for this relay session.
+    pub async fn open_control(&self) -> io::Result<(h2::SendStream<Bytes>, h2::RecvStream)> {
+        let mut h2_client = self.clone_send_request().await;
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://monad/control")
+            .body(())
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("bad request: {e}"))
+            })?;
+
+        let (response_future, h2_send) = h2_client
+            .send_request(request, false)
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}"))
+            })?;
+
+        let response = response_future
+            .await
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("h2 response error: {e}"))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("control stream rejected: {}", response.status()),
+            ));
+        }
+
+        Ok((h2_send, response.into_body()))
+    }
+
     /// Append a driver handle from an intermediate hop in a multi-hop chain.
     pub fn add_driver(&mut self, handle: JoinHandle<()>) {
         self.driver_handles.push(handle);
+    }
+
+    /// Append an abortable background task associated with this connection.
+    pub fn add_task(&mut self, handle: JoinHandle<()>) {
+        self.task_handles.push(handle);
     }
 
     /// Shut down the hop chain cleanly by dropping the shared H2 client handle
     /// and waiting for all per-hop H2 driver tasks to exit.
     pub async fn shutdown(self) {
         drop(self.h2_client);
+
+        for handle in self.task_handles {
+            handle.abort();
+            if let Err(e) = handle.await {
+                if !e.is_cancelled() {
+                    tracing::error!("background task panicked: {e}");
+                }
+            }
+        }
 
         for handle in self.driver_handles {
             if let Err(e) = handle.await {

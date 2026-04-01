@@ -757,6 +757,7 @@ dependencies = [
  "monad-common",
  "monad-quic",
  "quinn",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

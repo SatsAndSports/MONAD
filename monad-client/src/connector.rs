@@ -5,6 +5,7 @@
 //! Two hops:     TCP → Noise(T) → H2 → CONNECT(S) → Noise(S) → H2
 //! N hops:       Each hop wraps the previous one via H2ConnectStream.
 
+use crate::control;
 use monad_common::identity::Ed25519Pubkey;
 use monad_common::noise::{self, NoiseStream};
 use monad_common::session::RelayConnection;
@@ -13,6 +14,8 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::info;
+
+const INTERMEDIATE_FAKE_PAYMENT_MILLISATS: u64 = 10_000_000;
 
 /// A hop in the tunnel chain: server address and its Ed25519 public key.
 ///
@@ -167,6 +170,16 @@ where
     info!("hop {}/{}: H2 connection established", hop_idx + 1, hops.len());
 
     if hop_idx < hops.len() - 1 {
+        let (control_task, ready_rx) =
+            control::start_fake_payment_controller(&conn, INTERMEDIATE_FAKE_PAYMENT_MILLISATS)
+                .await?;
+        ready_rx.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("control task exited before hop {} was funded", hop.addr),
+            )
+        })?;
+
         // Not the last hop — open a CONNECT tunnel to the next hop
         let next = &hops[hop_idx + 1];
         info!(
@@ -188,6 +201,7 @@ where
         // Attach this hop's driver to the final connection.
         let mut next_conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;
         next_conn.add_driver(driver);
+        next_conn.add_task(control_task);
         Ok(next_conn)
     } else {
         // Last hop — attach the driver and return for actual use

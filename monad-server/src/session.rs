@@ -1,9 +1,8 @@
 //! Per-client H2 session handler.
 //!
-//! After the Noise handshake, the server runs an H2 server on the encrypted stream.
-//! It accepts H2 streams and routes them:
-//!   - CONNECT requests → open TCP (or QUIC) connection to target, bidirectional proxy
-//!   - POST /control → control channel (Ping/Pong, future: payments)
+//! After the Noise handshake, the server runs an H2 server on the encrypted
+//! stream. The session starts paused-by-default with zero balance. A long-lived
+//! `POST /control` stream is used to fund and observe the whole session.
 
 use crate::proxy;
 use crate::quic_pool::QuicPool;
@@ -14,25 +13,179 @@ use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise::NoiseStream;
 use monad_common::protocol::{ClientMessage, ServerMessage};
 use std::io;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, error, info, warn};
 
 /// Custom header name for QUIC pinned public key in CONNECT requests.
-///
-/// When present on a CONNECT request, the server connects to the target
-/// via QUIC instead of TCP, authenticating the target with this pinned key.
 pub const QUIC_PIN_HEADER: &str = "quic-pin";
+
+#[derive(Debug, Clone)]
+struct SessionSnapshot {
+    session_total_in: u64,
+    session_total_out: u64,
+    remaining_milli_sats: i64,
+    paused: bool,
+}
+
+impl SessionSnapshot {
+    fn to_message(&self) -> ServerMessage {
+        ServerMessage::SessionStatus {
+            session_total_in: self.session_total_in,
+            session_total_out: self.session_total_out,
+            remaining_milli_sats: self.remaining_milli_sats,
+            paused: self.paused,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionInner {
+    session_total_in: u64,
+    session_total_out: u64,
+    remaining_milli_sats: i64,
+    paused: bool,
+    control_attached: bool,
+    control_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionState {
+    inner: Arc<Mutex<SessionInner>>,
+    pause_tx: watch::Sender<bool>,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        let (pause_tx, _) = watch::channel(true);
+        Self {
+            inner: Arc::new(Mutex::new(SessionInner {
+                session_total_in: 0,
+                session_total_out: 0,
+                remaining_milli_sats: 0,
+                paused: true,
+                control_attached: false,
+                control_tx: None,
+            })),
+            pause_tx,
+        }
+    }
+
+    pub(crate) fn pause_receiver(&self) -> watch::Receiver<bool> {
+        self.pause_tx.subscribe()
+    }
+
+    async fn snapshot(&self) -> SessionSnapshot {
+        let inner = self.inner.lock().await;
+        SessionSnapshot {
+            session_total_in: inner.session_total_in,
+            session_total_out: inner.session_total_out,
+            remaining_milli_sats: inner.remaining_milli_sats,
+            paused: inner.paused,
+        }
+    }
+
+    async fn is_paused(&self) -> bool {
+        self.inner.lock().await.paused
+    }
+
+    async fn attach_control(
+        &self,
+        tx: mpsc::UnboundedSender<ServerMessage>,
+    ) -> Result<SessionSnapshot, ()> {
+        let mut inner = self.inner.lock().await;
+        if inner.control_attached {
+            return Err(());
+        }
+
+        inner.control_attached = true;
+        inner.control_tx = Some(tx);
+        Ok(SessionSnapshot {
+            session_total_in: inner.session_total_in,
+            session_total_out: inner.session_total_out,
+            remaining_milli_sats: inner.remaining_milli_sats,
+            paused: inner.paused,
+        })
+    }
+
+    async fn detach_control(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.control_attached = false;
+        inner.control_tx = None;
+    }
+
+    async fn apply_fake_payment(&self, milli_sats: u64) -> SessionSnapshot {
+        let added = milli_sats.min(i64::MAX as u64) as i64;
+        let mut inner = self.inner.lock().await;
+        inner.remaining_milli_sats = inner.remaining_milli_sats.saturating_add(added);
+
+        let was_paused = inner.paused;
+        inner.paused = inner.remaining_milli_sats <= 0;
+        if inner.paused != was_paused {
+            let _ = self.pause_tx.send_replace(inner.paused);
+        }
+
+        SessionSnapshot {
+            session_total_in: inner.session_total_in,
+            session_total_out: inner.session_total_out,
+            remaining_milli_sats: inner.remaining_milli_sats,
+            paused: inner.paused,
+        }
+    }
+
+    pub(crate) async fn note_outbound_bytes(&self, bytes: usize) -> bool {
+        self.note_bytes(bytes, true).await
+    }
+
+    pub(crate) async fn note_inbound_bytes(&self, bytes: usize) -> bool {
+        self.note_bytes(bytes, false).await
+    }
+
+    async fn note_bytes(&self, bytes: usize, outbound: bool) -> bool {
+        let charge = bytes.min(i64::MAX as usize) as i64;
+        let mut inner = self.inner.lock().await;
+
+        if outbound {
+            inner.session_total_out = inner.session_total_out.saturating_add(bytes as u64);
+        } else {
+            inner.session_total_in = inner.session_total_in.saturating_add(bytes as u64);
+        }
+
+        inner.remaining_milli_sats = inner.remaining_milli_sats.saturating_sub(charge);
+
+        let was_paused = inner.paused;
+        inner.paused = inner.remaining_milli_sats <= 0;
+        if inner.paused != was_paused {
+            let _ = self.pause_tx.send_replace(inner.paused);
+        }
+        inner.paused
+    }
+
+    async fn push_message(&self, message: ServerMessage) {
+        let tx = {
+            let inner = self.inner.lock().await;
+            inner.control_tx.clone()
+        };
+
+        if let Some(tx) = tx {
+            let _ = tx.send(message);
+        }
+    }
+
+    pub(crate) async fn push_status(&self) {
+        let snapshot = self.snapshot().await;
+        self.push_message(snapshot.to_message()).await;
+    }
+}
 
 /// An inbound relay session: an H2 server connection running over an
 /// encrypted `NoiseStream`.
-///
-/// Created from a `NoiseStream` after the Noise NK handshake. Call
-/// [`run`](Self::run) to start the accept loop that dispatches CONNECT
-/// and control requests.
 pub struct RelaySession<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     h2_conn: server::Connection<NoiseStream<T>, Bytes>,
     quic_pool: Option<QuicPool>,
+    state: SessionState,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
@@ -50,12 +203,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
 
         info!("H2 connection established");
 
-        Ok(Self { h2_conn, quic_pool })
+        Ok(Self {
+            h2_conn,
+            quic_pool,
+            state: SessionState::new(),
+        })
     }
 
     /// Run the accept loop: accept H2 streams and dispatch them to handlers.
-    ///
-    /// Returns when the H2 connection closes (client disconnects or error).
     pub async fn run(mut self) -> io::Result<()> {
         while let Some(result) = self.h2_conn.accept().await {
             match result {
@@ -71,6 +226,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
 
                     match (&method, uri.path()) {
                         (&Method::CONNECT, _) => {
+                            if self.state.is_paused().await {
+                                let resp = Response::builder()
+                                    .status(StatusCode::PAYMENT_REQUIRED)
+                                    .body(())
+                                    .unwrap();
+                                let _ = respond.send_response(resp, true);
+                                continue;
+                            }
+
                             let authority = uri
                                 .authority()
                                 .map(|a| a.to_string())
@@ -86,7 +250,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                 continue;
                             }
 
-                            // Check for quic-pin header → QUIC transport
                             let quic_pin_header = request
                                 .headers()
                                 .get(QUIC_PIN_HEADER)
@@ -142,9 +305,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                             Ok(h2_send) => {
                                                 let (_, h2_recv) = request.into_parts();
                                                 let label = format!("quic:{authority}");
+                                                let state = self.state.clone();
                                                 tokio::spawn(async move {
-                                                    if let Err(e) = proxy::proxy_bidirectional(
-                                                        h2_send, h2_recv, quic_stream, &label,
+                                                    if let Err(e) = proxy::proxy_bidirectional_accounted(
+                                                        h2_send,
+                                                        h2_recv,
+                                                        quic_stream,
+                                                        &label,
+                                                        state,
                                                     )
                                                     .await
                                                     {
@@ -167,7 +335,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                     }
                                 }
                             } else {
-                                // Plain TCP CONNECT
                                 info!("CONNECT {authority}");
 
                                 match TcpStream::connect(&authority).await {
@@ -180,9 +347,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                         match respond.send_response(resp, false) {
                                             Ok(h2_send) => {
                                                 let (_, h2_recv) = request.into_parts();
+                                                let state = self.state.clone();
                                                 tokio::spawn(async move {
-                                                    if let Err(e) = proxy::proxy_bidirectional(
-                                                        h2_send, h2_recv, tcp_stream, &authority,
+                                                    if let Err(e) = proxy::proxy_bidirectional_accounted(
+                                                        h2_send,
+                                                        h2_recv,
+                                                        tcp_stream,
+                                                        &authority,
+                                                        state,
                                                     )
                                                     .await
                                                     {
@@ -207,6 +379,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                             }
                         }
                         (&Method::POST, "/control") => {
+                            let (event_tx, event_rx) = mpsc::unbounded_channel();
+                            let snapshot = match self.state.attach_control(event_tx).await {
+                                Ok(snapshot) => snapshot,
+                                Err(()) => {
+                                    let resp = Response::builder()
+                                        .status(StatusCode::CONFLICT)
+                                        .body(())
+                                        .unwrap();
+                                    let _ = respond.send_response(resp, true);
+                                    continue;
+                                }
+                            };
+
                             let resp = Response::builder()
                                 .status(StatusCode::OK)
                                 .body(())
@@ -214,9 +399,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                             match respond.send_response(resp, false) {
                                 Ok(h2_send) => {
                                     let (_, h2_recv) = request.into_parts();
+                                    let state = self.state.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) =
-                                            handle_control_stream(h2_send, h2_recv).await
+                                            handle_control_stream(h2_send, h2_recv, state, event_rx, snapshot)
+                                                .await
                                         {
                                             error!("control channel error: {e}");
                                         }
@@ -224,6 +411,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                 }
                                 Err(e) => {
                                     error!("h2 send response error for control: {e}");
+                                    self.state.detach_control().await;
                                 }
                             }
                         }
@@ -249,90 +437,107 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
     }
 }
 
-/// Handle a control channel stream.
-///
-/// Reads JSON-encoded ClientMessage frames, responds with ServerMessage frames.
-/// Currently supports Ping → Pong. Future: payment tokens, session management.
+fn encode_server_message(message: &ServerMessage) -> io::Result<Bytes> {
+    let bytes = serde_json::to_vec(message)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
+    let mut frame = Vec::with_capacity(bytes.len() + 1);
+    frame.extend_from_slice(&bytes);
+    frame.push(b'\n');
+    Ok(Bytes::from(frame))
+}
+
+async fn send_control_message(
+    h2_send: &mut h2::SendStream<Bytes>,
+    message: &ServerMessage,
+) -> io::Result<()> {
+    let frame = encode_server_message(message)?;
+    h2_send.reserve_capacity(frame.len());
+    wait_for_send_capacity(h2_send).await?;
+    h2_send
+        .send_data(frame, false)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}")))
+}
+
+/// Handle a long-lived control stream for one paid relay session.
 async fn handle_control_stream(
     mut h2_send: h2::SendStream<Bytes>,
     mut h2_recv: h2::RecvStream,
+    state: SessionState,
+    mut events: mpsc::UnboundedReceiver<ServerMessage>,
+    initial_snapshot: SessionSnapshot,
 ) -> io::Result<()> {
     info!("control channel opened");
+
+    send_control_message(&mut h2_send, &initial_snapshot.to_message()).await?;
 
     let mut buf = Vec::new();
 
     loop {
-        match h2_recv.data().await {
-            Some(Ok(data)) => {
-                let len = data.len();
-                let _ = h2_recv.flow_control().release_capacity(len);
-
-                buf.extend_from_slice(&data);
-
-                // Process all complete newline-delimited JSON messages
-                while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=newline_pos).collect();
-                    let line = line.trim_ascii();
-
-                    if line.is_empty() {
-                        continue;
+        tokio::select! {
+            maybe_event = events.recv() => {
+                match maybe_event {
+                    Some(message) => {
+                        send_control_message(&mut h2_send, &message).await?;
                     }
-
-                    match serde_json::from_slice::<ClientMessage>(line) {
-                        Ok(msg) => {
-                            debug!("control recv: {msg:?}");
-                            let response = match msg {
-                                ClientMessage::Ping => ServerMessage::Pong,
-                            };
-
-                            let response_bytes = serde_json::to_vec(&response).map_err(|e| {
-                                io::Error::new(io::ErrorKind::Other, format!("json error: {e}"))
-                            })?;
-
-                            let mut frame = Vec::with_capacity(response_bytes.len() + 1);
-                            frame.extend_from_slice(&response_bytes);
-                            frame.push(b'\n');
-
-                            h2_send.reserve_capacity(frame.len());
-                            wait_for_send_capacity(&mut h2_send).await?;
-
-                            h2_send.send_data(Bytes::from(frame), false).map_err(|e| {
-                                io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}"))
-                            })?;
-
-                            debug!("control sent: {response:?}");
-                        }
-                        Err(e) => {
-                            warn!("control: invalid message: {e}");
-                            let err_msg = ServerMessage::Error {
-                                message: format!("invalid message: {e}"),
-                            };
-                            let err_bytes = serde_json::to_vec(&err_msg).unwrap();
-                            let mut frame = Vec::with_capacity(err_bytes.len() + 1);
-                            frame.extend_from_slice(&err_bytes);
-                            frame.push(b'\n');
-
-                            h2_send.reserve_capacity(frame.len());
-                            if wait_for_send_capacity(&mut h2_send).await.is_err() {
-                                break;
-                            }
-
-                            let _ = h2_send.send_data(Bytes::from(frame), false);
-                        }
-                    }
+                    None => break,
                 }
             }
-            Some(Err(e)) => {
-                debug!("control h2 recv error: {e}");
-                break;
-            }
-            None => {
-                debug!("control channel closed by client");
-                break;
+            maybe_chunk = h2_recv.data() => {
+                match maybe_chunk {
+                    Some(Ok(data)) => {
+                        let len = data.len();
+                        let _ = h2_recv.flow_control().release_capacity(len);
+                        buf.extend_from_slice(&data);
+
+                        while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
+                            let line: Vec<u8> = buf.drain(..=newline_pos).collect();
+                            let line = line.trim_ascii();
+
+                            if line.is_empty() {
+                                continue;
+                            }
+
+                            match serde_json::from_slice::<ClientMessage>(line) {
+                                Ok(ClientMessage::Ping) => {
+                                    send_control_message(&mut h2_send, &ServerMessage::Pong).await?;
+                                }
+                                Ok(ClientMessage::GetSessionStatus) => {
+                                    let snapshot = state.snapshot().await;
+                                    send_control_message(&mut h2_send, &snapshot.to_message()).await?;
+                                }
+                                Ok(ClientMessage::FakePayment { milli_sats }) => {
+                                    let snapshot = state.apply_fake_payment(milli_sats).await;
+                                    state.push_status().await;
+                                    debug!(
+                                        "fake payment accepted: added={} remaining={}",
+                                        milli_sats,
+                                        snapshot.remaining_milli_sats
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("control: invalid message: {e}");
+                                    let err_msg = ServerMessage::Error {
+                                        message: format!("invalid message: {e}"),
+                                    };
+                                    send_control_message(&mut h2_send, &err_msg).await?;
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        debug!("control h2 recv error: {e}");
+                        break;
+                    }
+                    None => {
+                        debug!("control channel closed by client");
+                        break;
+                    }
+                }
             }
         }
     }
 
+    state.detach_control().await;
     let _ = h2_send.send_data(Bytes::new(), true);
     info!("control channel closed");
     Ok(())

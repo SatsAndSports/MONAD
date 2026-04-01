@@ -27,6 +27,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+const TEST_SESSION_PAYMENT: u64 = 10_000_000;
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
@@ -117,6 +119,90 @@ async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &Ed25519Pubke
     .unwrap()
 }
 
+async fn connect_client_funded(
+    server_addr: std::net::SocketAddr,
+    pubkey: &Ed25519Pubkey,
+) -> RelayConnection {
+    let conn = connect_client(server_addr, pubkey).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    conn
+}
+
+async fn send_control_message(
+    h2_send: &mut h2::SendStream<Bytes>,
+    message: &ClientMessage,
+    end_stream: bool,
+) {
+    let bytes = serde_json::to_vec(message).unwrap();
+    let mut frame = Vec::with_capacity(bytes.len() + 1);
+    frame.extend_from_slice(&bytes);
+    frame.push(b'\n');
+
+    h2_send.reserve_capacity(frame.len());
+    wait_for_send_capacity(h2_send).await.unwrap();
+    h2_send.send_data(Bytes::from(frame), end_stream).unwrap();
+}
+
+async fn read_control_message(h2_recv: &mut h2::RecvStream) -> ServerMessage {
+    let mut response_buf = Vec::new();
+
+    loop {
+        if let Some(newline_pos) = response_buf.iter().position(|&b| b == b'\n') {
+            let line = &response_buf[..newline_pos];
+            return serde_json::from_slice(line).unwrap();
+        }
+
+        let chunk = h2_recv
+            .data()
+            .await
+            .expect("control stream closed unexpectedly")
+            .unwrap();
+        let len = chunk.len();
+        let _ = h2_recv.flow_control().release_capacity(len);
+        response_buf.extend_from_slice(&chunk);
+    }
+}
+
+async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
+    let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
+
+    match read_control_message(&mut h2_recv).await {
+        ServerMessage::SessionStatus {
+            paused,
+            remaining_milli_sats,
+            ..
+        } => {
+            assert!(paused);
+            assert_eq!(remaining_milli_sats, 0);
+        }
+        other => panic!("expected initial SessionStatus, got {other:?}"),
+    }
+
+    send_control_message(
+        &mut h2_send,
+        &ClientMessage::FakePayment { milli_sats },
+        false,
+    )
+    .await;
+
+    match read_control_message(&mut h2_recv).await {
+        ServerMessage::SessionStatus {
+            paused,
+            remaining_milli_sats,
+            ..
+        } => {
+            assert!(!paused, "session should unpause after funding");
+            assert_eq!(remaining_milli_sats, milli_sats as i64);
+        }
+        other => panic!("expected funded SessionStatus, got {other:?}"),
+    }
+
+    let _ = h2_send.send_data(Bytes::new(), true);
+    drop(h2_send);
+    drop(h2_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+}
+
 /// Open a CONNECT tunnel, send payload, read response.
 async fn tunnel_roundtrip(
     h2_client: &mut client::SendRequest<Bytes>,
@@ -178,43 +264,113 @@ async fn control_ping_pong(h2_client: &mut client::SendRequest<Bytes>) {
 
     let mut h2_recv = response.into_body();
 
-    // Send Ping (newline-delimited JSON)
-    let ping = serde_json::to_vec(&ClientMessage::Ping).unwrap();
-    let mut frame = Vec::with_capacity(ping.len() + 1);
-    frame.extend_from_slice(&ping);
-    frame.push(b'\n');
-
-    h2_send.reserve_capacity(frame.len());
-    wait_for_send_capacity(&mut h2_send).await.unwrap();
-    h2_send
-        .send_data(Bytes::from(frame), true)
-        .unwrap();
-
-    // Read Pong
-    let mut response_buf = Vec::new();
-    while let Some(chunk) = h2_recv.data().await {
-        let data = chunk.unwrap();
-        let len = data.len();
-        let _ = h2_recv.flow_control().release_capacity(len);
-        response_buf.extend_from_slice(&data);
+    match read_control_message(&mut h2_recv).await {
+        ServerMessage::SessionStatus { .. } => {}
+        other => panic!("expected initial SessionStatus, got {other:?}"),
     }
 
-    let response_str = String::from_utf8(response_buf).unwrap();
-    let first_line = response_str
-        .lines()
-        .next()
-        .expect("no response from control channel");
-    let msg: ServerMessage = serde_json::from_str(first_line).unwrap();
+    send_control_message(&mut h2_send, &ClientMessage::Ping, false).await;
 
-    match msg {
+    match read_control_message(&mut h2_recv).await {
         ServerMessage::Pong => {}
         other => panic!("expected Pong, got: {other:?}"),
     }
+
+    let _ = h2_send.send_data(Bytes::new(), true);
+    drop(h2_send);
+    drop(h2_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_session_starts_paused() {
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client(server_addr, &pubkey).await;
+    let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
+
+    match read_control_message(&mut h2_recv).await {
+        ServerMessage::SessionStatus {
+            session_total_in,
+            session_total_out,
+            remaining_milli_sats,
+            paused,
+        } => {
+            assert_eq!(session_total_in, 0);
+            assert_eq!(session_total_out, 0);
+            assert_eq!(remaining_milli_sats, 0);
+            assert!(paused);
+        }
+        other => panic!("expected initial SessionStatus, got {other:?}"),
+    }
+
+    let _ = h2_send.send_data(Bytes::new(), true);
+    drop(h2_send);
+    drop(h2_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_second_control_stream_rejected() {
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client(server_addr, &pubkey).await;
+
+    let (mut first_send, mut first_recv) = conn.open_control().await.unwrap();
+    match read_control_message(&mut first_recv).await {
+        ServerMessage::SessionStatus { paused, .. } => assert!(paused),
+        other => panic!("expected initial SessionStatus, got {other:?}"),
+    }
+
+    let mut h2 = conn.clone_send_request().await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("http://monad/control")
+        .body(())
+        .unwrap();
+    let (response_future, second_send) = h2.send_request(request, false).unwrap();
+    let response = response_future.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::CONFLICT);
+
+    drop(second_send);
+    drop(response);
+
+    let _ = first_send.send_data(Bytes::new(), true);
+    drop(first_send);
+    drop(first_recv);
+    drop(h2);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_connect_rejected_while_paused() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client(server_addr, &pubkey).await;
+    let mut h2 = conn.clone_send_request().await;
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("127.0.0.1:{}", upper_addr.port()))
+        .body(())
+        .unwrap();
+
+    let (response_future, h2_send) = h2.send_request(request, false).unwrap();
+    let response = response_future.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::PAYMENT_REQUIRED);
+
+    drop(h2_send);
+    drop(response);
+    drop(h2);
+    conn.shutdown().await;
+}
 
 /// Test both the control channel (Ping/Pong) and a data tunnel (uppercase)
 /// sequentially over the same H2 connection.
@@ -229,7 +385,7 @@ async fn test_control_and_data_channels() {
     let (server_addr, pubkey) = start_monad_server().await;
 
     // Client
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     // Control channel: Ping/Pong
@@ -252,7 +408,7 @@ async fn test_concurrent_channels() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_funded(server_addr, &pubkey).await;
     let h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -283,7 +439,7 @@ async fn test_multiple_tunnels() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_funded(server_addr, &pubkey).await;
     let h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -336,6 +492,7 @@ async fn test_nested_tunnel() {
         Hop { addr: t_addr.to_string(), pubkey: t_pubkey, use_quic: false },
         Hop { addr: s_addr.to_string(), pubkey: s_pubkey, use_quic: false },
     ]).await.unwrap();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     // Open a tunnel to the uppercase server (through S, via T)
@@ -363,6 +520,7 @@ async fn test_three_hop_tunnel() {
         Hop { addr: b_addr.to_string(), pubkey: b_pubkey, use_quic: false },
         Hop { addr: c_addr.to_string(), pubkey: c_pubkey, use_quic: false },
     ]).await.unwrap();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -382,7 +540,7 @@ async fn test_connect_to_ipv6_target() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("[::1]:{}", upper_addr.port());
@@ -405,7 +563,7 @@ async fn test_connect_to_ipv6_server() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"ipv6 server").await;
@@ -433,6 +591,7 @@ async fn test_mixed_ipv4_ipv6_hops() {
         Hop { addr: ipv4_hop_addr.to_string(), pubkey: ipv4_hop_pubkey, use_quic: false },
         Hop { addr: ipv6_hop_addr.to_string(), pubkey: ipv6_hop_pubkey, use_quic: false },
     ]).await.unwrap();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -450,7 +609,7 @@ async fn test_connect_with_hostname_resolution() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("localhost:{}", upper_addr.port());
@@ -532,6 +691,15 @@ async fn connect_client_quic(
     conn
 }
 
+async fn connect_client_quic_funded(
+    server_addr: SocketAddr,
+    pubkey: &Ed25519Pubkey,
+) -> RelayConnection {
+    let conn = connect_client_quic(server_addr, pubkey).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    conn
+}
+
 /// Test: connect to a MONAD server over QUIC, open a CONNECT tunnel,
 /// proxy data through the uppercase server.
 #[tokio::test]
@@ -541,7 +709,7 @@ async fn test_quic_single_hop() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server_with_quic().await;
-    let conn = connect_client_quic(server_addr, &pubkey).await;
+    let conn = connect_client_quic_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"hello via quic").await;
@@ -559,7 +727,7 @@ async fn test_quic_control_and_data() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server_with_quic().await;
-    let conn = connect_client_quic(server_addr, &pubkey).await;
+    let conn = connect_client_quic_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     // Control channel
@@ -593,7 +761,7 @@ async fn test_nested_quic_tunnel() {
     let (s_addr, s_pubkey) = start_monad_server().await;
 
     // Client connects to S via TCP (first hop)
-    let conn_to_s = connect_client(s_addr, &s_pubkey).await;
+    let conn_to_s = connect_client_funded(s_addr, &s_pubkey).await;
     let mut h2_to_s = conn_to_s.clone_send_request().await;
 
     // Derive QUIC pin (SPKI DER hex) from T's Ed25519 public key
@@ -637,6 +805,7 @@ async fn test_nested_quic_tunnel() {
     // Create RelayConnection to T
     let (mut conn_to_t, driver) = RelayConnection::from_noise_stream(noise_stream).await.unwrap();
     conn_to_t.add_driver(driver);
+    fund_session(&conn_to_t, TEST_SESSION_PAYMENT).await;
     let mut h2_to_t = conn_to_t.clone_send_request().await;
 
     // Open a CONNECT tunnel to the uppercase server through T
@@ -682,6 +851,7 @@ async fn test_connector_quic_hop() {
     ])
     .await
     .unwrap();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -735,6 +905,7 @@ async fn test_concurrent_quic_pool_access() {
             ])
             .await
             .unwrap();
+            fund_session(&conn, TEST_SESSION_PAYMENT).await;
             let mut h2 = conn.clone_send_request().await;
 
             let payload = format!("concurrent client {i}");
@@ -769,6 +940,7 @@ async fn test_quic_first_hop() {
     }])
     .await
     .unwrap();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic first hop").await;
@@ -803,6 +975,7 @@ async fn test_quic_first_hop_then_tcp() {
     ])
     .await
     .unwrap();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());

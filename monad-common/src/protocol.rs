@@ -9,10 +9,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    /// Request to open a tunnel to an external destination.
-    /// (This is informational — the actual tunnel is opened via H2 CONNECT.)
     Ping,
-    // Future: payment tokens, session management, etc.
+    /// Add fake credit to the current relay session.
+    FakePayment {
+        milli_sats: u64,
+    },
+    /// Request a fresh session status snapshot.
+    GetSessionStatus,
 }
 
 /// Messages sent from server to client on the control channel.
@@ -22,7 +25,14 @@ pub enum ServerMessage {
     /// Acknowledgement
     Pong,
 
+    /// Current session accounting and pause state.
+    SessionStatus {
+        session_total_in: u64,
+        session_total_out: u64,
+        remaining_milli_sats: i64,
+        paused: bool,
+    },
+
     /// Server-initiated error or notification
     Error { message: String },
-    // Future: payment receipts, bandwidth accounting, etc.
 }
