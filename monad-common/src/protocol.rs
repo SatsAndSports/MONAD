@@ -25,6 +25,12 @@ pub enum ServerMessage {
     /// Acknowledgement
     Pong,
 
+    /// Fixed pricing and other session parameters for this relay session.
+    SessionParams {
+        in_bytes_per_millisat: u64,
+        out_bytes_per_millisat: u64,
+    },
+
     /// Current session accounting and pause state.
     SessionStatus {
         session_total_in: u64,

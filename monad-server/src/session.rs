@@ -12,6 +12,7 @@ use http::{Method, Response, StatusCode};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise::NoiseStream;
 use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::session::{SessionPricing, clamp_i128_to_i64};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -21,6 +22,9 @@ use tracing::{debug, error, info, warn};
 
 /// Custom header name for QUIC pinned public key in CONNECT requests.
 pub const QUIC_PIN_HEADER: &str = "quic-pin";
+
+const DEFAULT_IN_BYTES_PER_MILLISAT: u64 = 1;
+const DEFAULT_OUT_BYTES_PER_MILLISAT: u64 = 1;
 
 #[derive(Debug, Clone)]
 struct SessionSnapshot {
@@ -45,7 +49,8 @@ impl SessionSnapshot {
 struct SessionInner {
     session_total_in: u64,
     session_total_out: u64,
-    remaining_milli_sats: i64,
+    total_paid_millisats: u64,
+    pricing: SessionPricing,
     paused: bool,
     control_attached: bool,
     control_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
@@ -64,12 +69,47 @@ impl SessionState {
             inner: Arc::new(Mutex::new(SessionInner {
                 session_total_in: 0,
                 session_total_out: 0,
-                remaining_milli_sats: 0,
+                total_paid_millisats: 0,
+                pricing: SessionPricing::new(
+                    DEFAULT_IN_BYTES_PER_MILLISAT,
+                    DEFAULT_OUT_BYTES_PER_MILLISAT,
+                ),
                 paused: true,
                 control_attached: false,
                 control_tx: None,
             })),
             pause_tx,
+        }
+    }
+
+    fn session_params_message(inner: &SessionInner) -> ServerMessage {
+        ServerMessage::SessionParams {
+            in_bytes_per_millisat: inner.pricing.in_bytes_per_millisat,
+            out_bytes_per_millisat: inner.pricing.out_bytes_per_millisat,
+        }
+    }
+
+    fn remaining_milli_sats(inner: &SessionInner) -> i128 {
+        let amount_due = inner
+            .pricing
+            .amount_due_millisats(inner.session_total_in, inner.session_total_out);
+        inner.total_paid_millisats as i128 - amount_due as i128
+    }
+
+    fn snapshot_from_inner(inner: &SessionInner) -> SessionSnapshot {
+        SessionSnapshot {
+            session_total_in: inner.session_total_in,
+            session_total_out: inner.session_total_out,
+            remaining_milli_sats: clamp_i128_to_i64(Self::remaining_milli_sats(inner)),
+            paused: inner.paused,
+        }
+    }
+
+    fn refresh_pause_state(&self, inner: &mut SessionInner) {
+        let was_paused = inner.paused;
+        inner.paused = Self::remaining_milli_sats(inner) <= 0;
+        if inner.paused != was_paused {
+            let _ = self.pause_tx.send_replace(inner.paused);
         }
     }
 
@@ -79,12 +119,12 @@ impl SessionState {
 
     async fn snapshot(&self) -> SessionSnapshot {
         let inner = self.inner.lock().await;
-        SessionSnapshot {
-            session_total_in: inner.session_total_in,
-            session_total_out: inner.session_total_out,
-            remaining_milli_sats: inner.remaining_milli_sats,
-            paused: inner.paused,
-        }
+        Self::snapshot_from_inner(&inner)
+    }
+
+    async fn session_params(&self) -> ServerMessage {
+        let inner = self.inner.lock().await;
+        Self::session_params_message(&inner)
     }
 
     async fn is_paused(&self) -> bool {
@@ -102,12 +142,7 @@ impl SessionState {
 
         inner.control_attached = true;
         inner.control_tx = Some(tx);
-        Ok(SessionSnapshot {
-            session_total_in: inner.session_total_in,
-            session_total_out: inner.session_total_out,
-            remaining_milli_sats: inner.remaining_milli_sats,
-            paused: inner.paused,
-        })
+        Ok(Self::snapshot_from_inner(&inner))
     }
 
     async fn detach_control(&self) {
@@ -117,22 +152,10 @@ impl SessionState {
     }
 
     async fn apply_fake_payment(&self, milli_sats: u64) -> SessionSnapshot {
-        let added = milli_sats.min(i64::MAX as u64) as i64;
         let mut inner = self.inner.lock().await;
-        inner.remaining_milli_sats = inner.remaining_milli_sats.saturating_add(added);
-
-        let was_paused = inner.paused;
-        inner.paused = inner.remaining_milli_sats <= 0;
-        if inner.paused != was_paused {
-            let _ = self.pause_tx.send_replace(inner.paused);
-        }
-
-        SessionSnapshot {
-            session_total_in: inner.session_total_in,
-            session_total_out: inner.session_total_out,
-            remaining_milli_sats: inner.remaining_milli_sats,
-            paused: inner.paused,
-        }
+        inner.total_paid_millisats = inner.total_paid_millisats.saturating_add(milli_sats);
+        self.refresh_pause_state(&mut inner);
+        Self::snapshot_from_inner(&inner)
     }
 
     pub(crate) async fn note_outbound_bytes(&self, bytes: usize) -> bool {
@@ -144,7 +167,6 @@ impl SessionState {
     }
 
     async fn note_bytes(&self, bytes: usize, outbound: bool) -> bool {
-        let charge = bytes.min(i64::MAX as usize) as i64;
         let mut inner = self.inner.lock().await;
 
         if outbound {
@@ -153,13 +175,7 @@ impl SessionState {
             inner.session_total_in = inner.session_total_in.saturating_add(bytes as u64);
         }
 
-        inner.remaining_milli_sats = inner.remaining_milli_sats.saturating_sub(charge);
-
-        let was_paused = inner.paused;
-        inner.paused = inner.remaining_milli_sats <= 0;
-        if inner.paused != was_paused {
-            let _ = self.pause_tx.send_replace(inner.paused);
-        }
+        self.refresh_pause_state(&mut inner);
         inner.paused
     }
 
@@ -468,6 +484,8 @@ async fn handle_control_stream(
 ) -> io::Result<()> {
     info!("control channel opened");
 
+    let params = state.session_params().await;
+    send_control_message(&mut h2_send, &params).await?;
     send_control_message(&mut h2_send, &initial_snapshot.to_message()).await?;
 
     let mut buf = Vec::new();

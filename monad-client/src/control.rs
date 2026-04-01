@@ -1,9 +1,10 @@
 use bytes::Bytes;
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::protocol::{ClientMessage, ServerMessage};
-use monad_common::session::RelayConnection;
+use monad_common::session::{RelayConnection, SessionPricing};
 use std::io;
-use tokio::sync::oneshot;
+use std::sync::Arc;
+use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -33,6 +34,7 @@ async fn run_control_task(
     mut h2_recv: h2::RecvStream,
     fake_payment_millisats: u64,
     ready_tx: oneshot::Sender<()>,
+    pricing_handle: Arc<RwLock<Option<SessionPricing>>>,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     let mut ready_tx = Some(ready_tx);
@@ -56,6 +58,22 @@ async fn run_control_task(
             match message {
                 ServerMessage::Pong => {
                     info!("control: pong");
+                }
+                ServerMessage::SessionParams {
+                    in_bytes_per_millisat,
+                    out_bytes_per_millisat,
+                } => {
+                    let pricing = SessionPricing::new(
+                        in_bytes_per_millisat,
+                        out_bytes_per_millisat,
+                    );
+                    info!(
+                        "session params: in_bytes_per_millisat={} out_bytes_per_millisat={} lcm={}",
+                        pricing.in_bytes_per_millisat,
+                        pricing.out_bytes_per_millisat,
+                        pricing.pricing_lcm,
+                    );
+                    *pricing_handle.write().await = Some(pricing);
                 }
                 ServerMessage::Error { message } => {
                     warn!("control error: {message}");
@@ -105,9 +123,18 @@ pub async fn start_fake_payment_controller(
 ) -> io::Result<(JoinHandle<()>, oneshot::Receiver<()>)> {
     let (control_send, control_recv) = conn.open_control().await?;
     let (ready_tx, ready_rx) = oneshot::channel();
+    let pricing_handle = conn.session_pricing_handle();
 
     let handle = tokio::spawn(async move {
-        if let Err(e) = run_control_task(control_send, control_recv, fake_payment_millisats, ready_tx).await {
+        if let Err(e) = run_control_task(
+            control_send,
+            control_recv,
+            fake_payment_millisats,
+            ready_tx,
+            pricing_handle,
+        )
+        .await
+        {
             warn!("control task ended with error: {e}");
         }
     });

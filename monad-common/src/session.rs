@@ -9,10 +9,81 @@ use h2::client;
 use http::{Method, Request, Uri};
 use std::io;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::h2stream::H2ConnectStream;
 use crate::noise::NoiseStream;
+
+// ---------------------------------------------------------------------------
+// Shared math helpers
+// ---------------------------------------------------------------------------
+
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let tmp = a % b;
+        a = b;
+        b = tmp;
+    }
+    a
+}
+
+/// Compute the LCM of two `u64` values, saturating on overflow.
+pub fn lcm_u64(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    (a / gcd_u64(a, b)).saturating_mul(b)
+}
+
+/// Clamp an `i128` to the `i64` range for wire representation.
+pub fn clamp_i128_to_i64(value: i128) -> i64 {
+    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+// ---------------------------------------------------------------------------
+// SessionPricing — local persisted pricing with precomputed LCM
+// ---------------------------------------------------------------------------
+
+/// Local session pricing metadata, persisted on both client and server.
+///
+/// Constructed from the wire `SessionParams` message. Includes the
+/// precomputed LCM of the two directional rates so billing math can
+/// use integer arithmetic without recomputing it per chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionPricing {
+    pub in_bytes_per_millisat: u64,
+    pub out_bytes_per_millisat: u64,
+    pub pricing_lcm: u64,
+}
+
+impl SessionPricing {
+    /// Create a `SessionPricing` from the raw directional rates.
+    ///
+    /// Computes and caches `lcm(in_bytes_per_millisat, out_bytes_per_millisat)`.
+    pub fn new(in_bytes_per_millisat: u64, out_bytes_per_millisat: u64) -> Self {
+        let in_rate = in_bytes_per_millisat.max(1);
+        let out_rate = out_bytes_per_millisat.max(1);
+        Self {
+            in_bytes_per_millisat: in_rate,
+            out_bytes_per_millisat: out_rate,
+            pricing_lcm: lcm_u64(in_rate, out_rate),
+        }
+    }
+
+    /// Compute the total amount due in millisats for the given byte totals.
+    ///
+    /// Uses the formula:
+    /// `ceil(in_bytes / in_bytes_per_millisat + out_bytes / out_bytes_per_millisat)`
+    ///
+    /// Implemented with integer-only arithmetic via the precomputed LCM.
+    pub fn amount_due_millisats(&self, session_total_in: u64, session_total_out: u64) -> u128 {
+        let lcm = self.pricing_lcm as u128;
+        let due_units = session_total_in as u128 * (lcm / self.in_bytes_per_millisat as u128)
+            + session_total_out as u128 * (lcm / self.out_bytes_per_millisat as u128);
+        due_units.div_ceil(lcm)
+    }
+}
 
 /// An established connection to a MONAD relay, ready to open H2 streams.
 ///
@@ -27,6 +98,9 @@ pub struct RelayConnection {
     /// Abortable background tasks associated with this relay connection, such as
     /// client-side control stream tasks.
     task_handles: Vec<JoinHandle<()>>,
+    /// Session pricing metadata, set by the control task after receiving
+    /// `SessionParams` from the relay.
+    session_pricing: Arc<RwLock<Option<SessionPricing>>>,
 }
 
 impl RelayConnection {
@@ -59,6 +133,7 @@ impl RelayConnection {
             h2_client: Arc::new(tokio::sync::Mutex::new(h2_client)),
             driver_handles: Vec::new(),
             task_handles: Vec::new(),
+            session_pricing: Arc::new(RwLock::new(None)),
         };
 
         Ok((conn, driver_handle))
@@ -121,6 +196,19 @@ impl RelayConnection {
         }
 
         Ok((h2_send, response.into_body()))
+    }
+
+    /// Get the current session pricing, if set by the control task.
+    pub async fn session_pricing(&self) -> Option<SessionPricing> {
+        *self.session_pricing.read().await
+    }
+
+    /// Get a shared handle to the session pricing storage.
+    ///
+    /// Used by the control task to persist pricing when `SessionParams`
+    /// arrives from the relay.
+    pub fn session_pricing_handle(&self) -> Arc<RwLock<Option<SessionPricing>>> {
+        self.session_pricing.clone()
     }
 
     /// Append a driver handle from an intermediate hop in a multi-hop chain.
