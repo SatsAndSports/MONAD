@@ -11,7 +11,7 @@ use h2::server;
 use http::{Method, Response, StatusCode};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise::NoiseStream;
-use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::protocol::{ClientMessage, MintUnitKeysets, ServerMessage};
 use monad_common::session::{SessionPricing, clamp_i128_to_i64};
 use std::io;
 use std::sync::Arc;
@@ -64,10 +64,12 @@ struct SessionInner {
 pub(crate) struct SessionState {
     inner: Arc<Mutex<SessionInner>>,
     pause_tx: watch::Sender<bool>,
+    receiver_pubkey: String,
+    mints_units_keysets: MintUnitKeysets,
 }
 
 impl SessionState {
-    fn new() -> Self {
+    fn new(receiver_pubkey: String, mints_units_keysets: MintUnitKeysets) -> Self {
         let (pause_tx, _) = watch::channel(true);
         Self {
             inner: Arc::new(Mutex::new(SessionInner {
@@ -84,14 +86,18 @@ impl SessionState {
                 control_tx: None,
             })),
             pause_tx,
+            receiver_pubkey,
+            mints_units_keysets,
         }
     }
 
-    fn session_params_message(inner: &SessionInner, negotiated_version: u8) -> ServerMessage {
+    fn session_params_message(&self, inner: &SessionInner, negotiated_version: u8) -> ServerMessage {
         ServerMessage::SessionParams {
             version: negotiated_version,
             in_bytes_per_millisat: inner.pricing.in_bytes_per_millisat,
             out_bytes_per_millisat: inner.pricing.out_bytes_per_millisat,
+            receiver_pubkey: self.receiver_pubkey.clone(),
+            mints_units_keysets: self.mints_units_keysets.clone(),
         }
     }
 
@@ -131,7 +137,7 @@ impl SessionState {
 
     async fn session_params(&self, negotiated_version: u8) -> ServerMessage {
         let inner = self.inner.lock().await;
-        Self::session_params_message(&inner, negotiated_version)
+        self.session_params_message(&inner, negotiated_version)
     }
 
     async fn is_paused(&self) -> bool {
@@ -217,6 +223,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
     pub async fn from_noise_stream(
         noise_stream: NoiseStream<T>,
         quic_pool: Option<QuicPool>,
+        receiver_pubkey: String,
+        mints_units_keysets: MintUnitKeysets,
     ) -> io::Result<Self> {
         let h2_conn = server::handshake(noise_stream)
             .await
@@ -229,7 +237,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
         Ok(Self {
             h2_conn,
             quic_pool,
-            state: SessionState::new(),
+            state: SessionState::new(receiver_pubkey, mints_units_keysets),
         })
     }
 

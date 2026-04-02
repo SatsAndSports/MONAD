@@ -59,6 +59,16 @@ pub struct SessionPricing {
     pub pricing_lcm: u64,
 }
 
+/// Spilman session metadata fetched by the client after receiving `SessionParams`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSpilmanInfo {
+    pub receiver_pubkey: String,
+    pub mint_url: String,
+    pub unit: String,
+    pub keyset_id: String,
+    pub keyset_info_json: String,
+}
+
 impl SessionPricing {
     /// Create a `SessionPricing` from the negotiated version and raw
     /// directional rates.
@@ -105,6 +115,8 @@ pub struct RelayConnection {
     /// Session pricing metadata, set by the control task after receiving
     /// `SessionParams` from the relay.
     session_pricing: Arc<RwLock<Option<SessionPricing>>>,
+    /// Spilman mint/keyset info fetched by the client for this session.
+    session_spilman_info: Arc<RwLock<Option<SessionSpilmanInfo>>>,
 }
 
 impl RelayConnection {
@@ -138,6 +150,7 @@ impl RelayConnection {
             driver_handles: Vec::new(),
             task_handles: Vec::new(),
             session_pricing: Arc::new(RwLock::new(None)),
+            session_spilman_info: Arc::new(RwLock::new(None)),
         };
 
         Ok((conn, driver_handle))
@@ -213,6 +226,16 @@ impl RelayConnection {
     /// arrives from the relay.
     pub fn session_pricing_handle(&self) -> Arc<RwLock<Option<SessionPricing>>> {
         self.session_pricing.clone()
+    }
+
+    /// Get the fetched Spilman metadata for this session, if available.
+    pub async fn session_spilman_info(&self) -> Option<SessionSpilmanInfo> {
+        self.session_spilman_info.read().await.clone()
+    }
+
+    /// Get a shared handle to the Spilman session metadata storage.
+    pub fn session_spilman_info_handle(&self) -> Arc<RwLock<Option<SessionSpilmanInfo>>> {
+        self.session_spilman_info.clone()
     }
 
     /// Append a driver handle from an intermediate hop in a multi-hop chain.

@@ -5,17 +5,78 @@ use crate::session::RelaySession;
 use monad_common::identity::ServerIdentity;
 use monad_common::noise;
 use monad_common::noise::NoiseStream;
+use monad_common::protocol::MintUnitKeysets;
 use monad_quic::stream::QuicStream;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::{error, info};
 
+/// Hardcoded trusted mint policy for now: mint URL -> allowed units.
+pub type TrustedMintUnits = BTreeMap<String, BTreeSet<String>>;
+
 /// Server configuration.
 pub struct ServerConfig {
     /// The server's unified identity (Ed25519 seed + derived keys).
     pub identity: ServerIdentity,
+    /// Receiver secp256k1 public key advertised for Spilman channels.
+    pub payment_receiver_pubkey: String,
+    /// Hardcoded trusted mint policy.
+    pub trusted_mint_units: TrustedMintUnits,
+}
+
+/// Discover all keyset IDs (active and inactive) for the configured mint/unit policy.
+pub async fn discover_mints_units_keysets(
+    trusted_mint_units: &TrustedMintUnits,
+) -> io::Result<MintUnitKeysets> {
+    let client = reqwest::Client::new();
+    let mut result = MintUnitKeysets::new();
+
+    for (mint_url, trusted_units) in trusted_mint_units {
+        let keysets_url = format!("{mint_url}/v1/keysets");
+        let response = client
+            .get(&keysets_url)
+            .send()
+            .await
+            .map_err(|e| io::Error::other(format!("fetch {keysets_url}: {e}")))?
+            .error_for_status()
+            .map_err(|e| io::Error::other(format!("fetch {keysets_url}: {e}")))?;
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| io::Error::other(format!("parse {keysets_url}: {e}")))?;
+
+        let keysets = json
+            .get("keysets")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| io::Error::other(format!("invalid /v1/keysets response from {mint_url}")))?;
+
+        let mut by_unit = BTreeMap::<String, Vec<String>>::new();
+        for keyset in keysets {
+            let Some(unit) = keyset.get("unit").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !trusted_units.contains(unit) {
+                continue;
+            }
+            let Some(id) = keyset.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            by_unit.entry(unit.to_string()).or_default().push(id.to_string());
+        }
+
+        for ids in by_unit.values_mut() {
+            ids.sort();
+            ids.dedup();
+        }
+
+        info!(mint = %mint_url, units = ?by_unit.keys().collect::<Vec<_>>(), "discovered trusted mint keysets");
+        result.insert(mint_url.clone(), by_unit);
+    }
+
+    Ok(result)
 }
 
 /// Run the server: listen for TCP and optionally QUIC connections, perform Noise
@@ -40,6 +101,7 @@ pub async fn run(
     // Create the QUIC connection pool for outbound CONNECT quic: forwarding.
     // This is separate from the QUIC endpoint (which handles inbound connections).
     let quic_pool = QuicPool::new().ok();
+    let discovered_mints_units_keysets = Arc::new(discover_mints_units_keysets(&config.trusted_mint_units).await?);
 
     // Accept loop — runs until Ctrl+C
     loop {
@@ -50,6 +112,7 @@ pub async fn run(
 
                 let config = config.clone();
                 let quic_pool = quic_pool.clone();
+                let discovered_mints_units_keysets = discovered_mints_units_keysets.clone();
 
                 sessions.spawn(async move {
                     // Noise NK handshake (server is responder)
@@ -69,7 +132,13 @@ pub async fn run(
                     let noise_stream = NoiseStream::new(tcp_stream, transport, label);
 
                     // Run the H2 session
-                    match RelaySession::from_noise_stream(noise_stream, quic_pool).await {
+                    match RelaySession::from_noise_stream(
+                        noise_stream,
+                        quic_pool,
+                        config.payment_receiver_pubkey.clone(),
+                        discovered_mints_units_keysets.as_ref().clone(),
+                    )
+                    .await {
                         Ok(session) => {
                             if let Err(e) = session.run().await {
                                 error!("session error with {peer_addr}: {e}");
@@ -98,6 +167,7 @@ pub async fn run(
             } => {
                 let config = config.clone();
                 let quic_pool = quic_pool.clone();
+                let discovered_mints_units_keysets = discovered_mints_units_keysets.clone();
 
                 sessions.spawn(async move {
                     // Complete the QUIC connection handshake
@@ -121,6 +191,7 @@ pub async fn run(
 
                                 let config = config.clone();
                                 let quic_pool = quic_pool.clone();
+                                let discovered_mints_units_keysets = discovered_mints_units_keysets.clone();
                                 tokio::spawn(async move {
                                     let mut quic_stream = QuicStream::new(send, recv);
 
@@ -145,7 +216,13 @@ pub async fn run(
                                     let noise_stream =
                                         NoiseStream::new(quic_stream, transport, label);
 
-                                    match RelaySession::from_noise_stream(noise_stream, quic_pool).await {
+                                    match RelaySession::from_noise_stream(
+                                        noise_stream,
+                                        quic_pool,
+                                        config.payment_receiver_pubkey.clone(),
+                                        discovered_mints_units_keysets.as_ref().clone(),
+                                    )
+                                    .await {
                                         Ok(session) => {
                                             if let Err(e) = session.run().await {
                                                 error!("session error with {remote} (QUIC {stream_id:?}): {e}");

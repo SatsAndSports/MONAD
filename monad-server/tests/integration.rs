@@ -12,22 +12,29 @@
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
 use bytes::Bytes;
+use cashu::nuts::SecretKey;
+use cdk_spilman_test_mint::{serve_mint_with_shutdown, TestMintConfig};
 use h2::client;
 use http::{Method, Request};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::identity::{self, Ed25519Pubkey};
 use monad_common::noise;
+use monad_common::protocol::MintUnitKeysets;
 use monad_common::session::RelayConnection;
 use monad_client::connector::{self, Hop};
+use monad_client::control;
 use monad_common::protocol::{ClientMessage, ServerMessage};
 use monad_server::listener::ServerConfig;
 use monad_quic::stream::QuicStream;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
+const TEST_RECEIVER_PUBKEY: &str =
+    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -118,15 +125,55 @@ async fn run_gated_reply_server(
     let _ = stream.write_all(response).await;
 }
 
+async fn start_http_test_mint() -> (String, tokio::sync::oneshot::Sender<()>) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let config = TestMintConfig::for_port(port);
+    let mint_url = config.base_url.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let _ = serve_mint_with_shutdown(config, async {
+            let _ = shutdown_rx.await;
+        })
+        .await;
+    });
+
+    let client = reqwest::Client::new();
+    for _ in 0..50 {
+        match client.get(format!("{mint_url}/v1/keysets")).send().await {
+            Ok(resp) if resp.status().is_success() => return (mint_url, shutdown_tx),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+
+    panic!("test mint failed to start at {mint_url}");
+}
+
 /// Spin up a MONAD server and return (server_addr, ed25519_pubkey).
 async fn start_monad_server() -> (std::net::SocketAddr, Ed25519Pubkey) {
+    start_monad_server_with_spilman(BTreeMap::new(), TEST_RECEIVER_PUBKEY.to_string()).await
+}
+
+/// Spin up a MONAD server with explicit Spilman advertisement config.
+async fn start_monad_server_with_spilman(
+    trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
+    payment_receiver_pubkey: String,
+) -> (std::net::SocketAddr, Ed25519Pubkey) {
     let identity = identity::ServerIdentity::generate().unwrap();
     let pubkey = identity.ed25519_pubkey().clone();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let config = Arc::new(ServerConfig { identity });
+    let config = Arc::new(ServerConfig {
+        identity,
+        payment_receiver_pubkey,
+        trusted_mint_units,
+    });
 
     tokio::spawn(monad_server::listener::run(listener, None, config));
 
@@ -147,7 +194,11 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Ed2
     };
     let addr = listener.local_addr().unwrap();
 
-    let config = Arc::new(ServerConfig { identity });
+    let config = Arc::new(ServerConfig {
+        identity,
+        payment_receiver_pubkey: TEST_RECEIVER_PUBKEY.to_string(),
+        trusted_mint_units: BTreeMap::new(),
+    });
 
     tokio::spawn(monad_server::listener::run(listener, None, config));
 
@@ -232,13 +283,21 @@ fn expect_session_status(message: ServerMessage) -> (u64, u64, u64, i64, bool) {
     }
 }
 
-fn expect_session_params(message: ServerMessage) -> (u8, u64, u64) {
+fn expect_session_params(message: ServerMessage) -> (u8, u64, u64, String, MintUnitKeysets) {
     match message {
         ServerMessage::SessionParams {
             version,
             in_bytes_per_millisat,
             out_bytes_per_millisat,
-        } => (version, in_bytes_per_millisat, out_bytes_per_millisat),
+            receiver_pubkey,
+            mints_units_keysets,
+        } => (
+            version,
+            in_bytes_per_millisat,
+            out_bytes_per_millisat,
+            receiver_pubkey,
+            mints_units_keysets,
+        ),
         other => panic!("expected SessionParams, got {other:?}"),
     }
 }
@@ -251,7 +310,7 @@ async fn control_handshake(
 ) -> (u64, u64, u64, i64, bool) {
     send_control_message(h2_send, &ClientMessage::Hello { version: 0 }, false).await;
 
-    let (version, in_bytes_per_millisat, out_bytes_per_millisat) =
+    let (version, in_bytes_per_millisat, out_bytes_per_millisat, _receiver_pubkey, _mints_units_keysets) =
         expect_session_params(read_control_message(h2_recv).await);
     assert_eq!(version, 0);
     assert_eq!(in_bytes_per_millisat, 1);
@@ -953,7 +1012,11 @@ async fn start_monad_server_with_quic() -> (SocketAddr, Ed25519Pubkey) {
         monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
     let quic_endpoint = quinn::Endpoint::server(quic_config, addr).unwrap();
 
-    let config = Arc::new(ServerConfig { identity });
+    let config = Arc::new(ServerConfig {
+        identity,
+        payment_receiver_pubkey: TEST_RECEIVER_PUBKEY.to_string(),
+        trusted_mint_units: BTreeMap::new(),
+    });
 
     tokio::spawn(monad_server::listener::run(
         listener,
@@ -1409,4 +1472,45 @@ async fn test_spilman_channel_payment() {
         .unwrap();
 
     assert_eq!(result2.balance, 50);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_params_advertise_and_client_stores_spilman_keyset_info() {
+    let (mint_url, mint_shutdown_tx) = start_http_test_mint().await;
+
+    let receiver_secret = SecretKey::generate();
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(
+        mint_url.clone(),
+        BTreeSet::from(["sat".to_string()]),
+    );
+
+    let (server_addr, pubkey) = start_monad_server_with_spilman(
+        trusted_mint_units,
+        receiver_secret.public_key().to_hex(),
+    )
+    .await;
+    let conn = connect_client(server_addr, &pubkey).await;
+
+    let (control_task, ready_rx) =
+        control::start_fake_payment_controller(&conn, TEST_SESSION_PAYMENT)
+            .await
+            .unwrap();
+
+    ready_rx.await.unwrap();
+
+    let session_spilman_info = conn
+        .session_spilman_info()
+        .await
+        .expect("client should store fetched Spilman keyset info");
+    assert_eq!(session_spilman_info.receiver_pubkey, receiver_secret.public_key().to_hex());
+    assert_eq!(session_spilman_info.mint_url, mint_url);
+    assert_eq!(session_spilman_info.unit, "sat");
+    assert!(!session_spilman_info.keyset_id.is_empty());
+    assert!(session_spilman_info.keyset_info_json.contains(&session_spilman_info.keyset_id));
+
+    control_task.abort();
+    let _ = control_task.await;
+    let _ = mint_shutdown_tx.send(());
+    conn.shutdown().await;
 }

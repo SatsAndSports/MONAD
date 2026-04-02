@@ -4,6 +4,10 @@
 //! The data channels use H2 CONNECT directly and don't need these types.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Mint URL -> unit -> advertised keyset IDs.
+pub type MintUnitKeysets = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
 /// Messages sent from client to server on the control channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +32,8 @@ pub enum ServerMessage {
         version: u8,
         in_bytes_per_millisat: u64,
         out_bytes_per_millisat: u64,
+        receiver_pubkey: String,
+        mints_units_keysets: MintUnitKeysets,
     },
 
     /// Current session accounting and pause state.
