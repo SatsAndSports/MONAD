@@ -116,7 +116,7 @@ pub async fn run(
 
                 sessions.spawn(async move {
                     // Noise NK handshake (server is responder)
-                    let transport =
+                    let (transport, session_id) =
                         match noise::handshake_responder(&mut tcp_stream, config.identity.x25519_private()).await {
                             Ok(t) => {
                                 info!("noise handshake complete with {peer_addr} (TCP)");
@@ -129,7 +129,7 @@ pub async fn run(
                         };
 
                     let label = format!("{local_addr} <-> {peer_addr} (TCP)");
-                    let noise_stream = NoiseStream::new(tcp_stream, transport, label);
+                    let noise_stream = NoiseStream::new(tcp_stream, transport, session_id, label);
 
                     // Run the H2 session
                     match RelaySession::from_noise_stream(
@@ -195,7 +195,7 @@ pub async fn run(
                                 tokio::spawn(async move {
                                     let mut quic_stream = QuicStream::new(send, recv);
 
-                                    let transport = match noise::handshake_responder(
+                                    let (transport, session_id) = match noise::handshake_responder(
                                         &mut quic_stream,
                                         config.identity.x25519_private(),
                                     )
@@ -214,7 +214,7 @@ pub async fn run(
                                     let label =
                                         format!("{} <-> {remote} (QUIC {stream_id:?})", "quic");
                                     let noise_stream =
-                                        NoiseStream::new(quic_stream, transport, label);
+                                        NoiseStream::new(quic_stream, transport, session_id, label);
 
                                     match RelaySession::from_noise_stream(
                                         noise_stream,

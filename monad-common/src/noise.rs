@@ -46,7 +46,7 @@ pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
 pub async fn handshake_initiator<T>(
     stream: &mut T,
     server_pubkey: &[u8],
-) -> io::Result<TransportState>
+) -> io::Result<(TransportState, [u8; 32])>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -66,7 +66,12 @@ where
     let msg = read_noise_msg(stream).await?;
     noise.read_message(&msg, &mut buf).map_err(noise_err)?;
 
-    noise.into_transport_mode().map_err(noise_err)
+    let handshake_hash: [u8; 32] = noise
+        .get_handshake_hash()
+        .try_into()
+        .map_err(|_| noise_err(snow::Error::State(snow::error::StateProblem::HandshakeNotFinished)))?;
+    let transport = noise.into_transport_mode().map_err(noise_err)?;
+    Ok((transport, handshake_hash))
 }
 
 /// Perform the Noise NK handshake as the responder (server).
@@ -76,7 +81,7 @@ where
 pub async fn handshake_responder<T>(
     stream: &mut T,
     server_privkey: &[u8],
-) -> io::Result<TransportState>
+) -> io::Result<(TransportState, [u8; 32])>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -96,7 +101,12 @@ where
     let len = noise.write_message(&[], &mut buf).map_err(noise_err)?;
     write_noise_msg(stream, &buf[..len]).await?;
 
-    noise.into_transport_mode().map_err(noise_err)
+    let handshake_hash: [u8; 32] = noise
+        .get_handshake_hash()
+        .try_into()
+        .map_err(|_| noise_err(snow::Error::State(snow::error::StateProblem::HandshakeNotFinished)))?;
+    let transport = noise.into_transport_mode().map_err(noise_err)?;
+    Ok((transport, handshake_hash))
 }
 
 /// Write a length-prefixed message to the stream.
@@ -149,6 +159,9 @@ pub struct NoiseStream<T> {
     inner: T,
     transport: TransportState,
 
+    /// Noise handshake hash — identical on both sides, unique per session.
+    session_id: [u8; 32],
+
     // Read side: buffer for decrypted plaintext not yet consumed by the caller
     read_plaintext: BytesMut,
     // Read side: buffer for accumulating an incoming encrypted message (len-prefixed)
@@ -176,10 +189,16 @@ impl<T> NoiseStream<T> {
     ///
     /// The label typically describes the connection endpoints, e.g.,
     /// `"127.0.0.1:9050 <-> 127.0.0.1:43210"` or `"tunnel to 1.2.3.4:9050"`.
-    pub fn new(inner: T, transport: TransportState, label: impl Into<String>) -> Self {
+    pub fn new(
+        inner: T,
+        transport: TransportState,
+        session_id: [u8; 32],
+        label: impl Into<String>,
+    ) -> Self {
         Self {
             inner,
             transport,
+            session_id,
             read_plaintext: BytesMut::new(),
             read_ciphertext: BytesMut::new(),
             read_expected_len: None,
@@ -188,6 +207,15 @@ impl<T> NoiseStream<T> {
             wire_bytes_written: 0,
             label: label.into(),
         }
+    }
+
+    /// The Noise handshake hash, used as a unique session identifier.
+    ///
+    /// Identical on both sides of the connection. Derived from the Noise
+    /// transcript (ephemeral keys + DH results), so it's unique per session
+    /// and unpredictable to non-participants.
+    pub fn session_id(&self) -> &[u8; 32] {
+        &self.session_id
     }
 }
 
@@ -432,8 +460,10 @@ mod tests {
             let privkey = privkey.clone();
             async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let transport = handshake_responder(&mut stream, &privkey).await.unwrap();
-                let mut noise_stream = NoiseStream::new(stream, transport, "test-server");
+                let (transport, session_id) =
+                    handshake_responder(&mut stream, &privkey).await.unwrap();
+                let mut noise_stream =
+                    NoiseStream::new(stream, transport, session_id, "test-server");
 
                 let mut buf = vec![0u8; 1024];
                 let n = noise_stream.read(&mut buf).await.unwrap();
@@ -449,8 +479,10 @@ mod tests {
 
         let client_handle = tokio::spawn(async move {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let transport = handshake_initiator(&mut stream, &pubkey).await.unwrap();
-            let mut noise_stream = NoiseStream::new(stream, transport, "test-client");
+            let (transport, session_id) =
+                handshake_initiator(&mut stream, &pubkey).await.unwrap();
+            let mut noise_stream =
+                NoiseStream::new(stream, transport, session_id, "test-client");
 
             noise_stream
                 .write_all(b"hello from client")
@@ -482,8 +514,10 @@ mod tests {
             let expected = large_data.clone();
             async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let transport = handshake_responder(&mut stream, &privkey).await.unwrap();
-                let mut noise_stream = NoiseStream::new(stream, transport, "test-server-large");
+                let (transport, session_id) =
+                    handshake_responder(&mut stream, &privkey).await.unwrap();
+                let mut noise_stream =
+                    NoiseStream::new(stream, transport, session_id, "test-server-large");
 
                 let mut received = Vec::new();
                 let mut buf = vec![0u8; 8192];
@@ -502,8 +536,10 @@ mod tests {
 
         let client_handle = tokio::spawn(async move {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let transport = handshake_initiator(&mut stream, &pubkey).await.unwrap();
-            let mut noise_stream = NoiseStream::new(stream, transport, "test-client-large");
+            let (transport, session_id) =
+                handshake_initiator(&mut stream, &pubkey).await.unwrap();
+            let mut noise_stream =
+                NoiseStream::new(stream, transport, session_id, "test-client-large");
 
             noise_stream.write_all(&large_data).await.unwrap();
             noise_stream.flush().await.unwrap();
@@ -512,5 +548,36 @@ mod tests {
 
         server_handle.await.unwrap();
         client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_session_id_matches_on_both_sides() {
+        let (privkey, pubkey) = generate_keypair();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn({
+            let privkey = privkey.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, session_id) =
+                    handshake_responder(&mut stream, &privkey).await.unwrap();
+                session_id
+            }
+        });
+
+        let client_handle = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let (_, session_id) =
+                handshake_initiator(&mut stream, &pubkey).await.unwrap();
+            session_id
+        });
+
+        let server_session_id = server_handle.await.unwrap();
+        let client_session_id = client_handle.await.unwrap();
+
+        assert_eq!(server_session_id, client_session_id);
+        assert_ne!(server_session_id, [0u8; 32]);
     }
 }

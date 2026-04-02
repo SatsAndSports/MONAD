@@ -1056,11 +1056,11 @@ async fn connect_client_quic(
     let x25519_pub = pubkey.to_x25519().unwrap();
 
     // Noise handshake over the QUIC stream
-    let transport = noise::handshake_initiator(&mut quic_stream, &x25519_pub)
+    let (transport, session_id) = noise::handshake_initiator(&mut quic_stream, &x25519_pub)
         .await
         .unwrap();
     let noise_stream =
-        noise::NoiseStream::new(quic_stream, transport, "test-quic-client".to_string());
+        noise::NoiseStream::new(quic_stream, transport, session_id, "test-quic-client".to_string());
 
     // Create RelayConnection from the Noise stream
     let (mut conn, driver) = RelayConnection::from_noise_stream(noise_stream).await.unwrap();
@@ -1170,11 +1170,11 @@ async fn test_nested_quic_tunnel() {
 
     // Noise handshake to T (nested inside the QUIC-forwarded tunnel)
     let mut stream = h2_connect_stream;
-    let transport = noise::handshake_initiator(&mut stream, &t_x25519_pub)
+    let (transport, session_id) = noise::handshake_initiator(&mut stream, &t_x25519_pub)
         .await
         .unwrap();
     let noise_stream =
-        noise::NoiseStream::new(stream, transport, "test-nested-quic-client".to_string());
+        noise::NoiseStream::new(stream, transport, session_id, "test-nested-quic-client".to_string());
 
     // Create RelayConnection to T
     let (mut conn_to_t, driver) = RelayConnection::from_noise_stream(noise_stream).await.unwrap();

@@ -214,6 +214,8 @@ impl SessionState {
 pub struct RelaySession<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     h2_conn: server::Connection<NoiseStream<T>, Bytes>,
     quic_pool: Option<QuicPool>,
+    #[allow(dead_code)]
+    session_id: [u8; 32],
     state: SessionState,
 }
 
@@ -226,17 +228,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
         receiver_pubkey: String,
         mints_units_keysets: MintUnitKeysets,
     ) -> io::Result<Self> {
+        let session_id = *noise_stream.session_id();
+
         let h2_conn = server::handshake(noise_stream)
             .await
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("h2 handshake error: {e}"))
             })?;
 
-        info!("H2 connection established");
+        info!(session_id = hex::encode(session_id), "H2 connection established");
 
         Ok(Self {
             h2_conn,
             quic_pool,
+            session_id,
             state: SessionState::new(receiver_pubkey, mints_units_keysets),
         })
     }

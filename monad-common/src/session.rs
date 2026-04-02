@@ -112,6 +112,8 @@ pub struct RelayConnection {
     /// Abortable background tasks associated with this relay connection, such as
     /// client-side control stream tasks.
     task_handles: Vec<JoinHandle<()>>,
+    /// Noise handshake hash — unique session identifier agreed by both sides.
+    session_id: [u8; 32],
     /// Session pricing metadata, set by the control task after receiving
     /// `SessionParams` from the relay.
     session_pricing: Arc<RwLock<Option<SessionPricing>>>,
@@ -133,6 +135,8 @@ impl RelayConnection {
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        let session_id = *noise_stream.session_id();
+
         let (h2_client, h2_conn) = client::handshake(noise_stream)
             .await
             .map_err(|e| {
@@ -149,6 +153,7 @@ impl RelayConnection {
             h2_client: Arc::new(tokio::sync::Mutex::new(h2_client)),
             driver_handles: Vec::new(),
             task_handles: Vec::new(),
+            session_id,
             session_pricing: Arc::new(RwLock::new(None)),
             session_spilman_info: Arc::new(RwLock::new(None)),
         };
@@ -213,6 +218,11 @@ impl RelayConnection {
         }
 
         Ok((h2_send, response.into_body()))
+    }
+
+    /// Get the Noise handshake hash used as a unique session identifier.
+    pub fn session_id(&self) -> &[u8; 32] {
+        &self.session_id
     }
 
     /// Get the current session pricing, if set by the control task.
