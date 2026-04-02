@@ -1296,3 +1296,117 @@ async fn test_quic_first_hop_then_tcp() {
     drop(h2);
     conn.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Spilman payment channel tests
+// ---------------------------------------------------------------------------
+
+/// Validates that the Spilman payment channel plumbing works inside MONAD's
+/// test environment: in-memory mint, channel opening, payment creation, and
+/// server-side payment verification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spilman_channel_payment() {
+    use cashu::nuts::SecretKey;
+    use cdk_spilman::{
+        build_cashu_b_token, ConfigurableClientHost, SpilmanBridge, SpilmanClientBridge,
+    };
+    use cdk_spilman_test_mint::{InMemoryMintNetworking, TestMintHelper, TestServerHost};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now_secs = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+
+    // 1. Create in-memory mint
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+
+    // 2. Generate sender (client) + receiver (server) keys
+    let sender_secret = SecretKey::generate();
+    let receiver_secret = SecretKey::generate();
+
+    // 3. Setup server-side Spilman bridge
+    let server_host = TestServerHost::new(receiver_secret.clone());
+    server_host.add_keyset(
+        "https://test-mint",
+        mint_helper.keyset_id(),
+        keyset_info_json.clone(),
+    );
+    let server_bridge = SpilmanBridge::new(server_host);
+
+    // 4. Setup client-side Spilman bridge
+    let mut client_host = ConfigurableClientHost::new_in_memory();
+    client_host.add_key(sender_secret.clone());
+    let client_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let client_bridge = SpilmanClientBridge::new(client_host, client_networking);
+
+    // 5. Mint a token and open a channel
+    let proofs = mint_helper.mint_proofs(1000).await.unwrap();
+    let token = build_cashu_b_token(
+        "https://test-mint",
+        "sat",
+        &serde_json::to_string(&proofs).unwrap(),
+    )
+    .unwrap();
+
+    let open_result = client_bridge
+        .open_channel_from_token(
+            &token,
+            &receiver_secret.public_key().to_hex(),
+            &sender_secret.public_key().to_hex(),
+            now_secs() + 3600,
+            &keyset_info_json,
+            64,
+        )
+        .unwrap();
+
+    assert!(open_result.capacity > 0);
+
+    // 6. Client creates first payment (includes funding data)
+    let payment1 = client_bridge
+        .create_payment_with_funding(&open_result.channel_id, 10)
+        .unwrap();
+
+    assert_eq!(payment1.balance, 10);
+    assert!(payment1.has_funding());
+
+    // 7. Server verifies and processes first payment
+    let result1 = server_bridge
+        .process_payment(
+            &payment1.channel_id,
+            payment1.balance,
+            &payment1.signature,
+            payment1.params.as_ref(),
+            payment1.funding_proofs.as_deref(),
+            &(),
+        )
+        .unwrap();
+
+    assert_eq!(result1.balance, 10);
+    assert_eq!(result1.capacity, open_result.capacity);
+
+    // 8. Client creates a top-up payment (no funding data)
+    let payment2 = client_bridge
+        .create_payment(&open_result.channel_id, 50)
+        .unwrap();
+
+    assert_eq!(payment2.balance, 50);
+    assert!(!payment2.has_funding());
+
+    // 9. Server verifies and processes top-up
+    let result2 = server_bridge
+        .process_payment(
+            &payment2.channel_id,
+            payment2.balance,
+            &payment2.signature,
+            None,
+            None,
+            &(),
+        )
+        .unwrap();
+
+    assert_eq!(result2.balance, 50);
+}

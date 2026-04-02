@@ -22,3 +22,6 @@ serde_json = "1"
 monad-client = { path = "../monad-client" }
 monad-quic = { path = "../monad-quic" }
 quinn = "0.11"
+cdk-spilman = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman", features = ["wallet"] }
+cdk-spilman-test-mint = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman-test-mint", default-features = false }
+cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cashu", default-features = false }
