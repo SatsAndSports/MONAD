@@ -6,12 +6,18 @@
 
 use crate::proxy;
 use crate::quic_pool::QuicPool;
+use crate::listener::SpilmanMintCache;
 use bytes::Bytes;
+use cashu::nuts::{CurrencyUnit, Id, PublicKey, SecretKey};
+use cdk_spilman::{
+    compute_channel_secret_from_hex, sign_with_tweaked_key_util, ChannelFunding,
+    ChannelPolicy, ChannelState, ClosingData, PaymentProof, SpilmanBridge, SpilmanHost,
+};
 use h2::server;
 use http::{Method, Response, StatusCode};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise::NoiseStream;
-use monad_common::protocol::{ClientMessage, MintUnitKeysets, ServerMessage};
+use monad_common::protocol::{ClientMessage, ServerMessage};
 use monad_common::session::{SessionPricing, clamp_i128_to_i64};
 use std::io;
 use std::sync::Arc;
@@ -64,12 +70,12 @@ struct SessionInner {
 pub(crate) struct SessionState {
     inner: Arc<Mutex<SessionInner>>,
     pause_tx: watch::Sender<bool>,
-    receiver_pubkey: String,
-    mints_units_keysets: MintUnitKeysets,
+    payment_receiver_secret: SecretKey,
+    spilman_mint_cache: SpilmanMintCache,
 }
 
 impl SessionState {
-    fn new(receiver_pubkey: String, mints_units_keysets: MintUnitKeysets) -> Self {
+    fn new(payment_receiver_secret: SecretKey, spilman_mint_cache: SpilmanMintCache) -> Self {
         let (pause_tx, _) = watch::channel(true);
         Self {
             inner: Arc::new(Mutex::new(SessionInner {
@@ -86,8 +92,8 @@ impl SessionState {
                 control_tx: None,
             })),
             pause_tx,
-            receiver_pubkey,
-            mints_units_keysets,
+            payment_receiver_secret,
+            spilman_mint_cache,
         }
     }
 
@@ -96,8 +102,8 @@ impl SessionState {
             version: negotiated_version,
             in_bytes_per_millisat: inner.pricing.in_bytes_per_millisat,
             out_bytes_per_millisat: inner.pricing.out_bytes_per_millisat,
-            receiver_pubkey: self.receiver_pubkey.clone(),
-            mints_units_keysets: self.mints_units_keysets.clone(),
+            receiver_pubkey: self.payment_receiver_secret.public_key().to_hex(),
+            mints_units_keysets: self.spilman_mint_cache.advertised.clone(),
         }
     }
 
@@ -209,6 +215,139 @@ impl SessionState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FundingValidationHost {
+    receiver_secret: SecretKey,
+    mint_cache: SpilmanMintCache,
+}
+
+impl FundingValidationHost {
+    fn new(receiver_secret: SecretKey, mint_cache: SpilmanMintCache) -> Self {
+        Self {
+            receiver_secret,
+            mint_cache,
+        }
+    }
+}
+
+impl SpilmanHost<()> for FundingValidationHost {
+    fn receiver_key_is_acceptable(&self, receiver_pubkey: &PublicKey) -> bool {
+        self.receiver_secret.public_key() == *receiver_pubkey
+    }
+
+    fn mint_and_keyset_is_acceptable(&self, mint: &str, keyset_id: &Id) -> bool {
+        self.mint_cache
+            .keyset_info_json_by_mint
+            .get(mint)
+            .and_then(|m| m.get(&keyset_id.to_string()))
+            .is_some()
+    }
+
+    fn get_funding(&self, _channel_id: &str) -> Option<ChannelFunding> {
+        None
+    }
+
+    fn save_funding(&self, _channel_id: &str, _funding: ChannelFunding, _initial_payment: PaymentProof) {}
+
+    fn get_amount_due(&self, _channel_id: &str, _context: Option<&()>) -> u64 {
+        0
+    }
+
+    fn record_payment(&self, _channel_id: &str, _payment: PaymentProof, _context: &()) {}
+
+    fn get_channel_state(&self, _channel_id: &str) -> ChannelState {
+        ChannelState::Open
+    }
+
+    fn mark_channel_closing(
+        &self,
+        _channel_id: &str,
+        _expiry_timestamp: u64,
+        _payment: PaymentProof,
+    ) -> Result<(), String> {
+        Err("closing unsupported in funding validation host".to_string())
+    }
+
+    fn get_closing_data(&self, _channel_id: &str) -> Option<ClosingData> {
+        None
+    }
+
+    fn get_channel_policy(&self, unit: &str) -> Option<ChannelPolicy> {
+        let supported = self
+            .mint_cache
+            .advertised
+            .values()
+            .any(|units| units.contains_key(unit));
+        supported.then_some(ChannelPolicy {
+            min_expiry_in_seconds: 0,
+            min_capacity: 0,
+            max_amount_per_output: None,
+        })
+    }
+
+    fn now_seconds(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn get_balance_and_signature_for_unilateral_exit(&self, _channel_id: &str) -> Option<PaymentProof> {
+        None
+    }
+
+    fn get_active_keyset_ids(&self, mint: &str, unit: &CurrencyUnit) -> Vec<Id> {
+        self.mint_cache
+            .advertised
+            .get(mint)
+            .and_then(|units| units.get(&unit.to_string()))
+            .map(|ids| ids.iter().filter_map(|id| id.parse().ok()).collect())
+            .unwrap_or_default()
+    }
+
+    fn get_keyset_info(&self, mint: &str, keyset_id: &Id) -> Option<String> {
+        self.mint_cache
+            .keyset_info_json_by_mint
+            .get(mint)
+            .and_then(|m| m.get(&keyset_id.to_string()))
+            .cloned()
+    }
+
+    fn mark_channel_closed(
+        &self,
+        _channel_id: &str,
+        _expiry_timestamp: u64,
+        _balance: u64,
+        _receiver_proofs_json: &str,
+        _sender_proofs_json: &str,
+        _receiver_sum: u64,
+        _sender_sum: u64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn compute_channel_secret(
+        &self,
+        _receiver_pubkey_hex: &str,
+        sender_pubkey_hex: &str,
+    ) -> Result<String, String> {
+        compute_channel_secret_from_hex(&self.receiver_secret.to_secret_hex(), sender_pubkey_hex)
+    }
+
+    fn sign_with_tweaked_key(
+        &self,
+        _signer_pubkey_hex: &str,
+        message_hex: &str,
+        tweak_scalar_hex: &str,
+    ) -> Result<String, String> {
+        sign_with_tweaked_key_util(
+            &self.receiver_secret.to_secret_hex(),
+            message_hex,
+            tweak_scalar_hex,
+        )
+    }
+}
+
 /// An inbound relay session: an H2 server connection running over an
 /// encrypted `NoiseStream`.
 pub struct RelaySession<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
@@ -225,8 +364,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
     pub async fn from_noise_stream(
         noise_stream: NoiseStream<T>,
         quic_pool: Option<QuicPool>,
-        receiver_pubkey: String,
-        mints_units_keysets: MintUnitKeysets,
+        payment_receiver_secret: SecretKey,
+        spilman_mint_cache: SpilmanMintCache,
     ) -> io::Result<Self> {
         let session_id = *noise_stream.session_id();
 
@@ -242,7 +381,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
             h2_conn,
             quic_pool,
             session_id,
-            state: SessionState::new(receiver_pubkey, mints_units_keysets),
+            state: SessionState::new(payment_receiver_secret, spilman_mint_cache),
         })
     }
 
@@ -616,6 +755,48 @@ async fn handle_control_stream(
                                 Ok(ClientMessage::GetSessionStatus) => {
                                     let snapshot = state.snapshot().await;
                                     send_control_message(&mut h2_send, &snapshot.to_message()).await?;
+                                }
+                                Ok(ClientMessage::ChannelFunding { payment_json }) => {
+                                    let payment: cdk_spilman::Payment = match serde_json::from_str(&payment_json) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            state.push_message(ServerMessage::Error {
+                                                message: format!("invalid ChannelFunding payload: {e}"),
+                                            }).await;
+                                            continue;
+                                        }
+                                    };
+
+                                    if payment.balance != 0 {
+                                        state.push_message(ServerMessage::Error {
+                                            message: "ChannelFunding requires balance=0".to_string(),
+                                        }).await;
+                                        continue;
+                                    }
+
+                                    let bridge = SpilmanBridge::<_, ()>::new(FundingValidationHost::new(
+                                        state.payment_receiver_secret.clone(),
+                                        state.spilman_mint_cache.clone(),
+                                    ));
+
+                                    match bridge.fund_channel_via_json(&payment_json) {
+                                        Ok(result) => {
+                                            info!(
+                                                channel_id = %result.channel_id,
+                                                capacity = result.capacity,
+                                                "validated zero-balance session channel funding"
+                                            );
+                                            state.push_message(ServerMessage::ChannelFundingAccepted {
+                                                channel_id: result.channel_id,
+                                                capacity: result.capacity,
+                                            }).await;
+                                        }
+                                        Err(e) => {
+                                            state.push_message(ServerMessage::Error {
+                                                message: format!("channel funding rejected: {e}"),
+                                            }).await;
+                                        }
+                                    }
                                 }
                                 Ok(ClientMessage::FakePayment { milli_sats }) => {
                                     let snapshot = state.apply_fake_payment(milli_sats).await;

@@ -2,6 +2,8 @@
 
 use crate::quic_pool::QuicPool;
 use crate::session::RelaySession;
+use cashu::nuts::SecretKey;
+use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::identity::ServerIdentity;
 use monad_common::noise;
 use monad_common::noise::NoiseStream;
@@ -17,54 +19,50 @@ use tracing::{error, info};
 /// Hardcoded trusted mint policy for now: mint URL -> allowed units.
 pub type TrustedMintUnits = BTreeMap<String, BTreeSet<String>>;
 
+/// Server-side cached view of trusted mints.
+#[derive(Debug, Clone, Default)]
+pub struct SpilmanMintCache {
+    /// Mint URL -> unit -> advertised keyset IDs.
+    pub advertised: MintUnitKeysets,
+    /// Mint URL -> keyset ID -> keyset info JSON.
+    pub keyset_info_json_by_mint: BTreeMap<String, BTreeMap<String, String>>,
+}
+
 /// Server configuration.
 pub struct ServerConfig {
     /// The server's unified identity (Ed25519 seed + derived keys).
     pub identity: ServerIdentity,
-    /// Receiver secp256k1 public key advertised for Spilman channels.
-    pub payment_receiver_pubkey: String,
+    /// Receiver secp256k1 secret used for Spilman channel validation.
+    pub payment_receiver_secret: SecretKey,
     /// Hardcoded trusted mint policy.
     pub trusted_mint_units: TrustedMintUnits,
 }
 
-/// Discover all keyset IDs (active and inactive) for the configured mint/unit policy.
-pub async fn discover_mints_units_keysets(
+/// Discover all keyset IDs (active and inactive) and cache their keyset info JSON.
+pub async fn discover_spilman_mint_cache(
     trusted_mint_units: &TrustedMintUnits,
-) -> io::Result<MintUnitKeysets> {
-    let client = reqwest::Client::new();
-    let mut result = MintUnitKeysets::new();
+) -> io::Result<SpilmanMintCache> {
+    let mut cache = SpilmanMintCache::default();
 
     for (mint_url, trusted_units) in trusted_mint_units {
-        let keysets_url = format!("{mint_url}/v1/keysets");
-        let response = client
-            .get(&keysets_url)
-            .send()
+        let keysets = fetch_all_keysets_from_mint(mint_url)
             .await
-            .map_err(|e| io::Error::other(format!("fetch {keysets_url}: {e}")))?
-            .error_for_status()
-            .map_err(|e| io::Error::other(format!("fetch {keysets_url}: {e}")))?;
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| io::Error::other(format!("parse {keysets_url}: {e}")))?;
-
-        let keysets = json
-            .get("keysets")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| io::Error::other(format!("invalid /v1/keysets response from {mint_url}")))?;
+            .map_err(|e| io::Error::other(format!("discover keysets from {mint_url}: {e}")))?;
 
         let mut by_unit = BTreeMap::<String, Vec<String>>::new();
+        let mut by_id = BTreeMap::<String, String>::new();
         for keyset in keysets {
-            let Some(unit) = keyset.get("unit").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if !trusted_units.contains(unit) {
+            let unit = keyset.unit.to_string();
+            if !trusted_units.contains(&unit) {
                 continue;
             }
-            let Some(id) = keyset.get("id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            by_unit.entry(unit.to_string()).or_default().push(id.to_string());
+
+            let id = keyset.id.to_string();
+            by_unit.entry(unit.clone()).or_default().push(id.clone());
+            by_id.insert(
+                id,
+                build_keyset_info_json(&keyset.id, &keyset.unit, &keyset.keys, keyset.input_fee_ppk),
+            );
         }
 
         for ids in by_unit.values_mut() {
@@ -73,10 +71,11 @@ pub async fn discover_mints_units_keysets(
         }
 
         info!(mint = %mint_url, units = ?by_unit.keys().collect::<Vec<_>>(), "discovered trusted mint keysets");
-        result.insert(mint_url.clone(), by_unit);
+        cache.advertised.insert(mint_url.clone(), by_unit);
+        cache.keyset_info_json_by_mint.insert(mint_url.clone(), by_id);
     }
 
-    Ok(result)
+    Ok(cache)
 }
 
 /// Run the server: listen for TCP and optionally QUIC connections, perform Noise
@@ -101,7 +100,7 @@ pub async fn run(
     // Create the QUIC connection pool for outbound CONNECT quic: forwarding.
     // This is separate from the QUIC endpoint (which handles inbound connections).
     let quic_pool = QuicPool::new().ok();
-    let discovered_mints_units_keysets = Arc::new(discover_mints_units_keysets(&config.trusted_mint_units).await?);
+    let discovered_spilman_mint_cache = Arc::new(discover_spilman_mint_cache(&config.trusted_mint_units).await?);
 
     // Accept loop — runs until Ctrl+C
     loop {
@@ -112,7 +111,7 @@ pub async fn run(
 
                 let config = config.clone();
                 let quic_pool = quic_pool.clone();
-                let discovered_mints_units_keysets = discovered_mints_units_keysets.clone();
+                let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
 
                 sessions.spawn(async move {
                     // Noise NK handshake (server is responder)
@@ -135,8 +134,8 @@ pub async fn run(
                     match RelaySession::from_noise_stream(
                         noise_stream,
                         quic_pool,
-                        config.payment_receiver_pubkey.clone(),
-                        discovered_mints_units_keysets.as_ref().clone(),
+                        config.payment_receiver_secret.clone(),
+                        discovered_spilman_mint_cache.as_ref().clone(),
                     )
                     .await {
                         Ok(session) => {
@@ -167,7 +166,7 @@ pub async fn run(
             } => {
                 let config = config.clone();
                 let quic_pool = quic_pool.clone();
-                let discovered_mints_units_keysets = discovered_mints_units_keysets.clone();
+                let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
 
                 sessions.spawn(async move {
                     // Complete the QUIC connection handshake
@@ -191,7 +190,7 @@ pub async fn run(
 
                                 let config = config.clone();
                                 let quic_pool = quic_pool.clone();
-                                let discovered_mints_units_keysets = discovered_mints_units_keysets.clone();
+                                let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
                                 tokio::spawn(async move {
                                     let mut quic_stream = QuicStream::new(send, recv);
 
@@ -219,8 +218,8 @@ pub async fn run(
                                     match RelaySession::from_noise_stream(
                                         noise_stream,
                                         quic_pool,
-                                        config.payment_receiver_pubkey.clone(),
-                                        discovered_mints_units_keysets.as_ref().clone(),
+                                        config.payment_receiver_secret.clone(),
+                                        discovered_spilman_mint_cache.as_ref().clone(),
                                     )
                                     .await {
                                         Ok(session) => {

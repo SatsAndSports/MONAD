@@ -16,6 +16,11 @@ pub enum ClientMessage {
     /// First message on the control stream. Declares the highest
     /// protocol version the client supports.
     Hello { version: u8 },
+    /// Register a funded Spilman channel for this session.
+    ///
+    /// The payload is a serialized `cdk_spilman::Payment` JSON object with
+    /// `balance == 0`, plus `params` and `funding_proofs` included.
+    ChannelFunding { payment_json: String },
     /// Add fake credit to the current relay session.
     FakePayment { milli_sats: u64 },
     /// Request a fresh session status snapshot.
@@ -35,6 +40,9 @@ pub enum ServerMessage {
         receiver_pubkey: String,
         mints_units_keysets: MintUnitKeysets,
     },
+
+    /// The server validated a zero-balance Spilman funding registration.
+    ChannelFundingAccepted { channel_id: String, capacity: u64 },
 
     /// Current session accounting and pause state.
     SessionStatus {

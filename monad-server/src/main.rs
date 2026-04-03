@@ -1,3 +1,4 @@
+use cashu::nuts::SecretKey;
 use clap::{Parser, Subcommand};
 use monad_common::identity::ServerIdentity;
 use monad_server::listener;
@@ -5,9 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
-
-const HARDCODED_PAYMENT_RECEIVER_PUBKEY: &str =
-    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
 #[derive(Parser)]
 #[command(name = "monad-server", about = "MONAD tunnel server")]
@@ -96,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
 
             let config = Arc::new(listener::ServerConfig {
                 identity,
-                payment_receiver_pubkey: HARDCODED_PAYMENT_RECEIVER_PUBKEY.to_string(),
+                payment_receiver_secret: SecretKey::generate(),
                 trusted_mint_units: BTreeMap::<String, BTreeSet<String>>::new(),
             });
 

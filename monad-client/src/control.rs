@@ -1,5 +1,8 @@
 use bytes::Bytes;
-use cdk_spilman::{ConfigurableClientHost, ReqwestClientNetworking, SpilmanClientBridge};
+use cdk_spilman::{
+    ConfigurableClientHost, MemoryClientStorage, Payment, ReqwestClientNetworking,
+    SpilmanClientBridge,
+};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::protocol::{ClientMessage, MintUnitKeysets, ServerMessage};
 use monad_common::session::{
@@ -49,6 +52,15 @@ impl SessionFundingProvider for FakePaymentProvider {
     ) -> Option<String> {
         None
     }
+}
+
+type SessionBridge =
+    SpilmanClientBridge<ConfigurableClientHost<MemoryClientStorage>, ReqwestClientNetworking>;
+
+struct SessionChannelRuntime {
+    _bridge: SessionBridge,
+    channel_id: String,
+    capacity: u64,
 }
 
 fn encode_client_message(message: &ClientMessage) -> io::Result<Bytes> {
@@ -124,7 +136,7 @@ fn fetch_session_spilman_info(
 fn open_spilman_channel(
     spilman_info: &SessionSpilmanInfo,
     token: &str,
-) -> io::Result<SessionChannelInfo> {
+) -> io::Result<(SessionChannelRuntime, String)> {
     use cashu::nuts::SecretKey;
 
     let sender_secret = SecretKey::generate();
@@ -149,10 +161,22 @@ fn open_spilman_channel(
         )
         .map_err(|e| io_other(format!("open Spilman channel: {e}")))?;
 
-    Ok(SessionChannelInfo {
-        channel_id: open_result.channel_id,
-        capacity: open_result.capacity,
-    })
+    let channel_id = open_result.channel_id;
+    let capacity = open_result.capacity;
+    let funding_payment: Payment = bridge
+        .create_payment_with_funding(&channel_id, 0)
+        .map_err(|e| io_other(format!("create funding registration payment: {e}")))?;
+    let payment_json = serde_json::to_string(&funding_payment)
+        .map_err(|e| io_other(format!("serialize funding registration payment: {e}")))?;
+
+    Ok((
+        SessionChannelRuntime {
+            _bridge: bridge,
+            channel_id,
+            capacity,
+        },
+        payment_json,
+    ))
 }
 
 async fn run_control_task(
@@ -168,6 +192,8 @@ async fn run_control_task(
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     let mut ready_tx = Some(ready_tx);
+    let mut pending_channel: Option<SessionChannelRuntime> = None;
+    let mut _active_channel: Option<SessionChannelRuntime> = None;
 
     // Send Hello as the first message on the control stream.
     send_control_message(&mut h2_send, &ClientMessage::Hello { version: CLIENT_VERSION }).await?;
@@ -243,13 +269,18 @@ async fn run_control_task(
                             &info.keyset_id,
                         ) {
                             match open_spilman_channel(info, &token) {
-                                Ok(channel_info) => {
+                                Ok((channel_runtime, payment_json)) => {
                                     info!(
-                                        channel_id = %channel_info.channel_id,
-                                        capacity = channel_info.capacity,
-                                        "opened Spilman channel for session"
+                                        channel_id = %channel_runtime.channel_id,
+                                        capacity = channel_runtime.capacity,
+                                        "opened Spilman channel for session; sending funding registration"
                                     );
-                                    *channel_info_handle.write().await = Some(channel_info);
+                                    pending_channel = Some(channel_runtime);
+                                    send_control_message(
+                                        &mut h2_send,
+                                        &ClientMessage::ChannelFunding { payment_json },
+                                    )
+                                    .await?;
                                 }
                                 Err(e) => {
                                     warn!("failed to open Spilman channel: {e}");
@@ -259,7 +290,44 @@ async fn run_control_task(
                     }
                 }
                 ServerMessage::Error { message } => {
+                    if pending_channel.is_some() {
+                        pending_channel = None;
+                    }
                     warn!("control error: {message}");
+                }
+                ServerMessage::ChannelFundingAccepted {
+                    channel_id,
+                    capacity,
+                } => {
+                    match pending_channel.take() {
+                        Some(channel_runtime) if channel_runtime.channel_id == channel_id => {
+                            if channel_runtime.capacity != capacity {
+                                warn!(
+                                    channel_id = %channel_id,
+                                    client_capacity = channel_runtime.capacity,
+                                    server_capacity = capacity,
+                                    "channel funding ack capacity differed from client view"
+                                );
+                            }
+                            *channel_info_handle.write().await = Some(SessionChannelInfo {
+                                channel_id: channel_runtime.channel_id.clone(),
+                                capacity,
+                            });
+                            info!(channel_id = %channel_id, capacity, "server accepted session channel funding");
+                            _active_channel = Some(channel_runtime);
+                        }
+                        Some(channel_runtime) => {
+                            warn!(
+                                expected_channel_id = %channel_runtime.channel_id,
+                                got_channel_id = %channel_id,
+                                "received funding ack for unexpected channel"
+                            );
+                            pending_channel = Some(channel_runtime);
+                        }
+                        None => {
+                            warn!(channel_id = %channel_id, "received unexpected channel funding ack");
+                        }
+                    }
                 }
                 ServerMessage::SessionStatus {
                     session_total_in,
