@@ -17,6 +17,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 http = "1"
 anyhow = "1"
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-cdk-spilman = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman", features = ["wallet"] }
-cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cashu", default-features = false }
+cdk-spilman = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman", features = ["wallet", "configurable-host-reqwest"] }
