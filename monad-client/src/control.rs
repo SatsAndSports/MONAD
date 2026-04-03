@@ -139,13 +139,12 @@ fn open_spilman_channel(
         .unwrap_or(0);
 
     let open_result = bridge
-        .open_channel_from_token_auto(
+        .open_channel_from_token(
             token,
             &spilman_info.receiver_pubkey,
             &sender_secret.public_key().to_hex(),
             now_secs + 3600,
-            &spilman_info.mint_url,
-            &spilman_info.keyset_id,
+            &spilman_info.keyset_info_json,
             64,
         )
         .map_err(|e| io_other(format!("open Spilman channel: {e}")))?;
