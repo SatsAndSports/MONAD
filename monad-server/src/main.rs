@@ -92,10 +92,16 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
 
+            let mut trusted_mint_units = BTreeMap::<String, BTreeSet<String>>::new();
+            trusted_mint_units.insert(
+                "https://fake.thesimplekid.dev".to_string(),
+                BTreeSet::from(["sat".to_string()]),
+            );
+
             let config = Arc::new(listener::ServerConfig {
                 identity,
                 payment_receiver_secret: SecretKey::generate(),
-                trusted_mint_units: BTreeMap::<String, BTreeSet<String>>::new(),
+                trusted_mint_units,
             });
 
             let tcp_listener = TcpListener::bind(&listen).await?;

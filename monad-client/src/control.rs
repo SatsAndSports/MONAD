@@ -28,6 +28,7 @@ pub trait SessionFundingProvider: Send + Sync + 'static {
     /// or `None` to fall back to `FakePayment`.
     fn provide_channel_token(
         &self,
+        hop_label: &str,
         session_id: &[u8; 32],
         receiver_pubkey: &str,
         mint_url: &str,
@@ -44,6 +45,7 @@ pub struct FakePaymentProvider {
 impl SessionFundingProvider for FakePaymentProvider {
     fn provide_channel_token(
         &self,
+        _hop_label: &str,
         _session_id: &[u8; 32],
         _receiver_pubkey: &str,
         _mint_url: &str,
@@ -51,6 +53,47 @@ impl SessionFundingProvider for FakePaymentProvider {
         _keyset_id: &str,
     ) -> Option<String> {
         None
+    }
+}
+
+/// Interactive funding provider that prompts the user for a Cashu token on stdin.
+pub struct StdinFundingProvider;
+
+impl SessionFundingProvider for StdinFundingProvider {
+    fn provide_channel_token(
+        &self,
+        hop_label: &str,
+        session_id: &[u8; 32],
+        _receiver_pubkey: &str,
+        mint_url: &str,
+        unit: &str,
+        keyset_id: &str,
+    ) -> Option<String> {
+        use std::io::Write;
+
+        let session_hex: String = session_id.iter().map(|b| format!("{b:02x}")).collect();
+
+        tokio::task::block_in_place(|| {
+            let stdout = std::io::stdout();
+            let stdin = std::io::stdin();
+            let mut out = stdout.lock();
+
+            let _ = writeln!(out, "--- Channel funding requested ---");
+            let _ = writeln!(out, "  Hop:      {hop_label}");
+            let _ = writeln!(out, "  Session:  {session_hex}");
+            let _ = writeln!(out, "  Mint:     {mint_url}");
+            let _ = writeln!(out, "  Unit:     {unit}");
+            let _ = writeln!(out, "  Keyset:   {keyset_id}");
+            let _ = write!(out, "Paste a Cashu token (or press Enter to skip): ");
+            let _ = out.flush();
+
+            let mut line = String::new();
+            if stdin.read_line(&mut line).is_err() {
+                return None;
+            }
+            let token = line.trim().to_string();
+            if token.is_empty() { None } else { Some(token) }
+        })
     }
 }
 
@@ -184,6 +227,7 @@ async fn run_control_task(
     mut h2_recv: h2::RecvStream,
     fake_payment_millisats: u64,
     session_id: [u8; 32],
+    hop_label: String,
     funding_provider: Arc<dyn SessionFundingProvider>,
     ready_tx: oneshot::Sender<()>,
     pricing_handle: Arc<RwLock<Option<SessionPricing>>>,
@@ -262,6 +306,7 @@ async fn run_control_task(
                     // Ask the funding provider for a token and open a channel.
                     if let Some(ref info) = spilman_info {
                         if let Some(token) = funding_provider.provide_channel_token(
+                            &hop_label,
                             &session_id,
                             &info.receiver_pubkey,
                             &info.mint_url,
@@ -378,11 +423,13 @@ async fn run_control_task(
 pub async fn start_control_task(
     conn: &RelayConnection,
     fake_payment_millisats: u64,
+    hop_label: &str,
     funding_provider: Arc<dyn SessionFundingProvider>,
 ) -> io::Result<(JoinHandle<()>, oneshot::Receiver<()>)> {
     let (control_send, control_recv) = conn.open_control().await?;
     let (ready_tx, ready_rx) = oneshot::channel();
     let session_id = *conn.session_id();
+    let hop_label = hop_label.to_string();
     let pricing_handle = conn.session_pricing_handle();
     let spilman_info_handle = conn.session_spilman_info_handle();
     let channel_info_handle = conn.session_channel_info_handle();
@@ -393,6 +440,7 @@ pub async fn start_control_task(
             control_recv,
             fake_payment_millisats,
             session_id,
+            hop_label,
             funding_provider,
             ready_tx,
             pricing_handle,
@@ -414,7 +462,8 @@ pub async fn start_control_task(
 pub async fn start_fake_payment_controller(
     conn: &RelayConnection,
     fake_payment_millisats: u64,
+    hop_label: &str,
 ) -> io::Result<(JoinHandle<()>, oneshot::Receiver<()>)> {
     let provider = Arc::new(FakePaymentProvider { fake_payment_millisats });
-    start_control_task(conn, fake_payment_millisats, provider).await
+    start_control_task(conn, fake_payment_millisats, hop_label, provider).await
 }

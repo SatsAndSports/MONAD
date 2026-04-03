@@ -182,8 +182,9 @@ where
     info!("hop {}/{}: H2 connection established", hop_idx + 1, hops.len());
 
     if hop_idx < hops.len() - 1 {
+        let hop_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
         let (control_task, ready_rx) =
-            control::start_control_task(&conn, INTERMEDIATE_FAKE_PAYMENT_MILLISATS, funding_provider.clone())
+            control::start_control_task(&conn, INTERMEDIATE_FAKE_PAYMENT_MILLISATS, &hop_label, funding_provider.clone())
                 .await?;
         ready_rx.await.map_err(|_| {
             io::Error::new(

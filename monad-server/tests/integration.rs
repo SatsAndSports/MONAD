@@ -1512,7 +1512,7 @@ async fn test_session_params_advertise_and_client_stores_spilman_keyset_info() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (control_task, ready_rx) =
-        control::start_fake_payment_controller(&conn, TEST_SESSION_PAYMENT)
+        control::start_fake_payment_controller(&conn, TEST_SESSION_PAYMENT, "test")
             .await
             .unwrap();
 
@@ -1574,6 +1574,7 @@ async fn test_session_funding_provider_opens_channel() {
     impl SessionFundingProvider for TestFundingProvider {
         fn provide_channel_token(
             &self,
+            _hop_label: &str,
             _session_id: &[u8; 32],
             _receiver_pubkey: &str,
             _mint_url: &str,
@@ -1632,7 +1633,7 @@ async fn test_session_funding_provider_opens_channel() {
     .unwrap();
 
     let (control_task, ready_rx) =
-        control::start_control_task(&conn, TEST_SESSION_PAYMENT, provider.clone())
+        control::start_control_task(&conn, TEST_SESSION_PAYMENT, "test", provider.clone())
             .await
             .unwrap();
 
