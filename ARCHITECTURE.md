@@ -21,14 +21,17 @@ Important types:
   - wraps an `AsyncRead + AsyncWrite` transport
   - performs encrypted Noise transport framing
   - tracks encrypted wire bytes
+  - carries a session ID (the Noise handshake hash) unique to each connection
 - `H2ConnectStream` (`h2stream.rs`)
   - wraps an H2 `SendStream + RecvStream` pair as a bidirectional async stream
   - allows another Noise+H2 session to run on top of an existing CONNECT tunnel
 - `ClientMessage` / `ServerMessage` (`protocol.rs`)
-  - wire protocol enums for the control stream (Hello, SessionParams, FakePayment, GetSessionStatus, SessionStatus, Error)
+  - wire protocol enums for the control stream (Hello, ChannelFunding, FakePayment, GetSessionStatus, SessionParams, ChannelFundingAccepted, SessionStatus, Error)
+  - `MintUnitKeysets` type alias for the mint/unit/keyset advertisement map
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established Noise+H2 session
-  - manages H2 client, driver handles, task handles, session pricing
+  - manages H2 client, driver handles, task handles, session pricing, session ID
+  - stores fetched `SessionSpilmanInfo` (mint, keyset, receiver pubkey) and `SessionChannelInfo` (channel ID, capacity)
 - `SessionPricing` (`session.rs`)
   - local billing metadata with precomputed LCM for integer-only arithmetic
 - `proxy_bidirectional` (`proxy.rs`)
@@ -43,6 +46,10 @@ Responsibilities:
 - build a single-hop or multi-hop MONAD chain
 - expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers)
 - open H2 `CONNECT` streams to final targets
+- fetch and verify mint keyset info from advertised mints (v1/v2 keyset ID consistency check)
+- open per-session Spilman payment channels via `SessionFundingProvider` callback
+- send zero-balance `ChannelFunding` registration and wait for server ack
+- manage per-session Spilman bridge state in the control task for future payments
 
 ### `monad-server`
 
@@ -54,6 +61,9 @@ Responsibilities:
   - `POST /control`
   - `CONNECT host:port`
 - proxy bytes between H2 streams and external TCP targets
+- discover trusted mint keysets at startup (`SpilmanMintCache`), caching keyset info JSON
+- advertise receiver pubkey and trusted mints/keysets in `SessionParams`
+- validate `ChannelFunding` registrations via `FundingValidationHost` (checks funding proofs, Schnorr signature, keyset, balance == 0)
 
 ### `monad-quic`
 
@@ -91,7 +101,7 @@ An H2 stream using:
 POST /control
 ```
 
-Used for session management: version negotiation (Hello/SessionParams), payments (FakePayment), and session status queries (GetSessionStatus/SessionStatus). See the "Control Protocol and Session Billing" section below for details.
+Used for session management: version negotiation (Hello/SessionParams), Spilman channel funding registration (ChannelFunding/ChannelFundingAccepted), payments (FakePayment), and session status queries (GetSessionStatus/SessionStatus). See the "Control Protocol and Session Billing" section below for details.
 
 ### Data stream
 
@@ -243,11 +253,13 @@ Control messages are JSON objects, newline-delimited, exchanged over the H2 cont
 
 Client to server (`ClientMessage`):
 - `Hello { version }` — first message; declares the highest protocol version the client supports
+- `ChannelFunding { payment_json }` — register a funded Spilman channel for this session (zero-balance, with funding proofs and signature)
 - `FakePayment { milli_sats }` — add fake credit to the session (placeholder for real payments)
 - `GetSessionStatus` — request a fresh session status snapshot
 
 Server to client (`ServerMessage`):
-- `SessionParams { version, in_bytes_per_millisat, out_bytes_per_millisat }` — sent in response to Hello; contains the negotiated version and pricing rates
+- `SessionParams { version, in_bytes_per_millisat, out_bytes_per_millisat, receiver_pubkey, mints_units_keysets }` — sent in response to Hello; contains the negotiated version, pricing rates, the server's secp256k1 receiver pubkey, and the trusted mint/unit/keyset advertisement map
+- `ChannelFundingAccepted { channel_id, capacity }` — the server validated a zero-balance Spilman funding registration
 - `SessionStatus { session_total_in, session_total_out, total_paid_millisats, remaining_milli_sats, paused }` — current session accounting snapshot
 - `Error { message }` — server-initiated error or rejection
 
@@ -290,6 +302,37 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 ### Client Auto-Funding
 
 The client opens a control stream immediately after connecting and sends `Hello`. When it receives `SessionStatus { paused: true, remaining_milli_sats <= 0, .. }`, it automatically sends a `FakePayment`. The client waits for the session to become unpaused before accepting SOCKS traffic. Intermediate hops in multi-hop chains each get their own control task with automatic funding.
+
+### Session ID
+
+Each Noise NK handshake produces a 32-byte **handshake hash** that is identical on both sides and unique per session. This is used as a session identifier:
+
+- Computed during the handshake, before `into_transport_mode()` consumes the handshake state
+- Stored on `NoiseStream`, `RelayConnection` (client), and `RelaySession` (server)
+- Deterministic: both initiator and responder derive the same value from the DH transcript
+- Unique: the client generates a fresh ephemeral key per connection
+- Not transmitted over the wire — derived locally from the shared transcript
+- Will be used for channel_id → session_id binding (enforcing one channel per session)
+
+### Spilman Channel Funding
+
+MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The channel establishment flow is:
+
+1. **Server advertises payment info** — `SessionParams` includes `receiver_pubkey` (secp256k1 hex) and `mints_units_keysets` (a map of `mint_url -> unit -> [keyset_ids]`). The server discovers these by fetching `/v1/keysets` from each trusted mint at startup and caching the full keyset info JSON.
+
+2. **Client fetches keyset info** — the client picks a mint/unit/keyset (preferring `sat`), fetches `/v1/keysets` and `/v1/keys/{id}` from the mint, verifies the keyset ID is consistent with the keys (v1 or v2 derivation), and stores the result as `SessionSpilmanInfo`.
+
+3. **Client obtains a token** — the `SessionFundingProvider` callback is called once per session with the session ID, receiver pubkey, mint URL, unit, and keyset ID. The provider returns a Cashu token (or `None` to fall back to `FakePayment`). `FakePaymentProvider` always returns `None` (default behavior).
+
+4. **Client opens a channel** — using the stored keyset info and the provided token, the client calls `open_channel_from_token` on a per-session `SpilmanClientBridge`. This swaps the token's proofs for 2-of-2 multisig funding outputs at the mint. The client generates an ephemeral secp256k1 sender key per session.
+
+5. **Client sends zero-balance funding registration** — the client calls `create_payment_with_funding(channel_id, 0)` to produce a Spilman `Payment` with funding proofs, channel parameters, and a valid Schnorr signature for balance=0. This is serialized and sent as `ChannelFunding { payment_json }`.
+
+6. **Server validates** — the server creates an ephemeral `FundingValidationHost` (a minimal `SpilmanHost` with no persistence) and calls `fund_channel_via_json`. This verifies the funding proofs, keyset consistency, the Schnorr signature, and that balance == 0 (a MONAD protocol rule). On success, the server sends `ChannelFundingAccepted { channel_id, capacity }`.
+
+7. **Client confirms** — on receiving the ack, the client promotes the channel from "pending" to "active" and publishes `SessionChannelInfo` on `RelayConnection`. The per-session `SpilmanClientBridge` is retained in the control task for future `create_payment` calls.
+
+The channel is now established but not yet used for byte payments — sessions still unpause via `FakePayment`. Each session gets exactly one channel. The `SessionFundingProvider` is called once per session, when `SessionParams` arrives.
 
 ## Shutdown Model
 
@@ -542,7 +585,9 @@ The full QUIC transport chain is implemented and tested:
 
 ## Current Limitations
 
-- real payment integration (Lightning or similar) is not yet implemented — currently using `FakePayment`
+- Spilman channel funding registration is implemented but real byte-level Spilman payments are not yet used — sessions still unpause via `FakePayment`
+- server does not yet persist Spilman channel state — funding validation is ephemeral (one-shot per `ChannelFunding` message)
+- multi-hop Spilman channel funding is wired (provider threaded through hop chain) but not yet tested
 - no persistent route configuration file yet
 - QUIC connection pool does not yet handle connection eviction or stale entry cleanup
 - asymmetric pricing (rates other than 1/1) is not yet tested
