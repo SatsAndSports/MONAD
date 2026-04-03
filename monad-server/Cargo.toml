@@ -26,3 +26,4 @@ quinn = "0.11"
 cdk-spilman = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman", features = ["wallet"] }
 cdk-spilman-test-mint = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman-test-mint", default-features = false, features = ["http"] }
 cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0-rc.1", package = "cashu", default-features = false }
+axum = "0.8"

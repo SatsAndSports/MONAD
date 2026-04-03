@@ -69,6 +69,13 @@ pub struct SessionSpilmanInfo {
     pub keyset_info_json: String,
 }
 
+/// Spilman channel opened by the client for a session.
+#[derive(Debug, Clone)]
+pub struct SessionChannelInfo {
+    pub channel_id: String,
+    pub capacity: u64,
+}
+
 impl SessionPricing {
     /// Create a `SessionPricing` from the negotiated version and raw
     /// directional rates.
@@ -119,6 +126,8 @@ pub struct RelayConnection {
     session_pricing: Arc<RwLock<Option<SessionPricing>>>,
     /// Spilman mint/keyset info fetched by the client for this session.
     session_spilman_info: Arc<RwLock<Option<SessionSpilmanInfo>>>,
+    /// Spilman channel opened by the client for this session.
+    session_channel_info: Arc<RwLock<Option<SessionChannelInfo>>>,
 }
 
 impl RelayConnection {
@@ -156,6 +165,7 @@ impl RelayConnection {
             session_id,
             session_pricing: Arc::new(RwLock::new(None)),
             session_spilman_info: Arc::new(RwLock::new(None)),
+            session_channel_info: Arc::new(RwLock::new(None)),
         };
 
         Ok((conn, driver_handle))
@@ -246,6 +256,16 @@ impl RelayConnection {
     /// Get a shared handle to the Spilman session metadata storage.
     pub fn session_spilman_info_handle(&self) -> Arc<RwLock<Option<SessionSpilmanInfo>>> {
         self.session_spilman_info.clone()
+    }
+
+    /// Get the opened Spilman channel info for this session, if available.
+    pub async fn session_channel_info(&self) -> Option<SessionChannelInfo> {
+        self.session_channel_info.read().await.clone()
+    }
+
+    /// Get a shared handle to the Spilman channel info storage.
+    pub fn session_channel_info_handle(&self) -> Arc<RwLock<Option<SessionChannelInfo>>> {
+        self.session_channel_info.clone()
     }
 
     /// Append a driver handle from an intermediate hop in a multi-hop chain.

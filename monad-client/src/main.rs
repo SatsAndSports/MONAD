@@ -1,11 +1,12 @@
 use clap::Parser;
 use monad_client::connector;
 use monad_client::connector::Hop;
-use monad_client::control;
+use monad_client::control::{self, FakePaymentProvider};
 use monad_client::socks;
 use monad_client::tunnel;
 use monad_common::identity::Ed25519Pubkey;
 use monad_common::session::RelayConnection;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -97,12 +98,17 @@ async fn main() -> anyhow::Result<()> {
             .join(" → ")
     );
 
+    // Create the funding provider (FakePayment for now)
+    let funding_provider = Arc::new(FakePaymentProvider {
+        fake_payment_millisats: cli.fake_payment_millisats,
+    });
+
     // Connect through the hop chain
-    let mut conn = connector::connect_through_chain(&hops).await?;
+    let mut conn = connector::connect_through_chain(&hops, funding_provider.clone()).await?;
 
     // Open the long-lived control stream before accepting SOCKS traffic.
     let (control_task, ready_rx) =
-        control::start_fake_payment_controller(&conn, cli.fake_payment_millisats).await?;
+        control::start_control_task(&conn, cli.fake_payment_millisats, funding_provider).await?;
     conn.add_task(control_task);
 
     ready_rx

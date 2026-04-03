@@ -22,7 +22,7 @@ use monad_common::noise;
 use monad_common::protocol::MintUnitKeysets;
 use monad_common::session::RelayConnection;
 use monad_client::connector::{self, Hop};
-use monad_client::control;
+use monad_client::control::{self, FakePaymentProvider, SessionFundingProvider};
 use monad_common::protocol::{ClientMessage, ServerMessage};
 use monad_server::listener::ServerConfig;
 use monad_quic::stream::QuicStream;
@@ -35,6 +35,12 @@ use tokio::net::TcpListener;
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
 const TEST_RECEIVER_PUBKEY: &str =
     "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+fn fake_provider() -> Arc<dyn SessionFundingProvider> {
+    Arc::new(FakePaymentProvider {
+        fake_payment_millisats: TEST_SESSION_PAYMENT,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -217,11 +223,14 @@ async fn bind_ipv6_listener() -> Option<TcpListener> {
 
 /// Connect to a MONAD server through the real client connector.
 async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &Ed25519Pubkey) -> RelayConnection {
-    connector::connect_through_chain(&[Hop {
-        addr: server_addr.to_string(),
-        pubkey: pubkey.clone(),
-        use_quic: false,
-    }])
+    connector::connect_through_chain(
+        &[Hop {
+            addr: server_addr.to_string(),
+            pubkey: pubkey.clone(),
+            use_quic: false,
+        }],
+        fake_provider(),
+    )
     .await
     .unwrap()
 }
@@ -864,7 +873,7 @@ async fn test_nested_tunnel() {
     let conn = connector::connect_through_chain(&[
         Hop { addr: t_addr.to_string(), pubkey: t_pubkey, use_quic: false },
         Hop { addr: s_addr.to_string(), pubkey: s_pubkey, use_quic: false },
-    ]).await.unwrap();
+    ], fake_provider()).await.unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -892,7 +901,7 @@ async fn test_three_hop_tunnel() {
         Hop { addr: a_addr.to_string(), pubkey: a_pubkey, use_quic: false },
         Hop { addr: b_addr.to_string(), pubkey: b_pubkey, use_quic: false },
         Hop { addr: c_addr.to_string(), pubkey: c_pubkey, use_quic: false },
-    ]).await.unwrap();
+    ], fake_provider()).await.unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -963,7 +972,7 @@ async fn test_mixed_ipv4_ipv6_hops() {
     let conn = connector::connect_through_chain(&[
         Hop { addr: ipv4_hop_addr.to_string(), pubkey: ipv4_hop_pubkey, use_quic: false },
         Hop { addr: ipv6_hop_addr.to_string(), pubkey: ipv6_hop_pubkey, use_quic: false },
-    ]).await.unwrap();
+    ], fake_provider()).await.unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -1211,18 +1220,21 @@ async fn test_connector_quic_hop() {
     let (s_addr, s_pubkey) = start_monad_server().await;
 
     // Use the client connector with a QUIC hop (single key per hop)
-    let conn = connector::connect_through_chain(&[
-        Hop {
-            addr: s_addr.to_string(),
-            pubkey: s_pubkey,
-            use_quic: false,
-        },
-        Hop {
-            addr: format!("127.0.0.1:{}", t_addr.port()),
-            pubkey: t_pubkey,
-            use_quic: true,
-        },
-    ])
+    let conn = connector::connect_through_chain(
+        &[
+            Hop {
+                addr: s_addr.to_string(),
+                pubkey: s_pubkey,
+                use_quic: false,
+            },
+            Hop {
+                addr: format!("127.0.0.1:{}", t_addr.port()),
+                pubkey: t_pubkey,
+                use_quic: true,
+            },
+        ],
+        fake_provider(),
+    )
     .await
     .unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
@@ -1265,18 +1277,21 @@ async fn test_concurrent_quic_pool_access() {
         let t_pubkey = t_pubkey.clone();
 
         handles.push(tokio::spawn(async move {
-            let conn = connector::connect_through_chain(&[
-                Hop {
-                    addr: s_addr.to_string(),
-                    pubkey: s_pubkey,
-                    use_quic: false,
-                },
-                Hop {
-                    addr: format!("127.0.0.1:{t_port}"),
-                    pubkey: t_pubkey,
-                    use_quic: true,
-                },
-            ])
+            let conn = connector::connect_through_chain(
+                &[
+                    Hop {
+                        addr: s_addr.to_string(),
+                        pubkey: s_pubkey,
+                        use_quic: false,
+                    },
+                    Hop {
+                        addr: format!("127.0.0.1:{t_port}"),
+                        pubkey: t_pubkey,
+                        use_quic: true,
+                    },
+                ],
+                fake_provider(),
+            )
             .await
             .unwrap();
             fund_session(&conn, TEST_SESSION_PAYMENT).await;
@@ -1307,11 +1322,14 @@ async fn test_quic_first_hop() {
     let (server_addr, pubkey) = start_monad_server_with_quic().await;
 
     // Client connects directly via QUIC (use_quic on the first hop)
-    let conn = connector::connect_through_chain(&[Hop {
-        addr: server_addr.to_string(),
-        pubkey: pubkey.clone(),
-        use_quic: true,
-    }])
+    let conn = connector::connect_through_chain(
+        &[Hop {
+            addr: server_addr.to_string(),
+            pubkey: pubkey.clone(),
+            use_quic: true,
+        }],
+        fake_provider(),
+    )
     .await
     .unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
@@ -1335,18 +1353,21 @@ async fn test_quic_first_hop_then_tcp() {
     let (t_addr, t_pubkey) = start_monad_server().await;
 
     // Client connects to S via QUIC, then S forwards to T via TCP
-    let conn = connector::connect_through_chain(&[
-        Hop {
-            addr: s_addr.to_string(),
-            pubkey: s_pubkey,
-            use_quic: true,
-        },
-        Hop {
-            addr: t_addr.to_string(),
-            pubkey: t_pubkey,
-            use_quic: false,
-        },
-    ])
+    let conn = connector::connect_through_chain(
+        &[
+            Hop {
+                addr: s_addr.to_string(),
+                pubkey: s_pubkey,
+                use_quic: true,
+            },
+            Hop {
+                addr: t_addr.to_string(),
+                pubkey: t_pubkey,
+                use_quic: false,
+            },
+        ],
+        fake_provider(),
+    )
     .await
     .unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
@@ -1508,6 +1529,132 @@ async fn test_session_params_advertise_and_client_stores_spilman_keyset_info() {
     assert_eq!(session_spilman_info.unit, "sat");
     assert!(!session_spilman_info.keyset_id.is_empty());
     assert!(session_spilman_info.keyset_info_json.contains(&session_spilman_info.keyset_id));
+
+    control_task.abort();
+    let _ = control_task.await;
+    let _ = mint_shutdown_tx.send(());
+    conn.shutdown().await;
+}
+
+/// Test: client receives SessionParams, funding provider mints a token on demand,
+/// client opens a Spilman channel via the test mint's HTTP API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_funding_provider_opens_channel() {
+    use cdk_spilman::build_cashu_b_token;
+    use cdk_spilman_test_mint::{build_router, TestMintHelper};
+    use std::sync::Mutex;
+
+    // 1. Create an in-memory mint and serve it over HTTP
+    let mint_helper = Arc::new(TestMintHelper::new().await.unwrap());
+    let router = build_router(mint_helper.mint()).await.unwrap();
+
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_url = format!("http://{}", http_listener.local_addr().unwrap());
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(http_listener, router)
+            .with_graceful_shutdown(async { let _ = mint_shutdown_rx.await; })
+            .await;
+    });
+
+    // Wait for mint to be ready
+    let client = reqwest::Client::new();
+    for _ in 0..50 {
+        match client.get(format!("{mint_url}/v1/keysets")).send().await {
+            Ok(resp) if resp.status().is_success() => break,
+            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+
+    // 2. Create a funding provider that mints tokens on demand
+    struct TestFundingProvider {
+        mint_helper: Arc<TestMintHelper>,
+        mint_url: String,
+        channels_opened: Mutex<Vec<String>>,
+    }
+
+    impl SessionFundingProvider for TestFundingProvider {
+        fn provide_channel_token(
+            &self,
+            _session_id: &[u8; 32],
+            _receiver_pubkey: &str,
+            _mint_url: &str,
+            _unit: &str,
+            _keyset_id: &str,
+        ) -> Option<String> {
+            let proofs = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(self.mint_helper.mint_proofs(1000))
+            })
+            .ok()?;
+            let token = build_cashu_b_token(
+                &self.mint_url,
+                "sat",
+                &serde_json::to_string(&proofs).unwrap(),
+            )
+            .ok()?;
+            self.channels_opened
+                .lock()
+                .unwrap()
+                .push(_session_id.iter().map(|b| format!("{b:02x}")).collect());
+            Some(token)
+        }
+    }
+
+    let provider = Arc::new(TestFundingProvider {
+        mint_helper: mint_helper.clone(),
+        mint_url: mint_url.clone(),
+        channels_opened: Mutex::new(Vec::new()),
+    });
+
+    // 3. Start MONAD server with the test mint
+    let receiver_secret = SecretKey::generate();
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(
+        mint_url.clone(),
+        BTreeSet::from(["sat".to_string()]),
+    );
+
+    let (server_addr, pubkey) = start_monad_server_with_spilman(
+        trusted_mint_units,
+        receiver_secret.public_key().to_hex(),
+    )
+    .await;
+
+    // 4. Connect client with the funding provider
+    let conn = connector::connect_through_chain(
+        &[Hop {
+            addr: server_addr.to_string(),
+            pubkey: pubkey.clone(),
+            use_quic: false,
+        }],
+        provider.clone(),
+    )
+    .await
+    .unwrap();
+
+    let (control_task, ready_rx) =
+        control::start_control_task(&conn, TEST_SESSION_PAYMENT, provider.clone())
+            .await
+            .unwrap();
+
+    ready_rx.await.unwrap();
+
+    // 5. Verify the client opened a Spilman channel
+    let channel_info = conn
+        .session_channel_info()
+        .await
+        .expect("client should have opened a Spilman channel");
+    assert!(!channel_info.channel_id.is_empty());
+    assert!(channel_info.capacity > 0);
+    eprintln!(
+        "Channel opened: id={}, capacity={}",
+        channel_info.channel_id, channel_info.capacity
+    );
+
+    // Verify the provider was called
+    let opened = provider.channels_opened.lock().unwrap();
+    assert_eq!(opened.len(), 1, "provider should have been called once");
 
     control_task.abort();
     let _ = control_task.await;
