@@ -781,15 +781,22 @@ async fn handle_control_stream(
 
                                     match bridge.fund_channel_via_json(&payment_json) {
                                         Ok(result) => {
+                                            let credit_millisats = result.capacity * 1000;
+                                            let snapshot = state.apply_fake_payment(credit_millisats).await;
                                             info!(
                                                 channel_id = %result.channel_id,
                                                 capacity = result.capacity,
-                                                "validated zero-balance session channel funding"
+                                                credit_millisats,
+                                                remaining = snapshot.remaining_milli_sats,
+                                                "channel payment accepted: credited {} millisats, remaining={}",
+                                                credit_millisats,
+                                                snapshot.remaining_milli_sats,
                                             );
                                             state.push_message(ServerMessage::ChannelFundingAccepted {
                                                 channel_id: result.channel_id,
                                                 capacity: result.capacity,
                                             }).await;
+                                            state.push_status().await;
                                         }
                                         Err(e) => {
                                             state.push_message(ServerMessage::Error {

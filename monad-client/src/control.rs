@@ -238,6 +238,7 @@ async fn run_control_task(
     let mut ready_tx = Some(ready_tx);
     let mut pending_channel: Option<SessionChannelRuntime> = None;
     let mut _active_channel: Option<SessionChannelRuntime> = None;
+    let mut channel_funding_json: Option<String> = None;
 
     // Send Hello as the first message on the control stream.
     send_control_message(&mut h2_send, &ClientMessage::Hello { version: CLIENT_VERSION }).await?;
@@ -321,6 +322,7 @@ async fn run_control_task(
                                         "opened Spilman channel for session; sending funding registration"
                                     );
                                     pending_channel = Some(channel_runtime);
+                                    channel_funding_json = Some(payment_json.clone());
                                     send_control_message(
                                         &mut h2_send,
                                         &ClientMessage::ChannelFunding { payment_json },
@@ -370,7 +372,12 @@ async fn run_control_task(
                             pending_channel = Some(channel_runtime);
                         }
                         None => {
-                            warn!(channel_id = %channel_id, "received unexpected channel funding ack");
+                            // Re-fund ack for already-active channel — expected when re-sending.
+                            if _active_channel.as_ref().map(|c| c.channel_id.as_str()) == Some(channel_id.as_str()) {
+                                info!(channel_id = %channel_id, capacity, "channel re-fund accepted");
+                            } else {
+                                warn!(channel_id = %channel_id, "received unexpected channel funding ack");
+                            }
                         }
                     }
                 }
@@ -391,17 +398,26 @@ async fn run_control_task(
                     );
 
                     if paused && remaining_milli_sats <= 0 {
-                        info!(
-                            "session paused; sending fake payment of {} millisats",
-                            fake_payment_millisats
-                        );
-                        send_control_message(
-                            &mut h2_send,
-                            &ClientMessage::FakePayment {
-                                milli_sats: fake_payment_millisats,
-                            },
-                        )
-                        .await?;
+                        if let Some(ref pj) = channel_funding_json {
+                            info!("session paused; re-sending channel funding to top up");
+                            send_control_message(
+                                &mut h2_send,
+                                &ClientMessage::ChannelFunding { payment_json: pj.clone() },
+                            )
+                            .await?;
+                        } else {
+                            info!(
+                                "session paused; sending fake payment of {} millisats",
+                                fake_payment_millisats
+                            );
+                            send_control_message(
+                                &mut h2_send,
+                                &ClientMessage::FakePayment {
+                                    milli_sats: fake_payment_millisats,
+                                },
+                            )
+                            .await?;
+                        }
                     } else if !paused {
                         if let Some(tx) = ready_tx.take() {
                             let _ = tx.send(());
