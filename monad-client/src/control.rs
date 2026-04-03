@@ -238,7 +238,7 @@ async fn run_control_task(
     let mut ready_tx = Some(ready_tx);
     let mut pending_channel: Option<SessionChannelRuntime> = None;
     let mut _active_channel: Option<SessionChannelRuntime> = None;
-    let mut channel_funding_json: Option<String> = None;
+    let mut session_spilman: Option<SessionSpilmanInfo> = None;
 
     // Send Hello as the first message on the control stream.
     send_control_message(&mut h2_send, &ClientMessage::Hello { version: CLIENT_VERSION }).await?;
@@ -282,7 +282,7 @@ async fn run_control_task(
                     *pricing_handle.write().await = Some(pricing);
 
                     // Fetch and verify keyset info from the advertised mint.
-                    let spilman_info =
+                    session_spilman =
                         match fetch_session_spilman_info(receiver_pubkey, mints_units_keysets) {
                             Ok(Some(info)) => {
                                 info!(
@@ -305,7 +305,7 @@ async fn run_control_task(
                         };
 
                     // Ask the funding provider for a token and open a channel.
-                    if let Some(ref info) = spilman_info {
+                    if let Some(ref info) = session_spilman {
                         if let Some(token) = funding_provider.provide_channel_token(
                             &hop_label,
                             &session_id,
@@ -322,7 +322,6 @@ async fn run_control_task(
                                         "opened Spilman channel for session; sending funding registration"
                                     );
                                     pending_channel = Some(channel_runtime);
-                                    channel_funding_json = Some(payment_json.clone());
                                     send_control_message(
                                         &mut h2_send,
                                         &ClientMessage::ChannelFunding { payment_json },
@@ -398,14 +397,39 @@ async fn run_control_task(
                     );
 
                     if paused && remaining_milli_sats <= 0 {
-                        if let Some(ref pj) = channel_funding_json {
-                            info!("session paused; re-sending channel funding to top up");
-                            send_control_message(
-                                &mut h2_send,
-                                &ClientMessage::ChannelFunding { payment_json: pj.clone() },
-                            )
-                            .await?;
-                        } else {
+                        // Try to open a new channel via the funding provider.
+                        let mut funded = false;
+                        if let Some(ref info) = session_spilman {
+                            if let Some(token) = funding_provider.provide_channel_token(
+                                &hop_label,
+                                &session_id,
+                                &info.receiver_pubkey,
+                                &info.mint_url,
+                                &info.unit,
+                                &info.keyset_id,
+                            ) {
+                                match open_spilman_channel(info, &token) {
+                                    Ok((channel_runtime, payment_json)) => {
+                                        info!(
+                                            channel_id = %channel_runtime.channel_id,
+                                            capacity = channel_runtime.capacity,
+                                            "opened new Spilman channel to top up session"
+                                        );
+                                        pending_channel = Some(channel_runtime);
+                                        send_control_message(
+                                            &mut h2_send,
+                                            &ClientMessage::ChannelFunding { payment_json },
+                                        )
+                                        .await?;
+                                        funded = true;
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to open Spilman channel: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        if !funded {
                             info!(
                                 "session paused; sending fake payment of {} millisats",
                                 fake_payment_millisats
