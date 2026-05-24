@@ -1,12 +1,11 @@
 use clap::Parser;
 use monad_client::connector;
 use monad_client::connector::Hop;
-use monad_client::control::{self, FakePaymentProvider, StdinFundingProvider};
+use monad_client::control;
 use monad_client::socks;
 use monad_client::tunnel;
 use monad_common::identity::Ed25519Pubkey;
 use monad_common::session::RelayConnection;
-use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -38,10 +37,6 @@ struct Cli {
     /// is paused with a non-positive balance.
     #[arg(long, default_value_t = 1024)]
     fake_payment_millisats: u64,
-
-    /// Prompt for a Cashu token on stdin to fund each hop's Spilman channel.
-    #[arg(long)]
-    fund: bool,
 }
 
 fn parse_hop(s: &str) -> anyhow::Result<Hop> {
@@ -102,17 +97,8 @@ async fn main() -> anyhow::Result<()> {
             .join(" → ")
     );
 
-    // Create the funding provider
-    let funding_provider: Arc<dyn control::SessionFundingProvider> = if cli.fund {
-        Arc::new(StdinFundingProvider)
-    } else {
-        Arc::new(FakePaymentProvider {
-            fake_payment_millisats: cli.fake_payment_millisats,
-        })
-    };
-
     // Connect through the hop chain
-    let mut conn = connector::connect_through_chain(&hops, funding_provider.clone()).await?;
+    let mut conn = connector::connect_through_chain(&hops).await?;
 
     // Open the long-lived control stream before accepting SOCKS traffic.
     let last_hop = hops.last().unwrap();
@@ -123,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
         last_hop.addr
     );
     let (control_task, ready_rx) =
-        control::start_control_task(&conn, cli.fake_payment_millisats, &hop_label, funding_provider).await?;
+        control::start_control_task(&conn, cli.fake_payment_millisats, &hop_label).await?;
     conn.add_task(control_task);
 
     ready_rx

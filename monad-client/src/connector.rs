@@ -5,13 +5,12 @@
 //! Two hops:     TCP → Noise(T) → H2 → CONNECT(S) → Noise(S) → H2
 //! N hops:       Each hop wraps the previous one via H2ConnectStream.
 
-use crate::control::{self, SessionFundingProvider};
+use crate::control;
 use monad_common::identity::Ed25519Pubkey;
 use monad_common::noise::{self, NoiseStream};
 use monad_common::session::RelayConnection;
 use monad_quic::stream::QuicStream;
 use std::io;
-use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::info;
@@ -42,7 +41,6 @@ pub struct Hop {
 pub async fn connect(
     server_addr: &str,
     server_pubkey: Ed25519Pubkey,
-    funding_provider: Arc<dyn SessionFundingProvider>,
 ) -> io::Result<RelayConnection> {
     connect_through_chain(
         &[Hop {
@@ -50,7 +48,6 @@ pub async fn connect(
             pubkey: server_pubkey,
             use_quic: false,
         }],
-        funding_provider,
     )
     .await
 }
@@ -68,7 +65,6 @@ pub async fn connect(
 /// is another MONAD session asking S to proxy onward.
 pub async fn connect_through_chain(
     hops: &[Hop],
-    funding_provider: Arc<dyn SessionFundingProvider>,
 ) -> io::Result<RelayConnection> {
     if hops.is_empty() {
         return Err(io::Error::new(
@@ -128,14 +124,14 @@ pub async fn connect_through_chain(
         let quic_stream = QuicStream::new(send, recv);
         info!("QUIC connected to {}", first.addr);
 
-        chain_from_stream(quic_stream, hops, 0, funding_provider).await
+        chain_from_stream(quic_stream, hops, 0).await
     } else {
         // Connect to the first hop via TCP
         info!("connecting to first hop: {}", first.addr);
         let tcp_stream = TcpStream::connect(&first.addr).await?;
         info!("TCP connected to {}", first.addr);
 
-        chain_from_stream(tcp_stream, hops, 0, funding_provider).await
+        chain_from_stream(tcp_stream, hops, 0).await
     }
 }
 
@@ -150,7 +146,6 @@ fn chain_from_stream<S>(
     mut stream: S,
     hops: &[Hop],
     hop_idx: usize,
-    funding_provider: Arc<dyn SessionFundingProvider>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<RelayConnection>> + Send>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -184,7 +179,7 @@ where
     if hop_idx < hops.len() - 1 {
         let hop_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
         let (control_task, ready_rx) =
-            control::start_control_task(&conn, INTERMEDIATE_FAKE_PAYMENT_MILLISATS, &hop_label, funding_provider.clone())
+            control::start_control_task(&conn, INTERMEDIATE_FAKE_PAYMENT_MILLISATS, &hop_label)
                 .await?;
         ready_rx.await.map_err(|_| {
             io::Error::new(
@@ -212,7 +207,7 @@ where
 
         // Recurse: perform Noise + H2 over this tunnel for the next hop.
         // Attach this hop's driver to the final connection.
-        let mut next_conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1, funding_provider).await?;
+        let mut next_conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;
         next_conn.add_driver(driver);
         next_conn.add_task(control_task);
         Ok(next_conn)

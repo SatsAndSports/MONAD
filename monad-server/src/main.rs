@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
 
             let mut trusted_mint_units = BTreeMap::<String, BTreeSet<String>>::new();
             trusted_mint_units.insert(
-                "https://fake.thesimplekid.dev".to_string(),
+                "https://dev.mint.camelus.app".to_string(),
                 BTreeSet::from(["sat".to_string()]),
             );
 

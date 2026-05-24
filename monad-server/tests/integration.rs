@@ -12,8 +12,6 @@
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
 use bytes::Bytes;
-use cashu::nuts::SecretKey;
-use cdk_spilman_test_mint::{serve_mint_with_shutdown, TestMintConfig};
 use h2::client;
 use http::{Method, Request};
 use monad_common::h2stream::wait_for_send_capacity;
@@ -22,7 +20,6 @@ use monad_common::noise;
 use monad_common::protocol::MintUnitKeysets;
 use monad_common::session::RelayConnection;
 use monad_client::connector::{self, Hop};
-use monad_client::control::{self, FakePaymentProvider, SessionFundingProvider};
 use monad_common::protocol::{ClientMessage, ServerMessage};
 use monad_server::listener::ServerConfig;
 use monad_quic::stream::QuicStream;
@@ -33,12 +30,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
-
-fn fake_provider() -> Arc<dyn SessionFundingProvider> {
-    Arc::new(FakePaymentProvider {
-        fake_payment_millisats: TEST_SESSION_PAYMENT,
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -129,43 +120,16 @@ async fn run_gated_reply_server(
     let _ = stream.write_all(response).await;
 }
 
-async fn start_http_test_mint() -> (String, tokio::sync::oneshot::Sender<()>) {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let config = TestMintConfig::for_port(port);
-    let mint_url = config.base_url.clone();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-
-    tokio::spawn(async move {
-        let _ = serve_mint_with_shutdown(config, async {
-            let _ = shutdown_rx.await;
-        })
-        .await;
-    });
-
-    let client = reqwest::Client::new();
-    for _ in 0..50 {
-        match client.get(format!("{mint_url}/v1/keysets")).send().await {
-            Ok(resp) if resp.status().is_success() => return (mint_url, shutdown_tx),
-            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
-        }
-    }
-
-    panic!("test mint failed to start at {mint_url}");
-}
-
 /// Spin up a MONAD server and return (server_addr, ed25519_pubkey).
 async fn start_monad_server() -> (std::net::SocketAddr, Ed25519Pubkey) {
+    use cashu::nuts::SecretKey;
     start_monad_server_with_spilman(BTreeMap::new(), SecretKey::generate()).await
 }
 
 /// Spin up a MONAD server with explicit Spilman advertisement config.
 async fn start_monad_server_with_spilman(
     trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
-    payment_receiver_secret: SecretKey,
+    payment_receiver_secret: cashu::nuts::SecretKey,
 ) -> (std::net::SocketAddr, Ed25519Pubkey) {
     let identity = identity::ServerIdentity::generate().unwrap();
     let pubkey = identity.ed25519_pubkey().clone();
@@ -200,7 +164,7 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Ed2
 
     let config = Arc::new(ServerConfig {
         identity,
-        payment_receiver_secret: SecretKey::generate(),
+        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
     });
 
@@ -227,7 +191,6 @@ async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &Ed25519Pubke
             pubkey: pubkey.clone(),
             use_quic: false,
         }],
-        fake_provider(),
     )
     .await
     .unwrap()
@@ -871,7 +834,7 @@ async fn test_nested_tunnel() {
     let conn = connector::connect_through_chain(&[
         Hop { addr: t_addr.to_string(), pubkey: t_pubkey, use_quic: false },
         Hop { addr: s_addr.to_string(), pubkey: s_pubkey, use_quic: false },
-    ], fake_provider()).await.unwrap();
+    ]).await.unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -899,7 +862,7 @@ async fn test_three_hop_tunnel() {
         Hop { addr: a_addr.to_string(), pubkey: a_pubkey, use_quic: false },
         Hop { addr: b_addr.to_string(), pubkey: b_pubkey, use_quic: false },
         Hop { addr: c_addr.to_string(), pubkey: c_pubkey, use_quic: false },
-    ], fake_provider()).await.unwrap();
+    ]).await.unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -970,7 +933,7 @@ async fn test_mixed_ipv4_ipv6_hops() {
     let conn = connector::connect_through_chain(&[
         Hop { addr: ipv4_hop_addr.to_string(), pubkey: ipv4_hop_pubkey, use_quic: false },
         Hop { addr: ipv6_hop_addr.to_string(), pubkey: ipv6_hop_pubkey, use_quic: false },
-    ], fake_provider()).await.unwrap();
+    ]).await.unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -1021,7 +984,7 @@ async fn start_monad_server_with_quic() -> (SocketAddr, Ed25519Pubkey) {
 
     let config = Arc::new(ServerConfig {
         identity,
-        payment_receiver_secret: SecretKey::generate(),
+        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
     });
 
@@ -1231,7 +1194,6 @@ async fn test_connector_quic_hop() {
                 use_quic: true,
             },
         ],
-        fake_provider(),
     )
     .await
     .unwrap();
@@ -1288,7 +1250,6 @@ async fn test_concurrent_quic_pool_access() {
                         use_quic: true,
                     },
                 ],
-                fake_provider(),
             )
             .await
             .unwrap();
@@ -1326,7 +1287,6 @@ async fn test_quic_first_hop() {
             pubkey: pubkey.clone(),
             use_quic: true,
         }],
-        fake_provider(),
     )
     .await
     .unwrap();
@@ -1364,7 +1324,6 @@ async fn test_quic_first_hop_then_tcp() {
                 use_quic: false,
             },
         ],
-        fake_provider(),
     )
     .await
     .unwrap();
@@ -1376,418 +1335,5 @@ async fn test_quic_first_hop_then_tcp() {
     assert_eq!(result, b"QUIC THEN TCP");
 
     drop(h2);
-    conn.shutdown().await;
-}
-
-// ---------------------------------------------------------------------------
-// Spilman payment channel tests
-// ---------------------------------------------------------------------------
-
-/// Validates that the Spilman payment channel plumbing works inside MONAD's
-/// test environment: in-memory mint, channel opening, payment creation, and
-/// server-side payment verification.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_spilman_channel_payment() {
-    use cashu::nuts::SecretKey;
-    use cdk_spilman::{
-        build_cashu_b_token, ConfigurableClientHost, SpilmanBridge, SpilmanClientBridge,
-    };
-    use cdk_spilman_test_mint::{InMemoryMintNetworking, TestMintHelper, TestServerHost};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let now_secs = || {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    };
-
-    // 1. Create in-memory mint
-    let mint_helper = TestMintHelper::new().await.unwrap();
-    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-
-    // 2. Generate sender (client) + receiver (server) keys
-    let sender_secret = SecretKey::generate();
-    let receiver_secret = SecretKey::generate();
-
-    // 3. Setup server-side Spilman bridge
-    let server_host = TestServerHost::new(receiver_secret.clone());
-    server_host.add_keyset(
-        "https://test-mint",
-        mint_helper.keyset_id(),
-        keyset_info_json.clone(),
-    );
-    let server_bridge = SpilmanBridge::new(server_host);
-
-    // 4. Setup client-side Spilman bridge
-    let mut client_host = ConfigurableClientHost::new_in_memory();
-    client_host.add_key(sender_secret.clone());
-    let client_networking = InMemoryMintNetworking::new(mint_helper.mint());
-    let client_bridge = SpilmanClientBridge::new(client_host, client_networking);
-
-    // 5. Mint a token and open a channel
-    let proofs = mint_helper.mint_proofs(1000).await.unwrap();
-    let token = build_cashu_b_token(
-        "https://test-mint",
-        "sat",
-        &serde_json::to_string(&proofs).unwrap(),
-    )
-    .unwrap();
-
-    let open_result = client_bridge
-        .open_channel_from_token(
-            &token,
-            &receiver_secret.public_key().to_hex(),
-            &sender_secret.public_key().to_hex(),
-            now_secs() + 3600,
-            &keyset_info_json,
-            64,
-        )
-        .unwrap();
-
-    assert!(open_result.capacity > 0);
-
-    // 6. Client creates first payment (includes funding data)
-    let payment1 = client_bridge
-        .create_payment_with_funding(&open_result.channel_id, 10)
-        .unwrap();
-
-    assert_eq!(payment1.balance, 10);
-    assert!(payment1.has_funding());
-
-    // 7. Server verifies and processes first payment
-    let result1 = server_bridge
-        .process_payment(
-            &payment1.channel_id,
-            payment1.balance,
-            &payment1.signature,
-            payment1.params.as_ref(),
-            payment1.funding_proofs.as_deref(),
-            &(),
-        )
-        .unwrap();
-
-    assert_eq!(result1.balance, 10);
-    assert_eq!(result1.capacity, open_result.capacity);
-
-    // 8. Client creates a top-up payment (no funding data)
-    let payment2 = client_bridge
-        .create_payment(&open_result.channel_id, 50)
-        .unwrap();
-
-    assert_eq!(payment2.balance, 50);
-    assert!(!payment2.has_funding());
-
-    // 9. Server verifies and processes top-up
-    let result2 = server_bridge
-        .process_payment(
-            &payment2.channel_id,
-            payment2.balance,
-            &payment2.signature,
-            None,
-            None,
-            &(),
-        )
-        .unwrap();
-
-    assert_eq!(result2.balance, 50);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_session_params_advertise_and_client_stores_spilman_keyset_info() {
-    let (mint_url, mint_shutdown_tx) = start_http_test_mint().await;
-
-    let receiver_secret = SecretKey::generate();
-    let mut trusted_mint_units = BTreeMap::new();
-    trusted_mint_units.insert(
-        mint_url.clone(),
-        BTreeSet::from(["sat".to_string()]),
-    );
-
-    let (server_addr, pubkey) = start_monad_server_with_spilman(
-        trusted_mint_units,
-        receiver_secret.clone(),
-    )
-    .await;
-    let conn = connect_client(server_addr, &pubkey).await;
-
-    let (control_task, ready_rx) =
-        control::start_fake_payment_controller(&conn, TEST_SESSION_PAYMENT, "test")
-            .await
-            .unwrap();
-
-    ready_rx.await.unwrap();
-
-    let session_spilman_info = conn
-        .session_spilman_info()
-        .await
-        .expect("client should store fetched Spilman keyset info");
-    assert_eq!(session_spilman_info.receiver_pubkey, receiver_secret.public_key().to_hex());
-    assert_eq!(session_spilman_info.mint_url, mint_url);
-    assert_eq!(session_spilman_info.unit, "sat");
-    assert!(!session_spilman_info.keyset_id.is_empty());
-    assert!(session_spilman_info.keyset_info_json.contains(&session_spilman_info.keyset_id));
-
-    control_task.abort();
-    let _ = control_task.await;
-    let _ = mint_shutdown_tx.send(());
-    conn.shutdown().await;
-}
-
-/// Test: client receives SessionParams, funding provider mints a token on demand,
-/// client opens a Spilman channel via the test mint's HTTP API.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_session_funding_provider_opens_channel() {
-    use cdk_spilman::build_cashu_b_token;
-    use cdk_spilman_test_mint::{build_router, TestMintHelper};
-    use std::sync::Mutex;
-
-    // 1. Create an in-memory mint and serve it over HTTP
-    let mint_helper = Arc::new(TestMintHelper::new().await.unwrap());
-    let router = build_router(mint_helper.mint()).await.unwrap();
-
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mint_url = format!("http://{}", http_listener.local_addr().unwrap());
-    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let _ = axum::serve(http_listener, router)
-            .with_graceful_shutdown(async { let _ = mint_shutdown_rx.await; })
-            .await;
-    });
-
-    // Wait for mint to be ready
-    let client = reqwest::Client::new();
-    for _ in 0..50 {
-        match client.get(format!("{mint_url}/v1/keysets")).send().await {
-            Ok(resp) if resp.status().is_success() => break,
-            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
-        }
-    }
-
-    // 2. Create a funding provider that mints tokens on demand
-    struct TestFundingProvider {
-        mint_helper: Arc<TestMintHelper>,
-        mint_url: String,
-        channels_opened: Mutex<Vec<String>>,
-    }
-
-    impl SessionFundingProvider for TestFundingProvider {
-        fn provide_channel_token(
-            &self,
-            _hop_label: &str,
-            _session_id: &[u8; 32],
-            _receiver_pubkey: &str,
-            _mint_url: &str,
-            _unit: &str,
-            _keyset_id: &str,
-        ) -> Option<String> {
-            let proofs = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(self.mint_helper.mint_proofs(1000))
-            })
-            .ok()?;
-            let token = build_cashu_b_token(
-                &self.mint_url,
-                "sat",
-                &serde_json::to_string(&proofs).unwrap(),
-            )
-            .ok()?;
-            self.channels_opened
-                .lock()
-                .unwrap()
-                .push(_session_id.iter().map(|b| format!("{b:02x}")).collect());
-            Some(token)
-        }
-    }
-
-    let provider = Arc::new(TestFundingProvider {
-        mint_helper: mint_helper.clone(),
-        mint_url: mint_url.clone(),
-        channels_opened: Mutex::new(Vec::new()),
-    });
-
-    // 3. Start MONAD server with the test mint
-    let receiver_secret = SecretKey::generate();
-    let mut trusted_mint_units = BTreeMap::new();
-    trusted_mint_units.insert(
-        mint_url.clone(),
-        BTreeSet::from(["sat".to_string()]),
-    );
-
-    let (server_addr, pubkey) = start_monad_server_with_spilman(
-        trusted_mint_units,
-        receiver_secret.clone(),
-    )
-    .await;
-
-    // 4. Connect client with the funding provider
-    let conn = connector::connect_through_chain(
-        &[Hop {
-            addr: server_addr.to_string(),
-            pubkey: pubkey.clone(),
-            use_quic: false,
-        }],
-        provider.clone(),
-    )
-    .await
-    .unwrap();
-
-    let (control_task, ready_rx) =
-        control::start_control_task(&conn, TEST_SESSION_PAYMENT, "test", provider.clone())
-            .await
-            .unwrap();
-
-    ready_rx.await.unwrap();
-
-    // 5. Verify the client opened a Spilman channel and the server acknowledged it.
-    let mut channel_info = None;
-    for _ in 0..50 {
-        channel_info = conn.session_channel_info().await;
-        if channel_info.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let channel_info = channel_info.expect("client should have opened and registered a Spilman channel");
-    assert!(!channel_info.channel_id.is_empty());
-    assert!(channel_info.capacity > 0);
-    eprintln!(
-        "Channel opened: id={}, capacity={}",
-        channel_info.channel_id, channel_info.capacity
-    );
-
-    // Verify the provider was called (at least once for initial funding;
-    // may be called again if the session paused and re-prompted).
-    let opened = provider.channels_opened.lock().unwrap();
-    assert!(opened.len() >= 1, "provider should have been called at least once");
-
-    control_task.abort();
-    let _ = control_task.await;
-    let _ = mint_shutdown_tx.send(());
-    conn.shutdown().await;
-}
-
-/// Test: server rejects an invalid zero-balance funding registration.
-///
-/// NOTE: This test is currently ignored due to an H2 connection driver issue
-/// where server-pushed error responses are not received by a manually-opened
-/// control stream in the test harness. The positive funding test
-/// (test_session_funding_provider_opens_channel) exercises the same server
-/// validation code path and confirms that valid funding is accepted.
-#[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_channel_funding_rejects_invalid_signature() {
-    use cdk_spilman::{
-        build_cashu_b_token, ConfigurableClientHost, Payment, ReqwestClientNetworking,
-        SpilmanClientBridge,
-    };
-    use cdk_spilman_test_mint::{build_router, TestMintHelper};
-
-    // 1. Create an in-memory mint and serve it over HTTP.
-    let mint_helper = Arc::new(TestMintHelper::new().await.unwrap());
-    let router = build_router(mint_helper.mint()).await.unwrap();
-
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mint_url = format!("http://{}", http_listener.local_addr().unwrap());
-    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let _ = axum::serve(http_listener, router)
-            .with_graceful_shutdown(async { let _ = mint_shutdown_rx.await; })
-            .await;
-    });
-
-    let client = reqwest::Client::new();
-    for _ in 0..50 {
-        match client.get(format!("{mint_url}/v1/keysets")).send().await {
-            Ok(resp) if resp.status().is_success() => break,
-            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
-        }
-    }
-
-    // 2. Start MONAD server with the test mint.
-    let receiver_secret = SecretKey::generate();
-    let mut trusted_mint_units = BTreeMap::new();
-    trusted_mint_units.insert(
-        mint_url.clone(),
-        BTreeSet::from(["sat".to_string()]),
-    );
-
-    let (server_addr, pubkey) =
-        start_monad_server_with_spilman(trusted_mint_units, receiver_secret.clone()).await;
-    let conn = connect_client(server_addr, &pubkey).await;
-
-    // 3. Complete the control handshake manually.
-    let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
-    assert!(paused0);
-    assert_eq!(rem0, 0);
-
-    // 4. Open a real channel client-side and create the funding-bearing zero-balance payment.
-    let mut client_host = ConfigurableClientHost::new_in_memory();
-    let sender_secret = SecretKey::generate();
-    client_host.add_key(sender_secret.clone());
-    let bridge = SpilmanClientBridge::new(client_host, ReqwestClientNetworking::new());
-    let keyset_info_json = bridge
-        .fetch_keyset_info(&mint_url, &mint_helper.keyset_id().to_string())
-        .unwrap();
-
-    let proofs = mint_helper.mint_proofs(1000).await.unwrap();
-    let token = build_cashu_b_token(
-        &mint_url,
-        "sat",
-        &serde_json::to_string(&proofs).unwrap(),
-    )
-    .unwrap();
-
-    let open_result = bridge
-        .open_channel_from_token(
-            &token,
-            &receiver_secret.public_key().to_hex(),
-            &sender_secret.public_key().to_hex(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 3600,
-            &keyset_info_json,
-            64,
-        )
-        .unwrap();
-
-    let mut funding_payment: Payment = bridge
-        .create_payment_with_funding(&open_result.channel_id, 0)
-        .unwrap();
-    funding_payment.signature = "00".repeat(64);
-    let payment_json = serde_json::to_string(&funding_payment).unwrap();
-
-    // 5. Send the tampered funding registration.
-    send_control_message(
-        &mut h2_send,
-        &ClientMessage::ChannelFunding { payment_json },
-        false,
-    )
-    .await;
-
-    // 6. Expect the Error response from the tampered funding.
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        read_control_message(&mut h2_recv),
-    )
-    .await
-    .expect("timed out waiting for server response to invalid funding");
-    match response {
-        ServerMessage::Error { message } => {
-            assert!(
-                message.contains("channel funding rejected") || message.contains("invalid"),
-                "unexpected error message: {message}"
-            );
-        }
-        other => panic!("expected Error after invalid channel funding, got {other:?}"),
-    }
-
-    assert!(conn.session_channel_info().await.is_none());
-
-    let _ = h2_send.send_data(Bytes::new(), true);
-    let _ = mint_shutdown_tx.send(());
     conn.shutdown().await;
 }
