@@ -26,18 +26,18 @@ Important types:
   - wraps an H2 `SendStream + RecvStream` pair as a bidirectional async stream
   - allows another Noise+H2 session to run on top of an existing CONNECT tunnel
 - `ClientMessage` / `ServerMessage` (`protocol.rs`)
-  - wire protocol enums for the control stream (Hello, ChannelFunding, FakePayment, GetSessionStatus, SessionParams, ChannelFundingAccepted, SessionStatus, Error)
-  - `MintUnitKeysets` type alias for the mint/unit/keyset advertisement map
+  - wire protocol enums for the control stream (Hello, ChannelLink, ChannelPayment, FakePayment, GetSessionStatus, SessionParams, ChannelLinkAccepted, ChannelEvicted, SessionStatus, Error)
+  - `KeysetAdvertisement` struct for mint/unit/keyset pricing options
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established Noise+H2 session
   - manages H2 client, driver handles, task handles, session pricing, session ID
-  - stores fetched `SessionSpilmanInfo` (mint, keyset, receiver pubkey) and `SessionChannelInfo` (channel ID, capacity)
+  - stores fetched `SessionSpilmanInfo` (mint, keyset, receiver pubkey) for the active channel
 - `SessionPricing` (`session.rs`)
   - local billing metadata with precomputed LCM for integer-only arithmetic
 - `proxy_bidirectional` (`proxy.rs`)
   - shared generic bidirectional proxy used by client tunnels
 - `Ed25519Pubkey` / `ServerIdentity` (`identity.rs`)
-  - unified server identity; derives X25519 (for Noise) and SPKI DER (for QUIC) from one Ed25519 key
+  - unified server identity; derives X25519 (for Noise) and SPKI DER (for QUIC) from one Ed25519 key, plus the secp256k1 receiver key for Spilman
 
 ### `monad-client`
 
@@ -101,7 +101,7 @@ An H2 stream using:
 POST /control
 ```
 
-Used for session management: version negotiation (Hello/SessionParams), Spilman channel funding registration (ChannelFunding/ChannelFundingAccepted), payments (FakePayment), and session status queries (GetSessionStatus/SessionStatus). See the "Control Protocol and Session Billing" section below for details.
+Used for session management: version negotiation (Hello/SessionParams), Spilman channel linking (ChannelLink/ChannelLinkAccepted), incremental payments (ChannelPayment), and session status updates (SessionStatus). See the "Control Protocol and Session Billing" section below for details.
 
 ### Data stream
 
@@ -253,13 +253,15 @@ Control messages are JSON objects, newline-delimited, exchanged over the H2 cont
 
 Client to server (`ClientMessage`):
 - `Hello { version }` — first message; declares the highest protocol version the client supports
-- `ChannelFunding { payment_json }` — register a funded Spilman channel for this session (zero-balance, with funding proofs and signature)
-- `FakePayment { milli_sats }` — add fake credit to the session (placeholder for real payments)
+- `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0 and funding proofs
+- `ChannelPayment { payment_json }` — increment session balance; requires a Spilman `Payment` signature for a higher balance than previously seen for this channel
+- `FakePayment { milli_sats }` — add fake credit to the session (placeholder for testing)
 - `GetSessionStatus` — request a fresh session status snapshot
 
 Server to client (`ServerMessage`):
-- `SessionParams { version, in_bytes_per_millisat, out_bytes_per_millisat, receiver_pubkey, mints_units_keysets }` — sent in response to Hello; contains the negotiated version, pricing rates, the server's secp256k1 receiver pubkey, and the trusted mint/unit/keyset advertisement map
-- `ChannelFundingAccepted { channel_id, capacity }` — the server validated a zero-balance Spilman funding registration
+- `SessionParams { receiver_pubkey, advertisements }` — sent in response to Hello; contains the server's secp256k1 pubkey and a list of supported `(Mint, Unit, Rates)` options
+- `ChannelLinkAccepted { channel_id, capacity }` — the server validated and linked the Spilman channel to this session
+- `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
 - `SessionStatus { session_total_in, session_total_out, total_paid_millisats, remaining_milli_sats, paused }` — current session accounting snapshot
 - `Error { message }` — server-initiated error or rejection
 
@@ -314,25 +316,85 @@ Each Noise NK handshake produces a 32-byte **handshake hash** that is identical 
 - Not transmitted over the wire — derived locally from the shared transcript
 - Will be used for channel_id → session_id binding (enforcing one channel per session)
 
-### Spilman Channel Funding
+### Spilman Channel Lifecycle
 
-MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The channel establishment flow is:
+MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The design enforces channel exclusivity and uses delta-based accounting.
 
-1. **Server advertises payment info** — `SessionParams` includes `receiver_pubkey` (secp256k1 hex) and `mints_units_keysets` (a map of `mint_url -> unit -> [keyset_ids]`). The server discovers these by fetching `/v1/keysets` from each trusted mint at startup and caching the full keyset info JSON.
+#### 1. Server Advertisement
+The server is configured with a map of `Mint -> Unit -> Rates`. In the `SessionParams` message, it advertises these options to the client as a list of `KeysetAdvertisement` objects. Each option includes the `in_bytes_per_millisat` and `out_bytes_per_millisat` specific to that mint/unit choice.
 
-2. **Client fetches keyset info** — the client picks a mint/unit/keyset (preferring `sat`), fetches `/v1/keysets` and `/v1/keys/{id}` from the mint, verifies the keyset ID is consistent with the keys (v1 or v2 derivation), and stores the result as `SessionSpilmanInfo`.
+#### 2. Channel Linking
+The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs.
+- **One Session Per Channel**: The server maintains a global registry of `ChannelId -> SessionId`.
+- **Exclusivity**: If a channel is already linked to another session, the server sends `ChannelEvicted` to the old session and links the channel to the new one.
+- **Stateless Session Start**: Every new Noise session starts with a `total_paid_millisats` of 0. Only *new* payments made within the current session count as credit.
 
-3. **Client obtains a token** — the `SessionFundingProvider` callback is called once per session with the session ID, receiver pubkey, mint URL, unit, and keyset ID. The provider returns a Cashu token (or `None` to fall back to `FakePayment`). `FakePaymentProvider` always returns `None` (default behavior).
+#### 3. Orthogonal State Model
+A session's ability to proxy data is determined by two orthogonal variables:
+- **Flow State**: Is the session balance strictly positive? (`Active` if balance > 0, else `Paused`)
+- **Linked State**: Is there a Spilman channel currently associated with this session? (`Linked` vs `Unlinked`)
 
-4. **Client opens a channel** — using the stored keyset info and the provided token, the client calls `open_channel_from_token` on a per-session `SpilmanClientBridge`. This swaps the token's proofs for 2-of-2 multisig funding outputs at the mint. The client generates an ephemeral secp256k1 sender key per session.
+#### 4. Incremental Payments (Delta Model)
+When the session balance runs low, the client sends a `ChannelPayment` with a signed balance update.
+- **Credit Calculation**: The server tracks the `max_balance_seen` for every channel ID.
+- **Delta**: `credit_millisats = (new_balance - max_balance_seen) * unit_multiplier`.
+- **Eviction Fairness**: If a session is evicted, it **remains Active** as long as it has a positive balance. The user can spend their existing credit, but cannot send further `ChannelPayment` updates until they link a new channel.
 
-5. **Client sends zero-balance funding registration** — the client calls `create_payment_with_funding(channel_id, 0)` to produce a Spilman `Payment` with funding proofs, channel parameters, and a valid Schnorr signature for balance=0. This is serialized and sent as `ChannelFunding { payment_json }`.
+#### 5. Session State Matrix
 
-6. **Server validates** — the server creates an ephemeral `FundingValidationHost` (a minimal `SpilmanHost` with no persistence) and calls `fund_channel_via_json`. This verifies the funding proofs, keyset consistency, the Schnorr signature, and that balance == 0 (a MONAD protocol rule). On success, the server sends `ChannelFundingAccepted { channel_id, capacity }`.
+```text
+    +-----------+
+    |  Connect  |
+    +-----+-----+
+          |
+          v
+    +-----------------+
+    |   Noise + H2    |
+    |   Handshake     |
+    +--------+--------+
+             |
+             v
+    +--------+--------+
+    |   Send Hello    |
+    +--------+--------+
+             |
+             v
+    +-----------------+
+    | Receive Params  |
+    | (Pricing & Mints)|
+    +--------+--------+
+             |
+             v
+    +-----------------------------------------------------------------------+
+    |                         SESSION STATE MATRIX                          |
+    |                         ====================                          |
+    |                                                                       |
+    |                       UNLINKED                         LINKED         |
+    |               (No associated channel)          (Channel associated)   |
+    |               +-------------------------+  Link  +--------------------+|
+    |               |                         |------->|                    ||
+    |     PAUSED    |     Unlinked / Paused   |        |   Linked / Paused  ||
+    |   (Bal <= 0)  |  (Initial / Exhausted)  |<-------|   (Awaiting Pay)   ||
+    |               |                         | Evict  |                    ||
+    |               +------------+------------+        +----------+---------+|
+    |                  |         ^                        ^       |         |
+    |          FakePay |         | Drain            Drain |       | Payment |
+    |                  v         |                        |       v         |
+    |               +------------+------------+  Link  +----------+---------+|
+    |               |                         |------->|                    ||
+    |     ACTIVE    |     Unlinked / Active   |        |   Linked / Active  ||
+    |   (Bal > 0)   |     (The Evicted state) |<-------|   (Normal Flow)    ||
+    |               |                         | Evict  |                    ||
+    |               +-------------------------+        +--------------------+|
+    +-----------------------------------------------------------------------+
+             |
+             v
+       +-----------+
+       | Disconnect|
+       +-----------+
+```
 
-7. **Client confirms** — on receiving the ack, the client promotes the channel from "pending" to "active" and publishes `SessionChannelInfo` on `RelayConnection`. The per-session `SpilmanClientBridge` is retained in the control task for future `create_payment` calls.
 
-The channel is now established but not yet used for byte payments — sessions still unpause via `FakePayment`. Each session gets exactly one channel. The `SessionFundingProvider` is called once per session, when `SessionParams` arrives.
 
 ## Shutdown Model
 
@@ -585,9 +647,9 @@ The full QUIC transport chain is implemented and tested:
 
 ## Current Limitations
 
-- Spilman channel funding registration is implemented but real byte-level Spilman payments are not yet used — sessions still unpause via `FakePayment`
-- server does not yet persist Spilman channel state — funding validation is ephemeral (one-shot per `ChannelFunding` message)
-- multi-hop Spilman channel funding is wired (provider threaded through hop chain) but not yet tested
-- no persistent route configuration file yet
-- QUIC connection pool does not yet handle connection eviction or stale entry cleanup
-- asymmetric pricing (rates other than 1/1) is not yet tested
+- Spilman channel implementation is currently being transitioned from a proof-of-concept to the "Proper" delta-based model described above.
+- server does not yet persist Spilman channel state across restarts (registry is in-memory).
+- multi-hop Spilman channel funding is wired but not yet fully tested with the new lifecycle.
+- no persistent route configuration file yet.
+- QUIC connection pool does not yet handle connection eviction or stale entry cleanup.
+- asymmetric pricing (rates other than 1/1) is not yet tested.

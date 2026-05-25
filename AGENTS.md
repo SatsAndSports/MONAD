@@ -24,22 +24,20 @@ cargo run -p monad-quic -- ...
   - shared transport, protocol, and session code
   - `NoiseStream` (`noise.rs`) — includes session ID (handshake hash)
   - `H2ConnectStream` (`h2stream.rs`)
-  - `ClientMessage` / `ServerMessage` wire protocol, `MintUnitKeysets` type (`protocol.rs`)
-  - `RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`, `SessionChannelInfo`, billing math (`session.rs`)
+  - `ClientMessage` / `ServerMessage` wire protocol, `KeysetAdvertisement` type (`protocol.rs`)
+  - `RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`, billing math (`session.rs`)
   - `proxy_bidirectional` shared proxy (`proxy.rs`)
   - `Ed25519Pubkey`, `ServerIdentity`, key derivation (`identity.rs`)
 - `monad-client`
   - reusable library code plus binary entrypoint
   - SOCKS5 listener
-  - multi-hop connector (`connector.rs`) — threads `SessionFundingProvider` through hop chain
+  - multi-hop connector (`connector.rs`)
   - tunnel proxying (`tunnel.rs`)
   - client control task with auto-payment and Spilman channel management (`control.rs`)
-  - `SessionFundingProvider` trait, `FakePaymentProvider`, `SessionChannelRuntime`
 - `monad-server`
   - reusable library code plus binary entrypoint
   - TCP+QUIC listener, `SpilmanMintCache`, `discover_spilman_mint_cache` (`listener.rs`)
   - `RelaySession<T>`, billing, control stream handler, version negotiation (`session.rs`)
-  - `FundingValidationHost` — minimal `SpilmanHost` for validating `ChannelFunding` (`session.rs`)
   - `proxy_bidirectional_accounted` with pause/resume enforcement (`proxy.rs`)
   - QUIC connection pool (`quic_pool.rs`)
 - `monad-quic`
@@ -61,7 +59,7 @@ cargo run -p monad-quic -- ...
 ### Control Protocol
 
 - Wire format: JSON newline-delimited messages on the H2 control stream (`POST /control`)
-- Handshake: client sends `Hello { version }`, server responds with `SessionParams { version, in_bytes_per_millisat, out_bytes_per_millisat, receiver_pubkey, mints_units_keysets }`
+- Handshake: client sends `Hello { version }`, server responds with `SessionParams { version, receiver_pubkey, advertisements }`
 - Version negotiation: `min(client_version, SERVER_MAX_VERSION)`, reject if < `SERVER_MIN_VERSION`
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, integer-only via precomputed LCM
@@ -70,8 +68,8 @@ cargo run -p monad-quic -- ...
 - Balance can go negative (chunk-boundary overshoot); session repauses
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
 - `Error` for server-initiated rejections (e.g. version mismatch)
-- `ChannelFunding { payment_json }` registers a zero-balance Spilman channel for the session; server validates and responds with `ChannelFundingAccepted { channel_id, capacity }` or `Error`
-- One Spilman channel per session, established once when `SessionParams` arrives
+- `ChannelLink { payment_json }` links a Spilman channel to the session; server validates and responds with `ChannelLinkAccepted { channel_id, capacity }` or `Error`. Only one session can own a channel at a time.
+- `ChannelPayment { payment_json }` increments the session balance based on the delta of the channel's max balance seen.
 - Session ID is the Noise handshake hash (32 bytes, identical on both sides)
 
 ### QUIC Transport
@@ -191,9 +189,8 @@ The test suite currently covers:
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
 - Noise session ID (handshake hash) matches on both sides
-- Spilman channel payment (standalone bridge test)
-- server advertises mint/keyset info, client fetches and stores it
-- session funding provider opens Spilman channel (server validates and acks)
+- Spilman channel implementation (delta-based) is currently being integrated and tested
+- server advertises multiple mint/unit pricing options
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
 

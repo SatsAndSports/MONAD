@@ -13,18 +13,18 @@ It provides:
 ## Status
 
 Implemented today:
-- `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup, validates Spilman channel funding registrations
-- `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels, auto-funds sessions via the control stream, fetches and verifies mint keyset info, opens per-session Spilman payment channels via a `SessionFundingProvider` callback
-- `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`, `SessionChannelInfo`), shared bidirectional proxy
+- `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup
+- `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels, auto-funds sessions via the control stream
+- `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, pinned-key auth, echo server/client, and shared config/keygen helpers used by server and client
 - QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, `quic-pin` H2 header for CONNECT forwarding
 - session payment system: paused-by-default sessions, Hello/SessionParams version negotiation, fake payments, totals-based billing with directional pricing, pause/resume enforcement
-- Spilman channel funding: server advertises receiver pubkey and trusted mints in `SessionParams`, client opens a Spilman channel per session and sends a zero-balance `ChannelFunding` registration, server validates the funding proofs and signature and acks with `ChannelFundingAccepted`
+- Spilman channel linking: server advertises receiver pubkey and trusted mints with per-mint pricing, client links a Spilman channel to the session and makes incremental delta-based payments
 - integration tests for direct, nested, IPv6, hostname-resolution, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, session payment lifecycle, and Spilman channel funding
 
 Not implemented yet:
-- real Spilman byte-level payments — channel establishment works but sessions still unpause via `FakePayment`
-- server-side Spilman channel state persistence
+- real Spilman byte-level payments — implementation of the new delta-based model is in progress
+- server-side Spilman channel state persistence across restarts
 - persistent route configuration file
 
 ## Workspace
@@ -79,9 +79,8 @@ Current coverage includes:
 - concurrent QUIC pool access
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
-- Spilman channel payment (standalone bridge test)
-- server advertises mint/keyset info, client fetches and stores it
-- session funding provider opens Spilman channel (server validates and acks)
+- session funding and incremental payments via Spilman channels (in progress)
+- server advertises multiple mint/unit pricing options
 
 ## Quick Start
 
