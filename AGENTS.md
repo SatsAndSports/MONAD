@@ -59,7 +59,7 @@ cargo run -p monad-quic -- ...
 ### Control Protocol
 
 - Wire format: JSON newline-delimited messages on the H2 control stream (`POST /control`)
-- Handshake: client sends `Hello { version }`, server responds with `SessionParams { version, receiver_pubkey, advertisements }`
+- Handshake: client sends `Hello { version }`, server responds with a unified `SessionStatus` containing advertisements and initial state
 - Version negotiation: `min(client_version, SERVER_MAX_VERSION)`, reject if < `SERVER_MIN_VERSION`
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, integer-only via precomputed LCM

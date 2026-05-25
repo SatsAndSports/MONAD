@@ -26,7 +26,7 @@ Important types:
   - wraps an H2 `SendStream + RecvStream` pair as a bidirectional async stream
   - allows another Noise+H2 session to run on top of an existing CONNECT tunnel
 - `ClientMessage` / `ServerMessage` (`protocol.rs`)
-  - wire protocol enums for the control stream (Hello, ChannelLink, ChannelPayment, FakePayment, GetSessionStatus, SessionParams, ChannelLinkAccepted, ChannelEvicted, SessionStatus, Error)
+  - wire protocol enums for the control stream (Hello, ChannelLink, ChannelPayment, FakePayment, GetSessionStatus, ChannelLinkAccepted, ChannelEvicted, SessionStatus, Error)
   - `KeysetAdvertisement` struct for mint/unit/keyset pricing options
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established Noise+H2 session
@@ -46,10 +46,10 @@ Responsibilities:
 - build a single-hop or multi-hop MONAD chain
 - expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers)
 - open H2 `CONNECT` streams to final targets
-- fetch and verify mint keyset info from advertised mints (v1/v2 keyset ID consistency check)
-- open per-session Spilman payment channels via `SessionFundingProvider` callback
-- send zero-balance `ChannelFunding` registration and wait for server ack
-- manage per-session Spilman bridge state in the control task for future payments
+- run a control task per hop that synchronises local state from the server's
+  unified `SessionStatus` and auto-funds the session via `FakePayment`
+  (Spilman channel linking and incremental payments are planned but not yet
+  implemented)
 
 ### `monad-server`
 
@@ -62,8 +62,11 @@ Responsibilities:
   - `CONNECT host:port`
 - proxy bytes between H2 streams and external TCP targets
 - discover trusted mint keysets at startup (`SpilmanMintCache`), caching keyset info JSON
-- advertise receiver pubkey and trusted mints/keysets in `SessionParams`
-- validate `ChannelFunding` registrations via `FundingValidationHost` (checks funding proofs, Schnorr signature, keyset, balance == 0)
+- advertise receiver pubkey and trusted mints/keysets in `SessionStatus`
+  (per-(mint, unit) rate configuration is planned; today every advertisement
+  carries the session's global default rates)
+- enforce per-session billing with pause/resume on the control stream
+  (`ChannelLink` / `ChannelPayment` validation is planned but not yet wired up)
 
 ### `monad-quic`
 
@@ -101,7 +104,7 @@ An H2 stream using:
 POST /control
 ```
 
-Used for session management: version negotiation (Hello/SessionParams), Spilman channel linking (ChannelLink/ChannelLinkAccepted), incremental payments (ChannelPayment), and session status updates (SessionStatus). See the "Control Protocol and Session Billing" section below for details.
+Used for session management: version negotiation (Hello), Spilman channel linking (ChannelLink/ChannelLinkAccepted), and unified session status synchronization (SessionStatus). See the "Control Protocol and Session Billing" section below for details.
 
 ### Data stream
 
@@ -259,15 +262,25 @@ Client to server (`ClientMessage`):
 - `GetSessionStatus` — request a fresh session status snapshot
 
 Server to client (`ServerMessage`):
-- `SessionParams { receiver_pubkey, advertisements }` — sent in response to Hello; contains the server's secp256k1 pubkey and a list of supported `(Mint, Unit, Rates)` options
+- `SessionStatus { ... }` — primary state synchronization message; sent immediately after Hello and proactively whenever session state (balance, link, pricing) changes. Contains:
+  - `version`: Negotiated protocol version
+  - `receiver_pubkey`: Server's secp256k1 key for Spilman
+  - `advertisements`: List of supported `(Mint, Unit, Rates)` options
+  - `linked_channel_id`: ID of currently linked channel (if any)
+  - `active_in_rate`: Rate currently being applied to inbound traffic
+  - `active_out_rate`: Rate currently being applied to outbound traffic
+  - `session_total_in`: Total inbound bytes processed
+  - `session_total_out`: Total outbound bytes processed
+  - `total_paid_millisats`: Total payments received
+  - `remaining_milli_sats`: Current session balance
+  - `paused`: Boolean indicating if traffic is currently blocked
 - `ChannelLinkAccepted { channel_id, capacity }` — the server validated and linked the Spilman channel to this session
 - `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
-- `SessionStatus { session_total_in, session_total_out, total_paid_millisats, remaining_milli_sats, paused }` — current session accounting snapshot
 - `Error { message }` — server-initiated error or rejection
 
 ### Version Negotiation
 
-The client sends `Hello { version }` as the first control message. The server computes `negotiated = min(client_version, SERVER_MAX_VERSION)`. If `negotiated < SERVER_MIN_VERSION`, the server sends an `Error` and closes the control stream. Otherwise it responds with `SessionParams` containing the negotiated version and pricing rates.
+The client sends `Hello { version }` as the first control message. The server computes `negotiated = min(client_version, SERVER_MAX_VERSION)`. If `negotiated < SERVER_MIN_VERSION`, the server sends an `Error` and closes the control stream. Otherwise it responds with a unified `SessionStatus` containing the negotiated version, available pricing options, and the initial zero-balance state.
 
 ### Paused-by-Default
 
@@ -298,12 +311,12 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 
 ### Two Pricing Structures
 
-- **Wire**: `ServerMessage::SessionParams` carries the raw rates (no LCM). This is what crosses the network.
-- **Local**: `SessionPricing` (in `monad-common/src/session.rs`) includes the precomputed LCM and negotiated version. Both client and server construct this from `SessionParams` for billing math.
+- **Wire**: `ServerMessage::SessionStatus` carries the active rates and the list of alternatives. This is what crosses the network.
+- **Local**: `SessionPricing` (in `monad-common/src/session.rs`) includes the precomputed LCM and negotiated version. Both client and server construct this from the active rates in `SessionStatus` for billing math.
 
 ### Client Auto-Funding
 
-The client opens a control stream immediately after connecting and sends `Hello`. When it receives `SessionStatus { paused: true, remaining_milli_sats <= 0, .. }`, it automatically sends a `FakePayment`. The client waits for the session to become unpaused before accepting SOCKS traffic. Intermediate hops in multi-hop chains each get their own control task with automatic funding.
+The client opens a control stream immediately after connecting and sends `Hello`. When it receives a `SessionStatus` with `paused: true` and `remaining_milli_sats <= 0`, it automatically sends a `FakePayment` (or initiates Spilman linking). The client waits for the session to become unpaused before accepting SOCKS traffic. Intermediate hops in multi-hop chains each get their own control task with automatic funding.
 
 ### Session ID
 
@@ -318,10 +331,19 @@ Each Noise NK handshake produces a 32-byte **handshake hash** that is identical 
 
 ### Spilman Channel Lifecycle
 
+> **Status (planned, not implemented):** the lifecycle below is the target
+> design. Today, the wire protocol carries `ChannelLink`, `ChannelPayment`,
+> `ChannelLinkAccepted` and `ChannelEvicted` messages, but the server logs
+> any client `ChannelLink` / `ChannelPayment` and otherwise ignores them,
+> and never emits `ChannelLinkAccepted` or `ChannelEvicted`. Only
+> `FakePayment` actually moves the session balance. The advertised rates
+> in `SessionStatus.advertisements` are also not yet per-(mint,unit) — every
+> advertisement copies the session's global rates.
+
 MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The design enforces channel exclusivity and uses delta-based accounting.
 
 #### 1. Server Advertisement
-The server is configured with a map of `Mint -> Unit -> Rates`. In the `SessionParams` message, it advertises these options to the client as a list of `KeysetAdvertisement` objects. Each option includes the `in_bytes_per_millisat` and `out_bytes_per_millisat` specific to that mint/unit choice.
+The server is configured with a map of `Mint -> Unit -> Rates`. In the `SessionStatus` message, it advertises these options to the client as a list of `KeysetAdvertisement` objects. Each option includes the `in_bytes_per_millisat` and `out_bytes_per_millisat` specific to that mint/unit choice.
 
 #### 2. Channel Linking
 The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs.
@@ -360,8 +382,9 @@ When the session balance runs low, the client sends a `ChannelPayment` with a si
              |
              v
     +-----------------+
-    | Receive Params  |
-    | (Pricing & Mints)|
+    | Receive         |
+    | SessionStatus   |
+    | (Pricing&Mints) |
     +--------+--------+
              |
              v

@@ -13,7 +13,7 @@ use h2::server;
 use http::{Method, Response, StatusCode};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise::NoiseStream;
-use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerMessage};
 use monad_common::session::{SessionPricing, clamp_i128_to_i64};
 use std::io;
 use std::sync::Arc;
@@ -30,27 +30,6 @@ const SERVER_MAX_VERSION: u8 = 0;
 const DEFAULT_IN_BYTES_PER_MILLISAT: u64 = 1;
 const DEFAULT_OUT_BYTES_PER_MILLISAT: u64 = 1;
 
-#[derive(Debug, Clone)]
-struct SessionSnapshot {
-    session_total_in: u64,
-    session_total_out: u64,
-    total_paid_millisats: u64,
-    remaining_milli_sats: i64,
-    paused: bool,
-}
-
-impl SessionSnapshot {
-    fn to_message(&self) -> ServerMessage {
-        ServerMessage::SessionStatus {
-            session_total_in: self.session_total_in,
-            session_total_out: self.session_total_out,
-            total_paid_millisats: self.total_paid_millisats,
-            remaining_milli_sats: self.remaining_milli_sats,
-            paused: self.paused,
-        }
-    }
-}
-
 #[derive(Debug)]
 struct SessionInner {
     session_total_in: u64,
@@ -60,6 +39,10 @@ struct SessionInner {
     paused: bool,
     control_attached: bool,
     control_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
+    // TODO: set this in a future ChannelLink handler. Currently always None
+    // because Spilman channel linking is not yet implemented; only FakePayment
+    // moves the balance today.
+    linked_channel_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -86,20 +69,11 @@ impl SessionState {
                 paused: true,
                 control_attached: false,
                 control_tx: None,
+                linked_channel_id: None,
             })),
             pause_tx,
             payment_receiver_secret,
             spilman_mint_cache,
-        }
-    }
-
-    fn session_params_message(&self, inner: &SessionInner, negotiated_version: u8) -> ServerMessage {
-        ServerMessage::SessionParams {
-            version: negotiated_version,
-            in_bytes_per_millisat: inner.pricing.in_bytes_per_millisat,
-            out_bytes_per_millisat: inner.pricing.out_bytes_per_millisat,
-            receiver_pubkey: self.payment_receiver_secret.public_key().to_hex(),
-            mints_units_keysets: self.spilman_mint_cache.advertised.clone(),
         }
     }
 
@@ -110,12 +84,34 @@ impl SessionState {
         inner.total_paid_millisats as i128 - amount_due as i128
     }
 
-    fn snapshot_from_inner(inner: &SessionInner) -> SessionSnapshot {
-        SessionSnapshot {
+    async fn session_status_message(&self, negotiated_version: u8) -> ServerMessage {
+        let inner = self.inner.lock().await;
+
+        let mut advertisements = Vec::new();
+        for (mint_url, unit_map) in &self.spilman_mint_cache.advertised {
+            for (unit, keyset_ids) in unit_map {
+                advertisements.push(KeysetAdvertisement {
+                    mint_url: mint_url.clone(),
+                    unit: unit.clone(),
+                    keyset_ids: keyset_ids.clone(),
+                    // Use session defaults for now until we have per-advertisement config
+                    in_bytes_per_millisat: inner.pricing.in_bytes_per_millisat,
+                    out_bytes_per_millisat: inner.pricing.out_bytes_per_millisat,
+                });
+            }
+        }
+
+        ServerMessage::SessionStatus {
+            version: negotiated_version,
+            receiver_pubkey: self.payment_receiver_secret.public_key().to_hex(),
+            advertisements,
+            linked_channel_id: inner.linked_channel_id.clone(),
+            active_in_rate: inner.pricing.in_bytes_per_millisat,
+            active_out_rate: inner.pricing.out_bytes_per_millisat,
             session_total_in: inner.session_total_in,
             session_total_out: inner.session_total_out,
             total_paid_millisats: inner.total_paid_millisats,
-            remaining_milli_sats: clamp_i128_to_i64(Self::remaining_milli_sats(inner)),
+            remaining_milli_sats: clamp_i128_to_i64(Self::remaining_milli_sats(&inner)),
             paused: inner.paused,
         }
     }
@@ -132,16 +128,6 @@ impl SessionState {
         self.pause_tx.subscribe()
     }
 
-    async fn snapshot(&self) -> SessionSnapshot {
-        let inner = self.inner.lock().await;
-        Self::snapshot_from_inner(&inner)
-    }
-
-    async fn session_params(&self, negotiated_version: u8) -> ServerMessage {
-        let inner = self.inner.lock().await;
-        self.session_params_message(&inner, negotiated_version)
-    }
-
     async fn is_paused(&self) -> bool {
         self.inner.lock().await.paused
     }
@@ -149,7 +135,7 @@ impl SessionState {
     async fn attach_control(
         &self,
         tx: mpsc::UnboundedSender<ServerMessage>,
-    ) -> Result<SessionSnapshot, ()> {
+    ) -> Result<(), ()> {
         let mut inner = self.inner.lock().await;
         if inner.control_attached {
             return Err(());
@@ -157,7 +143,7 @@ impl SessionState {
 
         inner.control_attached = true;
         inner.control_tx = Some(tx);
-        Ok(Self::snapshot_from_inner(&inner))
+        Ok(())
     }
 
     async fn detach_control(&self) {
@@ -166,11 +152,10 @@ impl SessionState {
         inner.control_tx = None;
     }
 
-    async fn apply_fake_payment(&self, milli_sats: u64) -> SessionSnapshot {
+    async fn apply_fake_payment(&self, milli_sats: u64) {
         let mut inner = self.inner.lock().await;
         inner.total_paid_millisats = inner.total_paid_millisats.saturating_add(milli_sats);
         self.refresh_pause_state(&mut inner);
-        Self::snapshot_from_inner(&inner)
     }
 
     pub(crate) async fn note_outbound_bytes(&self, bytes: usize) -> bool {
@@ -206,8 +191,12 @@ impl SessionState {
     }
 
     pub(crate) async fn push_status(&self) {
-        let snapshot = self.snapshot().await;
-        self.push_message(snapshot.to_message()).await;
+        let version = {
+            let inner = self.inner.lock().await;
+            inner.pricing.version
+        };
+        let status = self.session_status_message(version).await;
+        self.push_message(status).await;
     }
 }
 
@@ -418,17 +407,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                         }
                         (&Method::POST, "/control") => {
                             let (event_tx, event_rx) = mpsc::unbounded_channel();
-                            let snapshot = match self.state.attach_control(event_tx).await {
-                                Ok(snapshot) => snapshot,
-                                Err(()) => {
-                                    let resp = Response::builder()
-                                        .status(StatusCode::CONFLICT)
-                                        .body(())
-                                        .unwrap();
-                                    let _ = respond.send_response(resp, true);
-                                    continue;
-                                }
-                            };
+                            if self.state.attach_control(event_tx).await.is_err() {
+                                let resp = Response::builder()
+                                    .status(StatusCode::CONFLICT)
+                                    .body(())
+                                    .unwrap();
+                                let _ = respond.send_response(resp, true);
+                                continue;
+                            }
 
                             let resp = Response::builder()
                                 .status(StatusCode::OK)
@@ -440,7 +426,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                     let state = self.state.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) =
-                                            handle_control_stream(h2_send, h2_recv, state, event_rx, snapshot)
+                                            handle_control_stream(h2_send, h2_recv, state, event_rx)
                                                 .await
                                         {
                                             error!("control channel error: {e}");
@@ -533,11 +519,10 @@ async fn handle_control_stream(
     mut h2_recv: h2::RecvStream,
     state: SessionState,
     mut events: mpsc::UnboundedReceiver<ServerMessage>,
-    initial_snapshot: SessionSnapshot,
 ) -> io::Result<()> {
     info!("control channel opened");
 
-    // Wait for the client's Hello message before sending session params.
+    // Wait for the client's Hello message before sending the initial SessionStatus.
     let mut buf = Vec::new();
     let client_version = match read_one_control_message(&mut h2_recv, &mut buf).await? {
         Some(ClientMessage::Hello { version }) => {
@@ -578,9 +563,19 @@ async fn handle_control_stream(
         let _ = h2_send.send_data(Bytes::new(), true);
         return Ok(());
     }
-    let params = state.session_params(negotiated_version).await;
-    send_control_message(&mut h2_send, &params).await?;
-    send_control_message(&mut h2_send, &initial_snapshot.to_message()).await?;
+
+    // Set initial version in session state, then build and send the initial
+    // SessionStatus. This is race-free: the session starts paused and no
+    // proxy task can be running yet (CONNECT requires unpaused), so nothing
+    // else can mutate `inner` between attaching the control_tx and reading
+    // the snapshot here.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.pricing.version = negotiated_version;
+    }
+
+    let initial_status = state.session_status_message(negotiated_version).await;
+    send_control_message(&mut h2_send, &initial_status).await?;
 
     loop {
         tokio::select! {
@@ -616,17 +611,18 @@ async fn handle_control_stream(
                                     send_control_message(&mut h2_send, &err_msg).await?;
                                 }
                                 Ok(ClientMessage::GetSessionStatus) => {
-                                    let snapshot = state.snapshot().await;
-                                    send_control_message(&mut h2_send, &snapshot.to_message()).await?;
+                                    let status = state.session_status_message(negotiated_version).await;
+                                    send_control_message(&mut h2_send, &status).await?;
                                 }
                                 Ok(ClientMessage::FakePayment { milli_sats }) => {
-                                    let snapshot = state.apply_fake_payment(milli_sats).await;
+                                    state.apply_fake_payment(milli_sats).await;
                                     state.push_status().await;
                                     debug!(
-                                        "fake payment accepted: added={} remaining={}",
-                                        milli_sats,
-                                        snapshot.remaining_milli_sats
+                                        "fake payment accepted: added={milli_sats}"
                                     );
+                                }
+                                Ok(other) => {
+                                    warn!("control: message not yet implemented: {other:?}");
                                 }
                                 Err(e) => {
                                     warn!("control: invalid message: {e}");

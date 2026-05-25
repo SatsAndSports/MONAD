@@ -8,7 +8,7 @@
 //! Validates:
 //!   - Noise NK handshake and encrypted transport
 //!   - H2 multiplexing: control + data streams coexisting
-//!   - Control channel: Hello/SessionParams version negotiation, fake payment
+//!   - Control channel: Hello/SessionStatus version negotiation, fake payment
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
 use bytes::Bytes;
@@ -17,10 +17,10 @@ use http::{Method, Request};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::identity::{self, Ed25519Pubkey};
 use monad_common::noise;
-use monad_common::protocol::MintUnitKeysets;
 use monad_common::session::RelayConnection;
 use monad_client::connector::{self, Hop};
 use monad_common::protocol::{ClientMessage, ServerMessage};
+
 use monad_server::listener::ServerConfig;
 use monad_quic::stream::QuicStream;
 use std::collections::{BTreeMap, BTreeSet};
@@ -248,31 +248,13 @@ fn expect_session_status(message: ServerMessage) -> (u64, u64, u64, i64, bool) {
             total_paid_millisats,
             remaining_milli_sats,
             paused,
+            ..
         } => (session_total_in, session_total_out, total_paid_millisats, remaining_milli_sats, paused),
         other => panic!("expected SessionStatus, got {other:?}"),
     }
 }
 
-fn expect_session_params(message: ServerMessage) -> (u8, u64, u64, String, MintUnitKeysets) {
-    match message {
-        ServerMessage::SessionParams {
-            version,
-            in_bytes_per_millisat,
-            out_bytes_per_millisat,
-            receiver_pubkey,
-            mints_units_keysets,
-        } => (
-            version,
-            in_bytes_per_millisat,
-            out_bytes_per_millisat,
-            receiver_pubkey,
-            mints_units_keysets,
-        ),
-        other => panic!("expected SessionParams, got {other:?}"),
-    }
-}
-
-/// Send Hello, read SessionParams, read initial SessionStatus.
+/// Send Hello, read initial SessionStatus.
 /// Returns the initial session status fields.
 async fn control_handshake(
     h2_send: &mut h2::SendStream<Bytes>,
@@ -280,13 +262,22 @@ async fn control_handshake(
 ) -> (u64, u64, u64, i64, bool) {
     send_control_message(h2_send, &ClientMessage::Hello { version: 0 }, false).await;
 
-    let (version, in_bytes_per_millisat, out_bytes_per_millisat, _receiver_pubkey, _mints_units_keysets) =
-        expect_session_params(read_control_message(h2_recv).await);
-    assert_eq!(version, 0);
-    assert_eq!(in_bytes_per_millisat, 1);
-    assert_eq!(out_bytes_per_millisat, 1);
+    let message = read_control_message(h2_recv).await;
+    match &message {
+        ServerMessage::SessionStatus {
+            version,
+            active_in_rate,
+            active_out_rate,
+            ..
+        } => {
+            assert_eq!(*version, 0);
+            assert_eq!(*active_in_rate, 1);
+            assert_eq!(*active_out_rate, 1);
+        }
+        other => panic!("expected SessionStatus, got {other:?}"),
+    }
 
-    expect_session_status(read_control_message(h2_recv).await)
+    expect_session_status(message)
 }
 
 async fn fund_session(conn: &RelayConnection, milli_sats: u64) {

@@ -47,7 +47,7 @@ pub fn clamp_i128_to_i64(value: i128) -> i64 {
 
 /// Local session pricing metadata, persisted on both client and server.
 ///
-/// Constructed from the wire `SessionParams` message. Includes the
+/// Constructed from the wire `SessionStatus` message. Includes the
 /// precomputed LCM of the two directional rates so billing math can
 /// use integer arithmetic without recomputing it per chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +59,7 @@ pub struct SessionPricing {
     pub pricing_lcm: u64,
 }
 
-/// Spilman session metadata fetched by the client after receiving `SessionParams`.
+/// Spilman session metadata fetched by the client after receiving `SessionStatus`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSpilmanInfo {
     pub receiver_pubkey: String,
@@ -115,7 +115,7 @@ pub struct RelayConnection {
     /// Noise handshake hash — unique session identifier agreed by both sides.
     session_id: [u8; 32],
     /// Session pricing metadata, set by the control task after receiving
-    /// `SessionParams` from the relay.
+    /// `SessionStatus` from the relay.
     session_pricing: Arc<RwLock<Option<SessionPricing>>>,
     /// Spilman mint/keyset info fetched by the client for this session.
     session_spilman_info: Arc<RwLock<Option<SessionSpilmanInfo>>>,
@@ -232,7 +232,7 @@ impl RelayConnection {
 
     /// Get a shared handle to the session pricing storage.
     ///
-    /// Used by the control task to persist pricing when `SessionParams`
+    /// Used by the control task to persist pricing when `SessionStatus`
     /// arrives from the relay.
     pub fn session_pricing_handle(&self) -> Arc<RwLock<Option<SessionPricing>>> {
         self.session_pricing.clone()

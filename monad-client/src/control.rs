@@ -41,7 +41,7 @@ async fn run_control_task(
     _hop_label: String,
     ready_tx: oneshot::Sender<()>,
     pricing_handle: Arc<RwLock<Option<SessionPricing>>>,
-    _spilman_info_handle: Arc<RwLock<Option<SessionSpilmanInfo>>>,
+    spilman_info_handle: Arc<RwLock<Option<SessionSpilmanInfo>>>,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     let mut ready_tx = Some(ready_tx);
@@ -66,45 +66,46 @@ async fn run_control_task(
             let message: ServerMessage = serde_json::from_slice(line)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
             match message {
-                ServerMessage::SessionParams {
-                    version,
-                    in_bytes_per_millisat,
-                    out_bytes_per_millisat,
-                    receiver_pubkey: _,
-                    mints_units_keysets: _,
-                } => {
-                    let pricing = SessionPricing::new(
-                        version,
-                        in_bytes_per_millisat,
-                        out_bytes_per_millisat,
-                    );
-                    info!(
-                        "session params: version={} in_bytes_per_millisat={} out_bytes_per_millisat={} lcm={}",
-                        pricing.version,
-                        pricing.in_bytes_per_millisat,
-                        pricing.out_bytes_per_millisat,
-                        pricing.pricing_lcm,
-                    );
-                    *pricing_handle.write().await = Some(pricing);
-                }
-                ServerMessage::Error { message } => {
-                    warn!("control error: {message}");
-                }
                 ServerMessage::SessionStatus {
+                    version,
+                    receiver_pubkey,
+                    advertisements,
+                    linked_channel_id,
+                    active_in_rate,
+                    active_out_rate,
                     session_total_in,
                     session_total_out,
                     total_paid_millisats,
                     remaining_milli_sats,
                     paused,
                 } => {
+                    let pricing = SessionPricing::new(
+                        version,
+                        active_in_rate,
+                        active_out_rate,
+                    );
                     info!(
-                        "session status: paused={} balance={} paid={} in={} out={}",
+                        "session status: paused={} balance={} paid={} in={} out={} linked={:?}",
                         paused,
                         remaining_milli_sats,
                         total_paid_millisats,
                         session_total_in,
-                        session_total_out
+                        session_total_out,
+                        linked_channel_id,
                     );
+                    *pricing_handle.write().await = Some(pricing);
+
+                    // Update session Spilman info handle if we have enough info.
+                    // For now we just pick the first advertisement to store.
+                    if let Some(adv) = advertisements.first() {
+                        *spilman_info_handle.write().await = Some(SessionSpilmanInfo {
+                            receiver_pubkey,
+                            mint_url: adv.mint_url.clone(),
+                            unit: adv.unit.clone(),
+                            keyset_id: adv.keyset_ids.first().cloned().unwrap_or_default(),
+                            keyset_info_json: String::new(), // not yet fetched
+                        });
+                    }
 
                     if paused && remaining_milli_sats <= 0 {
                         // Always use FakePayment for now.
@@ -124,6 +125,15 @@ async fn run_control_task(
                             let _ = tx.send(());
                         }
                     }
+                }
+                ServerMessage::ChannelEvicted { channel_id } => {
+                    warn!("channel {channel_id} evicted from this session");
+                }
+                ServerMessage::ChannelLinkAccepted { channel_id, capacity } => {
+                    info!("channel {channel_id} linked successfully (capacity={capacity})");
+                }
+                ServerMessage::Error { message } => {
+                    warn!("control error: {message}");
                 }
             }
         }
