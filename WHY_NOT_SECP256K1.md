@@ -1,29 +1,10 @@
-# Key Schemes and secp256k1 Research
+# Why Not secp256k1?
 
-## Current Scheme
+This document records why MONAD does **not** currently use secp256k1 for its
+transport-layer identities.
 
-MONAD currently uses a unified Ed25519 server identity.
-
-From one Ed25519 seed/public key, the code derives the materials used by both transport layers:
-
-- Noise authentication and static key material use X25519 derived from the Ed25519 identity
-- QUIC authentication uses an Ed25519 self-signed certificate and pinned SPKI DER bytes derived from the same identity
-
-Today the stack is:
-
-```text
-TCP -> Noise_NK_25519_ChaChaPoly_BLAKE2s -> HTTP/2
-QUIC -> TLS 1.3 (quinn + rustls) with pinned certificate public key
-```
-
-Relevant code:
-
-- `monad-common/src/identity.rs`
-- `monad-common/src/noise.rs`
-- `monad-quic/src/keygen.rs`
-- `monad-quic/src/client.rs`
-- `monad-quic/src/server.rs`
-- `monad-server/src/listener.rs`
+The current identity and key-derivation scheme used by MONAD is documented in
+`ARCHITECTURE.md` under **Unified Identity And Key Derivation**.
 
 ## Why It Looks This Way
 

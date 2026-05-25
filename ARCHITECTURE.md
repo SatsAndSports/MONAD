@@ -462,6 +462,66 @@ MONAD currently provides:
 
 MONAD does not currently provide Tor-style shared relay-to-relay traffic mixing. Each client maintains its own hop chain, so this is closer to a layered multi-hop paid proxy than a full anonymity network.
 
+## Unified Identity And Key Derivation
+
+Each MONAD server publishes one long-term **Ed25519 public key**.
+
+Clients store that one public key per hop:
+
+```text
+addr:port,<ed25519_pubkey>
+quic:addr:port,<ed25519_pubkey>
+```
+
+From that single published key, the client derives everything it needs for both
+transport layers:
+
+- **QUIC pinning**: the Ed25519 public key is wrapped in a standard SPKI DER
+  structure and compared against the server's presented certificate public key
+- **Noise authentication**: the Ed25519 public key is decompressed as an
+  Edwards25519 point and converted to the corresponding X25519/Montgomery
+  public key
+
+On the server side, one 32-byte Ed25519 seed is configured at startup. From
+that seed, MONAD derives:
+
+- **Ed25519 private/public keypair** for QUIC/TLS certificate identity
+- **X25519 private key** for Noise NK handshakes, computed as
+  `SHA-512(seed)[0..32]`
+
+This means MONAD uses one **identity root** for both QUIC and Noise, but not
+the same raw private or public key bytes in both places.
+
+### Public-Key Representation
+
+The published Ed25519 public key is a 32-byte compressed Edwards25519 point:
+
+- the Edwards **y** coordinate
+- plus one sign bit for **x**
+
+The derived Noise public key is a 32-byte X25519/Montgomery **u** coordinate.
+
+So:
+
+- the client stores one public key per hop
+- QUIC and Noise use different derived representations of that hop identity
+- the exact bytes used by QUIC and Noise are different
+
+### Direction Of Conversion
+
+The conversion that MONAD relies on is:
+
+- **Ed25519 seed -> X25519 private key**: easy and deterministic
+- **Ed25519 public key -> X25519 public key**: easy and deterministic
+
+The reverse public-key mapping is not unique because the Montgomery form drops
+the sign of the Edwards x-coordinate. In practice, MONAD does not need the
+reverse mapping: Ed25519 is the canonical published identity, and the X25519
+form is always derived from it.
+
+For the rationale behind choosing this Ed25519-rooted design instead of a
+secp256k1 transport-layer identity, see `WHY_NOT_SECP256K1.md`.
+
 ## QUIC Transport Between Hops
 
 ### Motivation
