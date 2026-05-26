@@ -1,0 +1,15 @@
+[package]
+name = "monad-quic-npub-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+monad-quic = { path = "../monad-quic" }
+monad-secp256k1-identity = { path = "../monad-secp256k1-identity" }
+quinn = "0.11"
+rcgen = "0.14"
+rand_core = "0.6"
+rustls = "0.23"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time"] }
+tracing = "0.1"

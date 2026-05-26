@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result};
 use quinn::Endpoint;
@@ -8,6 +8,14 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::DigitallySignedStruct;
 use tracing::{error, info};
+
+static CRYPTO_PROVIDER: Once = Once::new();
+
+fn ensure_crypto_provider() {
+    CRYPTO_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
 
 /// Run the QUIC client.
 ///
@@ -119,6 +127,7 @@ async fn run_stream(conn: quinn::Connection, index: usize, bytes_per_stream: usi
 }
 
 pub fn build_client_config(pinned_spki: Vec<u8>) -> Result<quinn::ClientConfig> {
+    ensure_crypto_provider();
     let verifier = PinnedKeyVerifier {
         pinned_spki: pinned_spki.into(),
     };

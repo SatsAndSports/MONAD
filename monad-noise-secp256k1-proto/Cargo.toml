@@ -1,0 +1,16 @@
+[package]
+name = "monad-noise-secp256k1-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1"
+h2 = "0.4"
+http = "1"
+k256 = { version = "0.13", features = ["arithmetic", "ecdh", "schnorr"] }
+monad-secp256k1-identity = { path = "../monad-secp256k1-identity" }
+noise-protocol = "0.2"
+noise-rust-crypto = { version = "0.6", features = ["use-blake2", "use-chacha20poly1305"] }
+rand_core = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time"] }
+tracing = "0.1"

@@ -1,9 +1,17 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result};
 use quinn::Endpoint;
 use tracing::{error, info};
+
+static CRYPTO_PROVIDER: Once = Once::new();
+
+fn ensure_crypto_provider() {
+    CRYPTO_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
 
 /// Run the QUIC echo server.
 ///
@@ -76,6 +84,7 @@ async fn handle_stream(mut send: quinn::SendStream, mut recv: quinn::RecvStream)
 }
 
 pub fn build_server_config(cert_pem: &str, key_pem: &str) -> Result<quinn::ServerConfig> {
+    ensure_crypto_provider();
     // Parse certificate chain
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_pem.as_bytes())
