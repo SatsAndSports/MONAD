@@ -38,6 +38,8 @@ const ED25519_BASEPOINT_ORDER_LE: [u8; 32] = [
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlindedHopError {
+    #[error("invalid blinded path: {0}")]
+    InvalidPath(&'static str),
     #[error("invalid ed25519 public key")]
     InvalidEd25519Pubkey,
     #[error("failed to generate randomness")]
@@ -108,6 +110,40 @@ pub struct BlindedHopMessage {
     pub ciphertext: Vec<u8>,
 }
 
+/// The minimal client-facing data needed to reach one blinded hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindedHopDescriptor {
+    pub tweaked_ed25519_pubkey: Ed25519Pubkey,
+    pub message: BlindedHopMessage,
+}
+
+/// A cleartext hop whose real address and published identity are known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleartextHop {
+    pub addr: String,
+    pub pubkey: Ed25519Pubkey,
+}
+
+/// One hop in a mixed path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathNode {
+    Cleartext(CleartextHop),
+    Blinded(BlindedHopDescriptor),
+}
+
+/// A client-facing path whose first hop is cleartext and later hops may be blinded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Path {
+    pub hops: Vec<PathNode>,
+}
+
+/// Service-side real hop input used to build a client-facing path.
+#[derive(Clone, Copy)]
+pub struct PathHop<'a> {
+    pub addr: &'a str,
+    pub identity: &'a ServerIdentity,
+}
+
 /// The client-facing tweaked identity for a blinded hop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TweakedHopPublic {
@@ -147,6 +183,20 @@ pub fn tweak_ed25519_pubkey(
     let tweak_point = EdwardsPoint::mul_base(&tweak.as_scalar());
     let tweaked = point + tweak_point;
     Ok(Ed25519Pubkey::from_bytes(tweaked.compress().to_bytes()))
+}
+
+/// Reverse an additive tweak on an Ed25519 public key in Edwards form.
+pub fn untweak_ed25519_pubkey(
+    tweaked_pubkey: &Ed25519Pubkey,
+    tweak: &HopTweak,
+) -> Result<Ed25519Pubkey, BlindedHopError> {
+    let compressed = CompressedEdwardsY(*tweaked_pubkey.as_bytes());
+    let point = compressed
+        .decompress()
+        .ok_or(BlindedHopError::InvalidEd25519Pubkey)?;
+    let tweak_point = EdwardsPoint::mul_base(&tweak.as_scalar());
+    let original = point - tweak_point;
+    Ok(Ed25519Pubkey::from_bytes(original.compress().to_bytes()))
 }
 
 /// Derive the tweaked X25519 public key from a tweaked Ed25519 public key.
@@ -271,6 +321,54 @@ pub fn derive_compatible_tweaked_hop(
     derive_compatible_tweaked_hop_with_tweak_source(identity, HopTweak::generate)
 }
 
+/// Build the minimal client-facing descriptor for one blinded hop.
+pub fn build_blinded_hop_descriptor(
+    intro_pubkey: &Ed25519Pubkey,
+    next_hop_addr: &str,
+    hidden_hop_identity: &ServerIdentity,
+) -> Result<BlindedHopDescriptor, BlindedHopError> {
+    let compatible = derive_compatible_tweaked_hop(hidden_hop_identity)?;
+    let message = encrypt_blinded_hop_for_intro(
+        intro_pubkey,
+        &BlindedHopPlaintext {
+            next_hop_addr: next_hop_addr.to_owned(),
+            next_hop_tweak: compatible.tweak,
+        },
+    )?;
+
+    Ok(BlindedHopDescriptor {
+        tweaked_ed25519_pubkey: compatible.tweaked_ed25519_pubkey,
+        message,
+    })
+}
+
+/// Build a mixed client-facing path from a real hop sequence.
+pub fn build_path(hops: &[PathHop<'_>]) -> Result<Path, BlindedHopError> {
+    if hops.is_empty() {
+        return Err(BlindedHopError::InvalidPath(
+            "path requires at least one real hop",
+        ));
+    }
+
+    let mut path = Vec::with_capacity(hops.len());
+    path.push(PathNode::Cleartext(CleartextHop {
+        addr: hops[0].addr.to_owned(),
+        pubkey: hops[0].identity.ed25519_pubkey().clone(),
+    }));
+
+    for pair in hops.windows(2) {
+        let intro = pair[0];
+        let hidden = pair[1];
+        path.push(PathNode::Blinded(build_blinded_hop_descriptor(
+            intro.identity.ed25519_pubkey(),
+            hidden.addr,
+            hidden.identity,
+        )?));
+    }
+
+    Ok(Path { hops: path })
+}
+
 /// Encrypt a blinded-hop plaintext for a relay using the relay's real public key.
 pub fn encrypt_blinded_hop_for_intro(
     recipient_pubkey: &Ed25519Pubkey,
@@ -347,6 +445,8 @@ mod tests {
     const COMPATIBILITY_SAMPLES: usize = 64;
     const COMPATIBLE_HELPER_SAMPLES: usize = 256;
     const ZERO_MOD_EIGHT_SAMPLES: usize = 1024;
+    const COMPATIBILITY_RATE_SAMPLES: usize = 4096;
+    const COMPATIBILITY_RATE_STRESS_SAMPLES: usize = 65_536;
 
     fn sample_seed(i: u32) -> [u8; 32] {
         let mut hasher = Sha512::new();
@@ -412,6 +512,46 @@ mod tests {
 
         assert!(is_clamped_x25519_private_bytes(&candidate), "sample {i}");
         Some((candidate, tweaked))
+    }
+
+    fn assert_descriptor_matches_hidden_hop(
+        descriptor: &BlindedHopDescriptor,
+        intro_identity: &ServerIdentity,
+        hidden_identity: &ServerIdentity,
+        expected_next_hop_addr: &str,
+    ) {
+        let plaintext = decrypt_blinded_hop_for_intro(intro_identity, &descriptor.message).unwrap();
+        assert_eq!(plaintext.next_hop_addr, expected_next_hop_addr);
+
+        let tweaked =
+            derive_tweaked_hop_public(hidden_identity.ed25519_pubkey(), &plaintext.next_hop_tweak)
+                .unwrap();
+        assert_eq!(
+            descriptor.tweaked_ed25519_pubkey,
+            tweaked.tweaked_ed25519_pubkey
+        );
+        let recovered = untweak_ed25519_pubkey(
+            &descriptor.tweaked_ed25519_pubkey,
+            &plaintext.next_hop_tweak,
+        )
+        .unwrap();
+        assert_eq!(recovered, *hidden_identity.ed25519_pubkey());
+        assert_eq!(
+            recovered.to_spki_der(),
+            hidden_identity.ed25519_pubkey().to_spki_der()
+        );
+
+        let tweaked_scalar =
+            tweak_ed25519_secret_scalar(hidden_identity.seed(), &plaintext.next_hop_tweak);
+        let (candidate, _k) =
+            find_clamped_x25519_representative_for_tweaked_scalar(tweaked_scalar).unwrap();
+        let candidate_public = candidate_public_from_private_bytes(candidate);
+
+        assert_eq!(candidate_public, tweaked.tweaked_x25519_pubkey);
+        assert!(noise_handshake_succeeds(
+            candidate,
+            tweaked.tweaked_x25519_pubkey
+        ));
     }
 
     fn noise_handshake_succeeds(responder_private: [u8; 32], remote_public: [u8; 32]) -> bool {
@@ -501,6 +641,140 @@ mod tests {
     }
 
     #[test]
+    fn test_build_blinded_hop_descriptor_roundtrip_and_compatibility() {
+        let intro_identity = ServerIdentity::generate().unwrap();
+        let hidden_identity = ServerIdentity::generate().unwrap();
+        let descriptor = build_blinded_hop_descriptor(
+            intro_identity.ed25519_pubkey(),
+            "127.0.0.1:9002",
+            &hidden_identity,
+        )
+        .unwrap();
+
+        assert_descriptor_matches_hidden_hop(
+            &descriptor,
+            &intro_identity,
+            &hidden_identity,
+            "127.0.0.1:9002",
+        );
+    }
+
+    #[test]
+    fn test_build_path_builds_cleartext_then_blinded_hops() {
+        let hop_a = ServerIdentity::generate().unwrap();
+        let hop_b = ServerIdentity::generate().unwrap();
+        let hop_c = ServerIdentity::generate().unwrap();
+        let path = build_path(&[
+            PathHop {
+                addr: "127.0.0.1:9101",
+                identity: &hop_a,
+            },
+            PathHop {
+                addr: "127.0.0.1:9102",
+                identity: &hop_b,
+            },
+            PathHop {
+                addr: "127.0.0.1:9103",
+                identity: &hop_c,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(path.hops.len(), 3);
+        assert!(matches!(
+            &path.hops[0],
+            PathNode::Cleartext(CleartextHop { addr, pubkey })
+                if addr == "127.0.0.1:9101" && *pubkey == *hop_a.ed25519_pubkey()
+        ));
+
+        let PathNode::Blinded(descriptor_b) = &path.hops[1] else {
+            panic!("expected blinded hop at index 1");
+        };
+        let PathNode::Blinded(descriptor_c) = &path.hops[2] else {
+            panic!("expected blinded hop at index 2");
+        };
+
+        assert_descriptor_matches_hidden_hop(descriptor_b, &hop_a, &hop_b, "127.0.0.1:9102");
+        assert_descriptor_matches_hidden_hop(descriptor_c, &hop_b, &hop_c, "127.0.0.1:9103");
+    }
+
+    #[test]
+    fn test_build_path_with_one_real_hop_is_cleartext_only() {
+        let hop = ServerIdentity::generate().unwrap();
+        let path = build_path(&[PathHop {
+            addr: "127.0.0.1:9201",
+            identity: &hop,
+        }])
+        .unwrap();
+
+        assert_eq!(path.hops.len(), 1);
+        assert!(matches!(
+            &path.hops[0],
+            PathNode::Cleartext(CleartextHop { addr, pubkey })
+                if addr == "127.0.0.1:9201" && *pubkey == *hop.ed25519_pubkey()
+        ));
+    }
+
+    #[test]
+    fn test_build_path_rejects_empty_input() {
+        let result = build_path(&[]);
+
+        assert!(matches!(
+            result,
+            Err(BlindedHopError::InvalidPath(
+                "path requires at least one real hop"
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_build_path_multiple_blinded_hops_predecessors_recover_real_addr_and_pubkey() {
+        let hop_a = ServerIdentity::generate().unwrap();
+        let hop_b = ServerIdentity::generate().unwrap();
+        let hop_c = ServerIdentity::generate().unwrap();
+        let hop_d = ServerIdentity::generate().unwrap();
+        let path = build_path(&[
+            PathHop {
+                addr: "127.0.0.1:9301",
+                identity: &hop_a,
+            },
+            PathHop {
+                addr: "127.0.0.1:9302",
+                identity: &hop_b,
+            },
+            PathHop {
+                addr: "127.0.0.1:9303",
+                identity: &hop_c,
+            },
+            PathHop {
+                addr: "127.0.0.1:9304",
+                identity: &hop_d,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(path.hops.len(), 4);
+        assert!(matches!(&path.hops[0], PathNode::Cleartext(_)));
+        assert!(matches!(&path.hops[1], PathNode::Blinded(_)));
+        assert!(matches!(&path.hops[2], PathNode::Blinded(_)));
+        assert!(matches!(&path.hops[3], PathNode::Blinded(_)));
+
+        let PathNode::Blinded(descriptor_b) = &path.hops[1] else {
+            panic!("expected blinded hop for B");
+        };
+        let PathNode::Blinded(descriptor_c) = &path.hops[2] else {
+            panic!("expected blinded hop for C");
+        };
+        let PathNode::Blinded(descriptor_d) = &path.hops[3] else {
+            panic!("expected blinded hop for D");
+        };
+
+        assert_descriptor_matches_hidden_hop(descriptor_b, &hop_a, &hop_b, "127.0.0.1:9302");
+        assert_descriptor_matches_hidden_hop(descriptor_c, &hop_b, &hop_c, "127.0.0.1:9303");
+        assert_descriptor_matches_hidden_hop(descriptor_d, &hop_c, &hop_d, "127.0.0.1:9304");
+    }
+
+    #[test]
     fn test_tweaked_ed25519_pubkey_differs_from_original() {
         let identity = ServerIdentity::generate().unwrap();
         let tweak = HopTweak::generate().unwrap();
@@ -517,6 +791,41 @@ mod tests {
         let tweaked = tweak_ed25519_pubkey(identity.ed25519_pubkey(), &tweak).unwrap();
         let x25519 = tweaked_x25519_pubkey_from_ed25519(&tweaked).unwrap();
         assert_ne!(x25519, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_untweak_ed25519_pubkey_roundtrip_over_many_samples() {
+        for i in 0..COMPATIBILITY_SAMPLES as u32 {
+            let seed = sample_seed(i);
+            let identity = ServerIdentity::from_seed(seed).unwrap();
+            let tweak = sample_tweak(i);
+            let tweaked = tweak_ed25519_pubkey(identity.ed25519_pubkey(), &tweak).unwrap();
+            let recovered = untweak_ed25519_pubkey(&tweaked, &tweak).unwrap();
+
+            assert_eq!(recovered, *identity.ed25519_pubkey(), "sample {i}");
+        }
+    }
+
+    #[test]
+    fn test_untweak_recovered_pubkey_matches_original_x25519_and_spki_over_many_samples() {
+        for i in 0..COMPATIBILITY_SAMPLES as u32 {
+            let seed = sample_seed(i);
+            let identity = ServerIdentity::from_seed(seed).unwrap();
+            let tweak = sample_tweak(i);
+            let tweaked = tweak_ed25519_pubkey(identity.ed25519_pubkey(), &tweak).unwrap();
+            let recovered = untweak_ed25519_pubkey(&tweaked, &tweak).unwrap();
+
+            assert_eq!(
+                recovered.to_x25519().unwrap(),
+                identity.ed25519_pubkey().to_x25519().unwrap(),
+                "sample {i}"
+            );
+            assert_eq!(
+                recovered.to_spki_der(),
+                identity.ed25519_pubkey().to_spki_der(),
+                "sample {i}"
+            );
+        }
     }
 
     #[test]
@@ -601,6 +910,36 @@ mod tests {
         assert!(missing > 0, "expected at least one incompatible sample");
         assert!(sign_zero_found > 0 && sign_one_found > 0);
         assert!(max_k < 16);
+    }
+
+    #[test]
+    fn test_random_tweak_compatibility_rate_stays_near_half_over_large_sample() {
+        let mut found = 0usize;
+        let mut missing = 0usize;
+
+        for i in 0..COMPATIBILITY_RATE_SAMPLES as u32 {
+            let seed = sample_seed(i);
+            let tweak = sample_tweak(i.wrapping_mul(17).wrapping_add(5));
+            let tweaked_scalar = tweak_ed25519_secret_scalar(&seed, &tweak);
+
+            if find_clamped_x25519_representative_for_tweaked_scalar(tweaked_scalar).is_some() {
+                found += 1;
+            } else {
+                missing += 1;
+            }
+        }
+
+        let rate = found as f64 / COMPATIBILITY_RATE_SAMPLES as f64;
+        eprintln!(
+            "compatibility rate summary: samples={} found={} missing={} rate={rate:.6}",
+            COMPATIBILITY_RATE_SAMPLES, found, missing,
+        );
+
+        assert!(found > 0 && missing > 0);
+        assert!(
+            (0.40..=0.60).contains(&rate),
+            "compatibility rate unexpectedly far from half: {rate:.6}"
+        );
     }
 
     #[test]
@@ -833,6 +1172,37 @@ mod tests {
         assert!(
             saw_retry,
             "expected at least one 0 mod 8 sequence to need a retry"
+        );
+    }
+
+    #[test]
+    #[ignore = "stress coverage for compatibility rate stability"]
+    fn test_random_tweak_compatibility_rate_stress() {
+        let mut found = 0usize;
+        let mut missing = 0usize;
+
+        for i in 0..COMPATIBILITY_RATE_STRESS_SAMPLES as u32 {
+            let seed = sample_seed(i);
+            let tweak = sample_tweak(i.wrapping_mul(29).wrapping_add(11));
+            let tweaked_scalar = tweak_ed25519_secret_scalar(&seed, &tweak);
+
+            if find_clamped_x25519_representative_for_tweaked_scalar(tweaked_scalar).is_some() {
+                found += 1;
+            } else {
+                missing += 1;
+            }
+        }
+
+        let rate = found as f64 / COMPATIBILITY_RATE_STRESS_SAMPLES as f64;
+        eprintln!(
+            "compatibility rate stress summary: samples={} found={} missing={} rate={rate:.6}",
+            COMPATIBILITY_RATE_STRESS_SAMPLES, found, missing,
+        );
+
+        assert!(found > 0 && missing > 0);
+        assert!(
+            (0.45..=0.55).contains(&rate),
+            "stress compatibility rate unexpectedly far from half: {rate:.6}"
         );
     }
 
