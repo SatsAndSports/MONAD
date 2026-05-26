@@ -11,8 +11,8 @@ use tracing::{info, warn};
 const CLIENT_VERSION: u8 = 0;
 
 fn encode_client_message(message: &ClientMessage) -> io::Result<Bytes> {
-    let bytes = serde_json::to_vec(message)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
+    let bytes =
+        serde_json::to_vec(message).map_err(|e| io::Error::other(format!("json error: {e}")))?;
     let mut frame = Vec::with_capacity(bytes.len() + 1);
     frame.extend_from_slice(&bytes);
     frame.push(b'\n');
@@ -28,18 +28,20 @@ async fn send_control_message(
     wait_for_send_capacity(h2_send).await?;
     h2_send
         .send_data(frame, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}")))
+        .map_err(|e| io::Error::other(format!("h2 send error: {e}")))
+}
+
+struct ControlTaskConfig {
+    fake_payment_millisats: u64,
+    pricing_handle: Arc<RwLock<Option<SessionPricing>>>,
+    spilman_info_handle: Arc<RwLock<Option<SessionSpilmanInfo>>>,
 }
 
 async fn run_control_task(
     mut h2_send: h2::SendStream<Bytes>,
     mut h2_recv: h2::RecvStream,
-    fake_payment_millisats: u64,
-    _session_id: [u8; 32],
-    _hop_label: String,
     ready_tx: oneshot::Sender<()>,
-    pricing_handle: Arc<RwLock<Option<SessionPricing>>>,
-    spilman_info_handle: Arc<RwLock<Option<SessionSpilmanInfo>>>,
+    config: ControlTaskConfig,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     let mut ready_tx = Some(ready_tx);
@@ -54,8 +56,7 @@ async fn run_control_task(
     .await?;
 
     while let Some(chunk) = h2_recv.data().await {
-        let data = chunk
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 recv error: {e}")))?;
+        let data = chunk.map_err(|e| io::Error::other(format!("h2 recv error: {e}")))?;
         let len = data.len();
         let _ = h2_recv.flow_control().release_capacity(len);
         buf.extend_from_slice(&data);
@@ -68,7 +69,7 @@ async fn run_control_task(
             }
 
             let message: ServerMessage = serde_json::from_slice(line)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
+                .map_err(|e| io::Error::other(format!("json error: {e}")))?;
             match message {
                 ServerMessage::SessionStatus {
                     version,
@@ -93,12 +94,12 @@ async fn run_control_task(
                         session_total_out,
                         linked_channel_id,
                     );
-                    *pricing_handle.write().await = Some(pricing);
+                    *config.pricing_handle.write().await = Some(pricing);
 
                     // Update session Spilman info handle if we have enough info.
                     // For now we just pick the first advertisement to store.
                     if let Some(adv) = advertisements.first() {
-                        *spilman_info_handle.write().await = Some(SessionSpilmanInfo {
+                        *config.spilman_info_handle.write().await = Some(SessionSpilmanInfo {
                             receiver_pubkey,
                             mint_url: adv.mint_url.clone(),
                             unit: adv.unit.clone(),
@@ -111,12 +112,12 @@ async fn run_control_task(
                         // Always use FakePayment for now.
                         info!(
                             "session paused; sending fake payment of {} millisats",
-                            fake_payment_millisats
+                            config.fake_payment_millisats
                         );
                         send_control_message(
                             &mut h2_send,
                             &ClientMessage::FakePayment {
-                                milli_sats: fake_payment_millisats,
+                                milli_sats: config.fake_payment_millisats,
                             },
                         )
                         .await?;
@@ -153,24 +154,16 @@ pub async fn start_control_task(
 ) -> io::Result<(JoinHandle<()>, oneshot::Receiver<()>)> {
     let (control_send, control_recv) = conn.open_control().await?;
     let (ready_tx, ready_rx) = oneshot::channel();
-    let session_id = *conn.session_id();
-    let hop_label = hop_label.to_string();
-    let pricing_handle = conn.session_pricing_handle();
-    let spilman_info_handle = conn.session_spilman_info_handle();
+    let _session_id = *conn.session_id();
+    let _hop_label = hop_label.to_string();
+    let config = ControlTaskConfig {
+        fake_payment_millisats,
+        pricing_handle: conn.session_pricing_handle(),
+        spilman_info_handle: conn.session_spilman_info_handle(),
+    };
 
     let handle = tokio::spawn(async move {
-        if let Err(e) = run_control_task(
-            control_send,
-            control_recv,
-            fake_payment_millisats,
-            session_id,
-            hop_label,
-            ready_tx,
-            pricing_handle,
-            spilman_info_handle,
-        )
-        .await
-        {
+        if let Err(e) = run_control_task(control_send, control_recv, ready_tx, config).await {
             warn!("control task ended with error: {e}");
         }
     });

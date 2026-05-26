@@ -22,26 +22,16 @@ async fn start_echo_server() -> Result<(Endpoint, SocketAddr, String)> {
                     Ok(c) => c,
                     Err(_) => return,
                 };
-                loop {
-                    match conn.accept_bi().await {
-                        Ok((mut send, mut recv)) => {
-                            tokio::spawn(async move {
-                                let mut buf = vec![0u8; 64 * 1024];
-                                loop {
-                                    match recv.read(&mut buf).await {
-                                        Ok(Some(n)) => {
-                                            if send.write_all(&buf[..n]).await.is_err() {
-                                                return;
-                                            }
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                                let _ = send.finish();
-                            });
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        while let Ok(Some(n)) = recv.read(&mut buf).await {
+                            if send.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
                         }
-                        Err(_) => break,
-                    }
+                        let _ = send.finish();
+                    });
                 }
             });
         }
@@ -157,7 +147,6 @@ async fn test_multiple_connections() {
     // Open 3 separate connections, each with 10 streams
     let mut handles = Vec::new();
     for _ in 0..3 {
-        let addr = addr;
         let pin = pin.clone();
         handles.push(tokio::spawn(async move {
             run_echo_client(addr, &pin, 10, 8192).await

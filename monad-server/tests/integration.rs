@@ -1355,7 +1355,6 @@ async fn test_concurrent_quic_pool_access() {
     // Spawn 5 clients concurrently, all routing through S → QUIC → T → uppercase
     let mut handles = Vec::new();
     for i in 0..5 {
-        let s_addr = s_addr;
         let s_pubkey = s_pubkey.clone();
         let t_pubkey = t_pubkey.clone();
 

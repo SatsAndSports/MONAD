@@ -183,7 +183,7 @@ pub fn generate_identity() -> io::Result<([u8; 32], Ed25519Pubkey)> {
     let rng = ring::rand::SystemRandom::new();
     let mut seed = [0u8; 32];
     ring::rand::SecureRandom::fill(&rng, &mut seed)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to generate random seed"))?;
+        .map_err(|_| io::Error::other("failed to generate random seed"))?;
 
     let pubkey = Ed25519Pubkey(ed25519_seed_to_pubkey(&seed)?);
     Ok((seed, pubkey))

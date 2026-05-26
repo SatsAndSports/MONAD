@@ -59,9 +59,8 @@ impl QuicPool {
 
     /// Create a new empty QUIC connection pool.
     pub fn new() -> io::Result<Self> {
-        let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("QUIC endpoint error: {e}"))
-        })?;
+        let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+            .map_err(|e| io::Error::other(format!("QUIC endpoint error: {e}")))?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
@@ -240,39 +239,20 @@ impl QuicPool {
         // Resolve the target address
         let socket_addr: SocketAddr = tokio::net::lookup_host(target_addr)
             .await
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to resolve {target_addr}: {e}"),
-                )
-            })?
+            .map_err(|e| io::Error::other(format!("failed to resolve {target_addr}: {e}")))?
             .next()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("no addresses found for {target_addr}"),
-                )
-            })?;
+            .ok_or_else(|| io::Error::other(format!("no addresses found for {target_addr}")))?;
 
         // Build client config with pinned key verification
-        let client_config = monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to build QUIC client config: {e}"),
-            )
-        })?;
+        let client_config = monad_quic::client::build_client_config(pinned_spki)
+            .map_err(|e| io::Error::other(format!("failed to build QUIC client config: {e}")))?;
 
         info!("establishing new QUIC connection to {target_addr} ({socket_addr})");
 
         let conn = self
             .endpoint
             .connect_with(client_config, socket_addr, "monad-relay")
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("QUIC connect error to {target_addr}: {e}"),
-                )
-            })?
+            .map_err(|e| io::Error::other(format!("QUIC connect error to {target_addr}: {e}")))?
             .await
             .map_err(|e| {
                 io::Error::new(

@@ -218,9 +218,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
     ) -> io::Result<Self> {
         let session_id = *noise_stream.session_id();
 
-        let h2_conn = server::handshake(noise_stream).await.map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("h2 handshake error: {e}"))
-        })?;
+        let h2_conn = server::handshake(noise_stream)
+            .await
+            .map_err(|e| io::Error::other(format!("h2 handshake error: {e}")))?;
 
         info!(
             session_id = hex::encode(session_id),
@@ -460,8 +460,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
 }
 
 fn encode_server_message(message: &ServerMessage) -> io::Result<Bytes> {
-    let bytes = serde_json::to_vec(message)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
+    let bytes =
+        serde_json::to_vec(message).map_err(|e| io::Error::other(format!("json error: {e}")))?;
     let mut frame = Vec::with_capacity(bytes.len() + 1);
     frame.extend_from_slice(&bytes);
     frame.push(b'\n');
@@ -477,7 +477,7 @@ async fn send_control_message(
     wait_for_send_capacity(h2_send).await?;
     h2_send
         .send_data(frame, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}")))
+        .map_err(|e| io::Error::other(format!("h2 send error: {e}")))
 }
 
 /// Read one newline-delimited JSON message from the H2 recv stream.
@@ -505,10 +505,7 @@ async fn read_one_control_message(
                 buf.extend_from_slice(&data);
             }
             Some(Err(e)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("h2 recv error: {e}"),
-                ));
+                return Err(io::Error::other(format!("h2 recv error: {e}")));
             }
             None => return Ok(None),
         }
@@ -548,16 +545,15 @@ async fn handle_control_stream(
         }
     };
 
-    let negotiated_version = client_version.min(SERVER_MAX_VERSION);
-    if negotiated_version < SERVER_MIN_VERSION {
+    if !(SERVER_MIN_VERSION..=SERVER_MAX_VERSION).contains(&client_version) {
         warn!(
-            "control: client version {} below server minimum {}",
-            client_version, SERVER_MIN_VERSION
+            "control: unsupported client version {} (supported range {}..={})",
+            client_version, SERVER_MIN_VERSION, SERVER_MAX_VERSION
         );
         let err_msg = ServerMessage::Error {
             message: format!(
-                "unsupported version: client offered {}, server requires at least {}",
-                client_version, SERVER_MIN_VERSION
+                "unsupported version: client offered {}, supported range is {}..={}",
+                client_version, SERVER_MIN_VERSION, SERVER_MAX_VERSION
             ),
         };
         send_control_message(&mut h2_send, &err_msg).await?;
@@ -565,6 +561,8 @@ async fn handle_control_stream(
         let _ = h2_send.send_data(Bytes::new(), true);
         return Ok(());
     }
+
+    let negotiated_version = client_version;
 
     // Set initial version in session state, then build and send the initial
     // SessionStatus. This is race-free: the session starts paused and no

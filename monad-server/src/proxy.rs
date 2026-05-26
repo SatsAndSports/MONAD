@@ -60,10 +60,7 @@ where
                     }
                 }
                 Some(Err(e)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("h2 recv error: {e}"),
-                    ));
+                    return Err(io::Error::other(format!("h2 recv error: {e}")));
                 }
                 None => {
                     debug!("h2 recv stream ended");
@@ -92,9 +89,9 @@ where
 
                     h2_send.reserve_capacity(data.len());
                     wait_for_send_capacity(&mut h2_send).await?;
-                    h2_send.send_data(data, false).map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}"))
-                    })?;
+                    h2_send
+                        .send_data(data, false)
+                        .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
                     tunnel_inbound = tunnel_inbound.saturating_add(n as u64);
 
                     let paused = state.note_inbound_bytes(n).await;

@@ -521,11 +521,8 @@ mod tests {
 
         let tweaked = derive_tweaked_hop_public(identity.ed25519_pubkey(), &tweak).unwrap();
         let tweaked_scalar = tweak_ed25519_secret_scalar(&seed, &tweak);
-        let Some((candidate, _k)) =
-            find_clamped_x25519_representative_for_tweaked_scalar(tweaked_scalar)
-        else {
-            return None;
-        };
+        let (candidate, _k) =
+            find_clamped_x25519_representative_for_tweaked_scalar(tweaked_scalar)?;
 
         assert!(is_clamped_x25519_private_bytes(&candidate), "sample {i}");
         Some((candidate, tweaked))

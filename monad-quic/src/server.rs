@@ -65,14 +65,9 @@ async fn handle_stream(mut send: quinn::SendStream, mut recv: quinn::RecvStream)
     // Read all data and echo it back
     let mut total = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        match recv.read(&mut buf).await? {
-            Some(n) => {
-                send.write_all(&buf[..n]).await?;
-                total += n as u64;
-            }
-            None => break, // stream finished by peer
-        }
+    while let Some(n) = recv.read(&mut buf).await? {
+        send.write_all(&buf[..n]).await?;
+        total += n as u64;
     }
 
     send.finish()?;

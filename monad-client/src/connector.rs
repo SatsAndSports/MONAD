@@ -77,31 +77,22 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
 
         let pinned_spki = first.pubkey.to_spki_der();
 
-        let client_config = monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to build QUIC client config: {e}"),
-            )
-        })?;
+        let client_config = monad_quic::client::build_client_config(pinned_spki)
+            .map_err(|e| io::Error::other(format!("failed to build QUIC client config: {e}")))?;
 
         // Resolve the target address
         let socket_addr = tokio::net::lookup_host(&first.addr)
             .await?
             .next()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("no addresses found for {}", first.addr),
-                )
-            })?;
+            .ok_or_else(|| io::Error::other(format!("no addresses found for {}", first.addr)))?;
 
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("QUIC endpoint: {e}")))?;
+            .map_err(|e| io::Error::other(format!("QUIC endpoint: {e}")))?;
         endpoint.set_default_client_config(client_config);
 
         let conn = endpoint
             .connect(socket_addr, "monad-relay")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("QUIC connect: {e}")))?
+            .map_err(|e| io::Error::other(format!("QUIC connect: {e}")))?
             .await
             .map_err(|e| {
                 io::Error::new(

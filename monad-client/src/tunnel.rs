@@ -36,12 +36,12 @@ pub async fn open_tunnel(
     // Send the CONNECT request
     let (response_future, h2_send) = h2_client
         .send_request(request, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}")))?;
+        .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
 
     // Wait for the server's response
     let response = response_future
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 response error: {e}")))?;
+        .map_err(|e| io::Error::other(format!("h2 response error: {e}")))?;
 
     if !response.status().is_success() {
         return Err(io::Error::new(

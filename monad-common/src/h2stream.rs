@@ -35,10 +35,7 @@ pub struct H2ConnectStream {
 pub async fn wait_for_send_capacity(send: &mut SendStream<Bytes>) -> io::Result<usize> {
     match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
         Some(Ok(capacity)) => Ok(capacity),
-        Some(Err(e)) => Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("h2 capacity error: {e}"),
-        )),
+        Some(Err(e)) => Err(io::Error::other(format!("h2 capacity error: {e}"))),
         None => Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "h2 send stream closed",
@@ -101,10 +98,9 @@ impl AsyncRead for H2ConnectStream {
                 }
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("h2 recv error: {e}"),
-            ))),
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Err(io::Error::other(format!("h2 recv error: {e}"))))
+            }
             Poll::Ready(None) => {
                 // End of stream
                 me.recv_done = true;
@@ -136,15 +132,14 @@ impl AsyncWrite for H2ConnectStream {
                 // Send up to `capacity` bytes
                 let to_send = std::cmp::min(buf.len(), capacity);
                 let data = Bytes::copy_from_slice(&buf[..to_send]);
-                me.send.send_data(data, false).map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}"))
-                })?;
+                me.send
+                    .send_data(data, false)
+                    .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
                 Poll::Ready(Ok(to_send))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("h2 capacity error: {e}"),
-            ))),
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Err(io::Error::other(format!("h2 capacity error: {e}"))))
+            }
             Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "h2 send stream closed",

@@ -143,7 +143,7 @@ async fn read_noise_msg<T: AsyncRead + Unpin>(stream: &mut T) -> io::Result<Vec<
 }
 
 fn noise_err(e: snow::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("noise error: {e}"))
+    io::Error::other(format!("noise error: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +289,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for NoiseStream<T> {
                     }
                 }
                 Some(expected) => {
-                    let expected = expected;
                     if me.read_ciphertext.len() >= expected {
                         // We have the full encrypted message — decrypt it
                         let encrypted = &me.read_ciphertext[..expected];
