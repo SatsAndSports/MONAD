@@ -27,9 +27,15 @@ type ConnResult = Option<Result<quinn::Connection, String>>;
 enum PoolEntry {
     /// A QUIC handshake is in progress. Waiters clone the receiver and watch
     /// for the result. The sender is held by the task performing the handshake.
-    Pending(watch::Receiver<ConnResult>),
+    Pending {
+        pinned_spki: Vec<u8>,
+        rx: watch::Receiver<ConnResult>,
+    },
     /// An established QUIC connection ready for opening new streams.
-    Ready(quinn::Connection),
+    Ready {
+        pinned_spki: Vec<u8>,
+        conn: quinn::Connection,
+    },
 }
 
 /// A pool of shared QUIC connections keyed by target address string.
@@ -44,6 +50,13 @@ pub struct QuicPool {
 }
 
 impl QuicPool {
+    fn pinned_key_mismatch_error(target_addr: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("cached QUIC connection for {target_addr} uses a different pinned key"),
+        )
+    }
+
     /// Create a new empty QUIC connection pool.
     pub fn new() -> io::Result<Self> {
         let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| {
@@ -73,13 +86,25 @@ impl QuicPool {
                 let mut pool = self.inner.lock().await;
 
                 match pool.get(target_addr) {
-                    Some(PoolEntry::Ready(conn)) => {
+                    Some(PoolEntry::Ready {
+                        pinned_spki: cached_pinned_spki,
+                        conn,
+                    }) => {
+                        if cached_pinned_spki != &pinned_spki {
+                            return Err(Self::pinned_key_mismatch_error(target_addr));
+                        }
                         // Try to open a stream on the cached connection.
                         // Clone the connection handle (cheap Arc clone) so we
                         // can release the lock before the async open_bi call.
                         Action::UseExisting(conn.clone())
                     }
-                    Some(PoolEntry::Pending(rx)) => {
+                    Some(PoolEntry::Pending {
+                        pinned_spki: cached_pinned_spki,
+                        rx,
+                    }) => {
+                        if cached_pinned_spki != &pinned_spki {
+                            return Err(Self::pinned_key_mismatch_error(target_addr));
+                        }
                         // Another task is connecting — wait on its result.
                         Action::Wait(rx.clone())
                     }
@@ -87,7 +112,13 @@ impl QuicPool {
                         // No entry — we are the one to establish the connection.
                         // Insert a Pending entry and release the lock.
                         let (tx, rx) = watch::channel(None);
-                        pool.insert(target_addr.to_string(), PoolEntry::Pending(rx));
+                        pool.insert(
+                            target_addr.to_string(),
+                            PoolEntry::Pending {
+                                pinned_spki: pinned_spki.clone(),
+                                rx,
+                            },
+                        );
                         Action::Connect(tx)
                     }
                 }
@@ -110,7 +141,7 @@ impl QuicPool {
                             let mut pool = self.inner.lock().await;
                             // Only remove if it's still the same Ready entry (not
                             // replaced by a new Pending from another task).
-                            if matches!(pool.get(target_addr), Some(PoolEntry::Ready(_))) {
+                            if matches!(pool.get(target_addr), Some(PoolEntry::Ready { .. })) {
                                 pool.remove(target_addr);
                             }
                             // Loop back to retry — will either find a new Pending
@@ -160,7 +191,10 @@ impl QuicPool {
 
                 Action::Connect(tx) => {
                     // We are responsible for establishing the connection.
-                    match self.establish_connection(target_addr, pinned_spki).await {
+                    match self
+                        .establish_connection(target_addr, pinned_spki.clone())
+                        .await
+                    {
                         Ok(conn) => {
                             // Open the first stream.
                             let stream_result = open_monad_stream(&conn).await;
@@ -170,7 +204,10 @@ impl QuicPool {
                                 let mut pool = self.inner.lock().await;
                                 pool.insert(
                                     target_addr.to_string(),
-                                    PoolEntry::Ready(conn.clone()),
+                                    PoolEntry::Ready {
+                                        pinned_spki: pinned_spki.clone(),
+                                        conn: conn.clone(),
+                                    },
                                 );
                             }
                             let _ = tx.send(Some(Ok(conn)));

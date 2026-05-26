@@ -23,6 +23,7 @@ use monad_common::session::RelayConnection;
 
 use monad_quic::stream::open_monad_stream;
 use monad_server::listener::ServerConfig;
+use monad_server::quic_pool::QuicPool;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -1124,6 +1125,35 @@ async fn test_quic_unknown_stream_kind_rejected() {
     assert!(
         result.unwrap().is_err(),
         "server accepted unknown stream kind unexpectedly"
+    );
+}
+
+#[tokio::test]
+async fn test_quic_pool_rejects_same_address_with_different_pin() {
+    let (server_addr, pubkey) = start_monad_server_with_quic().await;
+    let wrong_pubkey = identity::ServerIdentity::generate()
+        .unwrap()
+        .ed25519_pubkey()
+        .clone();
+    let pool = QuicPool::new().unwrap();
+
+    let stream = pool
+        .open_stream(&server_addr.to_string(), pubkey.to_spki_der())
+        .await
+        .unwrap();
+    drop(stream);
+
+    let err = match pool
+        .open_stream(&server_addr.to_string(), wrong_pubkey.to_spki_der())
+        .await
+    {
+        Ok(_) => panic!("expected pin mismatch to reject pooled QUIC reuse"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        err.to_string().contains("different pinned key"),
+        "unexpected error: {err}"
     );
 }
 
