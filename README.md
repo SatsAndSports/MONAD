@@ -18,14 +18,17 @@ Implemented today:
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, pinned-key auth, echo server/client, and shared config/keygen helpers used by server and client
 - QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, `quic-pin` H2 header for CONNECT forwarding
+- deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
 - session payment system: paused-by-default sessions, Hello/SessionStatus handshake, fake payments, totals-based billing with directional pricing, pause/resume enforcement
 - Spilman advertisement plumbing: server discovers trusted mints/keysets at startup and includes a `KeysetAdvertisement` list plus its receiver pubkey in `SessionStatus`. The `ChannelLink`/`ChannelPayment`/`ChannelEvicted` wire messages exist but are not yet handled — the server only credits sessions via `FakePayment` today.
+- low-level blinded-hop building blocks: blinded blob encryption/decryption, tweak compatibility rejection sampling, reverse-tweak key recovery, and a mixed cleartext/blinded path data model in `monad-common`
 - integration tests for direct, nested, IPv6, hostname-resolution, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
 
 Not implemented yet:
 - real Spilman byte-level payments — implementation of the new delta-based model is in progress
 - server-side Spilman channel state persistence across restarts
 - persistent route configuration file
+- blinded transport integration (`CONNECT /blinded_hop_v1`, tweak-prefixed QUIC forwarded sessions, and end-to-end client/server blinded routing)
 
 ## Workspace
 
@@ -48,6 +51,21 @@ You can also just use `cargo run`, which builds automatically if needed.
 
 ```bash
 cargo test
+```
+
+## Developer Workflow
+
+The repo pins its Rust toolchain and formatting config so local runs and CI stay
+deterministic.
+
+Useful commands:
+
+```bash
+make fmt
+make fmt-check
+make lint
+make test
+make check
 ```
 
 Current coverage includes:

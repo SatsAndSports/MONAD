@@ -444,12 +444,39 @@ lets one relay open the next relay connection without the client knowing the
 next relay's real identity or real address. Once that blinded hop is
 established, the existing nested Noise+H2 model takes over unchanged.
 
+### Current Low-Level State
+
+The low-level crypto and path-shape pieces now exist in `monad-common`, but the
+transport integration described below is still planned.
+
+Implemented today:
+
+- blinded-hop blob encryption/decryption `(E, ciphertext)`
+- tweak compatibility rejection sampling for MONAD's Ed25519/X25519 identity
+  scheme
+- reverse-tweak recovery of the original Ed25519 public key from
+  `(tweaked_pubkey, tweak)`
+- a mixed client-facing `Path` model with:
+  - a required cleartext first hop
+  - later hops that may be cleartext or blinded
+- deterministic low-level tests showing random tweak compatibility is about 50%
+- a 1-byte QUIC stream-kind preamble for MONAD QUIC streams, with `0x00`
+  currently reserved for ordinary nested Noise sessions
+
+Planned next:
+
+- `CONNECT /blinded_hop_v1` transport integration
+- a second QUIC stream kind carrying the tweak preamble for blinded forwarded
+  sessions
+- end-to-end client/server blinded-hop routing on top of the existing nesting
+  machinery
+
 ### Published Path Shape
 
-A service publishes:
+A service publishes a mixed path:
 
-- one public **introduction hop** `(addr:port, ed25519_pubkey)`
-- a sequence of blinded hops
+- one public **cleartext first hop** `(addr:port, ed25519_pubkey)`
+- then a sequence of later hops, each of which may be cleartext or blinded
 
 Each blinded hop is a tuple visible to the client:
 
@@ -466,6 +493,10 @@ where:
 
 The client cannot decrypt `ciphertext`, and it does not know the real long-term
 identity behind `tweaked_pubkey`.
+
+In the current low-level `Path` model, the introduction relay for a blinded hop
+is implicit from position: the immediately preceding real hop decrypts the blob
+for the next blinded hop.
 
 ### What The Encrypted Blob Contains
 
@@ -574,15 +605,26 @@ scalar and the Ed25519-to-X25519 clamping rules, not just the tweak's low bits.
 
 ### Relay-To-Relay QUIC + Noise Preamble
 
-For a blinded hop, the current relay opens a normal QUIC stream to the next
+For a blinded hop, the current relay will open a normal QUIC stream to the next
 relay using the next relay's **real** identity. The QUIC layer is therefore:
 
 - encrypted
 - authenticated against the next relay's real QUIC key
 - unchanged from today's relay-to-relay QUIC pool design
 
-Before the nested Noise handshake bytes begin on that QUIC stream, the current
-relay sends a short preamble telling the next relay which tweak to apply:
+Implemented today, all MONAD QUIC streams begin with a 1-byte stream-kind
+preamble. Only one kind is currently accepted:
+
+```text
+[1 byte stream kind = plain-noise-v1]
+[then normal Noise handshake bytes]
+```
+
+Unknown kinds are rejected immediately at the QUIC stream layer.
+
+Planned next, blinded forwarded sessions will use a second stream kind. Before
+the nested Noise handshake bytes begin on that QUIC stream, the current relay
+will send a short preamble telling the next relay which tweak to apply:
 
 ```text
 [1 byte stream kind = tweaked-noise-v1]
@@ -595,21 +637,24 @@ channel.
 
 ### Blinded CONNECT Dispatch
 
-To trigger this flow, the client uses a special CONNECT target instead of a
-real `host:port` authority:
+Planned transport integration uses a special CONNECT target instead of a real
+`host:port` authority:
 
 ```text
 CONNECT /blinded_hop_v1
 ```
 
-with headers carrying the blinded material:
+The exact on-wire carriage for the blinded material is not finalized yet. The
+current design direction is that the request carries enough data for the relay
+to recover:
 
 ```text
-blinded-ephemeral: <E hex>
-blinded-payload: <ciphertext hex>
+E
+ciphertext
+tweaked_pubkey
 ```
 
-The relay interprets `/blinded_hop_v1` as:
+The relay will interpret `/blinded_hop_v1` as:
 
 - do **not** parse the authority as an address
 - decrypt the blinded payload using the relay's real private key and `E`
