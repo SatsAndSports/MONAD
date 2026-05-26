@@ -2399,6 +2399,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "monad-secp256k1-full-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "h2",
+ "http",
+ "monad-noise-secp256k1-proto",
+ "monad-quic",
+ "monad-quic-npub-proto",
+ "monad-secp256k1-identity",
+ "quinn",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "monad-secp256k1-identity"
 version = "0.1.0"
 dependencies = [
