@@ -553,6 +553,25 @@ way it does today for non-blinded hops.
 The receiving relay applies the tweak on its private side before serving the
 Noise handshake.
 
+In MONAD's current Ed25519-rooted identity scheme, not every tweaked Edwards
+scalar class has a valid clamped X25519 private-byte representative. In
+practice, blinded-hop construction therefore uses **rejection sampling**:
+
+- sample a candidate tweak
+- derive the tweaked public identity seen by the client
+- check whether a matching clamped X25519 responder private representation
+  exists for the receiving relay
+- if not, discard the tweak and try again
+
+This succeeds quickly in practice (about 2 attempts on average in the current
+low-level tests) and gives a fully normal Noise NK handshake once a compatible
+tweak is found.
+
+Constraining tweaks to a particular residue class (e.g. requiring `t ≡ 0 mod 8`
+as an integer) was investigated but does not eliminate the need for rejection
+sampling — compatibility depends on the full interaction between the tweaked
+scalar and the Ed25519-to-X25519 clamping rules, not just the tweak's low bits.
+
 ### Relay-To-Relay QUIC + Noise Preamble
 
 For a blinded hop, the current relay opens a normal QUIC stream to the next
