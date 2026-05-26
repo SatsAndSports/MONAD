@@ -14,13 +14,15 @@
 use bytes::Bytes;
 use h2::client;
 use http::{Method, Request};
-use monad_client::connector::{self, Hop};
+use monad_client::connector::{self, Hop, HopIdentity};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::identity::{self, Ed25519Pubkey};
 use monad_common::noise;
 use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
+use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
 use monad_quic::stream::open_monad_stream;
 use monad_server::listener::ServerConfig;
 use monad_server::quic_pool::QuicPool;
@@ -139,6 +141,7 @@ async fn start_monad_server_with_spilman(
 
     let config = Arc::new(ServerConfig {
         identity,
+        quic_transport_key: None,
         payment_receiver_secret,
         trusted_mint_units,
     });
@@ -164,6 +167,7 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Ed2
 
     let config = Arc::new(ServerConfig {
         identity,
+        quic_transport_key: None,
         payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
     });
@@ -190,7 +194,7 @@ async fn connect_client(
 ) -> RelayConnection {
     connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
-        pubkey: pubkey.clone(),
+        identity: HopIdentity::Ed25519(pubkey.clone()),
         use_quic: false,
     }])
     .await
@@ -856,12 +860,12 @@ async fn test_nested_tunnel() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: t_addr.to_string(),
-            pubkey: t_pubkey,
+            identity: HopIdentity::Ed25519(t_pubkey),
             use_quic: false,
         },
         Hop {
             addr: s_addr.to_string(),
-            pubkey: s_pubkey,
+            identity: HopIdentity::Ed25519(s_pubkey),
             use_quic: false,
         },
     ])
@@ -893,17 +897,17 @@ async fn test_three_hop_tunnel() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: a_addr.to_string(),
-            pubkey: a_pubkey,
+            identity: HopIdentity::Ed25519(a_pubkey),
             use_quic: false,
         },
         Hop {
             addr: b_addr.to_string(),
-            pubkey: b_pubkey,
+            identity: HopIdentity::Ed25519(b_pubkey),
             use_quic: false,
         },
         Hop {
             addr: c_addr.to_string(),
-            pubkey: c_pubkey,
+            identity: HopIdentity::Ed25519(c_pubkey),
             use_quic: false,
         },
     ])
@@ -979,12 +983,12 @@ async fn test_mixed_ipv4_ipv6_hops() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: ipv4_hop_addr.to_string(),
-            pubkey: ipv4_hop_pubkey,
+            identity: HopIdentity::Ed25519(ipv4_hop_pubkey),
             use_quic: false,
         },
         Hop {
             addr: ipv6_hop_addr.to_string(),
-            pubkey: ipv6_hop_pubkey,
+            identity: HopIdentity::Ed25519(ipv6_hop_pubkey),
             use_quic: false,
         },
     ])
@@ -1040,6 +1044,7 @@ async fn start_monad_server_with_quic() -> (SocketAddr, Ed25519Pubkey) {
 
     let config = Arc::new(ServerConfig {
         identity,
+        quic_transport_key: None,
         payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
     });
@@ -1051,6 +1056,92 @@ async fn start_monad_server_with_quic() -> (SocketAddr, Ed25519Pubkey) {
     ));
 
     (addr, pubkey)
+}
+
+async fn start_monad_server_with_quic_secp256k1() -> (SocketAddr, Secp256k1Pubkey) {
+    let identity = identity::ServerIdentity::generate().unwrap();
+    let transport_key = SecpTransportKeypair::generate();
+    let pubkey = transport_key.pubkey();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let quic_endpoint = quinn::Endpoint::server(quic_server_config, addr).unwrap();
+
+    let config = Arc::new(ServerConfig {
+        identity,
+        quic_transport_key: Some(transport_key),
+        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
+        trusted_mint_units: BTreeMap::new(),
+    });
+
+    tokio::spawn(monad_server::listener::run(
+        listener,
+        Some(quic_endpoint),
+        config,
+    ));
+
+    (addr, pubkey)
+}
+
+#[tokio::test]
+async fn test_quic_secp256k1_first_hop_single_hop() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let conn = connector::connect_through_chain(&[Hop {
+        addr: server_addr.to_string(),
+        identity: HopIdentity::Secp256k1(pubkey),
+        use_quic: true,
+    }])
+    .await
+    .unwrap();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    let mut h2 = conn.clone_send_request().await;
+
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic secp first hop").await;
+    assert_eq!(result, b"QUIC SECP FIRST HOP");
+
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_mixed_legacy_first_hop_then_quic_secp_second_hop() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (first_addr, first_pubkey) = start_monad_server().await;
+    let (second_addr, second_pubkey) = start_monad_server_with_quic_secp256k1().await;
+
+    let conn = connector::connect_through_chain(&[
+        Hop {
+            addr: first_addr.to_string(),
+            identity: HopIdentity::Ed25519(first_pubkey),
+            use_quic: false,
+        },
+        Hop {
+            addr: second_addr.to_string(),
+            identity: HopIdentity::Secp256k1(second_pubkey),
+            use_quic: true,
+        },
+    ])
+    .await
+    .unwrap();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    let mut h2 = conn.clone_send_request().await;
+
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"mixed secp second hop").await;
+    assert_eq!(result, b"MIXED SECP SECOND HOP");
+
+    drop(h2);
+    conn.shutdown().await;
 }
 
 /// Connect to a MONAD server over QUIC, run a Noise+H2 session,
@@ -1129,6 +1220,68 @@ async fn test_quic_unknown_stream_kind_rejected() {
 }
 
 #[tokio::test]
+async fn test_quic_secp256k1_auth_direct_connection() {
+    let (server_addr, pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+    let client_config = build_client_config_for_auth(ClientAuthMode::Secp256k1(pubkey)).unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    let conn = connect_with_auth(&endpoint, server_addr, ClientAuthMode::Secp256k1(pubkey))
+        .await
+        .unwrap();
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_quic_secp256k1_auth_direct_connection_wrong_key_fails() {
+    let (server_addr, _pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let wrong_pubkey = SecpTransportKeypair::generate().pubkey();
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+    let client_config =
+        build_client_config_for_auth(ClientAuthMode::Secp256k1(wrong_pubkey)).unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    let result = connect_with_auth(
+        &endpoint,
+        server_addr,
+        ClientAuthMode::Secp256k1(wrong_pubkey),
+    )
+    .await;
+    assert!(result.is_err(), "expected wrong secp256k1 auth to fail");
+}
+
+#[tokio::test]
+async fn test_quic_pool_supports_secp256k1_auth() {
+    let (server_addr, pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let pool = QuicPool::new().unwrap();
+
+    let stream = pool
+        .open_stream(&server_addr.to_string(), ClientAuthMode::Secp256k1(pubkey))
+        .await
+        .unwrap();
+    drop(stream);
+}
+
+#[tokio::test]
+async fn test_quic_pool_rejects_wrong_secp256k1_pubkey() {
+    let (server_addr, _pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let wrong_pubkey = SecpTransportKeypair::generate().pubkey();
+    let pool = QuicPool::new().unwrap();
+
+    let err = match pool
+        .open_stream(
+            &server_addr.to_string(),
+            ClientAuthMode::Secp256k1(wrong_pubkey),
+        )
+        .await
+    {
+        Ok(_) => panic!("expected wrong secp256k1 pubkey to reject pooled QUIC connect"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+#[tokio::test]
 async fn test_quic_pool_rejects_same_address_with_different_pin() {
     let (server_addr, pubkey) = start_monad_server_with_quic().await;
     let wrong_pubkey = identity::ServerIdentity::generate()
@@ -1138,13 +1291,19 @@ async fn test_quic_pool_rejects_same_address_with_different_pin() {
     let pool = QuicPool::new().unwrap();
 
     let stream = pool
-        .open_stream(&server_addr.to_string(), pubkey.to_spki_der())
+        .open_stream(
+            &server_addr.to_string(),
+            ClientAuthMode::PinnedSpki(pubkey.to_spki_der()),
+        )
         .await
         .unwrap();
     drop(stream);
 
     let err = match pool
-        .open_stream(&server_addr.to_string(), wrong_pubkey.to_spki_der())
+        .open_stream(
+            &server_addr.to_string(),
+            ClientAuthMode::PinnedSpki(wrong_pubkey.to_spki_der()),
+        )
         .await
     {
         Ok(_) => panic!("expected pin mismatch to reject pooled QUIC reuse"),
@@ -1152,7 +1311,7 @@ async fn test_quic_pool_rejects_same_address_with_different_pin() {
     };
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(
-        err.to_string().contains("different pinned key"),
+        err.to_string().contains("different transport auth mode"),
         "unexpected error: {err}"
     );
 }
@@ -1309,12 +1468,12 @@ async fn test_connector_quic_hop() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: s_addr.to_string(),
-            pubkey: s_pubkey,
+            identity: HopIdentity::Ed25519(s_pubkey),
             use_quic: false,
         },
         Hop {
             addr: format!("127.0.0.1:{}", t_addr.port()),
-            pubkey: t_pubkey,
+            identity: HopIdentity::Ed25519(t_pubkey),
             use_quic: true,
         },
     ])
@@ -1362,12 +1521,12 @@ async fn test_concurrent_quic_pool_access() {
             let conn = connector::connect_through_chain(&[
                 Hop {
                     addr: s_addr.to_string(),
-                    pubkey: s_pubkey,
+                    identity: HopIdentity::Ed25519(s_pubkey),
                     use_quic: false,
                 },
                 Hop {
                     addr: format!("127.0.0.1:{t_port}"),
-                    pubkey: t_pubkey,
+                    identity: HopIdentity::Ed25519(t_pubkey),
                     use_quic: true,
                 },
             ])
@@ -1403,7 +1562,7 @@ async fn test_quic_first_hop() {
     // Client connects directly via QUIC (use_quic on the first hop)
     let conn = connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
-        pubkey: pubkey.clone(),
+        identity: HopIdentity::Ed25519(pubkey.clone()),
         use_quic: true,
     }])
     .await
@@ -1432,12 +1591,12 @@ async fn test_quic_first_hop_then_tcp() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: s_addr.to_string(),
-            pubkey: s_pubkey,
+            identity: HopIdentity::Ed25519(s_pubkey),
             use_quic: true,
         },
         Hop {
             addr: t_addr.to_string(),
-            pubkey: t_pubkey,
+            identity: HopIdentity::Ed25519(t_pubkey),
             use_quic: false,
         },
     ])

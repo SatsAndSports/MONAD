@@ -1,3 +1,5 @@
+use crate::auth::authenticate_connection;
+use monad_common::secp_identity::Secp256k1Pubkey;
 use std::net::SocketAddr;
 use std::sync::{Arc, Once};
 
@@ -127,14 +129,27 @@ async fn run_stream(conn: quinn::Connection, index: usize, bytes_per_stream: usi
 }
 
 pub fn build_client_config(pinned_spki: Vec<u8>) -> Result<quinn::ClientConfig> {
+    build_client_config_for_auth(ClientAuthMode::PinnedSpki(pinned_spki))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientAuthMode {
+    PinnedSpki(Vec<u8>),
+    Secp256k1(Secp256k1Pubkey),
+}
+
+pub fn build_client_config_for_auth(auth: ClientAuthMode) -> Result<quinn::ClientConfig> {
     ensure_crypto_provider();
-    let verifier = PinnedKeyVerifier {
-        pinned_spki: pinned_spki.into(),
+    let verifier: Arc<dyn ServerCertVerifier> = match auth {
+        ClientAuthMode::PinnedSpki(pinned_spki) => Arc::new(PinnedKeyVerifier {
+            pinned_spki: pinned_spki.into(),
+        }),
+        ClientAuthMode::Secp256k1(_) => Arc::new(PermissiveVerifier),
     };
 
     let mut tls_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
 
     // Match ALPN
@@ -160,6 +175,23 @@ pub fn build_client_config(pinned_spki: Vec<u8>) -> Result<quinn::ClientConfig> 
     Ok(client_config)
 }
 
+pub async fn connect_with_auth(
+    endpoint: &Endpoint,
+    connect: SocketAddr,
+    auth: ClientAuthMode,
+) -> Result<quinn::Connection> {
+    let conn = endpoint
+        .connect(connect, "monad-relay")?
+        .await
+        .context("failed to connect")?;
+
+    if let ClientAuthMode::Secp256k1(pubkey) = auth {
+        authenticate_connection(&conn, &pubkey).await?;
+    }
+
+    Ok(conn)
+}
+
 /// Custom TLS certificate verifier that checks the server's certificate
 /// contains the expected pinned SubjectPublicKeyInfo (SPKI) DER bytes.
 ///
@@ -168,6 +200,53 @@ pub fn build_client_config(pinned_spki: Vec<u8>) -> Result<quinn::ClientConfig> 
 #[derive(Debug)]
 struct PinnedKeyVerifier {
     pinned_spki: Arc<[u8]>,
+}
+
+#[derive(Debug)]
+struct PermissiveVerifier;
+
+impl ServerCertVerifier for PermissiveVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General(
+            "TLS 1.2 is not supported for QUIC".into(),
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 impl ServerCertVerifier for PinnedKeyVerifier {

@@ -122,22 +122,14 @@ pub struct RelayConnection {
 }
 
 impl RelayConnection {
-    /// Perform an H2 client handshake over an established `NoiseStream`.
-    ///
-    /// Returns a `RelayConnection` (with no driver handles yet) and the
-    /// `JoinHandle` for the spawned H2 connection driver. The caller is
-    /// responsible for attaching the driver via [`add_driver`](Self::add_driver)
-    /// — either to this connection or, during multi-hop chain building, to
-    /// the final connection in the chain.
-    pub async fn from_noise_stream<T>(
-        noise_stream: NoiseStream<T>,
+    pub async fn from_transport_stream<T>(
+        stream: T,
+        session_id: [u8; 32],
     ) -> io::Result<(Self, JoinHandle<()>)>
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let session_id = *noise_stream.session_id();
-
-        let (h2_client, h2_conn) = client::handshake(noise_stream)
+        let (h2_client, h2_conn) = client::handshake(stream)
             .await
             .map_err(|e| io::Error::other(format!("h2 handshake error: {e}")))?;
 
@@ -159,6 +151,23 @@ impl RelayConnection {
         Ok((conn, driver_handle))
     }
 
+    /// Perform an H2 client handshake over an established `NoiseStream`.
+    ///
+    /// Returns a `RelayConnection` (with no driver handles yet) and the
+    /// `JoinHandle` for the spawned H2 connection driver. The caller is
+    /// responsible for attaching the driver via [`add_driver`](Self::add_driver)
+    /// — either to this connection or, during multi-hop chain building, to
+    /// the final connection in the chain.
+    pub async fn from_noise_stream<T>(
+        noise_stream: NoiseStream<T>,
+    ) -> io::Result<(Self, JoinHandle<()>)>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let session_id = *noise_stream.session_id();
+        Self::from_transport_stream(noise_stream, session_id).await
+    }
+
     /// Open an H2 CONNECT tunnel to the given target authority.
     ///
     /// Returns an `H2ConnectStream` that implements `AsyncRead + AsyncWrite`,
@@ -174,7 +183,23 @@ impl RelayConnection {
         target_authority: &str,
         pin: &[u8],
     ) -> io::Result<H2ConnectStream> {
-        self.open_tunnel_inner(target_authority, Some(pin)).await
+        self.open_tunnel_inner(target_authority, Some(("quic-pin", hex::encode(pin))))
+            .await
+    }
+
+    /// Open an H2 CONNECT tunnel with a `quic-secp256k1-pubkey` header, telling the relay
+    /// to reach the target via QUIC and authenticate the connection using the
+    /// provided compressed secp256k1 public key.
+    pub async fn open_tunnel_quic_secp256k1(
+        &self,
+        target_authority: &str,
+        pubkey_hex: &str,
+    ) -> io::Result<H2ConnectStream> {
+        self.open_tunnel_inner(
+            target_authority,
+            Some(("quic-secp256k1-pubkey", pubkey_hex.to_owned())),
+        )
+        .await
     }
 
     /// Clone the underlying `SendRequest` handle for direct H2 stream use
@@ -277,7 +302,7 @@ impl RelayConnection {
     async fn open_tunnel_inner(
         &self,
         target_authority: &str,
-        quic_pin: Option<&[u8]>,
+        quic_header: Option<(&str, String)>,
     ) -> io::Result<H2ConnectStream> {
         let mut h2_client = self.clone_send_request().await;
 
@@ -287,8 +312,8 @@ impl RelayConnection {
 
         let mut builder = Request::builder().method(Method::CONNECT).uri(uri);
 
-        if let Some(pin) = quic_pin {
-            builder = builder.header("quic-pin", hex::encode(pin));
+        if let Some((header_name, header_value)) = quic_header {
+            builder = builder.header(header_name, header_value);
         }
 
         let request = builder.body(()).map_err(|e| {

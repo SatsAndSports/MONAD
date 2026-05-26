@@ -5,6 +5,7 @@ use monad_client::control;
 use monad_client::socks;
 use monad_client::tunnel;
 use monad_common::identity::Ed25519Pubkey;
+use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::RelayConnection;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -13,10 +14,12 @@ use tracing::{error, info, warn};
 #[derive(Parser)]
 #[command(name = "monad-client", about = "MONAD tunnel client")]
 struct Cli {
-    /// Server hop(s) in order: addr:port,pubkey_hex or quic:addr:port,pubkey_hex
+    /// Server hop(s) in order: addr:port,<identity> or quic:addr:port,<identity>
     ///
-    /// Each hop uses a single Ed25519 public key (32 bytes, 64 hex chars).
-    /// The key is used for both Noise authentication and QUIC pinning.
+    /// Supported identity forms:
+    /// - legacy untagged Ed25519 hex: `<pubkey_hex>`
+    /// - explicit Ed25519: `ed25519:<pubkey_hex>`
+    /// - explicit secp256k1 transport identity: `secp256k1:<33-byte-compressed-pubkey-hex>`
     ///
     /// For a direct connection, specify one hop:
     ///   --hop 1.2.3.4:9050,<pubkey>
@@ -39,6 +42,24 @@ struct Cli {
     fake_payment_millisats: u64,
 }
 
+fn parse_hop_identity(identity: &str, addr: &str) -> anyhow::Result<connector::HopIdentity> {
+    if let Some(rest) = identity.strip_prefix("ed25519:") {
+        let pubkey = Ed25519Pubkey::from_hex(rest)
+            .map_err(|e| anyhow::anyhow!("bad Ed25519 public key for hop {addr}: {e}"))?;
+        return Ok(connector::HopIdentity::Ed25519(pubkey));
+    }
+
+    if let Some(rest) = identity.strip_prefix("secp256k1:") {
+        let pubkey = Secp256k1Pubkey::from_hex(rest)
+            .map_err(|e| anyhow::anyhow!("bad secp256k1 public key for hop {addr}: {e}"))?;
+        return Ok(connector::HopIdentity::Secp256k1(pubkey));
+    }
+
+    let pubkey = Ed25519Pubkey::from_hex(identity)
+        .map_err(|e| anyhow::anyhow!("bad legacy Ed25519 public key for hop {addr}: {e}"))?;
+    Ok(connector::HopIdentity::Ed25519(pubkey))
+}
+
 fn parse_hop(s: &str) -> anyhow::Result<Hop> {
     // Check for quic: prefix
     let (rest, use_quic) = if let Some(rest) = s.strip_prefix("quic:") {
@@ -47,17 +68,16 @@ fn parse_hop(s: &str) -> anyhow::Result<Hop> {
         (s, false)
     };
 
-    // Format: addr:port,pubkey_hex (one comma, pubkey is always last)
-    let (addr, pubkey_hex) = rest
+    // Format: addr:port,<identity> (one comma, identity is always last)
+    let (addr, identity) = rest
         .rsplit_once(',')
-        .ok_or_else(|| anyhow::anyhow!("hop must be addr:port,pubkey_hex — got: {s}"))?;
+        .ok_or_else(|| anyhow::anyhow!("hop must be addr:port,<identity> — got: {s}"))?;
 
-    let pubkey = Ed25519Pubkey::from_hex(pubkey_hex)
-        .map_err(|e| anyhow::anyhow!("bad public key for hop {addr}: {e}"))?;
+    let identity = parse_hop_identity(identity, addr)?;
 
     Ok(Hop {
         addr: addr.to_string(),
-        pubkey,
+        identity,
         use_quic,
     })
 }
@@ -88,9 +108,9 @@ async fn main() -> anyhow::Result<()> {
         hops.len(),
         hops.iter()
             .map(|h| if h.use_quic {
-                format!("quic:{}", h.addr)
+                format!("quic:{}({})", h.addr, h.identity.describe())
             } else {
-                h.addr.clone()
+                format!("{}({})", h.addr, h.identity.describe())
             })
             .collect::<Vec<_>>()
             .join(" → ")
@@ -210,4 +230,36 @@ async fn accept_loop(socks_listener: &TcpListener, conn: &RelayConnection) -> an
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monad_common::secp_identity::SecpTransportKeypair;
+
+    #[test]
+    fn test_parse_hop_legacy_ed25519() {
+        let hop = parse_hop(
+            "127.0.0.1:9050,00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+        assert!(!hop.use_quic);
+        assert!(matches!(hop.identity, connector::HopIdentity::Ed25519(_)));
+    }
+
+    #[test]
+    fn test_parse_hop_explicit_ed25519() {
+        let hop = parse_hop("quic:127.0.0.1:9050,ed25519:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap();
+        assert!(hop.use_quic);
+        assert!(matches!(hop.identity, connector::HopIdentity::Ed25519(_)));
+    }
+
+    #[test]
+    fn test_parse_hop_explicit_secp256k1() {
+        let keypair = SecpTransportKeypair::generate();
+        let pubkey = keypair.pubkey().to_hex();
+        let hop = parse_hop(&format!("127.0.0.1:9050,secp256k1:{pubkey}")).unwrap();
+
+        assert!(matches!(hop.identity, connector::HopIdentity::Secp256k1(_)));
+    }
 }

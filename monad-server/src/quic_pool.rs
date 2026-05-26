@@ -12,7 +12,10 @@
 //! - callers to different targets are never blocked by each other
 //! - failed handshakes clean up the placeholder so the next caller retries
 
-use monad_quic::stream::{open_monad_stream, QuicStream};
+use monad_common::secp_identity::Secp256k1Pubkey;
+use monad_quic::auth::authenticate_connection;
+use monad_quic::client::{build_client_config_for_auth, ClientAuthMode};
+use monad_quic::stream::{open_monad_stream_with_kind, QuicStream, STREAM_KIND_PLAIN_NOISE};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -23,17 +26,32 @@ use tracing::info;
 /// Result of a QUIC connection attempt, shared with waiters via a watch channel.
 type ConnResult = Option<Result<quinn::Connection, String>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuicAuthKey {
+    PinnedSpki(Vec<u8>),
+    Secp256k1(Secp256k1Pubkey),
+}
+
+impl From<ClientAuthMode> for QuicAuthKey {
+    fn from(value: ClientAuthMode) -> Self {
+        match value {
+            ClientAuthMode::PinnedSpki(spki) => Self::PinnedSpki(spki),
+            ClientAuthMode::Secp256k1(pubkey) => Self::Secp256k1(pubkey),
+        }
+    }
+}
+
 /// State of a pool entry for a given target.
 enum PoolEntry {
     /// A QUIC handshake is in progress. Waiters clone the receiver and watch
     /// for the result. The sender is held by the task performing the handshake.
     Pending {
-        pinned_spki: Vec<u8>,
+        auth: QuicAuthKey,
         rx: watch::Receiver<ConnResult>,
     },
     /// An established QUIC connection ready for opening new streams.
     Ready {
-        pinned_spki: Vec<u8>,
+        auth: QuicAuthKey,
         conn: quinn::Connection,
     },
 }
@@ -50,10 +68,12 @@ pub struct QuicPool {
 }
 
 impl QuicPool {
-    fn pinned_key_mismatch_error(target_addr: &str) -> io::Error {
+    fn auth_mismatch_error(target_addr: &str) -> io::Error {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("cached QUIC connection for {target_addr} uses a different pinned key"),
+            format!(
+                "cached QUIC connection for {target_addr} uses a different transport auth mode"
+            ),
         )
     }
 
@@ -78,19 +98,30 @@ impl QuicPool {
     pub async fn open_stream(
         &self,
         target_addr: &str,
-        pinned_spki: Vec<u8>,
+        auth: ClientAuthMode,
+    ) -> io::Result<QuicStream> {
+        self.open_stream_with_kind(target_addr, auth, STREAM_KIND_PLAIN_NOISE)
+            .await
+    }
+
+    pub async fn open_stream_with_kind(
+        &self,
+        target_addr: &str,
+        auth: ClientAuthMode,
+        stream_kind: u8,
     ) -> io::Result<QuicStream> {
         loop {
+            let auth_key = QuicAuthKey::from(auth.clone());
             let action = {
                 let mut pool = self.inner.lock().await;
 
                 match pool.get(target_addr) {
                     Some(PoolEntry::Ready {
-                        pinned_spki: cached_pinned_spki,
+                        auth: cached_auth,
                         conn,
                     }) => {
-                        if cached_pinned_spki != &pinned_spki {
-                            return Err(Self::pinned_key_mismatch_error(target_addr));
+                        if cached_auth != &auth_key {
+                            return Err(Self::auth_mismatch_error(target_addr));
                         }
                         // Try to open a stream on the cached connection.
                         // Clone the connection handle (cheap Arc clone) so we
@@ -98,11 +129,11 @@ impl QuicPool {
                         Action::UseExisting(conn.clone())
                     }
                     Some(PoolEntry::Pending {
-                        pinned_spki: cached_pinned_spki,
+                        auth: cached_auth,
                         rx,
                     }) => {
-                        if cached_pinned_spki != &pinned_spki {
-                            return Err(Self::pinned_key_mismatch_error(target_addr));
+                        if cached_auth != &auth_key {
+                            return Err(Self::auth_mismatch_error(target_addr));
                         }
                         // Another task is connecting — wait on its result.
                         Action::Wait(rx.clone())
@@ -114,7 +145,7 @@ impl QuicPool {
                         pool.insert(
                             target_addr.to_string(),
                             PoolEntry::Pending {
-                                pinned_spki: pinned_spki.clone(),
+                                auth: auth_key.clone(),
                                 rx,
                             },
                         );
@@ -126,7 +157,7 @@ impl QuicPool {
 
             match action {
                 Action::UseExisting(conn) => {
-                    match open_monad_stream(&conn).await {
+                    match open_monad_stream_with_kind(&conn, stream_kind).await {
                         Ok(stream) => {
                             info!("reusing QUIC connection to {target_addr}");
                             return Ok(stream);
@@ -190,13 +221,11 @@ impl QuicPool {
 
                 Action::Connect(tx) => {
                     // We are responsible for establishing the connection.
-                    match self
-                        .establish_connection(target_addr, pinned_spki.clone())
-                        .await
-                    {
+                    match self.establish_connection(target_addr, auth.clone()).await {
                         Ok(conn) => {
                             // Open the first stream.
-                            let stream_result = open_monad_stream(&conn).await;
+                            let stream_result =
+                                open_monad_stream_with_kind(&conn, stream_kind).await;
 
                             // Promote to Ready in the pool, notify waiters.
                             {
@@ -204,7 +233,7 @@ impl QuicPool {
                                 pool.insert(
                                     target_addr.to_string(),
                                     PoolEntry::Ready {
-                                        pinned_spki: pinned_spki.clone(),
+                                        auth: auth_key.clone(),
                                         conn: conn.clone(),
                                     },
                                 );
@@ -234,7 +263,7 @@ impl QuicPool {
     async fn establish_connection(
         &self,
         target_addr: &str,
-        pinned_spki: Vec<u8>,
+        auth: ClientAuthMode,
     ) -> io::Result<quinn::Connection> {
         // Resolve the target address
         let socket_addr: SocketAddr = tokio::net::lookup_host(target_addr)
@@ -244,7 +273,7 @@ impl QuicPool {
             .ok_or_else(|| io::Error::other(format!("no addresses found for {target_addr}")))?;
 
         // Build client config with pinned key verification
-        let client_config = monad_quic::client::build_client_config(pinned_spki)
+        let client_config = build_client_config_for_auth(auth.clone())
             .map_err(|e| io::Error::other(format!("failed to build QUIC client config: {e}")))?;
 
         info!("establishing new QUIC connection to {target_addr} ({socket_addr})");
@@ -260,6 +289,15 @@ impl QuicPool {
                     format!("QUIC handshake failed with {target_addr}: {e}"),
                 )
             })?;
+
+        if let ClientAuthMode::Secp256k1(pubkey) = auth {
+            authenticate_connection(&conn, &pubkey).await.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("QUIC secp256k1 auth failed with {target_addr}: {e}"),
+                )
+            })?;
+        }
 
         Ok(conn)
     }

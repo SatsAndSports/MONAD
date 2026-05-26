@@ -1,17 +1,26 @@
 //! TCP and QUIC listener that accepts connections and performs the Noise NK handshake.
 
 use crate::quic_pool::QuicPool;
-use crate::session::RelaySession;
+use crate::session::{relay_session_from_noise_stream, relay_session_from_transport_stream};
 use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::identity::ServerIdentity;
 use monad_common::noise;
 use monad_common::noise::NoiseStream;
+use monad_common::noise_secp256k1;
 use monad_common::protocol::MintUnitKeysets;
-use monad_quic::stream::accept_monad_stream;
+use monad_common::secp_identity::SecpTransportKeypair;
+use monad_quic::auth::{
+    reject_stream, serve_attestation_stream, AUTH_STREAM_KIND, STREAM_ERROR_AUTH_REQUIRED,
+    STREAM_ERROR_UNKNOWN_KIND,
+};
+use monad_quic::stream::{QuicStream, STREAM_KIND_PLAIN_NOISE, STREAM_KIND_SECP_NOISE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::{error, info};
@@ -32,6 +41,8 @@ pub struct SpilmanMintCache {
 pub struct ServerConfig {
     /// The server's unified identity (Ed25519 seed + derived keys).
     pub identity: ServerIdentity,
+    /// Optional dedicated secp256k1 transport identity for QUIC auth.
+    pub quic_transport_key: Option<SecpTransportKeypair>,
     /// Receiver secp256k1 secret used for Spilman channel validation.
     pub payment_receiver_secret: SecretKey,
     /// Hardcoded trusted mint policy.
@@ -139,7 +150,7 @@ pub async fn run(
                     let noise_stream = NoiseStream::new(tcp_stream, transport, session_id, label);
 
                     // Run the H2 session
-                    match RelaySession::from_noise_stream(
+                    match relay_session_from_noise_stream(
                         noise_stream,
                         quic_pool,
                         config.payment_receiver_secret.clone(),
@@ -187,6 +198,7 @@ pub async fn run(
                     };
                     let remote = conn.remote_address();
                     info!("accepted QUIC connection from {remote}");
+                    let authenticated = Arc::new(AtomicBool::new(config.quic_transport_key.is_none()));
 
                     // Accept bidirectional streams from this QUIC connection.
                     // Each stream is an independent Noise+H2 session.
@@ -199,51 +211,145 @@ pub async fn run(
                                 let config = config.clone();
                                 let quic_pool = quic_pool.clone();
                                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
+                                let quic_transport_key = config.quic_transport_key.clone();
+                                let authenticated = authenticated.clone();
+                                let conn = conn.clone();
                                 tokio::spawn(async move {
-                                    let mut quic_stream = match accept_monad_stream(send, recv).await {
-                                        Ok(stream) => stream,
-                                        Err(e) => {
-                                            error!("invalid QUIC MONAD stream from {remote} ({stream_id:?}): {e}");
+                                    let mut send = send;
+                                    let mut recv = recv;
+                                    let mut kind = [0u8; 1];
+                                    if recv.read_exact(&mut kind).await.is_err() {
+                                        return;
+                                    }
+
+                                    if let Some(ref transport_key) = quic_transport_key {
+                                        if kind[0] == AUTH_STREAM_KIND {
+                                            if let Err(e) = serve_attestation_stream(
+                                                &conn,
+                                                transport_key,
+                                                &mut send,
+                                                &mut recv,
+                                            )
+                                            .await
+                                            {
+                                                error!("QUIC secp256k1 auth failed with {remote} ({stream_id:?}): {e}");
+                                            } else {
+                                                authenticated.store(true, Ordering::Release);
+                                            }
                                             return;
                                         }
-                                    };
 
-                                    let (transport, session_id) = match noise::handshake_responder(
-                                        &mut quic_stream,
-                                        config.identity.x25519_private(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(t) => {
-                                            info!("noise handshake complete with {remote} (QUIC {stream_id:?})");
-                                            t
-                                        }
-                                        Err(e) => {
-                                            error!("noise handshake failed with {remote} (QUIC {stream_id:?}): {e}");
+                                        if kind[0] != STREAM_KIND_PLAIN_NOISE
+                                            && kind[0] != STREAM_KIND_SECP_NOISE
+                                        {
+                                            reject_stream(&mut send, &mut recv, STREAM_ERROR_UNKNOWN_KIND);
                                             return;
                                         }
-                                    };
 
-                                    let label =
-                                        format!("{} <-> {remote} (QUIC {stream_id:?})", "quic");
-                                    let noise_stream =
-                                        NoiseStream::new(quic_stream, transport, session_id, label);
+                                        if !authenticated.load(Ordering::Acquire) {
+                                            reject_stream(&mut send, &mut recv, STREAM_ERROR_AUTH_REQUIRED);
+                                            return;
+                                        }
+                                    }
 
-                                    match RelaySession::from_noise_stream(
-                                        noise_stream,
-                                        quic_pool,
-                                        config.payment_receiver_secret.clone(),
-                                        discovered_spilman_mint_cache.as_ref().clone(),
-                                    )
-                                    .await {
-                                        Ok(session) => {
-                                            if let Err(e) = session.run().await {
-                                                error!("session error with {remote} (QUIC {stream_id:?}): {e}");
+                                    if kind[0] != STREAM_KIND_PLAIN_NOISE && kind[0] != STREAM_KIND_SECP_NOISE {
+                                        reject_stream(&mut send, &mut recv, STREAM_ERROR_UNKNOWN_KIND);
+                                        return;
+                                    }
+
+                                    match kind[0] {
+                                        STREAM_KIND_PLAIN_NOISE => {
+                                            let mut quic_stream = QuicStream::new(send, recv);
+
+                                            let (transport, session_id) = match noise::handshake_responder(
+                                                &mut quic_stream,
+                                                config.identity.x25519_private(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(t) => {
+                                                    info!("noise handshake complete with {remote} (QUIC {stream_id:?})");
+                                                    t
+                                                }
+                                                Err(e) => {
+                                                    error!("noise handshake failed with {remote} (QUIC {stream_id:?}): {e}");
+                                                    return;
+                                                }
+                                            };
+
+                                            let label = format!("{} <-> {remote} (QUIC {stream_id:?})", "quic");
+                                            let noise_stream = NoiseStream::new(
+                                                quic_stream,
+                                                transport,
+                                                session_id,
+                                                label,
+                                            );
+
+                                            match relay_session_from_noise_stream(
+                                                noise_stream,
+                                                quic_pool,
+                                                config.payment_receiver_secret.clone(),
+                                                discovered_spilman_mint_cache.as_ref().clone(),
+                                            )
+                                            .await {
+                                                Ok(session) => {
+                                                    if let Err(e) = session.run().await {
+                                                        error!("session error with {remote} (QUIC {stream_id:?}): {e}");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("H2 handshake failed with {remote} (QUIC {stream_id:?}): {e}");
+                                                }
                                             }
                                         }
-                                        Err(e) => {
-                                            error!("H2 handshake failed with {remote} (QUIC {stream_id:?}): {e}");
+                                        STREAM_KIND_SECP_NOISE => {
+                                            let Some(ref transport_key) = quic_transport_key else {
+                                                reject_stream(&mut send, &mut recv, STREAM_ERROR_UNKNOWN_KIND);
+                                                return;
+                                            };
+                                            let mut quic_stream = QuicStream::new(send, recv);
+                                            let (send_cipher, recv_cipher, session_id) =
+                                                match noise_secp256k1::handshake_responder(
+                                                    &mut quic_stream,
+                                                    transport_key,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(v) => {
+                                                        info!("secp noise handshake complete with {remote} (QUIC {stream_id:?})");
+                                                        v
+                                                    }
+                                                    Err(e) => {
+                                                        error!("secp noise handshake failed with {remote} (QUIC {stream_id:?}): {e}");
+                                                        return;
+                                                    }
+                                                };
+                                            let secp_stream = noise_secp256k1::SecpNoiseStream::new(
+                                                quic_stream,
+                                                send_cipher,
+                                                recv_cipher,
+                                                session_id,
+                                            );
+
+                                            match relay_session_from_transport_stream(
+                                                secp_stream,
+                                                session_id,
+                                                quic_pool,
+                                                config.payment_receiver_secret.clone(),
+                                                discovered_spilman_mint_cache.as_ref().clone(),
+                                            )
+                                            .await {
+                                                Ok(session) => {
+                                                    if let Err(e) = session.run().await {
+                                                        error!("session error with {remote} (QUIC {stream_id:?}): {e}");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("H2 handshake failed with {remote} (QUIC {stream_id:?}): {e}");
+                                                }
+                                            }
                                         }
+                                        _ => unreachable!(),
                                     }
 
                                     info!("QUIC stream {stream_id:?} from {remote} closed");

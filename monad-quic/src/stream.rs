@@ -10,6 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub const STREAM_KIND_PLAIN_NOISE: u8 = 0x00;
+pub const STREAM_KIND_SECP_NOISE: u8 = 0x02;
 pub const STREAM_ERROR_UNKNOWN_KIND: u64 = 0x01;
 
 fn stream_error_code(code: u64) -> quinn::VarInt {
@@ -34,11 +35,18 @@ impl QuicStream {
 
 /// Open a QUIC bidirectional stream carrying a MONAD session.
 pub async fn open_monad_stream(conn: &quinn::Connection) -> io::Result<QuicStream> {
+    open_monad_stream_with_kind(conn, STREAM_KIND_PLAIN_NOISE).await
+}
+
+pub async fn open_monad_stream_with_kind(
+    conn: &quinn::Connection,
+    kind: u8,
+) -> io::Result<QuicStream> {
     let (mut send, recv) = conn
         .open_bi()
         .await
         .map_err(|e| io::Error::other(format!("failed to open QUIC stream: {e}")))?;
-    send.write_all(&[STREAM_KIND_PLAIN_NOISE])
+    send.write_all(&[kind])
         .await
         .map_err(|e| io::Error::other(format!("failed to write QUIC stream preamble: {e}")))?;
     send.flush()

@@ -105,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
 
             let config = Arc::new(listener::ServerConfig {
                 identity,
+                quic_transport_key: None,
                 payment_receiver_secret: SecretKey::generate(),
                 trusted_mint_units,
             });
