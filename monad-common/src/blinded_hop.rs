@@ -138,10 +138,17 @@ pub struct Path {
 }
 
 /// Service-side real hop input used to build a client-facing path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathHopMode {
+    Cleartext,
+    Blinded,
+}
+
 #[derive(Clone, Copy)]
 pub struct PathHop<'a> {
     pub addr: &'a str,
     pub identity: &'a ServerIdentity,
+    pub mode: PathHopMode,
 }
 
 /// The client-facing tweaked identity for a blinded hop.
@@ -349,21 +356,31 @@ pub fn build_path(hops: &[PathHop<'_>]) -> Result<Path, BlindedHopError> {
             "path requires at least one real hop",
         ));
     }
+    if hops[0].mode != PathHopMode::Cleartext {
+        return Err(BlindedHopError::InvalidPath(
+            "first path hop must be cleartext",
+        ));
+    }
 
     let mut path = Vec::with_capacity(hops.len());
-    path.push(PathNode::Cleartext(CleartextHop {
-        addr: hops[0].addr.to_owned(),
-        pubkey: hops[0].identity.ed25519_pubkey().clone(),
-    }));
 
-    for pair in hops.windows(2) {
-        let intro = pair[0];
-        let hidden = pair[1];
-        path.push(PathNode::Blinded(build_blinded_hop_descriptor(
-            intro.identity.ed25519_pubkey(),
-            hidden.addr,
-            hidden.identity,
-        )?));
+    for (i, hop) in hops.iter().enumerate() {
+        match hop.mode {
+            PathHopMode::Cleartext => {
+                path.push(PathNode::Cleartext(CleartextHop {
+                    addr: hop.addr.to_owned(),
+                    pubkey: hop.identity.ed25519_pubkey().clone(),
+                }));
+            }
+            PathHopMode::Blinded => {
+                let predecessor = &hops[i - 1];
+                path.push(PathNode::Blinded(build_blinded_hop_descriptor(
+                    predecessor.identity.ed25519_pubkey(),
+                    hop.addr,
+                    hop.identity,
+                )?));
+            }
+        }
     }
 
     Ok(Path { hops: path })
@@ -668,14 +685,17 @@ mod tests {
             PathHop {
                 addr: "127.0.0.1:9101",
                 identity: &hop_a,
+                mode: PathHopMode::Cleartext,
             },
             PathHop {
                 addr: "127.0.0.1:9102",
                 identity: &hop_b,
+                mode: PathHopMode::Blinded,
             },
             PathHop {
                 addr: "127.0.0.1:9103",
                 identity: &hop_c,
+                mode: PathHopMode::Blinded,
             },
         ])
         .unwrap();
@@ -704,6 +724,7 @@ mod tests {
         let path = build_path(&[PathHop {
             addr: "127.0.0.1:9201",
             identity: &hop,
+            mode: PathHopMode::Cleartext,
         }])
         .unwrap();
 
@@ -728,6 +749,83 @@ mod tests {
     }
 
     #[test]
+    fn test_build_path_rejects_blinded_first_hop() {
+        let hop_a = ServerIdentity::generate().unwrap();
+        let hop_b = ServerIdentity::generate().unwrap();
+        let result = build_path(&[
+            PathHop {
+                addr: "127.0.0.1:9251",
+                identity: &hop_a,
+                mode: PathHopMode::Blinded,
+            },
+            PathHop {
+                addr: "127.0.0.1:9252",
+                identity: &hop_b,
+                mode: PathHopMode::Cleartext,
+            },
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(BlindedHopError::InvalidPath(
+                "first path hop must be cleartext"
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_build_path_supports_cleartext_hop_in_the_middle() {
+        let hop_a = ServerIdentity::generate().unwrap();
+        let hop_b = ServerIdentity::generate().unwrap();
+        let hop_c = ServerIdentity::generate().unwrap();
+        let hop_d = ServerIdentity::generate().unwrap();
+        let path = build_path(&[
+            PathHop {
+                addr: "127.0.0.1:9261",
+                identity: &hop_a,
+                mode: PathHopMode::Cleartext,
+            },
+            PathHop {
+                addr: "127.0.0.1:9262",
+                identity: &hop_b,
+                mode: PathHopMode::Blinded,
+            },
+            PathHop {
+                addr: "127.0.0.1:9263",
+                identity: &hop_c,
+                mode: PathHopMode::Cleartext,
+            },
+            PathHop {
+                addr: "127.0.0.1:9264",
+                identity: &hop_d,
+                mode: PathHopMode::Blinded,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(path.hops.len(), 4);
+        assert!(matches!(&path.hops[0], PathNode::Cleartext(_)));
+        assert!(matches!(&path.hops[1], PathNode::Blinded(_)));
+        assert!(matches!(&path.hops[2], PathNode::Cleartext(_)));
+        assert!(matches!(&path.hops[3], PathNode::Blinded(_)));
+
+        let PathNode::Blinded(descriptor_b) = &path.hops[1] else {
+            panic!("expected blinded hop for B");
+        };
+        let PathNode::Cleartext(cleartext_c) = &path.hops[2] else {
+            panic!("expected cleartext hop for C");
+        };
+        let PathNode::Blinded(descriptor_d) = &path.hops[3] else {
+            panic!("expected blinded hop for D");
+        };
+
+        assert_descriptor_matches_hidden_hop(descriptor_b, &hop_a, &hop_b, "127.0.0.1:9262");
+        assert_eq!(cleartext_c.addr, "127.0.0.1:9263");
+        assert_eq!(cleartext_c.pubkey, *hop_c.ed25519_pubkey());
+        assert_descriptor_matches_hidden_hop(descriptor_d, &hop_c, &hop_d, "127.0.0.1:9264");
+    }
+
+    #[test]
     fn test_build_path_multiple_blinded_hops_predecessors_recover_real_addr_and_pubkey() {
         let hop_a = ServerIdentity::generate().unwrap();
         let hop_b = ServerIdentity::generate().unwrap();
@@ -737,18 +835,22 @@ mod tests {
             PathHop {
                 addr: "127.0.0.1:9301",
                 identity: &hop_a,
+                mode: PathHopMode::Cleartext,
             },
             PathHop {
                 addr: "127.0.0.1:9302",
                 identity: &hop_b,
+                mode: PathHopMode::Blinded,
             },
             PathHop {
                 addr: "127.0.0.1:9303",
                 identity: &hop_c,
+                mode: PathHopMode::Blinded,
             },
             PathHop {
                 addr: "127.0.0.1:9304",
                 identity: &hop_d,
+                mode: PathHopMode::Blinded,
             },
         ])
         .unwrap();
