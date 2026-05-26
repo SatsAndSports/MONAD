@@ -4,10 +4,10 @@
 //! tunnels to external targets) and the client (proxying local SOCKS5
 //! connections through H2 tunnels).
 
+use crate::h2stream::wait_for_send_capacity;
 use bytes::Bytes;
 use h2::RecvStream;
 use h2::SendStream;
-use crate::h2stream::wait_for_send_capacity;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

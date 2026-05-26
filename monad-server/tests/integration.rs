@@ -14,15 +14,15 @@
 use bytes::Bytes;
 use h2::client;
 use http::{Method, Request};
+use monad_client::connector::{self, Hop};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::identity::{self, Ed25519Pubkey};
 use monad_common::noise;
-use monad_common::session::RelayConnection;
-use monad_client::connector::{self, Hop};
 use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::session::RelayConnection;
 
-use monad_server::listener::ServerConfig;
 use monad_quic::stream::QuicStream;
+use monad_server::listener::ServerConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -49,10 +49,8 @@ async fn run_uppercase_server(listener: TcpListener) {
                 match stream.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        let upper: Vec<u8> = buf[..n]
-                            .iter()
-                            .map(|b| b.to_ascii_uppercase())
-                            .collect();
+                        let upper: Vec<u8> =
+                            buf[..n].iter().map(|b| b.to_ascii_uppercase()).collect();
                         if stream.write_all(&upper).await.is_err() {
                             break;
                         }
@@ -184,14 +182,15 @@ async fn bind_ipv6_listener() -> Option<TcpListener> {
 }
 
 /// Connect to a MONAD server through the real client connector.
-async fn connect_client(server_addr: std::net::SocketAddr, pubkey: &Ed25519Pubkey) -> RelayConnection {
-    connector::connect_through_chain(
-        &[Hop {
-            addr: server_addr.to_string(),
-            pubkey: pubkey.clone(),
-            use_quic: false,
-        }],
-    )
+async fn connect_client(
+    server_addr: std::net::SocketAddr,
+    pubkey: &Ed25519Pubkey,
+) -> RelayConnection {
+    connector::connect_through_chain(&[Hop {
+        addr: server_addr.to_string(),
+        pubkey: pubkey.clone(),
+        use_quic: false,
+    }])
     .await
     .unwrap()
 }
@@ -249,7 +248,13 @@ fn expect_session_status(message: ServerMessage) -> (u64, u64, u64, i64, bool) {
             remaining_milli_sats,
             paused,
             ..
-        } => (session_total_in, session_total_out, total_paid_millisats, remaining_milli_sats, paused),
+        } => (
+            session_total_in,
+            session_total_out,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+        ),
         other => panic!("expected SessionStatus, got {other:?}"),
     }
 }
@@ -384,7 +389,8 @@ async fn test_second_control_stream_rejected() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut first_send, mut first_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, _paid0, _rem0, paused0) = control_handshake(&mut first_send, &mut first_recv).await;
+    let (_in0, _out0, _paid0, _rem0, paused0) =
+        control_handshake(&mut first_send, &mut first_recv).await;
     assert!(paused0);
 
     let mut h2 = conn.clone_send_request().await;
@@ -444,7 +450,8 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
@@ -454,7 +461,8 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
         false,
     )
     .await;
-    let (_in1, _out1, _paid1, rem1, paused1) = expect_session_status(read_control_message(&mut control_recv).await);
+    let (_in1, _out1, _paid1, rem1, paused1) =
+        expect_session_status(read_control_message(&mut control_recv).await);
     assert!(!paused1);
     assert_eq!(rem1, 5);
 
@@ -477,17 +485,17 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
             .unwrap();
     }
 
-    let (_in2, out2, _paid2, rem2, paused2) = expect_session_status(read_control_message(&mut control_recv).await);
+    let (_in2, out2, _paid2, rem2, paused2) =
+        expect_session_status(read_control_message(&mut control_recv).await);
     assert!(paused2, "session should re-pause after credit is exhausted");
     assert_eq!(out2, 5);
     assert_eq!(rem2, 0);
 
-    let stalled = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        h2_recv.data(),
-    )
-    .await;
-    assert!(stalled.is_err(), "CONNECT should stall while session is paused");
+    let stalled = tokio::time::timeout(std::time::Duration::from_millis(200), h2_recv.data()).await;
+    assert!(
+        stalled.is_err(),
+        "CONNECT should stall while session is paused"
+    );
 
     send_control_message(
         &mut control_send,
@@ -495,7 +503,8 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
         false,
     )
     .await;
-    let (_in3, _out3, _paid3, rem3, paused3) = expect_session_status(read_control_message(&mut control_recv).await);
+    let (_in3, _out3, _paid3, rem3, paused3) =
+        expect_session_status(read_control_message(&mut control_recv).await);
     assert!(!paused3, "session should unpause after second payment");
     assert_eq!(rem3, 10);
 
@@ -531,13 +540,19 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(run_gated_reply_server(target_listener, 10, b"DONE", release_rx));
+    tokio::spawn(run_gated_reply_server(
+        target_listener,
+        10,
+        b"DONE",
+        release_rx,
+    ));
 
     let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
@@ -565,7 +580,9 @@ async fn test_session_overshoot_negative_balance_and_resume() {
 
     h2_send.reserve_capacity(10);
     wait_for_send_capacity(&mut h2_send).await.unwrap();
-    h2_send.send_data(Bytes::from_static(b"abcdefghij"), true).unwrap();
+    h2_send
+        .send_data(Bytes::from_static(b"abcdefghij"), true)
+        .unwrap();
 
     let (_in2, out2, _paid2, rem2, paused2) =
         expect_session_status(read_control_message(&mut control_recv).await);
@@ -626,13 +643,19 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(run_gated_reply_server(target_listener, 10, b"DONE", release_rx));
+    tokio::spawn(run_gated_reply_server(
+        target_listener,
+        10,
+        b"DONE",
+        release_rx,
+    ));
 
     let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut control_send, &mut control_recv).await;
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
     assert_eq!(rem0, 0);
 
@@ -660,7 +683,9 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
 
     h2_send.reserve_capacity(10);
     wait_for_send_capacity(&mut h2_send).await.unwrap();
-    h2_send.send_data(Bytes::from_static(b"abcdefghij"), true).unwrap();
+    h2_send
+        .send_data(Bytes::from_static(b"abcdefghij"), true)
+        .unwrap();
 
     let (_in2, out2, _paid2, rem2, paused2) =
         expect_session_status(read_control_message(&mut control_recv).await);
@@ -676,7 +701,10 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     .await;
     let (_in3, _out3, _paid3, rem3, paused3) =
         expect_session_status(read_control_message(&mut control_recv).await);
-    assert!(paused3, "session should stay paused while balance is non-positive");
+    assert!(
+        paused3,
+        "session should stay paused while balance is non-positive"
+    );
     assert_eq!(rem3, -1);
 
     let mut h2_for_paused_connect = conn.clone_send_request().await;
@@ -685,8 +713,9 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
         .uri(format!("127.0.0.1:{}", target_addr.port()))
         .body(())
         .unwrap();
-    let (paused_response_future, paused_h2_send) =
-        h2_for_paused_connect.send_request(paused_request, false).unwrap();
+    let (paused_response_future, paused_h2_send) = h2_for_paused_connect
+        .send_request(paused_request, false)
+        .unwrap();
     let paused_response = paused_response_future.await.unwrap();
     assert_eq!(paused_response.status(), http::StatusCode::PAYMENT_REQUIRED);
     drop(paused_h2_send);
@@ -823,9 +852,19 @@ async fn test_nested_tunnel() {
 
     // Client connects through T → S
     let conn = connector::connect_through_chain(&[
-        Hop { addr: t_addr.to_string(), pubkey: t_pubkey, use_quic: false },
-        Hop { addr: s_addr.to_string(), pubkey: s_pubkey, use_quic: false },
-    ]).await.unwrap();
+        Hop {
+            addr: t_addr.to_string(),
+            pubkey: t_pubkey,
+            use_quic: false,
+        },
+        Hop {
+            addr: s_addr.to_string(),
+            pubkey: s_pubkey,
+            use_quic: false,
+        },
+    ])
+    .await
+    .unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -850,10 +889,24 @@ async fn test_three_hop_tunnel() {
     let (c_addr, c_pubkey) = start_monad_server().await;
 
     let conn = connector::connect_through_chain(&[
-        Hop { addr: a_addr.to_string(), pubkey: a_pubkey, use_quic: false },
-        Hop { addr: b_addr.to_string(), pubkey: b_pubkey, use_quic: false },
-        Hop { addr: c_addr.to_string(), pubkey: c_pubkey, use_quic: false },
-    ]).await.unwrap();
+        Hop {
+            addr: a_addr.to_string(),
+            pubkey: a_pubkey,
+            use_quic: false,
+        },
+        Hop {
+            addr: b_addr.to_string(),
+            pubkey: b_pubkey,
+            use_quic: false,
+        },
+        Hop {
+            addr: c_addr.to_string(),
+            pubkey: c_pubkey,
+            use_quic: false,
+        },
+    ])
+    .await
+    .unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -922,9 +975,19 @@ async fn test_mixed_ipv4_ipv6_hops() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let conn = connector::connect_through_chain(&[
-        Hop { addr: ipv4_hop_addr.to_string(), pubkey: ipv4_hop_pubkey, use_quic: false },
-        Hop { addr: ipv6_hop_addr.to_string(), pubkey: ipv6_hop_pubkey, use_quic: false },
-    ]).await.unwrap();
+        Hop {
+            addr: ipv4_hop_addr.to_string(),
+            pubkey: ipv4_hop_pubkey,
+            use_quic: false,
+        },
+        Hop {
+            addr: ipv6_hop_addr.to_string(),
+            pubkey: ipv6_hop_pubkey,
+            use_quic: false,
+        },
+    ])
+    .await
+    .unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -991,10 +1054,7 @@ async fn start_monad_server_with_quic() -> (SocketAddr, Ed25519Pubkey) {
 /// Connect to a MONAD server over QUIC, run a Noise+H2 session,
 /// and return a RelayConnection.
 /// Takes a single Ed25519 public key — derives X25519 for Noise and SPKI for QUIC.
-async fn connect_client_quic(
-    server_addr: SocketAddr,
-    pubkey: &Ed25519Pubkey,
-) -> RelayConnection {
+async fn connect_client_quic(server_addr: SocketAddr, pubkey: &Ed25519Pubkey) -> RelayConnection {
     // Derive SPKI DER for QUIC pinned key verification
     let pinned_spki = pubkey.to_spki_der();
     let client_config = monad_quic::client::build_client_config(pinned_spki).unwrap();
@@ -1020,11 +1080,17 @@ async fn connect_client_quic(
     let (transport, session_id) = noise::handshake_initiator(&mut quic_stream, &x25519_pub)
         .await
         .unwrap();
-    let noise_stream =
-        noise::NoiseStream::new(quic_stream, transport, session_id, "test-quic-client".to_string());
+    let noise_stream = noise::NoiseStream::new(
+        quic_stream,
+        transport,
+        session_id,
+        "test-quic-client".to_string(),
+    );
 
     // Create RelayConnection from the Noise stream
-    let (mut conn, driver) = RelayConnection::from_noise_stream(noise_stream).await.unwrap();
+    let (mut conn, driver) = RelayConnection::from_noise_stream(noise_stream)
+        .await
+        .unwrap();
     conn.add_driver(driver);
     conn
 }
@@ -1134,11 +1200,17 @@ async fn test_nested_quic_tunnel() {
     let (transport, session_id) = noise::handshake_initiator(&mut stream, &t_x25519_pub)
         .await
         .unwrap();
-    let noise_stream =
-        noise::NoiseStream::new(stream, transport, session_id, "test-nested-quic-client".to_string());
+    let noise_stream = noise::NoiseStream::new(
+        stream,
+        transport,
+        session_id,
+        "test-nested-quic-client".to_string(),
+    );
 
     // Create RelayConnection to T
-    let (mut conn_to_t, driver) = RelayConnection::from_noise_stream(noise_stream).await.unwrap();
+    let (mut conn_to_t, driver) = RelayConnection::from_noise_stream(noise_stream)
+        .await
+        .unwrap();
     conn_to_t.add_driver(driver);
     fund_session(&conn_to_t, TEST_SESSION_PAYMENT).await;
     let mut h2_to_t = conn_to_t.clone_send_request().await;
@@ -1172,20 +1244,18 @@ async fn test_connector_quic_hop() {
     let (s_addr, s_pubkey) = start_monad_server().await;
 
     // Use the client connector with a QUIC hop (single key per hop)
-    let conn = connector::connect_through_chain(
-        &[
-            Hop {
-                addr: s_addr.to_string(),
-                pubkey: s_pubkey,
-                use_quic: false,
-            },
-            Hop {
-                addr: format!("127.0.0.1:{}", t_addr.port()),
-                pubkey: t_pubkey,
-                use_quic: true,
-            },
-        ],
-    )
+    let conn = connector::connect_through_chain(&[
+        Hop {
+            addr: s_addr.to_string(),
+            pubkey: s_pubkey,
+            use_quic: false,
+        },
+        Hop {
+            addr: format!("127.0.0.1:{}", t_addr.port()),
+            pubkey: t_pubkey,
+            use_quic: true,
+        },
+    ])
     .await
     .unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
@@ -1228,20 +1298,18 @@ async fn test_concurrent_quic_pool_access() {
         let t_pubkey = t_pubkey.clone();
 
         handles.push(tokio::spawn(async move {
-            let conn = connector::connect_through_chain(
-                &[
-                    Hop {
-                        addr: s_addr.to_string(),
-                        pubkey: s_pubkey,
-                        use_quic: false,
-                    },
-                    Hop {
-                        addr: format!("127.0.0.1:{t_port}"),
-                        pubkey: t_pubkey,
-                        use_quic: true,
-                    },
-                ],
-            )
+            let conn = connector::connect_through_chain(&[
+                Hop {
+                    addr: s_addr.to_string(),
+                    pubkey: s_pubkey,
+                    use_quic: false,
+                },
+                Hop {
+                    addr: format!("127.0.0.1:{t_port}"),
+                    pubkey: t_pubkey,
+                    use_quic: true,
+                },
+            ])
             .await
             .unwrap();
             fund_session(&conn, TEST_SESSION_PAYMENT).await;
@@ -1272,13 +1340,11 @@ async fn test_quic_first_hop() {
     let (server_addr, pubkey) = start_monad_server_with_quic().await;
 
     // Client connects directly via QUIC (use_quic on the first hop)
-    let conn = connector::connect_through_chain(
-        &[Hop {
-            addr: server_addr.to_string(),
-            pubkey: pubkey.clone(),
-            use_quic: true,
-        }],
-    )
+    let conn = connector::connect_through_chain(&[Hop {
+        addr: server_addr.to_string(),
+        pubkey: pubkey.clone(),
+        use_quic: true,
+    }])
     .await
     .unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
@@ -1302,20 +1368,18 @@ async fn test_quic_first_hop_then_tcp() {
     let (t_addr, t_pubkey) = start_monad_server().await;
 
     // Client connects to S via QUIC, then S forwards to T via TCP
-    let conn = connector::connect_through_chain(
-        &[
-            Hop {
-                addr: s_addr.to_string(),
-                pubkey: s_pubkey,
-                use_quic: true,
-            },
-            Hop {
-                addr: t_addr.to_string(),
-                pubkey: t_pubkey,
-                use_quic: false,
-            },
-        ],
-    )
+    let conn = connector::connect_through_chain(&[
+        Hop {
+            addr: s_addr.to_string(),
+            pubkey: s_pubkey,
+            use_quic: true,
+        },
+        Hop {
+            addr: t_addr.to_string(),
+            pubkey: t_pubkey,
+            use_quic: false,
+        },
+    ])
     .await
     .unwrap();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;

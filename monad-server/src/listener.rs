@@ -61,7 +61,12 @@ pub async fn discover_spilman_mint_cache(
             by_unit.entry(unit.clone()).or_default().push(id.clone());
             by_id.insert(
                 id,
-                build_keyset_info_json(&keyset.id, &keyset.unit, &keyset.keys, keyset.input_fee_ppk),
+                build_keyset_info_json(
+                    &keyset.id,
+                    &keyset.unit,
+                    &keyset.keys,
+                    keyset.input_fee_ppk,
+                ),
             );
         }
 
@@ -72,7 +77,9 @@ pub async fn discover_spilman_mint_cache(
 
         info!(mint = %mint_url, units = ?by_unit.keys().collect::<Vec<_>>(), "discovered trusted mint keysets");
         cache.advertised.insert(mint_url.clone(), by_unit);
-        cache.keyset_info_json_by_mint.insert(mint_url.clone(), by_id);
+        cache
+            .keyset_info_json_by_mint
+            .insert(mint_url.clone(), by_id);
     }
 
     Ok(cache)
@@ -100,7 +107,8 @@ pub async fn run(
     // Create the QUIC connection pool for outbound CONNECT quic: forwarding.
     // This is separate from the QUIC endpoint (which handles inbound connections).
     let quic_pool = QuicPool::new().ok();
-    let discovered_spilman_mint_cache = Arc::new(discover_spilman_mint_cache(&config.trusted_mint_units).await?);
+    let discovered_spilman_mint_cache =
+        Arc::new(discover_spilman_mint_cache(&config.trusted_mint_units).await?);
 
     // Accept loop — runs until Ctrl+C
     loop {

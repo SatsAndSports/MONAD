@@ -46,10 +46,9 @@ pub struct QuicPool {
 impl QuicPool {
     /// Create a new empty QUIC connection pool.
     pub fn new() -> io::Result<Self> {
-        let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("QUIC endpoint error: {e}"))
-            })?;
+        let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("QUIC endpoint error: {e}"))
+        })?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
@@ -167,9 +166,7 @@ impl QuicPool {
                             let stream_result = conn.open_bi().await.map_err(|e| {
                                 io::Error::new(
                                     io::ErrorKind::Other,
-                                    format!(
-                                        "failed to open QUIC stream to {target_addr}: {e}"
-                                    ),
+                                    format!("failed to open QUIC stream to {target_addr}: {e}"),
                                 )
                             });
 
@@ -184,9 +181,7 @@ impl QuicPool {
                             let _ = tx.send(Some(Ok(conn)));
 
                             let (send, recv) = stream_result?;
-                            info!(
-                                "QUIC connection to {target_addr} established and cached"
-                            );
+                            info!("QUIC connection to {target_addr} established and cached");
                             return Ok(QuicStream::new(send, recv));
                         }
                         Err(e) => {
@@ -229,13 +224,12 @@ impl QuicPool {
             })?;
 
         // Build client config with pinned key verification
-        let client_config =
-            monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to build QUIC client config: {e}"),
-                )
-            })?;
+        let client_config = monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to build QUIC client config: {e}"),
+            )
+        })?;
 
         info!("establishing new QUIC connection to {target_addr} ({socket_addr})");
 

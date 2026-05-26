@@ -59,10 +59,7 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
     Ok(())
 }
 
-async fn handle_stream(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-) -> Result<()> {
+async fn handle_stream(mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Result<()> {
     let stream_id = send.id();
 
     // Read all data and echo it back
@@ -118,7 +115,7 @@ pub fn build_server_config(cert_pem: &str, key_pem: &str) -> Result<quinn::Serve
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(2048u32.into());
     transport.max_concurrent_uni_streams(0u32.into()); // only bidi for now
-    // Increase flow-control windows to support large payloads per stream
+                                                       // Increase flow-control windows to support large payloads per stream
     transport.stream_receive_window(8_000_000u32.into());
     transport.receive_window(16_000_000u32.into());
     server_config.transport_config(Arc::new(transport));

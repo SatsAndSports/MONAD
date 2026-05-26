@@ -66,8 +66,7 @@ fn parse_hop(s: &str) -> anyhow::Result<Hop> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -102,12 +101,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Open the long-lived control stream before accepting SOCKS traffic.
     let last_hop = hops.last().unwrap();
-    let hop_label = format!(
-        "hop {}/{} to {}",
-        hops.len(),
-        hops.len(),
-        last_hop.addr
-    );
+    let hop_label = format!("hop {}/{} to {}", hops.len(), hops.len(), last_hop.addr);
     let (control_task, ready_rx) =
         control::start_control_task(&conn, cli.fake_payment_millisats, &hop_label).await?;
     conn.add_task(control_task);
@@ -130,10 +124,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn accept_loop(
-    socks_listener: &TcpListener,
-    conn: &RelayConnection,
-) -> anyhow::Result<()> {
+async fn accept_loop(socks_listener: &TcpListener, conn: &RelayConnection) -> anyhow::Result<()> {
     let mut tunnels = JoinSet::new();
 
     loop {

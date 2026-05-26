@@ -66,10 +66,11 @@ where
     let msg = read_noise_msg(stream).await?;
     noise.read_message(&msg, &mut buf).map_err(noise_err)?;
 
-    let handshake_hash: [u8; 32] = noise
-        .get_handshake_hash()
-        .try_into()
-        .map_err(|_| noise_err(snow::Error::State(snow::error::StateProblem::HandshakeNotFinished)))?;
+    let handshake_hash: [u8; 32] = noise.get_handshake_hash().try_into().map_err(|_| {
+        noise_err(snow::Error::State(
+            snow::error::StateProblem::HandshakeNotFinished,
+        ))
+    })?;
     let transport = noise.into_transport_mode().map_err(noise_err)?;
     Ok((transport, handshake_hash))
 }
@@ -101,10 +102,11 @@ where
     let len = noise.write_message(&[], &mut buf).map_err(noise_err)?;
     write_noise_msg(stream, &buf[..len]).await?;
 
-    let handshake_hash: [u8; 32] = noise
-        .get_handshake_hash()
-        .try_into()
-        .map_err(|_| noise_err(snow::Error::State(snow::error::StateProblem::HandshakeNotFinished)))?;
+    let handshake_hash: [u8; 32] = noise.get_handshake_hash().try_into().map_err(|_| {
+        noise_err(snow::Error::State(
+            snow::error::StateProblem::HandshakeNotFinished,
+        ))
+    })?;
     let transport = noise.into_transport_mode().map_err(noise_err)?;
     Ok((transport, handshake_hash))
 }
@@ -254,9 +256,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for NoiseStream<T> {
                 None => {
                     // We need to read the 2-byte length prefix
                     if me.read_ciphertext.len() >= LEN_PREFIX_SIZE {
-                        let len =
-                            u16::from_be_bytes([me.read_ciphertext[0], me.read_ciphertext[1]])
-                                as usize;
+                        let len = u16::from_be_bytes([me.read_ciphertext[0], me.read_ciphertext[1]])
+                            as usize;
                         me.read_ciphertext.advance(LEN_PREFIX_SIZE);
                         if len > NOISE_MAX_MSG_LEN {
                             return Poll::Ready(Err(io::Error::new(
@@ -280,8 +281,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for NoiseStream<T> {
                                 return Poll::Ready(Ok(()));
                             }
                             me.wire_bytes_read += n as u64;
-                            me.read_ciphertext
-                                .extend_from_slice(tmp_read_buf.filled());
+                            me.read_ciphertext.extend_from_slice(tmp_read_buf.filled());
                             continue;
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -324,8 +324,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for NoiseStream<T> {
                                 )));
                             }
                             me.wire_bytes_read += n as u64;
-                            me.read_ciphertext
-                                .extend_from_slice(tmp_read_buf.filled());
+                            me.read_ciphertext.extend_from_slice(tmp_read_buf.filled());
                             continue;
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -469,25 +468,17 @@ mod tests {
                 let n = noise_stream.read(&mut buf).await.unwrap();
                 assert_eq!(&buf[..n], b"hello from client");
 
-                noise_stream
-                    .write_all(b"hello from server")
-                    .await
-                    .unwrap();
+                noise_stream.write_all(b"hello from server").await.unwrap();
                 noise_stream.flush().await.unwrap();
             }
         });
 
         let client_handle = tokio::spawn(async move {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let (transport, session_id) =
-                handshake_initiator(&mut stream, &pubkey).await.unwrap();
-            let mut noise_stream =
-                NoiseStream::new(stream, transport, session_id, "test-client");
+            let (transport, session_id) = handshake_initiator(&mut stream, &pubkey).await.unwrap();
+            let mut noise_stream = NoiseStream::new(stream, transport, session_id, "test-client");
 
-            noise_stream
-                .write_all(b"hello from client")
-                .await
-                .unwrap();
+            noise_stream.write_all(b"hello from client").await.unwrap();
             noise_stream.flush().await.unwrap();
 
             let mut buf = vec![0u8; 1024];
@@ -536,8 +527,7 @@ mod tests {
 
         let client_handle = tokio::spawn(async move {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let (transport, session_id) =
-                handshake_initiator(&mut stream, &pubkey).await.unwrap();
+            let (transport, session_id) = handshake_initiator(&mut stream, &pubkey).await.unwrap();
             let mut noise_stream =
                 NoiseStream::new(stream, transport, session_id, "test-client-large");
 
@@ -561,16 +551,14 @@ mod tests {
             let privkey = privkey.clone();
             async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let (_, session_id) =
-                    handshake_responder(&mut stream, &privkey).await.unwrap();
+                let (_, session_id) = handshake_responder(&mut stream, &privkey).await.unwrap();
                 session_id
             }
         });
 
         let client_handle = tokio::spawn(async move {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let (_, session_id) =
-                handshake_initiator(&mut stream, &pubkey).await.unwrap();
+            let (_, session_id) = handshake_initiator(&mut stream, &pubkey).await.unwrap();
             session_id
         });
 

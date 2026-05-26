@@ -78,7 +78,9 @@ fn main() -> Result<()> {
         } => {
             init_tracing();
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(monad_quic::client::run_client(connect, &pin, streams, bytes))
+            rt.block_on(monad_quic::client::run_client(
+                connect, &pin, streams, bytes,
+            ))
         }
     }
 }

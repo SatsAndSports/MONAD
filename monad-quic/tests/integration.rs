@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use quinn::Endpoint;
 use rand::RngCore;
+use std::net::SocketAddr;
 
 /// Helper: generate key material, start a QUIC echo server on a random port,
 /// return the server endpoint (to keep it alive) and the connect address + pin.
@@ -144,7 +144,9 @@ async fn test_1000_concurrent_streams() {
 async fn test_large_payload_single_stream() {
     let (_server, addr, pin) = start_echo_server().await.unwrap();
     // 4 MB on a single stream
-    let ok = run_echo_client(addr, &pin, 1, 4 * 1024 * 1024).await.unwrap();
+    let ok = run_echo_client(addr, &pin, 1, 4 * 1024 * 1024)
+        .await
+        .unwrap();
     assert_eq!(ok, 1, "expected single large-payload stream to succeed");
 }
 

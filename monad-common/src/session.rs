@@ -137,11 +137,9 @@ impl RelayConnection {
     {
         let session_id = *noise_stream.session_id();
 
-        let (h2_client, h2_conn) = client::handshake(noise_stream)
-            .await
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("h2 handshake error: {e}"))
-            })?;
+        let (h2_client, h2_conn) = client::handshake(noise_stream).await.map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("h2 handshake error: {e}"))
+        })?;
 
         let driver_handle = tokio::spawn(async move {
             if let Err(e) = h2_conn.await {
@@ -200,15 +198,11 @@ impl RelayConnection {
 
         let (response_future, h2_send) = h2_client
             .send_request(request, false)
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}"))
-            })?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}")))?;
 
         let response = response_future
             .await
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("h2 response error: {e}"))
-            })?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 response error: {e}")))?;
 
         if !response.status().is_success() {
             return Err(io::Error::new(
@@ -289,35 +283,25 @@ impl RelayConnection {
 
         let uri: Uri = target_authority
             .parse()
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("bad URI: {e}"))
-            })?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad URI: {e}")))?;
 
-        let mut builder = Request::builder()
-            .method(Method::CONNECT)
-            .uri(uri);
+        let mut builder = Request::builder().method(Method::CONNECT).uri(uri);
 
         if let Some(pin) = quic_pin {
             builder = builder.header("quic-pin", hex::encode(pin));
         }
 
-        let request = builder
-            .body(())
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("bad request: {e}"))
-            })?;
+        let request = builder.body(()).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad request: {e}"))
+        })?;
 
         let (response_future, h2_send) = h2_client
             .send_request(request, false)
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}"))
-            })?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 send error: {e}")))?;
 
         let response = response_future
             .await
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("h2 response error: {e}"))
-            })?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 response error: {e}")))?;
 
         if !response.status().is_success() {
             return Err(io::Error::new(

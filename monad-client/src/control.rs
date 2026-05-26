@@ -1,9 +1,7 @@
 use bytes::Bytes;
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::protocol::{ClientMessage, ServerMessage};
-use monad_common::session::{
-    RelayConnection, SessionPricing, SessionSpilmanInfo,
-};
+use monad_common::session::{RelayConnection, SessionPricing, SessionSpilmanInfo};
 use std::io;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
@@ -47,7 +45,13 @@ async fn run_control_task(
     let mut ready_tx = Some(ready_tx);
 
     // Send Hello as the first message on the control stream.
-    send_control_message(&mut h2_send, &ClientMessage::Hello { version: CLIENT_VERSION }).await?;
+    send_control_message(
+        &mut h2_send,
+        &ClientMessage::Hello {
+            version: CLIENT_VERSION,
+        },
+    )
+    .await?;
 
     while let Some(chunk) = h2_recv.data().await {
         let data = chunk
@@ -79,11 +83,7 @@ async fn run_control_task(
                     remaining_milli_sats,
                     paused,
                 } => {
-                    let pricing = SessionPricing::new(
-                        version,
-                        active_in_rate,
-                        active_out_rate,
-                    );
+                    let pricing = SessionPricing::new(version, active_in_rate, active_out_rate);
                     info!(
                         "session status: paused={} balance={} paid={} in={} out={} linked={:?}",
                         paused,
@@ -129,7 +129,10 @@ async fn run_control_task(
                 ServerMessage::ChannelEvicted { channel_id } => {
                     warn!("channel {channel_id} evicted from this session");
                 }
-                ServerMessage::ChannelLinkAccepted { channel_id, capacity } => {
+                ServerMessage::ChannelLinkAccepted {
+                    channel_id,
+                    capacity,
+                } => {
                     info!("channel {channel_id} linked successfully (capacity={capacity})");
                 }
                 ServerMessage::Error { message } => {

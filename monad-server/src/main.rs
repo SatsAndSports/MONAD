@@ -41,8 +41,7 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -60,13 +59,19 @@ async fn main() -> anyhow::Result<()> {
             println!("#");
             println!("# One key is used for both Noise and QUIC authentication.");
             println!();
-            println!("Private key (Ed25519 seed): {}", hex::encode(identity.seed()));
+            println!(
+                "Private key (Ed25519 seed): {}",
+                hex::encode(identity.seed())
+            );
             println!("Public key (Ed25519):       {pubkey}");
             println!();
             println!("# --- QUIC certificate (derived from the same key) ---");
             println!("{}", quic_km.cert_pem);
             println!("# Run the server with:");
-            println!("#   monad-server run --private-key {} --quic", hex::encode(identity.seed()));
+            println!(
+                "#   monad-server run --private-key {} --quic",
+                hex::encode(identity.seed())
+            );
             println!("#");
             println!("# Give the public key to clients:");
             println!("#   {pubkey}");

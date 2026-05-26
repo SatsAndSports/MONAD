@@ -42,13 +42,11 @@ pub async fn connect(
     server_addr: &str,
     server_pubkey: Ed25519Pubkey,
 ) -> io::Result<RelayConnection> {
-    connect_through_chain(
-        &[Hop {
-            addr: server_addr.to_string(),
-            pubkey: server_pubkey,
-            use_quic: false,
-        }],
-    )
+    connect_through_chain(&[Hop {
+        addr: server_addr.to_string(),
+        pubkey: server_pubkey,
+        use_quic: false,
+    }])
     .await
 }
 
@@ -63,9 +61,7 @@ pub async fn connect(
 ///
 /// T only sees encrypted Noise bytes. It has no idea that inside those bytes
 /// is another MONAD session asking S to proxy onward.
-pub async fn connect_through_chain(
-    hops: &[Hop],
-) -> io::Result<RelayConnection> {
+pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> {
     if hops.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -81,13 +77,12 @@ pub async fn connect_through_chain(
 
         let pinned_spki = first.pubkey.to_spki_der();
 
-        let client_config =
-            monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to build QUIC client config: {e}"),
-                )
-            })?;
+        let client_config = monad_quic::client::build_client_config(pinned_spki).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to build QUIC client config: {e}"),
+            )
+        })?;
 
         // Resolve the target address
         let socket_addr = tokio::net::lookup_host(&first.addr)
@@ -146,7 +141,7 @@ fn chain_from_stream<S>(
     mut stream: S,
     hops: &[Hop],
     hop_idx: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<RelayConnection>> + Send>>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<RelayConnection>> + Send>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -154,69 +149,73 @@ where
     let hops = hops.to_vec();
 
     Box::pin(async move {
-    let hop = &hops[hop_idx];
+        let hop = &hops[hop_idx];
 
-    info!(
-        "hop {}/{}: Noise handshake with {}",
-        hop_idx + 1,
-        hops.len(),
-        hop.addr
-    );
-
-    // Derive X25519 public key from the Ed25519 public key for Noise
-    let x25519_pub = hop.pubkey.to_x25519()?;
-
-    // Noise NK handshake with this hop
-    let (transport, session_id) = noise::handshake_initiator(&mut stream, &x25519_pub).await?;
-    let label = format!("client hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
-    let noise_stream = NoiseStream::new(stream, transport, session_id, label);
-
-    // H2 handshake over the encrypted stream
-    let (conn, driver) = RelayConnection::from_noise_stream(noise_stream).await?;
-
-    info!("hop {}/{}: H2 connection established", hop_idx + 1, hops.len());
-
-    if hop_idx < hops.len() - 1 {
-        let hop_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
-        let (control_task, ready_rx) =
-            control::start_control_task(&conn, INTERMEDIATE_FAKE_PAYMENT_MILLISATS, &hop_label)
-                .await?;
-        ready_rx.await.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("control task exited before hop {} was funded", hop.addr),
-            )
-        })?;
-
-        // Not the last hop — open a CONNECT tunnel to the next hop
-        let next = &hops[hop_idx + 1];
         info!(
-            "hop {}/{}: opening CONNECT tunnel to next hop {}",
+            "hop {}/{}: Noise handshake with {}",
             hop_idx + 1,
             hops.len(),
-            next.addr
+            hop.addr
         );
 
-        // Open the CONNECT tunnel, with QUIC pin if the next hop uses QUIC
-        let h2_connect_stream = if next.use_quic {
-            let spki = next.pubkey.to_spki_der();
-            conn.open_tunnel_quic(&next.addr, &spki).await?
-        } else {
-            conn.open_tunnel(&next.addr).await?
-        };
+        // Derive X25519 public key from the Ed25519 public key for Noise
+        let x25519_pub = hop.pubkey.to_x25519()?;
 
-        // Recurse: perform Noise + H2 over this tunnel for the next hop.
-        // Attach this hop's driver to the final connection.
-        let mut next_conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;
-        next_conn.add_driver(driver);
-        next_conn.add_task(control_task);
-        Ok(next_conn)
-    } else {
-        // Last hop — attach the driver and return for actual use
-        let mut conn = conn;
-        conn.add_driver(driver);
-        info!("tunnel chain established ({} hops)", hops.len());
-        Ok(conn)
-    }
+        // Noise NK handshake with this hop
+        let (transport, session_id) = noise::handshake_initiator(&mut stream, &x25519_pub).await?;
+        let label = format!("client hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
+        let noise_stream = NoiseStream::new(stream, transport, session_id, label);
+
+        // H2 handshake over the encrypted stream
+        let (conn, driver) = RelayConnection::from_noise_stream(noise_stream).await?;
+
+        info!(
+            "hop {}/{}: H2 connection established",
+            hop_idx + 1,
+            hops.len()
+        );
+
+        if hop_idx < hops.len() - 1 {
+            let hop_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
+            let (control_task, ready_rx) =
+                control::start_control_task(&conn, INTERMEDIATE_FAKE_PAYMENT_MILLISATS, &hop_label)
+                    .await?;
+            ready_rx.await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("control task exited before hop {} was funded", hop.addr),
+                )
+            })?;
+
+            // Not the last hop — open a CONNECT tunnel to the next hop
+            let next = &hops[hop_idx + 1];
+            info!(
+                "hop {}/{}: opening CONNECT tunnel to next hop {}",
+                hop_idx + 1,
+                hops.len(),
+                next.addr
+            );
+
+            // Open the CONNECT tunnel, with QUIC pin if the next hop uses QUIC
+            let h2_connect_stream = if next.use_quic {
+                let spki = next.pubkey.to_spki_der();
+                conn.open_tunnel_quic(&next.addr, &spki).await?
+            } else {
+                conn.open_tunnel(&next.addr).await?
+            };
+
+            // Recurse: perform Noise + H2 over this tunnel for the next hop.
+            // Attach this hop's driver to the final connection.
+            let mut next_conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;
+            next_conn.add_driver(driver);
+            next_conn.add_task(control_task);
+            Ok(next_conn)
+        } else {
+            // Last hop — attach the driver and return for actual use
+            let mut conn = conn;
+            conn.add_driver(driver);
+            info!("tunnel chain established ({} hops)", hops.len());
+            Ok(conn)
+        }
     }) // close Box::pin(async move { ... })
 }

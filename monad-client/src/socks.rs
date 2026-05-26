@@ -127,8 +127,7 @@ pub async fn send_reply(
 ) -> io::Result<()> {
     let mut reply = vec![
         0x05, // VER
-        reply_code,
-        0x00, // RSV
+        reply_code, 0x00, // RSV
         0x01, // ATYP: IPv4
         0, 0, 0, 0, // BND.ADDR (0.0.0.0)
     ];

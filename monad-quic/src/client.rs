@@ -44,9 +44,7 @@ pub async fn run_client(
     let mut handles = Vec::with_capacity(streams);
     for i in 0..streams {
         let conn = conn.clone();
-        let handle = tokio::spawn(async move {
-            run_stream(conn, i, bytes_per_stream).await
-        });
+        let handle = tokio::spawn(async move { run_stream(conn, i, bytes_per_stream).await });
         handles.push(handle);
     }
 
@@ -75,14 +73,15 @@ pub async fn run_client(
     Ok(())
 }
 
-async fn run_stream(
-    conn: quinn::Connection,
-    index: usize,
-    bytes_per_stream: usize,
-) -> Result<()> {
+async fn run_stream(conn: quinn::Connection, index: usize, bytes_per_stream: usize) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     let stream_id = send.id();
-    info!(index, ?stream_id, bytes = bytes_per_stream, "stream opened, sending data");
+    info!(
+        index,
+        ?stream_id,
+        bytes = bytes_per_stream,
+        "stream opened, sending data"
+    );
 
     // Generate random payload
     let mut payload = vec![0u8; bytes_per_stream];
@@ -110,7 +109,12 @@ async fn run_stream(
         anyhow::bail!("stream {index}: echo data mismatch");
     }
 
-    info!(index, ?stream_id, bytes = bytes_per_stream, "stream echo verified OK");
+    info!(
+        index,
+        ?stream_id,
+        bytes = bytes_per_stream,
+        "stream echo verified OK"
+    );
     Ok(())
 }
 

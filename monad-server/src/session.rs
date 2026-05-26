@@ -4,17 +4,17 @@
 //! stream. The session starts paused-by-default with zero balance. A long-lived
 //! `POST /control` stream is used to fund and observe the whole session.
 
+use crate::listener::SpilmanMintCache;
 use crate::proxy;
 use crate::quic_pool::QuicPool;
-use crate::listener::SpilmanMintCache;
 use bytes::Bytes;
-use cashu::nuts::{SecretKey};
+use cashu::nuts::SecretKey;
 use h2::server;
 use http::{Method, Response, StatusCode};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise::NoiseStream;
 use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerMessage};
-use monad_common::session::{SessionPricing, clamp_i128_to_i64};
+use monad_common::session::{clamp_i128_to_i64, SessionPricing};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -132,10 +132,7 @@ impl SessionState {
         self.inner.lock().await.paused
     }
 
-    async fn attach_control(
-        &self,
-        tx: mpsc::UnboundedSender<ServerMessage>,
-    ) -> Result<(), ()> {
+    async fn attach_control(&self, tx: mpsc::UnboundedSender<ServerMessage>) -> Result<(), ()> {
         let mut inner = self.inner.lock().await;
         if inner.control_attached {
             return Err(());
@@ -221,13 +218,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
     ) -> io::Result<Self> {
         let session_id = *noise_stream.session_id();
 
-        let h2_conn = server::handshake(noise_stream)
-            .await
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("h2 handshake error: {e}"))
-            })?;
+        let h2_conn = server::handshake(noise_stream).await.map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("h2 handshake error: {e}"))
+        })?;
 
-        info!(session_id = hex::encode(session_id), "H2 connection established");
+        info!(
+            session_id = hex::encode(session_id),
+            "H2 connection established"
+        );
 
         Ok(Self {
             h2_conn,
@@ -311,7 +309,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                 let pool = match &self.quic_pool {
                                     Some(p) => p.clone(),
                                     None => {
-                                        warn!("CONNECT with quic-pin but QUIC pool is not available");
+                                        warn!(
+                                            "CONNECT with quic-pin but QUIC pool is not available"
+                                        );
                                         let resp = Response::builder()
                                             .status(StatusCode::BAD_GATEWAY)
                                             .body(())
@@ -334,16 +334,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                                 let label = format!("quic:{authority}");
                                                 let state = self.state.clone();
                                                 tokio::spawn(async move {
-                                                    if let Err(e) = proxy::proxy_bidirectional_accounted(
-                                                        h2_send,
-                                                        h2_recv,
-                                                        quic_stream,
-                                                        &label,
-                                                        state,
-                                                    )
-                                                    .await
+                                                    if let Err(e) =
+                                                        proxy::proxy_bidirectional_accounted(
+                                                            h2_send,
+                                                            h2_recv,
+                                                            quic_stream,
+                                                            &label,
+                                                            state,
+                                                        )
+                                                        .await
                                                     {
-                                                        error!("tunnel to quic:{authority} error: {e}");
+                                                        error!(
+                                                            "tunnel to quic:{authority} error: {e}"
+                                                        );
                                                     }
                                                 });
                                             }
@@ -376,14 +379,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                                 let (_, h2_recv) = request.into_parts();
                                                 let state = self.state.clone();
                                                 tokio::spawn(async move {
-                                                    if let Err(e) = proxy::proxy_bidirectional_accounted(
-                                                        h2_send,
-                                                        h2_recv,
-                                                        tcp_stream,
-                                                        &authority,
-                                                        state,
-                                                    )
-                                                    .await
+                                                    if let Err(e) =
+                                                        proxy::proxy_bidirectional_accounted(
+                                                            h2_send, h2_recv, tcp_stream,
+                                                            &authority, state,
+                                                        )
+                                                        .await
                                                     {
                                                         error!("tunnel to {authority} error: {e}");
                                                     }
@@ -416,10 +417,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<T> {
                                 continue;
                             }
 
-                            let resp = Response::builder()
-                                .status(StatusCode::OK)
-                                .body(())
-                                .unwrap();
+                            let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
                             match respond.send_response(resp, false) {
                                 Ok(h2_send) => {
                                     let (_, h2_recv) = request.into_parts();
@@ -494,8 +492,9 @@ async fn read_one_control_message(
             if line.is_empty() {
                 continue;
             }
-            let msg = serde_json::from_slice::<ClientMessage>(line)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid message: {e}")))?;
+            let msg = serde_json::from_slice::<ClientMessage>(line).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("invalid message: {e}"))
+            })?;
             return Ok(Some(msg));
         }
 
@@ -506,7 +505,10 @@ async fn read_one_control_message(
                 buf.extend_from_slice(&data);
             }
             Some(Err(e)) => {
-                return Err(io::Error::new(io::ErrorKind::Other, format!("h2 recv error: {e}")));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("h2 recv error: {e}"),
+                ));
             }
             None => return Ok(None),
         }
