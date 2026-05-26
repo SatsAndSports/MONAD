@@ -8,7 +8,7 @@ use monad_common::identity::ServerIdentity;
 use monad_common::noise;
 use monad_common::noise::NoiseStream;
 use monad_common::protocol::MintUnitKeysets;
-use monad_quic::stream::QuicStream;
+use monad_quic::stream::accept_monad_stream;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
@@ -200,7 +200,13 @@ pub async fn run(
                                 let quic_pool = quic_pool.clone();
                                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
                                 tokio::spawn(async move {
-                                    let mut quic_stream = QuicStream::new(send, recv);
+                                    let mut quic_stream = match accept_monad_stream(send, recv).await {
+                                        Ok(stream) => stream,
+                                        Err(e) => {
+                                            error!("invalid QUIC MONAD stream from {remote} ({stream_id:?}): {e}");
+                                            return;
+                                        }
+                                    };
 
                                     let (transport, session_id) = match noise::handshake_responder(
                                         &mut quic_stream,

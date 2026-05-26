@@ -12,7 +12,7 @@
 //! - callers to different targets are never blocked by each other
 //! - failed handshakes clean up the placeholder so the next caller retries
 
-use monad_quic::stream::QuicStream;
+use monad_quic::stream::{open_monad_stream, QuicStream};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -96,10 +96,10 @@ impl QuicPool {
 
             match action {
                 Action::UseExisting(conn) => {
-                    match conn.open_bi().await {
-                        Ok((send, recv)) => {
+                    match open_monad_stream(&conn).await {
+                        Ok(stream) => {
                             info!("reusing QUIC connection to {target_addr}");
-                            return Ok(QuicStream::new(send, recv));
+                            return Ok(stream);
                         }
                         Err(e) => {
                             // Connection is dead — remove it and retry.
@@ -163,12 +163,7 @@ impl QuicPool {
                     match self.establish_connection(target_addr, pinned_spki).await {
                         Ok(conn) => {
                             // Open the first stream.
-                            let stream_result = conn.open_bi().await.map_err(|e| {
-                                io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!("failed to open QUIC stream to {target_addr}: {e}"),
-                                )
-                            });
+                            let stream_result = open_monad_stream(&conn).await;
 
                             // Promote to Ready in the pool, notify waiters.
                             {
@@ -180,9 +175,8 @@ impl QuicPool {
                             }
                             let _ = tx.send(Some(Ok(conn)));
 
-                            let (send, recv) = stream_result?;
                             info!("QUIC connection to {target_addr} established and cached");
-                            return Ok(QuicStream::new(send, recv));
+                            return stream_result;
                         }
                         Err(e) => {
                             // Remove the Pending placeholder, notify waiters of failure.

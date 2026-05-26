@@ -6,7 +6,15 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+pub const STREAM_KIND_PLAIN_NOISE: u8 = 0x00;
+pub const STREAM_ERROR_UNKNOWN_KIND: u64 = 0x01;
+
+fn stream_error_code(code: u64) -> quinn::VarInt {
+    quinn::VarInt::from_u64(code).expect("valid QUIC application error code")
+}
 
 /// A bidirectional QUIC stream that implements `AsyncRead + AsyncWrite`.
 ///
@@ -22,6 +30,49 @@ impl QuicStream {
     pub fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
         Self { send, recv }
     }
+}
+
+/// Open a QUIC bidirectional stream carrying a MONAD session.
+pub async fn open_monad_stream(conn: &quinn::Connection) -> io::Result<QuicStream> {
+    let (mut send, recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| io::Error::other(format!("failed to open QUIC stream: {e}")))?;
+    send.write_all(&[STREAM_KIND_PLAIN_NOISE])
+        .await
+        .map_err(|e| io::Error::other(format!("failed to write QUIC stream preamble: {e}")))?;
+    send.flush()
+        .await
+        .map_err(|e| io::Error::other(format!("failed to flush QUIC stream preamble: {e}")))?;
+    Ok(QuicStream::new(send, recv))
+}
+
+/// Accept a QUIC bidirectional stream carrying a MONAD session.
+pub async fn accept_monad_stream(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> io::Result<QuicStream> {
+    let mut kind = [0u8; 1];
+    if let Err(e) = recv.read_exact(&mut kind).await {
+        let code = stream_error_code(STREAM_ERROR_UNKNOWN_KIND);
+        let _ = recv.stop(code);
+        let _ = send.reset(code);
+        return Err(io::Error::other(format!(
+            "failed to read QUIC stream kind preamble: {e}"
+        )));
+    }
+
+    if kind[0] != STREAM_KIND_PLAIN_NOISE {
+        let code = stream_error_code(STREAM_ERROR_UNKNOWN_KIND);
+        let _ = recv.stop(code);
+        let _ = send.reset(code);
+        return Err(io::Error::other(format!(
+            "unsupported QUIC stream kind: {}",
+            kind[0]
+        )));
+    }
+
+    Ok(QuicStream::new(send, recv))
 }
 
 impl AsyncRead for QuicStream {

@@ -9,7 +9,7 @@ use crate::control;
 use monad_common::identity::Ed25519Pubkey;
 use monad_common::noise::{self, NoiseStream};
 use monad_common::session::RelayConnection;
-use monad_quic::stream::QuicStream;
+use monad_quic::stream::open_monad_stream;
 use std::io;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -110,13 +110,7 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
                 )
             })?;
 
-        let (send, recv) = conn.open_bi().await.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to open QUIC stream: {e}"),
-            )
-        })?;
-        let quic_stream = QuicStream::new(send, recv);
+        let quic_stream = open_monad_stream(&conn).await?;
         info!("QUIC connected to {}", first.addr);
 
         chain_from_stream(quic_stream, hops, 0).await

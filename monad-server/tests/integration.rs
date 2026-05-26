@@ -21,13 +21,14 @@ use monad_common::noise;
 use monad_common::protocol::{ClientMessage, ServerMessage};
 use monad_common::session::RelayConnection;
 
-use monad_quic::stream::QuicStream;
+use monad_quic::stream::open_monad_stream;
 use monad_server::listener::ServerConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::time::{timeout, Duration};
 
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
 
@@ -1069,9 +1070,8 @@ async fn connect_client_quic(server_addr: SocketAddr, pubkey: &Ed25519Pubkey) ->
         .await
         .unwrap();
 
-    // Open a bidirectional QUIC stream
-    let (send, recv) = conn.open_bi().await.unwrap();
-    let mut quic_stream = QuicStream::new(send, recv);
+    // Open a bidirectional QUIC stream carrying a MONAD session.
+    let mut quic_stream = open_monad_stream(&conn).await.unwrap();
 
     // Derive X25519 public key for Noise handshake
     let x25519_pub = pubkey.to_x25519().unwrap();
@@ -1093,6 +1093,38 @@ async fn connect_client_quic(server_addr: SocketAddr, pubkey: &Ed25519Pubkey) ->
         .unwrap();
     conn.add_driver(driver);
     conn
+}
+
+#[tokio::test]
+async fn test_quic_unknown_stream_kind_rejected() {
+    let (server_addr, pubkey) = start_monad_server_with_quic().await;
+
+    let pinned_spki = pubkey.to_spki_der();
+    let client_config = monad_quic::client::build_client_config(pinned_spki).unwrap();
+
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    let conn = endpoint
+        .connect(server_addr, "monad-relay")
+        .unwrap()
+        .await
+        .unwrap();
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&[0xff]).await.unwrap();
+    send.flush().await.unwrap();
+
+    let mut buf = [0u8; 1];
+    let result = timeout(Duration::from_secs(1), recv.read(&mut buf)).await;
+    assert!(
+        result.is_ok(),
+        "server did not reject unknown stream kind promptly"
+    );
+    assert!(
+        result.unwrap().is_err(),
+        "server accepted unknown stream kind unexpectedly"
+    );
 }
 
 async fn connect_client_quic_funded(
