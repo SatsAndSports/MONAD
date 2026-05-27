@@ -1317,8 +1317,13 @@ async fn test_nested_quic_tunnel() {
         noise_secp256k1::handshake_initiator(&mut stream, &t_pubkey)
             .await
             .unwrap();
-    let noise_stream =
-        noise_secp256k1::SecpNoiseStream::new(stream, send_cipher, recv_cipher, session_id);
+    let noise_stream = noise_secp256k1::SecpNoiseStream::new(
+        stream,
+        send_cipher,
+        recv_cipher,
+        session_id,
+        "nested quic secp test",
+    );
 
     // Create RelayConnection to T
     let (mut conn_to_t, driver) = RelayConnection::from_transport_stream(noise_stream, session_id)

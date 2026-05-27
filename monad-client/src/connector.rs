@@ -197,6 +197,7 @@ where
                     send_cipher,
                     recv_cipher,
                     session_id,
+                    label,
                 );
                 RelayConnection::from_transport_stream(secp_stream, session_id).await?
             }

@@ -329,6 +329,10 @@ pub async fn run(
                                                 send_cipher,
                                                 recv_cipher,
                                                 session_id,
+                                                format!(
+                                                    "{} <-> {remote} (QUIC {stream_id:?} secp)",
+                                                    "quic"
+                                                ),
                                             );
 
                                             match relay_session_from_transport_stream(

@@ -1,4 +1,4 @@
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::schnorr::SigningKey;
 use k256::{ecdh, PublicKey};
@@ -15,6 +15,7 @@ use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 const PROLOGUE: &[u8] = b"monad-noise-secp256k1-v1";
 const MAX_MSG_LEN: usize = 65535;
 const LEN_PREFIX_SIZE: usize = 2;
+const MAX_PLAINTEXT_LEN: usize = MAX_MSG_LEN - 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecpPublicKeyBytes([u8; 33]);
@@ -87,6 +88,10 @@ pub struct SecpNoiseStream<T> {
     read_plaintext: BytesMut,
     read_ciphertext: BytesMut,
     read_expected_len: Option<usize>,
+    write_ciphertext: BytesMut,
+    wire_bytes_read: u64,
+    wire_bytes_written: u64,
+    label: String,
 }
 
 impl<T> SecpNoiseStream<T> {
@@ -95,6 +100,7 @@ impl<T> SecpNoiseStream<T> {
         send_cipher: CipherState<ChaCha20Poly1305>,
         recv_cipher: CipherState<ChaCha20Poly1305>,
         session_id: [u8; 32],
+        label: impl Into<String>,
     ) -> Self {
         Self {
             inner,
@@ -104,11 +110,51 @@ impl<T> SecpNoiseStream<T> {
             read_plaintext: BytesMut::new(),
             read_ciphertext: BytesMut::new(),
             read_expected_len: None,
+            write_ciphertext: BytesMut::new(),
+            wire_bytes_read: 0,
+            wire_bytes_written: 0,
+            label: label.into(),
         }
     }
 
     pub fn session_id(&self) -> &[u8; 32] {
         &self.session_id
+    }
+
+    fn poll_flush_pending_ciphertext(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+    {
+        while !self.write_ciphertext.is_empty() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.write_ciphertext) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write returned 0",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    self.wire_bytes_written += n as u64;
+                    self.write_ciphertext.advance(n);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T> Drop for SecpNoiseStream<T> {
+    fn drop(&mut self) {
+        tracing::debug!(
+            label = %self.label,
+            wire_read = self.wire_bytes_read,
+            wire_written = self.wire_bytes_written,
+            wire_total = self.wire_bytes_read + self.wire_bytes_written,
+            "SecpNoiseStream closed"
+        );
     }
 }
 
@@ -154,6 +200,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for SecpNoiseStream<T> {
                             if n == 0 {
                                 return Poll::Ready(Ok(()));
                             }
+                            me.wire_bytes_read += n as u64;
                             me.read_ciphertext.extend_from_slice(tmp_read_buf.filled());
                             continue;
                         }
@@ -181,8 +228,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for SecpNoiseStream<T> {
                         Poll::Ready(Ok(())) => {
                             let n = tmp_read_buf.filled().len();
                             if n == 0 {
-                                return Poll::Ready(Ok(()));
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "connection closed mid-noise-message",
+                                )));
                             }
+                            me.wire_bytes_read += n as u64;
                             me.read_ciphertext.extend_from_slice(tmp_read_buf.filled());
                             continue;
                         }
@@ -202,38 +253,50 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SecpNoiseStream<T> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let me = self.get_mut();
+
+        match me.poll_flush_pending_ciphertext(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let plaintext_len = std::cmp::min(buf.len(), MAX_MSG_LEN - 16);
+
+        let plaintext_len = std::cmp::min(buf.len(), MAX_PLAINTEXT_LEN);
         let encrypted = me.send_cipher.encrypt_vec(&buf[..plaintext_len]);
         let len = encrypted.len() as u16;
-        let mut frame = Vec::with_capacity(LEN_PREFIX_SIZE + encrypted.len());
-        frame.extend_from_slice(&len.to_be_bytes());
-        frame.extend_from_slice(&encrypted);
+        me.write_ciphertext
+            .reserve(LEN_PREFIX_SIZE + encrypted.len());
+        me.write_ciphertext.put_slice(&len.to_be_bytes());
+        me.write_ciphertext.put_slice(&encrypted);
 
-        match Pin::new(&mut me.inner).poll_write(cx, &frame) {
-            Poll::Ready(Ok(n)) => {
-                if n == frame.len() {
-                    Poll::Ready(Ok(plaintext_len))
-                } else {
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "partial SecpNoise frame write",
-                    )))
-                }
-            }
+        match me.poll_flush_pending_ciphertext(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(plaintext_len)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Ready(Ok(plaintext_len)),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.as_mut().get_mut();
+
+        match me.poll_flush_pending_ciphertext(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut me.inner).poll_flush(cx),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let me = self.as_mut().get_mut();
+
+        match me.poll_flush_pending_ciphertext(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut me.inner).poll_shutdown(cx),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -332,6 +395,49 @@ pub async fn handshake_responder<T: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct LimitedWrite<T> {
+        inner: T,
+        max_write: usize,
+    }
+
+    impl<T> LimitedWrite<T> {
+        fn new(inner: T, max_write: usize) -> Self {
+            Self { inner, max_write }
+        }
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for LimitedWrite<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for LimitedWrite<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let limit = std::cmp::min(self.max_write, buf.len());
+            Pin::new(&mut self.inner).poll_write(cx, &buf[..limit])
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     #[tokio::test]
     async fn test_secp_noise_handshake_and_transport_roundtrip() {
@@ -343,12 +449,12 @@ mod tests {
             let (send, recv, session_id) = handshake_responder(&mut b, &server_key_clone)
                 .await
                 .unwrap();
-            SecpNoiseStream::new(b, send, recv, session_id)
+            SecpNoiseStream::new(b, send, recv, session_id, "test-secp-server")
         });
         let initiator = tokio::spawn(async move {
             let (send, recv, session_id) =
                 handshake_initiator(&mut a, &server_pubkey).await.unwrap();
-            SecpNoiseStream::new(a, send, recv, session_id)
+            SecpNoiseStream::new(a, send, recv, session_id, "test-secp-client")
         });
 
         let mut responder = responder.await.unwrap();
@@ -367,6 +473,79 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = initiator.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello back");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_secp_noise_stream_handles_partial_writes() {
+        let server_key = SecpTransportKeypair::generate();
+        let server_pubkey = server_key.pubkey();
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        let server_key_clone = server_key.clone();
+
+        let responder = tokio::spawn(async move {
+            let (send, recv, session_id) = handshake_responder(&mut b, &server_key_clone)
+                .await
+                .unwrap();
+            let limited = LimitedWrite::new(b, 3);
+            SecpNoiseStream::new(limited, send, recv, session_id, "partial-write-server")
+        });
+        let initiator = tokio::spawn(async move {
+            let (send, recv, session_id) =
+                handshake_initiator(&mut a, &server_pubkey).await.unwrap();
+            let limited = LimitedWrite::new(a, 3);
+            SecpNoiseStream::new(limited, send, recv, session_id, "partial-write-client")
+        });
+
+        let mut responder = responder.await.unwrap();
+        let mut initiator = initiator.await.unwrap();
+        let payload = vec![0x5a; MAX_PLAINTEXT_LEN * 2 + 137];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let mut received = vec![0u8; expected.len()];
+            responder.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+        });
+
+        initiator.write_all(&payload).await.unwrap();
+        initiator.flush().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_secp_noise_shutdown_flushes_buffered_ciphertext() {
+        let server_key = SecpTransportKeypair::generate();
+        let server_pubkey = server_key.pubkey();
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        let server_key_clone = server_key.clone();
+
+        let responder = tokio::spawn(async move {
+            let (send, recv, session_id) = handshake_responder(&mut b, &server_key_clone)
+                .await
+                .unwrap();
+            SecpNoiseStream::new(b, send, recv, session_id, "shutdown-server")
+        });
+        let initiator = tokio::spawn(async move {
+            let (send, recv, session_id) =
+                handshake_initiator(&mut a, &server_pubkey).await.unwrap();
+            let limited = LimitedWrite::new(a, 1);
+            SecpNoiseStream::new(limited, send, recv, session_id, "shutdown-client")
+        });
+
+        let mut responder = responder.await.unwrap();
+        let mut initiator = initiator.await.unwrap();
+        let payload = b"buffered shutdown payload".to_vec();
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let mut buf = vec![0u8; expected.len()];
+            responder.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, expected);
+        });
+
+        initiator.write_all(&payload).await.unwrap();
+        initiator.shutdown().await.unwrap();
         server.await.unwrap();
     }
 }
