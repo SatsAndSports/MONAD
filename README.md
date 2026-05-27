@@ -145,7 +145,7 @@ Single hop (TCP only):
 ```bash
 RUST_LOG=info cargo run -p monad-server -- run \
   --listen 127.0.0.1:9050 \
-  --private-key <SERVER_ED25519_SEED> \
+  --quic-cert-seed <SERVER_ED25519_SEED> \
   --transport-key <SERVER_SECP256K1_KEY>
 ```
 
@@ -154,7 +154,7 @@ With QUIC enabled (add `--quic`):
 ```bash
 RUST_LOG=info cargo run -p monad-server -- run \
   --listen 127.0.0.1:9050 \
-  --private-key <SERVER_ED25519_SEED> \
+  --quic-cert-seed <SERVER_ED25519_SEED> \
   --transport-key <SERVER_SECP256K1_KEY> \
   --quic
 ```
@@ -162,9 +162,9 @@ RUST_LOG=info cargo run -p monad-server -- run \
 Multi-hop example:
 
 ```bash
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9051 --private-key <HOP1_ED25519> --transport-key <HOP1_SECP>
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9052 --private-key <HOP2_ED25519> --transport-key <HOP2_SECP> --quic
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9053 --private-key <HOP3_ED25519> --transport-key <HOP3_SECP> --quic
+RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9051 --quic-cert-seed <HOP1_ED25519> --transport-key <HOP1_SECP>
+RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9052 --quic-cert-seed <HOP2_ED25519> --transport-key <HOP2_SECP> --quic
+RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9053 --quic-cert-seed <HOP3_ED25519> --transport-key <HOP3_SECP> --quic
 ```
 
 ### 3. Start the client

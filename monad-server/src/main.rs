@@ -1,6 +1,6 @@
 use cashu::nuts::SecretKey;
 use clap::{Parser, Subcommand};
-use monad_common::identity::ServerIdentity;
+use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::SecpTransportKeypair;
 use monad_server::listener;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,8 +28,8 @@ enum Command {
 
         /// Server Ed25519 seed (hex-encoded, 32 bytes).
         /// Used for QUIC certificate generation.
-        #[arg(long, env = "MONAD_PRIVATE_KEY")]
-        private_key: String,
+        #[arg(long, env = "MONAD_QUIC_CERT_SEED")]
+        quic_cert_seed: String,
 
         /// Shared secp256k1 transport private key (hex-encoded, 32 bytes).
         /// Used for secp-authenticated transports, including TCP and QUIC secp auth.
@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Keygen => {
-            let identity = ServerIdentity::generate()?;
+            let identity = QuicCertIdentity::generate()?;
             let transport_key = SecpTransportKeypair::generate();
 
             // Generate QUIC certificate from the same seed
@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", quic_km.cert_pem);
             println!("# Run the server with:");
             println!(
-                "#   monad-server run --private-key {} --transport-key {} --quic",
+                "#   monad-server run --quic-cert-seed {} --transport-key {} --quic",
                 hex::encode(identity.seed()),
                 hex::encode(transport_key.secret_bytes())
             );
@@ -94,12 +94,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Run {
             listen,
-            private_key,
+            quic_cert_seed,
             transport_key,
             quic,
         } => {
-            let identity = ServerIdentity::from_hex(&private_key)
-                .map_err(|e| anyhow::anyhow!("bad private key: {e}"))?;
+            let identity = QuicCertIdentity::from_hex(&quic_cert_seed)
+                .map_err(|e| anyhow::anyhow!("bad QUIC cert seed: {e}"))?;
             let transport_key = parse_transport_key(&transport_key)?;
 
             // Optionally set up QUIC listener from the same seed

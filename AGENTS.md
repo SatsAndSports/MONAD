@@ -27,7 +27,7 @@ cargo run -p monad-quic -- ...
   - `ClientMessage` / `ServerMessage` wire protocol, `KeysetAdvertisement` type (`protocol.rs`)
   - `RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`, billing math (`session.rs`)
   - `proxy_bidirectional` shared proxy (`proxy.rs`)
-  - `ServerIdentity`, Ed25519 key derivation for QUIC certificate plumbing (`identity.rs`)
+  - `QuicCertIdentity`, Ed25519 key derivation for QUIC certificate plumbing (`quic_cert_identity.rs`)
   - `Secp256k1Pubkey`, `SecpTransportKeypair`, transport auth helpers (`secp_identity.rs`)
 - `monad-client`
   - reusable library code plus binary entrypoint

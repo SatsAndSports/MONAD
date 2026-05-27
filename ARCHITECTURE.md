@@ -36,7 +36,7 @@ Important types:
   - local billing metadata with precomputed LCM for integer-only arithmetic
 - `proxy_bidirectional` (`proxy.rs`)
   - shared generic bidirectional proxy used by client tunnels
-- `Ed25519Pubkey` / `ServerIdentity` (`identity.rs`)
+- `Ed25519Pubkey` / `QuicCertIdentity` (`quic_cert_identity.rs`)
   - Ed25519 key material retained for QUIC certificate generation and SPKI helpers used by standalone QUIC tooling
 - `Secp256k1Pubkey` / `SecpTransportKeypair` (`secp_identity.rs`)
   - secp256k1 transport identity used for TCP MONAD transport and secp-authenticated QUIC paths
@@ -903,7 +903,7 @@ A QUIC-capable server has both:
 - an Ed25519 identity for QUIC certificate generation
 - a secp256k1 transport key for TCP MONAD transport and secp-authenticated QUIC
 
-The `--quic` flag enables the QUIC listener; the QUIC certificate is generated from the `--private-key` Ed25519 seed, while `--transport-key` supplies the shared secp transport key.
+The `--quic` flag enables the QUIC listener; the QUIC certificate is generated from the `--quic-cert-seed` Ed25519 seed, while `--transport-key` supplies the shared secp transport key.
 
 ### CONNECT Syntax for QUIC Hops
 

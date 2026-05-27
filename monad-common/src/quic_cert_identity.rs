@@ -1,4 +1,4 @@
-//! Unified Ed25519 identity for MONAD servers.
+//! Ed25519 QUIC certificate identity helpers for MONAD servers.
 //!
 //! MONAD still uses an Ed25519 keypair internally for QUIC/TLS certificate
 //! generation. From this keypair, we derive:
@@ -62,16 +62,16 @@ impl std::fmt::Display for Ed25519Pubkey {
 }
 
 // ---------------------------------------------------------------------------
-// ServerIdentity — unified server identity derived from an Ed25519 seed
+// QuicCertIdentity — Ed25519 QUIC certificate identity derived from a seed
 // ---------------------------------------------------------------------------
 
 /// A server's Ed25519 identity, derived from a single Ed25519 seed.
-pub struct ServerIdentity {
+pub struct QuicCertIdentity {
     seed: [u8; 32],
     ed25519_pubkey: Ed25519Pubkey,
 }
 
-impl ServerIdentity {
+impl QuicCertIdentity {
     /// Generate a new random server identity.
     pub fn generate() -> io::Result<Self> {
         let (seed, pubkey) = generate_identity()?;
@@ -90,7 +90,7 @@ impl ServerIdentity {
         })
     }
 
-    /// Decode a hex-encoded Ed25519 seed into a `ServerIdentity`.
+    /// Decode a hex-encoded Ed25519 seed into a `QuicCertIdentity`.
     pub fn from_hex(hex: &str) -> io::Result<Self> {
         let bytes = hex::decode(hex)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid hex: {e}")))?;

@@ -16,9 +16,9 @@ use h2::client;
 use http::{Method, Request};
 use monad_client::connector::{self, Hop, HopIdentity};
 use monad_common::h2stream::wait_for_send_capacity;
-use monad_common::identity;
 use monad_common::noise_secp256k1;
 use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
@@ -132,7 +132,7 @@ async fn start_monad_server_with_spilman(
     trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
     payment_receiver_secret: cashu::nuts::SecretKey,
 ) -> (std::net::SocketAddr, Secp256k1Pubkey) {
-    let identity = identity::ServerIdentity::generate().unwrap();
+    let identity = QuicCertIdentity::generate().unwrap();
     let transport_key = SecpTransportKeypair::generate();
     let pubkey = transport_key.pubkey();
 
@@ -161,7 +161,7 @@ async fn start_monad_server_with_spilman(
 
 /// Spin up a MONAD server bound to a specific address and return (server_addr, secp256k1 pubkey).
 async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp256k1Pubkey)> {
-    let identity = identity::ServerIdentity::generate().unwrap();
+    let identity = QuicCertIdentity::generate().unwrap();
     let transport_key = SecpTransportKeypair::generate();
     let pubkey = transport_key.pubkey();
 

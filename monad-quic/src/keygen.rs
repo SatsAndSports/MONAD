@@ -1,5 +1,5 @@
 use anyhow::Result;
-use monad_common::identity;
+use monad_common::quic_cert_identity;
 use rcgen::{CertificateParams, KeyPair};
 
 /// Generated key material for a MONAD QUIC server.
@@ -17,15 +17,15 @@ pub struct KeyMaterial {
 /// The seed must be a 32-byte Ed25519 private key seed. The certificate and
 /// pinned public key are deterministically derived from it.
 pub fn generate_from_seed(seed: &[u8; 32]) -> Result<KeyMaterial> {
-    let pkcs8_der = identity::ed25519_seed_to_pkcs8_der(seed);
+    let pkcs8_der = quic_cert_identity::ed25519_seed_to_pkcs8_der(seed);
     let pkcs8_key = rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8_der);
 
     let key_pair = KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8_key, &rcgen::PKCS_ED25519)?;
 
     // Compute the SPKI DER for pinning from the Ed25519 public key
-    let ed25519_pub = identity::ed25519_seed_to_pubkey(seed)
+    let ed25519_pub = quic_cert_identity::ed25519_seed_to_pubkey(seed)
         .map_err(|e| anyhow::anyhow!("failed to derive Ed25519 public key: {e}"))?;
-    let spki_der = identity::ed25519_pubkey_to_spki_der(&ed25519_pub);
+    let spki_der = quic_cert_identity::ed25519_pubkey_to_spki_der(&ed25519_pub);
     let pin_hex = hex::encode(&spki_der);
 
     // Build self-signed certificate
@@ -45,7 +45,7 @@ pub fn generate_from_seed(seed: &[u8; 32]) -> Result<KeyMaterial> {
 ///
 /// This generates a fresh Ed25519 seed and derives everything from it.
 pub fn generate() -> Result<KeyMaterial> {
-    let (seed, _pubkey) = identity::generate_identity()
+    let (seed, _pubkey) = quic_cert_identity::generate_identity()
         .map_err(|e| anyhow::anyhow!("failed to generate identity: {e}"))?;
     generate_from_seed(&seed)
 }

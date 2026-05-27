@@ -4,9 +4,9 @@ use crate::quic_pool::QuicPool;
 use crate::session::relay_session_from_transport_stream;
 use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
-use monad_common::identity::ServerIdentity;
 use monad_common::noise_secp256k1;
 use monad_common::protocol::MintUnitKeysets;
+use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::SecpTransportKeypair;
 use monad_quic::auth::{
     reject_stream, serve_attestation_stream, AUTH_STREAM_KIND, STREAM_ERROR_AUTH_REQUIRED,
@@ -37,8 +37,8 @@ pub struct SpilmanMintCache {
 
 /// Server configuration.
 pub struct ServerConfig {
-    /// The server's unified identity (Ed25519 seed + derived keys).
-    pub identity: ServerIdentity,
+    /// The server's Ed25519 QUIC certificate identity.
+    pub identity: QuicCertIdentity,
     /// Optional shared secp256k1 transport identity for secp-authenticated transports.
     pub transport_key: Option<SecpTransportKeypair>,
     /// Receiver secp256k1 secret used for Spilman channel validation.
