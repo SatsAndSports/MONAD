@@ -16,8 +16,8 @@ Implemented today:
 - `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup
 - `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels, auto-funds sessions via the control stream
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
-- `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, pinned-key auth, secp attestation helpers, echo server/client, and shared config/keygen helpers used by server and client
-- QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, `quic-pin` and `quic-secp256k1-pubkey` H2 headers for CONNECT forwarding
+- `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by server and client
+- QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
 - session payment system: paused-by-default sessions, Hello/SessionStatus handshake, fake payments, totals-based billing with directional pricing, pause/resume enforcement
 - Spilman advertisement plumbing: server discovers trusted mints/keysets at startup and includes a `KeysetAdvertisement` list plus its receiver pubkey in `SessionStatus`. The `ChannelLink`/`ChannelPayment`/`ChannelEvicted` wire messages exist but are not yet handled — the server only credits sessions via `FakePayment` today.
@@ -98,22 +98,25 @@ Current coverage includes:
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
 - TCP secp single-hop and nested plain-CONNECT secp tunnels
-- legacy Ed25519/plain-noise QUIC first hop
 - session funding and incremental payments via Spilman channels (in progress)
 - server advertises multiple mint/unit pricing options
 
 ## Transport Identities
 
-MONAD currently uses a split transport model:
+MONAD transport now uses secp256k1 identities throughout:
 
-- **TCP MONAD transport** is secp256k1-only
-- **QUIC MONAD transport** supports both:
-  - legacy Ed25519 identity with derived X25519 Noise key and pinned SPKI cert key
-  - secp256k1 transport identity with QUIC attestation plus secp Noise
+- **TCP MONAD transport** uses secp Noise
+- **QUIC MONAD transport** uses secp attestation plus secp Noise
 
-The `monad-client` binary now emits and accepts only secp256k1 hop identities. The
-legacy Ed25519 QUIC/plain-noise path remains in the server and lower-level transport
-code for compatibility and testing, but it is no longer used by the main client CLI.
+The `monad-client` binary emits and accepts only secp256k1 hop identities. The
+server still keeps an Ed25519 seed internally for QUIC certificate generation,
+but that is no longer a client-facing MONAD transport identity.
+
+For QUIC, the server first presents a self-signed Ed25519 certificate so the
+standard TLS 1.3 handshake can establish an encrypted channel. MONAD then binds
+that live QUIC channel to the configured secp256k1 transport identity by having
+the server sign a challenge plus QUIC exporter-derived keying material. Clients
+verify that signature against the expected secp256k1 public key.
 
 Quick reference:
 
@@ -121,7 +124,6 @@ Quick reference:
 |-----------|-----------|----------|----------------|
 | TCP | `addr:port,secp256k1:<pub>` | secp256k1 | secp Noise NK |
 | QUIC (secp) | `quic:addr:port,secp256k1:<pub>` | secp256k1 | QUIC attestation + secp Noise NK |
-| QUIC (legacy compatibility) | server/lower-level only | Ed25519 | pinned SPKI cert + X25519 Noise NK |
 
 ## Quick Start
 
@@ -132,8 +134,8 @@ cargo run -p monad-server -- keygen
 ```
 
 This prints:
-- an Ed25519 seed/public key for legacy QUIC/plain-noise compatibility
-- a secp256k1 transport private/public key for TCP MONAD transport and secp-authenticated QUIC
+- an Ed25519 seed/public key used for QUIC certificate generation
+- a secp256k1 transport private/public key for MONAD TCP and QUIC transport auth
 - a QUIC certificate derived from the Ed25519 seed
 
 ### 2. Start one or more servers
@@ -247,16 +249,16 @@ tunnel closed: example.com:22 | outbound=63630 inbound=5200 total=68830
 
 ### Per-hop encrypted wire counts
 
-Each `NoiseStream` and `SecpNoiseStream` logs encrypted wire usage when the hop connection shuts down:
+Each `SecpNoiseStream` logs encrypted wire usage when the hop connection shuts down:
 
 ```text
-NoiseStream closed label=client hop 2/3 to 127.0.0.1:9052 wire_read=... wire_written=... wire_total=...
+SecpNoiseStream closed label=client hop 2/3 to 127.0.0.1:9052 wire_read=... wire_written=... wire_total=...
 ```
 
 To see these, use debug logging for the Noise module:
 
 ```bash
-RUST_LOG=monad_common::noise=debug,monad_common::noise_secp256k1=debug,monad_client=info,monad_server=info
+RUST_LOG=monad_common::noise_secp256k1=debug,monad_client=info,monad_server=info
 ```
 
 ### CONNECT visibility
@@ -277,7 +279,7 @@ Both client and server handle `Ctrl+C` gracefully:
 - stop accepting new work
 - wait briefly for active tunnels/sessions to finish
 - shut down H2 connections cleanly
-- emit `NoiseStream` wire-byte totals
+- emit `SecpNoiseStream` wire-byte totals
 
 ## QUIC Echo Tool
 

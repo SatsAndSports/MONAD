@@ -1,7 +1,7 @@
 //! `QuicStream` — wraps a quinn bidirectional stream as `AsyncRead + AsyncWrite`.
 //!
 //! This allows a QUIC bidirectional stream to be used anywhere a `TcpStream` is
-//! used today, including as the transport for `NoiseStream<QuicStream>`.
+//! used today, including as the transport for secp Noise + H2.
 
 use std::io;
 use std::pin::Pin;
@@ -9,13 +9,7 @@ use std::task::{Context, Poll};
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub const STREAM_KIND_PLAIN_NOISE: u8 = 0x00;
 pub const STREAM_KIND_SECP_NOISE: u8 = 0x02;
-pub const STREAM_ERROR_UNKNOWN_KIND: u64 = 0x01;
-
-fn stream_error_code(code: u64) -> quinn::VarInt {
-    quinn::VarInt::from_u64(code).expect("valid QUIC application error code")
-}
 
 /// A bidirectional QUIC stream that implements `AsyncRead + AsyncWrite`.
 ///
@@ -33,11 +27,6 @@ impl QuicStream {
     }
 }
 
-/// Open a QUIC bidirectional stream carrying a MONAD session.
-pub async fn open_monad_stream(conn: &quinn::Connection) -> io::Result<QuicStream> {
-    open_monad_stream_with_kind(conn, STREAM_KIND_PLAIN_NOISE).await
-}
-
 pub async fn open_monad_stream_with_kind(
     conn: &quinn::Connection,
     kind: u8,
@@ -52,34 +41,6 @@ pub async fn open_monad_stream_with_kind(
     send.flush()
         .await
         .map_err(|e| io::Error::other(format!("failed to flush QUIC stream preamble: {e}")))?;
-    Ok(QuicStream::new(send, recv))
-}
-
-/// Accept a QUIC bidirectional stream carrying a MONAD session.
-pub async fn accept_monad_stream(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-) -> io::Result<QuicStream> {
-    let mut kind = [0u8; 1];
-    if let Err(e) = recv.read_exact(&mut kind).await {
-        let code = stream_error_code(STREAM_ERROR_UNKNOWN_KIND);
-        let _ = recv.stop(code);
-        let _ = send.reset(code);
-        return Err(io::Error::other(format!(
-            "failed to read QUIC stream kind preamble: {e}"
-        )));
-    }
-
-    if kind[0] != STREAM_KIND_PLAIN_NOISE {
-        let code = stream_error_code(STREAM_ERROR_UNKNOWN_KIND);
-        let _ = recv.stop(code);
-        let _ = send.reset(code);
-        return Err(io::Error::other(format!(
-            "unsupported QUIC stream kind: {}",
-            kind[0]
-        )));
-    }
-
     Ok(QuicStream::new(send, recv))
 }
 

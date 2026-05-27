@@ -26,8 +26,8 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:9050")]
         listen: String,
 
-        /// Server private key — Ed25519 seed (hex-encoded, 32 bytes).
-        /// Used for both Noise (via X25519 derivation) and QUIC (via Ed25519 certificate).
+        /// Server Ed25519 seed (hex-encoded, 32 bytes).
+        /// Used for QUIC certificate generation.
         #[arg(long, env = "MONAD_PRIVATE_KEY")]
         private_key: String,
 
@@ -37,7 +37,7 @@ enum Command {
         transport_key: String,
 
         /// Enable QUIC listener. The QUIC certificate is derived from the
-        /// same Ed25519 private key. If omitted, only TCP is accepted.
+        /// Ed25519 seed. If omitted, only TCP is accepted.
         #[arg(long)]
         quic: bool,
     },
@@ -63,9 +63,9 @@ async fn main() -> anyhow::Result<()> {
 
             let pubkey = identity.ed25519_pubkey();
             let transport_pubkey = transport_key.pubkey();
-            println!("# MONAD server identity (unified Ed25519 key)");
+            println!("# MONAD server identity set");
             println!("#");
-            println!("# The Ed25519 key is used for legacy Noise+QUIC compatibility.");
+            println!("# The Ed25519 key is used for QUIC certificate generation.");
             println!();
             println!(
                 "Private key (Ed25519 seed): {}",
@@ -89,10 +89,7 @@ async fn main() -> anyhow::Result<()> {
                 hex::encode(transport_key.secret_bytes())
             );
             println!("#");
-            println!("# Legacy QUIC/plain-noise clients use:");
-            println!("#   {pubkey}");
-            println!("#");
-            println!("# secp transport clients use:");
+            println!("# MONAD clients use the secp transport key:");
             println!("#   secp256k1:{transport_pubkey}");
         }
         Command::Run {

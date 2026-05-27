@@ -1,12 +1,10 @@
 //! TCP and QUIC listener that accepts connections and performs the Noise NK handshake.
 
 use crate::quic_pool::QuicPool;
-use crate::session::{relay_session_from_noise_stream, relay_session_from_transport_stream};
+use crate::session::relay_session_from_transport_stream;
 use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::identity::ServerIdentity;
-use monad_common::noise;
-use monad_common::noise::NoiseStream;
 use monad_common::noise_secp256k1;
 use monad_common::protocol::MintUnitKeysets;
 use monad_common::secp_identity::SecpTransportKeypair;
@@ -14,7 +12,7 @@ use monad_quic::auth::{
     reject_stream, serve_attestation_stream, AUTH_STREAM_KIND, STREAM_ERROR_AUTH_REQUIRED,
     STREAM_ERROR_UNKNOWN_KIND,
 };
-use monad_quic::stream::{QuicStream, STREAM_KIND_PLAIN_NOISE, STREAM_KIND_SECP_NOISE};
+use monad_quic::stream::{QuicStream, STREAM_KIND_SECP_NOISE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::{
@@ -96,15 +94,15 @@ pub async fn discover_spilman_mint_cache(
     Ok(cache)
 }
 
-/// Run the server: listen for TCP and optionally QUIC connections, perform Noise
-/// handshake, handle H2 sessions.
+/// Run the server: listen for TCP and optionally QUIC connections, perform secp
+/// Noise handshake, handle H2 sessions.
 ///
-/// Both TCP and QUIC connections are fed into the same Noise+H2 session handler.
-/// The server treats them identically after the transport is established.
+/// Both TCP and QUIC connections are fed into the same H2 session handler.
+/// The server treats them identically after the secp transport is established.
 ///
 /// Handles Ctrl+C gracefully: stops accepting new connections, waits for active
-/// sessions to finish (up to a timeout), then exits. This ensures NoiseStream
-/// Drop impls run and wire byte counters are logged.
+/// sessions to finish (up to a timeout), then exits. This ensures
+/// `SecpNoiseStream` drop logging runs and wire byte counters are logged.
 pub async fn run(
     listener: TcpListener,
     quic_endpoint: Option<quinn::Endpoint>,
@@ -217,7 +215,7 @@ pub async fn run(
                     let authenticated = Arc::new(AtomicBool::new(false));
 
                     // Accept bidirectional streams from this QUIC connection.
-                    // Each stream is an independent Noise+H2 session.
+                    // Each stream is an independent secp Noise+H2 session.
                     loop {
                         match conn.accept_bi().await {
                             Ok((send, recv)) => {
@@ -254,56 +252,12 @@ pub async fn run(
                                         return;
                                     }
 
-                                    if kind[0] != STREAM_KIND_PLAIN_NOISE && kind[0] != STREAM_KIND_SECP_NOISE {
+                                    if kind[0] != STREAM_KIND_SECP_NOISE {
                                         reject_stream(&mut send, &mut recv, STREAM_ERROR_UNKNOWN_KIND);
                                         return;
                                     }
 
                                     match kind[0] {
-                                        STREAM_KIND_PLAIN_NOISE => {
-                                            let mut quic_stream = QuicStream::new(send, recv);
-
-                                            let (transport, session_id) = match noise::handshake_responder(
-                                                &mut quic_stream,
-                                                config.identity.x25519_private(),
-                                            )
-                                            .await
-                                            {
-                                                Ok(t) => {
-                                                    info!("noise handshake complete with {remote} (QUIC {stream_id:?})");
-                                                    t
-                                                }
-                                                Err(e) => {
-                                                    error!("noise handshake failed with {remote} (QUIC {stream_id:?}): {e}");
-                                                    return;
-                                                }
-                                            };
-
-                                            let label = format!("{} <-> {remote} (QUIC {stream_id:?})", "quic");
-                                            let noise_stream = NoiseStream::new(
-                                                quic_stream,
-                                                transport,
-                                                session_id,
-                                                label,
-                                            );
-
-                                            match relay_session_from_noise_stream(
-                                                noise_stream,
-                                                quic_pool,
-                                                config.payment_receiver_secret.clone(),
-                                                discovered_spilman_mint_cache.as_ref().clone(),
-                                            )
-                                            .await {
-                                                Ok(session) => {
-                                                    if let Err(e) = session.run().await {
-                                                        error!("session error with {remote} (QUIC {stream_id:?}): {e}");
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("H2 handshake failed with {remote} (QUIC {stream_id:?}): {e}");
-                                                }
-                                            }
-                                        }
                                         STREAM_KIND_SECP_NOISE => {
                                             if !authenticated.load(Ordering::Acquire) {
                                                 reject_stream(&mut send, &mut recv, STREAM_ERROR_AUTH_REQUIRED);

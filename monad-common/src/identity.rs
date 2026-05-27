@@ -1,17 +1,12 @@
 //! Unified Ed25519 identity for MONAD servers.
 //!
-//! Each server has one Ed25519 keypair that serves as its identity.
-//! From this single keypair, we derive:
+//! MONAD still uses an Ed25519 keypair internally for QUIC/TLS certificate
+//! generation. From this keypair, we derive:
 //!
-//! - **X25519 private key** (for Noise NK handshakes): `SHA-512(seed)[0..32]`
-//! - **X25519 public key** (for Noise NK client verification): Edwards-to-Montgomery conversion
-//! - **QUIC/TLS certificate** (for relay-to-relay transport): self-signed cert from the Ed25519 key
+//! - **QUIC/TLS certificate**: self-signed cert from the Ed25519 key
 //! - **QUIC pinned public key** (SPKI DER): fixed ASN.1 header + raw Ed25519 public key
-//!
-//! This means operators generate and publish one key, and clients specify one key per hop.
 
 use ring::signature::KeyPair as _;
-use sha2::{Digest, Sha512};
 use std::io;
 
 // ---------------------------------------------------------------------------
@@ -20,9 +15,8 @@ use std::io;
 
 /// A validated 32-byte Ed25519 public key.
 ///
-/// This is the unified identity for a MONAD server. From it, the X25519
-/// public key (for Noise) and SPKI DER (for QUIC pinning) are derived
-/// on demand.
+/// This is the published Ed25519 public key for a MONAD server's QUIC
+/// certificate plumbing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ed25519Pubkey([u8; 32]);
 
@@ -55,11 +49,6 @@ impl Ed25519Pubkey {
         &self.0
     }
 
-    /// Derive the X25519 public key for Noise NK handshakes.
-    pub fn to_x25519(&self) -> io::Result<[u8; 32]> {
-        ed25519_pubkey_to_x25519_pubkey(&self.0)
-    }
-
     /// Derive the SPKI DER blob for QUIC pinned-key verification.
     pub fn to_spki_der(&self) -> Vec<u8> {
         ed25519_pubkey_to_spki_der(&self.0)
@@ -76,36 +65,28 @@ impl std::fmt::Display for Ed25519Pubkey {
 // ServerIdentity — unified server identity derived from an Ed25519 seed
 // ---------------------------------------------------------------------------
 
-/// A server's unified identity, derived from a single Ed25519 seed.
-///
-/// From this seed, the X25519 private key (for Noise) and Ed25519 public key
-/// (for client verification / QUIC pinning) are derived and cached.
+/// A server's Ed25519 identity, derived from a single Ed25519 seed.
 pub struct ServerIdentity {
     seed: [u8; 32],
     ed25519_pubkey: Ed25519Pubkey,
-    x25519_private: [u8; 32],
 }
 
 impl ServerIdentity {
     /// Generate a new random server identity.
     pub fn generate() -> io::Result<Self> {
         let (seed, pubkey) = generate_identity()?;
-        let x25519_private = ed25519_seed_to_x25519_private(&seed);
         Ok(Self {
             seed,
             ed25519_pubkey: pubkey,
-            x25519_private,
         })
     }
 
     /// Derive a server identity from a known Ed25519 seed.
     pub fn from_seed(seed: [u8; 32]) -> io::Result<Self> {
         let pubkey = Ed25519Pubkey(ed25519_seed_to_pubkey(&seed)?);
-        let x25519_private = ed25519_seed_to_x25519_private(&seed);
         Ok(Self {
             seed,
             ed25519_pubkey: pubkey,
-            x25519_private,
         })
     }
 
@@ -130,11 +111,6 @@ impl ServerIdentity {
     /// The server's Ed25519 public key (its published identity).
     pub fn ed25519_pubkey(&self) -> &Ed25519Pubkey {
         &self.ed25519_pubkey
-    }
-
-    /// The derived X25519 private key for Noise NK handshakes.
-    pub fn x25519_private(&self) -> &[u8; 32] {
-        &self.x25519_private
     }
 }
 
@@ -203,38 +179,6 @@ pub fn ed25519_seed_to_pubkey(seed: &[u8; 32]) -> io::Result<[u8; 32]> {
     Ok(pubkey)
 }
 
-/// Convert an Ed25519 seed (32 bytes) to an X25519 private key (32 bytes).
-///
-/// This follows the standard Ed25519-to-X25519 conversion:
-/// `x25519_private = SHA-512(seed)[0..32]`
-///
-/// Snow's Noise implementation will apply X25519 clamping internally
-/// when this key is used.
-pub fn ed25519_seed_to_x25519_private(seed: &[u8; 32]) -> [u8; 32] {
-    let hash = Sha512::digest(seed);
-    let mut x25519_private = [0u8; 32];
-    x25519_private.copy_from_slice(&hash[..32]);
-    x25519_private
-}
-
-/// Convert an Ed25519 public key (32 bytes) to an X25519 public key (32 bytes).
-///
-/// This performs the Edwards-to-Montgomery point conversion:
-/// the Ed25519 compressed Edwards Y coordinate is decompressed to a curve point,
-/// then converted to Montgomery form (X25519 u-coordinate).
-pub fn ed25519_pubkey_to_x25519_pubkey(ed25519_pub: &[u8; 32]) -> io::Result<[u8; 32]> {
-    let compressed = curve25519_dalek::edwards::CompressedEdwardsY(*ed25519_pub);
-    let edwards_point = compressed.decompress().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid Ed25519 public key: failed to decompress Edwards point",
-        )
-    })?;
-
-    let montgomery_point = edwards_point.to_montgomery();
-    Ok(montgomery_point.to_bytes())
-}
-
 /// Construct the SPKI DER encoding of an Ed25519 public key.
 ///
 /// This is the format used for QUIC pinned key verification:
@@ -263,25 +207,12 @@ mod tests {
 
     #[test]
     fn test_identity_roundtrip() {
-        // Generate an identity and verify the conversions are consistent.
+        // Generate an identity and verify the cached derivations are consistent.
         let (seed, pubkey) = generate_identity().unwrap();
 
         // Verify we can derive the same pubkey from the seed
         let pubkey2 = ed25519_seed_to_pubkey(&seed).unwrap();
         assert_eq!(pubkey.as_bytes(), &pubkey2);
-
-        // Verify X25519 conversion produces valid-looking keys
-        let x25519_priv = ed25519_seed_to_x25519_private(&seed);
-        assert_ne!(
-            x25519_priv, [0u8; 32],
-            "X25519 private key should not be all zeros"
-        );
-
-        let x25519_pub = pubkey.to_x25519().unwrap();
-        assert_ne!(
-            x25519_pub, [0u8; 32],
-            "X25519 public key should not be all zeros"
-        );
 
         // Verify SPKI DER has the right structure
         let spki = pubkey.to_spki_der();
@@ -294,84 +225,5 @@ mod tests {
         assert_eq!(pkcs8.len(), 48);
         assert_eq!(&pkcs8[..16], &ED25519_PKCS8_HEADER);
         assert_eq!(&pkcs8[16..], &seed);
-    }
-
-    #[test]
-    fn test_x25519_conversion_matches_snow() {
-        // Verify that our Ed25519→X25519 conversion produces keys that
-        // snow can use for a Noise handshake.
-        let (seed, pubkey) = generate_identity().unwrap();
-
-        let x25519_priv = ed25519_seed_to_x25519_private(&seed);
-        let x25519_pub = pubkey.to_x25519().unwrap();
-
-        // Build a Noise responder with the derived X25519 private key
-        let builder = snow::Builder::new("Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-        let _responder = builder
-            .local_private_key(&x25519_priv)
-            .build_responder()
-            .expect("snow should accept our derived X25519 private key");
-
-        // Build a Noise initiator with the derived X25519 public key
-        let builder = snow::Builder::new("Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-        let _initiator = builder
-            .remote_public_key(&x25519_pub)
-            .build_initiator()
-            .expect("snow should accept our derived X25519 public key");
-    }
-
-    #[test]
-    fn test_x25519_keypair_consistency() {
-        // Verify that the X25519 public key we derive from the Ed25519 public key
-        // matches the X25519 public key that snow would derive from the X25519
-        // private key. This confirms the Ed25519→X25519 conversion is correct.
-        let (seed, pubkey) = generate_identity().unwrap();
-
-        let x25519_priv = ed25519_seed_to_x25519_private(&seed);
-        let x25519_pub_from_ed = pubkey.to_x25519().unwrap();
-
-        // Ask snow to derive the X25519 public key from the private key
-        let builder = snow::Builder::new("Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-        let snow_keypair = builder.generate_keypair().unwrap();
-        // We can't easily get snow to derive from our key, but we can verify
-        // via a Noise handshake that both sides agree.
-
-        // Build responder with our derived X25519 private key
-        let builder = snow::Builder::new("Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-        let mut responder = builder
-            .local_private_key(&x25519_priv)
-            .build_responder()
-            .unwrap();
-
-        // Build initiator with our derived X25519 public key
-        let builder = snow::Builder::new("Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-        let mut initiator = builder
-            .remote_public_key(&x25519_pub_from_ed)
-            .build_initiator()
-            .unwrap();
-
-        // Perform the Noise handshake (NK: 2 messages)
-        let mut buf = [0u8; 256];
-        let len = initiator.write_message(&[], &mut buf).unwrap();
-        let mut buf2 = [0u8; 256];
-        responder.read_message(&buf[..len], &mut buf2).unwrap();
-
-        let len = responder.write_message(&[], &mut buf).unwrap();
-        initiator.read_message(&buf[..len], &mut buf2).unwrap();
-
-        // Both sides should transition to transport mode
-        let mut initiator_transport = initiator.into_transport_mode().unwrap();
-        let mut responder_transport = responder.into_transport_mode().unwrap();
-
-        // Verify data can flow
-        let msg = b"unified key test";
-        let len = initiator_transport.write_message(msg, &mut buf).unwrap();
-        let len = responder_transport
-            .read_message(&buf[..len], &mut buf2)
-            .unwrap();
-        assert_eq!(&buf2[..len], msg);
-
-        // Suppress unused variable warning
-        let _ = snow_keypair;
     }
 }

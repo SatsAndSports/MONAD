@@ -193,7 +193,7 @@ secp256k1-native while staying on the current standards-compliant QUIC stack.
 At the time of writing:
 
 - MONAD's plain TCP transport uses secp256k1 Noise
-- MONAD's QUIC transport supports both the legacy Ed25519/plain-noise path and a secp-authenticated path
+- MONAD's QUIC transport now uses secp-authenticated MONAD sessions; Ed25519 remains only for QUIC certificate generation
 - QUIC/TLS certificate authentication is still not secp256k1-native; the secp QUIC path relies on post-handshake attestation rather than a secp256k1 TLS certificate
 - the remaining blocker to a fully secp-only transport story is therefore concentrated in QUIC/TLS, not the Noise layer
 

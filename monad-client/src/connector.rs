@@ -6,13 +6,11 @@
 //! N hops:       Each hop wraps the previous one via H2ConnectStream.
 
 use crate::control;
-use monad_common::identity::Ed25519Pubkey;
-use monad_common::noise::{self, NoiseStream};
 use monad_common::noise_secp256k1;
 use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::RelayConnection;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
-use monad_quic::stream::{open_monad_stream, open_monad_stream_with_kind, STREAM_KIND_SECP_NOISE};
+use monad_quic::stream::{open_monad_stream_with_kind, STREAM_KIND_SECP_NOISE};
 use std::io;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -23,14 +21,12 @@ const INTERMEDIATE_FAKE_PAYMENT_MILLISATS: u64 = 10_000_000;
 /// A hop identity for transport authentication.
 #[derive(Debug, Clone)]
 pub enum HopIdentity {
-    Ed25519(Ed25519Pubkey),
     Secp256k1(Secp256k1Pubkey),
 }
 
 impl HopIdentity {
     pub fn describe(&self) -> &'static str {
         match self {
-            Self::Ed25519(_) => "ed25519",
             Self::Secp256k1(_) => "secp256k1",
         }
     }
@@ -38,9 +34,7 @@ impl HopIdentity {
 
 /// A hop in the tunnel chain: server address and its transport identity.
 ///
-/// MONAD currently supports two hop identity families:
-/// - legacy Ed25519 identities for QUIC plain-noise hops
-/// - secp256k1 identities for secp-authenticated transports, including plain TCP
+/// MONAD transport now uses secp256k1 identities for both plain TCP and QUIC.
 ///
 /// If `use_quic` is true, the previous relay in the chain will connect to this
 /// hop via QUIC instead of TCP.
@@ -90,13 +84,6 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
 
     let first = &hops[0];
 
-    if matches!(first.identity, HopIdentity::Ed25519(_)) && !first.use_quic {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "legacy Ed25519 transport hops currently require QUIC",
-        ));
-    }
-
     if first.use_quic {
         // Connect to the first hop via QUIC
         info!("connecting to first hop via QUIC: {}", first.addr);
@@ -115,7 +102,6 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
         let mut endpoint = quinn::Endpoint::client(bind_addr.parse().unwrap())
             .map_err(|e| io::Error::other(format!("QUIC endpoint: {e}")))?;
         let auth = match &first.identity {
-            HopIdentity::Ed25519(pubkey) => ClientAuthMode::PinnedSpki(pubkey.to_spki_der()),
             HopIdentity::Secp256k1(pubkey) => ClientAuthMode::Secp256k1(*pubkey),
         };
         let client_config = build_client_config_for_auth(auth.clone())
@@ -131,12 +117,7 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
                 )
             })?;
 
-        let quic_stream = match &first.identity {
-            HopIdentity::Ed25519(_) => open_monad_stream(&conn).await?,
-            HopIdentity::Secp256k1(_) => {
-                open_monad_stream_with_kind(&conn, STREAM_KIND_SECP_NOISE).await?
-            }
-        };
+        let quic_stream = open_monad_stream_with_kind(&conn, STREAM_KIND_SECP_NOISE).await?;
         info!("QUIC connected to {}", first.addr);
 
         chain_from_stream(quic_stream, hops, 0).await
@@ -180,13 +161,6 @@ where
 
         let label = format!("client hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
         let (conn, driver) = match &hop.identity {
-            HopIdentity::Ed25519(pubkey) => {
-                let x25519_pub = pubkey.to_x25519()?;
-                let (transport, session_id) =
-                    noise::handshake_initiator(&mut stream, &x25519_pub).await?;
-                let noise_stream = NoiseStream::new(stream, transport, session_id, label);
-                RelayConnection::from_noise_stream(noise_stream).await?
-            }
             HopIdentity::Secp256k1(pubkey) => {
                 let (send_cipher, recv_cipher, session_id) =
                     noise_secp256k1::handshake_initiator(&mut stream, pubkey).await?;
@@ -231,22 +205,12 @@ where
             // Open the CONNECT tunnel, with QUIC pin if the next hop uses QUIC
             let h2_connect_stream = if next.use_quic {
                 match &next.identity {
-                    HopIdentity::Ed25519(pubkey) => {
-                        let spki = pubkey.to_spki_der();
-                        conn.open_tunnel_quic(&next.addr, &spki).await?
-                    }
                     HopIdentity::Secp256k1(pubkey) => {
                         conn.open_tunnel_quic_secp256k1(&next.addr, &pubkey.to_hex())
                             .await?
                     }
                 }
             } else {
-                if matches!(next.identity, HopIdentity::Ed25519(_)) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "legacy Ed25519 transport hops currently require QUIC",
-                    ));
-                }
                 conn.open_tunnel(&next.addr).await?
             };
 

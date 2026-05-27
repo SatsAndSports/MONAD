@@ -1,8 +1,8 @@
 //! QUIC connection pool for relay-to-relay transport.
 //!
 //! Maintains shared QUIC connections keyed by `(host, port)`. When the server
-//! receives a CONNECT request with a `quic-pin` header, it either reuses an
-//! existing QUIC connection to that target or establishes a new one, then
+//! receives a CONNECT request with a `quic-secp256k1-pubkey` header, it either
+//! reuses an existing QUIC connection to that target or establishes a new one, then
 //! opens a new bidirectional stream inside it.
 //!
 //! The pool uses per-key pending state so that:
@@ -15,7 +15,7 @@
 use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_quic::auth::authenticate_connection;
 use monad_quic::client::{build_client_config_for_auth, ClientAuthMode};
-use monad_quic::stream::{open_monad_stream_with_kind, QuicStream, STREAM_KIND_PLAIN_NOISE};
+use monad_quic::stream::{open_monad_stream_with_kind, QuicStream, STREAM_KIND_SECP_NOISE};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -28,14 +28,15 @@ type ConnResult = Option<Result<quinn::Connection, String>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QuicAuthKey {
-    PinnedSpki(Vec<u8>),
     Secp256k1(Secp256k1Pubkey),
 }
 
 impl From<ClientAuthMode> for QuicAuthKey {
     fn from(value: ClientAuthMode) -> Self {
         match value {
-            ClientAuthMode::PinnedSpki(spki) => Self::PinnedSpki(spki),
+            ClientAuthMode::PinnedSpki(_) => {
+                panic!("legacy pinned-SPKI MONAD transport is no longer supported")
+            }
             ClientAuthMode::Secp256k1(pubkey) => Self::Secp256k1(pubkey),
         }
     }
@@ -89,19 +90,13 @@ impl QuicPool {
         })
     }
 
-    /// Open a QUIC bidirectional stream to `target_addr`, reusing an existing
-    /// connection if one is available, or establishing a new one using the
-    /// provided pinned SPKI for server authentication.
-    ///
-    /// If another caller is already establishing a connection to the same target,
-    /// this call waits for that handshake to complete rather than starting a
-    /// duplicate connection.
+    /// Open a secp-authenticated QUIC bidirectional stream to `target_addr`.
     pub async fn open_stream(
         &self,
         target_addr: &str,
         auth: ClientAuthMode,
     ) -> io::Result<QuicStream> {
-        self.open_stream_with_kind(target_addr, auth, STREAM_KIND_PLAIN_NOISE)
+        self.open_stream_with_kind(target_addr, auth, STREAM_KIND_SECP_NOISE)
             .await
     }
 
@@ -291,14 +286,21 @@ impl QuicPool {
                 )
             })?;
 
-        if let ClientAuthMode::Secp256k1(pubkey) = auth {
-            authenticate_connection(&conn, &pubkey).await.map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("QUIC secp256k1 auth failed with {target_addr}: {e}"),
-                )
-            })?;
-        }
+        let pubkey = match auth {
+            ClientAuthMode::Secp256k1(pubkey) => pubkey,
+            ClientAuthMode::PinnedSpki(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "legacy pinned-SPKI MONAD transport is no longer supported",
+                ));
+            }
+        };
+        authenticate_connection(&conn, &pubkey).await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("QUIC secp256k1 auth failed with {target_addr}: {e}"),
+            )
+        })?;
 
         Ok(conn)
     }

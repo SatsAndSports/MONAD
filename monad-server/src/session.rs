@@ -12,7 +12,6 @@ use cashu::nuts::SecretKey;
 use h2::server;
 use http::{Method, Response, StatusCode};
 use monad_common::h2stream::wait_for_send_capacity;
-use monad_common::noise::NoiseStream;
 use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerMessage};
 use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::{clamp_i128_to_i64, SessionPricing};
@@ -25,8 +24,6 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, error, info, warn};
 
-/// Custom header name for QUIC pinned public key in CONNECT requests.
-pub const QUIC_PIN_HEADER: &str = "quic-pin";
 /// Custom header name for QUIC secp256k1 transport identity in CONNECT requests.
 pub const QUIC_SECP256K1_PUBKEY_HEADER: &str = "quic-secp256k1-pubkey";
 
@@ -203,7 +200,7 @@ impl SessionState {
 }
 
 /// An inbound relay session: an H2 server connection running over an
-/// encrypted `NoiseStream`.
+/// encrypted transport stream.
 pub struct RelaySession<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     h2_conn: server::Connection<S, Bytes>,
     quic_pool: Option<QuicPool>,
@@ -237,26 +234,6 @@ where
         session_id,
         state: SessionState::new(payment_receiver_secret, spilman_mint_cache),
     })
-}
-
-pub async fn relay_session_from_noise_stream<T>(
-    noise_stream: NoiseStream<T>,
-    quic_pool: Option<QuicPool>,
-    payment_receiver_secret: SecretKey,
-    spilman_mint_cache: SpilmanMintCache,
-) -> io::Result<RelaySession<NoiseStream<T>>>
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let session_id = *noise_stream.session_id();
-    relay_session_from_transport_stream(
-        noise_stream,
-        session_id,
-        quic_pool,
-        payment_receiver_secret,
-        spilman_mint_cache,
-    )
-    .await
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
@@ -300,119 +277,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                 continue;
                             }
 
-                            let quic_pin_header = request
-                                .headers()
-                                .get(QUIC_PIN_HEADER)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.to_string());
                             let quic_secp256k1_pubkey_header = request
                                 .headers()
                                 .get(QUIC_SECP256K1_PUBKEY_HEADER)
                                 .and_then(|v| v.to_str().ok())
                                 .map(|s| s.to_string());
-
-                            if quic_pin_header.is_some() && quic_secp256k1_pubkey_header.is_some() {
-                                warn!(
-                                    "CONNECT request provided both quic-pin and quic-secp256k1-pubkey headers"
-                                );
-                                let resp = Response::builder()
-                                    .status(StatusCode::BAD_REQUEST)
-                                    .body(())
-                                    .unwrap();
-                                let _ = respond.send_response(resp, true);
-                                continue;
-                            }
-
-                            if let Some(pin_hex) = quic_pin_header {
-                                info!("CONNECT {authority} (via QUIC)");
-
-                                let pinned_spki = match hex::decode(&pin_hex) {
-                                    Ok(b) if !b.is_empty() => b,
-                                    Ok(_) => {
-                                        warn!("empty quic-pin header");
-                                        let resp = Response::builder()
-                                            .status(StatusCode::BAD_REQUEST)
-                                            .body(())
-                                            .unwrap();
-                                        let _ = respond.send_response(resp, true);
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        warn!("invalid hex in quic-pin header: {e}");
-                                        let resp = Response::builder()
-                                            .status(StatusCode::BAD_REQUEST)
-                                            .body(())
-                                            .unwrap();
-                                        let _ = respond.send_response(resp, true);
-                                        continue;
-                                    }
-                                };
-
-                                let pool = match &self.quic_pool {
-                                    Some(p) => p.clone(),
-                                    None => {
-                                        warn!(
-                                            "CONNECT with quic-pin but QUIC pool is not available"
-                                        );
-                                        let resp = Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .body(())
-                                            .unwrap();
-                                        let _ = respond.send_response(resp, true);
-                                        continue;
-                                    }
-                                };
-
-                                match pool
-                                    .open_stream(
-                                        &authority,
-                                        ClientAuthMode::PinnedSpki(pinned_spki),
-                                    )
-                                    .await
-                                {
-                                    Ok(quic_stream) => {
-                                        info!("QUIC stream opened to {authority}");
-                                        let resp = Response::builder()
-                                            .status(StatusCode::OK)
-                                            .body(())
-                                            .unwrap();
-                                        match respond.send_response(resp, false) {
-                                            Ok(h2_send) => {
-                                                let (_, h2_recv) = request.into_parts();
-                                                let label = format!("quic:{authority}");
-                                                let state = self.state.clone();
-                                                tokio::spawn(async move {
-                                                    if let Err(e) =
-                                                        proxy::proxy_bidirectional_accounted(
-                                                            h2_send,
-                                                            h2_recv,
-                                                            quic_stream,
-                                                            &label,
-                                                            state,
-                                                        )
-                                                        .await
-                                                    {
-                                                        error!(
-                                                            "tunnel to quic:{authority} error: {e}"
-                                                        );
-                                                    }
-                                                });
-                                            }
-                                            Err(e) => {
-                                                error!("h2 send response error: {e}");
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to connect via QUIC to {authority}: {e}");
-                                        let resp = Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .body(())
-                                            .unwrap();
-                                        let _ = respond.send_response(resp, true);
-                                    }
-                                }
-                            } else if let Some(pubkey_hex) = quic_secp256k1_pubkey_header {
+                            if let Some(pubkey_hex) = quic_secp256k1_pubkey_header {
                                 info!("CONNECT {authority} (via QUIC secp256k1 auth)");
 
                                 let pubkey = match Secp256k1Pubkey::from_hex(&pubkey_hex) {

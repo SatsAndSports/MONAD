@@ -13,7 +13,6 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::h2stream::H2ConnectStream;
-use crate::noise::NoiseStream;
 
 // ---------------------------------------------------------------------------
 // Shared math helpers
@@ -151,40 +150,12 @@ impl RelayConnection {
         Ok((conn, driver_handle))
     }
 
-    /// Perform an H2 client handshake over an established `NoiseStream`.
-    ///
-    /// Returns a `RelayConnection` (with no driver handles yet) and the
-    /// `JoinHandle` for the spawned H2 connection driver. The caller is
-    /// responsible for attaching the driver via [`add_driver`](Self::add_driver)
-    /// — either to this connection or, during multi-hop chain building, to
-    /// the final connection in the chain.
-    pub async fn from_noise_stream<T>(
-        noise_stream: NoiseStream<T>,
-    ) -> io::Result<(Self, JoinHandle<()>)>
-    where
-        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    {
-        let session_id = *noise_stream.session_id();
-        Self::from_transport_stream(noise_stream, session_id).await
-    }
-
     /// Open an H2 CONNECT tunnel to the given target authority.
     ///
     /// Returns an `H2ConnectStream` that implements `AsyncRead + AsyncWrite`,
     /// suitable for running a nested Noise+H2 session on top.
     pub async fn open_tunnel(&self, target_authority: &str) -> io::Result<H2ConnectStream> {
         self.open_tunnel_inner(target_authority, None).await
-    }
-
-    /// Open an H2 CONNECT tunnel with a `quic-pin` header, telling the relay
-    /// to reach the target via QUIC instead of TCP.
-    pub async fn open_tunnel_quic(
-        &self,
-        target_authority: &str,
-        pin: &[u8],
-    ) -> io::Result<H2ConnectStream> {
-        self.open_tunnel_inner(target_authority, Some(("quic-pin", hex::encode(pin))))
-            .await
     }
 
     /// Open an H2 CONNECT tunnel with a `quic-secp256k1-pubkey` header, telling the relay
@@ -298,7 +269,7 @@ impl RelayConnection {
         }
     }
 
-    /// Internal: open a CONNECT tunnel with an optional `quic-pin` header.
+    /// Internal: open a CONNECT tunnel with an optional QUIC transport header.
     async fn open_tunnel_inner(
         &self,
         target_authority: &str,
