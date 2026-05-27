@@ -22,12 +22,14 @@ cargo run -p monad-quic -- ...
 
 - `monad-common`
   - shared transport, protocol, and session code
-  - `NoiseStream` (`noise.rs`) — includes session ID (handshake hash)
+  - `NoiseStream` (`noise.rs`) — legacy X25519 Noise transport, includes session ID (handshake hash)
+  - `SecpNoiseStream` (`noise_secp256k1.rs`) — secp256k1 Noise transport with buffered writes and wire-byte logging
   - `H2ConnectStream` (`h2stream.rs`)
   - `ClientMessage` / `ServerMessage` wire protocol, `KeysetAdvertisement` type (`protocol.rs`)
   - `RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`, billing math (`session.rs`)
   - `proxy_bidirectional` shared proxy (`proxy.rs`)
   - `Ed25519Pubkey`, `ServerIdentity`, key derivation (`identity.rs`)
+  - `Secp256k1Pubkey`, `SecpTransportKeypair`, transport auth helpers (`secp_identity.rs`)
 - `monad-client`
   - reusable library code plus binary entrypoint
   - SOCKS5 listener
@@ -50,7 +52,7 @@ cargo run -p monad-quic -- ...
 ## Current Protocol Model
 
 - Outer transport: TCP or QUIC
-- Encryption: Noise NK
+- Encryption: secp256k1 Noise NK on TCP; legacy X25519 Noise NK or secp256k1 Noise NK on QUIC
 - Multiplexing: HTTP/2
 - Control stream: `POST /control`
 - Data stream: `CONNECT host:port`
@@ -75,13 +77,13 @@ cargo run -p monad-quic -- ...
 ### QUIC Transport
 
 - Relay-to-relay transport: QUIC (replaces TCP between hops, does not replace Noise)
-- QUIC authentication: pinned self-signed Ed25519 certificates (one-way, no CA)
-- QUIC hop signaling: `CONNECT host:port` with `quic-pin: <hex>` H2 header
-- Client hop syntax: `--hop quic:addr:port,<ed25519_pubkey>`
+- QUIC authentication: either pinned self-signed Ed25519 certificates (legacy) or secp256k1 attestation
+- QUIC hop signaling: `CONNECT host:port` with `quic-pin: <hex>` or `quic-secp256k1-pubkey: <hex>` H2 header
+- Client hop syntax: `--hop quic:addr:port,<ed25519_pubkey>` or `--hop quic:addr:port,secp256k1:<pubkey>`
 - Client can also use QUIC directly to the first hop with the same `--hop quic:` syntax
 - Noise nesting is preserved — the inner Noise+H2 session runs unchanged inside the QUIC stream
 - Server listens on the same port for both TCP and UDP (QUIC)
-- QUIC connection pool: shared connections reused across client sessions, keyed by `(host, port)`
+- QUIC connection pool: shared connections reused across client sessions, keyed by `(host, port)` plus auth mode
 
 ## Important Invariants
 
@@ -138,7 +140,7 @@ Use:
 - `wire_written`
 - `wire_total`
 
-for per-hop encrypted byte counts from `NoiseStream`.
+for per-hop encrypted byte counts from `NoiseStream` and `SecpNoiseStream`.
 
 ### CONNECT logs
 
@@ -157,13 +159,14 @@ The client and server both implement graceful shutdown.
 If you change shutdown logic:
 - keep task tracking explicit
 - prefer `JoinSet` / awaited tasks over heuristic sleeps
-- preserve reliable `NoiseStream` drop logging
+- preserve reliable `NoiseStream` and `SecpNoiseStream` drop logging
 
 ## Test Expectations
 
 The test suite currently covers:
-- Noise transport correctness
+- Noise transport correctness (both legacy X25519 and secp256k1)
 - large payload chunking
+- secp256k1 Noise partial-write tolerance and shutdown flushing
 - session starts paused by default
 - second control stream rejected
 - CONNECT rejected while paused (402)
@@ -177,6 +180,7 @@ The test suite currently covers:
 - mixed-family hop chains
 - hostname resolution at the final hop
 - SOCKS5 IPv6 parsing
+- TCP secp single-hop and nested plain-CONNECT secp tunnels
 - QUIC echo with pinned-key authentication
 - QUIC pinned-key rejection (wrong key)
 - 1,000 concurrent QUIC streams over one connection
@@ -188,6 +192,8 @@ The test suite currently covers:
 - client connector with QUIC hop (`--hop quic:` end-to-end path)
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
+- legacy Ed25519/plain-noise QUIC first hop still works
+- non-QUIC Ed25519 hop rejected by client connector
 - Noise session ID (handshake hash) matches on both sides
 - Spilman channel implementation (delta-based) is currently being integrated and tested
 - server advertises multiple mint/unit pricing options

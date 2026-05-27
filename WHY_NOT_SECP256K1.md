@@ -1,10 +1,11 @@
-# Why Not secp256k1?
+# Why Not secp256k1 Everywhere?
 
-This document records why MONAD does **not** currently use secp256k1 for its
-transport-layer identities.
+This document records why MONAD still does **not** use secp256k1 everywhere in
+the transport stack, even though secp256k1 transport identities are now used
+for MONAD's TCP transport and for the secp-authenticated QUIC path.
 
-The current identity and key-derivation scheme used by MONAD is documented in
-`ARCHITECTURE.md` under **Unified Identity And Key Derivation**.
+The current transport split is documented in `ARCHITECTURE.md` under
+**Current Transport Identity Model**.
 
 ## Why It Looks This Way
 
@@ -178,21 +179,23 @@ So unlike QUIC/TLS, the Noise side is not fundamentally blocked.
 
 ## Combined Conclusion
 
-If the goal is "switch both QUIC and Noise to secp256k1 at the transport layer", the practical split is:
+If the goal is "make every transport path use secp256k1 and remove the legacy
+Ed25519/X25519 QUIC/plain-noise path", the practical split is:
 
 - QUIC/TLS transport-layer secp256k1: effectively blocked with the current stack
 - Noise transport-layer secp256k1: plausible with a different Noise implementation
 
-So there is no realistic near-term path to making both layers use secp256k1 while staying on the current standards-compliant QUIC stack.
+So there is still no realistic near-term path to making QUIC/TLS itself fully
+secp256k1-native while staying on the current standards-compliant QUIC stack.
 
 ## Decision Record
 
 At the time of writing:
 
-- MONAD remains on the current unified Ed25519 identity design
-- we are not attempting a secp256k1 migration
-- if secp256k1 is revisited later, QUIC should be assumed blocked unless a custom or nonstandard TLS/QUIC crypto stack is acceptable
-- if secp256k1 is revisited later, the most promising place to experiment is the Noise layer using `noise-protocol` + `k256`
+- MONAD's plain TCP transport uses secp256k1 Noise
+- MONAD's QUIC transport supports both the legacy Ed25519/plain-noise path and a secp-authenticated path
+- QUIC/TLS certificate authentication is still not secp256k1-native; the secp QUIC path relies on post-handshake attestation rather than a secp256k1 TLS certificate
+- the remaining blocker to a fully secp-only transport story is therefore concentrated in QUIC/TLS, not the Noise layer
 
 ## Future Experiment Ideas
 

@@ -16,13 +16,13 @@ Implemented today:
 - `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup
 - `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels, auto-funds sessions via the control stream
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
-- `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, pinned-key auth, echo server/client, and shared config/keygen helpers used by server and client
-- QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, `quic-pin` H2 header for CONNECT forwarding
+- `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, pinned-key auth, secp attestation helpers, echo server/client, and shared config/keygen helpers used by server and client
+- QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, `quic-pin` and `quic-secp256k1-pubkey` H2 headers for CONNECT forwarding
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
 - session payment system: paused-by-default sessions, Hello/SessionStatus handshake, fake payments, totals-based billing with directional pricing, pause/resume enforcement
 - Spilman advertisement plumbing: server discovers trusted mints/keysets at startup and includes a `KeysetAdvertisement` list plus its receiver pubkey in `SessionStatus`. The `ChannelLink`/`ChannelPayment`/`ChannelEvicted` wire messages exist but are not yet handled — the server only credits sessions via `FakePayment` today.
 - low-level blinded-hop building blocks: blinded blob encryption/decryption, tweak compatibility rejection sampling, reverse-tweak key recovery, and a mixed cleartext/blinded path data model in `monad-common`
-- integration tests for direct, nested, IPv6, hostname-resolution, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
+- integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
 
 Not implemented yet:
 - real Spilman byte-level payments — implementation of the new delta-based model is in progress
@@ -97,8 +97,25 @@ Current coverage includes:
 - concurrent QUIC pool access
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
+- TCP secp single-hop and nested plain-CONNECT secp tunnels
+- legacy Ed25519/plain-noise QUIC first hop
 - session funding and incremental payments via Spilman channels (in progress)
 - server advertises multiple mint/unit pricing options
+
+## Transport Identities
+
+MONAD currently uses a split transport model:
+
+- **TCP MONAD transport** is secp256k1-only
+- **QUIC MONAD transport** supports both:
+  - legacy Ed25519 identity with derived X25519 Noise key and pinned SPKI cert key
+  - secp256k1 transport identity with QUIC attestation plus secp Noise
+
+So the hop identity you give the client depends on the transport:
+
+- `addr:port,secp256k1:<pubkey>` for plain TCP MONAD hops
+- `quic:addr:port,<legacy_ed25519_pubkey>` for legacy QUIC/plain-noise hops
+- `quic:addr:port,secp256k1:<pubkey>` for secp-authenticated QUIC hops
 
 ## Quick Start
 
@@ -109,11 +126,9 @@ cargo run -p monad-server -- keygen
 ```
 
 This prints:
-- a private key (Ed25519 seed) for the server process
-- a public key (Ed25519) to give to clients
-- a QUIC certificate (derived from the same key)
-
-One key is used for both Noise and QUIC authentication.
+- an Ed25519 seed/public key for legacy QUIC/plain-noise compatibility
+- a secp256k1 transport private/public key for TCP MONAD transport and secp-authenticated QUIC
+- a QUIC certificate derived from the Ed25519 seed
 
 ### 2. Start one or more servers
 
@@ -122,7 +137,8 @@ Single hop (TCP only):
 ```bash
 RUST_LOG=info cargo run -p monad-server -- run \
   --listen 127.0.0.1:9050 \
-  --private-key <SERVER_PRIVATE_KEY>
+  --private-key <SERVER_ED25519_SEED> \
+  --transport-key <SERVER_SECP256K1_KEY>
 ```
 
 With QUIC enabled (add `--quic`):
@@ -130,15 +146,17 @@ With QUIC enabled (add `--quic`):
 ```bash
 RUST_LOG=info cargo run -p monad-server -- run \
   --listen 127.0.0.1:9050 \
-  --private-key <SERVER_PRIVATE_KEY> --quic
+  --private-key <SERVER_ED25519_SEED> \
+  --transport-key <SERVER_SECP256K1_KEY> \
+  --quic
 ```
 
 Multi-hop example:
 
 ```bash
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9051 --private-key <HOP1_PRIV>
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9052 --private-key <HOP2_PRIV> --quic
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9053 --private-key <HOP3_PRIV> --quic
+RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9051 --private-key <HOP1_ED25519> --transport-key <HOP1_SECP>
+RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9052 --private-key <HOP2_ED25519> --transport-key <HOP2_SECP> --quic
+RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9053 --private-key <HOP3_ED25519> --transport-key <HOP3_SECP> --quic
 ```
 
 ### 3. Start the client
@@ -147,7 +165,7 @@ Direct connection:
 
 ```bash
 RUST_LOG=info cargo run -p monad-client -- \
-  --hop 127.0.0.1:9050,<SERVER_PUBLIC_KEY> \
+  --hop 127.0.0.1:9050,secp256k1:<SERVER_SECP256K1_PUBKEY> \
   --socks 127.0.0.1:1080
 ```
 
@@ -155,9 +173,9 @@ Three-hop chain:
 
 ```bash
 RUST_LOG=info cargo run -p monad-client -- \
-  --hop 127.0.0.1:9051,<HOP1_PUB> \
-  --hop 127.0.0.1:9052,<HOP2_PUB> \
-  --hop 127.0.0.1:9053,<HOP3_PUB> \
+  --hop 127.0.0.1:9051,secp256k1:<HOP1_SECP_PUB> \
+  --hop 127.0.0.1:9052,secp256k1:<HOP2_SECP_PUB> \
+  --hop 127.0.0.1:9053,secp256k1:<HOP3_SECP_PUB> \
   --socks 127.0.0.1:1080
 ```
 
@@ -169,22 +187,22 @@ QUIC hops:
 
 ```bash
 RUST_LOG=info cargo run -p monad-client -- \
-  --hop 127.0.0.1:9051,<HOP1_PUB> \
-  --hop quic:127.0.0.1:9052,<HOP2_PUB> \
+  --hop 127.0.0.1:9051,secp256k1:<HOP1_SECP_PUB> \
+  --hop quic:127.0.0.1:9052,secp256k1:<HOP2_SECP_PUB> \
   --socks 127.0.0.1:1080
 ```
 
-The `quic:` prefix tells the client to instruct the previous hop to connect via QUIC instead of TCP. Each hop uses a single Ed25519 public key — the Noise X25519 key and QUIC pinned key are both derived from it. See `ARCHITECTURE.md` for the full layering model.
+The `quic:` prefix tells the client to instruct the previous hop to connect via QUIC instead of TCP. For QUIC hops, you can use either a legacy Ed25519 identity or an explicit `secp256k1:<pubkey>` transport identity. Plain non-QUIC hops are secp256k1-only. See `ARCHITECTURE.md` for the full layering model.
 
 QUIC first hop:
 
 ```bash
 RUST_LOG=info cargo run -p monad-client -- \
-  --hop quic:127.0.0.1:9051,<HOP1_PUB> \
+  --hop quic:127.0.0.1:9051,<HOP1_LEGACY_ED25519_PUB> \
   --socks 127.0.0.1:1080
 ```
 
-The client connects directly to the first hop via QUIC, then runs the same Noise+H2 session on top.
+The client connects directly to the first hop via QUIC, then runs the same Noise+H2 session on top. Use an untagged or `ed25519:` key for the legacy QUIC/plain-noise path, or `secp256k1:` for the secp QUIC path.
 
 ## Example Usage
 
@@ -223,7 +241,7 @@ tunnel closed: example.com:22 | outbound=63630 inbound=5200 total=68830
 
 ### Per-hop encrypted wire counts
 
-Each `NoiseStream` logs encrypted wire usage when the hop connection shuts down:
+Each `NoiseStream` and `SecpNoiseStream` logs encrypted wire usage when the hop connection shuts down:
 
 ```text
 NoiseStream closed label=client hop 2/3 to 127.0.0.1:9052 wire_read=... wire_written=... wire_total=...
@@ -232,7 +250,7 @@ NoiseStream closed label=client hop 2/3 to 127.0.0.1:9052 wire_read=... wire_wri
 To see these, use debug logging for the Noise module:
 
 ```bash
-RUST_LOG=monad_common::noise=debug,monad_client=info,monad_server=info
+RUST_LOG=monad_common::noise=debug,monad_common::noise_secp256k1=debug,monad_client=info,monad_server=info
 ```
 
 ### CONNECT visibility

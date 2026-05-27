@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("Public key (secp256k1):     {transport_pubkey}");
             println!();
-            println!("# --- QUIC certificate (derived from the same key) ---");
+            println!("# --- QUIC certificate (derived from the Ed25519 key) ---");
             println!("{}", quic_km.cert_pem);
             println!("# Run the server with:");
             println!(
