@@ -1,7 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::schnorr::SigningKey;
-use k256::{ecdh, PublicKey};
+use k256::{ecdh, PublicKey, SecretKey};
 use noise_protocol::patterns;
 use noise_protocol::{CipherState, HandshakeState, U8Array};
 use noise_rust_crypto::{Blake2s, ChaCha20Poly1305};
@@ -64,16 +63,16 @@ impl noise_protocol::DH for Secp256k1Dh {
     }
 
     fn pubkey(key: &Self::Key) -> Self::Pubkey {
-        let signing_key = SigningKey::from_bytes(key).expect("valid secp256k1 secret key bytes");
-        let public_key = PublicKey::from(*signing_key.verifying_key());
+        let secret_key = SecretKey::from_slice(key).expect("valid secp256k1 secret key bytes");
+        let public_key = secret_key.public_key();
         let encoded = public_key.to_encoded_point(true);
         SecpPublicKeyBytes::from_slice(encoded.as_bytes())
     }
 
     fn dh(key: &Self::Key, pubkey: &Self::Pubkey) -> Result<Self::Output, ()> {
-        let signing_key = SigningKey::from_bytes(key).map_err(|_| ())?;
+        let secret_key = SecretKey::from_slice(key).map_err(|_| ())?;
         let public_key = PublicKey::from_sec1_bytes(pubkey.as_slice()).map_err(|_| ())?;
-        let shared = ecdh::diffie_hellman(signing_key.as_nonzero_scalar(), public_key.as_affine());
+        let shared = ecdh::diffie_hellman(secret_key.to_nonzero_scalar(), public_key.as_affine());
         Ok((*shared.raw_secret_bytes()).into())
     }
 }
@@ -325,7 +324,7 @@ pub async fn handshake_initiator<T: AsyncRead + AsyncWrite + Unpin>(
     CipherState<ChaCha20Poly1305>,
     [u8; 32],
 )> {
-    handshake_initiator_with_pubkey(stream, *server_pubkey.as_bytes()).await
+    handshake_initiator_with_pubkey(stream, server_pubkey.to_compressed_bytes()).await
 }
 
 pub async fn handshake_initiator_with_pubkey<T: AsyncRead + AsyncWrite + Unpin>(
@@ -369,11 +368,22 @@ pub async fn handshake_responder<T: AsyncRead + AsyncWrite + Unpin>(
     CipherState<ChaCha20Poly1305>,
     [u8; 32],
 )> {
+    handshake_responder_with_secret_key_bytes(stream, server_key.normalized_secret_bytes()).await
+}
+
+pub async fn handshake_responder_with_secret_key_bytes<T: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut T,
+    server_key: [u8; 32],
+) -> io::Result<(
+    CipherState<ChaCha20Poly1305>,
+    CipherState<ChaCha20Poly1305>,
+    [u8; 32],
+)> {
     let mut hs = SecpHandshake::new(
         patterns::noise_nk(),
         false,
         PROLOGUE,
-        Some(server_key.normalized_secret_bytes()),
+        Some(server_key),
         None,
         None,
         None,

@@ -7,10 +7,12 @@ use std::fmt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecpIdentityError {
-    #[error("invalid secp256k1 compressed public key hex: {0}")]
+    #[error("invalid secp256k1 public key hex: {0}")]
     Hex(hex::FromHexError),
-    #[error("invalid secp256k1 compressed public key bytes")]
+    #[error("invalid secp256k1 x-only public key bytes")]
     InvalidPublicKey,
+    #[error("invalid secp256k1 signed public key bytes")]
+    InvalidSignedPublicKey,
     #[error("invalid secp256k1 secret key bytes")]
     InvalidSecretKey,
     #[error("invalid schnorr signature bytes")]
@@ -18,24 +20,24 @@ pub enum SecpIdentityError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Secp256k1Pubkey([u8; 33]);
+pub struct Secp256k1Pubkey([u8; 32]);
 
 impl Secp256k1Pubkey {
-    pub fn from_bytes(bytes: [u8; 33]) -> Result<Self, SecpIdentityError> {
-        PublicKey::from_sec1_bytes(&bytes).map_err(|_| SecpIdentityError::InvalidPublicKey)?;
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, SecpIdentityError> {
+        VerifyingKey::from_bytes(&bytes).map_err(|_| SecpIdentityError::InvalidPublicKey)?;
         Ok(Self(bytes))
     }
 
     pub fn from_hex(pubkey_hex: &str) -> Result<Self, SecpIdentityError> {
         let bytes = hex::decode(pubkey_hex).map_err(SecpIdentityError::Hex)?;
-        let arr: [u8; 33] = bytes
+        let arr: [u8; 32] = bytes
             .as_slice()
             .try_into()
             .map_err(|_| SecpIdentityError::InvalidPublicKey)?;
         Self::from_bytes(arr)
     }
 
-    pub fn as_bytes(&self) -> &[u8; 33] {
+    pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
@@ -43,8 +45,79 @@ impl Secp256k1Pubkey {
         hex::encode(self.0)
     }
 
+    pub fn to_verifying_key(&self) -> Result<VerifyingKey, SecpIdentityError> {
+        VerifyingKey::from_bytes(&self.0).map_err(|_| SecpIdentityError::InvalidPublicKey)
+    }
+
     pub fn to_public_key(&self) -> Result<PublicKey, SecpIdentityError> {
-        PublicKey::from_sec1_bytes(&self.0).map_err(|_| SecpIdentityError::InvalidPublicKey)
+        Ok(PublicKey::from(self.to_verifying_key()?))
+    }
+
+    pub fn to_compressed_bytes(&self) -> [u8; 33] {
+        let public_key = self
+            .to_public_key()
+            .expect("valid x-only secp256k1 public key");
+        let encoded = public_key.to_encoded_point(true);
+        let mut out = [0u8; 33];
+        out.copy_from_slice(encoded.as_bytes());
+        out
+    }
+
+    pub fn from_compressed_bytes(bytes: [u8; 33]) -> Result<Self, SecpIdentityError> {
+        let signed = SignedSecp256k1Pubkey::from_compressed_bytes(bytes)?;
+        if signed.is_odd() {
+            return Err(SecpIdentityError::InvalidPublicKey);
+        }
+        Self::from_bytes(signed.x_only_bytes())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SignedSecp256k1Pubkey {
+    x_only: [u8; 32],
+    odd: bool,
+}
+
+impl SignedSecp256k1Pubkey {
+    pub fn from_compressed_bytes(bytes: [u8; 33]) -> Result<Self, SecpIdentityError> {
+        let prefix = bytes[0];
+        if prefix != 0x02 && prefix != 0x03 {
+            return Err(SecpIdentityError::InvalidSignedPublicKey);
+        }
+        PublicKey::from_sec1_bytes(&bytes)
+            .map_err(|_| SecpIdentityError::InvalidSignedPublicKey)?;
+        let mut x_only = [0u8; 32];
+        x_only.copy_from_slice(&bytes[1..]);
+        Ok(Self {
+            x_only,
+            odd: prefix == 0x03,
+        })
+    }
+
+    pub fn from_public_key(public_key: &PublicKey) -> Self {
+        let encoded = public_key.to_encoded_point(true);
+        let mut bytes = [0u8; 33];
+        bytes.copy_from_slice(encoded.as_bytes());
+        Self::from_compressed_bytes(bytes).expect("valid compressed secp256k1 public key")
+    }
+
+    pub fn x_only_bytes(&self) -> [u8; 32] {
+        self.x_only
+    }
+
+    pub fn is_odd(&self) -> bool {
+        self.odd
+    }
+
+    pub fn to_compressed_bytes(&self) -> [u8; 33] {
+        let mut out = [0u8; 33];
+        out[0] = if self.odd { 0x03 } else { 0x02 };
+        out[1..].copy_from_slice(&self.x_only);
+        out
+    }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.to_compressed_bytes())
     }
 }
 
@@ -75,11 +148,8 @@ impl SecpTransportKeypair {
     }
 
     pub fn pubkey(&self) -> Secp256k1Pubkey {
-        let public_key = PublicKey::from(*self.signing_key.verifying_key());
-        let encoded = public_key.to_encoded_point(true);
-        let mut out = [0u8; 33];
-        out.copy_from_slice(encoded.as_bytes());
-        Secp256k1Pubkey(out)
+        Secp256k1Pubkey::from_bytes(self.signing_key.verifying_key().to_bytes().into())
+            .expect("normalized signing key has valid x-only pubkey")
     }
 
     pub fn sign_digest(&self, digest: &[u8; 32]) -> [u8; 64] {
@@ -118,8 +188,7 @@ pub fn verify_transport_auth_digest(
 ) -> Result<(), SecpIdentityError> {
     let signature = Signature::try_from(signature_bytes.as_slice())
         .map_err(|_| SecpIdentityError::InvalidSignature)?;
-    let verifying_key = VerifyingKey::try_from(pubkey.to_public_key()?)
-        .map_err(|_| SecpIdentityError::InvalidPublicKey)?;
+    let verifying_key = pubkey.to_verifying_key()?;
     verifying_key
         .verify_raw(digest, &signature)
         .map_err(|_| SecpIdentityError::InvalidSignature)
@@ -157,7 +226,7 @@ mod tests {
     fn test_generated_pubkey_is_even_y_form() {
         for _ in 0..32 {
             let keypair = SecpTransportKeypair::generate();
-            assert_eq!(keypair.pubkey().as_bytes()[0], 0x02);
+            assert_eq!(keypair.pubkey().to_compressed_bytes()[0], 0x02);
         }
     }
 
@@ -181,6 +250,32 @@ mod tests {
             from_negated.normalized_secret_bytes()
         );
         assert_eq!(normalized.pubkey(), from_negated.pubkey());
-        assert_eq!(normalized.pubkey().as_bytes()[0], 0x02);
+        assert_eq!(normalized.pubkey().to_compressed_bytes()[0], 0x02);
+    }
+
+    #[test]
+    fn test_signed_pubkey_roundtrip_preserves_parity() {
+        let keypair = SecpTransportKeypair::generate();
+        let even =
+            SignedSecp256k1Pubkey::from_compressed_bytes(keypair.pubkey().to_compressed_bytes())
+                .unwrap();
+        let negated_bytes: [u8; 32] =
+            (-*SigningKey::from_bytes(&keypair.normalized_secret_bytes())
+                .unwrap()
+                .as_nonzero_scalar()
+                .as_ref())
+            .to_bytes()
+            .into();
+        let odd = SignedSecp256k1Pubkey::from_compressed_bytes(
+            SecpTransportKeypair::from_secret_bytes(&negated_bytes)
+                .unwrap()
+                .pubkey()
+                .to_compressed_bytes(),
+        )
+        .unwrap();
+
+        assert!(!even.is_odd());
+        assert_eq!(even.to_compressed_bytes()[0], 0x02);
+        assert_eq!(odd.to_compressed_bytes()[0], 0x02);
     }
 }
