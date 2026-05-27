@@ -21,6 +21,9 @@ struct Cli {
     /// - explicit Ed25519: `ed25519:<pubkey_hex>`
     /// - explicit secp256k1 transport identity: `secp256k1:<33-byte-compressed-pubkey-hex>`
     ///
+    /// Non-QUIC hops are secp256k1-only. Ed25519 hop identities remain supported
+    /// for legacy QUIC/plain-noise hops.
+    ///
     /// For a direct connection, specify one hop:
     ///   --hop 1.2.3.4:9050,<pubkey>
     ///
@@ -235,6 +238,7 @@ async fn accept_loop(socks_listener: &TcpListener, conn: &RelayConnection) -> an
 #[cfg(test)]
 mod tests {
     use super::*;
+    use monad_common::identity::ServerIdentity;
     use monad_common::secp_identity::SecpTransportKeypair;
 
     #[test]
@@ -261,5 +265,25 @@ mod tests {
         let hop = parse_hop(&format!("127.0.0.1:9050,secp256k1:{pubkey}")).unwrap();
 
         assert!(matches!(hop.identity, connector::HopIdentity::Secp256k1(_)));
+    }
+
+    #[tokio::test]
+    async fn test_non_quic_ed25519_hop_rejected() {
+        let identity = ServerIdentity::generate().unwrap();
+        let err = match connector::connect_through_chain(&[Hop {
+            addr: "127.0.0.1:9050".to_string(),
+            identity: connector::HopIdentity::Ed25519(identity.ed25519_pubkey().clone()),
+            use_quic: false,
+        }])
+        .await
+        {
+            Ok(_) => panic!("expected non-QUIC Ed25519 hop to be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err
+            .to_string()
+            .contains("legacy Ed25519 transport hops currently require QUIC"));
     }
 }

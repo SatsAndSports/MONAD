@@ -38,11 +38,9 @@ impl HopIdentity {
 
 /// A hop in the tunnel chain: server address and its transport identity.
 ///
-/// Today, MONAD's mainline transport uses Ed25519 public keys, from which the
-/// X25519 Noise key and QUIC SPKI pin are derived automatically. secp256k1
-/// identities are parsed and carried through the hop model for the dual-stack
-/// migration, but their transport path is not integrated into the mainline
-/// connector yet.
+/// MONAD currently supports two hop identity families:
+/// - legacy Ed25519 identities for QUIC plain-noise hops
+/// - secp256k1 identities for secp-authenticated transports, including plain TCP
 ///
 /// If `use_quic` is true, the previous relay in the chain will connect to this
 /// hop via QUIC instead of TCP.
@@ -61,11 +59,11 @@ pub struct Hop {
 #[allow(dead_code)]
 pub async fn connect(
     server_addr: &str,
-    server_pubkey: Ed25519Pubkey,
+    server_pubkey: Secp256k1Pubkey,
 ) -> io::Result<RelayConnection> {
     connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
-        identity: HopIdentity::Ed25519(server_pubkey),
+        identity: HopIdentity::Secp256k1(server_pubkey),
         use_quic: false,
     }])
     .await
@@ -92,10 +90,10 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
 
     let first = &hops[0];
 
-    if matches!(first.identity, HopIdentity::Secp256k1(_)) && !first.use_quic {
+    if matches!(first.identity, HopIdentity::Ed25519(_)) && !first.use_quic {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "secp256k1 transport hops currently require QUIC",
+            "legacy Ed25519 transport hops currently require QUIC",
         ));
     }
 
@@ -243,10 +241,10 @@ where
                     }
                 }
             } else {
-                if matches!(next.identity, HopIdentity::Secp256k1(_)) {
+                if matches!(next.identity, HopIdentity::Ed25519(_)) {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
-                        "secp256k1 transport hops currently require QUIC",
+                        "legacy Ed25519 transport hops currently require QUIC",
                     ));
                 }
                 conn.open_tunnel(&next.addr).await?

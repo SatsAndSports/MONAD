@@ -110,6 +110,12 @@ pub async fn run(
     quic_endpoint: Option<quinn::Endpoint>,
     config: Arc<ServerConfig>,
 ) -> io::Result<()> {
+    let transport_key = config.transport_key.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "server transport_key is required for secp-authenticated transport",
+        )
+    })?;
     let local_addr = listener.local_addr()?;
     info!("listening on {local_addr}");
 
@@ -129,29 +135,38 @@ pub async fn run(
                 info!("accepted TCP connection from {peer_addr}");
 
                 let config = config.clone();
+                let transport_key = transport_key.clone();
                 let quic_pool = quic_pool.clone();
                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
 
                 sessions.spawn(async move {
-                    // Noise NK handshake (server is responder)
-                    let (transport, session_id) =
-                        match noise::handshake_responder(&mut tcp_stream, config.identity.x25519_private()).await {
-                            Ok(t) => {
-                                info!("noise handshake complete with {peer_addr} (TCP)");
-                                t
+                    let (send_cipher, recv_cipher, session_id) =
+                        match noise_secp256k1::handshake_responder(&mut tcp_stream, &transport_key)
+                            .await
+                        {
+                            Ok(v) => {
+                                info!("secp noise handshake complete with {peer_addr} (TCP)");
+                                v
                             }
                             Err(e) => {
-                                error!("noise handshake failed with {peer_addr}: {e}");
+                                error!("secp noise handshake failed with {peer_addr}: {e}");
                                 return;
                             }
                         };
 
                     let label = format!("{local_addr} <-> {peer_addr} (TCP)");
-                    let noise_stream = NoiseStream::new(tcp_stream, transport, session_id, label);
+                    let secp_stream = noise_secp256k1::SecpNoiseStream::new(
+                        tcp_stream,
+                        send_cipher,
+                        recv_cipher,
+                        session_id,
+                        label,
+                    );
 
                     // Run the H2 session
-                    match relay_session_from_noise_stream(
-                        noise_stream,
+                    match relay_session_from_transport_stream(
+                        secp_stream,
+                        session_id,
                         quic_pool,
                         config.payment_receiver_secret.clone(),
                         discovered_spilman_mint_cache.as_ref().clone(),
@@ -184,6 +199,7 @@ pub async fn run(
                 }
             } => {
                 let config = config.clone();
+                let transport_key = transport_key.clone();
                 let quic_pool = quic_pool.clone();
                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
 
@@ -198,7 +214,7 @@ pub async fn run(
                     };
                     let remote = conn.remote_address();
                     info!("accepted QUIC connection from {remote}");
-                    let authenticated = Arc::new(AtomicBool::new(config.transport_key.is_none()));
+                    let authenticated = Arc::new(AtomicBool::new(false));
 
                     // Accept bidirectional streams from this QUIC connection.
                     // Each stream is an independent Noise+H2 session.
@@ -209,9 +225,9 @@ pub async fn run(
                                 info!(%remote, ?stream_id, "accepted QUIC stream");
 
                                 let config = config.clone();
+                                let transport_key = transport_key.clone();
                                 let quic_pool = quic_pool.clone();
                                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
-                                let transport_key = config.transport_key.clone();
                                 let authenticated = authenticated.clone();
                                 let conn = conn.clone();
                                 tokio::spawn(async move {
@@ -222,34 +238,20 @@ pub async fn run(
                                         return;
                                     }
 
-                                    if let Some(ref transport_key) = transport_key {
-                                        if kind[0] == AUTH_STREAM_KIND {
-                                            if let Err(e) = serve_attestation_stream(
-                                                &conn,
-                                                transport_key,
-                                                &mut send,
-                                                &mut recv,
-                                            )
-                                            .await
-                                            {
-                                                error!("QUIC secp256k1 auth failed with {remote} ({stream_id:?}): {e}");
-                                            } else {
-                                                authenticated.store(true, Ordering::Release);
-                                            }
-                                            return;
-                                        }
-
-                                        if kind[0] != STREAM_KIND_PLAIN_NOISE
-                                            && kind[0] != STREAM_KIND_SECP_NOISE
+                                    if kind[0] == AUTH_STREAM_KIND {
+                                        if let Err(e) = serve_attestation_stream(
+                                            &conn,
+                                            &transport_key,
+                                            &mut send,
+                                            &mut recv,
+                                        )
+                                        .await
                                         {
-                                            reject_stream(&mut send, &mut recv, STREAM_ERROR_UNKNOWN_KIND);
-                                            return;
+                                            error!("QUIC secp256k1 auth failed with {remote} ({stream_id:?}): {e}");
+                                        } else {
+                                            authenticated.store(true, Ordering::Release);
                                         }
-
-                                        if !authenticated.load(Ordering::Acquire) {
-                                            reject_stream(&mut send, &mut recv, STREAM_ERROR_AUTH_REQUIRED);
-                                            return;
-                                        }
+                                        return;
                                     }
 
                                     if kind[0] != STREAM_KIND_PLAIN_NOISE && kind[0] != STREAM_KIND_SECP_NOISE {
@@ -303,15 +305,15 @@ pub async fn run(
                                             }
                                         }
                                         STREAM_KIND_SECP_NOISE => {
-                                            let Some(ref transport_key) = transport_key else {
-                                                reject_stream(&mut send, &mut recv, STREAM_ERROR_UNKNOWN_KIND);
+                                            if !authenticated.load(Ordering::Acquire) {
+                                                reject_stream(&mut send, &mut recv, STREAM_ERROR_AUTH_REQUIRED);
                                                 return;
-                                            };
+                                            }
                                             let mut quic_stream = QuicStream::new(send, recv);
                                             let (send_cipher, recv_cipher, session_id) =
                                                 match noise_secp256k1::handshake_responder(
                                                     &mut quic_stream,
-                                                    transport_key,
+                                                    &transport_key,
                                                 )
                                                 .await
                                                 {

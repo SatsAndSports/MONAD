@@ -17,7 +17,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a new server identity (unified Ed25519 key for Noise + QUIC)
+    /// Generate a new server identity set
     Keygen,
 
     /// Run the server
@@ -31,10 +31,10 @@ enum Command {
         #[arg(long, env = "MONAD_PRIVATE_KEY")]
         private_key: String,
 
-        /// Optional shared secp256k1 transport private key (hex-encoded, 32 bytes).
-        /// Used for secp-authenticated transports, including QUIC secp auth today.
+        /// Shared secp256k1 transport private key (hex-encoded, 32 bytes).
+        /// Used for secp-authenticated transports, including TCP and QUIC secp auth.
         #[arg(long, env = "MONAD_TRANSPORT_KEY")]
-        transport_key: Option<String>,
+        transport_key: String,
 
         /// Enable QUIC listener. The QUIC certificate is derived from the
         /// same Ed25519 private key. If omitted, only TCP is accepted.
@@ -103,10 +103,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let identity = ServerIdentity::from_hex(&private_key)
                 .map_err(|e| anyhow::anyhow!("bad private key: {e}"))?;
-            let transport_key = transport_key
-                .as_deref()
-                .map(parse_transport_key)
-                .transpose()?;
+            let transport_key = parse_transport_key(&transport_key)?;
 
             // Optionally set up QUIC listener from the same seed
             let quic_config = if quic {
@@ -126,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
             let config = Arc::new(listener::ServerConfig {
                 identity,
-                transport_key,
+                transport_key: Some(transport_key),
                 payment_receiver_secret: SecretKey::generate(),
                 trusted_mint_units,
             });

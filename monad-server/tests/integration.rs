@@ -123,6 +123,16 @@ async fn run_gated_reply_server(
 
 /// Spin up a MONAD server and return (server_addr, secp256k1 pubkey).
 async fn start_monad_server() -> (std::net::SocketAddr, Secp256k1Pubkey) {
+    let (addr, secp_pubkey, _) = start_monad_server_with_identities().await;
+    (addr, secp_pubkey)
+}
+
+/// Spin up a MONAD server and return both published transport identities.
+async fn start_monad_server_with_identities() -> (
+    std::net::SocketAddr,
+    Secp256k1Pubkey,
+    identity::Ed25519Pubkey,
+) {
     use cashu::nuts::SecretKey;
     start_monad_server_with_spilman(BTreeMap::new(), SecretKey::generate()).await
 }
@@ -131,10 +141,15 @@ async fn start_monad_server() -> (std::net::SocketAddr, Secp256k1Pubkey) {
 async fn start_monad_server_with_spilman(
     trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
     payment_receiver_secret: cashu::nuts::SecretKey,
-) -> (std::net::SocketAddr, Secp256k1Pubkey) {
+) -> (
+    std::net::SocketAddr,
+    Secp256k1Pubkey,
+    identity::Ed25519Pubkey,
+) {
     let identity = identity::ServerIdentity::generate().unwrap();
     let transport_key = SecpTransportKeypair::generate();
     let pubkey = transport_key.pubkey();
+    let legacy_pubkey = identity.ed25519_pubkey().clone();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -156,7 +171,7 @@ async fn start_monad_server_with_spilman(
         config,
     ));
 
-    (addr, pubkey)
+    (addr, pubkey, legacy_pubkey)
 }
 
 /// Spin up a MONAD server bound to a specific address and return (server_addr, secp256k1 pubkey).
@@ -218,11 +233,55 @@ async fn connect_client(
     .unwrap()
 }
 
+async fn connect_client_tcp(
+    server_addr: std::net::SocketAddr,
+    pubkey: &Secp256k1Pubkey,
+) -> RelayConnection {
+    connector::connect_through_chain(&[Hop {
+        addr: server_addr.to_string(),
+        identity: HopIdentity::Secp256k1(*pubkey),
+        use_quic: false,
+    }])
+    .await
+    .unwrap()
+}
+
+async fn connect_client_legacy_quic(
+    server_addr: std::net::SocketAddr,
+    pubkey: &identity::Ed25519Pubkey,
+) -> RelayConnection {
+    connector::connect_through_chain(&[Hop {
+        addr: server_addr.to_string(),
+        identity: HopIdentity::Ed25519(pubkey.clone()),
+        use_quic: true,
+    }])
+    .await
+    .unwrap()
+}
+
 async fn connect_client_funded(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
     let conn = connect_client(server_addr, pubkey).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    conn
+}
+
+async fn connect_client_tcp_funded(
+    server_addr: std::net::SocketAddr,
+    pubkey: &Secp256k1Pubkey,
+) -> RelayConnection {
+    let conn = connect_client_tcp(server_addr, pubkey).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    conn
+}
+
+async fn connect_client_legacy_quic_funded(
+    server_addr: std::net::SocketAddr,
+    pubkey: &identity::Ed25519Pubkey,
+) -> RelayConnection {
+    let conn = connect_client_legacy_quic(server_addr, pubkey).await;
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     conn
 }
@@ -851,6 +910,23 @@ async fn test_multiple_tunnels() {
     conn.shutdown().await;
 }
 
+#[tokio::test]
+async fn test_tcp_secp_single_hop() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_tcp_funded(server_addr, &pubkey).await;
+    let mut h2 = conn.clone_send_request().await;
+
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"hello via tcp secp").await;
+    assert_eq!(result, b"HELLO VIA TCP SECP");
+
+    drop(h2);
+    conn.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Nested / onion routing tests
 // ---------------------------------------------------------------------------
@@ -895,6 +971,40 @@ async fn test_nested_tunnel() {
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"nested hello").await;
     assert_eq!(result, b"NESTED HELLO");
+
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_nested_plain_tcp_tunnel() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (s_addr, s_pubkey) = start_monad_server().await;
+    let (t_addr, t_pubkey) = start_monad_server().await;
+
+    let conn = connector::connect_through_chain(&[
+        Hop {
+            addr: t_addr.to_string(),
+            identity: HopIdentity::Secp256k1(t_pubkey),
+            use_quic: false,
+        },
+        Hop {
+            addr: s_addr.to_string(),
+            identity: HopIdentity::Secp256k1(s_pubkey),
+            use_quic: false,
+        },
+    ])
+    .await
+    .unwrap();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    let mut h2 = conn.clone_send_request().await;
+
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2, &target, b"nested tcp hello").await;
+    assert_eq!(result, b"NESTED TCP HELLO");
 
     drop(h2);
     conn.shutdown().await;
@@ -1072,6 +1182,23 @@ async fn test_quic_secp256k1_first_hop_single_hop() {
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic secp first hop").await;
     assert_eq!(result, b"QUIC SECP FIRST HOP");
+
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_quic_legacy_ed25519_first_hop_single_hop() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, _secp_pubkey, legacy_pubkey) = start_monad_server_with_identities().await;
+    let conn = connect_client_legacy_quic_funded(server_addr, &legacy_pubkey).await;
+    let mut h2 = conn.clone_send_request().await;
+
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic legacy first hop").await;
+    assert_eq!(result, b"QUIC LEGACY FIRST HOP");
 
     drop(h2);
     conn.shutdown().await;
