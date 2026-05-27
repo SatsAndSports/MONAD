@@ -4,9 +4,5 @@ members = [
     "monad-server",
     "monad-client",
     "monad-quic",
-    "monad-secp256k1-identity",
-    "monad-quic-npub-proto",
-    "monad-noise-secp256k1-proto",
-    "monad-secp256k1-full-proto",
 ]
 resolver = "2"

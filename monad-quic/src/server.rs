@@ -9,7 +9,7 @@ static CRYPTO_PROVIDER: Once = Once::new();
 
 fn ensure_crypto_provider() {
     CRYPTO_PROVIDER.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 
