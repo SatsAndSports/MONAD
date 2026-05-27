@@ -41,8 +41,8 @@ pub struct SpilmanMintCache {
 pub struct ServerConfig {
     /// The server's unified identity (Ed25519 seed + derived keys).
     pub identity: ServerIdentity,
-    /// Optional dedicated secp256k1 transport identity for QUIC auth.
-    pub quic_transport_key: Option<SecpTransportKeypair>,
+    /// Optional shared secp256k1 transport identity for secp-authenticated transports.
+    pub transport_key: Option<SecpTransportKeypair>,
     /// Receiver secp256k1 secret used for Spilman channel validation.
     pub payment_receiver_secret: SecretKey,
     /// Hardcoded trusted mint policy.
@@ -198,7 +198,7 @@ pub async fn run(
                     };
                     let remote = conn.remote_address();
                     info!("accepted QUIC connection from {remote}");
-                    let authenticated = Arc::new(AtomicBool::new(config.quic_transport_key.is_none()));
+                    let authenticated = Arc::new(AtomicBool::new(config.transport_key.is_none()));
 
                     // Accept bidirectional streams from this QUIC connection.
                     // Each stream is an independent Noise+H2 session.
@@ -211,7 +211,7 @@ pub async fn run(
                                 let config = config.clone();
                                 let quic_pool = quic_pool.clone();
                                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
-                                let quic_transport_key = config.quic_transport_key.clone();
+                                let transport_key = config.transport_key.clone();
                                 let authenticated = authenticated.clone();
                                 let conn = conn.clone();
                                 tokio::spawn(async move {
@@ -222,7 +222,7 @@ pub async fn run(
                                         return;
                                     }
 
-                                    if let Some(ref transport_key) = quic_transport_key {
+                                    if let Some(ref transport_key) = transport_key {
                                         if kind[0] == AUTH_STREAM_KIND {
                                             if let Err(e) = serve_attestation_stream(
                                                 &conn,
@@ -303,7 +303,7 @@ pub async fn run(
                                             }
                                         }
                                         STREAM_KIND_SECP_NOISE => {
-                                            let Some(ref transport_key) = quic_transport_key else {
+                                            let Some(ref transport_key) = transport_key else {
                                                 reject_stream(&mut send, &mut recv, STREAM_ERROR_UNKNOWN_KIND);
                                                 return;
                                             };

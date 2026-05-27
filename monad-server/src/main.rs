@@ -1,6 +1,7 @@
 use cashu::nuts::SecretKey;
 use clap::{Parser, Subcommand};
 use monad_common::identity::ServerIdentity;
+use monad_common::secp_identity::SecpTransportKeypair;
 use monad_server::listener;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -30,6 +31,11 @@ enum Command {
         #[arg(long, env = "MONAD_PRIVATE_KEY")]
         private_key: String,
 
+        /// Optional shared secp256k1 transport private key (hex-encoded, 32 bytes).
+        /// Used for secp-authenticated transports, including QUIC secp auth today.
+        #[arg(long, env = "MONAD_TRANSPORT_KEY")]
+        transport_key: Option<String>,
+
         /// Enable QUIC listener. The QUIC certificate is derived from the
         /// same Ed25519 private key. If omitted, only TCP is accepted.
         #[arg(long)]
@@ -50,14 +56,16 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Keygen => {
             let identity = ServerIdentity::generate()?;
+            let transport_key = SecpTransportKeypair::generate();
 
             // Generate QUIC certificate from the same seed
             let quic_km = monad_quic::keygen::generate_from_seed(identity.seed())?;
 
             let pubkey = identity.ed25519_pubkey();
+            let transport_pubkey = transport_key.pubkey();
             println!("# MONAD server identity (unified Ed25519 key)");
             println!("#");
-            println!("# One key is used for both Noise and QUIC authentication.");
+            println!("# The Ed25519 key is used for legacy Noise+QUIC compatibility.");
             println!();
             println!(
                 "Private key (Ed25519 seed): {}",
@@ -65,27 +73,40 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("Public key (Ed25519):       {pubkey}");
             println!();
+            println!("# Shared secp256k1 transport identity");
+            println!(
+                "Private key (secp256k1):    {}",
+                hex::encode(transport_key.secret_bytes())
+            );
+            println!("Public key (secp256k1):     {transport_pubkey}");
+            println!();
             println!("# --- QUIC certificate (derived from the same key) ---");
             println!("{}", quic_km.cert_pem);
             println!("# Run the server with:");
             println!(
-                "#   monad-server run --private-key {} --quic",
-                hex::encode(identity.seed())
+                "#   monad-server run --private-key {} --transport-key {} --quic",
+                hex::encode(identity.seed()),
+                hex::encode(transport_key.secret_bytes())
             );
             println!("#");
-            println!("# Give the public key to clients:");
+            println!("# Legacy QUIC/plain-noise clients use:");
             println!("#   {pubkey}");
             println!("#");
-            println!("# For a QUIC hop, clients use the same key:");
-            println!("#   --hop quic:addr:port,{pubkey}");
+            println!("# secp transport clients use:");
+            println!("#   secp256k1:{transport_pubkey}");
         }
         Command::Run {
             listen,
             private_key,
+            transport_key,
             quic,
         } => {
             let identity = ServerIdentity::from_hex(&private_key)
                 .map_err(|e| anyhow::anyhow!("bad private key: {e}"))?;
+            let transport_key = transport_key
+                .as_deref()
+                .map(parse_transport_key)
+                .transpose()?;
 
             // Optionally set up QUIC listener from the same seed
             let quic_config = if quic {
@@ -105,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
 
             let config = Arc::new(listener::ServerConfig {
                 identity,
-                quic_transport_key: None,
+                transport_key,
                 payment_receiver_secret: SecretKey::generate(),
                 trusted_mint_units,
             });
@@ -127,4 +148,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_transport_key(hex_key: &str) -> anyhow::Result<SecpTransportKeypair> {
+    let bytes = hex::decode(hex_key)
+        .map_err(|e| anyhow::anyhow!("invalid secp256k1 transport key hex: {e}"))?;
+    let bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("secp256k1 transport key must be 32 bytes"))?;
+    SecpTransportKeypair::from_secret_bytes(&bytes)
+        .map_err(|e| anyhow::anyhow!("bad secp256k1 transport key: {e}"))
 }

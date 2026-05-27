@@ -145,7 +145,7 @@ async fn start_monad_server_with_spilman(
 
     let config = Arc::new(ServerConfig {
         identity,
-        quic_transport_key: Some(transport_key),
+        transport_key: Some(transport_key),
         payment_receiver_secret,
         trusted_mint_units,
     });
@@ -180,7 +180,7 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Sec
 
     let config = Arc::new(ServerConfig {
         identity,
-        quic_transport_key: Some(transport_key),
+        transport_key: Some(transport_key),
         payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
     });
