@@ -16,14 +16,13 @@ use h2::client;
 use http::{Method, Request};
 use monad_client::connector::{self, Hop, HopIdentity};
 use monad_common::h2stream::wait_for_send_capacity;
-use monad_common::identity::{self, Ed25519Pubkey};
-use monad_common::noise;
+use monad_common::identity;
+use monad_common::noise_secp256k1;
 use monad_common::protocol::{ClientMessage, ServerMessage};
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
-use monad_quic::stream::open_monad_stream;
 use monad_server::listener::ServerConfig;
 use monad_server::quic_pool::QuicPool;
 use std::collections::{BTreeMap, BTreeSet};
@@ -122,8 +121,8 @@ async fn run_gated_reply_server(
     let _ = stream.write_all(response).await;
 }
 
-/// Spin up a MONAD server and return (server_addr, ed25519_pubkey).
-async fn start_monad_server() -> (std::net::SocketAddr, Ed25519Pubkey) {
+/// Spin up a MONAD server and return (server_addr, secp256k1 pubkey).
+async fn start_monad_server() -> (std::net::SocketAddr, Secp256k1Pubkey) {
     use cashu::nuts::SecretKey;
     start_monad_server_with_spilman(BTreeMap::new(), SecretKey::generate()).await
 }
@@ -132,29 +131,39 @@ async fn start_monad_server() -> (std::net::SocketAddr, Ed25519Pubkey) {
 async fn start_monad_server_with_spilman(
     trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
     payment_receiver_secret: cashu::nuts::SecretKey,
-) -> (std::net::SocketAddr, Ed25519Pubkey) {
+) -> (std::net::SocketAddr, Secp256k1Pubkey) {
     let identity = identity::ServerIdentity::generate().unwrap();
-    let pubkey = identity.ed25519_pubkey().clone();
+    let transport_key = SecpTransportKeypair::generate();
+    let pubkey = transport_key.pubkey();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let quic_endpoint = quinn::Endpoint::server(quic_server_config, addr).unwrap();
 
     let config = Arc::new(ServerConfig {
         identity,
-        quic_transport_key: None,
+        quic_transport_key: Some(transport_key),
         payment_receiver_secret,
         trusted_mint_units,
     });
 
-    tokio::spawn(monad_server::listener::run(listener, None, config));
+    tokio::spawn(monad_server::listener::run(
+        listener,
+        Some(quic_endpoint),
+        config,
+    ));
 
     (addr, pubkey)
 }
 
-/// Spin up a MONAD server bound to a specific address and return (server_addr, ed25519_pubkey).
-async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Ed25519Pubkey)> {
+/// Spin up a MONAD server bound to a specific address and return (server_addr, secp256k1 pubkey).
+async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp256k1Pubkey)> {
     let identity = identity::ServerIdentity::generate().unwrap();
-    let pubkey = identity.ed25519_pubkey().clone();
+    let transport_key = SecpTransportKeypair::generate();
+    let pubkey = transport_key.pubkey();
 
     let listener = match TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
@@ -164,15 +173,23 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Ed2
         }
     };
     let addr = listener.local_addr().unwrap();
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let quic_endpoint = quinn::Endpoint::server(quic_server_config, addr).unwrap();
 
     let config = Arc::new(ServerConfig {
         identity,
-        quic_transport_key: None,
+        quic_transport_key: Some(transport_key),
         payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
     });
 
-    tokio::spawn(monad_server::listener::run(listener, None, config));
+    tokio::spawn(monad_server::listener::run(
+        listener,
+        Some(quic_endpoint),
+        config,
+    ));
 
     Some((addr, pubkey))
 }
@@ -190,12 +207,12 @@ async fn bind_ipv6_listener() -> Option<TcpListener> {
 /// Connect to a MONAD server through the real client connector.
 async fn connect_client(
     server_addr: std::net::SocketAddr,
-    pubkey: &Ed25519Pubkey,
+    pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
     connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
-        identity: HopIdentity::Ed25519(pubkey.clone()),
-        use_quic: false,
+        identity: HopIdentity::Secp256k1(*pubkey),
+        use_quic: true,
     }])
     .await
     .unwrap()
@@ -203,7 +220,7 @@ async fn connect_client(
 
 async fn connect_client_funded(
     server_addr: std::net::SocketAddr,
-    pubkey: &Ed25519Pubkey,
+    pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
     let conn = connect_client(server_addr, pubkey).await;
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
@@ -860,13 +877,13 @@ async fn test_nested_tunnel() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: t_addr.to_string(),
-            identity: HopIdentity::Ed25519(t_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(t_pubkey),
+            use_quic: true,
         },
         Hop {
             addr: s_addr.to_string(),
-            identity: HopIdentity::Ed25519(s_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(s_pubkey),
+            use_quic: true,
         },
     ])
     .await
@@ -897,18 +914,18 @@ async fn test_three_hop_tunnel() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: a_addr.to_string(),
-            identity: HopIdentity::Ed25519(a_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(a_pubkey),
+            use_quic: true,
         },
         Hop {
             addr: b_addr.to_string(),
-            identity: HopIdentity::Ed25519(b_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(b_pubkey),
+            use_quic: true,
         },
         Hop {
             addr: c_addr.to_string(),
-            identity: HopIdentity::Ed25519(c_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(c_pubkey),
+            use_quic: true,
         },
     ])
     .await
@@ -983,13 +1000,13 @@ async fn test_mixed_ipv4_ipv6_hops() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: ipv4_hop_addr.to_string(),
-            identity: HopIdentity::Ed25519(ipv4_hop_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(ipv4_hop_pubkey),
+            use_quic: true,
         },
         Hop {
             addr: ipv6_hop_addr.to_string(),
-            identity: HopIdentity::Ed25519(ipv6_hop_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(ipv6_hop_pubkey),
+            use_quic: true,
         },
     ])
     .await
@@ -1027,64 +1044,13 @@ async fn test_connect_with_hostname_resolution() {
 // QUIC transport tests
 // ---------------------------------------------------------------------------
 
-/// Spin up a MONAD server with both TCP and QUIC listeners.
-/// Returns (server_addr, ed25519_pubkey).
-/// Both Noise and QUIC use the same Ed25519 identity.
-async fn start_monad_server_with_quic() -> (SocketAddr, Ed25519Pubkey) {
-    let identity = identity::ServerIdentity::generate().unwrap();
-    let pubkey = identity.ed25519_pubkey().clone();
-    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let quic_config =
-        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
-    let quic_endpoint = quinn::Endpoint::server(quic_config, addr).unwrap();
-
-    let config = Arc::new(ServerConfig {
-        identity,
-        quic_transport_key: None,
-        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
-        trusted_mint_units: BTreeMap::new(),
-    });
-
-    tokio::spawn(monad_server::listener::run(
-        listener,
-        Some(quic_endpoint),
-        config,
-    ));
-
-    (addr, pubkey)
+/// Spin up a MONAD server with QUIC transport.
+async fn start_monad_server_with_quic() -> (SocketAddr, Secp256k1Pubkey) {
+    start_monad_server().await
 }
 
 async fn start_monad_server_with_quic_secp256k1() -> (SocketAddr, Secp256k1Pubkey) {
-    let identity = identity::ServerIdentity::generate().unwrap();
-    let transport_key = SecpTransportKeypair::generate();
-    let pubkey = transport_key.pubkey();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
-    let quic_server_config =
-        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
-    let quic_endpoint = quinn::Endpoint::server(quic_server_config, addr).unwrap();
-
-    let config = Arc::new(ServerConfig {
-        identity,
-        quic_transport_key: Some(transport_key),
-        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
-        trusted_mint_units: BTreeMap::new(),
-    });
-
-    tokio::spawn(monad_server::listener::run(
-        listener,
-        Some(quic_endpoint),
-        config,
-    ));
-
-    (addr, pubkey)
+    start_monad_server().await
 }
 
 #[tokio::test]
@@ -1123,8 +1089,8 @@ async fn test_mixed_legacy_first_hop_then_quic_secp_second_hop() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: first_addr.to_string(),
-            identity: HopIdentity::Ed25519(first_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(first_pubkey),
+            use_quic: true,
         },
         Hop {
             addr: second_addr.to_string(),
@@ -1144,62 +1110,27 @@ async fn test_mixed_legacy_first_hop_then_quic_secp_second_hop() {
     conn.shutdown().await;
 }
 
-/// Connect to a MONAD server over QUIC, run a Noise+H2 session,
-/// and return a RelayConnection.
-/// Takes a single Ed25519 public key — derives X25519 for Noise and SPKI for QUIC.
-async fn connect_client_quic(server_addr: SocketAddr, pubkey: &Ed25519Pubkey) -> RelayConnection {
-    // Derive SPKI DER for QUIC pinned key verification
-    let pinned_spki = pubkey.to_spki_der();
-    let client_config = monad_quic::client::build_client_config(pinned_spki).unwrap();
-
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
-    endpoint.set_default_client_config(client_config);
-
-    // Connect via QUIC
-    let conn = endpoint
-        .connect(server_addr, "monad-relay")
-        .unwrap()
-        .await
-        .unwrap();
-
-    // Open a bidirectional QUIC stream carrying a MONAD session.
-    let mut quic_stream = open_monad_stream(&conn).await.unwrap();
-
-    // Derive X25519 public key for Noise handshake
-    let x25519_pub = pubkey.to_x25519().unwrap();
-
-    // Noise handshake over the QUIC stream
-    let (transport, session_id) = noise::handshake_initiator(&mut quic_stream, &x25519_pub)
-        .await
-        .unwrap();
-    let noise_stream = noise::NoiseStream::new(
-        quic_stream,
-        transport,
-        session_id,
-        "test-quic-client".to_string(),
-    );
-
-    // Create RelayConnection from the Noise stream
-    let (mut conn, driver) = RelayConnection::from_noise_stream(noise_stream)
-        .await
-        .unwrap();
-    conn.add_driver(driver);
-    conn
+/// Connect to a MONAD server over QUIC using the mainline secp transport path.
+async fn connect_client_quic(server_addr: SocketAddr, pubkey: &Secp256k1Pubkey) -> RelayConnection {
+    connector::connect_through_chain(&[Hop {
+        addr: server_addr.to_string(),
+        identity: HopIdentity::Secp256k1(*pubkey),
+        use_quic: true,
+    }])
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
 async fn test_quic_unknown_stream_kind_rejected() {
     let (server_addr, pubkey) = start_monad_server_with_quic().await;
 
-    let pinned_spki = pubkey.to_spki_der();
-    let client_config = monad_quic::client::build_client_config(pinned_spki).unwrap();
+    let client_config = build_client_config_for_auth(ClientAuthMode::Secp256k1(pubkey)).unwrap();
 
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(client_config);
 
-    let conn = endpoint
-        .connect(server_addr, "monad-relay")
-        .unwrap()
+    let conn = connect_with_auth(&endpoint, server_addr, ClientAuthMode::Secp256k1(pubkey))
         .await
         .unwrap();
 
@@ -1281,44 +1212,9 @@ async fn test_quic_pool_rejects_wrong_secp256k1_pubkey() {
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
-#[tokio::test]
-async fn test_quic_pool_rejects_same_address_with_different_pin() {
-    let (server_addr, pubkey) = start_monad_server_with_quic().await;
-    let wrong_pubkey = identity::ServerIdentity::generate()
-        .unwrap()
-        .ed25519_pubkey()
-        .clone();
-    let pool = QuicPool::new().unwrap();
-
-    let stream = pool
-        .open_stream(
-            &server_addr.to_string(),
-            ClientAuthMode::PinnedSpki(pubkey.to_spki_der()),
-        )
-        .await
-        .unwrap();
-    drop(stream);
-
-    let err = match pool
-        .open_stream(
-            &server_addr.to_string(),
-            ClientAuthMode::PinnedSpki(wrong_pubkey.to_spki_der()),
-        )
-        .await
-    {
-        Ok(_) => panic!("expected pin mismatch to reject pooled QUIC reuse"),
-        Err(err) => err,
-    };
-    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-    assert!(
-        err.to_string().contains("different transport auth mode"),
-        "unexpected error: {err}"
-    );
-}
-
 async fn connect_client_quic_funded(
     server_addr: SocketAddr,
-    pubkey: &Ed25519Pubkey,
+    pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
     let conn = connect_client_quic(server_addr, pubkey).await;
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
@@ -1365,9 +1261,10 @@ async fn test_quic_control_and_data() {
 
 /// Test: 2-hop nested route where relay S forwards to relay T via QUIC.
 ///
-/// Client → S (TCP+Noise+H2) → CONNECT T:port [quic-pin header] → T (QUIC+Noise+H2) → uppercase
+/// Client → S (QUIC+Noise+H2) → CONNECT T:port [quic-secp256k1-pubkey header] → T (QUIC+Noise+H2) → uppercase
 ///
-/// This test manually constructs the H2 CONNECT request with the quic-pin header
+/// This test manually constructs the H2 CONNECT request with the
+/// `quic-secp256k1-pubkey` header
 /// to exercise the server-side QUIC forwarding path directly.
 #[tokio::test]
 async fn test_nested_quic_tunnel() {
@@ -1386,16 +1283,17 @@ async fn test_nested_quic_tunnel() {
     let conn_to_s = connect_client_funded(s_addr, &s_pubkey).await;
     let mut h2_to_s = conn_to_s.clone_send_request().await;
 
-    // Derive QUIC pin (SPKI DER hex) from T's Ed25519 public key
-    let t_spki = t_pubkey.to_spki_der();
-    let t_quic_pin = hex::encode(&t_spki);
+    let t_quic_pubkey = t_pubkey.to_hex();
 
-    // Ask S to CONNECT to T via QUIC (using quic-pin header)
+    // Ask S to CONNECT to T via QUIC (using secp256k1 auth header)
     let t_authority = format!("127.0.0.1:{}", t_addr.port());
     let request = Request::builder()
         .method(Method::CONNECT)
         .uri(&t_authority)
-        .header(monad_server::session::QUIC_PIN_HEADER, &t_quic_pin)
+        .header(
+            monad_server::session::QUIC_SECP256K1_PUBKEY_HEADER,
+            &t_quic_pubkey,
+        )
         .body(())
         .unwrap();
 
@@ -1413,23 +1311,17 @@ async fn test_nested_quic_tunnel() {
     let h2_connect_stream =
         monad_common::h2stream::H2ConnectStream::new(h2_send_to_t, h2_recv_from_t);
 
-    // Derive X25519 public key from T's Ed25519 key for the Noise handshake
-    let t_x25519_pub = t_pubkey.to_x25519().unwrap();
-
-    // Noise handshake to T (nested inside the QUIC-forwarded tunnel)
+    // secp Noise handshake to T (nested inside the QUIC-forwarded tunnel)
     let mut stream = h2_connect_stream;
-    let (transport, session_id) = noise::handshake_initiator(&mut stream, &t_x25519_pub)
-        .await
-        .unwrap();
-    let noise_stream = noise::NoiseStream::new(
-        stream,
-        transport,
-        session_id,
-        "test-nested-quic-client".to_string(),
-    );
+    let (send_cipher, recv_cipher, session_id) =
+        noise_secp256k1::handshake_initiator(&mut stream, &t_pubkey)
+            .await
+            .unwrap();
+    let noise_stream =
+        noise_secp256k1::SecpNoiseStream::new(stream, send_cipher, recv_cipher, session_id);
 
     // Create RelayConnection to T
-    let (mut conn_to_t, driver) = RelayConnection::from_noise_stream(noise_stream)
+    let (mut conn_to_t, driver) = RelayConnection::from_transport_stream(noise_stream, session_id)
         .await
         .unwrap();
     conn_to_t.add_driver(driver);
@@ -1468,12 +1360,12 @@ async fn test_connector_quic_hop() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: s_addr.to_string(),
-            identity: HopIdentity::Ed25519(s_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(s_pubkey),
+            use_quic: true,
         },
         Hop {
             addr: format!("127.0.0.1:{}", t_addr.port()),
-            identity: HopIdentity::Ed25519(t_pubkey),
+            identity: HopIdentity::Secp256k1(t_pubkey),
             use_quic: true,
         },
     ])
@@ -1514,19 +1406,16 @@ async fn test_concurrent_quic_pool_access() {
     // Spawn 5 clients concurrently, all routing through S → QUIC → T → uppercase
     let mut handles = Vec::new();
     for i in 0..5 {
-        let s_pubkey = s_pubkey.clone();
-        let t_pubkey = t_pubkey.clone();
-
         handles.push(tokio::spawn(async move {
             let conn = connector::connect_through_chain(&[
                 Hop {
                     addr: s_addr.to_string(),
-                    identity: HopIdentity::Ed25519(s_pubkey),
-                    use_quic: false,
+                    identity: HopIdentity::Secp256k1(s_pubkey),
+                    use_quic: true,
                 },
                 Hop {
                     addr: format!("127.0.0.1:{t_port}"),
-                    identity: HopIdentity::Ed25519(t_pubkey),
+                    identity: HopIdentity::Secp256k1(t_pubkey),
                     use_quic: true,
                 },
             ])
@@ -1562,7 +1451,7 @@ async fn test_quic_first_hop() {
     // Client connects directly via QUIC (use_quic on the first hop)
     let conn = connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
-        identity: HopIdentity::Ed25519(pubkey.clone()),
+        identity: HopIdentity::Secp256k1(pubkey),
         use_quic: true,
     }])
     .await
@@ -1591,13 +1480,13 @@ async fn test_quic_first_hop_then_tcp() {
     let conn = connector::connect_through_chain(&[
         Hop {
             addr: s_addr.to_string(),
-            identity: HopIdentity::Ed25519(s_pubkey),
+            identity: HopIdentity::Secp256k1(s_pubkey),
             use_quic: true,
         },
         Hop {
             addr: t_addr.to_string(),
-            identity: HopIdentity::Ed25519(t_pubkey),
-            use_quic: false,
+            identity: HopIdentity::Secp256k1(t_pubkey),
+            use_quic: true,
         },
     ])
     .await

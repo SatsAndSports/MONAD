@@ -79,7 +79,8 @@ impl QuicPool {
 
     /// Create a new empty QUIC connection pool.
     pub fn new() -> io::Result<Self> {
-        let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+        let endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
+            .or_else(|_| quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()))
             .map_err(|e| io::Error::other(format!("QUIC endpoint error: {e}")))?;
 
         Ok(Self {

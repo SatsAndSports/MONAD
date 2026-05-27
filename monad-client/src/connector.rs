@@ -109,7 +109,12 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
             .next()
             .ok_or_else(|| io::Error::other(format!("no addresses found for {}", first.addr)))?;
 
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+        let bind_addr = if socket_addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let mut endpoint = quinn::Endpoint::client(bind_addr.parse().unwrap())
             .map_err(|e| io::Error::other(format!("QUIC endpoint: {e}")))?;
         let auth = match &first.identity {
             HopIdentity::Ed25519(pubkey) => ClientAuthMode::PinnedSpki(pubkey.to_spki_der()),
