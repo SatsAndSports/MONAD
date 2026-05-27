@@ -5,7 +5,8 @@
 //! need for the old Ed25519/X25519 compatibility bridge or its rejection
 //! sampling.
 
-use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair, SignedSecp256k1Pubkey};
+use crate::secp_identity::Secp256k1Pubkey;
+use crate::secp_identity::SecpTransportKeypair;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::schnorr::SigningKey;
 use k256::{ecdh, ProjectivePoint, PublicKey, Scalar, SecretKey};
@@ -84,7 +85,7 @@ pub struct BlindedHopMessage {
 /// Minimal client-facing data needed to reach one blinded hop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlindedHopDescriptor {
-    pub tweaked_pubkey: SignedSecp256k1Pubkey,
+    pub tweaked_pubkey: Secp256k1Pubkey,
     pub message: BlindedHopMessage,
 }
 
@@ -121,13 +122,13 @@ pub struct PathHop<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TweakedHopPublic {
-    pub tweaked_pubkey: SignedSecp256k1Pubkey,
+    pub tweaked_pubkey: Secp256k1Pubkey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TweakedHopIdentity {
     pub tweak: HopTweak,
-    pub tweaked_pubkey: SignedSecp256k1Pubkey,
+    pub tweaked_pubkey: Secp256k1Pubkey,
     pub responder_secret_key: [u8; 32],
 }
 
@@ -154,56 +155,77 @@ fn compressed_bytes(public_key: &PublicKey) -> [u8; 33] {
     out
 }
 
-fn signed_public_key_from_identity(identity: &SecpTransportKeypair) -> SignedSecp256k1Pubkey {
-    SignedSecp256k1Pubkey::from_compressed_bytes(identity.pubkey().to_compressed_bytes())
-        .expect("normalized identity yields valid even signed pubkey")
+#[cfg(test)]
+fn pubkey_from_secret_bytes(secret_bytes: &[u8; 32]) -> Result<Secp256k1Pubkey, BlindedHopError> {
+    let secret_key =
+        SecretKey::from_slice(secret_bytes).map_err(|_| BlindedHopError::InvalidTweak)?;
+    let public_key = secret_key.public_key();
+    let compressed = compressed_bytes(&public_key);
+    Secp256k1Pubkey::from_compressed_bytes(compressed)
+        .map_err(|_| BlindedHopError::InvalidPublicKey)
 }
 
-fn signed_public_key(pubkey: Secp256k1Pubkey) -> SignedSecp256k1Pubkey {
-    SignedSecp256k1Pubkey::from_compressed_bytes(pubkey.to_compressed_bytes())
-        .expect("x-only identity yields valid even signed pubkey")
+fn is_even_point(public_key: &PublicKey) -> bool {
+    compressed_bytes(public_key)[0] == 0x02
+}
+
+fn derive_even_tweaked_secret_key(
+    identity: &SecpTransportKeypair,
+) -> Result<(HopTweak, [u8; 32], Secp256k1Pubkey), BlindedHopError> {
+    let base_key = SigningKey::from_bytes(&identity.normalized_secret_bytes())
+        .map_err(|_| BlindedHopError::InvalidTweak)?;
+
+    loop {
+        let tweak = HopTweak::generate()?;
+        let tweaked_scalar = *base_key.as_nonzero_scalar().as_ref() + tweak.scalar()?;
+        let responder_secret_key: [u8; 32] = tweaked_scalar.to_bytes().into();
+        let secret_key = SecretKey::from_slice(&responder_secret_key)
+            .map_err(|_| BlindedHopError::InvalidTweak)?;
+        let tweaked_public = secret_key.public_key();
+        if is_even_point(&tweaked_public) {
+            let tweaked_pubkey =
+                Secp256k1Pubkey::from_compressed_bytes(compressed_bytes(&tweaked_public))
+                    .map_err(|_| BlindedHopError::InvalidPublicKey)?;
+            return Ok((tweak, responder_secret_key, tweaked_pubkey));
+        }
+    }
 }
 
 #[cfg(test)]
-fn signed_public_key_from_secret_bytes(
+fn pubkey_from_secret_bytes_for_test(
     secret_bytes: &[u8; 32],
-) -> Result<SignedSecp256k1Pubkey, BlindedHopError> {
-    let signing_key =
-        SigningKey::from_bytes(secret_bytes).map_err(|_| BlindedHopError::InvalidTweak)?;
-    let public_key = PublicKey::from(*signing_key.verifying_key());
-    Ok(SignedSecp256k1Pubkey::from_public_key(&public_key))
-}
-
-fn tweak_secret_key_with_tweak(
-    identity: &SecpTransportKeypair,
-    tweak: &HopTweak,
-) -> Result<[u8; 32], BlindedHopError> {
-    let base_key = SigningKey::from_bytes(&identity.normalized_secret_bytes())
-        .map_err(|_| BlindedHopError::InvalidTweak)?;
-    let tweaked_scalar = *base_key.as_nonzero_scalar().as_ref() + tweak.scalar()?;
-    Ok(tweaked_scalar.to_bytes().into())
+) -> Result<Secp256k1Pubkey, BlindedHopError> {
+    pubkey_from_secret_bytes(secret_bytes)
 }
 
 pub fn tweak_pubkey(
-    pubkey: SignedSecp256k1Pubkey,
+    pubkey: Secp256k1Pubkey,
     tweak: &HopTweak,
-) -> Result<SignedSecp256k1Pubkey, BlindedHopError> {
-    let public = public_key_from_bytes(&pubkey.to_compressed_bytes())?;
+) -> Result<Secp256k1Pubkey, BlindedHopError> {
+    let public = pubkey
+        .to_public_key()
+        .map_err(|_| BlindedHopError::InvalidPublicKey)?;
     let tweaked_point =
         ProjectivePoint::from(public) + ProjectivePoint::GENERATOR * tweak.scalar()?;
     let tweaked_public = public_key_from_point(tweaked_point)?;
-    Ok(SignedSecp256k1Pubkey::from_public_key(&tweaked_public))
+    let tweaked_compressed = compressed_bytes(&tweaked_public);
+    Secp256k1Pubkey::from_compressed_bytes(tweaked_compressed)
+        .map_err(|_| BlindedHopError::InvalidPublicKey)
 }
 
 pub fn untweak_pubkey(
-    tweaked_pubkey: SignedSecp256k1Pubkey,
+    tweaked_pubkey: Secp256k1Pubkey,
     tweak: &HopTweak,
-) -> Result<SignedSecp256k1Pubkey, BlindedHopError> {
-    let public = public_key_from_bytes(&tweaked_pubkey.to_compressed_bytes())?;
+) -> Result<Secp256k1Pubkey, BlindedHopError> {
+    let public = tweaked_pubkey
+        .to_public_key()
+        .map_err(|_| BlindedHopError::InvalidPublicKey)?;
     let original_point =
         ProjectivePoint::from(public) - ProjectivePoint::GENERATOR * tweak.scalar()?;
     let original_public = public_key_from_point(original_point)?;
-    Ok(SignedSecp256k1Pubkey::from_public_key(&original_public))
+    let original_compressed = compressed_bytes(&original_public);
+    Secp256k1Pubkey::from_compressed_bytes(original_compressed)
+        .map_err(|_| BlindedHopError::InvalidPublicKey)
 }
 
 pub fn derive_tweaked_hop_public(
@@ -211,16 +233,14 @@ pub fn derive_tweaked_hop_public(
     tweak: &HopTweak,
 ) -> Result<TweakedHopPublic, BlindedHopError> {
     Ok(TweakedHopPublic {
-        tweaked_pubkey: tweak_pubkey(signed_public_key(real_pubkey), tweak)?,
+        tweaked_pubkey: tweak_pubkey(real_pubkey, tweak)?,
     })
 }
 
 pub fn derive_tweaked_hop_identity(
     identity: &SecpTransportKeypair,
 ) -> Result<TweakedHopIdentity, BlindedHopError> {
-    let tweak = HopTweak::generate()?;
-    let responder_secret_key = tweak_secret_key_with_tweak(identity, &tweak)?;
-    let tweaked_pubkey = tweak_pubkey(signed_public_key_from_identity(identity), &tweak)?;
+    let (tweak, responder_secret_key, tweaked_pubkey) = derive_even_tweaked_secret_key(identity)?;
     Ok(TweakedHopIdentity {
         tweak,
         tweaked_pubkey,
@@ -271,7 +291,7 @@ pub fn build_path(hops: &[PathHop<'_>]) -> Result<Path, BlindedHopError> {
             PathHopMode::Blinded => {
                 let predecessor = &hops[i - 1];
                 path.push(PathNode::Blinded(build_blinded_hop_descriptor(
-                    signed_public_key_from_identity(predecessor.identity).to_compressed_bytes(),
+                    predecessor.identity.pubkey().to_compressed_bytes(),
                     hop.addr,
                     hop.identity,
                 )?));
@@ -369,10 +389,6 @@ mod tests {
             .unwrap()
     }
 
-    fn sample_tweak(i: u32) -> HopTweak {
-        HopTweak::from_bytes(sample_secret_bytes(b"monad-secp-hop-tweak", i))
-    }
-
     fn assert_descriptor_matches_hidden_hop(
         descriptor: &BlindedHopDescriptor,
         intro_identity: &SecpTransportKeypair,
@@ -391,33 +407,30 @@ mod tests {
         assert_eq!(descriptor.tweaked_pubkey, tweaked.tweaked_pubkey);
     }
 
-    fn same_x_coordinate(a: SignedSecp256k1Pubkey, b: SignedSecp256k1Pubkey) -> bool {
-        a.x_only_bytes() == b.x_only_bytes()
-    }
-
     #[test]
     fn test_tweak_pubkey_differs_from_original() {
         let identity = sample_identity(0);
-        let tweak = HopTweak::generate().unwrap();
-        let tweaked = tweak_pubkey(signed_public_key_from_identity(&identity), &tweak).unwrap();
+        let tweak = derive_even_tweaked_secret_key(&identity).unwrap().0;
+        let tweaked = tweak_pubkey(identity.pubkey(), &tweak).unwrap();
 
-        assert_ne!(tweaked, signed_public_key_from_identity(&identity));
+        assert_ne!(tweaked, identity.pubkey());
     }
 
     #[test]
-    fn test_tweak_secret_matches_tweaked_pubkey_x_coordinate_over_many_samples() {
+    fn test_tweak_secret_matches_tweaked_pubkey_over_many_samples() {
         for i in 0..SAMPLE_COUNT as u32 {
             let identity = sample_identity(i);
-            let tweak = sample_tweak(i);
-            let tweaked_secret = tweak_secret_key_with_tweak(&identity, &tweak).unwrap();
-            let tweaked_pubkey =
-                tweak_pubkey(signed_public_key_from_identity(&identity), &tweak).unwrap();
+            let (tweak, tweaked_secret, tweaked_pubkey) =
+                derive_even_tweaked_secret_key(&identity).unwrap();
 
-            assert!(
-                same_x_coordinate(
-                    signed_public_key_from_secret_bytes(&tweaked_secret).unwrap(),
-                    tweaked_pubkey
-                ),
+            assert_eq!(
+                pubkey_from_secret_bytes_for_test(&tweaked_secret).unwrap(),
+                tweaked_pubkey,
+                "sample {i}"
+            );
+            assert_eq!(
+                tweak_pubkey(identity.pubkey(), &tweak).unwrap(),
+                tweaked_pubkey,
                 "sample {i}"
             );
         }
@@ -427,8 +440,8 @@ mod tests {
     fn test_tweak_and_untweak_roundtrip_over_many_samples() {
         for i in 0..SAMPLE_COUNT as u32 {
             let identity = sample_identity(i);
-            let tweak = sample_tweak(i);
-            let original = signed_public_key_from_identity(&identity);
+            let tweak = derive_even_tweaked_secret_key(&identity).unwrap().0;
+            let original = identity.pubkey();
             let tweaked = tweak_pubkey(original, &tweak).unwrap();
             let untweaked = untweak_pubkey(tweaked, &tweak).unwrap();
 
@@ -446,11 +459,9 @@ mod tests {
             next_hop_tweak: tweak,
         };
 
-        let message = encrypt_blinded_hop_for_intro(
-            signed_public_key_from_identity(&recipient).to_compressed_bytes(),
-            &plaintext,
-        )
-        .unwrap();
+        let message =
+            encrypt_blinded_hop_for_intro(recipient.pubkey().to_compressed_bytes(), &plaintext)
+                .unwrap();
         let decrypted = decrypt_blinded_hop_for_intro(&recipient, &message).unwrap();
         assert_eq!(decrypted, plaintext);
     }
@@ -466,11 +477,9 @@ mod tests {
             next_hop_tweak: tweak,
         };
 
-        let message = encrypt_blinded_hop_for_intro(
-            signed_public_key_from_identity(&recipient_a).to_compressed_bytes(),
-            &plaintext,
-        )
-        .unwrap();
+        let message =
+            encrypt_blinded_hop_for_intro(recipient_a.pubkey().to_compressed_bytes(), &plaintext)
+                .unwrap();
         let result = decrypt_blinded_hop_for_intro(&recipient_b, &message);
         assert!(matches!(
             result,
@@ -488,16 +497,12 @@ mod tests {
             next_hop_tweak: tweak,
         };
 
-        let msg1 = encrypt_blinded_hop_for_intro(
-            signed_public_key_from_identity(&recipient).to_compressed_bytes(),
-            &plaintext,
-        )
-        .unwrap();
-        let msg2 = encrypt_blinded_hop_for_intro(
-            signed_public_key_from_identity(&recipient).to_compressed_bytes(),
-            &plaintext,
-        )
-        .unwrap();
+        let msg1 =
+            encrypt_blinded_hop_for_intro(recipient.pubkey().to_compressed_bytes(), &plaintext)
+                .unwrap();
+        let msg2 =
+            encrypt_blinded_hop_for_intro(recipient.pubkey().to_compressed_bytes(), &plaintext)
+                .unwrap();
         assert_ne!(msg1.ephemeral_pubkey, msg2.ephemeral_pubkey);
         assert_ne!(msg1.ciphertext, msg2.ciphertext);
     }
@@ -507,7 +512,7 @@ mod tests {
         let intro_identity = sample_identity(0);
         let hidden_identity = sample_identity(1);
         let descriptor = build_blinded_hop_descriptor(
-            signed_public_key_from_identity(&intro_identity).to_compressed_bytes(),
+            intro_identity.pubkey().to_compressed_bytes(),
             "127.0.0.1:9002",
             &hidden_identity,
         )

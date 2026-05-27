@@ -16,7 +16,7 @@ struct Cli {
     /// Server hop(s) in order: addr:port,<identity> or quic:addr:port,<identity>
     ///
     /// Supported identity form:
-    /// - explicit secp256k1 transport identity: `secp256k1:<33-byte-compressed-pubkey-hex>`
+    /// - explicit secp256k1 transport identity: `secp256k1:<32-byte-x-only-pubkey-hex>`
     ///
     /// The `monad-client` binary now uses secp256k1 transport identities for
     /// both TCP and QUIC hops.

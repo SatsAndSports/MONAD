@@ -160,7 +160,7 @@ impl RelayConnection {
 
     /// Open an H2 CONNECT tunnel with a `quic-secp256k1-pubkey` header, telling the relay
     /// to reach the target via QUIC and authenticate the connection using the
-    /// provided compressed secp256k1 public key.
+    /// provided x-only secp256k1 public key.
     pub async fn open_tunnel_quic_secp256k1(
         &self,
         target_authority: &str,

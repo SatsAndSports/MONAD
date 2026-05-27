@@ -911,14 +911,14 @@ The client signals to a relay that it should use QUIC to reach the next hop by i
 
 ```text
 CONNECT host:port HTTP/2
-quic-secp256k1-pubkey: <compressed_secp_pubkey_hex>
+quic-secp256k1-pubkey: <xonly_secp_pubkey_hex>
 ```
 
 For example:
 
 ```text
 CONNECT 10.0.0.5:9050 HTTP/2
-quic-secp256k1-pubkey: 02abcd...
+quic-secp256k1-pubkey: abcd...
 ```
 
 The relay checks for the QUIC transport header:
