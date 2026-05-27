@@ -111,11 +111,13 @@ MONAD currently uses a split transport model:
   - legacy Ed25519 identity with derived X25519 Noise key and pinned SPKI cert key
   - secp256k1 transport identity with QUIC attestation plus secp Noise
 
-So the hop identity you give the client depends on the transport:
+Quick reference:
 
-- `addr:port,secp256k1:<pubkey>` for plain TCP MONAD hops
-- `quic:addr:port,<legacy_ed25519_pubkey>` for legacy QUIC/plain-noise hops
-- `quic:addr:port,secp256k1:<pubkey>` for secp-authenticated QUIC hops
+| Transport | Hop syntax | Identity | Auth mechanism |
+|-----------|-----------|----------|----------------|
+| TCP | `addr:port,secp256k1:<pub>` | secp256k1 | secp Noise NK |
+| QUIC (secp) | `quic:addr:port,secp256k1:<pub>` | secp256k1 | QUIC attestation + secp Noise NK |
+| QUIC (legacy) | `quic:addr:port,<ed25519_pub>` | Ed25519 | pinned SPKI cert + X25519 Noise NK |
 
 ## Quick Start
 

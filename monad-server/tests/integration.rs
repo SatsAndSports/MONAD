@@ -219,8 +219,8 @@ async fn bind_ipv6_listener() -> Option<TcpListener> {
     }
 }
 
-/// Connect to a MONAD server through the real client connector.
-async fn connect_client(
+/// Connect to a MONAD server over QUIC with secp256k1 transport auth.
+async fn connect_client_quic_secp(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
@@ -259,11 +259,11 @@ async fn connect_client_legacy_quic(
     .unwrap()
 }
 
-async fn connect_client_funded(
+async fn connect_client_quic_secp_funded(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
-    let conn = connect_client(server_addr, pubkey).await;
+    let conn = connect_client_quic_secp(server_addr, pubkey).await;
     fund_session(&conn, TEST_SESSION_PAYMENT).await;
     conn
 }
@@ -448,7 +448,7 @@ async fn tunnel_roundtrip(
 #[tokio::test]
 async fn test_session_starts_paused() {
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
 
     let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
@@ -468,7 +468,7 @@ async fn test_session_starts_paused() {
 #[tokio::test]
 async fn test_second_control_stream_rejected() {
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
 
     let (mut first_send, mut first_recv) = conn.open_control().await.unwrap();
     let (_in0, _out0, _paid0, _rem0, paused0) =
@@ -503,7 +503,7 @@ async fn test_connect_rejected_while_paused() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     let request = Request::builder()
@@ -529,7 +529,7 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
     tokio::spawn(run_counting_server(target_listener, 10, b"DONE"));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
     let (_in0, _out0, _paid0, rem0, paused0) =
@@ -630,7 +630,7 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     ));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
     let (_in0, _out0, _paid0, rem0, paused0) =
@@ -733,7 +733,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     ));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
 
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
     let (_in0, _out0, _paid0, rem0, paused0) =
@@ -864,7 +864,7 @@ async fn test_funded_data_channel() {
     let (server_addr, pubkey) = start_monad_server().await;
 
     // Client
-    let conn = connect_client_funded(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     // Data channel: CONNECT → uppercase
@@ -884,7 +884,7 @@ async fn test_multiple_tunnels() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client_funded(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp_funded(server_addr, &pubkey).await;
     let h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -1060,7 +1060,7 @@ async fn test_connect_to_ipv6_target() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client_funded(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("[::1]:{}", upper_addr.port());
@@ -1083,7 +1083,7 @@ async fn test_connect_to_ipv6_server() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let conn = connect_client_funded(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"ipv6 server").await;
@@ -1139,7 +1139,7 @@ async fn test_connect_with_hostname_resolution() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connect_client_funded(server_addr, &pubkey).await;
+    let conn = connect_client_quic_secp_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("localhost:{}", upper_addr.port());
@@ -1154,22 +1154,13 @@ async fn test_connect_with_hostname_resolution() {
 // QUIC transport tests
 // ---------------------------------------------------------------------------
 
-/// Spin up a MONAD server with QUIC transport.
-async fn start_monad_server_with_quic() -> (SocketAddr, Secp256k1Pubkey) {
-    start_monad_server().await
-}
-
-async fn start_monad_server_with_quic_secp256k1() -> (SocketAddr, Secp256k1Pubkey) {
-    start_monad_server().await
-}
-
 #[tokio::test]
 async fn test_quic_secp256k1_first_hop_single_hop() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let (server_addr, pubkey) = start_monad_server().await;
     let conn = connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
         identity: HopIdentity::Secp256k1(pubkey),
@@ -1205,13 +1196,13 @@ async fn test_quic_legacy_ed25519_first_hop_single_hop() {
 }
 
 #[tokio::test]
-async fn test_mixed_legacy_first_hop_then_quic_secp_second_hop() {
+async fn test_two_hop_quic_secp_chain() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (first_addr, first_pubkey) = start_monad_server().await;
-    let (second_addr, second_pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let (second_addr, second_pubkey) = start_monad_server().await;
 
     let conn = connector::connect_through_chain(&[
         Hop {
@@ -1237,20 +1228,9 @@ async fn test_mixed_legacy_first_hop_then_quic_secp_second_hop() {
     conn.shutdown().await;
 }
 
-/// Connect to a MONAD server over QUIC using the mainline secp transport path.
-async fn connect_client_quic(server_addr: SocketAddr, pubkey: &Secp256k1Pubkey) -> RelayConnection {
-    connector::connect_through_chain(&[Hop {
-        addr: server_addr.to_string(),
-        identity: HopIdentity::Secp256k1(*pubkey),
-        use_quic: true,
-    }])
-    .await
-    .unwrap()
-}
-
 #[tokio::test]
 async fn test_quic_unknown_stream_kind_rejected() {
-    let (server_addr, pubkey) = start_monad_server_with_quic().await;
+    let (server_addr, pubkey) = start_monad_server().await;
 
     let client_config = build_client_config_for_auth(ClientAuthMode::Secp256k1(pubkey)).unwrap();
 
@@ -1279,7 +1259,7 @@ async fn test_quic_unknown_stream_kind_rejected() {
 
 #[tokio::test]
 async fn test_quic_secp256k1_auth_direct_connection() {
-    let (server_addr, pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let (server_addr, pubkey) = start_monad_server().await;
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
     let client_config = build_client_config_for_auth(ClientAuthMode::Secp256k1(pubkey)).unwrap();
     endpoint.set_default_client_config(client_config);
@@ -1292,7 +1272,7 @@ async fn test_quic_secp256k1_auth_direct_connection() {
 
 #[tokio::test]
 async fn test_quic_secp256k1_auth_direct_connection_wrong_key_fails() {
-    let (server_addr, _pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let (server_addr, _pubkey) = start_monad_server().await;
     let wrong_pubkey = SecpTransportKeypair::generate().pubkey();
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
     let client_config =
@@ -1310,7 +1290,7 @@ async fn test_quic_secp256k1_auth_direct_connection_wrong_key_fails() {
 
 #[tokio::test]
 async fn test_quic_pool_supports_secp256k1_auth() {
-    let (server_addr, pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let (server_addr, pubkey) = start_monad_server().await;
     let pool = QuicPool::new().unwrap();
 
     let stream = pool
@@ -1322,7 +1302,7 @@ async fn test_quic_pool_supports_secp256k1_auth() {
 
 #[tokio::test]
 async fn test_quic_pool_rejects_wrong_secp256k1_pubkey() {
-    let (server_addr, _pubkey) = start_monad_server_with_quic_secp256k1().await;
+    let (server_addr, _pubkey) = start_monad_server().await;
     let wrong_pubkey = SecpTransportKeypair::generate().pubkey();
     let pool = QuicPool::new().unwrap();
 
@@ -1339,15 +1319,6 @@ async fn test_quic_pool_rejects_wrong_secp256k1_pubkey() {
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
-async fn connect_client_quic_funded(
-    server_addr: SocketAddr,
-    pubkey: &Secp256k1Pubkey,
-) -> RelayConnection {
-    let conn = connect_client_quic(server_addr, pubkey).await;
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
-    conn
-}
-
 /// Test: connect to a MONAD server over QUIC, open a CONNECT tunnel,
 /// proxy data through the uppercase server.
 #[tokio::test]
@@ -1356,8 +1327,8 @@ async fn test_quic_single_hop() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey) = start_monad_server_with_quic().await;
-    let conn = connect_client_quic_funded(server_addr, &pubkey).await;
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"hello via quic").await;
@@ -1374,8 +1345,8 @@ async fn test_quic_control_and_data() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey) = start_monad_server_with_quic().await;
-    let conn = connect_client_quic_funded(server_addr, &pubkey).await;
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp_funded(server_addr, &pubkey).await;
     let mut h2 = conn.clone_send_request().await;
 
     // Data channel
@@ -1401,13 +1372,13 @@ async fn test_nested_quic_tunnel() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     // Server T (final hop — QUIC-enabled, will proxy to uppercase server)
-    let (t_addr, t_pubkey) = start_monad_server_with_quic().await;
+    let (t_addr, t_pubkey) = start_monad_server().await;
 
     // Server S (intermediate hop — TCP only, will forward via QUIC to T)
     let (s_addr, s_pubkey) = start_monad_server().await;
 
     // Client connects to S via TCP (first hop)
-    let conn_to_s = connect_client_funded(s_addr, &s_pubkey).await;
+    let conn_to_s = connect_client_quic_secp_funded(s_addr, &s_pubkey).await;
     let mut h2_to_s = conn_to_s.clone_send_request().await;
 
     let t_quic_pubkey = t_pubkey.to_hex();
@@ -1483,7 +1454,7 @@ async fn test_connector_quic_hop() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     // Server T (final hop — QUIC-enabled)
-    let (t_addr, t_pubkey) = start_monad_server_with_quic().await;
+    let (t_addr, t_pubkey) = start_monad_server().await;
 
     // Server S (intermediate hop — TCP only)
     let (s_addr, s_pubkey) = start_monad_server().await;
@@ -1527,7 +1498,7 @@ async fn test_concurrent_quic_pool_access() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     // Server T (QUIC-enabled, shared target)
-    let (t_addr, t_pubkey) = start_monad_server_with_quic().await;
+    let (t_addr, t_pubkey) = start_monad_server().await;
 
     // Server S (intermediate, all clients connect through this)
     let (s_addr, s_pubkey) = start_monad_server().await;
@@ -1578,7 +1549,7 @@ async fn test_quic_first_hop() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (server_addr, pubkey) = start_monad_server_with_quic().await;
+    let (server_addr, pubkey) = start_monad_server().await;
 
     // Client connects directly via QUIC (use_quic on the first hop)
     let conn = connector::connect_through_chain(&[Hop {
@@ -1605,7 +1576,7 @@ async fn test_quic_first_hop_then_tcp() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let (s_addr, s_pubkey) = start_monad_server_with_quic().await;
+    let (s_addr, s_pubkey) = start_monad_server().await;
     let (t_addr, t_pubkey) = start_monad_server().await;
 
     // Client connects to S via QUIC, then S forwards to T via TCP
