@@ -71,7 +71,6 @@ impl HopTweak {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindedHopPlaintext {
     pub next_hop_addr: String,
-    pub next_hop_pubkey_hex: String,
     pub next_hop_tweak: HopTweak,
 }
 
@@ -258,7 +257,6 @@ pub fn build_blinded_hop_descriptor(
         intro_pubkey,
         &BlindedHopPlaintext {
             next_hop_addr: next_hop_addr.to_owned(),
-            next_hop_pubkey_hex: hidden_hop_identity.pubkey().to_hex(),
             next_hop_tweak: tweaked.tweak,
         },
     )?;
@@ -397,10 +395,10 @@ mod tests {
     ) {
         let plaintext = decrypt_blinded_hop_for_intro(intro_identity, &descriptor.message).unwrap();
         assert_eq!(plaintext.next_hop_addr, expected_next_hop_addr);
-        assert_eq!(
-            plaintext.next_hop_pubkey_hex,
-            hidden_identity.pubkey().to_hex()
-        );
+
+        let recovered_hidden =
+            untweak_pubkey(descriptor.tweaked_pubkey, &plaintext.next_hop_tweak).unwrap();
+        assert_eq!(recovered_hidden, hidden_identity.pubkey());
 
         let tweaked =
             derive_tweaked_hop_public(hidden_identity.pubkey(), &plaintext.next_hop_tweak).unwrap();
@@ -455,7 +453,6 @@ mod tests {
         let tweak = HopTweak::generate().unwrap();
         let plaintext = BlindedHopPlaintext {
             next_hop_addr: "10.1.2.3:9050".to_string(),
-            next_hop_pubkey_hex: recipient.pubkey().to_hex(),
             next_hop_tweak: tweak,
         };
 
@@ -473,7 +470,6 @@ mod tests {
         let tweak = HopTweak::generate().unwrap();
         let plaintext = BlindedHopPlaintext {
             next_hop_addr: "10.1.2.3:9050".to_string(),
-            next_hop_pubkey_hex: recipient_a.pubkey().to_hex(),
             next_hop_tweak: tweak,
         };
 
@@ -493,7 +489,6 @@ mod tests {
         let tweak = HopTweak::generate().unwrap();
         let plaintext = BlindedHopPlaintext {
             next_hop_addr: "10.1.2.3:9050".to_string(),
-            next_hop_pubkey_hex: recipient.pubkey().to_hex(),
             next_hop_tweak: tweak,
         };
 
