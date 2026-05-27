@@ -4,7 +4,6 @@ use monad_client::connector::Hop;
 use monad_client::control;
 use monad_client::socks;
 use monad_client::tunnel;
-use monad_common::identity::Ed25519Pubkey;
 use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::RelayConnection;
 use tokio::net::TcpListener;
@@ -16,13 +15,11 @@ use tracing::{error, info, warn};
 struct Cli {
     /// Server hop(s) in order: addr:port,<identity> or quic:addr:port,<identity>
     ///
-    /// Supported identity forms:
-    /// - legacy untagged Ed25519 hex: `<pubkey_hex>`
-    /// - explicit Ed25519: `ed25519:<pubkey_hex>`
+    /// Supported identity form:
     /// - explicit secp256k1 transport identity: `secp256k1:<33-byte-compressed-pubkey-hex>`
     ///
-    /// Non-QUIC hops are secp256k1-only. Ed25519 hop identities remain supported
-    /// for legacy QUIC/plain-noise hops.
+    /// The `monad-client` binary now uses secp256k1 transport identities for
+    /// both TCP and QUIC hops.
     ///
     /// For a direct connection, specify one hop:
     ///   --hop 1.2.3.4:9050,<pubkey>
@@ -46,21 +43,21 @@ struct Cli {
 }
 
 fn parse_hop_identity(identity: &str, addr: &str) -> anyhow::Result<connector::HopIdentity> {
-    if let Some(rest) = identity.strip_prefix("ed25519:") {
-        let pubkey = Ed25519Pubkey::from_hex(rest)
-            .map_err(|e| anyhow::anyhow!("bad Ed25519 public key for hop {addr}: {e}"))?;
-        return Ok(connector::HopIdentity::Ed25519(pubkey));
-    }
-
     if let Some(rest) = identity.strip_prefix("secp256k1:") {
         let pubkey = Secp256k1Pubkey::from_hex(rest)
             .map_err(|e| anyhow::anyhow!("bad secp256k1 public key for hop {addr}: {e}"))?;
         return Ok(connector::HopIdentity::Secp256k1(pubkey));
     }
 
-    let pubkey = Ed25519Pubkey::from_hex(identity)
-        .map_err(|e| anyhow::anyhow!("bad legacy Ed25519 public key for hop {addr}: {e}"))?;
-    Ok(connector::HopIdentity::Ed25519(pubkey))
+    if identity.starts_with("ed25519:") {
+        anyhow::bail!(
+            "legacy Ed25519 hop identities are no longer accepted by monad-client for hop {addr}; use secp256k1:<pubkey>"
+        );
+    }
+
+    anyhow::bail!(
+        "hop {addr} must use explicit secp256k1:<pubkey> identity syntax; legacy untagged identities are no longer accepted"
+    )
 }
 
 fn parse_hop(s: &str) -> anyhow::Result<Hop> {
@@ -238,24 +235,25 @@ async fn accept_loop(socks_listener: &TcpListener, conn: &RelayConnection) -> an
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monad_common::identity::ServerIdentity;
     use monad_common::secp_identity::SecpTransportKeypair;
 
     #[test]
-    fn test_parse_hop_legacy_ed25519() {
-        let hop = parse_hop(
+    fn test_parse_hop_legacy_ed25519_rejected() {
+        let err = parse_hop(
             "127.0.0.1:9050,00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
         )
-        .unwrap();
-        assert!(!hop.use_quic);
-        assert!(matches!(hop.identity, connector::HopIdentity::Ed25519(_)));
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must use explicit secp256k1:<pubkey> identity syntax"));
     }
 
     #[test]
-    fn test_parse_hop_explicit_ed25519() {
-        let hop = parse_hop("quic:127.0.0.1:9050,ed25519:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap();
-        assert!(hop.use_quic);
-        assert!(matches!(hop.identity, connector::HopIdentity::Ed25519(_)));
+    fn test_parse_hop_explicit_ed25519_rejected() {
+        let err = parse_hop("quic:127.0.0.1:9050,ed25519:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("legacy Ed25519 hop identities are no longer accepted"));
     }
 
     #[test]
@@ -265,25 +263,5 @@ mod tests {
         let hop = parse_hop(&format!("127.0.0.1:9050,secp256k1:{pubkey}")).unwrap();
 
         assert!(matches!(hop.identity, connector::HopIdentity::Secp256k1(_)));
-    }
-
-    #[tokio::test]
-    async fn test_non_quic_ed25519_hop_rejected() {
-        let identity = ServerIdentity::generate().unwrap();
-        let err = match connector::connect_through_chain(&[Hop {
-            addr: "127.0.0.1:9050".to_string(),
-            identity: connector::HopIdentity::Ed25519(identity.ed25519_pubkey().clone()),
-            use_quic: false,
-        }])
-        .await
-        {
-            Ok(_) => panic!("expected non-QUIC Ed25519 hop to be rejected"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-        assert!(err
-            .to_string()
-            .contains("legacy Ed25519 transport hops currently require QUIC"));
     }
 }

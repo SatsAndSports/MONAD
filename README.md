@@ -111,13 +111,17 @@ MONAD currently uses a split transport model:
   - legacy Ed25519 identity with derived X25519 Noise key and pinned SPKI cert key
   - secp256k1 transport identity with QUIC attestation plus secp Noise
 
+The `monad-client` binary now emits and accepts only secp256k1 hop identities. The
+legacy Ed25519 QUIC/plain-noise path remains in the server and lower-level transport
+code for compatibility and testing, but it is no longer used by the main client CLI.
+
 Quick reference:
 
 | Transport | Hop syntax | Identity | Auth mechanism |
 |-----------|-----------|----------|----------------|
 | TCP | `addr:port,secp256k1:<pub>` | secp256k1 | secp Noise NK |
 | QUIC (secp) | `quic:addr:port,secp256k1:<pub>` | secp256k1 | QUIC attestation + secp Noise NK |
-| QUIC (legacy) | `quic:addr:port,<ed25519_pub>` | Ed25519 | pinned SPKI cert + X25519 Noise NK |
+| QUIC (legacy compatibility) | server/lower-level only | Ed25519 | pinned SPKI cert + X25519 Noise NK |
 
 ## Quick Start
 
@@ -194,17 +198,17 @@ RUST_LOG=info cargo run -p monad-client -- \
   --socks 127.0.0.1:1080
 ```
 
-The `quic:` prefix tells the client to instruct the previous hop to connect via QUIC instead of TCP. For QUIC hops, you can use either a legacy Ed25519 identity or an explicit `secp256k1:<pubkey>` transport identity. Plain non-QUIC hops are secp256k1-only. See `ARCHITECTURE.md` for the full layering model.
+The `quic:` prefix tells the client to instruct the previous hop to connect via QUIC instead of TCP. The `monad-client` binary uses explicit `secp256k1:<pubkey>` transport identities for both QUIC and non-QUIC hops. See `ARCHITECTURE.md` for the full layering model.
 
 QUIC first hop:
 
 ```bash
 RUST_LOG=info cargo run -p monad-client -- \
-  --hop quic:127.0.0.1:9051,<HOP1_LEGACY_ED25519_PUB> \
+  --hop quic:127.0.0.1:9051,secp256k1:<HOP1_SECP_PUB> \
   --socks 127.0.0.1:1080
 ```
 
-The client connects directly to the first hop via QUIC, then runs the same Noise+H2 session on top. Use an untagged or `ed25519:` key for the legacy QUIC/plain-noise path, or `secp256k1:` for the secp QUIC path.
+The client connects directly to the first hop via QUIC, then runs the same Noise+H2 session on top using the secp QUIC path.
 
 ## Example Usage
 
