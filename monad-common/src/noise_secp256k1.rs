@@ -60,7 +60,7 @@ impl noise_protocol::DH for Secp256k1Dh {
     }
 
     fn genkey() -> Self::Key {
-        SecpTransportKeypair::generate().secret_bytes()
+        SecpTransportKeypair::generate().normalized_secret_bytes()
     }
 
     fn pubkey(key: &Self::Key) -> Self::Pubkey {
@@ -373,7 +373,7 @@ pub async fn handshake_responder<T: AsyncRead + AsyncWrite + Unpin>(
         patterns::noise_nk(),
         false,
         PROLOGUE,
-        Some(server_key.secret_bytes()),
+        Some(server_key.normalized_secret_bytes()),
         None,
         None,
         None,

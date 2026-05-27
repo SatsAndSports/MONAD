@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
             println!("# Shared secp256k1 transport identity");
             println!(
                 "Private key (secp256k1):    {}",
-                hex::encode(transport_key.secret_bytes())
+                hex::encode(transport_key.normalized_secret_bytes())
             );
             println!("Public key (secp256k1):     {transport_pubkey}");
             println!();
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "#   monad-server run --quic-cert-seed {} --transport-key {} --quic",
                 hex::encode(identity.seed()),
-                hex::encode(transport_key.secret_bytes())
+                hex::encode(transport_key.normalized_secret_bytes())
             );
             println!("#");
             println!("# MONAD clients use the secp transport key:");

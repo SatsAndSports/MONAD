@@ -61,18 +61,16 @@ pub struct SecpTransportKeypair {
 
 impl SecpTransportKeypair {
     pub fn generate() -> Self {
-        Self {
-            signing_key: SigningKey::random(&mut OsRng),
-        }
+        Self::normalize_signing_key(SigningKey::random(&mut OsRng))
     }
 
     pub fn from_secret_bytes(bytes: &[u8; 32]) -> Result<Self, SecpIdentityError> {
         let signing_key =
             SigningKey::from_bytes(bytes).map_err(|_| SecpIdentityError::InvalidSecretKey)?;
-        Ok(Self { signing_key })
+        Ok(Self::normalize_signing_key(signing_key))
     }
 
-    pub fn secret_bytes(&self) -> [u8; 32] {
+    pub fn normalized_secret_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes().into()
     }
 
@@ -89,6 +87,19 @@ impl SecpTransportKeypair {
             .sign_raw(digest, &[0u8; 32])
             .expect("valid digest")
             .to_bytes()
+    }
+
+    fn normalize_signing_key(signing_key: SigningKey) -> Self {
+        let public_key = PublicKey::from(*signing_key.verifying_key());
+        let encoded = public_key.to_encoded_point(true);
+        if encoded.as_bytes()[0] == 0x02 {
+            return Self { signing_key };
+        }
+
+        let normalized_bytes = (-*signing_key.as_nonzero_scalar().as_ref()).to_bytes();
+        let signing_key =
+            SigningKey::from_bytes(&normalized_bytes).expect("negated secp256k1 secret key");
+        Self { signing_key }
     }
 }
 
@@ -140,5 +151,36 @@ mod tests {
         assert!(
             verify_transport_auth_digest(&keypair.pubkey(), &wrong_digest, &signature).is_err()
         );
+    }
+
+    #[test]
+    fn test_generated_pubkey_is_even_y_form() {
+        for _ in 0..32 {
+            let keypair = SecpTransportKeypair::generate();
+            assert_eq!(keypair.pubkey().as_bytes()[0], 0x02);
+        }
+    }
+
+    #[test]
+    fn test_from_secret_bytes_normalizes_negated_scalar() {
+        let keypair = SecpTransportKeypair::generate();
+        let negated_bytes: [u8; 32] =
+            (-*SigningKey::from_bytes(&keypair.normalized_secret_bytes())
+                .unwrap()
+                .as_nonzero_scalar()
+                .as_ref())
+            .to_bytes()
+            .into();
+
+        let normalized =
+            SecpTransportKeypair::from_secret_bytes(&keypair.normalized_secret_bytes()).unwrap();
+        let from_negated = SecpTransportKeypair::from_secret_bytes(&negated_bytes).unwrap();
+
+        assert_eq!(
+            normalized.normalized_secret_bytes(),
+            from_negated.normalized_secret_bytes()
+        );
+        assert_eq!(normalized.pubkey(), from_negated.pubkey());
+        assert_eq!(normalized.pubkey().as_bytes()[0], 0x02);
     }
 }

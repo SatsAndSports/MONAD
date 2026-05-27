@@ -46,7 +46,9 @@ pub struct HopTweak([u8; 32]);
 
 impl HopTweak {
     pub fn generate() -> Result<Self, BlindedHopError> {
-        Ok(Self(SecpTransportKeypair::generate().secret_bytes()))
+        Ok(Self(
+            SecpTransportKeypair::generate().normalized_secret_bytes(),
+        ))
     }
 
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -162,7 +164,7 @@ fn tweak_secret_key_with_tweak(
     identity: &SecpTransportKeypair,
     tweak: &HopTweak,
 ) -> Result<SecpTransportKeypair, BlindedHopError> {
-    let base_key = SigningKey::from_bytes(&identity.secret_bytes())
+    let base_key = SigningKey::from_bytes(&identity.normalized_secret_bytes())
         .map_err(|_| BlindedHopError::InvalidTweak)?;
     let tweaked_scalar = *base_key.as_nonzero_scalar().as_ref() + tweak.scalar()?;
     let bytes: [u8; 32] = tweaked_scalar.to_bytes().into();
@@ -209,7 +211,7 @@ pub fn derive_tweaked_hop_identity(
     Ok(TweakedHopIdentity {
         tweak,
         tweaked_pubkey,
-        responder_secret_key: tweaked_identity.secret_bytes(),
+        responder_secret_key: tweaked_identity.normalized_secret_bytes(),
     })
 }
 
@@ -293,7 +295,7 @@ pub fn decrypt_blinded_hop_for_intro(
     recipient: &SecpTransportKeypair,
     message: &BlindedHopMessage,
 ) -> Result<BlindedHopPlaintext, BlindedHopError> {
-    let secret_key = SecretKey::from_slice(&recipient.secret_bytes())
+    let secret_key = SecretKey::from_slice(&recipient.normalized_secret_bytes())
         .map_err(|_| BlindedHopError::InvalidTweak)?;
     let sender_public = PublicKey::from_sec1_bytes(&message.ephemeral_pubkey)
         .map_err(|_| BlindedHopError::Decrypt)?;
