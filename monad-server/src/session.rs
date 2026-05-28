@@ -5,8 +5,10 @@
 //! `POST /control` stream is used to fund and observe the whole session.
 
 use crate::listener::SpilmanMintCache;
+use crate::payments::{LinkError, LinkOutcome, PaymentOutcome, RelayPayments};
 use crate::proxy;
 use crate::quic_pool::QuicPool;
+use crate::session_registry::SessionRegistry;
 use bytes::Bytes;
 use cashu::nuts::SecretKey;
 use h2::server;
@@ -41,9 +43,6 @@ struct SessionInner {
     paused: bool,
     control_attached: bool,
     control_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
-    // TODO: set this in a future ChannelLink handler. Currently always None
-    // because Spilman channel linking is not yet implemented; only FakePayment
-    // moves the balance today.
     linked_channel_id: Option<String>,
 }
 
@@ -51,12 +50,21 @@ struct SessionInner {
 pub(crate) struct SessionState {
     inner: Arc<Mutex<SessionInner>>,
     pause_tx: watch::Sender<bool>,
+    session_id: [u8; 32],
+    payments: Arc<dyn RelayPayments>,
+    session_registry: Arc<SessionRegistry>,
     payment_receiver_secret: SecretKey,
     spilman_mint_cache: SpilmanMintCache,
 }
 
 impl SessionState {
-    fn new(payment_receiver_secret: SecretKey, spilman_mint_cache: SpilmanMintCache) -> Self {
+    fn new(
+        session_id: [u8; 32],
+        payments: Arc<dyn RelayPayments>,
+        session_registry: Arc<SessionRegistry>,
+        payment_receiver_secret: SecretKey,
+        spilman_mint_cache: SpilmanMintCache,
+    ) -> Self {
         let (pause_tx, _) = watch::channel(true);
         Self {
             inner: Arc::new(Mutex::new(SessionInner {
@@ -74,6 +82,9 @@ impl SessionState {
                 linked_channel_id: None,
             })),
             pause_tx,
+            session_id,
+            payments,
+            session_registry,
             payment_receiver_secret,
             spilman_mint_cache,
         }
@@ -141,7 +152,8 @@ impl SessionState {
         }
 
         inner.control_attached = true;
-        inner.control_tx = Some(tx);
+        inner.control_tx = Some(tx.clone());
+        self.session_registry.register(self.session_id, tx);
         Ok(())
     }
 
@@ -149,12 +161,62 @@ impl SessionState {
         let mut inner = self.inner.lock().await;
         inner.control_attached = false;
         inner.control_tx = None;
+        self.session_registry.deregister(&self.session_id);
     }
 
     async fn apply_fake_payment(&self, milli_sats: u64) {
         let mut inner = self.inner.lock().await;
         inner.total_paid_millisats = inner.total_paid_millisats.saturating_add(milli_sats);
         self.refresh_pause_state(&mut inner);
+    }
+
+    async fn apply_channel_link(&self, payment_json: &str) -> Result<LinkOutcome, LinkError> {
+        let outcome = self.payments.link_channel(self.session_id, payment_json)?;
+
+        {
+            let mut inner = self.inner.lock().await;
+            inner.linked_channel_id = Some(outcome.channel_id.clone());
+        }
+
+        if let Some(evicted_session) = outcome.evicted_session {
+            let _ = self.session_registry.notify(
+                &evicted_session,
+                ServerMessage::ChannelEvicted {
+                    channel_id: outcome.channel_id.clone(),
+                },
+            );
+        }
+
+        Ok(outcome)
+    }
+
+    async fn apply_channel_payment_msg(
+        &self,
+        payment_json: &str,
+    ) -> Result<PaymentOutcome, crate::payments::ChannelPaymentError> {
+        let linked_channel_id = {
+            let inner = self.inner.lock().await;
+            inner.linked_channel_id.clone()
+        }
+        .ok_or(crate::payments::ChannelPaymentError::WrongChannel)?;
+
+        let outcome = self
+            .payments
+            .apply_channel_payment(&linked_channel_id, payment_json)?;
+
+        let mut inner = self.inner.lock().await;
+        inner.total_paid_millisats = inner
+            .total_paid_millisats
+            .saturating_add(outcome.delta_millisats);
+        self.refresh_pause_state(&mut inner);
+        Ok(outcome)
+    }
+
+    async fn handle_channel_evicted(&self, channel_id: &str) {
+        let mut inner = self.inner.lock().await;
+        if inner.linked_channel_id.as_deref() == Some(channel_id) {
+            inner.linked_channel_id = None;
+        }
     }
 
     pub(crate) async fn note_outbound_bytes(&self, bytes: usize) -> bool {
@@ -213,6 +275,8 @@ pub async fn relay_session_from_transport_stream<S>(
     stream: S,
     session_id: [u8; 32],
     quic_pool: Option<QuicPool>,
+    payments: Arc<dyn RelayPayments>,
+    session_registry: Arc<SessionRegistry>,
     payment_receiver_secret: SecretKey,
     spilman_mint_cache: SpilmanMintCache,
 ) -> io::Result<RelaySession<S>>
@@ -232,7 +296,13 @@ where
         h2_conn,
         quic_pool,
         session_id,
-        state: SessionState::new(payment_receiver_secret, spilman_mint_cache),
+        state: SessionState::new(
+            session_id,
+            payments,
+            session_registry,
+            payment_receiver_secret,
+            spilman_mint_cache,
+        ),
     })
 }
 
@@ -581,6 +651,9 @@ async fn handle_control_stream(
             maybe_event = events.recv() => {
                 match maybe_event {
                     Some(message) => {
+                        if let ServerMessage::ChannelEvicted { channel_id } = &message {
+                            state.handle_channel_evicted(channel_id).await;
+                        }
                         send_control_message(&mut h2_send, &message).await?;
                     }
                     None => break,
@@ -620,8 +693,46 @@ async fn handle_control_stream(
                                         "fake payment accepted: added={milli_sats}"
                                     );
                                 }
-                                Ok(other) => {
-                                    warn!("control: message not yet implemented: {other:?}");
+                                Ok(ClientMessage::ChannelLink { payment_json }) => {
+                                    match state.apply_channel_link(&payment_json).await {
+                                        Ok(outcome) => {
+                                            send_control_message(
+                                                &mut h2_send,
+                                                &ServerMessage::ChannelLinkAccepted {
+                                                    channel_id: outcome.channel_id,
+                                                    capacity: outcome.capacity_millisats,
+                                                },
+                                            )
+                                            .await?;
+                                            state.push_status().await;
+                                        }
+                                        Err(e) => {
+                                            warn!("control: channel link rejected: {e}");
+                                            let err_msg = ServerMessage::Error {
+                                                message: e.to_string(),
+                                            };
+                                            send_control_message(&mut h2_send, &err_msg).await?;
+                                        }
+                                    }
+                                }
+                                Ok(ClientMessage::ChannelPayment { payment_json }) => {
+                                    match state.apply_channel_payment_msg(&payment_json).await {
+                                        Ok(outcome) => {
+                                            debug!(
+                                                channel_id = %outcome.channel_id,
+                                                delta_millisats = outcome.delta_millisats,
+                                                "channel payment accepted"
+                                            );
+                                            state.push_status().await;
+                                        }
+                                        Err(e) => {
+                                            warn!("control: channel payment rejected: {e}");
+                                            let err_msg = ServerMessage::Error {
+                                                message: e.to_string(),
+                                            };
+                                            send_control_message(&mut h2_send, &err_msg).await?;
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     warn!("control: invalid message: {e}");

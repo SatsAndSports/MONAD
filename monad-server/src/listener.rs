@@ -1,7 +1,9 @@
 //! TCP and QUIC listener that accepts connections and performs the Noise NK handshake.
 
+use crate::payments::{RelayPayments, SpilmanRelayPayments};
 use crate::quic_pool::QuicPool;
 use crate::session::relay_session_from_transport_stream;
+use crate::session_registry::SessionRegistry;
 use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::noise_secp256k1;
@@ -108,6 +110,29 @@ pub async fn run(
     quic_endpoint: Option<quinn::Endpoint>,
     config: Arc<ServerConfig>,
 ) -> io::Result<()> {
+    let discovered_spilman_mint_cache =
+        Arc::new(discover_spilman_mint_cache(&config.trusted_mint_units).await?);
+    let payments: Arc<dyn RelayPayments> = Arc::new(SpilmanRelayPayments::new(
+        config.payment_receiver_secret.clone(),
+        discovered_spilman_mint_cache.as_ref().clone(),
+    ));
+    run_with_payments(
+        listener,
+        quic_endpoint,
+        config,
+        payments,
+        discovered_spilman_mint_cache,
+    )
+    .await
+}
+
+pub async fn run_with_payments(
+    listener: TcpListener,
+    quic_endpoint: Option<quinn::Endpoint>,
+    config: Arc<ServerConfig>,
+    payments: Arc<dyn RelayPayments>,
+    discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
+) -> io::Result<()> {
     let transport_key = config.transport_key.clone().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -122,8 +147,7 @@ pub async fn run(
     // Create the QUIC connection pool for outbound CONNECT quic: forwarding.
     // This is separate from the QUIC endpoint (which handles inbound connections).
     let quic_pool = QuicPool::new().ok();
-    let discovered_spilman_mint_cache =
-        Arc::new(discover_spilman_mint_cache(&config.trusted_mint_units).await?);
+    let session_registry = Arc::new(SessionRegistry::new());
 
     // Accept loop — runs until Ctrl+C
     loop {
@@ -136,6 +160,8 @@ pub async fn run(
                 let transport_key = transport_key.clone();
                 let quic_pool = quic_pool.clone();
                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
+                let payments = payments.clone();
+                let session_registry = session_registry.clone();
 
                 sessions.spawn(async move {
                     let (send_cipher, recv_cipher, session_id) =
@@ -166,6 +192,8 @@ pub async fn run(
                         secp_stream,
                         session_id,
                         quic_pool,
+                        payments,
+                        session_registry,
                         config.payment_receiver_secret.clone(),
                         discovered_spilman_mint_cache.as_ref().clone(),
                     )
@@ -200,6 +228,8 @@ pub async fn run(
                 let transport_key = transport_key.clone();
                 let quic_pool = quic_pool.clone();
                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
+                let payments = payments.clone();
+                let session_registry = session_registry.clone();
 
                 sessions.spawn(async move {
                     // Complete the QUIC connection handshake
@@ -226,6 +256,8 @@ pub async fn run(
                                 let transport_key = transport_key.clone();
                                 let quic_pool = quic_pool.clone();
                                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
+                                let payments = payments.clone();
+                                let session_registry = session_registry.clone();
                                 let authenticated = authenticated.clone();
                                 let conn = conn.clone();
                                 tokio::spawn(async move {
@@ -291,13 +323,15 @@ pub async fn run(
                                                 ),
                                             );
 
-                                            match relay_session_from_transport_stream(
-                                                secp_stream,
-                                                session_id,
-                                                quic_pool,
-                                                config.payment_receiver_secret.clone(),
-                                                discovered_spilman_mint_cache.as_ref().clone(),
-                                            )
+                                                match relay_session_from_transport_stream(
+                                                    secp_stream,
+                                                    session_id,
+                                                    quic_pool,
+                                                    payments,
+                                                    session_registry,
+                                                    config.payment_receiver_secret.clone(),
+                                                    discovered_spilman_mint_cache.as_ref().clone(),
+                                                )
                                             .await {
                                                 Ok(session) => {
                                                     if let Err(e) = session.run().await {

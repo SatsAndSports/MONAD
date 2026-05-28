@@ -23,7 +23,8 @@ use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
-use monad_server::listener::ServerConfig;
+use monad_server::listener::{discover_spilman_mint_cache, run_with_payments, ServerConfig};
+use monad_server::payments::testing::InMemoryRelayPayments;
 use monad_server::quic_pool::QuicPool;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -150,10 +151,19 @@ async fn start_monad_server_with_spilman(
         trusted_mint_units,
     });
 
-    tokio::spawn(monad_server::listener::run(
+    let discovered_spilman_mint_cache = Arc::new(
+        discover_spilman_mint_cache(&config.trusted_mint_units)
+            .await
+            .unwrap(),
+    );
+    let payments = Arc::new(InMemoryRelayPayments::new());
+
+    tokio::spawn(run_with_payments(
         listener,
         Some(quic_endpoint),
         config,
+        payments,
+        discovered_spilman_mint_cache,
     ));
 
     (addr, pubkey)
@@ -185,10 +195,19 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Sec
         trusted_mint_units: BTreeMap::new(),
     });
 
-    tokio::spawn(monad_server::listener::run(
+    let discovered_spilman_mint_cache = Arc::new(
+        discover_spilman_mint_cache(&config.trusted_mint_units)
+            .await
+            .unwrap(),
+    );
+    let payments = Arc::new(InMemoryRelayPayments::new());
+
+    tokio::spawn(run_with_payments(
         listener,
         Some(quic_endpoint),
         config,
+        payments,
+        discovered_spilman_mint_cache,
     ));
 
     Some((addr, pubkey))
@@ -362,6 +381,24 @@ async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 }
 
+fn test_channel_link_json(channel_id: &str, capacity: u64, unit: &str) -> String {
+    serde_json::json!({
+        "channel_id": channel_id,
+        "balance": 0,
+        "capacity": capacity,
+        "unit": unit,
+    })
+    .to_string()
+}
+
+fn test_channel_payment_json(channel_id: &str, balance: u64) -> String {
+    serde_json::json!({
+        "channel_id": channel_id,
+        "balance": balance,
+    })
+    .to_string()
+}
+
 /// Open a CONNECT tunnel, send payload, read response.
 async fn tunnel_roundtrip(
     h2_client: &mut client::SendRequest<Bytes>,
@@ -483,6 +520,245 @@ async fn test_connect_rejected_while_paused() {
     drop(response);
     drop(h2);
     conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_channel_link_does_not_unpause_session() {
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
+    assert!(paused0);
+    assert_eq!(rem0, 0);
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: test_channel_link_json("chan-msat", 250, "msat"),
+        },
+        false,
+    )
+    .await;
+
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::ChannelLinkAccepted {
+            channel_id,
+            capacity,
+        } => {
+            assert_eq!(channel_id, "chan-msat");
+            assert_eq!(capacity, 250);
+        }
+        other => panic!("expected ChannelLinkAccepted, got {other:?}"),
+    }
+
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::SessionStatus {
+            linked_channel_id,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            ..
+        } => {
+            assert_eq!(linked_channel_id.as_deref(), Some("chan-msat"));
+            assert_eq!(total_paid_millisats, 0);
+            assert_eq!(remaining_milli_sats, 0);
+            assert!(paused);
+        }
+        other => panic!("expected SessionStatus after link, got {other:?}"),
+    }
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_channel_payment_msat_unpauses_with_raw_delta() {
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+
+    let (_in0, _out0, _paid0, _rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
+    assert!(paused0);
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: test_channel_link_json("chan-msat", 250, "msat"),
+        },
+        false,
+    )
+    .await;
+    let _ = read_control_message(&mut control_recv).await;
+    let _ = read_control_message(&mut control_recv).await;
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment {
+            payment_json: test_channel_payment_json("chan-msat", 50),
+        },
+        false,
+    )
+    .await;
+
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::SessionStatus {
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            linked_channel_id,
+            ..
+        } => {
+            assert_eq!(linked_channel_id.as_deref(), Some("chan-msat"));
+            assert_eq!(total_paid_millisats, 50);
+            assert_eq!(remaining_milli_sats, 50);
+            assert!(!paused);
+        }
+        other => panic!("expected SessionStatus after channel payment, got {other:?}"),
+    }
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_channel_payment_sat_unpauses_with_millisat_conversion() {
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+
+    let (_in0, _out0, _paid0, _rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
+    assert!(paused0);
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: test_channel_link_json("chan-sat", 25, "sat"),
+        },
+        false,
+    )
+    .await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::ChannelLinkAccepted { capacity, .. } => {
+            assert_eq!(capacity, 25_000);
+        }
+        other => panic!("expected ChannelLinkAccepted, got {other:?}"),
+    }
+    let _ = read_control_message(&mut control_recv).await;
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment {
+            payment_json: test_channel_payment_json("chan-sat", 5),
+        },
+        false,
+    )
+    .await;
+
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::SessionStatus {
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            ..
+        } => {
+            assert_eq!(total_paid_millisats, 5_000);
+            assert_eq!(remaining_milli_sats, 5_000);
+            assert!(!paused);
+        }
+        other => panic!("expected SessionStatus after sat channel payment, got {other:?}"),
+    }
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_channel_eviction_clears_linked_channel_id() {
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
+    let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
+
+    let (mut send_a, mut recv_a) = conn_a.open_control().await.unwrap();
+    let (mut send_b, mut recv_b) = conn_b.open_control().await.unwrap();
+    let _ = control_handshake(&mut send_a, &mut recv_a).await;
+    let _ = control_handshake(&mut send_b, &mut recv_b).await;
+
+    send_control_message(
+        &mut send_a,
+        &ClientMessage::ChannelLink {
+            payment_json: test_channel_link_json("shared", 100, "msat"),
+        },
+        false,
+    )
+    .await;
+    let _ = read_control_message(&mut recv_a).await;
+    let _ = read_control_message(&mut recv_a).await;
+
+    send_control_message(
+        &mut send_b,
+        &ClientMessage::ChannelLink {
+            payment_json: test_channel_link_json("shared", 100, "msat"),
+        },
+        false,
+    )
+    .await;
+
+    match read_control_message(&mut recv_b).await {
+        ServerMessage::ChannelLinkAccepted { channel_id, .. } => {
+            assert_eq!(channel_id, "shared");
+        }
+        other => panic!("expected ChannelLinkAccepted for session B, got {other:?}"),
+    }
+    let _ = read_control_message(&mut recv_b).await;
+
+    let evicted = timeout(
+        Duration::from_millis(500),
+        read_control_message(&mut recv_a),
+    )
+    .await
+    .expect("expected eviction event");
+    match evicted {
+        ServerMessage::ChannelEvicted { channel_id } => {
+            assert_eq!(channel_id, "shared");
+        }
+        other => panic!("expected ChannelEvicted, got {other:?}"),
+    }
+
+    send_control_message(&mut send_a, &ClientMessage::GetSessionStatus, false).await;
+    match read_control_message(&mut recv_a).await {
+        ServerMessage::SessionStatus {
+            linked_channel_id,
+            paused,
+            ..
+        } => {
+            assert_eq!(linked_channel_id, None);
+            assert!(paused);
+        }
+        other => panic!("expected SessionStatus for evicted session, got {other:?}"),
+    }
+
+    let _ = send_a.send_data(Bytes::new(), true);
+    let _ = send_b.send_data(Bytes::new(), true);
+    drop(send_a);
+    drop(recv_a);
+    drop(send_b);
+    drop(recv_b);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn_a.shutdown().await;
+    conn_b.shutdown().await;
 }
 
 #[tokio::test]
