@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
                 "Private key (secp256k1):    {}",
                 hex::encode(transport_key.normalized_secret_bytes())
             );
-            println!("Public key (secp256k1):     {transport_pubkey}");
+            println!("Public key (secp256k1 x-only): {transport_pubkey}");
             println!();
             println!("# --- QUIC certificate (derived from the Ed25519 key) ---");
             println!("{}", quic_km.cert_pem);

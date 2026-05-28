@@ -854,6 +854,11 @@ T authenticates itself twice:
 - to S via QUIC attestation using T's secp transport key
 - to C via secp Noise using the same secp transport key
 
+Relay transport identities are represented at the MONAD configuration layer as
+32-byte x-only secp256k1 pubkeys with implied even Y. When a transport layer
+needs an actual curve point, MONAD reconstructs the corresponding even-Y
+compressed point internally.
+
 The QUIC/TLS certificate is still Ed25519-backed internally, but MONAD transport
 authentication itself is secp-based.
 
@@ -866,8 +871,8 @@ the long-term transport identity.
 After the QUIC connection is up, the initiator requests a secp256k1 attestation.
 The responder signs a challenge plus QUIC exporter-derived keying material with
 its configured secp256k1 transport key. The initiator verifies that signature
-against the expected secp256k1 public key, which binds the MONAD transport
-identity to the live QUIC channel.
+against the expected 32-byte x-only secp256k1 public key, which binds the
+MONAD transport identity to the live QUIC channel.
 
 This authentication is intentionally one-way: the target authenticates itself to
 the initiator, but the initiator does not authenticate itself at the QUIC layer.
@@ -901,17 +906,17 @@ After the handshake completes, the session handler does not care which transport
 
 A QUIC-capable server has both:
 - an Ed25519 identity for QUIC certificate generation
-- a secp256k1 transport key for TCP MONAD transport and secp-authenticated QUIC
+- a secp256k1 transport key whose public MONAD identity is a 32-byte x-only pubkey for TCP MONAD transport and secp-authenticated QUIC
 
 The `--quic` flag enables the QUIC listener; the QUIC certificate is generated from the `--quic-cert-seed` Ed25519 seed, while `--transport-key` supplies the shared secp transport key.
 
 ### CONNECT Syntax for QUIC Hops
 
-The client signals to a relay that it should use QUIC to reach the next hop by including a `quic-secp256k1-pubkey` header in the H2 CONNECT request. The URI authority remains a standard `host:port`:
+The client signals to a relay that it should use QUIC to reach the next hop by including a `quic-secp256k1-pubkey` header in the H2 CONNECT request. The URI authority remains a standard `host:port`, and the header value is the next hop's 32-byte x-only secp256k1 identity encoded as 64 hex characters:
 
 ```text
 CONNECT host:port HTTP/2
-quic-secp256k1-pubkey: <xonly_secp_pubkey_hex>
+quic-secp256k1-pubkey: <64-hex-char-x-only-pubkey>
 ```
 
 For example:
@@ -941,7 +946,7 @@ This is the core scaling benefit: one QUIC handshake to T is amortized across al
 
 ### Client `--hop` Syntax for QUIC Hops
 
-The `--hop` syntax uses secp256k1 identities:
+The `--hop` syntax uses 32-byte x-only secp256k1 identities:
 
 ```text
 --hop addr:port,secp256k1:<pubkey>

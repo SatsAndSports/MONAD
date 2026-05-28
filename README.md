@@ -105,12 +105,18 @@ Current coverage includes:
 
 MONAD transport now uses secp256k1 identities throughout:
 
-- **TCP MONAD transport** uses secp Noise
-- **QUIC MONAD transport** uses secp attestation plus secp Noise
+- **TCP MONAD transport** uses secp Noise with 32-byte x-only relay identities
+- **QUIC MONAD transport** uses secp attestation plus secp Noise with the same 32-byte x-only relay identities
 
 The `monad-client` binary emits and accepts only secp256k1 hop identities. The
 server still keeps an Ed25519 seed internally for QUIC certificate generation,
 but that is no longer a client-facing MONAD transport identity.
+
+Identity model:
+- long-lived relay identities are 32-byte x-only secp256k1 pubkeys with implied even Y
+- blinded-hop tweaked pubkeys are also 32-byte x-only secp256k1 pubkeys, enforced even via rejection sampling
+- ephemeral ECDH pubkeys remain 33-byte compressed curve points
+- Noise DH operates on full curve points internally even though the configured relay identities are x-only
 
 For QUIC, the server first presents a self-signed Ed25519 certificate so the
 standard TLS 1.3 handshake can establish an encrypted channel. MONAD then binds
@@ -122,8 +128,8 @@ Quick reference:
 
 | Transport | Hop syntax | Identity | Auth mechanism |
 |-----------|-----------|----------|----------------|
-| TCP | `addr:port,secp256k1:<pub>` | secp256k1 | secp Noise NK |
-| QUIC (secp) | `quic:addr:port,secp256k1:<pub>` | secp256k1 | QUIC attestation + secp Noise NK |
+| TCP | `addr:port,secp256k1:<pub>` | 32-byte x-only secp256k1 | secp Noise NK |
+| QUIC (secp) | `quic:addr:port,secp256k1:<pub>` | 32-byte x-only secp256k1 | QUIC attestation + secp Noise NK |
 
 ## Quick Start
 
@@ -135,7 +141,7 @@ cargo run -p monad-server -- keygen
 
 This prints:
 - an Ed25519 seed/public key used for QUIC certificate generation
-- a secp256k1 transport private/public key for MONAD TCP and QUIC transport auth
+- a secp256k1 transport private key plus its 32-byte x-only public identity for MONAD TCP and QUIC transport auth
 - a QUIC certificate derived from the Ed25519 seed
 
 ### 2. Start one or more servers

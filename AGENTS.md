@@ -28,7 +28,7 @@ cargo run -p monad-quic -- ...
   - `RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`, billing math (`session.rs`)
   - `proxy_bidirectional` shared proxy (`proxy.rs`)
   - `QuicCertIdentity`, Ed25519 key derivation for QUIC certificate plumbing (`quic_cert_identity.rs`)
-  - `Secp256k1Pubkey`, `SecpTransportKeypair`, transport auth helpers (`secp_identity.rs`)
+  - `Secp256k1Pubkey` (32-byte x-only, implied even Y), `SecpTransportKeypair`, transport auth helpers (`secp_identity.rs`)
 - `monad-client`
   - reusable library code plus binary entrypoint
   - SOCKS5 listener
@@ -77,12 +77,19 @@ cargo run -p monad-quic -- ...
 
 - Relay-to-relay transport: QUIC (replaces TCP between hops, does not replace Noise)
 - QUIC authentication: secp256k1 attestation on top of the QUIC/TLS channel
-- QUIC hop signaling: `CONNECT host:port` with `quic-secp256k1-pubkey: <hex>` H2 header
+- QUIC hop signaling: `CONNECT host:port` with `quic-secp256k1-pubkey: <64-hex-char x-only pubkey>` H2 header
 - Client hop syntax: `--hop quic:addr:port,secp256k1:<pubkey>`
 - Client can also use QUIC directly to the first hop with the same `--hop quic:` syntax
 - Noise nesting is preserved — the inner Noise+H2 session runs unchanged inside the QUIC stream
 - Server listens on the same port for both TCP and UDP (QUIC)
 - QUIC connection pool: shared connections reused across client sessions, keyed by `(host, port)` plus auth mode
+
+### Transport Identity Model
+
+- Long-lived relay identities are 32-byte x-only secp256k1 pubkeys with implied even Y.
+- Blinded-hop tweaked pubkeys are also represented as 32-byte x-only pubkeys and are forced even via rejection sampling.
+- Ephemeral ECDH pubkeys remain 33-byte compressed points.
+- Noise DH uses full curve points internally even when configured identities are x-only.
 
 ## Important Invariants
 
