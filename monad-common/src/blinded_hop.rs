@@ -610,6 +610,116 @@ mod tests {
     }
 
     #[test]
+    fn test_blinded_hop_tweaked_pubkeys_are_always_even_over_many_samples() {
+        for i in 0..SAMPLE_COUNT as u32 {
+            let identity = sample_identity(i);
+            let tweaked = derive_tweaked_hop_identity(&identity).unwrap();
+            assert_eq!(
+                tweaked.tweaked_pubkey.to_compressed_bytes()[0],
+                0x02,
+                "sample {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_blinded_hop_ciphertext_tamper_fails_decryption() {
+        let recipient = sample_identity(0);
+        let plaintext = BlindedHopPlaintext {
+            next_hop_addr: "10.1.2.3:9050".to_string(),
+            next_hop_tweak: derive_even_tweaked_secret_key(&recipient).unwrap().0,
+        };
+        let mut message =
+            encrypt_blinded_hop_for_intro(recipient.pubkey().to_compressed_bytes(), &plaintext)
+                .unwrap();
+        let last = message.ciphertext.len() - 1;
+        message.ciphertext[last] ^= 0x01;
+
+        assert!(matches!(
+            decrypt_blinded_hop_for_intro(&recipient, &message),
+            Err(BlindedHopError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn test_blinded_hop_ephemeral_pubkey_tamper_fails_decryption() {
+        let recipient = sample_identity(0);
+        let plaintext = BlindedHopPlaintext {
+            next_hop_addr: "10.1.2.3:9050".to_string(),
+            next_hop_tweak: derive_even_tweaked_secret_key(&recipient).unwrap().0,
+        };
+        let mut message =
+            encrypt_blinded_hop_for_intro(recipient.pubkey().to_compressed_bytes(), &plaintext)
+                .unwrap();
+        message.ephemeral_pubkey[10] ^= 0x01;
+
+        assert!(matches!(
+            decrypt_blinded_hop_for_intro(&recipient, &message),
+            Err(BlindedHopError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn test_blinded_hop_truncated_ciphertext_fails_decryption() {
+        let recipient = sample_identity(0);
+        let plaintext = BlindedHopPlaintext {
+            next_hop_addr: "10.1.2.3:9050".to_string(),
+            next_hop_tweak: derive_even_tweaked_secret_key(&recipient).unwrap().0,
+        };
+        let mut message =
+            encrypt_blinded_hop_for_intro(recipient.pubkey().to_compressed_bytes(), &plaintext)
+                .unwrap();
+        message.ciphertext.pop();
+
+        assert!(matches!(
+            decrypt_blinded_hop_for_intro(&recipient, &message),
+            Err(BlindedHopError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn test_blinded_hop_invalid_ephemeral_point_fails_decryption() {
+        let recipient = sample_identity(0);
+        let plaintext = BlindedHopPlaintext {
+            next_hop_addr: "10.1.2.3:9050".to_string(),
+            next_hop_tweak: derive_even_tweaked_secret_key(&recipient).unwrap().0,
+        };
+        let mut message =
+            encrypt_blinded_hop_for_intro(recipient.pubkey().to_compressed_bytes(), &plaintext)
+                .unwrap();
+        message.ephemeral_pubkey = [0u8; 33];
+
+        assert!(matches!(
+            decrypt_blinded_hop_for_intro(&recipient, &message),
+            Err(BlindedHopError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn test_mismatched_descriptor_pubkey_recovers_different_hidden_identity() {
+        let intro_identity = sample_identity(0);
+        let hidden_identity_a = sample_identity(1);
+        let hidden_identity_b = sample_identity(2);
+        let mut descriptor = build_blinded_hop_descriptor(
+            intro_identity.pubkey().to_compressed_bytes(),
+            "127.0.0.1:9002",
+            &hidden_identity_a,
+        )
+        .unwrap();
+        descriptor.tweaked_pubkey = derive_tweaked_hop_identity(&hidden_identity_b)
+            .unwrap()
+            .tweaked_pubkey;
+
+        let plaintext =
+            decrypt_blinded_hop_for_intro(&intro_identity, &descriptor.message).unwrap();
+        match untweak_pubkey(descriptor.tweaked_pubkey, &plaintext.next_hop_tweak) {
+            Ok(recovered_hidden) => assert_ne!(recovered_hidden, hidden_identity_a.pubkey()),
+            Err(BlindedHopError::InvalidPublicKey) => {}
+            Err(e) => panic!("unexpected untweak error: {e:?}"),
+        }
+    }
+
+    #[test]
     fn test_blinded_hop_uses_fresh_ephemeral_key() {
         let recipient = sample_identity(0);
         let tweak = HopTweak::generate().unwrap();

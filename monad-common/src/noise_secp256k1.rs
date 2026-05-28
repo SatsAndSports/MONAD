@@ -405,6 +405,7 @@ pub async fn handshake_responder_with_secret_key_bytes<T: AsyncRead + AsyncWrite
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::schnorr::SigningKey;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -557,5 +558,37 @@ mod tests {
         initiator.write_all(&payload).await.unwrap();
         initiator.shutdown().await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_secp_noise_handshake_with_odd_form_imported_secret() {
+        let canonical = SecpTransportKeypair::generate();
+        let odd_form_bytes: [u8; 32] =
+            (-*SigningKey::from_bytes(&canonical.normalized_secret_bytes())
+                .unwrap()
+                .as_nonzero_scalar()
+                .as_ref())
+            .to_bytes()
+            .into();
+        let imported = SecpTransportKeypair::from_secret_bytes(&odd_form_bytes).unwrap();
+        let server_pubkey = canonical.pubkey();
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+
+        let responder =
+            tokio::spawn(async move { handshake_responder(&mut b, &imported).await.unwrap() });
+        let initiator =
+            tokio::spawn(async move { handshake_initiator(&mut a, &server_pubkey).await.unwrap() });
+
+        let (responder_send, responder_recv, responder_session_id) = responder.await.unwrap();
+        let (initiator_send, initiator_recv, initiator_session_id) = initiator.await.unwrap();
+
+        assert_eq!(canonical.pubkey(), server_pubkey);
+        assert_eq!(responder_session_id, initiator_session_id);
+        drop((
+            responder_send,
+            responder_recv,
+            initiator_send,
+            initiator_recv,
+        ));
     }
 }

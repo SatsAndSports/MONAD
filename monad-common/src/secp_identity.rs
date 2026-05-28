@@ -149,6 +149,15 @@ pub fn verify_transport_auth_digest(
 mod tests {
     use super::*;
 
+    fn negated_secret_bytes(bytes: [u8; 32]) -> [u8; 32] {
+        (-*SigningKey::from_bytes(&bytes)
+            .unwrap()
+            .as_nonzero_scalar()
+            .as_ref())
+        .to_bytes()
+        .into()
+    }
+
     #[test]
     fn test_pubkey_roundtrip() {
         let keypair = SecpTransportKeypair::generate();
@@ -184,13 +193,7 @@ mod tests {
     #[test]
     fn test_from_secret_bytes_normalizes_negated_scalar() {
         let keypair = SecpTransportKeypair::generate();
-        let negated_bytes: [u8; 32] =
-            (-*SigningKey::from_bytes(&keypair.normalized_secret_bytes())
-                .unwrap()
-                .as_nonzero_scalar()
-                .as_ref())
-            .to_bytes()
-            .into();
+        let negated_bytes = negated_secret_bytes(keypair.normalized_secret_bytes());
 
         let normalized =
             SecpTransportKeypair::from_secret_bytes(&keypair.normalized_secret_bytes()).unwrap();
@@ -202,5 +205,23 @@ mod tests {
         );
         assert_eq!(normalized.pubkey(), from_negated.pubkey());
         assert_eq!(normalized.pubkey().to_compressed_bytes()[0], 0x02);
+    }
+
+    #[test]
+    fn test_odd_form_import_signs_for_same_x_only_identity() {
+        let keypair = SecpTransportKeypair::generate();
+        let odd_form_bytes = negated_secret_bytes(keypair.normalized_secret_bytes());
+        let imported = SecpTransportKeypair::from_secret_bytes(&odd_form_bytes).unwrap();
+        let challenge = [5u8; 32];
+        let exporter = [7u8; 32];
+        let digest = transport_auth_digest(b"monad-test-v1", &challenge, &exporter);
+        let signature = imported.sign_digest(&digest);
+
+        assert_eq!(imported.pubkey(), keypair.pubkey());
+        assert_eq!(
+            imported.normalized_secret_bytes(),
+            keypair.normalized_secret_bytes()
+        );
+        verify_transport_auth_digest(&keypair.pubkey(), &digest, &signature).unwrap();
     }
 }
