@@ -13,7 +13,6 @@ use k256::{ecdh, ProjectivePoint, PublicKey, Scalar, SecretKey};
 use rand_core::OsRng;
 use ring::aead;
 use ring::hkdf;
-use serde::{Deserialize, Serialize};
 
 const BLINDED_HOP_HKDF_LABEL: &[u8] = b"monad-blinded-hop-v2-secp256k1";
 const BLINDED_HOP_AAD: &[u8] = b"monad-blinded-hop-v2-secp256k1";
@@ -29,10 +28,10 @@ pub enum BlindedHopError {
     InvalidPublicKey,
     #[error("failed to generate randomness")]
     Randomness,
-    #[error("failed to serialize blinded hop payload: {0}")]
-    Serialize(serde_json::Error),
-    #[error("failed to deserialize blinded hop payload: {0}")]
-    Deserialize(serde_json::Error),
+    #[error("invalid blinded hop payload: {0}")]
+    InvalidPayload(&'static str),
+    #[error("invalid blinded hop address utf-8: {0}")]
+    InvalidUtf8(std::str::Utf8Error),
     #[error("failed to derive symmetric key")]
     KeyDerivation,
     #[error("encryption failed")]
@@ -42,7 +41,7 @@ pub enum BlindedHopError {
 }
 
 /// A tweak scalar for one blinded hop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HopTweak([u8; 32]);
 
 impl HopTweak {
@@ -68,10 +67,60 @@ impl HopTweak {
 }
 
 /// The secret payload revealed to the current relay after decrypting a blinded hop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlindedHopPlaintext {
     pub next_hop_addr: String,
     pub next_hop_tweak: HopTweak,
+}
+
+fn encode_blinded_hop_plaintext(
+    plaintext: &BlindedHopPlaintext,
+) -> Result<Vec<u8>, BlindedHopError> {
+    if plaintext.next_hop_addr.is_empty() {
+        return Err(BlindedHopError::InvalidPayload(
+            "next hop address must not be empty",
+        ));
+    }
+    if plaintext.next_hop_addr.as_bytes().contains(&0) {
+        return Err(BlindedHopError::InvalidPayload(
+            "blinded hop address contains interior null",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(32 + plaintext.next_hop_addr.len());
+    out.extend_from_slice(plaintext.next_hop_tweak.as_bytes());
+    out.extend_from_slice(plaintext.next_hop_addr.as_bytes());
+    Ok(out)
+}
+
+fn decode_blinded_hop_plaintext(bytes: &[u8]) -> Result<BlindedHopPlaintext, BlindedHopError> {
+    if bytes.len() <= 32 {
+        return Err(BlindedHopError::InvalidPayload(
+            "blinded hop payload too short",
+        ));
+    }
+
+    let mut tweak = [0u8; 32];
+    tweak.copy_from_slice(&bytes[..32]);
+    let addr_bytes = &bytes[32..];
+    if addr_bytes.is_empty() {
+        return Err(BlindedHopError::InvalidPayload(
+            "next hop address must not be empty",
+        ));
+    }
+    if addr_bytes.contains(&0) {
+        return Err(BlindedHopError::InvalidPayload(
+            "blinded hop address contains interior null",
+        ));
+    }
+
+    let next_hop_addr = std::str::from_utf8(addr_bytes)
+        .map_err(BlindedHopError::InvalidUtf8)?
+        .to_owned();
+    Ok(BlindedHopPlaintext {
+        next_hop_addr,
+        next_hop_tweak: HopTweak::from_bytes(tweak),
+    })
 }
 
 /// A one-shot sealed blinded-hop message.
@@ -310,7 +359,7 @@ pub fn encrypt_blinded_hop_for_intro(
     let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public);
     let symmetric_key = derive_aead_key(shared_secret.raw_secret_bytes())?;
 
-    let mut in_out = serde_json::to_vec(plaintext).map_err(BlindedHopError::Serialize)?;
+    let mut in_out = encode_blinded_hop_plaintext(plaintext)?;
     let nonce = aead::Nonce::assume_unique_for_key(BLINDED_HOP_ZERO_NONCE);
     symmetric_key
         .seal_in_place_append_tag(nonce, aead::Aad::from(BLINDED_HOP_AAD), &mut in_out)
@@ -339,7 +388,7 @@ pub fn decrypt_blinded_hop_for_intro(
     let plaintext = symmetric_key
         .open_in_place(nonce, aead::Aad::from(BLINDED_HOP_AAD), &mut in_out)
         .map_err(|_| BlindedHopError::Decrypt)?;
-    serde_json::from_slice(plaintext).map_err(BlindedHopError::Deserialize)
+    decode_blinded_hop_plaintext(plaintext)
 }
 
 fn derive_aead_key(shared_secret: &[u8]) -> Result<aead::LessSafeKey, BlindedHopError> {
@@ -464,6 +513,77 @@ mod tests {
     }
 
     #[test]
+    fn test_blinded_hop_plaintext_binary_roundtrip() {
+        let plaintext = BlindedHopPlaintext {
+            next_hop_addr: "example.com:9050".to_string(),
+            next_hop_tweak: HopTweak::from_bytes(sample_secret_bytes(b"monad-plaintext-tweak", 0)),
+        };
+
+        let encoded = encode_blinded_hop_plaintext(&plaintext).unwrap();
+        assert_eq!(&encoded[..32], plaintext.next_hop_tweak.as_bytes());
+        assert_eq!(&encoded[32..], plaintext.next_hop_addr.as_bytes());
+        assert_eq!(decode_blinded_hop_plaintext(&encoded).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_blinded_hop_plaintext_rejects_empty_address() {
+        let plaintext = BlindedHopPlaintext {
+            next_hop_addr: String::new(),
+            next_hop_tweak: HopTweak::from_bytes(sample_secret_bytes(b"monad-plaintext-tweak", 1)),
+        };
+
+        assert!(matches!(
+            encode_blinded_hop_plaintext(&plaintext),
+            Err(BlindedHopError::InvalidPayload(
+                "next hop address must not be empty"
+            ))
+        ));
+
+        let encoded = vec![0u8; 32];
+        assert!(matches!(
+            decode_blinded_hop_plaintext(&encoded),
+            Err(BlindedHopError::InvalidPayload(
+                "blinded hop payload too short"
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_blinded_hop_plaintext_rejects_too_short_payload() {
+        let encoded = vec![0u8; 31];
+        assert!(matches!(
+            decode_blinded_hop_plaintext(&encoded),
+            Err(BlindedHopError::InvalidPayload(
+                "blinded hop payload too short"
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_blinded_hop_plaintext_rejects_interior_null() {
+        let mut encoded = vec![0u8; 32];
+        encoded.extend_from_slice(b"example");
+        encoded.push(0);
+        encoded.extend_from_slice(b"com:9050");
+        assert!(matches!(
+            decode_blinded_hop_plaintext(&encoded),
+            Err(BlindedHopError::InvalidPayload(
+                "blinded hop address contains interior null"
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_blinded_hop_plaintext_rejects_invalid_utf8() {
+        let mut encoded = vec![0u8; 32];
+        encoded.extend_from_slice(&[0xff, 0xfe]);
+        assert!(matches!(
+            decode_blinded_hop_plaintext(&encoded),
+            Err(BlindedHopError::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
     fn test_blinded_hop_wrong_recipient_fails() {
         let recipient_a = sample_identity(0);
         let recipient_b = sample_identity(1);
@@ -479,7 +599,9 @@ mod tests {
         let result = decrypt_blinded_hop_for_intro(&recipient_b, &message);
         assert!(matches!(
             result,
-            Err(BlindedHopError::Decrypt) | Err(BlindedHopError::Deserialize(_))
+            Err(BlindedHopError::Decrypt)
+                | Err(BlindedHopError::InvalidPayload(_))
+                | Err(BlindedHopError::InvalidUtf8(_))
         ));
     }
 
