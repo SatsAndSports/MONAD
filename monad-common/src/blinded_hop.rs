@@ -45,13 +45,15 @@ pub enum BlindedHopError {
 pub struct HopTweak([u8; 32]);
 
 impl HopTweak {
-    pub fn generate() -> Result<Self, BlindedHopError> {
+    // Raw random tweak generation stays private so callers go through
+    // identity-aware helpers that enforce an even tweaked pubkey.
+    fn generate() -> Result<Self, BlindedHopError> {
         Ok(Self(
             SecpTransportKeypair::generate().normalized_secret_bytes(),
         ))
     }
 
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+    fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
@@ -223,6 +225,8 @@ fn derive_even_tweaked_secret_key(
     let base_key = SigningKey::from_bytes(&identity.normalized_secret_bytes())
         .map_err(|_| BlindedHopError::InvalidTweak)?;
 
+    // Keep sampling until P + tG lands on an even-Y point so the published
+    // tweaked hop identity can remain a 32-byte x-only pubkey.
     loop {
         let tweak = HopTweak::generate()?;
         let tweaked_scalar = *base_key.as_nonzero_scalar().as_ref() + tweak.scalar()?;
