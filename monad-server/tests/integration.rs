@@ -34,6 +34,7 @@ use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
 
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
+const TEST_CHANNEL_CAPACITY_UNITS: u64 = u64::MAX / 4096;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -356,24 +357,15 @@ async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
     assert!(paused0);
     assert_eq!(rem0, 0);
 
-    send_control_message(
-        &mut h2_send,
-        &ClientMessage::FakePayment { milli_sats },
-        false,
-    )
-    .await;
-
-    match read_control_message(&mut h2_recv).await {
-        ServerMessage::SessionStatus {
-            paused,
-            remaining_milli_sats,
-            ..
-        } => {
-            assert!(!paused, "session should unpause after funding");
-            assert_eq!(remaining_milli_sats, milli_sats as i64);
-        }
-        other => panic!("expected funded SessionStatus, got {other:?}"),
-    }
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    let (_in1, _out1, paid1, rem1, paused1) = channel.link(&mut h2_send, &mut h2_recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
+    let (_in1, _out1, _paid1, rem1, paused1) =
+        channel.pay(&mut h2_send, &mut h2_recv, milli_sats).await;
+    assert!(!paused1, "session should unpause after funding");
+    assert_eq!(rem1, milli_sats as i64);
 
     let _ = h2_send.send_data(Bytes::new(), true);
     drop(h2_send);
@@ -381,22 +373,141 @@ async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 }
 
-fn test_channel_link_json(channel_id: &str, capacity: u64, unit: &str) -> String {
-    serde_json::json!({
-        "channel_id": channel_id,
-        "balance": 0,
-        "capacity": capacity,
-        "unit": unit,
-    })
-    .to_string()
+struct SessionPaymentChannel {
+    channel_id: String,
+    cumulative_balance_units: u64,
+    unit: &'static str,
 }
 
-fn test_channel_payment_json(channel_id: &str, balance: u64) -> String {
-    serde_json::json!({
-        "channel_id": channel_id,
-        "balance": balance,
-    })
-    .to_string()
+impl SessionPaymentChannel {
+    fn for_session_id(session_id: &[u8; 32]) -> Self {
+        Self {
+            channel_id: format!("test-chan-{}", hex::encode(&session_id[..8])),
+            cumulative_balance_units: 0,
+            unit: "msat",
+        }
+    }
+
+    fn for_explicit_id(channel_id: impl Into<String>) -> Self {
+        Self {
+            channel_id: channel_id.into(),
+            cumulative_balance_units: 0,
+            unit: "msat",
+        }
+    }
+
+    fn with_unit(mut self, unit: &'static str) -> Self {
+        self.unit = unit;
+        self
+    }
+
+    fn capacity_units(&self) -> u64 {
+        TEST_CHANNEL_CAPACITY_UNITS
+    }
+
+    fn expected_capacity_millisats(&self) -> u64 {
+        match self.unit {
+            "sat" => self.capacity_units() * 1000,
+            _ => self.capacity_units(),
+        }
+    }
+
+    fn link_json(&self) -> String {
+        serde_json::json!({
+            "channel_id": self.channel_id,
+            "balance": 0,
+            "capacity": self.capacity_units(),
+            "unit": self.unit,
+        })
+        .to_string()
+    }
+
+    fn payment_json(&self) -> String {
+        serde_json::json!({
+            "channel_id": self.channel_id,
+            "balance": self.cumulative_balance_units,
+        })
+        .to_string()
+    }
+
+    async fn link(
+        &mut self,
+        h2_send: &mut h2::SendStream<Bytes>,
+        h2_recv: &mut h2::RecvStream,
+    ) -> (u64, u64, u64, i64, bool) {
+        send_control_message(
+            h2_send,
+            &ClientMessage::ChannelLink {
+                payment_json: self.link_json(),
+            },
+            false,
+        )
+        .await;
+
+        match read_control_message(h2_recv).await {
+            ServerMessage::ChannelLinkAccepted {
+                channel_id,
+                capacity,
+            } => {
+                assert_eq!(channel_id, self.channel_id);
+                assert_eq!(capacity, self.expected_capacity_millisats());
+            }
+            other => panic!("expected ChannelLinkAccepted, got {other:?}"),
+        }
+
+        match read_control_message(h2_recv).await {
+            ServerMessage::SessionStatus {
+                linked_channel_id,
+                session_total_in,
+                session_total_out,
+                total_paid_millisats,
+                remaining_milli_sats,
+                paused,
+                ..
+            } => {
+                assert_eq!(linked_channel_id.as_deref(), Some(self.channel_id.as_str()));
+                (
+                    session_total_in,
+                    session_total_out,
+                    total_paid_millisats,
+                    remaining_milli_sats,
+                    paused,
+                )
+            }
+            other => panic!("expected SessionStatus after link, got {other:?}"),
+        }
+    }
+
+    async fn pay(
+        &mut self,
+        h2_send: &mut h2::SendStream<Bytes>,
+        h2_recv: &mut h2::RecvStream,
+        delta_millisats: u64,
+    ) -> (u64, u64, u64, i64, bool) {
+        let delta_units = match self.unit {
+            "sat" => {
+                assert_eq!(
+                    delta_millisats % 1000,
+                    0,
+                    "sat test deltas must be multiples of 1000 millisats"
+                );
+                delta_millisats / 1000
+            }
+            _ => delta_millisats,
+        };
+        self.cumulative_balance_units = self.cumulative_balance_units.saturating_add(delta_units);
+
+        send_control_message(
+            h2_send,
+            &ClientMessage::ChannelPayment {
+                payment_json: self.payment_json(),
+            },
+            false,
+        )
+        .await;
+
+        expect_session_status(read_control_message(h2_recv).await)
+    }
 }
 
 /// Open a CONNECT tunnel, send payload, read response.
@@ -533,41 +644,12 @@ async fn test_channel_link_does_not_unpause_session() {
     assert!(paused0);
     assert_eq!(rem0, 0);
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: test_channel_link_json("chan-msat", 250, "msat"),
-        },
-        false,
-    )
-    .await;
-
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::ChannelLinkAccepted {
-            channel_id,
-            capacity,
-        } => {
-            assert_eq!(channel_id, "chan-msat");
-            assert_eq!(capacity, 250);
-        }
-        other => panic!("expected ChannelLinkAccepted, got {other:?}"),
-    }
-
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::SessionStatus {
-            linked_channel_id,
-            total_paid_millisats,
-            remaining_milli_sats,
-            paused,
-            ..
-        } => {
-            assert_eq!(linked_channel_id.as_deref(), Some("chan-msat"));
-            assert_eq!(total_paid_millisats, 0);
-            assert_eq!(remaining_milli_sats, 0);
-            assert!(paused);
-        }
-        other => panic!("expected SessionStatus after link, got {other:?}"),
-    }
+    let mut channel = SessionPaymentChannel::for_explicit_id("chan-msat");
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -586,41 +668,17 @@ async fn test_channel_payment_msat_unpauses_with_raw_delta() {
         control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: test_channel_link_json("chan-msat", 250, "msat"),
-        },
-        false,
-    )
-    .await;
-    let _ = read_control_message(&mut control_recv).await;
-    let _ = read_control_message(&mut control_recv).await;
-
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelPayment {
-            payment_json: test_channel_payment_json("chan-msat", 50),
-        },
-        false,
-    )
-    .await;
-
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::SessionStatus {
-            total_paid_millisats,
-            remaining_milli_sats,
-            paused,
-            linked_channel_id,
-            ..
-        } => {
-            assert_eq!(linked_channel_id.as_deref(), Some("chan-msat"));
-            assert_eq!(total_paid_millisats, 50);
-            assert_eq!(remaining_milli_sats, 50);
-            assert!(!paused);
-        }
-        other => panic!("expected SessionStatus after channel payment, got {other:?}"),
-    }
+    let mut channel = SessionPaymentChannel::for_explicit_id("chan-msat");
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel.pay(&mut control_send, &mut control_recv, 50).await;
+    assert_eq!(paid1, 50);
+    assert_eq!(rem1, 50);
+    assert!(!paused1);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -639,44 +697,18 @@ async fn test_channel_payment_sat_unpauses_with_millisat_conversion() {
         control_handshake(&mut control_send, &mut control_recv).await;
     assert!(paused0);
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: test_channel_link_json("chan-sat", 25, "sat"),
-        },
-        false,
-    )
-    .await;
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::ChannelLinkAccepted { capacity, .. } => {
-            assert_eq!(capacity, 25_000);
-        }
-        other => panic!("expected ChannelLinkAccepted, got {other:?}"),
-    }
-    let _ = read_control_message(&mut control_recv).await;
-
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelPayment {
-            payment_json: test_channel_payment_json("chan-sat", 5),
-        },
-        false,
-    )
-    .await;
-
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::SessionStatus {
-            total_paid_millisats,
-            remaining_milli_sats,
-            paused,
-            ..
-        } => {
-            assert_eq!(total_paid_millisats, 5_000);
-            assert_eq!(remaining_milli_sats, 5_000);
-            assert!(!paused);
-        }
-        other => panic!("expected SessionStatus after sat channel payment, got {other:?}"),
-    }
+    let mut channel = SessionPaymentChannel::for_explicit_id("chan-sat").with_unit("sat");
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
+    let (_in1, _out1, paid1, rem1, paused1) = channel
+        .pay(&mut control_send, &mut control_recv, 5_000)
+        .await;
+    assert_eq!(paid1, 5_000);
+    assert_eq!(rem1, 5_000);
+    assert!(!paused1);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -696,33 +728,10 @@ async fn test_channel_eviction_clears_linked_channel_id() {
     let _ = control_handshake(&mut send_a, &mut recv_a).await;
     let _ = control_handshake(&mut send_b, &mut recv_b).await;
 
-    send_control_message(
-        &mut send_a,
-        &ClientMessage::ChannelLink {
-            payment_json: test_channel_link_json("shared", 100, "msat"),
-        },
-        false,
-    )
-    .await;
-    let _ = read_control_message(&mut recv_a).await;
-    let _ = read_control_message(&mut recv_a).await;
-
-    send_control_message(
-        &mut send_b,
-        &ClientMessage::ChannelLink {
-            payment_json: test_channel_link_json("shared", 100, "msat"),
-        },
-        false,
-    )
-    .await;
-
-    match read_control_message(&mut recv_b).await {
-        ServerMessage::ChannelLinkAccepted { channel_id, .. } => {
-            assert_eq!(channel_id, "shared");
-        }
-        other => panic!("expected ChannelLinkAccepted for session B, got {other:?}"),
-    }
-    let _ = read_control_message(&mut recv_b).await;
+    let mut channel_a = SessionPaymentChannel::for_explicit_id("shared");
+    let mut channel_b = SessionPaymentChannel::for_explicit_id("shared");
+    let _ = channel_a.link(&mut send_a, &mut recv_a).await;
+    let _ = channel_b.link(&mut send_b, &mut recv_b).await;
 
     let evicted = timeout(
         Duration::from_millis(500),
@@ -762,6 +771,103 @@ async fn test_channel_eviction_clears_linked_channel_id() {
 }
 
 #[tokio::test]
+async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_old_channel_payment()
+{
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
+    assert!(paused0);
+    assert_eq!(rem0, 0);
+
+    let mut channel_a = SessionPaymentChannel::for_explicit_id("chan-a");
+    let mut channel_b = SessionPaymentChannel::for_explicit_id("chan-b");
+
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel_a.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel_a.pay(&mut control_send, &mut control_recv, 7).await;
+    assert_eq!(paid1, 7);
+    assert_eq!(rem1, 7);
+    assert!(!paused1);
+
+    let (_in2, _out2, paid2, rem2, paused2) =
+        channel_b.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(paid2, 7);
+    assert_eq!(rem2, 7);
+    assert!(!paused2);
+    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::SessionStatus {
+            linked_channel_id,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            ..
+        } => {
+            assert_eq!(linked_channel_id.as_deref(), Some("chan-b"));
+            assert_eq!(total_paid_millisats, 7);
+            assert_eq!(remaining_milli_sats, 7);
+            assert!(!paused);
+        }
+        other => panic!("expected SessionStatus after relink, got {other:?}"),
+    }
+
+    let (_in2, _out2, paid2, rem2, paused2) =
+        channel_b.pay(&mut control_send, &mut control_recv, 5).await;
+    assert_eq!(paid2, 12);
+    assert_eq!(rem2, 12);
+    assert!(!paused2);
+
+    channel_a.cumulative_balance_units = channel_a.cumulative_balance_units.saturating_add(1);
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment {
+            payment_json: channel_a.payment_json(),
+        },
+        false,
+    )
+    .await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { message } => {
+            assert!(
+                message.contains("wrong channel"),
+                "unexpected error: {message}"
+            );
+        }
+        other => panic!("expected Error for old channel payment, got {other:?}"),
+    }
+
+    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::SessionStatus {
+            linked_channel_id,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            ..
+        } => {
+            assert_eq!(linked_channel_id.as_deref(), Some("chan-b"));
+            assert_eq!(total_paid_millisats, 12);
+            assert_eq!(remaining_milli_sats, 12);
+            assert!(!paused);
+        }
+        other => panic!("expected SessionStatus after rejected old channel payment, got {other:?}"),
+    }
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_session_repauses_and_resumes_after_second_payment() {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
@@ -776,14 +882,14 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
     assert!(paused0);
     assert_eq!(rem0, 0);
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::FakePayment { milli_sats: 5 },
-        false,
-    )
-    .await;
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
     let (_in1, _out1, _paid1, rem1, paused1) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        channel.pay(&mut control_send, &mut control_recv, 5).await;
     assert!(!paused1);
     assert_eq!(rem1, 5);
 
@@ -818,14 +924,8 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
         "CONNECT should stall while session is paused"
     );
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::FakePayment { milli_sats: 10 },
-        false,
-    )
-    .await;
     let (_in3, _out3, _paid3, rem3, paused3) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        channel.pay(&mut control_send, &mut control_recv, 10).await;
     assert!(!paused3, "session should unpause after second payment");
     assert_eq!(rem3, 10);
 
@@ -877,14 +977,14 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     assert!(paused0);
     assert_eq!(rem0, 0);
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::FakePayment { milli_sats: 5 },
-        false,
-    )
-    .await;
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
     let (_in1, _out1, _paid1, rem1, paused1) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        channel.pay(&mut control_send, &mut control_recv, 5).await;
     assert!(!paused1);
     assert_eq!(rem1, 5);
 
@@ -911,14 +1011,8 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     assert_eq!(out2, 10);
     assert_eq!(rem2, -5);
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::FakePayment { milli_sats: 10 },
-        false,
-    )
-    .await;
     let (_in3, _out3, _paid3, rem3, paused3) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        channel.pay(&mut control_send, &mut control_recv, 10).await;
     assert!(
         !paused3,
         "session should unpause after positive top-up, got paused={paused3} remaining={rem3}"
@@ -980,14 +1074,14 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     assert!(paused0);
     assert_eq!(rem0, 0);
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::FakePayment { milli_sats: 5 },
-        false,
-    )
-    .await;
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
     let (_in1, _out1, _paid1, rem1, paused1) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        channel.pay(&mut control_send, &mut control_recv, 5).await;
     assert!(!paused1);
     assert_eq!(rem1, 5);
 
@@ -1014,14 +1108,8 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     assert_eq!(out2, 10);
     assert_eq!(rem2, -5);
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::FakePayment { milli_sats: 4 },
-        false,
-    )
-    .await;
     let (_in3, _out3, _paid3, rem3, paused3) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        channel.pay(&mut control_send, &mut control_recv, 4).await;
     assert!(
         paused3,
         "session should stay paused while balance is non-positive"
@@ -1043,14 +1131,8 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     drop(paused_response);
     drop(h2_for_paused_connect);
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::FakePayment { milli_sats: 6 },
-        false,
-    )
-    .await;
     let (_in4, _out4, _paid4, rem4, paused4) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        channel.pay(&mut control_send, &mut control_recv, 6).await;
     assert!(
         !paused4,
         "session should unpause once balance becomes positive, got paused={paused4} remaining={rem4}"
