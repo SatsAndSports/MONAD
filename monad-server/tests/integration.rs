@@ -27,6 +27,7 @@ use monad_server::listener::{discover_spilman_mint_cache, run_with_payments, Ser
 use monad_server::payments::testing::InMemoryRelayPayments;
 use monad_server::quic_pool::QuicPool;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,6 +36,7 @@ use tokio::time::{timeout, Duration};
 
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
 const TEST_CHANNEL_CAPACITY_UNITS: u64 = u64::MAX / 4096;
+const MAX_SHARED_BIND_RETRIES: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -123,6 +125,40 @@ async fn run_gated_reply_server(
     let _ = stream.write_all(response).await;
 }
 
+async fn bind_tcp_and_quic_on_same_port(
+    bind_addr: SocketAddr,
+    quic_server_config: quinn::ServerConfig,
+) -> io::Result<(TcpListener, quinn::Endpoint, SocketAddr)> {
+    let mut last_addr_in_use: Option<io::Error> = None;
+
+    for _ in 0..MAX_SHARED_BIND_RETRIES {
+        let listener = match TcpListener::bind(bind_addr).await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                last_addr_in_use = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
+        let addr = listener.local_addr()?;
+        match quinn::Endpoint::server(quic_server_config.clone(), addr) {
+            Ok(quic_endpoint) => return Ok((listener, quic_endpoint, addr)),
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                last_addr_in_use = Some(err);
+                drop(listener);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_addr_in_use.unwrap_or_else(|| {
+        io::Error::other(format!(
+            "failed to bind shared TCP/QUIC test server after {MAX_SHARED_BIND_RETRIES} retries"
+        ))
+    }))
+}
+
 /// Spin up a MONAD server and return (server_addr, secp256k1 pubkey).
 async fn start_monad_server() -> (std::net::SocketAddr, Secp256k1Pubkey) {
     use cashu::nuts::SecretKey;
@@ -137,13 +173,15 @@ async fn start_monad_server_with_spilman(
     let identity = QuicCertIdentity::generate().unwrap();
     let transport_key = SecpTransportKeypair::generate();
     let pubkey = transport_key.pubkey();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
     let quic_server_config =
         monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
-    let quic_endpoint = quinn::Endpoint::server(quic_server_config, addr).unwrap();
+    let (listener, quic_endpoint, addr) = bind_tcp_and_quic_on_same_port(
+        "127.0.0.1:0".parse().unwrap(),
+        quic_server_config,
+    )
+    .await
+    .unwrap();
 
     let config = Arc::new(ServerConfig {
         identity,
@@ -175,19 +213,16 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Sec
     let identity = QuicCertIdentity::generate().unwrap();
     let transport_key = SecpTransportKeypair::generate();
     let pubkey = transport_key.pubkey();
-
-    let listener = match TcpListener::bind(bind_addr).await {
-        Ok(listener) => listener,
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let (listener, quic_endpoint, addr) = match bind_tcp_and_quic_on_same_port(bind_addr, quic_server_config).await {
+        Ok(bound) => bound,
         Err(e) => {
             eprintln!("skipping IPv6 test: failed to bind {bind_addr}: {e}");
             return None;
         }
     };
-    let addr = listener.local_addr().unwrap();
-    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
-    let quic_server_config =
-        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
-    let quic_endpoint = quinn::Endpoint::server(quic_server_config, addr).unwrap();
 
     let config = Arc::new(ServerConfig {
         identity,
