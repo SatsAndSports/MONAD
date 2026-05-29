@@ -176,12 +176,10 @@ async fn start_monad_server_with_spilman(
     let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
     let quic_server_config =
         monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
-    let (listener, quic_endpoint, addr) = bind_tcp_and_quic_on_same_port(
-        "127.0.0.1:0".parse().unwrap(),
-        quic_server_config,
-    )
-    .await
-    .unwrap();
+    let (listener, quic_endpoint, addr) =
+        bind_tcp_and_quic_on_same_port("127.0.0.1:0".parse().unwrap(), quic_server_config)
+            .await
+            .unwrap();
 
     let config = Arc::new(ServerConfig {
         identity,
@@ -216,13 +214,14 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Sec
     let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
     let quic_server_config =
         monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
-    let (listener, quic_endpoint, addr) = match bind_tcp_and_quic_on_same_port(bind_addr, quic_server_config).await {
-        Ok(bound) => bound,
-        Err(e) => {
-            eprintln!("skipping IPv6 test: failed to bind {bind_addr}: {e}");
-            return None;
-        }
-    };
+    let (listener, quic_endpoint, addr) =
+        match bind_tcp_and_quic_on_same_port(bind_addr, quic_server_config).await {
+            Ok(bound) => bound,
+            Err(e) => {
+                eprintln!("skipping IPv6 test: failed to bind {bind_addr}: {e}");
+                return None;
+            }
+        };
 
     let config = Arc::new(ServerConfig {
         identity,
@@ -694,6 +693,126 @@ async fn test_channel_link_does_not_unpause_session() {
 }
 
 #[tokio::test]
+async fn test_non_zero_channel_link_is_rejected_and_does_not_link_session() {
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
+    assert!(paused0);
+    assert_eq!(rem0, 0);
+
+    let payment_json = serde_json::json!({
+        "channel_id": "bad-link",
+        "balance": 1,
+        "capacity": TEST_CHANNEL_CAPACITY_UNITS,
+        "unit": "msat",
+    })
+    .to_string();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink { payment_json },
+        false,
+    )
+    .await;
+
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { message } => {
+            assert!(
+                message.contains("link balance must be zero"),
+                "unexpected error: {message}"
+            );
+        }
+        other => panic!("expected Error for non-zero ChannelLink, got {other:?}"),
+    }
+
+    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::SessionStatus {
+            linked_channel_id,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            ..
+        } => {
+            assert_eq!(linked_channel_id, None);
+            assert_eq!(total_paid_millisats, 0);
+            assert_eq!(remaining_milli_sats, 0);
+            assert!(paused);
+        }
+        other => panic!("expected SessionStatus after rejected link, got {other:?}"),
+    }
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_unsupported_unit_channel_link_is_rejected_and_does_not_link_session() {
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
+    assert!(paused0);
+    assert_eq!(rem0, 0);
+
+    let payment_json = serde_json::json!({
+        "channel_id": "bad-unit",
+        "balance": 0,
+        "capacity": TEST_CHANNEL_CAPACITY_UNITS,
+        "unit": "usd",
+    })
+    .to_string();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink { payment_json },
+        false,
+    )
+    .await;
+
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { message } => {
+            assert!(
+                message.contains("unsupported unit"),
+                "unexpected error: {message}"
+            );
+        }
+        other => panic!("expected Error for unsupported-unit ChannelLink, got {other:?}"),
+    }
+
+    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::SessionStatus {
+            linked_channel_id,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            ..
+        } => {
+            assert_eq!(linked_channel_id, None);
+            assert_eq!(total_paid_millisats, 0);
+            assert_eq!(remaining_milli_sats, 0);
+            assert!(paused);
+        }
+        other => {
+            panic!("expected SessionStatus after rejected unsupported-unit link, got {other:?}")
+        }
+    }
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_channel_payment_msat_unpauses_with_raw_delta() {
     let (server_addr, pubkey) = start_monad_server().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
@@ -714,6 +833,79 @@ async fn test_channel_payment_msat_unpauses_with_raw_delta() {
     assert_eq!(paid1, 50);
     assert_eq!(rem1, 50);
     assert!(!paused1);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_channel_payment_with_funding_payload_is_rejected_and_state_is_unchanged() {
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+
+    let (_in0, _out0, _paid0, _rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
+    assert!(paused0);
+
+    let mut channel = SessionPaymentChannel::for_explicit_id("chan-funded-payload");
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
+    let (_in2, _out2, paid2, rem2, paused2) =
+        channel.pay(&mut control_send, &mut control_recv, 50).await;
+    assert_eq!(paid2, 50);
+    assert_eq!(rem2, 50);
+    assert!(!paused2);
+
+    let bad_payment_json = serde_json::json!({
+        "channel_id": channel.channel_id,
+        "balance": channel.cumulative_balance_units + 1,
+        "params": { "fake": true },
+    })
+    .to_string();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment {
+            payment_json: bad_payment_json,
+        },
+        false,
+    )
+    .await;
+
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { message } => {
+            assert!(
+                message.contains("must not include funding"),
+                "unexpected error: {message}"
+            );
+        }
+        other => panic!("expected Error for funding-bearing ChannelPayment, got {other:?}"),
+    }
+
+    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::SessionStatus {
+            linked_channel_id,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            ..
+        } => {
+            assert_eq!(linked_channel_id.as_deref(), Some("chan-funded-payload"));
+            assert_eq!(total_paid_millisats, 50);
+            assert_eq!(remaining_milli_sats, 50);
+            assert!(!paused);
+        }
+        other => {
+            panic!("expected SessionStatus after rejected funding-bearing payment, got {other:?}")
+        }
+    }
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);

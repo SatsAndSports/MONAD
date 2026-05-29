@@ -593,6 +593,7 @@ pub mod testing {
         balance: u64,
         capacity: Option<u64>,
         unit: Option<String>,
+        has_funding: bool,
         closed: bool,
         invalid: bool,
         wrong_receiver: bool,
@@ -620,6 +621,7 @@ pub mod testing {
                 .get("unit")
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
+            let has_funding = obj.contains_key("params") || obj.contains_key("funding_proofs");
             let closed = obj.get("closed").and_then(Value::as_bool).unwrap_or(false);
             let invalid = obj.get("invalid").and_then(Value::as_bool).unwrap_or(false);
             let wrong_receiver = obj
@@ -632,6 +634,7 @@ pub mod testing {
                 balance,
                 capacity,
                 unit,
+                has_funding,
                 closed,
                 invalid,
                 wrong_receiver,
@@ -728,6 +731,11 @@ pub mod testing {
             if parsed.channel_id != expected_channel_id {
                 return Err(ChannelPaymentError::WrongChannel);
             }
+            if parsed.has_funding {
+                return Err(ChannelPaymentError::InvalidPayment(
+                    "channel payment must not include funding".to_string(),
+                ));
+            }
 
             let mut inner = self
                 .inner
@@ -797,6 +805,15 @@ pub mod testing {
                 serde_json::from_str(&payment_json(channel_id, balance, capacity, unit)).unwrap();
             value_json[flag] = serde_json::json!(value);
             serde_json::to_string(&value_json).unwrap()
+        }
+
+        fn payment_json_with_params(channel_id: &str, balance: u64) -> String {
+            serde_json::json!({
+                "channel_id": channel_id,
+                "balance": balance,
+                "params": { "fake": true },
+            })
+            .to_string()
         }
 
         fn session(byte: u8) -> [u8; 32] {
@@ -940,6 +957,24 @@ pub mod testing {
                 .apply_channel_payment("chan", &payment_json("chan", 5, None, None))
                 .unwrap_err();
             assert_eq!(err, ChannelPaymentError::NoNewFunds);
+        }
+
+        #[test]
+        fn funding_bearing_channel_payment_is_rejected() {
+            let payments = InMemoryRelayPayments::new();
+            payments
+                .link_channel(session(1), &payment_json("chan", 0, Some(10), Some("msat")))
+                .unwrap();
+
+            let err = payments
+                .apply_channel_payment("chan", &payment_json_with_params("chan", 1))
+                .unwrap_err();
+            assert_eq!(
+                err,
+                ChannelPaymentError::InvalidPayment(
+                    "channel payment must not include funding".to_string()
+                )
+            );
         }
 
         #[test]
