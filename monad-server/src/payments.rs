@@ -25,6 +25,8 @@ pub trait RelayPayments: Send + Sync + 'static {
     ) -> Result<PaymentOutcome, ChannelPaymentError>;
 
     fn linked_channel_status(&self, channel_id: &str) -> Option<LinkedChannelStatus>;
+
+    fn release_channel_ownership(&self, session_id: [u8; 32], channel_id: &str);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +295,16 @@ impl RelayPayments for SpilmanRelayPayments {
             capacity_raw: channel.capacity_raw,
             unit: channel.unit.as_str().to_string(),
         })
+    }
+
+    fn release_channel_ownership(&self, session_id: [u8; 32], channel_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(channel) = state.channels.get_mut(channel_id) {
+                if channel.owner == Some(session_id) {
+                    channel.owner = None;
+                }
+            }
+        }
     }
 }
 
@@ -801,6 +813,16 @@ pub mod testing {
                 capacity_raw: record.capacity_raw,
                 unit: record.unit.as_str().to_string(),
             })
+        }
+
+        fn release_channel_ownership(&self, session_id: [u8; 32], channel_id: &str) {
+            if let Ok(mut inner) = self.inner.lock() {
+                if let Some(record) = inner.channels.get_mut(channel_id) {
+                    if record.owner == Some(session_id) {
+                        record.owner = None;
+                    }
+                }
+            }
         }
     }
 

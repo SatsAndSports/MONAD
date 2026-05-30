@@ -5,9 +5,12 @@
 //! `POST /control` stream is used to fund and observe the whole session.
 
 use crate::listener::SpilmanMintCache;
-use crate::payments::{LinkError, LinkOutcome, PaymentOutcome, RelayPayments};
+use crate::payments::RelayPayments;
 use crate::proxy;
 use crate::quic_pool::QuicPool;
+use crate::session_fsm::{
+    apply_accounted_bytes, step, ByteDirection, ServerSessionState, SessionEffect, SessionEvent,
+};
 use crate::session_registry::SessionRegistry;
 use bytes::Bytes;
 use cashu::nuts::SecretKey;
@@ -19,6 +22,7 @@ use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::{clamp_i128_to_i64, SessionPricing};
 use monad_quic::client::ClientAuthMode;
 use monad_quic::stream::STREAM_KIND_SECP_NOISE;
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -44,6 +48,29 @@ struct SessionInner {
     control_attached: bool,
     control_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
     linked_channel_id: Option<String>,
+}
+
+impl SessionInner {
+    fn to_fsm_state(&self) -> ServerSessionState {
+        ServerSessionState {
+            pricing: self.pricing,
+            session_total_in: self.session_total_in,
+            session_total_out: self.session_total_out,
+            total_paid_millisats: self.total_paid_millisats,
+            paused: self.paused,
+            linked_channel_id: self.linked_channel_id.clone(),
+            terminated: false,
+        }
+    }
+
+    fn apply_fsm_state(&mut self, state: &ServerSessionState) {
+        self.pricing = state.pricing;
+        self.session_total_in = state.session_total_in;
+        self.session_total_out = state.session_total_out;
+        self.total_paid_millisats = state.total_paid_millisats;
+        self.paused = state.paused;
+        self.linked_channel_id = state.linked_channel_id.clone();
+    }
 }
 
 #[derive(Clone)]
@@ -132,14 +159,6 @@ impl SessionState {
         }
     }
 
-    fn refresh_pause_state(&self, inner: &mut SessionInner) {
-        let was_paused = inner.paused;
-        inner.paused = Self::remaining_milli_sats(inner) <= 0;
-        if inner.paused != was_paused {
-            let _ = self.pause_tx.send_replace(inner.paused);
-        }
-    }
-
     pub(crate) fn pause_receiver(&self) -> watch::Receiver<bool> {
         self.pause_tx.subscribe()
     }
@@ -167,55 +186,6 @@ impl SessionState {
         self.session_registry.deregister(&self.session_id);
     }
 
-    async fn apply_channel_link(&self, payment_json: &str) -> Result<LinkOutcome, LinkError> {
-        let outcome = self.payments.link_channel(self.session_id, payment_json)?;
-
-        {
-            let mut inner = self.inner.lock().await;
-            inner.linked_channel_id = Some(outcome.channel_id.clone());
-        }
-
-        if let Some(evicted_session) = outcome.evicted_session {
-            let _ = self.session_registry.notify(
-                &evicted_session,
-                ServerMessage::ChannelEvicted {
-                    channel_id: outcome.channel_id.clone(),
-                },
-            );
-        }
-
-        Ok(outcome)
-    }
-
-    async fn apply_channel_payment_msg(
-        &self,
-        payment_json: &str,
-    ) -> Result<PaymentOutcome, crate::payments::ChannelPaymentError> {
-        let linked_channel_id = {
-            let inner = self.inner.lock().await;
-            inner.linked_channel_id.clone()
-        }
-        .ok_or(crate::payments::ChannelPaymentError::WrongChannel)?;
-
-        let outcome = self
-            .payments
-            .apply_channel_payment(&linked_channel_id, payment_json)?;
-
-        let mut inner = self.inner.lock().await;
-        inner.total_paid_millisats = inner
-            .total_paid_millisats
-            .saturating_add(outcome.delta_millisats);
-        self.refresh_pause_state(&mut inner);
-        Ok(outcome)
-    }
-
-    async fn handle_channel_evicted(&self, channel_id: &str) {
-        let mut inner = self.inner.lock().await;
-        if inner.linked_channel_id.as_deref() == Some(channel_id) {
-            inner.linked_channel_id = None;
-        }
-    }
-
     pub(crate) async fn note_outbound_bytes(&self, bytes: usize) -> bool {
         self.note_bytes(bytes, true).await
     }
@@ -226,15 +196,18 @@ impl SessionState {
 
     async fn note_bytes(&self, bytes: usize, outbound: bool) -> bool {
         let mut inner = self.inner.lock().await;
-
-        if outbound {
-            inner.session_total_out = inner.session_total_out.saturating_add(bytes as u64);
+        let direction = if outbound {
+            ByteDirection::Outbound
         } else {
-            inner.session_total_in = inner.session_total_in.saturating_add(bytes as u64);
+            ByteDirection::Inbound
+        };
+        let (next_state, pause_changed) =
+            apply_accounted_bytes(inner.to_fsm_state(), direction, bytes);
+        inner.apply_fsm_state(&next_state);
+        if let Some(paused) = pause_changed {
+            let _ = self.pause_tx.send_replace(paused);
         }
-
-        self.refresh_pause_state(&mut inner);
-        inner.paused
+        next_state.paused
     }
 
     async fn push_message(&self, message: ServerMessage) {
@@ -643,18 +616,26 @@ async fn handle_control_stream(
     let initial_status = state.session_status_message(negotiated_version).await;
     send_control_message(&mut h2_send, &initial_status).await?;
 
+    let mut terminate_session = false;
+
     loop {
         tokio::select! {
             maybe_event = events.recv() => {
                 match maybe_event {
                     Some(message) => {
-                        if let ServerMessage::ChannelEvicted { channel_id } = &message {
-                            state.handle_channel_evicted(channel_id).await;
-                        }
-                        send_control_message(&mut h2_send, &message).await?;
-                        if matches!(message, ServerMessage::ChannelEvicted { .. }) {
-                            let status = state.session_status_message(negotiated_version).await;
-                            send_control_message(&mut h2_send, &status).await?;
+                        if let ServerMessage::ChannelEvicted { channel_id } = message {
+                            terminate_session = process_session_event(
+                                &state,
+                                SessionEvent::ChannelEvicted { channel_id },
+                                negotiated_version,
+                                &mut h2_send,
+                            )
+                            .await?;
+                            if terminate_session {
+                                break;
+                            }
+                        } else {
+                            send_control_message(&mut h2_send, &message).await?;
                         }
                     }
                     None => break,
@@ -684,49 +665,31 @@ async fn handle_control_stream(
                                     send_control_message(&mut h2_send, &err_msg).await?;
                                 }
                                 Ok(ClientMessage::GetSessionStatus) => {
-                                    let status = state.session_status_message(negotiated_version).await;
-                                    send_control_message(&mut h2_send, &status).await?;
+                                    terminate_session = process_session_event(
+                                        &state,
+                                        SessionEvent::ClientGetSessionStatus,
+                                        negotiated_version,
+                                        &mut h2_send,
+                                    )
+                                    .await?;
                                 }
                                 Ok(ClientMessage::ChannelLink { payment_json }) => {
-                                    match state.apply_channel_link(&payment_json).await {
-                                        Ok(outcome) => {
-                                            send_control_message(
-                                                &mut h2_send,
-                                                &ServerMessage::ChannelLinkAccepted {
-                                                    channel_id: outcome.channel_id,
-                                                    capacity: outcome.capacity_millisats,
-                                                },
-                                            )
-                                            .await?;
-                                            state.push_status().await;
-                                        }
-                                        Err(e) => {
-                                            warn!("control: channel link rejected: {e}");
-                                            let err_msg = ServerMessage::Error {
-                                                message: e.to_string(),
-                                            };
-                                            send_control_message(&mut h2_send, &err_msg).await?;
-                                        }
-                                    }
+                                    terminate_session = process_session_event(
+                                        &state,
+                                        SessionEvent::ClientChannelLink { payment_json },
+                                        negotiated_version,
+                                        &mut h2_send,
+                                    )
+                                    .await?;
                                 }
                                 Ok(ClientMessage::ChannelPayment { payment_json }) => {
-                                    match state.apply_channel_payment_msg(&payment_json).await {
-                                        Ok(outcome) => {
-                                            debug!(
-                                                channel_id = %outcome.channel_id,
-                                                delta_millisats = outcome.delta_millisats,
-                                                "channel payment accepted"
-                                            );
-                                            state.push_status().await;
-                                        }
-                                        Err(e) => {
-                                            warn!("control: channel payment rejected: {e}");
-                                            let err_msg = ServerMessage::Error {
-                                                message: e.to_string(),
-                                            };
-                                            send_control_message(&mut h2_send, &err_msg).await?;
-                                        }
-                                    }
+                                    terminate_session = process_session_event(
+                                        &state,
+                                        SessionEvent::ClientChannelPayment { payment_json },
+                                        negotiated_version,
+                                        &mut h2_send,
+                                    )
+                                    .await?;
                                 }
                                 Err(e) => {
                                     warn!("control: invalid message: {e}");
@@ -735,6 +698,10 @@ async fn handle_control_stream(
                                     };
                                     send_control_message(&mut h2_send, &err_msg).await?;
                                 }
+                            }
+
+                            if terminate_session {
+                                break;
                             }
                         }
                     }
@@ -749,10 +716,90 @@ async fn handle_control_stream(
                 }
             }
         }
+
+        if terminate_session {
+            break;
+        }
     }
+
+    let _ = process_session_event(
+        &state,
+        SessionEvent::ControlDetached,
+        negotiated_version,
+        &mut h2_send,
+    )
+    .await?;
 
     state.detach_control().await;
     let _ = h2_send.send_data(Bytes::new(), true);
     info!("control channel closed");
     Ok(())
+}
+
+async fn process_session_event(
+    state: &SessionState,
+    initial_event: SessionEvent,
+    negotiated_version: u8,
+    h2_send: &mut h2::SendStream<Bytes>,
+) -> io::Result<bool> {
+    let mut pending = VecDeque::from([initial_event]);
+    let mut terminate = false;
+
+    while let Some(event) = pending.pop_front() {
+        let effects = {
+            let mut inner = state.inner.lock().await;
+            let (next_state, effects) = step(inner.to_fsm_state(), event);
+            inner.apply_fsm_state(&next_state);
+            effects
+        };
+
+        for effect in effects {
+            match effect {
+                SessionEffect::SendControl(message) => {
+                    send_control_message(h2_send, &message).await?;
+                }
+                SessionEffect::SendStatus => {
+                    let status = state.session_status_message(negotiated_version).await;
+                    send_control_message(h2_send, &status).await?;
+                }
+                SessionEffect::RunLinkValidation { payment_json } => {
+                    pending.push_back(SessionEvent::LinkValidationFinished(
+                        state.payments.link_channel(state.session_id, &payment_json),
+                    ));
+                }
+                SessionEffect::RunPaymentValidation {
+                    expected_channel_id,
+                    payment_json,
+                } => {
+                    pending.push_back(SessionEvent::PaymentValidationFinished(
+                        state
+                            .payments
+                            .apply_channel_payment(&expected_channel_id, &payment_json),
+                    ));
+                }
+                SessionEffect::NotifySessionEvicted {
+                    target_session_id,
+                    channel_id,
+                } => {
+                    let _ = state.session_registry.notify(
+                        &target_session_id,
+                        ServerMessage::ChannelEvicted { channel_id },
+                    );
+                }
+                SessionEffect::ReleaseLinkedChannelOwnership { channel_id } => {
+                    state
+                        .payments
+                        .release_channel_ownership(state.session_id, &channel_id);
+                }
+                SessionEffect::UpdatePauseWatch(paused) => {
+                    let _ = state.pause_tx.send_replace(paused);
+                }
+                SessionEffect::EndSession => {
+                    terminate = true;
+                }
+            }
+        }
+    }
+
+    Ok(terminate)
 }
