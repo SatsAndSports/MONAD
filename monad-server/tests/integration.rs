@@ -392,6 +392,30 @@ async fn connect_client_tcp(
     .unwrap()
 }
 
+async fn connect_nested_session(
+    parent_conn: &RelayConnection,
+    next_hop_addr: &str,
+    next_hop_pubkey: &Secp256k1Pubkey,
+) -> RelayConnection {
+    let mut stream = parent_conn.open_tunnel(next_hop_addr).await.unwrap();
+    let (send_cipher, recv_cipher, session_id) =
+        noise_secp256k1::handshake_initiator(&mut stream, next_hop_pubkey)
+            .await
+            .unwrap();
+    let noise_stream = noise_secp256k1::SecpNoiseStream::new(
+        stream,
+        send_cipher,
+        recv_cipher,
+        session_id,
+        format!("nested session to {next_hop_addr}"),
+    );
+    let (mut conn, driver) = RelayConnection::from_transport_stream(noise_stream, session_id)
+        .await
+        .unwrap();
+    conn.add_driver(driver);
+    conn
+}
+
 async fn connect_client_quic_secp_funded(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
@@ -1487,6 +1511,136 @@ async fn test_control_detach_ends_active_and_future_streams() {
     drop(h2_recv);
     drop(h2);
     conn.shutdown().await;
+}
+
+async fn assert_nested_detach_releases_both_channels(
+    parent_conn: RelayConnection,
+    child_addr: std::net::SocketAddr,
+    child_pubkey: Secp256k1Pubkey,
+    parent_payments: Arc<InMemoryRelayPayments>,
+    child_payments: Arc<InMemoryRelayPayments>,
+) {
+    let parent_conn = parent_conn;
+
+    let (mut parent_send, mut parent_recv) = parent_conn.open_control().await.unwrap();
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut parent_send, &mut parent_recv).await;
+    assert!(paused0);
+    assert_eq!(rem0, 0);
+    let mut parent_channel = SessionPaymentChannel::for_session_id(parent_conn.session_id());
+    let _ = parent_channel
+        .link(&mut parent_send, &mut parent_recv)
+        .await;
+    let _ = parent_channel
+        .pay(&mut parent_send, &mut parent_recv, TEST_SESSION_PAYMENT)
+        .await;
+    assert_eq!(
+        parent_payments.owner_of(&parent_channel.channel_id),
+        Some(*parent_conn.session_id())
+    );
+
+    let child_conn =
+        connect_nested_session(&parent_conn, &child_addr.to_string(), &child_pubkey).await;
+
+    let (mut child_send, mut child_recv) = child_conn.open_control().await.unwrap();
+    let (_in1, _out1, _paid1, rem1, paused1) =
+        control_handshake(&mut child_send, &mut child_recv).await;
+    assert!(paused1);
+    assert_eq!(rem1, 0);
+    let mut child_channel = SessionPaymentChannel::for_session_id(child_conn.session_id());
+    let _ = child_channel.link(&mut child_send, &mut child_recv).await;
+    let _ = child_channel
+        .pay(&mut child_send, &mut child_recv, TEST_SESSION_PAYMENT)
+        .await;
+    assert_eq!(
+        child_payments.owner_of(&child_channel.channel_id),
+        Some(*child_conn.session_id())
+    );
+
+    let _ = parent_send.send_data(Bytes::new(), true);
+    drop(parent_send);
+    drop(parent_recv);
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if parent_payments
+                .owner_of(&parent_channel.channel_id)
+                .is_none()
+                && child_payments.owner_of(&child_channel.channel_id).is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("nested teardown should release both parent and child channels");
+
+    let child_control_ended = timeout(Duration::from_secs(2), child_recv.data()).await;
+    assert!(
+        child_control_ended.is_ok(),
+        "child control stream should end promptly when the parent session ends"
+    );
+
+    let mut child_h2 = child_conn.clone_send_request().await;
+    let followup = timeout(Duration::from_secs(2), async {
+        child_h2.send_request(
+            Request::builder()
+                .method(Method::CONNECT)
+                .uri("127.0.0.1:9")
+                .body(())
+                .unwrap(),
+            false,
+        )
+    })
+    .await;
+    assert!(
+        followup.is_ok(),
+        "child followup request should fail promptly"
+    );
+    if let Ok((response_future, _send)) = followup.unwrap() {
+        let response = timeout(Duration::from_secs(2), response_future).await;
+        assert!(response.is_err() || response.unwrap().is_err());
+    }
+
+    let _ = child_send.send_data(Bytes::new(), true);
+    drop(child_send);
+    child_conn.shutdown().await;
+    parent_conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_nested_quic_parent_control_detach_releases_child_channel() {
+    let (child_addr, child_pubkey, child_payments) = start_monad_server_with_test_payments().await;
+    let (parent_addr, parent_pubkey, parent_payments) =
+        start_monad_server_with_test_payments().await;
+
+    let parent_conn = connect_client_quic_secp(parent_addr, &parent_pubkey).await;
+    assert_nested_detach_releases_both_channels(
+        parent_conn,
+        child_addr,
+        child_pubkey,
+        parent_payments,
+        child_payments,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_nested_tcp_parent_control_detach_releases_child_channel() {
+    let (child_addr, child_pubkey, child_payments) = start_monad_server_with_test_payments().await;
+    let (parent_addr, parent_pubkey, parent_payments) =
+        start_monad_server_with_test_payments().await;
+
+    let parent_conn = connect_client_tcp(parent_addr, &parent_pubkey).await;
+    assert_nested_detach_releases_both_channels(
+        parent_conn,
+        child_addr,
+        child_pubkey,
+        parent_payments,
+        child_payments,
+    )
+    .await;
 }
 
 #[tokio::test]
