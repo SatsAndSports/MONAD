@@ -14,18 +14,20 @@ It provides:
 
 Implemented today:
 - `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup
-- `monad-client`: exposes a local SOCKS5 proxy, connects through one or more MONAD hops, opens H2 `CONNECT` tunnels, auto-funds sessions via the control stream
+- `monad-client`: provides the reusable selector / wallet / session-driver client library pieces for relay session funding and multi-hop connection setup
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by server and client
 - QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
-- session payment system: paused-by-default sessions, Hello/SessionStatus handshake, fake payments, totals-based billing with directional pricing, pause/resume enforcement
-- Spilman advertisement plumbing: server discovers trusted mints/keysets at startup and includes a `KeysetAdvertisement` list plus its receiver pubkey in `SessionStatus`. The `ChannelLink`/`ChannelPayment`/`ChannelEvicted` wire messages exist but are not yet handled — the server only credits sessions via `FakePayment` today.
+- session payment system: paused-by-default sessions, Hello/SessionStatus handshake, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
+- relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
+- mock wallet runtime path for tests and connector flows: `MockWallet` plus `session_driver` funds relay sessions without a real wallet backend
 - low-level blinded-hop building blocks: blinded blob encryption/decryption, even-Y tweak rejection sampling, reverse-tweak key recovery, compact binary payload encoding, and a mixed cleartext/blinded path data model in `monad-common`
 - integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
 
 Not implemented yet:
-- real Spilman byte-level payments — implementation of the new delta-based model is in progress
+- real `MonadWallet` backend over `cashu_spilman_channels`
+- usable `monad-client` CLI runtime on top of that real wallet backend
 - server-side Spilman channel state persistence across restarts
 - persistent route configuration file
 - blinded transport integration (`CONNECT /blinded_hop_v1`, tweak-prefixed QUIC forwarded sessions, and end-to-end client/server blinded routing)
@@ -34,7 +36,7 @@ Not implemented yet:
 
 ```text
 monad-common/     Shared transport and protocol helpers
-monad-client/     Local SOCKS5 proxy and multi-hop client
+monad-client/     Client library, wallet/driver logic, and binary entrypoint
 monad-server/     Tunnel server
 monad-quic/       Shared QUIC transport code plus standalone echo tooling
 ```
@@ -98,7 +100,7 @@ Current coverage includes:
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
 - TCP secp single-hop and nested plain-CONNECT secp tunnels
-- session funding and incremental payments via Spilman channels (in progress)
+- session funding and incremental payments via `ChannelLink` / `ChannelPayment`
 - server advertises multiple mint/unit pricing options
 
 ## Transport Identities
@@ -175,6 +177,10 @@ RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9053 --quic-ce
 
 ### 3. Start the client
 
+`monad-client` CLI is temporarily unavailable until the real wallet backend is
+implemented. The current runtime exits with an error rather than pretending the
+mock wallet is production-ready.
+
 Direct connection:
 
 ```bash
@@ -193,9 +199,8 @@ RUST_LOG=info cargo run -p monad-client -- \
   --socks 127.0.0.1:1080
 ```
 
-The client listens locally as a SOCKS5 proxy on `127.0.0.1:1080` by default.
-
-Sessions start paused with zero balance. The client automatically opens a control stream and sends a fake payment to fund the session before accepting SOCKS traffic. The default funding amount is 1024 millisats per payment; override with `--fake-payment-millisats`.
+The eventual client runtime will listen locally as a SOCKS5 proxy on
+`127.0.0.1:1080` by default.
 
 QUIC hops:
 

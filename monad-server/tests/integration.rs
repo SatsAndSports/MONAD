@@ -8,7 +8,8 @@
 //! Validates:
 //!   - Noise NK handshake and encrypted transport
 //!   - H2 multiplexing: control + data streams coexisting
-//!   - Control channel: Hello/SessionStatus version negotiation, fake payment
+//!   - Control channel: Hello/SessionStatus version negotiation, channel linking,
+//!     incremental channel payments, and linked-channel state synchronization
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
 use bytes::Bytes;

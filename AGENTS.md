@@ -24,17 +24,18 @@ cargo run -p monad-quic -- ...
   - shared transport, protocol, and session code
   - `SecpNoiseStream` (`noise_secp256k1.rs`) — secp256k1 Noise transport with buffered writes and wire-byte logging
   - `H2ConnectStream` (`h2stream.rs`)
-  - `ClientMessage` / `ServerMessage` wire protocol, `KeysetAdvertisement` type (`protocol.rs`)
+  - `ClientMessage` / `ServerMessage` wire protocol, `KeysetAdvertisement`, `LinkedChannelStatus` (`protocol.rs`)
   - `RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`, billing math (`session.rs`)
   - `proxy_bidirectional` shared proxy (`proxy.rs`)
   - `QuicCertIdentity`, Ed25519 key derivation for QUIC certificate plumbing (`quic_cert_identity.rs`)
   - `Secp256k1Pubkey` (32-byte x-only, implied even Y), `SecpTransportKeypair`, transport auth helpers (`secp_identity.rs`)
 - `monad-client`
   - reusable library code plus binary entrypoint
-  - SOCKS5 listener
   - multi-hop connector (`connector.rs`)
+  - session payment driver (`session_driver.rs`)
+  - wallet abstraction and mock wallet (`wallet.rs`)
   - tunnel proxying (`tunnel.rs`)
-  - client control task with auto-payment and Spilman channel management (`control.rs`)
+  - binary currently exits early until the real wallet backend exists
 - `monad-server`
   - reusable library code plus binary entrypoint
   - TCP+QUIC listener, `SpilmanMintCache`, `discover_spilman_mint_cache` (`listener.rs`)
@@ -64,14 +65,20 @@ cargo run -p monad-quic -- ...
 - Version negotiation: `min(client_version, SERVER_MAX_VERSION)`, reject if < `SERVER_MIN_VERSION`
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, integer-only via precomputed LCM
-- `FakePayment` credits the session; server unpauses when balance > 0 and sends `SessionStatus`
 - `CONNECT` rejected with 402 while paused
 - Balance can go negative (chunk-boundary overshoot); session repauses
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
 - `Error` for server-initiated rejections (e.g. version mismatch)
 - `ChannelLink { payment_json }` links a Spilman channel to the session; server validates and responds with `ChannelLinkAccepted { channel_id, capacity }` or `Error`. Only one session can own a channel at a time.
 - `ChannelPayment { payment_json }` increments the session balance based on the delta of the channel's max balance seen.
+- `SessionStatus.linked_channel` carries the relay-authoritative linked channel id, latest accepted raw balance, raw capacity, and unit.
 - Session ID is the Noise handshake hash (32 bytes, identical on both sides)
+
+### Current Client Runtime State
+
+- `monad-client` library now has a wallet abstraction plus per-session payment driver.
+- `connector.rs` uses `MockWallet` + `session_driver` so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` flow.
+- the `monad-client` binary intentionally exits early until the real wallet backend exists.
 
 ### QUIC Transport
 
@@ -201,6 +208,7 @@ The test suite currently covers:
 - Noise session ID (handshake hash) matches on both sides
 - Spilman channel implementation (delta-based) is currently being integrated and tested
 - server advertises multiple mint/unit pricing options
+- default integration-test relays advertise a synthetic test mint/keyset offer so connector-driven intermediate hops can provision mock channels without a real wallet backend
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
 

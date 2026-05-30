@@ -26,8 +26,8 @@ Important types:
   - wraps an H2 `SendStream + RecvStream` pair as a bidirectional async stream
   - allows another Noise+H2 session to run on top of an existing CONNECT tunnel
 - `ClientMessage` / `ServerMessage` (`protocol.rs`)
-  - wire protocol enums for the control stream (Hello, ChannelLink, ChannelPayment, FakePayment, GetSessionStatus, ChannelLinkAccepted, ChannelEvicted, SessionStatus, Error)
-  - `KeysetAdvertisement` struct for mint/unit/keyset pricing options
+  - wire protocol enums for the control stream (Hello, ChannelLink, ChannelPayment, GetSessionStatus, ChannelLinkAccepted, ChannelEvicted, SessionStatus, Error)
+  - `KeysetAdvertisement` plus `LinkedChannelStatus` for mint offers and relay-authoritative linked-channel sync
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established secp Noise+H2 session
   - manages H2 client, driver handles, task handles, session pricing, session ID
@@ -46,12 +46,13 @@ Important types:
 Responsibilities:
 - parse local SOCKS5 requests
 - build a single-hop or multi-hop MONAD chain
-- expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers)
+- expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers`) once the real wallet backend exists
 - open H2 `CONNECT` streams to final targets
-- run a control task per hop that synchronises local state from the server's
-  unified `SessionStatus` and auto-funds the session via `FakePayment`
-  (Spilman channel linking and incremental payments are planned but not yet
-  implemented)
+- run one payment/session driver per relay session
+- keep a shared wallet across relay sessions
+- select or provision channels, send `ChannelLink`, and send incremental
+  `ChannelPayment` messages using relay-authoritative linked-channel sync from
+  `SessionStatus`
 
 ### `monad-server`
 
@@ -68,7 +69,7 @@ Responsibilities:
   (per-(mint, unit) rate configuration is planned; today every advertisement
   carries the session's global default rates)
 - enforce per-session billing with pause/resume on the control stream
-  (`ChannelLink` / `ChannelPayment` validation is planned but not yet wired up)
+  using validated `ChannelLink` / `ChannelPayment` messages
 
 ### `monad-quic`
 
@@ -260,7 +261,6 @@ Client to server (`ClientMessage`):
 - `Hello { version }` — first message; declares the highest protocol version the client supports
 - `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0 and funding proofs
 - `ChannelPayment { payment_json }` — increment session balance; requires a Spilman `Payment` signature for a higher balance than previously seen for this channel
-- `FakePayment { milli_sats }` — add fake credit to the session (placeholder for testing)
 - `GetSessionStatus` — request a fresh session status snapshot
 
 Server to client (`ServerMessage`):
@@ -268,7 +268,7 @@ Server to client (`ServerMessage`):
   - `version`: Negotiated protocol version
   - `receiver_pubkey`: Server's secp256k1 key for Spilman
   - `advertisements`: List of supported `(Mint, Unit, Rates)` options
-  - `linked_channel_id`: ID of currently linked channel (if any)
+  - `linked_channel`: Relay-authoritative linked channel status (if any), including channel id, latest accepted raw balance, raw capacity, and unit
   - `active_in_rate`: Rate currently being applied to inbound traffic
   - `active_out_rate`: Rate currently being applied to outbound traffic
   - `session_total_in`: Total inbound bytes processed
@@ -318,7 +318,7 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 
 ### Client Auto-Funding
 
-The client opens a control stream immediately after connecting and sends `Hello`. When it receives a `SessionStatus` with `paused: true` and `remaining_milli_sats <= 0`, it automatically sends a `FakePayment` (or initiates Spilman linking). The client waits for the session to become unpaused before accepting SOCKS traffic. Intermediate hops in multi-hop chains each get their own control task with automatic funding.
+The client opens a control stream immediately after connecting and sends `Hello`. When it receives `SessionStatus`, the per-session payment driver either selects a matching local channel or provisions one from the relay's advertisements, sends `ChannelLink`, then sends `ChannelPayment` updates whenever the remaining session balance becomes non-positive. Intermediate hops in multi-hop chains use the same session-driver model.
 
 ### Session ID
 
@@ -330,17 +330,6 @@ Each Noise NK handshake produces a 32-byte **handshake hash** that is identical 
 - Unique: the client generates a fresh ephemeral key per connection
 - Not transmitted over the wire — derived locally from the shared transcript
 - Will be used for channel_id → session_id binding (enforcing one channel per session)
-
-### Spilman Channel Lifecycle
-
-> **Status (planned, not implemented):** the lifecycle below is the target
-> design. Today, the wire protocol carries `ChannelLink`, `ChannelPayment`,
-> `ChannelLinkAccepted` and `ChannelEvicted` messages, but the server logs
-> any client `ChannelLink` / `ChannelPayment` and otherwise ignores them,
-> and never emits `ChannelLinkAccepted` or `ChannelEvicted`. Only
-> `FakePayment` actually moves the session balance. The advertised rates
-> in `SessionStatus.advertisements` are also not yet per-(mint,unit) — every
-> advertisement copies the session's global rates.
 
 MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The design enforces channel exclusivity and uses delta-based accounting.
 
@@ -362,6 +351,24 @@ A session's ability to proxy data is determined by two orthogonal variables:
 When the session balance runs low, the client sends a `ChannelPayment` with a signed balance update.
 - **Credit Calculation**: The server tracks the `max_balance_seen` for every channel ID.
 - **Delta**: `credit_millisats = (new_balance - max_balance_seen) * unit_multiplier`.
+
+#### 5. Relay-Authoritative Linked-Channel Sync
+Every `SessionStatus` carries the relay's authoritative view of the currently linked channel.
+
+The client uses that to learn:
+
+- which channel is linked
+- the latest accepted cumulative raw balance
+- the raw capacity of that channel
+- the unit (`sat` or `msat`)
+
+The client driver then computes the next requested cumulative balance from:
+
+- current `remaining_milli_sats`
+- target positive remaining balance
+- relay-reported `linked_channel.balance_raw`
+
+and asks the wallet backend to build a payment for that exact next balance.
 - **Eviction Fairness**: If a session is evicted, it **remains Active** as long as it has a positive balance. The user can spend their existing credit, but cannot send further `ChannelPayment` updates until they link a new channel.
 
 #### 5. Session State Matrix

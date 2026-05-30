@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     anyhow::bail!(
-        "real MONAD wallet backend not implemented yet; monad-client CLI is temporarily unavailable after FakePayment removal"
+        "real MONAD wallet backend not implemented yet; monad-client CLI is temporarily unavailable"
     )
 }
 
