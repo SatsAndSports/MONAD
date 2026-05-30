@@ -13,15 +13,15 @@ It provides:
 ## Status
 
 Implemented today:
-- `monad-server`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup
+- `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup
 - `monad-client`: provides the reusable selector / wallet / session-driver client library pieces for relay session funding and multi-hop connection setup
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
-- `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by server and client
-- QUIC hop support: server dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
+- `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
+- QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
 - session payment system: paused-by-default sessions, Hello/SessionStatus handshake, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
 - relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
-- server-side session FSM for steady-state control handling and full teardown on control-stream detach
+- relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - client-side session FSM for serialized per-session link/payment/relink decisions
 - mock wallet runtime path for tests and connector flows: `MockWallet` plus `session_driver` funds relay sessions without a real wallet backend
 - low-level blinded-hop building blocks: blinded blob encryption/decryption, even-Y tweak rejection sampling, reverse-tweak key recovery, compact binary payload encoding, and a mixed cleartext/blinded path data model in `monad-common`
@@ -30,16 +30,16 @@ Implemented today:
 Not implemented yet:
 - real `MonadWallet` backend over `cashu_spilman_channels`
 - usable `monad-client` CLI runtime on top of that real wallet backend
-- server-side Spilman channel state persistence across restarts
+- relay-side Spilman channel state persistence across restarts
 - persistent route configuration file
-- blinded transport integration (`CONNECT /blinded_hop_v1`, tweak-prefixed QUIC forwarded sessions, and end-to-end client/server blinded routing)
+- blinded transport integration (`CONNECT /blinded_hop_v1`, tweak-prefixed QUIC forwarded sessions, and end-to-end client/relay blinded routing)
 
 ## Workspace
 
 ```text
 monad-common/     Shared transport and protocol helpers
 monad-client/     Client library, wallet/driver logic, and binary entrypoint
-monad-server/     Tunnel server
+monad-relay/      Relay binary and library
 monad-quic/       Shared QUIC transport code plus standalone echo tooling
 ```
 
@@ -103,7 +103,7 @@ Current coverage includes:
 - QUIC first hop then TCP second hop
 - TCP secp single-hop and nested plain-CONNECT secp tunnels
 - session funding and incremental payments via `ChannelLink` / `ChannelPayment`
-- server advertises multiple mint/unit pricing options
+- relay advertises multiple mint/unit pricing options
 - control detach releases linked channels and tears down active / future streams
 
 ## Transport Identities
@@ -114,7 +114,7 @@ MONAD transport now uses secp256k1 identities throughout:
 - **QUIC MONAD transport** uses secp attestation plus secp Noise with the same 32-byte x-only relay identities
 
 The `monad-client` binary emits and accepts only secp256k1 hop identities. The
-server still keeps an Ed25519 seed internally for QUIC certificate generation,
+relay still keeps an Ed25519 seed internally for QUIC certificate generation,
 but that is no longer a client-facing MONAD transport identity.
 
 Identity model:
@@ -123,10 +123,10 @@ Identity model:
 - ephemeral ECDH pubkeys remain 33-byte compressed curve points
 - Noise DH operates on full curve points internally even though the configured relay identities are x-only
 
-For QUIC, the server first presents a self-signed Ed25519 certificate so the
+For QUIC, the relay first presents a self-signed Ed25519 certificate so the
 standard TLS 1.3 handshake can establish an encrypted channel. MONAD then binds
 that live QUIC channel to the configured secp256k1 transport identity by having
-the server sign a challenge plus QUIC exporter-derived keying material. Clients
+the relay sign a challenge plus QUIC exporter-derived keying material. Clients
 verify that signature against the expected secp256k1 public key.
 
 Quick reference:
@@ -138,10 +138,10 @@ Quick reference:
 
 ## Quick Start
 
-### 1. Generate keys for each server
+### 1. Generate keys for each relay
 
 ```bash
-cargo run -p monad-server -- keygen
+cargo run -p monad-relay -- keygen
 ```
 
 This prints:
@@ -149,12 +149,12 @@ This prints:
 - a secp256k1 transport private key plus its 32-byte x-only public identity for MONAD TCP and QUIC transport auth
 - a QUIC certificate derived from the Ed25519 seed
 
-### 2. Start one or more servers
+### 2. Start one or more relays
 
 Single hop (TCP only):
 
 ```bash
-RUST_LOG=info cargo run -p monad-server -- run \
+RUST_LOG=info cargo run -p monad-relay -- run \
   --listen 127.0.0.1:9050 \
   --quic-cert-seed <SERVER_ED25519_SEED> \
   --transport-key <SERVER_SECP256K1_KEY>
@@ -163,7 +163,7 @@ RUST_LOG=info cargo run -p monad-server -- run \
 With QUIC enabled (add `--quic`):
 
 ```bash
-RUST_LOG=info cargo run -p monad-server -- run \
+RUST_LOG=info cargo run -p monad-relay -- run \
   --listen 127.0.0.1:9050 \
   --quic-cert-seed <SERVER_ED25519_SEED> \
   --transport-key <SERVER_SECP256K1_KEY> \
@@ -173,9 +173,9 @@ RUST_LOG=info cargo run -p monad-server -- run \
 Multi-hop example:
 
 ```bash
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9051 --quic-cert-seed <HOP1_ED25519> --transport-key <HOP1_SECP>
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9052 --quic-cert-seed <HOP2_ED25519> --transport-key <HOP2_SECP> --quic
-RUST_LOG=info cargo run -p monad-server -- run --listen 127.0.0.1:9053 --quic-cert-seed <HOP3_ED25519> --transport-key <HOP3_SECP> --quic
+RUST_LOG=info cargo run -p monad-relay -- run --listen 127.0.0.1:9051 --quic-cert-seed <HOP1_ED25519> --transport-key <HOP1_SECP>
+RUST_LOG=info cargo run -p monad-relay -- run --listen 127.0.0.1:9052 --quic-cert-seed <HOP2_ED25519> --transport-key <HOP2_SECP> --quic
+RUST_LOG=info cargo run -p monad-relay -- run --listen 127.0.0.1:9053 --quic-cert-seed <HOP3_ED25519> --transport-key <HOP3_SECP> --quic
 ```
 
 ### 3. Start the client
@@ -255,7 +255,7 @@ scp -o ProxyCommand='ncat --proxy 127.0.0.1:1080 --proxy-type socks5 %h %p' \
 
 ### Per-tunnel plaintext byte counts
 
-When a tunnel closes, the client and final server log plaintext proxied bytes:
+When a tunnel closes, the client and final relay log plaintext proxied bytes:
 
 ```text
 tunnel closed: example.com:22 | outbound=63630 inbound=5200 total=68830
@@ -272,12 +272,12 @@ SecpNoiseStream closed label=client hop 2/3 to 127.0.0.1:9052 wire_read=... wire
 To see these, use debug logging for the Noise module:
 
 ```bash
-RUST_LOG=monad_common::noise_secp256k1=debug,monad_client=info,monad_server=info
+RUST_LOG=monad_common::noise_secp256k1=debug,monad_client=info,monad_relay=info
 ```
 
 ### CONNECT visibility
 
-Each server logs every `CONNECT` request it receives:
+Each relay logs every `CONNECT` request it receives:
 
 ```text
 CONNECT 127.0.0.1:9052
@@ -289,7 +289,7 @@ In a multi-hop chain, only the final hop sees the actual target. Intermediate ho
 
 ## Graceful Shutdown
 
-Both client and server handle `Ctrl+C` gracefully:
+Both client and relay handle `Ctrl+C` gracefully:
 - stop accepting new work
 - wait briefly for active tunnels/sessions to finish
 - shut down H2 connections cleanly
@@ -297,7 +297,7 @@ Both client and server handle `Ctrl+C` gracefully:
 
 ## QUIC Echo Tool
 
-The `monad-quic` crate also includes a standalone QUIC echo server/client for transport testing and experimentation. The main MONAD client and server now use shared code from this crate for QUIC support.
+The `monad-quic` crate also includes a standalone QUIC echo server/client for transport testing and experimentation. The main MONAD client and relay now use shared code from this crate for QUIC support.
 
 ### Generate a keypair
 

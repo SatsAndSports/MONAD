@@ -1,4 +1,4 @@
-//! Ed25519 QUIC certificate identity helpers for MONAD servers.
+//! Ed25519 QUIC certificate identity helpers for MONAD relays.
 //!
 //! MONAD still uses an Ed25519 keypair internally for QUIC/TLS certificate
 //! generation. From this keypair, we derive:
@@ -15,7 +15,7 @@ use std::io;
 
 /// A validated 32-byte Ed25519 public key.
 ///
-/// This is the published Ed25519 public key for a MONAD server's QUIC
+/// This is the published Ed25519 public key for a MONAD relay's QUIC
 /// certificate plumbing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ed25519Pubkey([u8; 32]);
@@ -65,14 +65,14 @@ impl std::fmt::Display for Ed25519Pubkey {
 // QuicCertIdentity — Ed25519 QUIC certificate identity derived from a seed
 // ---------------------------------------------------------------------------
 
-/// A server's Ed25519 identity, derived from a single Ed25519 seed.
+/// A relay's Ed25519 identity, derived from a single Ed25519 seed.
 pub struct QuicCertIdentity {
     seed: [u8; 32],
     ed25519_pubkey: Ed25519Pubkey,
 }
 
 impl QuicCertIdentity {
-    /// Generate a new random server identity.
+    /// Generate a new random relay identity.
     pub fn generate() -> io::Result<Self> {
         let (seed, pubkey) = generate_identity()?;
         Ok(Self {
@@ -81,7 +81,7 @@ impl QuicCertIdentity {
         })
     }
 
-    /// Derive a server identity from a known Ed25519 seed.
+    /// Derive a relay identity from a known Ed25519 seed.
     pub fn from_seed(seed: [u8; 32]) -> io::Result<Self> {
         let pubkey = Ed25519Pubkey(ed25519_seed_to_pubkey(&seed)?);
         Ok(Self {
@@ -108,7 +108,7 @@ impl QuicCertIdentity {
         &self.seed
     }
 
-    /// The server's Ed25519 public key (its published identity).
+    /// The relay's Ed25519 public key (its published identity).
     pub fn ed25519_pubkey(&self) -> &Ed25519Pubkey {
         &self.ed25519_pubkey
     }
@@ -154,7 +154,7 @@ const ED25519_PKCS8_HEADER: [u8; 16] = [
 /// Generate a new Ed25519 identity.
 ///
 /// Returns `(seed, public_key)` where seed is 32 bytes of private key material
-/// and public_key is the server's identity.
+/// and public_key is the relay's identity.
 pub fn generate_identity() -> io::Result<([u8; 32], Ed25519Pubkey)> {
     let rng = ring::rand::SystemRandom::new();
     let mut seed = [0u8; 32];

@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "monad-common",
-    "monad-server",
+    "monad-relay",
     "monad-client",
     "monad-quic",
 ]

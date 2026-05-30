@@ -13,7 +13,7 @@ cargo test
 For binaries during development:
 
 ```bash
-cargo run -p monad-server -- ...
+cargo run -p monad-relay -- ...
 cargo run -p monad-client -- ...
 cargo run -p monad-quic -- ...
 ```
@@ -36,7 +36,7 @@ cargo run -p monad-quic -- ...
   - wallet abstraction and mock wallet (`wallet.rs`)
   - tunnel proxying (`tunnel.rs`)
   - binary currently exits early until the real wallet backend exists
-- `monad-server`
+- `monad-relay`
   - reusable library code plus binary entrypoint
   - TCP+QUIC listener, `SpilmanMintCache`, `discover_spilman_mint_cache` (`listener.rs`)
   - `RelaySession<T>`, billing, control stream handler, version negotiation (`session.rs`)
@@ -62,15 +62,15 @@ cargo run -p monad-quic -- ...
 ### Control Protocol
 
 - Wire format: JSON newline-delimited messages on the H2 control stream (`POST /control`)
-- Handshake: client sends `Hello { version }`, server responds with a unified `SessionStatus` containing advertisements and initial state
+- Handshake: client sends `Hello { version }`, relay responds with a unified `SessionStatus` containing advertisements and initial state
 - Version negotiation: `min(client_version, SERVER_MAX_VERSION)`, reject if < `SERVER_MIN_VERSION`
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, integer-only via precomputed LCM
 - `CONNECT` rejected with 402 while paused
 - Balance can go negative (chunk-boundary overshoot); session repauses
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
-- `Error` for server-initiated rejections (e.g. version mismatch)
-- `ChannelLink { payment_json }` links a Spilman channel to the session; server validates and responds with `ChannelLinkAccepted { channel_id, capacity }` or `Error`. Only one session can own a channel at a time.
+- `Error` for relay-initiated rejections (e.g. version mismatch)
+- `ChannelLink { payment_json }` links a Spilman channel to the session; relay validates and responds with `ChannelLinkAccepted { channel_id, capacity }` or `Error`. Only one session can own a channel at a time.
 - `ChannelPayment { payment_json }` increments the session balance based on the delta of the channel's max balance seen.
 - `SessionStatus.linked_channel` carries the relay-authoritative linked channel id, latest accepted raw balance, raw capacity, and unit.
 - control-stream detach fully ends the session: linked ownership is released, active streams are torn down, and new streams are no longer accepted.
@@ -82,7 +82,7 @@ cargo run -p monad-quic -- ...
 - client steady-state control/payment behavior is modeled as an explicit per-session reducer (`session_fsm.rs`) executed by `session_driver.rs`.
 - `connector.rs` uses `MockWallet` + `session_driver` so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` flow.
 - the `monad-client` binary intentionally exits early until the real wallet backend exists.
-- server-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
+- relay-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
 
 ### QUIC Transport
 
@@ -107,7 +107,7 @@ cargo run -p monad-quic -- ...
 ### 1. Keep direct and nested modes working
 
 Do not break:
-- single-hop client → server usage
+- single-hop client → relay usage
 - multi-hop nested usage
 - simultaneous multiple CONNECT tunnels
 
@@ -161,7 +161,7 @@ for per-hop encrypted byte counts from `SecpNoiseStream`.
 
 ### CONNECT logs
 
-Each server logs received CONNECT requests like:
+Each relay logs received CONNECT requests like:
 
 ```text
 CONNECT example.com:22
@@ -171,7 +171,7 @@ Keep this simple and readable.
 
 ## Shutdown Behavior
 
-The client and server both implement graceful shutdown.
+The client and relay both implement graceful shutdown.
 
 If you change shutdown logic:
 - keep task tracking explicit
@@ -211,7 +211,7 @@ The test suite currently covers:
 - QUIC first hop then TCP second hop
 - Noise session ID (handshake hash) matches on both sides
 - Spilman channel implementation (delta-based) is currently being integrated and tested
-- server advertises multiple mint/unit pricing options
+- relay advertises multiple mint/unit pricing options
 - default integration-test relays advertise a synthetic test mint/keyset offer so connector-driven intermediate hops can provision mock channels without a real wallet backend
 - control detach releases linked channel ownership and tears down active/future streams
 

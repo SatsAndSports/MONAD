@@ -1,4 +1,4 @@
-//! Opens an H2 CONNECT tunnel through the server and proxies data bidirectionally
+//! Opens an H2 CONNECT tunnel through the relay and proxies data bidirectionally
 //! between a local TCP socket and the H2 stream.
 
 use crate::socks;
@@ -10,7 +10,7 @@ use std::io;
 use tokio::net::TcpStream;
 use tracing::info;
 
-/// Open a tunnel to `target_authority` (e.g., "example.com:443") through the MONAD server
+/// Open a tunnel to `target_authority` (e.g., "example.com:443") through the MONAD relay
 /// and proxy data bidirectionally between the local `client_stream` and the remote target.
 ///
 /// Sends the SOCKS5 success reply to the local client before starting the proxy.
@@ -38,7 +38,7 @@ pub async fn open_tunnel(
         .send_request(request, false)
         .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
 
-    // Wait for the server's response
+    // Wait for the relay's response
     let response = response_future
         .await
         .map_err(|e| io::Error::other(format!("h2 response error: {e}")))?;
@@ -46,7 +46,7 @@ pub async fn open_tunnel(
     if !response.status().is_success() {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
-            format!("server rejected CONNECT: {}", response.status()),
+            format!("relay rejected CONNECT: {}", response.status()),
         ));
     }
 

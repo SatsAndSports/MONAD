@@ -1,6 +1,6 @@
 //! QUIC connection pool for relay-to-relay transport.
 //!
-//! Maintains shared QUIC connections keyed by `(host, port)`. When the server
+//! Maintains shared QUIC connections keyed by `(host, port)`. When the relay
 //! receives a CONNECT request with a `quic-secp256k1-pubkey` header, it either
 //! reuses an existing QUIC connection to that target or establishes a new one, then
 //! opens a new bidirectional stream inside it.

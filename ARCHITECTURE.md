@@ -54,7 +54,7 @@ Responsibilities:
   `ChannelPayment` messages using relay-authoritative linked-channel sync from
   `SessionStatus`
 
-### `monad-server`
+### `monad-relay`
 
 Responsibilities:
 - accept TCP connections
@@ -70,14 +70,14 @@ Responsibilities:
   carries the session's global default rates)
 - enforce per-session billing with pause/resume on the control stream
   using validated `ChannelLink` / `ChannelPayment` messages
-- drive steady-state control/session transitions through an explicit server-side
+- drive steady-state control/session transitions through an explicit relay-side
   session FSM after the initial bootstrap handshake
 - fully tear down a session when the control stream detaches, releasing any
   linked channel and stopping active / future streams
 
 ### `monad-quic`
 
-Shared QUIC transport building blocks, fully integrated into the main MONAD system. Provides `QuicStream`, QUIC client/server config helpers, attestation helpers, and keygen helpers used by both `monad-server` and `monad-client` for QUIC hop support.
+Shared QUIC transport building blocks, fully integrated into the main MONAD system. Provides `QuicStream`, QUIC client/server config helpers, attestation helpers, and keygen helpers used by both `monad-relay` and `monad-client` for QUIC hop support.
 
 Core functionality:
 - Ed25519 self-signed certificate generation via `rcgen`
@@ -95,7 +95,7 @@ Also includes standalone echo tooling for transport testing:
 
 ### Hop
 
-A MONAD server in the route.
+A MONAD relay in the route.
 
 Example 3-hop route:
 
@@ -140,9 +140,9 @@ Application bytes flowing through an individual CONNECT tunnel, excluding Noise 
 ```text
 Application
   -> SOCKS5 to monad-client
-    -> Noise NK to monad-server
+    -> Noise NK to monad-relay
       -> H2 CONNECT example.com:443
-        -> server opens TCP connection to example.com:443
+        -> relay opens TCP connection to example.com:443
           -> bytes flow both directions
 ```
 
@@ -280,13 +280,13 @@ Server to client (`ServerMessage`):
   - `total_paid_millisats`: Total payments received
   - `remaining_milli_sats`: Current session balance
   - `paused`: Boolean indicating if traffic is currently blocked
-- `ChannelLinkAccepted { channel_id, capacity }` — the server validated and linked the Spilman channel to this session
+- `ChannelLinkAccepted { channel_id, capacity }` — the relay validated and linked the Spilman channel to this session
 - `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
-- `Error { message }` — server-initiated error or rejection
+- `Error { message }` — relay-initiated error or rejection
 
 ### Version Negotiation
 
-The client sends `Hello { version }` as the first control message. The server computes `negotiated = min(client_version, SERVER_MAX_VERSION)`. If `negotiated < SERVER_MIN_VERSION`, the server sends an `Error` and closes the control stream. Otherwise it responds with a unified `SessionStatus` containing the negotiated version, available pricing options, and the initial zero-balance state.
+The client sends `Hello { version }` as the first control message. The relay computes `negotiated = min(client_version, SERVER_MAX_VERSION)`. If `negotiated < SERVER_MIN_VERSION`, the relay sends an `Error` and closes the control stream. Otherwise it responds with a unified `SessionStatus` containing the negotiated version, available pricing options, and the initial zero-balance state.
 
 This bootstrap sequence stays outside the explicit session FSM. The reducer-style
 state machine begins only after the initial `SessionStatus` has been sent.
@@ -316,12 +316,12 @@ This is implemented with integer-only arithmetic via a precomputed `lcm(in_rate,
 
 ### Chunk-Boundary Overshoot
 
-The balance can go negative between billing checks (a proxy chunk may push usage past the paid amount). When the server detects negative balance, it pauses the session and sends a `SessionStatus`. The client can then send another payment to resume.
+The balance can go negative between billing checks (a proxy chunk may push usage past the paid amount). When the relay detects negative balance, it pauses the session and sends a `SessionStatus`. The client can then send another payment to resume.
 
 ### Two Pricing Structures
 
 - **Wire**: `ServerMessage::SessionStatus` carries the active rates and the list of alternatives. This is what crosses the network.
-- **Local**: `SessionPricing` (in `monad-common/src/session.rs`) includes the precomputed LCM and negotiated version. Both client and server construct this from the active rates in `SessionStatus` for billing math.
+- **Local**: `SessionPricing` (in `monad-common/src/session.rs`) includes the precomputed LCM and negotiated version. Both client and relay construct this from the active rates in `SessionStatus` for billing math.
 
 ### Client Auto-Funding
 
@@ -330,7 +330,7 @@ The client opens a control stream immediately after connecting and sends `Hello`
 ### Client Session FSM
 
 After the client sends `Hello`, steady-state client behavior is also handled as a
-serialized event/effect reducer, mirroring the server-side FSM.
+serialized event/effect reducer, mirroring the relay-side FSM.
 
 Bootstrap stays outside the reducer:
 
@@ -348,7 +348,7 @@ The client reducer is responsible for:
 - deciding when to send `ChannelLink`
 - deciding when to send `ChannelPayment`
 - reacting to `ChannelEvicted`
-- classifying server `Error` messages into channel-invalidating vs session-local outcomes
+- classifying relay `Error` messages into channel-invalidating vs session-local outcomes
 - ending the local session on control detach
 
 Important design points:
@@ -367,7 +367,7 @@ an explicit tree of child sessions.
 
 ### Server Session FSM
 
-After bootstrap, the server handles steady-state control/session logic as an
+After bootstrap, the relay handles steady-state control/session logic as an
 explicit event/effect reducer.
 
 Conceptually:
@@ -415,7 +415,7 @@ handle the more complex protocol transitions.
 Each Noise NK handshake produces a 32-byte **handshake hash** that is identical on both sides and unique per session. This is used as a session identifier:
 
 - Computed during the handshake, before `into_transport_mode()` consumes the handshake state
-- Stored on `SecpNoiseStream`, `RelayConnection` (client), and `RelaySession` (server)
+- Stored on `SecpNoiseStream`, `RelayConnection` (client), and `RelaySession` (relay)
 - Deterministic: both initiator and responder derive the same value from the DH transcript
 - Unique: the client generates a fresh ephemeral key per connection
 - Not transmitted over the wire — derived locally from the shared transcript
@@ -424,12 +424,12 @@ Each Noise NK handshake produces a 32-byte **handshake hash** that is identical 
 MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The design enforces channel exclusivity and uses delta-based accounting.
 
 #### 1. Server Advertisement
-The server is configured with a map of `Mint -> Unit -> Rates`. In the `SessionStatus` message, it advertises these options to the client as a list of `KeysetAdvertisement` objects. Each option includes the `in_bytes_per_millisat` and `out_bytes_per_millisat` specific to that mint/unit choice.
+The relay is configured with a map of `Mint -> Unit -> Rates`. In the `SessionStatus` message, it advertises these options to the client as a list of `KeysetAdvertisement` objects. Each option includes the `in_bytes_per_millisat` and `out_bytes_per_millisat` specific to that mint/unit choice.
 
 #### 2. Channel Linking
 The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs.
-- **One Session Per Channel**: The server maintains a global registry of `ChannelId -> SessionId`.
-- **Exclusivity**: If a channel is already linked to another session, the server sends `ChannelEvicted` to the old session and links the channel to the new one.
+- **One Session Per Channel**: The relay maintains a global registry of `ChannelId -> SessionId`.
+- **Exclusivity**: If a channel is already linked to another session, the relay sends `ChannelEvicted` to the old session and links the channel to the new one.
 - **Stateless Session Start**: Every new Noise session starts with a `total_paid_millisats` of 0. Only *new* payments made within the current session count as credit.
 
 #### 3. Orthogonal State Model
@@ -439,7 +439,7 @@ A session's ability to proxy data is determined by two orthogonal variables:
 
 #### 4. Incremental Payments (Delta Model)
 When the session balance runs low, the client sends a `ChannelPayment` with a signed balance update.
-- **Credit Calculation**: The server tracks the `max_balance_seen` for every channel ID.
+- **Credit Calculation**: The relay tracks the `max_balance_seen` for every channel ID.
 - **Delta**: `credit_millisats = (new_balance - max_balance_seen) * unit_multiplier`.
 
 #### 5. Relay-Authoritative Linked-Channel Sync
@@ -463,7 +463,7 @@ and asks the wallet backend to build a payment for that exact next balance.
 
 #### 6. Session Teardown on Control Detach
 
-If the control stream detaches, the server treats the session as fully ended.
+If the control stream detaches, the relay treats the session as fully ended.
 
 That means:
 
@@ -472,7 +472,7 @@ That means:
 - terminate active proxy streams relatively soon
 - end the underlying H2 / Noise session gracefully where easy, but fully
 
-If the server itself decides to terminate the session while the control stream
+If the relay itself decides to terminate the session while the control stream
 still exists, it can send `Error { message }` first. If the control stream is
 already gone, no final control error message is possible.
 
@@ -581,7 +581,7 @@ Planned next:
 - `CONNECT /blinded_hop_v1` transport integration
 - a second QUIC stream kind carrying the tweak preamble for blinded forwarded
   sessions
-- end-to-end client/server blinded-hop routing on top of the existing nesting
+- end-to-end client/relay blinded-hop routing on top of the existing nesting
   machinery
 
 ### Published Path Shape
@@ -826,7 +826,7 @@ transport layer is not currently built on secp256k1, see
 
 ## Shutdown Model
 
-Both client and server use graceful shutdown:
+Both client and relay use graceful shutdown:
 - stop accepting new work on `Ctrl+C`
 - wait for active tunnels/sessions with a timeout
 - close H2 connections cleanly
@@ -838,7 +838,7 @@ Both client and server use graceful shutdown:
 
 Logged by:
 - `monad-client::tunnel`
-- `monad-server::proxy`
+- `monad-relay::proxy`
 
 Fields:
 - `outbound`
@@ -881,7 +881,7 @@ addr:port,secp256k1:<secp_pubkey>
 quic:addr:port,secp256k1:<secp_pubkey>
 ```
 
-On the server side, startup still takes both:
+On the relay side, startup still takes both:
 
 - a 32-byte **Ed25519 seed** for QUIC certificate generation
 - a 32-byte **secp256k1 transport private key** for MONAD TCP and QUIC transport auth
@@ -992,22 +992,22 @@ MONAD transport identity to the live QUIC channel.
 
 This authentication is intentionally one-way: the target authenticates itself to
 the initiator, but the initiator does not authenticate itself at the QUIC layer.
-This aligns with MONAD's current model, where the initiator knows the server
-identity in advance and the server proves possession of the corresponding
+This aligns with MONAD's current model, where the initiator knows the relay
+identity in advance and the relay proves possession of the corresponding
 private key.
 
 If the opposite traffic direction ever needs its own initiator-driven link, that should be modeled as a separate independent QUIC connection in the reverse direction rather than by introducing mutual authentication. This keeps connection ownership, authentication rules, and future state machines simpler.
 
 ### Server Dual Listener
 
-A MONAD server that supports QUIC listens on the same port number for both TCP and UDP:
+A MONAD relay that supports QUIC listens on the same port number for both TCP and UDP:
 
 - **TCP** (existing): accepts connections, performs secp Noise handshake, runs H2
 - **UDP** (new): accepts QUIC connections, accepts bidirectional streams
 
 TCP and UDP can share a port because they are different IP protocols at the kernel level.
 
-On the receiving side, both transports feed into the same session handler. A QUIC bidirectional stream is wrapped as `AsyncRead + AsyncWrite` (a `QuicStream` type), and the server runs the same H2 session on top of it as it does for TCP.
+On the receiving side, both transports feed into the same session handler. A QUIC bidirectional stream is wrapped as `AsyncRead + AsyncWrite` (a `QuicStream` type), and the relay runs the same H2 session on top of it as it does for TCP.
 
 - TCP: secp Noise
 - QUIC: secp Noise on `STREAM_KIND_SECP_NOISE`
@@ -1020,7 +1020,7 @@ QUIC listener ──> accept_bi() ──> QuicStream ──────┘
 
 After the handshake completes, the session handler does not care which transport delivered the bytes.
 
-A QUIC-capable server has both:
+A QUIC-capable relay has both:
 - an Ed25519 identity for QUIC certificate generation
 - a secp256k1 transport key whose public MONAD identity is a 32-byte x-only pubkey for TCP MONAD transport and secp-authenticated QUIC
 
@@ -1094,7 +1094,7 @@ The client:
 
 ### QUIC Implementation Status
 
-The QUIC transport is fully integrated into the main MONAD system. The `monad-quic` crate provides shared building blocks (`QuicStream`, `build_server_config`, `build_client_config`, keygen), and the server and client use them for QUIC hop support.
+The QUIC transport is fully integrated into the main MONAD system. The `monad-quic` crate provides shared building blocks (`QuicStream`, `build_server_config`, `build_client_config`, keygen), and the relay and client use them for QUIC hop support.
 
 What has been validated:
 
@@ -1110,7 +1110,7 @@ What has been validated:
 
 Quinn's default `stream_receive_window` is 1MB and the default connection-level `receive_window` is also limited. These defaults are fine for typical web traffic but can cause problems with large payloads in a write-then-read pattern.
 
-The specific issue: if a client sends a large payload (exceeding the receive window) and the server echoes it back before the client has started reading, both sides can deadlock. The client blocks trying to send because the server's receive window is full, and the server blocks trying to echo because the client's receive window is full — neither side makes progress.
+The specific issue: if a client sends a large payload (exceeding the receive window) and the relay echoes it back before the client has started reading, both sides can deadlock. The client blocks trying to send because the relay's receive window is full, and the relay blocks trying to echo because the client's receive window is full — neither side makes progress.
 
 This is specific to the echo test pattern (sequential write-all then read-all on the same stream). In real MONAD relay usage, the two directions of a stream are handled by separate tasks reading and writing concurrently, so this deadlock does not apply. Nevertheless, the current `monad-quic` transport config sets:
 
@@ -1126,17 +1126,17 @@ Initiator-side QUIC connections also enable periodic keep-alives so idle client-
 The full QUIC transport chain is implemented and tested:
 
 1. **`QuicStream` type in `monad-quic`** — wraps a quinn bidirectional stream as `AsyncRead + AsyncWrite`, used interchangeably with `TcpStream`
-2. **QUIC listener in `monad-server`** — binds a UDP socket on the same port as the TCP listener, accepts QUIC connections, feeds incoming streams into the existing Noise+H2 session handler
-3. **Dual transport identity plumbing in `monad-server`** — `monad-server keygen` emits both an Ed25519 identity set for QUIC certificate generation and a secp256k1 transport key for MONAD transport auth.
-4. **QUIC transport header parsing in `monad-server`** — detects `quic-secp256k1-pubkey` on CONNECT requests and connects via secp-authenticated QUIC instead of TCP
-5. **QUIC connection pool in `monad-server`** — maintains shared QUIC connections keyed by `(host, port)`, reuses across client sessions
+2. **QUIC listener in `monad-relay`** — binds a UDP socket on the same port as the TCP listener, accepts QUIC connections, feeds incoming streams into the existing Noise+H2 session handler
+3. **Dual transport identity plumbing in `monad-relay`** — `monad-relay keygen` emits both an Ed25519 identity set for QUIC certificate generation and a secp256k1 transport key for MONAD transport auth.
+4. **QUIC transport header parsing in `monad-relay`** — detects `quic-secp256k1-pubkey` on CONNECT requests and connects via secp-authenticated QUIC instead of TCP
+5. **QUIC connection pool in `monad-relay`** — maintains shared QUIC connections keyed by `(host, port)`, reuses across client sessions
 6. **`--hop quic:` parsing in `monad-client`** — parses the `quic:` prefix from the hop spec, emits `quic-secp256k1-pubkey`, and uses secp256k1 directly for non-QUIC hops
 7. **Integration tests** — cover QUIC single-hop, QUIC with control+data channels, nested QUIC tunnels (manual and via connector), alongside all existing TCP tests
 
 ## Current Limitations
 
 - Spilman channel implementation is currently being transitioned from a proof-of-concept to the "Proper" delta-based model described above.
-- server does not yet persist Spilman channel state across restarts (registry is in-memory).
+- relay does not yet persist Spilman channel state across restarts (registry is in-memory).
 - multi-hop Spilman channel funding is wired but not yet fully tested with the new lifecycle.
 - no persistent route configuration file yet.
 - QUIC connection pool does not yet handle connection eviction or stale entry cleanup.

@@ -44,7 +44,7 @@ pub fn clamp_i128_to_i64(value: i128) -> i64 {
 // SessionPricing — local persisted pricing with precomputed LCM
 // ---------------------------------------------------------------------------
 
-/// Local session pricing metadata, persisted on both client and server.
+/// Local session pricing metadata, persisted on both client and relay.
 ///
 /// Constructed from the wire `SessionStatus` message. Includes the
 /// precomputed LCM of the two directional rates so billing math can

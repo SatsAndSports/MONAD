@@ -1,6 +1,6 @@
 //! Bidirectional proxy between an H2 stream pair and a transport.
 //!
-//! This is the shared copy loop used by both the server (proxying CONNECT
+//! This is the shared copy loop used by both the relay (proxying CONNECT
 //! tunnels to external targets) and the client (proxying local SOCKS5
 //! connections through H2 tunnels).
 

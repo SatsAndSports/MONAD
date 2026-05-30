@@ -1,4 +1,4 @@
-//! Establishes a connection to a MONAD server, optionally through a chain
+//! Establishes a connection to a MONAD relay, optionally through a chain
 //! of intermediate hops (onion routing / nested tunneling).
 //!
 //! Single hop:   TCP → Noise(S) → H2
@@ -32,7 +32,7 @@ impl HopIdentity {
     }
 }
 
-/// A hop in the tunnel chain: server address and its transport identity.
+/// A hop in the tunnel chain: relay address and its transport identity.
 ///
 /// MONAD transport now uses secp256k1 identities for both plain TCP and QUIC.
 ///
@@ -47,23 +47,23 @@ pub struct Hop {
     pub use_quic: bool,
 }
 
-/// Connect to a MONAD server directly (single hop).
+/// Connect to a MONAD relay directly (single hop).
 ///
 /// Equivalent to `connect_through_chain(&[hop])`.
 #[allow(dead_code)]
 pub async fn connect(
-    server_addr: &str,
-    server_pubkey: Secp256k1Pubkey,
+    relay_addr: &str,
+    relay_pubkey: Secp256k1Pubkey,
 ) -> io::Result<RelayConnection> {
     connect_through_chain(&[Hop {
-        addr: server_addr.to_string(),
-        identity: HopIdentity::Secp256k1(server_pubkey),
+        addr: relay_addr.to_string(),
+        identity: HopIdentity::Secp256k1(relay_pubkey),
         use_quic: false,
     }])
     .await
 }
 
-/// Connect to a MONAD server through a chain of hops.
+/// Connect to a chain of MONAD relays.
 ///
 /// `hops` must have at least one entry. The first hop is connected to via TCP.
 /// Each subsequent hop is reached by opening an H2 CONNECT tunnel through the

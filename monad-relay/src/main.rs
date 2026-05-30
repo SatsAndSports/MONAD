@@ -2,14 +2,14 @@ use cashu::nuts::SecretKey;
 use clap::{Parser, Subcommand};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::SecpTransportKeypair;
-use monad_server::listener;
+use monad_relay::listener;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "monad-server", about = "MONAD tunnel server")]
+#[command(name = "monad-relay", about = "MONAD relay")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -17,16 +17,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a new server identity set
+    /// Generate a new relay identity set
     Keygen,
 
-    /// Run the server
+    /// Run the relay
     Run {
         /// Address to listen on (TCP and optionally QUIC/UDP on the same port)
         #[arg(long, default_value = "0.0.0.0:9050")]
         listen: String,
 
-        /// Server Ed25519 seed (hex-encoded, 32 bytes).
+        /// Relay Ed25519 seed (hex-encoded, 32 bytes).
         /// Used for QUIC certificate generation.
         #[arg(long, env = "MONAD_QUIC_CERT_SEED")]
         quic_cert_seed: String,
@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
             let pubkey = identity.ed25519_pubkey();
             let transport_pubkey = transport_key.pubkey();
-            println!("# MONAD server identity set");
+            println!("# MONAD relay identity set");
             println!("#");
             println!("# The Ed25519 key is used for QUIC certificate generation.");
             println!();
@@ -82,9 +82,9 @@ async fn main() -> anyhow::Result<()> {
             println!();
             println!("# --- QUIC certificate (derived from the Ed25519 key) ---");
             println!("{}", quic_km.cert_pem);
-            println!("# Run the server with:");
+            println!("# Run the relay with:");
             println!(
-                "#   monad-server run --quic-cert-seed {} --transport-key {} --quic",
+                "#   monad-relay run --quic-cert-seed {} --transport-key {} --quic",
                 hex::encode(identity.seed()),
                 hex::encode(transport_key.normalized_secret_bytes())
             );
@@ -105,9 +105,9 @@ async fn main() -> anyhow::Result<()> {
             // Optionally set up QUIC listener from the same seed
             let quic_config = if quic {
                 let quic_km = monad_quic::keygen::generate_from_seed(identity.seed())?;
-                let server_config =
+                let relay_config =
                     monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem)?;
-                Some(server_config)
+                Some(relay_config)
             } else {
                 None
             };
@@ -136,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
 
-            info!("server starting");
+            info!("relay starting");
             listener::run(tcp_listener, quic_endpoint, config).await?;
         }
     }

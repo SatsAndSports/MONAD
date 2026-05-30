@@ -2328,7 +2328,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "monad-server"
+name = "monad-relay"
 version = "0.1.0"
 dependencies = [
  "anyhow",

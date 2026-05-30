@@ -28,7 +28,7 @@ use tracing::{error, info};
 /// Hardcoded trusted mint policy for now: mint URL -> allowed units.
 pub type TrustedMintUnits = BTreeMap<String, BTreeSet<String>>;
 
-/// Server-side cached view of trusted mints.
+/// Relay-side cached view of trusted mints.
 #[derive(Debug, Clone, Default)]
 pub struct SpilmanMintCache {
     /// Mint URL -> unit -> advertised keyset IDs.
@@ -37,9 +37,9 @@ pub struct SpilmanMintCache {
     pub keyset_info_json_by_mint: BTreeMap<String, BTreeMap<String, String>>,
 }
 
-/// Server configuration.
+/// Relay configuration.
 pub struct ServerConfig {
-    /// The server's Ed25519 QUIC certificate identity.
+    /// The relay's Ed25519 QUIC certificate identity.
     pub identity: QuicCertIdentity,
     /// Optional shared secp256k1 transport identity for secp-authenticated transports.
     pub transport_key: Option<SecpTransportKeypair>,
@@ -96,11 +96,11 @@ pub async fn discover_spilman_mint_cache(
     Ok(cache)
 }
 
-/// Run the server: listen for TCP and optionally QUIC connections, perform secp
-/// Noise handshake, handle H2 sessions.
+/// Run the relay: listen for TCP and optionally QUIC connections, perform secp
+/// Noise handshake, and handle H2 sessions.
 ///
 /// Both TCP and QUIC connections are fed into the same H2 session handler.
-/// The server treats them identically after the secp transport is established.
+/// The relay treats them identically after the secp transport is established.
 ///
 /// Handles Ctrl+C gracefully: stops accepting new connections, waits for active
 /// sessions to finish (up to a timeout), then exits. This ensures
@@ -136,7 +136,7 @@ pub async fn run_with_payments(
     let transport_key = config.transport_key.clone().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "server transport_key is required for secp-authenticated transport",
+            "relay transport_key is required for secp-authenticated transport",
         )
     })?;
     let local_addr = listener.local_addr()?;
@@ -408,6 +408,6 @@ pub async fn run_with_payments(
         ep.close(0u32.into(), b"shutdown");
     }
 
-    info!("server shut down");
+    info!("relay shut down");
     Ok(())
 }

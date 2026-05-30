@@ -1,6 +1,6 @@
 //! Per-client H2 session handler.
 //!
-//! After the Noise handshake, the server runs an H2 server on the encrypted
+//! After the Noise handshake, the relay runs an H2 server on the encrypted
 //! stream. The session starts paused-by-default with zero balance. A long-lived
 //! `POST /control` stream is used to fund and observe the whole session.
 
