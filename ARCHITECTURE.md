@@ -327,6 +327,44 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 
 The client opens a control stream immediately after connecting and sends `Hello`. When it receives `SessionStatus`, the per-session payment driver either selects a matching local channel or provisions one from the relay's advertisements, sends `ChannelLink`, then sends `ChannelPayment` updates whenever the remaining session balance becomes non-positive. Intermediate hops in multi-hop chains use the same session-driver model.
 
+### Client Session FSM
+
+After the client sends `Hello`, steady-state client behavior is also handled as a
+serialized event/effect reducer, mirroring the server-side FSM.
+
+Bootstrap stays outside the reducer:
+
+- open the control stream
+- send `Hello { version }`
+- wait for the first `SessionStatus`
+
+The first reducer-driving event is that initial `SessionStatus`.
+
+The client reducer is responsible for:
+
+- tracking the latest relay-authoritative session snapshot
+- reconciling the local active channel with the relay-reported linked channel
+- selecting or provisioning channels
+- deciding when to send `ChannelLink`
+- deciding when to send `ChannelPayment`
+- reacting to `ChannelEvicted`
+- classifying server `Error` messages into channel-invalidating vs session-local outcomes
+- ending the local session on control detach
+
+Important design points:
+
+- one client relay session is handled by one serialized executor loop
+- the per-session client FSM state does not need a mutex
+- `paused` is the real operational state; there is no separate long-lived `ready`
+  state inside the reducer
+- the startup oneshot waiter is executor-only coordination, not session state
+- wallet operations (select, provision, build link/payment payloads) are executed
+  as reducer effects and their results are fed back in as reducer events
+
+When a parent session dies in a nested route, deeper nested client sessions end
+indirectly when the underlying transport collapses; the client FSM does not walk
+an explicit tree of child sessions.
+
 ### Server Session FSM
 
 After bootstrap, the server handles steady-state control/session logic as an

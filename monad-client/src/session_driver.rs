@@ -89,6 +89,9 @@ async fn run_session_driver(
     ready_tx: oneshot::Sender<()>,
     config: SessionDriverConfig,
 ) -> io::Result<()> {
+    // Bootstrap stays outside the client reducer. We open the control stream,
+    // send Hello, and start the reducer only once the first SessionStatus
+    // arrives from the relay.
     let mut buf = Vec::new();
     let mut state = ClientSessionState::new();
     let mut ready_tx = Some(ready_tx);
@@ -207,6 +210,8 @@ async fn process_client_event(
     h2_send: &mut h2::SendStream<Bytes>,
     ready_tx: &mut Option<oneshot::Sender<()>>,
 ) -> io::Result<bool> {
+    // Run a small local event queue so wallet/build effects can feed their
+    // result-events back into the same serialized reducer pass.
     let mut pending = VecDeque::from([initial_event]);
     let mut terminate = false;
 

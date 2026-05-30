@@ -79,6 +79,7 @@ cargo run -p monad-quic -- ...
 ### Current Client Runtime State
 
 - `monad-client` library now has a wallet abstraction plus per-session payment driver.
+- client steady-state control/payment behavior is modeled as an explicit per-session reducer (`session_fsm.rs`) executed by `session_driver.rs`.
 - `connector.rs` uses `MockWallet` + `session_driver` so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` flow.
 - the `monad-client` binary intentionally exits early until the real wallet backend exists.
 - server-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
