@@ -631,11 +631,10 @@ async fn handle_control_stream(
 
     let negotiated_version = client_version;
 
-    // Set initial version in session state, then build and send the initial
-    // SessionStatus. This is race-free: the session starts paused and no
-    // proxy task can be running yet (CONNECT requires unpaused), so nothing
-    // else can mutate `inner` between attaching the control_tx and reading
-    // the snapshot here.
+    // Bootstrap stays outside the explicit steady-state session FSM. After
+    // version negotiation, we seed the session state with the negotiated
+    // version and send the initial SessionStatus before entering the reducer-
+    // driven control loop.
     {
         let mut inner = state.inner.lock().await;
         inner.pricing.version = negotiated_version;
@@ -770,6 +769,9 @@ async fn process_session_event(
     negotiated_version: u8,
     h2_send: &mut h2::SendStream<Bytes>,
 ) -> io::Result<bool> {
+    // Run a small local event queue so effects like link/payment validation can
+    // feed result-events back into the same reducer pass without holding the
+    // session mutex during validation.
     let mut pending = VecDeque::from([initial_event]);
     let mut terminate = false;
 

@@ -70,6 +70,10 @@ Responsibilities:
   carries the session's global default rates)
 - enforce per-session billing with pause/resume on the control stream
   using validated `ChannelLink` / `ChannelPayment` messages
+- drive steady-state control/session transitions through an explicit server-side
+  session FSM after the initial bootstrap handshake
+- fully tear down a session when the control stream detaches, releasing any
+  linked channel and stopping active / future streams
 
 ### `monad-quic`
 
@@ -284,6 +288,9 @@ Server to client (`ServerMessage`):
 
 The client sends `Hello { version }` as the first control message. The server computes `negotiated = min(client_version, SERVER_MAX_VERSION)`. If `negotiated < SERVER_MIN_VERSION`, the server sends an `Error` and closes the control stream. Otherwise it responds with a unified `SessionStatus` containing the negotiated version, available pricing options, and the initial zero-balance state.
 
+This bootstrap sequence stays outside the explicit session FSM. The reducer-style
+state machine begins only after the initial `SessionStatus` has been sent.
+
 ### Paused-by-Default
 
 Sessions start paused with zero balance. While paused:
@@ -319,6 +326,51 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 ### Client Auto-Funding
 
 The client opens a control stream immediately after connecting and sends `Hello`. When it receives `SessionStatus`, the per-session payment driver either selects a matching local channel or provisions one from the relay's advertisements, sends `ChannelLink`, then sends `ChannelPayment` updates whenever the remaining session balance becomes non-positive. Intermediate hops in multi-hop chains use the same session-driver model.
+
+### Server Session FSM
+
+After bootstrap, the server handles steady-state control/session logic as an
+explicit event/effect reducer.
+
+Conceptually:
+
+- incoming control messages and internal notifications become session events
+- the reducer updates session state and emits effects
+- the executor performs those effects (send control messages, validate
+  link/payment requests, notify evicted sessions, release ownership, terminate
+  the session)
+
+Important steady-state events include:
+
+- client `GetSessionStatus`
+- client `ChannelLink`
+- client `ChannelPayment`
+- internal `ChannelEvicted`
+- control-stream detach / teardown
+
+Important effects include:
+
+- send `SessionStatus`
+- send `ChannelLinkAccepted`, `ChannelEvicted`, or `Error`
+- run link/payment validation outside the session mutex
+- notify another session that it has been evicted
+- release linked-channel ownership
+- terminate the session
+
+### Fast-Path Byte Accounting
+
+Per-byte accounting is intentionally not routed through the main control/session
+reducer.
+
+Instead, active proxy tasks update the session byte counters directly under the
+per-session mutex as soon as possible:
+
+- increment `session_total_in` / `session_total_out`
+- recompute paused state
+- notify the pause watcher if the pause state changed
+
+This keeps the hot data path low-latency while still allowing the control FSM to
+handle the more complex protocol transitions.
 
 ### Session ID
 
@@ -370,6 +422,21 @@ The client driver then computes the next requested cumulative balance from:
 
 and asks the wallet backend to build a payment for that exact next balance.
 - **Eviction Fairness**: If a session is evicted, it **remains Active** as long as it has a positive balance. The user can spend their existing credit, but cannot send further `ChannelPayment` updates until they link a new channel.
+
+#### 6. Session Teardown on Control Detach
+
+If the control stream detaches, the server treats the session as fully ended.
+
+That means:
+
+- release any linked-channel ownership immediately
+- stop accepting new H2 requests for that session
+- terminate active proxy streams relatively soon
+- end the underlying H2 / Noise session gracefully where easy, but fully
+
+If the server itself decides to terminate the session while the control stream
+still exists, it can send `Error { message }` first. If the control stream is
+already gone, no final control error message is possible.
 
 #### 5. Session State Matrix
 

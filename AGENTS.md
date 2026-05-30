@@ -40,6 +40,7 @@ cargo run -p monad-quic -- ...
   - reusable library code plus binary entrypoint
   - TCP+QUIC listener, `SpilmanMintCache`, `discover_spilman_mint_cache` (`listener.rs`)
   - `RelaySession<T>`, billing, control stream handler, version negotiation (`session.rs`)
+  - explicit steady-state session reducer (`session_fsm.rs`)
   - `proxy_bidirectional_accounted` with pause/resume enforcement (`proxy.rs`)
   - QUIC connection pool (`quic_pool.rs`)
 - `monad-quic`
@@ -72,6 +73,7 @@ cargo run -p monad-quic -- ...
 - `ChannelLink { payment_json }` links a Spilman channel to the session; server validates and responds with `ChannelLinkAccepted { channel_id, capacity }` or `Error`. Only one session can own a channel at a time.
 - `ChannelPayment { payment_json }` increments the session balance based on the delta of the channel's max balance seen.
 - `SessionStatus.linked_channel` carries the relay-authoritative linked channel id, latest accepted raw balance, raw capacity, and unit.
+- control-stream detach fully ends the session: linked ownership is released, active streams are torn down, and new streams are no longer accepted.
 - Session ID is the Noise handshake hash (32 bytes, identical on both sides)
 
 ### Current Client Runtime State
@@ -79,6 +81,7 @@ cargo run -p monad-quic -- ...
 - `monad-client` library now has a wallet abstraction plus per-session payment driver.
 - `connector.rs` uses `MockWallet` + `session_driver` so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` flow.
 - the `monad-client` binary intentionally exits early until the real wallet backend exists.
+- server-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
 
 ### QUIC Transport
 
@@ -209,6 +212,7 @@ The test suite currently covers:
 - Spilman channel implementation (delta-based) is currently being integrated and tested
 - server advertises multiple mint/unit pricing options
 - default integration-test relays advertise a synthetic test mint/keyset offer so connector-driven intermediate hops can provision mock channels without a real wallet backend
+- control detach releases linked channel ownership and tears down active/future streams
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
 

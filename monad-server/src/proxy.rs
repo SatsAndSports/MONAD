@@ -41,6 +41,10 @@ async fn wait_until_unpaused_or_terminated(
 }
 
 /// Proxy bytes bidirectionally while enforcing per-session payment pauses.
+///
+/// Byte accounting stays on the fast path here rather than flowing through the
+/// main control/session reducer so the active data path can update counters as
+/// soon as possible.
 pub(crate) async fn proxy_bidirectional_accounted<T>(
     mut h2_send: SendStream<Bytes>,
     mut h2_recv: RecvStream,

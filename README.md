@@ -21,6 +21,7 @@ Implemented today:
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
 - session payment system: paused-by-default sessions, Hello/SessionStatus handshake, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
 - relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
+- server-side session FSM for steady-state control handling and full teardown on control-stream detach
 - mock wallet runtime path for tests and connector flows: `MockWallet` plus `session_driver` funds relay sessions without a real wallet backend
 - low-level blinded-hop building blocks: blinded blob encryption/decryption, even-Y tweak rejection sampling, reverse-tweak key recovery, compact binary payload encoding, and a mixed cleartext/blinded path data model in `monad-common`
 - integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
@@ -102,6 +103,7 @@ Current coverage includes:
 - TCP secp single-hop and nested plain-CONNECT secp tunnels
 - session funding and incremental payments via `ChannelLink` / `ChannelPayment`
 - server advertises multiple mint/unit pricing options
+- control detach releases linked channels and tears down active / future streams
 
 ## Transport Identities
 
