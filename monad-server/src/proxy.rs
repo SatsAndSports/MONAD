@@ -7,22 +7,36 @@ use monad_common::h2stream::wait_for_send_capacity;
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 pub use monad_common::proxy::proxy_bidirectional;
 
-async fn wait_until_unpaused(paused_rx: &mut watch::Receiver<bool>) -> io::Result<()> {
+async fn wait_until_unpaused_or_terminated(
+    paused_rx: &mut watch::Receiver<bool>,
+    termination: &CancellationToken,
+) -> io::Result<()> {
     loop {
         if !*paused_rx.borrow() {
             return Ok(());
         }
 
-        paused_rx.changed().await.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "session pause channel closed unexpectedly",
-            )
-        })?;
+        tokio::select! {
+            _ = termination.cancelled() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "session terminated",
+                ));
+            }
+            changed = paused_rx.changed() => {
+                changed.map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "session pause channel closed unexpectedly",
+                    )
+                })?;
+            }
+        }
     }
 }
 
@@ -40,13 +54,18 @@ where
     let (mut target_read, mut target_write) = tokio::io::split(target);
     let mut paused_rx_a = state.pause_receiver();
     let mut paused_rx_b = state.pause_receiver();
+    let termination_a = state.termination_token();
+    let termination_b = state.termination_token();
 
     let h2_to_target = async {
         let mut tunnel_outbound = 0u64;
         loop {
-            wait_until_unpaused(&mut paused_rx_a).await?;
+            wait_until_unpaused_or_terminated(&mut paused_rx_a, &termination_a).await?;
 
-            match h2_recv.data().await {
+            match tokio::select! {
+                _ = termination_a.cancelled() => None,
+                item = h2_recv.data() => item,
+            } {
                 Some(Ok(data)) => {
                     let len = data.len();
                     let _ = h2_recv.flow_control().release_capacity(len);
@@ -77,9 +96,12 @@ where
         let mut buf = vec![0u8; 16384];
         let mut tunnel_inbound = 0u64;
         loop {
-            wait_until_unpaused(&mut paused_rx_b).await?;
+            wait_until_unpaused_or_terminated(&mut paused_rx_b, &termination_b).await?;
 
-            match target_read.read(&mut buf).await {
+            match tokio::select! {
+                _ = termination_b.cancelled() => Ok(0),
+                read = target_read.read(&mut buf) => read,
+            } {
                 Ok(0) => {
                     debug!("target read EOF");
                     break;

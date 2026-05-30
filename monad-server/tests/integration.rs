@@ -216,6 +216,42 @@ async fn start_monad_server() -> (std::net::SocketAddr, Secp256k1Pubkey) {
     (addr, pubkey)
 }
 
+async fn start_monad_server_with_test_payments() -> (
+    std::net::SocketAddr,
+    Secp256k1Pubkey,
+    Arc<InMemoryRelayPayments>,
+) {
+    let identity = QuicCertIdentity::generate().unwrap();
+    let transport_key = SecpTransportKeypair::generate();
+    let pubkey = transport_key.pubkey();
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let (listener, quic_endpoint, addr) =
+        bind_tcp_and_quic_on_same_port("127.0.0.1:0".parse().unwrap(), quic_server_config)
+            .await
+            .unwrap();
+
+    let config = Arc::new(ServerConfig {
+        identity,
+        transport_key: Some(transport_key),
+        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
+        trusted_mint_units: BTreeMap::new(),
+    });
+    let payments = Arc::new(InMemoryRelayPayments::new());
+    let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
+
+    tokio::spawn(run_with_payments(
+        listener,
+        Some(quic_endpoint),
+        config,
+        payments.clone(),
+        synthetic_mint_cache,
+    ));
+
+    (addr, pubkey, payments)
+}
+
 /// Spin up a MONAD server with explicit Spilman advertisement config.
 async fn start_monad_server_with_spilman(
     trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
@@ -360,8 +396,8 @@ async fn connect_client_quic_secp_funded(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
-    let conn = connect_client_quic_secp(server_addr, pubkey).await;
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    let mut conn = connect_client_quic_secp(server_addr, pubkey).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     conn
 }
 
@@ -369,8 +405,8 @@ async fn connect_client_tcp_funded(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
-    let conn = connect_client_tcp(server_addr, pubkey).await;
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    let mut conn = connect_client_tcp(server_addr, pubkey).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     conn
 }
 
@@ -455,7 +491,7 @@ async fn control_handshake(
     expect_session_status(message)
 }
 
-async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
+async fn fund_session(conn: &mut RelayConnection, milli_sats: u64) {
     let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
 
     let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
@@ -472,10 +508,21 @@ async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
     assert!(!paused1, "session should unpause after funding");
     assert_eq!(rem1, milli_sats as i64);
 
-    let _ = h2_send.send_data(Bytes::new(), true);
-    drop(h2_send);
-    drop(h2_recv);
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let keepalive = tokio::spawn(async move {
+        let mut send = h2_send;
+        let mut recv = h2_recv;
+        while let Some(chunk) = recv.data().await {
+            match chunk {
+                Ok(data) => {
+                    let len = data.len();
+                    let _ = recv.flow_control().release_capacity(len);
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = send.send_data(Bytes::new(), true);
+    });
+    conn.add_task(keepalive);
 }
 
 struct SessionPaymentChannel {
@@ -1301,6 +1348,148 @@ async fn test_channel_eviction_clears_linked_channel() {
 }
 
 #[tokio::test]
+async fn test_control_detach_releases_channel_ownership() {
+    let (server_addr, pubkey, payments) = start_monad_server_with_test_payments().await;
+    let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
+    let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
+
+    let (mut send_a, mut recv_a) = conn_a.open_control().await.unwrap();
+    let (mut send_b, mut recv_b) = conn_b.open_control().await.unwrap();
+    let _ = control_handshake(&mut send_a, &mut recv_a).await;
+    let _ = control_handshake(&mut send_b, &mut recv_b).await;
+
+    let mut channel = SessionPaymentChannel::for_explicit_id("detach-owned");
+    let _ = channel.link(&mut send_a, &mut recv_a).await;
+    assert_eq!(
+        payments.owner_of("detach-owned"),
+        Some(*conn_a.session_id()),
+        "server should record channel ownership for the linked session"
+    );
+
+    let _ = send_a.send_data(Bytes::new(), true);
+    drop(send_a);
+    drop(recv_a);
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if payments.owner_of("detach-owned").is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server should release linked channel ownership after control detach");
+    assert_eq!(
+        payments.owner_of("detach-owned"),
+        None,
+        "server should clear ownership map on detach"
+    );
+
+    let _ = channel.link(&mut send_b, &mut recv_b).await;
+    assert_eq!(
+        payments.owner_of("detach-owned"),
+        Some(*conn_b.session_id()),
+        "ownership should transfer cleanly to the new session"
+    );
+
+    let _ = send_b.send_data(Bytes::new(), true);
+    drop(send_b);
+    drop(recv_b);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    conn_a.shutdown().await;
+    conn_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_control_detach_ends_active_and_future_streams() {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(run_gated_reply_server(
+        target_listener,
+        5,
+        b"DONE",
+        release_rx,
+    ));
+
+    let (server_addr, pubkey) = start_monad_server().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
+    assert!(paused0);
+    assert_eq!(rem0, 0);
+
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    let _ = channel.link(&mut control_send, &mut control_recv).await;
+    let (_in1, _out1, _paid1, rem1, paused1) = channel
+        .pay(&mut control_send, &mut control_recv, TEST_SESSION_PAYMENT)
+        .await;
+    assert!(!paused1);
+    assert_eq!(rem1, TEST_SESSION_PAYMENT as i64);
+
+    let mut h2 = conn.clone_send_request().await;
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("127.0.0.1:{}", target_addr.port()))
+        .body(())
+        .unwrap();
+    let (response_future, mut h2_send) = h2.send_request(request, false).unwrap();
+    let response = response_future.await.unwrap();
+    assert!(response.status().is_success());
+    let mut h2_recv = response.into_body();
+
+    h2_send.reserve_capacity(5);
+    wait_for_send_capacity(&mut h2_send).await.unwrap();
+    h2_send
+        .send_data(Bytes::from_static(b"hello"), true)
+        .unwrap();
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+
+    let tunnel_ended = timeout(Duration::from_secs(2), async {
+        match h2_recv.data().await {
+            Some(Ok(_)) => Ok::<(), &'static str>(()),
+            Some(Err(_)) | None => Err("ended"),
+        }
+    })
+    .await;
+    assert!(
+        tunnel_ended.is_ok(),
+        "active tunnel should end promptly after control detach"
+    );
+
+    let mut h2_after = conn.clone_send_request().await;
+    let followup_request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("127.0.0.1:{}", target_addr.port()))
+        .body(())
+        .unwrap();
+    let followup = timeout(Duration::from_secs(2), async {
+        h2_after.send_request(followup_request, false)
+    })
+    .await;
+    assert!(followup.is_ok(), "new stream attempt should fail promptly");
+    if let Ok((response_future, _send)) = followup.unwrap() {
+        let response = timeout(Duration::from_secs(2), response_future).await;
+        assert!(
+            response.is_err() || response.unwrap().is_err(),
+            "followup CONNECT should not succeed after session teardown"
+        );
+    }
+
+    let _ = release_tx.send(());
+    drop(h2_send);
+    drop(h2_recv);
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_old_channel_payment()
 {
     let (server_addr, pubkey) = start_monad_server().await;
@@ -1811,7 +2000,7 @@ async fn test_nested_tunnel() {
     let (t_addr, t_pubkey) = start_monad_server().await;
 
     // Client connects through T → S
-    let conn = connector::connect_through_chain(&[
+    let mut conn = connector::connect_through_chain(&[
         Hop {
             addr: t_addr.to_string(),
             identity: HopIdentity::Secp256k1(t_pubkey),
@@ -1825,7 +2014,7 @@ async fn test_nested_tunnel() {
     ])
     .await
     .unwrap();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     // Open a tunnel to the uppercase server (through S, via T)
@@ -1846,7 +2035,7 @@ async fn test_nested_plain_tcp_tunnel() {
     let (s_addr, s_pubkey) = start_monad_server().await;
     let (t_addr, t_pubkey) = start_monad_server().await;
 
-    let conn = connector::connect_through_chain(&[
+    let mut conn = connector::connect_through_chain(&[
         Hop {
             addr: t_addr.to_string(),
             identity: HopIdentity::Secp256k1(t_pubkey),
@@ -1860,7 +2049,7 @@ async fn test_nested_plain_tcp_tunnel() {
     ])
     .await
     .unwrap();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -1882,7 +2071,7 @@ async fn test_three_hop_tunnel() {
     let (b_addr, b_pubkey) = start_monad_server().await;
     let (c_addr, c_pubkey) = start_monad_server().await;
 
-    let conn = connector::connect_through_chain(&[
+    let mut conn = connector::connect_through_chain(&[
         Hop {
             addr: a_addr.to_string(),
             identity: HopIdentity::Secp256k1(a_pubkey),
@@ -1901,7 +2090,7 @@ async fn test_three_hop_tunnel() {
     ])
     .await
     .unwrap();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -1968,7 +2157,7 @@ async fn test_mixed_ipv4_ipv6_hops() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let conn = connector::connect_through_chain(&[
+    let mut conn = connector::connect_through_chain(&[
         Hop {
             addr: ipv4_hop_addr.to_string(),
             identity: HopIdentity::Secp256k1(ipv4_hop_pubkey),
@@ -1982,7 +2171,7 @@ async fn test_mixed_ipv4_ipv6_hops() {
     ])
     .await
     .unwrap();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -2022,14 +2211,14 @@ async fn test_quic_secp256k1_first_hop_single_hop() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_server().await;
-    let conn = connector::connect_through_chain(&[Hop {
+    let mut conn = connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
         identity: HopIdentity::Secp256k1(pubkey),
         use_quic: true,
     }])
     .await
     .unwrap();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic secp first hop").await;
@@ -2048,7 +2237,7 @@ async fn test_two_hop_quic_secp_chain() {
     let (first_addr, first_pubkey) = start_monad_server().await;
     let (second_addr, second_pubkey) = start_monad_server().await;
 
-    let conn = connector::connect_through_chain(&[
+    let mut conn = connector::connect_through_chain(&[
         Hop {
             addr: first_addr.to_string(),
             identity: HopIdentity::Secp256k1(first_pubkey),
@@ -2062,7 +2251,7 @@ async fn test_two_hop_quic_secp_chain() {
     ])
     .await
     .unwrap();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"mixed secp second hop").await;
@@ -2272,7 +2461,7 @@ async fn test_nested_quic_tunnel() {
         .await
         .unwrap();
     conn_to_t.add_driver(driver);
-    fund_session(&conn_to_t, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn_to_t, TEST_SESSION_PAYMENT).await;
     let mut h2_to_t = conn_to_t.clone_send_request().await;
 
     // Open a CONNECT tunnel to the uppercase server through T
@@ -2304,7 +2493,7 @@ async fn test_connector_quic_hop() {
     let (s_addr, s_pubkey) = start_monad_server().await;
 
     // Use the client connector with a QUIC hop (single key per hop)
-    let conn = connector::connect_through_chain(&[
+    let mut conn = connector::connect_through_chain(&[
         Hop {
             addr: s_addr.to_string(),
             identity: HopIdentity::Secp256k1(s_pubkey),
@@ -2318,7 +2507,7 @@ async fn test_connector_quic_hop() {
     ])
     .await
     .unwrap();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -2354,7 +2543,7 @@ async fn test_concurrent_quic_pool_access() {
     let mut handles = Vec::new();
     for i in 0..5 {
         handles.push(tokio::spawn(async move {
-            let conn = connector::connect_through_chain(&[
+            let mut conn = connector::connect_through_chain(&[
                 Hop {
                     addr: s_addr.to_string(),
                     identity: HopIdentity::Secp256k1(s_pubkey),
@@ -2368,7 +2557,7 @@ async fn test_concurrent_quic_pool_access() {
             ])
             .await
             .unwrap();
-            fund_session(&conn, TEST_SESSION_PAYMENT).await;
+            fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
             let mut h2 = conn.clone_send_request().await;
 
             let payload = format!("concurrent client {i}");
@@ -2396,14 +2585,14 @@ async fn test_quic_first_hop() {
     let (server_addr, pubkey) = start_monad_server().await;
 
     // Client connects directly via QUIC (use_quic on the first hop)
-    let conn = connector::connect_through_chain(&[Hop {
+    let mut conn = connector::connect_through_chain(&[Hop {
         addr: server_addr.to_string(),
         identity: HopIdentity::Secp256k1(pubkey),
         use_quic: true,
     }])
     .await
     .unwrap();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic first hop").await;
@@ -2424,7 +2613,7 @@ async fn test_quic_first_hop_then_tcp() {
     let (t_addr, t_pubkey) = start_monad_server().await;
 
     // Client connects to S via QUIC, then S forwards to T via TCP
-    let conn = connector::connect_through_chain(&[
+    let mut conn = connector::connect_through_chain(&[
         Hop {
             addr: s_addr.to_string(),
             identity: HopIdentity::Secp256k1(s_pubkey),
@@ -2438,7 +2627,7 @@ async fn test_quic_first_hop_then_tcp() {
     ])
     .await
     .unwrap();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());

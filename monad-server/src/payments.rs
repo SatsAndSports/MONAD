@@ -621,6 +621,14 @@ pub mod testing {
         pub fn new() -> Self {
             Self::default()
         }
+
+        pub fn owner_of(&self, channel_id: &str) -> Option<[u8; 32]> {
+            let inner = self.inner.lock().ok()?;
+            inner
+                .channels
+                .get(channel_id)
+                .and_then(|record| record.owner)
+        }
     }
 
     #[derive(Debug)]

@@ -28,6 +28,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Custom header name for QUIC secp256k1 transport identity in CONNECT requests.
@@ -77,6 +78,7 @@ impl SessionInner {
 pub(crate) struct SessionState {
     inner: Arc<Mutex<SessionInner>>,
     pause_tx: watch::Sender<bool>,
+    termination: CancellationToken,
     session_id: [u8; 32],
     payments: Arc<dyn RelayPayments>,
     session_registry: Arc<SessionRegistry>,
@@ -109,6 +111,7 @@ impl SessionState {
                 linked_channel_id: None,
             })),
             pause_tx,
+            termination: CancellationToken::new(),
             session_id,
             payments,
             session_registry,
@@ -161,6 +164,18 @@ impl SessionState {
 
     pub(crate) fn pause_receiver(&self) -> watch::Receiver<bool> {
         self.pause_tx.subscribe()
+    }
+
+    pub(crate) fn termination_token(&self) -> CancellationToken {
+        self.termination.clone()
+    }
+
+    pub(crate) fn terminate(&self) {
+        self.termination.cancel();
+    }
+
+    pub(crate) fn is_terminated(&self) -> bool {
+        self.termination.is_cancelled()
     }
 
     async fn is_paused(&self) -> bool {
@@ -279,9 +294,22 @@ where
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
     /// Run the accept loop: accept H2 streams and dispatch them to handlers.
     pub async fn run(mut self) -> io::Result<()> {
-        while let Some(result) = self.h2_conn.accept().await {
+        let termination = self.state.termination_token();
+        loop {
+            let result = tokio::select! {
+                _ = termination.cancelled() => break,
+                result = self.h2_conn.accept() => result,
+            };
+
+            let Some(result) = result else {
+                break;
+            };
+
             match result {
                 Ok((request, mut respond)) => {
+                    if self.state.is_terminated() {
+                        break;
+                    }
                     let method = request.method().clone();
                     let uri = request.uri().clone();
 
@@ -795,6 +823,7 @@ async fn process_session_event(
                     let _ = state.pause_tx.send_replace(paused);
                 }
                 SessionEffect::EndSession => {
+                    state.terminate();
                     terminate = true;
                 }
             }
