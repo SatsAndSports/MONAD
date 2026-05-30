@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::h2stream::H2ConnectStream;
+use crate::proxy::CleartextByteCounters;
 
 // ---------------------------------------------------------------------------
 // Shared math helpers
@@ -118,6 +119,10 @@ pub struct RelayConnection {
     session_pricing: Arc<RwLock<Option<SessionPricing>>>,
     /// Spilman mint/keyset info fetched by the client for this session.
     session_spilman_info: Arc<RwLock<Option<SessionSpilmanInfo>>>,
+    /// Client-side passive cleartext byte counters for this relay session.
+    /// Semantics intentionally mirror the relay's `session_total_in/out`
+    /// billing counters for CONNECT payload bytes.
+    cleartext_byte_counters: CleartextByteCounters,
 }
 
 impl RelayConnection {
@@ -145,6 +150,7 @@ impl RelayConnection {
             session_id,
             session_pricing: Arc::new(RwLock::new(None)),
             session_spilman_info: Arc::new(RwLock::new(None)),
+            cleartext_byte_counters: CleartextByteCounters::default(),
         };
 
         Ok((conn, driver_handle))
@@ -238,6 +244,16 @@ impl RelayConnection {
         self.session_spilman_info.clone()
     }
 
+    /// Get a snapshot of `(inbound, outbound)` client-side cleartext bytes for this session.
+    pub fn local_session_totals(&self) -> (u64, u64) {
+        self.cleartext_byte_counters.snapshot()
+    }
+
+    /// Clone the per-session cleartext byte counters for passive tracking.
+    pub fn cleartext_byte_counters(&self) -> CleartextByteCounters {
+        self.cleartext_byte_counters.clone()
+    }
+
     /// Append a driver handle from an intermediate hop in a multi-hop chain.
     pub fn add_driver(&mut self, handle: JoinHandle<()>) {
         self.driver_handles.push(handle);
@@ -307,6 +323,10 @@ impl RelayConnection {
         }
 
         let h2_recv = response.into_body();
-        Ok(H2ConnectStream::new(h2_send, h2_recv))
+        Ok(H2ConnectStream::new(
+            h2_send,
+            h2_recv,
+            Some(self.cleartext_byte_counters.clone()),
+        ))
     }
 }

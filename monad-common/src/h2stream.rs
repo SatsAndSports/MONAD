@@ -5,6 +5,7 @@
 //! CONNECT tunnel look like a plain TCP socket, so that another Noise + H2
 //! session can run on top of it.
 
+use crate::proxy::CleartextByteCounters;
 use bytes::{Buf, Bytes, BytesMut};
 use h2::{RecvStream, SendStream};
 use std::io;
@@ -19,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub struct H2ConnectStream {
     send: SendStream<Bytes>,
     recv: RecvStream,
+    accounting: Option<CleartextByteCounters>,
 
     // Read side: buffered data from H2 data frames not yet consumed by the caller.
     read_buf: BytesMut,
@@ -49,10 +51,15 @@ impl H2ConnectStream {
     /// These are typically obtained from an H2 CONNECT request:
     /// - `send` from `h2_client.send_request(connect_request, false)`
     /// - `recv` from `response.into_body()`
-    pub fn new(send: SendStream<Bytes>, recv: RecvStream) -> Self {
+    pub fn new(
+        send: SendStream<Bytes>,
+        recv: RecvStream,
+        accounting: Option<CleartextByteCounters>,
+    ) -> Self {
         Self {
             send,
             recv,
+            accounting,
             read_buf: BytesMut::new(),
             recv_done: false,
         }
@@ -74,6 +81,9 @@ impl AsyncRead for H2ConnectStream {
             let to_copy = std::cmp::min(buf.remaining(), me.read_buf.len());
             buf.put_slice(&me.read_buf[..to_copy]);
             me.read_buf.advance(to_copy);
+            if let Some(accounting) = &me.accounting {
+                accounting.note_inbound(to_copy);
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -93,6 +103,9 @@ impl AsyncRead for H2ConnectStream {
                 // Copy what we can into the caller's buffer, buffer the rest
                 let to_copy = std::cmp::min(buf.remaining(), data.len());
                 buf.put_slice(&data[..to_copy]);
+                if let Some(accounting) = &me.accounting {
+                    accounting.note_inbound(to_copy);
+                }
                 if to_copy < data.len() {
                     me.read_buf.extend_from_slice(&data[to_copy..]);
                 }
@@ -135,6 +148,9 @@ impl AsyncWrite for H2ConnectStream {
                 me.send
                     .send_data(data, false)
                     .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
+                if let Some(accounting) = &me.accounting {
+                    accounting.note_outbound(to_send);
+                }
                 Poll::Ready(Ok(to_send))
             }
             Poll::Ready(Some(Err(e))) => {

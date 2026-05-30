@@ -14,6 +14,47 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info};
 
+/// Passive per-session cleartext byte counters for a MONAD relay session.
+///
+/// Semantics mirror the relay-side `session_total_in` / `session_total_out`
+/// accounting used for billing:
+/// - `outbound`: cleartext CONNECT payload bytes sent from the client side of
+///   the session toward the target
+/// - `inbound`: cleartext CONNECT payload bytes sent from the target back
+///   toward the client
+///
+/// These counters intentionally exclude control-stream traffic and all H2 /
+/// Noise framing overhead.
+#[derive(Clone, Debug, Default)]
+pub struct CleartextByteCounters {
+    inbound: Arc<AtomicU64>,
+    outbound: Arc<AtomicU64>,
+}
+
+impl CleartextByteCounters {
+    /// Record cleartext bytes received from the target side of the relay session.
+    pub fn note_inbound(&self, bytes: usize) {
+        self.inbound.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Record cleartext bytes sent toward the target side of the relay session.
+    pub fn note_outbound(&self, bytes: usize) {
+        self.outbound.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn inbound(&self) -> u64 {
+        self.inbound.load(Ordering::Relaxed)
+    }
+
+    pub fn outbound(&self) -> u64 {
+        self.outbound.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> (u64, u64) {
+        (self.inbound(), self.outbound())
+    }
+}
+
 /// Proxy bytes bidirectionally between an H2 send/recv stream pair and a
 /// transport.
 ///
@@ -29,6 +70,7 @@ pub async fn proxy_bidirectional<T>(
     mut h2_recv: RecvStream,
     target: T,
     label: &str,
+    accounting: Option<CleartextByteCounters>,
 ) -> io::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
@@ -41,6 +83,8 @@ where
 
     let bytes_to_target_ref = bytes_to_target.clone();
     let bytes_from_target_ref = bytes_from_target.clone();
+    let accounting_to_target = accounting.clone();
+    let accounting_from_target = accounting;
 
     // H2 recv -> target write (data from H2 peer going to the target)
     let h2_to_target = async {
@@ -52,6 +96,9 @@ where
                     let _ = h2_recv.flow_control().release_capacity(len);
 
                     bytes_to_target_ref.fetch_add(len as u64, Ordering::Relaxed);
+                    if let Some(accounting) = &accounting_to_target {
+                        accounting.note_outbound(len);
+                    }
 
                     if let Err(e) = target_write.write_all(&data).await {
                         debug!("target write error: {e}");
@@ -83,6 +130,9 @@ where
                 }
                 Ok(n) => {
                     bytes_from_target_ref.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Some(accounting) = &accounting_from_target {
+                        accounting.note_inbound(n);
+                    }
 
                     let data = Bytes::copy_from_slice(&buf[..n]);
 

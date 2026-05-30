@@ -2,10 +2,9 @@
 //! between a local TCP socket and the H2 stream.
 
 use crate::socks;
-use bytes::Bytes;
-use h2::client::SendRequest;
 use http::{Method, Request, Uri};
 use monad_common::proxy::proxy_bidirectional;
+use monad_common::session::RelayConnection;
 use std::io;
 use tokio::net::TcpStream;
 use tracing::info;
@@ -16,11 +15,12 @@ use tracing::info;
 /// Sends the SOCKS5 success reply to the local client before starting the proxy.
 /// On completion, logs the total proxied bytes in each direction.
 pub async fn open_tunnel(
-    mut h2_client: SendRequest<Bytes>,
+    conn: &RelayConnection,
     target_authority: &str,
     local_stream: &mut TcpStream,
 ) -> io::Result<()> {
     info!("opening tunnel to {target_authority}");
+    let mut h2_client = conn.clone_send_request().await;
 
     // Build the CONNECT request
     let uri: Uri = target_authority
@@ -60,5 +60,12 @@ pub async fn open_tunnel(
     // Proxy data bidirectionally between the H2 stream and the local socket.
     // `&mut TcpStream` implements AsyncRead + AsyncWrite, so the shared proxy
     // function works directly without transferring ownership.
-    proxy_bidirectional(h2_send, h2_recv, &mut *local_stream, target_authority).await
+    proxy_bidirectional(
+        h2_send,
+        h2_recv,
+        &mut *local_stream,
+        target_authority,
+        Some(conn.cleartext_byte_counters()),
+    )
+    .await
 }

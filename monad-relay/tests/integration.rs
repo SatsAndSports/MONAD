@@ -17,6 +17,7 @@ use h2::client;
 use http::{Method, Request};
 use monad_client::connector::{self, Hop, HopIdentity};
 use monad_client::session_driver::start_session_payment_driver;
+use monad_client::tunnel;
 use monad_client::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise_secp256k1;
@@ -416,6 +417,33 @@ async fn connect_nested_session(
     conn
 }
 
+async fn connect_nested_session_quic(
+    parent_conn: &RelayConnection,
+    next_hop_addr: &str,
+    next_hop_pubkey: &Secp256k1Pubkey,
+) -> RelayConnection {
+    let mut stream = parent_conn
+        .open_tunnel_quic_secp256k1(next_hop_addr, &next_hop_pubkey.to_hex())
+        .await
+        .unwrap();
+    let (send_cipher, recv_cipher, session_id) =
+        noise_secp256k1::handshake_initiator(&mut stream, next_hop_pubkey)
+            .await
+            .unwrap();
+    let noise_stream = noise_secp256k1::SecpNoiseStream::new(
+        stream,
+        send_cipher,
+        recv_cipher,
+        session_id,
+        format!("nested quic session to {next_hop_addr}"),
+    );
+    let (mut conn, driver) = RelayConnection::from_transport_stream(noise_stream, session_id)
+        .await
+        .unwrap();
+    conn.add_driver(driver);
+    conn
+}
+
 async fn connect_client_quic_secp_funded(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
@@ -469,6 +497,39 @@ async fn read_control_message(h2_recv: &mut h2::RecvStream) -> ServerMessage {
     }
 }
 
+async fn request_session_status(
+    h2_send: &mut h2::SendStream<Bytes>,
+    h2_recv: &mut h2::RecvStream,
+) -> (u64, u64, u64, i64, bool) {
+    send_control_message(h2_send, &ClientMessage::GetSessionStatus, false).await;
+    expect_session_status(read_control_message(h2_recv).await)
+}
+
+type SessionStatusTuple = (u64, u64, u64, i64, bool);
+
+async fn wait_for_session_totals(
+    h2_send: &mut h2::SendStream<Bytes>,
+    h2_recv: &mut h2::RecvStream,
+    expected_in: u64,
+    expected_out: u64,
+) -> Result<SessionStatusTuple, String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+
+    loop {
+        let status = request_session_status(h2_send, h2_recv).await;
+        if status.0 == expected_in && status.1 == expected_out {
+            return Ok(status);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            let (actual_in, actual_out, _paid, remaining, paused) = status;
+            return Err(format!(
+                "timed out waiting for session totals: expected in={expected_in} out={expected_out}, got in={actual_in} out={actual_out} remaining={remaining} paused={paused}"
+            ));
+        }
+    }
+}
+
 fn expect_session_status(message: ServerMessage) -> (u64, u64, u64, i64, bool) {
     match message {
         ServerMessage::SessionStatus {
@@ -515,7 +576,10 @@ async fn control_handshake(
     expect_session_status(message)
 }
 
-async fn fund_session(conn: &mut RelayConnection, milli_sats: u64) {
+async fn open_funded_control(
+    conn: &RelayConnection,
+    milli_sats: u64,
+) -> (h2::SendStream<Bytes>, h2::RecvStream) {
     let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
 
     let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
@@ -527,10 +591,16 @@ async fn fund_session(conn: &mut RelayConnection, milli_sats: u64) {
     assert_eq!(paid1, 0);
     assert_eq!(rem1, 0);
     assert!(paused1);
-    let (_in1, _out1, _paid1, rem1, paused1) =
+    let (_in2, _out2, _paid2, rem2, paused2) =
         channel.pay(&mut h2_send, &mut h2_recv, milli_sats).await;
-    assert!(!paused1, "session should unpause after funding");
-    assert_eq!(rem1, milli_sats as i64);
+    assert!(!paused2, "session should unpause after funding");
+    assert_eq!(rem2, milli_sats as i64);
+
+    (h2_send, h2_recv)
+}
+
+async fn fund_session(conn: &mut RelayConnection, milli_sats: u64) {
+    let (h2_send, h2_recv) = open_funded_control(conn, milli_sats).await;
 
     let keepalive = tokio::spawn(async move {
         let mut send = h2_send;
@@ -2080,6 +2150,157 @@ async fn test_funded_data_channel() {
     conn.shutdown().await;
 }
 
+#[tokio::test]
+async fn test_client_cleartext_accounting_matches_relay_single_hop() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) =
+        open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
+
+    let mut tunnel = conn.open_tunnel(&upper_addr.to_string()).await.unwrap();
+    tunnel
+        .write_all(b"hello single-hop accounting")
+        .await
+        .unwrap();
+    tunnel.shutdown().await.unwrap();
+
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"HELLO SINGLE-HOP ACCOUNTING");
+
+    let (expected_in, expected_out) = conn.local_session_totals();
+    assert_eq!(expected_out, b"hello single-hop accounting".len() as u64);
+    assert_eq!(expected_in, b"HELLO SINGLE-HOP ACCOUNTING".len() as u64);
+
+    let (session_total_in, session_total_out, _paid, _remaining, _paused) =
+        wait_for_session_totals(
+            &mut control_send,
+            &mut control_recv,
+            expected_in,
+            expected_out,
+        )
+        .await
+        .expect("single-hop QUIC accounting should converge to exact totals");
+    assert_eq!(session_total_in, expected_in);
+    assert_eq!(session_total_out, expected_out);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_client_cleartext_accounting_matches_relay_single_hop_tcp() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_tcp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) =
+        open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
+
+    let mut tunnel = conn.open_tunnel(&upper_addr.to_string()).await.unwrap();
+    tunnel.write_all(b"hello tcp accounting").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"HELLO TCP ACCOUNTING");
+
+    let (expected_in, expected_out) = conn.local_session_totals();
+    assert_eq!(expected_out, b"hello tcp accounting".len() as u64);
+    assert_eq!(expected_in, b"HELLO TCP ACCOUNTING".len() as u64);
+
+    let (session_total_in, session_total_out, _paid, _remaining, _paused) =
+        wait_for_session_totals(
+            &mut control_send,
+            &mut control_recv,
+            expected_in,
+            expected_out,
+        )
+        .await
+        .expect("single-hop TCP accounting should converge to exact totals");
+    assert_eq!(session_total_in, expected_in);
+    assert_eq!(session_total_out, expected_out);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_client_cleartext_accounting_aggregates_multiple_tunnels() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) =
+        open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
+
+    let payload_a = b"first aggregate tunnel".to_vec();
+    let payload_b = b"second aggregate".to_vec();
+    let target = upper_addr.to_string();
+
+    let mut tunnel_a = conn.open_tunnel(&target).await.unwrap();
+    let mut tunnel_b = conn.open_tunnel(&target).await.unwrap();
+
+    let task_a = tokio::spawn(async move {
+        tunnel_a.write_all(&payload_a).await.unwrap();
+        tunnel_a.shutdown().await.unwrap();
+        let mut result = Vec::new();
+        tunnel_a.read_to_end(&mut result).await.unwrap();
+        result
+    });
+    let task_b = tokio::spawn(async move {
+        tunnel_b.write_all(&payload_b).await.unwrap();
+        tunnel_b.shutdown().await.unwrap();
+        let mut result = Vec::new();
+        tunnel_b.read_to_end(&mut result).await.unwrap();
+        result
+    });
+
+    let result_a = task_a.await.unwrap();
+    let result_b = task_b.await.unwrap();
+    assert_eq!(result_a, b"FIRST AGGREGATE TUNNEL");
+    assert_eq!(result_b, b"SECOND AGGREGATE");
+
+    let (expected_in, expected_out) = conn.local_session_totals();
+    assert_eq!(
+        expected_out,
+        (b"first aggregate tunnel".len() + b"second aggregate".len()) as u64
+    );
+    assert_eq!(
+        expected_in,
+        (b"FIRST AGGREGATE TUNNEL".len() + b"SECOND AGGREGATE".len()) as u64
+    );
+
+    let (session_total_in, session_total_out, _paid, _remaining, _paused) =
+        wait_for_session_totals(
+            &mut control_send,
+            &mut control_recv,
+            expected_in,
+            expected_out,
+        )
+        .await
+        .expect("multi-stream accounting should converge to aggregate totals");
+    assert_eq!(session_total_in, expected_in);
+    assert_eq!(session_total_out, expected_out);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+}
+
 /// Test two data tunnels simultaneously through the same H2 connection.
 #[tokio::test]
 async fn test_multiple_tunnels() {
@@ -2177,6 +2398,196 @@ async fn test_nested_tunnel() {
     assert_eq!(result, b"NESTED HELLO");
 
     drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_client_cleartext_accounting_matches_relay_nested_sessions() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (child_addr, child_pubkey) = start_monad_relay().await;
+    let (parent_addr, parent_pubkey) = start_monad_relay().await;
+
+    let parent_conn = connect_client_quic_secp(parent_addr, &parent_pubkey).await;
+    let (mut parent_control_send, mut parent_control_recv) =
+        open_funded_control(&parent_conn, TEST_SESSION_PAYMENT).await;
+
+    let child_conn =
+        connect_nested_session(&parent_conn, &child_addr.to_string(), &child_pubkey).await;
+    let (mut child_control_send, mut child_control_recv) =
+        open_funded_control(&child_conn, TEST_SESSION_PAYMENT).await;
+
+    let mut tunnel = child_conn
+        .open_tunnel(&upper_addr.to_string())
+        .await
+        .unwrap();
+    tunnel.write_all(b"nested accounting").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"NESTED ACCOUNTING");
+
+    let (child_expected_in, child_expected_out) = child_conn.local_session_totals();
+    assert_eq!(child_expected_out, b"nested accounting".len() as u64);
+    assert_eq!(child_expected_in, b"NESTED ACCOUNTING".len() as u64);
+
+    let (child_session_total_in, child_session_total_out, _paid, _remaining, _paused) =
+        wait_for_session_totals(
+            &mut child_control_send,
+            &mut child_control_recv,
+            child_expected_in,
+            child_expected_out,
+        )
+        .await
+        .expect("nested child TCP accounting should converge to exact totals");
+    assert_eq!(child_session_total_in, child_expected_in);
+    assert_eq!(child_session_total_out, child_expected_out);
+
+    let (parent_expected_in, parent_expected_out) = parent_conn.local_session_totals();
+    let (parent_session_total_in, parent_session_total_out, _paid, _remaining, _paused) =
+        wait_for_session_totals(
+            &mut parent_control_send,
+            &mut parent_control_recv,
+            parent_expected_in,
+            parent_expected_out,
+        )
+        .await
+        .expect("nested parent TCP accounting should converge to exact totals");
+    assert_eq!(parent_session_total_in, parent_expected_in);
+    assert_eq!(parent_session_total_out, parent_expected_out);
+
+    let _ = child_control_send.send_data(Bytes::new(), true);
+    let _ = parent_control_send.send_data(Bytes::new(), true);
+    drop(child_control_send);
+    drop(child_control_recv);
+    drop(parent_control_send);
+    drop(parent_control_recv);
+    child_conn.shutdown().await;
+    parent_conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_client_cleartext_accounting_matches_relay_nested_quic_sessions() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (child_addr, child_pubkey) = start_monad_relay().await;
+    let (parent_addr, parent_pubkey) = start_monad_relay().await;
+
+    let parent_conn = connect_client_quic_secp(parent_addr, &parent_pubkey).await;
+    let (mut parent_control_send, mut parent_control_recv) =
+        open_funded_control(&parent_conn, TEST_SESSION_PAYMENT).await;
+
+    let child_conn =
+        connect_nested_session_quic(&parent_conn, &child_addr.to_string(), &child_pubkey).await;
+    let (mut child_control_send, mut child_control_recv) =
+        open_funded_control(&child_conn, TEST_SESSION_PAYMENT).await;
+
+    let mut tunnel = child_conn
+        .open_tunnel(&upper_addr.to_string())
+        .await
+        .unwrap();
+    tunnel.write_all(b"nested quic accounting").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"NESTED QUIC ACCOUNTING");
+
+    let (child_expected_in, child_expected_out) = child_conn.local_session_totals();
+    assert_eq!(child_expected_out, b"nested quic accounting".len() as u64);
+    assert_eq!(child_expected_in, b"NESTED QUIC ACCOUNTING".len() as u64);
+
+    let (child_session_total_in, child_session_total_out, _paid, _remaining, _paused) =
+        wait_for_session_totals(
+            &mut child_control_send,
+            &mut child_control_recv,
+            child_expected_in,
+            child_expected_out,
+        )
+        .await
+        .expect("nested child QUIC accounting should converge to exact totals");
+    assert_eq!(child_session_total_in, child_expected_in);
+    assert_eq!(child_session_total_out, child_expected_out);
+
+    let (parent_expected_in, parent_expected_out) = parent_conn.local_session_totals();
+    let (parent_session_total_in, parent_session_total_out, _paid, _remaining, _paused) =
+        wait_for_session_totals(
+            &mut parent_control_send,
+            &mut parent_control_recv,
+            parent_expected_in,
+            parent_expected_out,
+        )
+        .await
+        .expect("nested parent QUIC accounting should converge to exact totals");
+    assert_eq!(parent_session_total_in, parent_expected_in);
+    assert_eq!(parent_session_total_out, parent_expected_out);
+
+    let _ = child_control_send.send_data(Bytes::new(), true);
+    let _ = parent_control_send.send_data(Bytes::new(), true);
+    drop(child_control_send);
+    drop(child_control_recv);
+    drop(parent_control_send);
+    drop(parent_control_recv);
+    child_conn.shutdown().await;
+    parent_conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_client_tunnel_helper_updates_session_accounting() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) =
+        open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
+
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local_listener.local_addr().unwrap();
+    let local_peer = tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+        let mut socks_reply = [0u8; 10];
+        stream.read_exact(&mut socks_reply).await.unwrap();
+        assert_eq!(socks_reply, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        stream.write_all(b"helper path payload").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut result = Vec::new();
+        stream.read_to_end(&mut result).await.unwrap();
+        result
+    });
+
+    let (mut accepted, _) = local_listener.accept().await.unwrap();
+    tunnel::open_tunnel(&conn, &upper_addr.to_string(), &mut accepted)
+        .await
+        .unwrap();
+    let result = local_peer.await.unwrap();
+    assert_eq!(result, b"HELPER PATH PAYLOAD");
+
+    let (expected_in, expected_out) = conn.local_session_totals();
+    assert_eq!(expected_out, b"helper path payload".len() as u64);
+    assert_eq!(expected_in, b"HELPER PATH PAYLOAD".len() as u64);
+
+    let (session_total_in, session_total_out, _paid, _remaining, _paused) =
+        wait_for_session_totals(
+            &mut control_send,
+            &mut control_recv,
+            expected_in,
+            expected_out,
+        )
+        .await
+        .expect("tunnel helper accounting should converge to exact totals");
+    assert_eq!(session_total_in, expected_in);
+    assert_eq!(session_total_out, expected_out);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
     conn.shutdown().await;
 }
 
@@ -2594,7 +3005,7 @@ async fn test_nested_quic_tunnel() {
     // Wrap it as an H2ConnectStream, do a Noise handshake to T, run H2.
     let h2_recv_from_t = response.into_body();
     let h2_connect_stream =
-        monad_common::h2stream::H2ConnectStream::new(h2_send_to_t, h2_recv_from_t);
+        monad_common::h2stream::H2ConnectStream::new(h2_send_to_t, h2_recv_from_t, None);
 
     // secp Noise handshake to T (nested inside the QUIC-forwarded tunnel)
     let mut stream = h2_connect_stream;
