@@ -43,11 +43,6 @@ pub enum ClientMessage {
     ///
     /// The payload is a serialized `cdk_spilman::Payment` JSON object.
     ChannelPayment { payment_json: String },
-    /// Add fake credit to the current relay session.
-    ///
-    /// Temporary compatibility path while the CLI is still being migrated to
-    /// real Spilman `ChannelLink` / `ChannelPayment` control flow.
-    FakePayment { milli_sats: u64 },
     /// Request a fresh session status snapshot.
     GetSessionStatus,
 }

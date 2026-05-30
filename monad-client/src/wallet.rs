@@ -106,6 +106,12 @@ pub trait MonadWallet: Send + Sync + 'static {
 
     fn mark_channel_unusable(&self, channel_id: &str) -> Result<(), WalletError>;
 
+    fn provision_channel(
+        &self,
+        offer: &RelayPaymentOffer,
+        capacity_msats: u64,
+    ) -> Result<String, WalletError>;
+
     fn build_link_request(
         &self,
         channel_id: &str,
@@ -168,6 +174,7 @@ pub struct MockWallet {
 #[derive(Debug, Default)]
 struct MockWalletInner {
     channels: BTreeMap<String, StoredChannel>,
+    next_channel_number: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -429,6 +436,53 @@ impl MonadWallet for MockWallet {
         stored.channel.state = WalletChannelState::Closing;
         stored.channel.attached_session_id = None;
         Ok(())
+    }
+
+    fn provision_channel(
+        &self,
+        offer: &RelayPaymentOffer,
+        capacity_msats: u64,
+    ) -> Result<String, WalletError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| WalletError::Backend("wallet mutex poisoned".to_string()))?;
+        let channel_number = inner.next_channel_number;
+        inner.next_channel_number = inner.next_channel_number.saturating_add(1);
+        let channel_id = format!("mock-chan-{channel_number}");
+        let keyset_id = offer.accepted_keyset_ids.first().cloned().ok_or_else(|| {
+            WalletError::OfferMismatch("offer has no accepted keysets".to_string())
+        })?;
+        let channel = WalletChannel {
+            channel_id: channel_id.clone(),
+            state: WalletChannelState::Open,
+            receiver_pubkey: offer.receiver_pubkey.clone(),
+            mint_url: offer.mint_url.clone(),
+            unit: offer.unit.clone(),
+            keyset_id,
+            attached_session_id: None,
+            capacity_msats,
+            current_signed_balance_msats: 0,
+        };
+        let (capacity_raw, signed_balance_raw, signed_balance_msats) =
+            raw_amounts_for_channel(&channel, channel.current_signed_balance_msats)?;
+        inner.channels.insert(
+            channel_id.clone(),
+            StoredChannel {
+                channel: WalletChannel {
+                    current_signed_balance_msats: signed_balance_msats,
+                    ..channel
+                },
+                capacity_raw,
+                current_signed_balance_raw: signed_balance_raw,
+                next_link_invalid: false,
+                next_link_wrong_receiver: false,
+                next_payment_invalid: false,
+                last_link_payload: None,
+                last_payment_payload: None,
+            },
+        );
+        Ok(channel_id)
     }
 
     fn build_link_request(
@@ -802,5 +856,18 @@ mod tests {
                 capacity: 10_000,
             }
         );
+    }
+
+    #[test]
+    fn provisioned_channel_matches_offer() {
+        let wallet = MockWallet::new();
+        let channel_id = wallet.provision_channel(&offer("sat"), 12_000).unwrap();
+        let channel = wallet.get_channel(&channel_id).unwrap();
+
+        assert_eq!(channel.receiver_pubkey, "receiver");
+        assert_eq!(channel.mint_url, "https://mint");
+        assert_eq!(channel.unit, "sat");
+        assert_eq!(channel.keyset_id, "keyset-a");
+        assert_eq!(channel.capacity_msats, 12_000);
     }
 }

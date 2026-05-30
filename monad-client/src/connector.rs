@@ -5,18 +5,18 @@
 //! Two hops:     TCP → Noise(T) → H2 → CONNECT(S) → Noise(S) → H2
 //! N hops:       Each hop wraps the previous one via H2ConnectStream.
 
-use crate::control;
+use crate::session_driver;
+use crate::wallet::{MockWallet, MonadWallet};
 use monad_common::noise_secp256k1;
 use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::RelayConnection;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
 use monad_quic::stream::{open_monad_stream_with_kind, STREAM_KIND_SECP_NOISE};
 use std::io;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::info;
-
-const INTERMEDIATE_FAKE_PAYMENT_MILLISATS: u64 = 10_000_000;
 
 /// A hop identity for transport authentication.
 #[derive(Debug, Clone)]
@@ -83,6 +83,7 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
     }
 
     let first = &hops[0];
+    let wallet: Arc<dyn MonadWallet> = Arc::new(MockWallet::new());
 
     if first.use_quic {
         // Connect to the first hop via QUIC
@@ -120,14 +121,14 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
         let quic_stream = open_monad_stream_with_kind(&conn, STREAM_KIND_SECP_NOISE).await?;
         info!("QUIC connected to {}", first.addr);
 
-        chain_from_stream(quic_stream, hops, 0).await
+        chain_from_stream(quic_stream, hops, 0, wallet).await
     } else {
         // Connect to the first hop via TCP
         info!("connecting to first hop: {}", first.addr);
         let tcp_stream = TcpStream::connect(&first.addr).await?;
         info!("TCP connected to {}", first.addr);
 
-        chain_from_stream(tcp_stream, hops, 0).await
+        chain_from_stream(tcp_stream, hops, 0, wallet).await
     }
 }
 
@@ -142,12 +143,14 @@ fn chain_from_stream<S>(
     mut stream: S,
     hops: &[Hop],
     hop_idx: usize,
+    wallet: Arc<dyn MonadWallet>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<RelayConnection>> + Send>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Clone what we need since we're moving into a boxed future
     let hops = hops.to_vec();
+    let wallet = wallet.clone();
 
     Box::pin(async move {
         let hop = &hops[hop_idx];
@@ -184,7 +187,7 @@ where
         if hop_idx < hops.len() - 1 {
             let hop_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
             let (control_task, ready_rx) =
-                control::start_control_task(&conn, INTERMEDIATE_FAKE_PAYMENT_MILLISATS, &hop_label)
+                session_driver::start_session_payment_driver(&conn, wallet.clone(), &hop_label)
                     .await?;
             ready_rx.await.map_err(|_| {
                 io::Error::new(
@@ -216,7 +219,8 @@ where
 
             // Recurse: perform Noise + H2 over this tunnel for the next hop.
             // Attach this hop's driver to the final connection.
-            let mut next_conn = chain_from_stream(h2_connect_stream, &hops, hop_idx + 1).await?;
+            let mut next_conn =
+                chain_from_stream(h2_connect_stream, &hops, hop_idx + 1, wallet.clone()).await?;
             next_conn.add_driver(driver);
             next_conn.add_task(control_task);
             Ok(next_conn)

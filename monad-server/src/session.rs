@@ -167,12 +167,6 @@ impl SessionState {
         self.session_registry.deregister(&self.session_id);
     }
 
-    async fn apply_fake_payment(&self, milli_sats: u64) {
-        let mut inner = self.inner.lock().await;
-        inner.total_paid_millisats = inner.total_paid_millisats.saturating_add(milli_sats);
-        self.refresh_pause_state(&mut inner);
-    }
-
     async fn apply_channel_link(&self, payment_json: &str) -> Result<LinkOutcome, LinkError> {
         let outcome = self.payments.link_channel(self.session_id, payment_json)?;
 
@@ -692,13 +686,6 @@ async fn handle_control_stream(
                                 Ok(ClientMessage::GetSessionStatus) => {
                                     let status = state.session_status_message(negotiated_version).await;
                                     send_control_message(&mut h2_send, &status).await?;
-                                }
-                                Ok(ClientMessage::FakePayment { milli_sats }) => {
-                                    state.apply_fake_payment(milli_sats).await;
-                                    state.push_status().await;
-                                    debug!(
-                                        "fake payment accepted: added={milli_sats}"
-                                    );
                                 }
                                 Ok(ClientMessage::ChannelLink { payment_json }) => {
                                     match state.apply_channel_link(&payment_json).await {

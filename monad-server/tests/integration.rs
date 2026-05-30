@@ -26,7 +26,9 @@ use monad_common::session::RelayConnection;
 
 use cdk_spilman_test_mint::{build_router, build_test_mint, TestMintConfig};
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
-use monad_server::listener::{discover_spilman_mint_cache, run_with_payments, ServerConfig};
+use monad_server::listener::{
+    discover_spilman_mint_cache, run_with_payments, ServerConfig, SpilmanMintCache,
+};
 use monad_server::payments::testing::InMemoryRelayPayments;
 use monad_server::quic_pool::QuicPool;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +42,9 @@ use tokio::time::{timeout, Duration};
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
 const TEST_CHANNEL_CAPACITY_UNITS: u64 = u64::MAX / 4096;
 const MAX_SHARED_BIND_RETRIES: usize = 32;
+const SYNTHETIC_TEST_MINT_URL: &str = "https://test-mint.invalid";
+const SYNTHETIC_TEST_MINT_UNIT: &str = "msat";
+const SYNTHETIC_TEST_KEYSET_ID: &str = "00testkeyset0000";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -162,10 +167,52 @@ async fn bind_tcp_and_quic_on_same_port(
     }))
 }
 
+fn synthetic_test_mint_cache() -> SpilmanMintCache {
+    let mut advertised = BTreeMap::new();
+    advertised.insert(
+        SYNTHETIC_TEST_MINT_URL.to_string(),
+        BTreeMap::from([(
+            SYNTHETIC_TEST_MINT_UNIT.to_string(),
+            vec![SYNTHETIC_TEST_KEYSET_ID.to_string()],
+        )]),
+    );
+    SpilmanMintCache {
+        advertised,
+        keyset_info_json_by_mint: BTreeMap::new(),
+    }
+}
+
 /// Spin up a MONAD server and return (server_addr, secp256k1 pubkey).
 async fn start_monad_server() -> (std::net::SocketAddr, Secp256k1Pubkey) {
-    use cashu::nuts::SecretKey;
-    start_monad_server_with_spilman(BTreeMap::new(), SecretKey::generate()).await
+    let identity = QuicCertIdentity::generate().unwrap();
+    let transport_key = SecpTransportKeypair::generate();
+    let pubkey = transport_key.pubkey();
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let (listener, quic_endpoint, addr) =
+        bind_tcp_and_quic_on_same_port("127.0.0.1:0".parse().unwrap(), quic_server_config)
+            .await
+            .unwrap();
+
+    let config = Arc::new(ServerConfig {
+        identity,
+        transport_key: Some(transport_key),
+        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
+        trusted_mint_units: BTreeMap::new(),
+    });
+    let payments = Arc::new(InMemoryRelayPayments::new());
+    let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
+
+    tokio::spawn(run_with_payments(
+        listener,
+        Some(quic_endpoint),
+        config,
+        payments,
+        synthetic_mint_cache,
+    ));
+
+    (addr, pubkey)
 }
 
 /// Spin up a MONAD server with explicit Spilman advertisement config.
@@ -257,20 +304,15 @@ async fn start_monad_server_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Sec
         payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
     });
-
-    let discovered_spilman_mint_cache = Arc::new(
-        discover_spilman_mint_cache(&config.trusted_mint_units)
-            .await
-            .unwrap(),
-    );
     let payments = Arc::new(InMemoryRelayPayments::new());
+    let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
 
     tokio::spawn(run_with_payments(
         listener,
         Some(quic_endpoint),
         config,
         payments,
-        discovered_spilman_mint_cache,
+        synthetic_mint_cache,
     ));
 
     Some((addr, pubkey))

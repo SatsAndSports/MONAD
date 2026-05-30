@@ -15,6 +15,7 @@ use crate::wallet::{select_channel, MonadWallet, RelayPaymentOffer, WalletChanne
 
 const CLIENT_VERSION: u8 = 0;
 const TARGET_TOPUP_BUFFER_MSATS: u64 = 10_000_000;
+const DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS: u64 = 100_000_000;
 
 fn encode_client_message(message: &ClientMessage) -> io::Result<Bytes> {
     let bytes =
@@ -243,38 +244,31 @@ async fn maybe_progress_session(
             )
             .map_err(io_wallet_error)?
             else {
-                warn!(
-                    "{} no selectable channel matched relay advertisements; session stays paused",
-                    config.hop_label
-                );
+                let Some(offer) = snapshot.advertisements.first().map(|advertisement| {
+                    RelayPaymentOffer::from_advertisement(
+                        snapshot.receiver_pubkey.clone(),
+                        advertisement,
+                    )
+                }) else {
+                    warn!(
+                        "{} no relay advertisements available; session stays paused",
+                        config.hop_label
+                    );
+                    return Ok(());
+                };
+                let provisioned_channel_id = config
+                    .wallet
+                    .provision_channel(&offer, DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS)
+                    .map_err(io_wallet_error)?;
+                let channel = config
+                    .wallet
+                    .get_channel(&provisioned_channel_id)
+                    .map_err(io_wallet_error)?;
+                attach_and_link_selected_channel(config, state, h2_send, channel, offer).await?;
                 return Ok(());
             };
-
-            config
-                .wallet
-                .attach_channel_to_session(&channel.channel_id, config.session_id)
-                .map_err(io_wallet_error)?;
-            match config
-                .wallet
-                .build_link_request(&channel.channel_id, &offer)
-            {
-                Ok(payment_json) => {
-                    state.active_channel_id = Some(channel.channel_id.clone());
-                    state.active_offer = Some(offer);
-                    return send_control_message(
-                        h2_send,
-                        &ClientMessage::ChannelLink { payment_json },
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    config
-                        .wallet
-                        .detach_channel_from_session(&channel.channel_id, config.session_id)
-                        .map_err(io_wallet_error)?;
-                    return Err(io_wallet_error(err));
-                }
-            }
+            attach_and_link_selected_channel(config, state, h2_send, channel, offer).await?;
+            return Ok(());
         }
 
         let Some(active_channel_id) = state.active_channel_id.clone() else {
@@ -340,6 +334,36 @@ async fn maybe_progress_session(
 
         return send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json })
             .await;
+    }
+}
+
+async fn attach_and_link_selected_channel(
+    config: &SessionDriverConfig,
+    state: &mut SessionDriverState,
+    h2_send: &mut h2::SendStream<Bytes>,
+    channel: WalletChannel,
+    offer: RelayPaymentOffer,
+) -> io::Result<()> {
+    config
+        .wallet
+        .attach_channel_to_session(&channel.channel_id, config.session_id)
+        .map_err(io_wallet_error)?;
+    match config
+        .wallet
+        .build_link_request(&channel.channel_id, &offer)
+    {
+        Ok(payment_json) => {
+            state.active_channel_id = Some(channel.channel_id.clone());
+            state.active_offer = Some(offer);
+            send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await
+        }
+        Err(err) => {
+            config
+                .wallet
+                .detach_channel_from_session(&channel.channel_id, config.session_id)
+                .map_err(io_wallet_error)?;
+            Err(io_wallet_error(err))
+        }
     }
 }
 
