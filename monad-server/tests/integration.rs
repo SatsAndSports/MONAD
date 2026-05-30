@@ -15,6 +15,8 @@ use bytes::Bytes;
 use h2::client;
 use http::{Method, Request};
 use monad_client::connector::{self, Hop, HopIdentity};
+use monad_client::session_driver::start_session_payment_driver;
+use monad_client::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise_secp256k1;
 use monad_common::protocol::{ClientMessage, ServerMessage};
@@ -22,6 +24,7 @@ use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
+use cdk_spilman_test_mint::{build_router, build_test_mint, TestMintConfig};
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
 use monad_server::listener::{discover_spilman_mint_cache, run_with_payments, ServerConfig};
 use monad_server::payments::testing::InMemoryRelayPayments;
@@ -204,6 +207,31 @@ async fn start_monad_server_with_spilman(
     ));
 
     (addr, pubkey)
+}
+
+async fn start_http_test_mint() -> (String, String, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = TestMintConfig::for_port(addr.port());
+    let mint = Arc::new(build_test_mint(&config).await.unwrap());
+    let router = build_router(Arc::clone(&mint)).await.unwrap();
+    let keyset_id = mint
+        .get_active_keysets()
+        .get(&cashu::nuts::CurrencyUnit::Sat)
+        .unwrap()
+        .to_string();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        mint.stop().await.unwrap();
+    });
+
+    (config.base_url, keyset_id, shutdown_tx)
 }
 
 /// Spin up a MONAD server bound to a specific address and return (server_addr, secp256k1 pubkey).
@@ -491,7 +519,7 @@ impl SessionPaymentChannel {
 
         match read_control_message(h2_recv).await {
             ServerMessage::SessionStatus {
-                linked_channel_id,
+                linked_channel,
                 session_total_in,
                 session_total_out,
                 total_paid_millisats,
@@ -499,7 +527,11 @@ impl SessionPaymentChannel {
                 paused,
                 ..
             } => {
-                assert_eq!(linked_channel_id.as_deref(), Some(self.channel_id.as_str()));
+                let linked_channel = linked_channel.expect("linked channel status after link");
+                assert_eq!(linked_channel.channel_id, self.channel_id);
+                assert_eq!(linked_channel.balance_raw, 0);
+                assert_eq!(linked_channel.capacity_raw, self.capacity_units());
+                assert_eq!(linked_channel.unit, self.unit);
                 (
                     session_total_in,
                     session_total_out,
@@ -540,7 +572,31 @@ impl SessionPaymentChannel {
         )
         .await;
 
-        expect_session_status(read_control_message(h2_recv).await)
+        match read_control_message(h2_recv).await {
+            ServerMessage::SessionStatus {
+                linked_channel,
+                session_total_in,
+                session_total_out,
+                total_paid_millisats,
+                remaining_milli_sats,
+                paused,
+                ..
+            } => {
+                let linked_channel = linked_channel.expect("linked channel status after payment");
+                assert_eq!(linked_channel.channel_id, self.channel_id);
+                assert_eq!(linked_channel.balance_raw, self.cumulative_balance_units);
+                assert_eq!(linked_channel.capacity_raw, self.capacity_units());
+                assert_eq!(linked_channel.unit, self.unit);
+                (
+                    session_total_in,
+                    session_total_out,
+                    total_paid_millisats,
+                    remaining_milli_sats,
+                    paused,
+                )
+            }
+            other => panic!("expected SessionStatus after payment, got {other:?}"),
+        }
     }
 }
 
@@ -584,6 +640,25 @@ async fn tunnel_roundtrip(
     }
 
     result
+}
+
+fn mock_wallet_channel(
+    channel_id: &str,
+    receiver_pubkey: String,
+    mint_url: String,
+    keyset_id: String,
+) -> WalletChannel {
+    WalletChannel {
+        channel_id: channel_id.to_string(),
+        state: WalletChannelState::Open,
+        receiver_pubkey,
+        mint_url,
+        unit: "sat".to_string(),
+        keyset_id,
+        attached_session_id: None,
+        capacity_msats: 20_000_000,
+        current_signed_balance_msats: 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,13 +805,13 @@ async fn test_non_zero_channel_link_is_rejected_and_does_not_link_session() {
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::SessionStatus {
-            linked_channel_id,
+            linked_channel,
             total_paid_millisats,
             remaining_milli_sats,
             paused,
             ..
         } => {
-            assert_eq!(linked_channel_id, None);
+            assert_eq!(linked_channel, None);
             assert_eq!(total_paid_millisats, 0);
             assert_eq!(remaining_milli_sats, 0);
             assert!(paused);
@@ -789,13 +864,13 @@ async fn test_unsupported_unit_channel_link_is_rejected_and_does_not_link_sessio
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::SessionStatus {
-            linked_channel_id,
+            linked_channel,
             total_paid_millisats,
             remaining_milli_sats,
             paused,
             ..
         } => {
-            assert_eq!(linked_channel_id, None);
+            assert_eq!(linked_channel, None);
             assert_eq!(total_paid_millisats, 0);
             assert_eq!(remaining_milli_sats, 0);
             assert!(paused);
@@ -891,13 +966,18 @@ async fn test_channel_payment_with_funding_payload_is_rejected_and_state_is_unch
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::SessionStatus {
-            linked_channel_id,
+            linked_channel,
             total_paid_millisats,
             remaining_milli_sats,
             paused,
             ..
         } => {
-            assert_eq!(linked_channel_id.as_deref(), Some("chan-funded-payload"));
+            assert_eq!(
+                linked_channel
+                    .as_ref()
+                    .map(|channel| channel.channel_id.as_str()),
+                Some("chan-funded-payload")
+            );
             assert_eq!(total_paid_millisats, 50);
             assert_eq!(remaining_milli_sats, 50);
             assert!(!paused);
@@ -912,6 +992,187 @@ async fn test_channel_payment_with_funding_payload_is_rejected_and_state_is_unch
     drop(control_recv);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_session_payment_driver_links_unpauses_and_allows_data_flow() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
+    let (server_addr, pubkey) =
+        start_monad_server_with_spilman(trusted_mint_units, payment_receiver_secret).await;
+
+    let wallet = Arc::new(MockWallet::new());
+    wallet
+        .insert_channel(mock_wallet_channel(
+            "driver-chan",
+            receiver_pubkey,
+            mint_url,
+            keyset_id,
+        ))
+        .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (driver_handle, ready_rx) = start_session_payment_driver(
+        &conn,
+        wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "integration hop",
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("driver should ready")
+        .expect("driver ready signal");
+
+    let mut h2 = conn.clone_send_request().await;
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2, &target, b"wallet flow").await;
+    assert_eq!(result, b"WALLET FLOW");
+    assert!(wallet.last_link_payload("driver-chan").unwrap().is_some());
+    assert!(wallet
+        .last_payment_payload("driver-chan")
+        .unwrap()
+        .is_some());
+
+    driver_handle.abort();
+    let _ = driver_handle.await;
+    drop(h2);
+    conn.shutdown().await;
+    let _ = mint_shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
+    let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
+    let (server_addr, pubkey) =
+        start_monad_server_with_spilman(trusted_mint_units, payment_receiver_secret).await;
+
+    let wallet = Arc::new(MockWallet::new());
+    wallet
+        .insert_channel(mock_wallet_channel(
+            "a-bad",
+            receiver_pubkey.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+        ))
+        .unwrap();
+    wallet
+        .insert_channel(mock_wallet_channel(
+            "b-good",
+            receiver_pubkey,
+            mint_url,
+            keyset_id,
+        ))
+        .unwrap();
+    wallet.force_next_link_wrong_receiver("a-bad").unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (driver_handle, ready_rx) = start_session_payment_driver(
+        &conn,
+        wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "integration hop",
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("driver should ready after reselection")
+        .expect("driver ready signal");
+
+    assert_eq!(
+        wallet.get_channel("a-bad").unwrap().state,
+        WalletChannelState::Closing
+    );
+    assert!(wallet.last_link_payload("a-bad").unwrap().is_some());
+    assert!(wallet.last_link_payload("b-good").unwrap().is_some());
+    assert!(wallet.last_payment_payload("b-good").unwrap().is_some());
+
+    driver_handle.abort();
+    let _ = driver_handle.await;
+    conn.shutdown().await;
+    let _ = mint_shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_session_payment_driver_detaches_evicted_channel() {
+    let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
+    let (server_addr, pubkey) =
+        start_monad_server_with_spilman(trusted_mint_units, payment_receiver_secret).await;
+
+    let wallet_a = Arc::new(MockWallet::new());
+    let wallet_b = Arc::new(MockWallet::new());
+    for wallet in [&wallet_a, &wallet_b] {
+        wallet
+            .insert_channel(mock_wallet_channel(
+                "shared-channel",
+                receiver_pubkey.clone(),
+                mint_url.clone(),
+                keyset_id.clone(),
+            ))
+            .unwrap();
+    }
+
+    let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (driver_a, ready_a) = start_session_payment_driver(
+        &conn_a,
+        wallet_a.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "driver a",
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(2), ready_a)
+        .await
+        .expect("driver a should ready")
+        .expect("driver a ready signal");
+    assert!(wallet_a.attachment("shared-channel").unwrap().is_some());
+
+    let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (driver_b, ready_b) = start_session_payment_driver(
+        &conn_b,
+        wallet_b.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "driver b",
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(2), ready_b)
+        .await
+        .expect("driver b should ready")
+        .expect("driver b ready signal");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if wallet_a.attachment("shared-channel").unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("driver a should observe eviction");
+    assert!(wallet_b.attachment("shared-channel").unwrap().is_some());
+
+    driver_a.abort();
+    let _ = driver_a.await;
+    driver_b.abort();
+    let _ = driver_b.await;
+    conn_a.shutdown().await;
+    conn_b.shutdown().await;
+    let _ = mint_shutdown.send(());
 }
 
 #[tokio::test]
@@ -945,7 +1206,7 @@ async fn test_channel_payment_sat_unpauses_with_millisat_conversion() {
 }
 
 #[tokio::test]
-async fn test_channel_eviction_clears_linked_channel_id() {
+async fn test_channel_eviction_clears_linked_channel() {
     let (server_addr, pubkey) = start_monad_server().await;
     let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
     let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
@@ -973,14 +1234,13 @@ async fn test_channel_eviction_clears_linked_channel_id() {
         other => panic!("expected ChannelEvicted, got {other:?}"),
     }
 
-    send_control_message(&mut send_a, &ClientMessage::GetSessionStatus, false).await;
     match read_control_message(&mut recv_a).await {
         ServerMessage::SessionStatus {
-            linked_channel_id,
+            linked_channel,
             paused,
             ..
         } => {
-            assert_eq!(linked_channel_id, None);
+            assert_eq!(linked_channel, None);
             assert!(paused);
         }
         other => panic!("expected SessionStatus for evicted session, got {other:?}"),
@@ -1031,13 +1291,18 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::SessionStatus {
-            linked_channel_id,
+            linked_channel,
             total_paid_millisats,
             remaining_milli_sats,
             paused,
             ..
         } => {
-            assert_eq!(linked_channel_id.as_deref(), Some("chan-b"));
+            assert_eq!(
+                linked_channel
+                    .as_ref()
+                    .map(|channel| channel.channel_id.as_str()),
+                Some("chan-b")
+            );
             assert_eq!(total_paid_millisats, 7);
             assert_eq!(remaining_milli_sats, 7);
             assert!(!paused);
@@ -1073,13 +1338,18 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::SessionStatus {
-            linked_channel_id,
+            linked_channel,
             total_paid_millisats,
             remaining_milli_sats,
             paused,
             ..
         } => {
-            assert_eq!(linked_channel_id.as_deref(), Some("chan-b"));
+            assert_eq!(
+                linked_channel
+                    .as_ref()
+                    .map(|channel| channel.channel_id.as_str()),
+                Some("chan-b")
+            );
             assert_eq!(total_paid_millisats, 12);
             assert_eq!(remaining_milli_sats, 12);
             assert!(!paused);

@@ -118,7 +118,10 @@ impl SessionState {
             version: negotiated_version,
             receiver_pubkey: self.payment_receiver_secret.public_key().to_hex(),
             advertisements,
-            linked_channel_id: inner.linked_channel_id.clone(),
+            linked_channel: inner
+                .linked_channel_id
+                .as_deref()
+                .and_then(|channel_id| self.payments.linked_channel_status(channel_id)),
             active_in_rate: inner.pricing.in_bytes_per_millisat,
             active_out_rate: inner.pricing.out_bytes_per_millisat,
             session_total_in: inner.session_total_in,
@@ -655,6 +658,10 @@ async fn handle_control_stream(
                             state.handle_channel_evicted(channel_id).await;
                         }
                         send_control_message(&mut h2_send, &message).await?;
+                        if matches!(message, ServerMessage::ChannelEvicted { .. }) {
+                            let status = state.session_status_message(negotiated_version).await;
+                            send_control_message(&mut h2_send, &status).await?;
+                        }
                     }
                     None => break,
                 }

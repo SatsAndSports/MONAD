@@ -4,6 +4,7 @@ use cdk_spilman::{
     compute_channel_secret_from_hex, sign_with_tweaked_key_util, BridgeError, ChannelFunding,
     ChannelPolicy, ChannelState, ClosingData, Payment, PaymentProof, SpilmanBridge, SpilmanHost,
 };
+use monad_common::protocol::LinkedChannelStatus;
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -22,6 +23,8 @@ pub trait RelayPayments: Send + Sync + 'static {
         expected_channel_id: &str,
         payment_json: &str,
     ) -> Result<PaymentOutcome, ChannelPaymentError>;
+
+    fn linked_channel_status(&self, channel_id: &str) -> Option<LinkedChannelStatus>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +136,13 @@ impl ChannelUnit {
                 .ok_or_else(|| ChannelPaymentError::Internal("delta overflow".to_string())),
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sat => "sat",
+            Self::Msat => "msat",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -147,6 +157,7 @@ struct StoredChannel {
     state: ChannelState,
     closing_data: Option<ClosingData>,
     unit: ChannelUnit,
+    capacity_raw: u64,
     owner: Option<[u8; 32]>,
 }
 
@@ -272,6 +283,17 @@ impl RelayPayments for SpilmanRelayPayments {
             delta_millisats: unit.delta_millisats(delta_raw)?,
         })
     }
+
+    fn linked_channel_status(&self, channel_id: &str) -> Option<LinkedChannelStatus> {
+        let state = self.state.lock().ok()?;
+        let channel = state.channels.get(channel_id)?;
+        Some(LinkedChannelStatus {
+            channel_id: channel_id.to_string(),
+            balance_raw: channel.latest_payment.balance,
+            capacity_raw: channel.capacity_raw,
+            unit: channel.unit.as_str().to_string(),
+        })
+    }
 }
 
 impl SpilmanHost<PaymentContext> for MonadHost {
@@ -315,6 +337,7 @@ impl SpilmanHost<PaymentContext> for MonadHost {
                 state: ChannelState::Open,
                 closing_data: None,
                 unit: metadata.0,
+                capacity_raw: metadata.1,
                 owner: None,
             },
         );
@@ -558,6 +581,7 @@ pub mod testing {
     use super::{
         ChannelPaymentError, ChannelUnit, LinkError, LinkOutcome, PaymentOutcome, RelayPayments,
     };
+    use monad_common::protocol::LinkedChannelStatus;
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -765,6 +789,17 @@ pub mod testing {
             Ok(PaymentOutcome {
                 channel_id: parsed.channel_id,
                 delta_millisats,
+            })
+        }
+
+        fn linked_channel_status(&self, channel_id: &str) -> Option<LinkedChannelStatus> {
+            let inner = self.inner.lock().ok()?;
+            let record = inner.channels.get(channel_id)?;
+            Some(LinkedChannelStatus {
+                channel_id: channel_id.to_string(),
+                balance_raw: record.latest_balance,
+                capacity_raw: record.capacity_raw,
+                unit: record.unit.as_str().to_string(),
             })
         }
     }

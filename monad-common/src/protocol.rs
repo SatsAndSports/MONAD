@@ -19,6 +19,14 @@ pub struct KeysetAdvertisement {
     pub out_bytes_per_millisat: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkedChannelStatus {
+    pub channel_id: String,
+    pub balance_raw: u64,
+    pub capacity_raw: u64,
+    pub unit: String,
+}
+
 /// Messages sent from client to server on the control channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -58,7 +66,7 @@ pub enum ServerMessage {
         advertisements: Vec<KeysetAdvertisement>,
 
         // --- Active Session Info ---
-        linked_channel_id: Option<String>,
+        linked_channel: Option<LinkedChannelStatus>,
         active_in_rate: u64,
         active_out_rate: u64,
 

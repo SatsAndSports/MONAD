@@ -75,7 +75,7 @@ async fn run_control_task(
                     version,
                     receiver_pubkey,
                     advertisements,
-                    linked_channel_id,
+                    linked_channel,
                     active_in_rate,
                     active_out_rate,
                     session_total_in,
@@ -92,7 +92,7 @@ async fn run_control_task(
                         total_paid_millisats,
                         session_total_in,
                         session_total_out,
-                        linked_channel_id,
+                        linked_channel.as_ref().map(|channel| &channel.channel_id),
                     );
                     *config.pricing_handle.write().await = Some(pricing);
 
@@ -109,7 +109,7 @@ async fn run_control_task(
                     }
 
                     if paused && remaining_milli_sats <= 0 {
-                        // Always use FakePayment for now.
+                        // Legacy compatibility path until the runtime switches to session_driver.
                         info!(
                             "session paused; sending fake payment of {} millisats",
                             config.fake_payment_millisats
