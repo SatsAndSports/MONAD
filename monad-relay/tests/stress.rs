@@ -22,6 +22,7 @@ const SYNTHETIC_TEST_MINT_UNIT: &str = "msat";
 const SYNTHETIC_TEST_KEYSET_ID: &str = "00testkeyset0000";
 
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
+const STRESS_PATH_SEED: u64 = 0x4d4f_4e41_445f_5354;
 
 #[derive(Debug, Clone, Copy)]
 struct StressConfig {
@@ -222,23 +223,16 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
     (addr, pubkey)
 }
 
-fn ordered_triplets(relays: usize, hops: usize) -> Vec<Vec<usize>> {
-    assert_eq!(hops, 3, "current stress harness expects exactly 3 hops");
-    let mut out = Vec::new();
-    for a in 0..relays {
-        for b in 0..relays {
-            if b == a {
-                continue;
-            }
-            for c in 0..relays {
-                if c == a || c == b {
-                    continue;
-                }
-                out.push(vec![a, b, c]);
-            }
-        }
+fn sample_relay_indices(relays: usize, hops: usize, circuit_id: usize) -> Vec<usize> {
+    let mut state = STRESS_PATH_SEED ^ ((circuit_id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let mut indices = Vec::with_capacity(hops);
+    for _ in 0..hops {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        indices.push((state as usize) % relays);
     }
-    out
+    indices
 }
 
 async fn run_stream_echo(
@@ -300,13 +294,18 @@ async fn run_stream_echo(
 async fn run_circuit(
     circuit_id: usize,
     runtime: ConnectorRuntime,
-    hops: [Hop; 3],
+    hops: Vec<Hop>,
     config: CircuitRunConfig,
 ) -> io::Result<CircuitStats> {
     if config.verbose {
+        let hop_path = hops
+            .iter()
+            .map(|hop| hop.addr.as_str())
+            .collect::<Vec<_>>()
+            .join(" -> ");
         println!(
-            "circuit {circuit_id}: building 3-hop QUIC chain via [{} -> {} -> {}]",
-            hops[0].addr, hops[1].addr, hops[2].addr
+            "circuit {circuit_id}: building {}-hop QUIC chain via [{hop_path}]",
+            hops.len(),
         );
         println!("circuit {circuit_id}: connector will fund all hops via shared MockWallet");
     }
@@ -399,11 +398,11 @@ async fn run_circuit(
 
 async fn run_stress_scenario(config: StressConfig) {
     init_stress_tracing();
-    assert_eq!(
-        config.hops_per_circuit, 3,
-        "only 3-hop circuits are supported currently"
+    assert!(
+        config.hops_per_circuit >= 1,
+        "need at least 1 hop per circuit"
     );
-    assert!(config.relays >= 3, "need at least 3 relays");
+    assert!(config.relays >= 1, "need at least 1 relay");
 
     println!(
         "stress start relays={} circuits={} hops={} streams_per_circuit={} payload_bytes={}",
@@ -428,9 +427,6 @@ async fn run_stress_scenario(config: StressConfig) {
         );
         relays.push(relay);
     }
-
-    let triplets = ordered_triplets(config.relays, config.hops_per_circuit);
-    assert!(!triplets.is_empty(), "expected at least one relay triplet");
     let runtime = ConnectorRuntime::new(Some(Arc::new(MockWallet::new()) as Arc<dyn MonadWallet>))
         .expect("stress runtime should construct a shared first-hop QUIC pool");
     let total_streams = config.circuits * config.streams_per_circuit;
@@ -439,24 +435,15 @@ async fn run_stress_scenario(config: StressConfig) {
     let total_start = Instant::now();
     let mut handles = Vec::with_capacity(config.circuits);
     for circuit_id in 0..config.circuits {
-        let triplet = &triplets[circuit_id % triplets.len()];
-        let hops = [
-            Hop {
-                addr: relays[triplet[0]].0.to_string(),
-                identity: HopIdentity::Secp256k1(relays[triplet[0]].1),
+        let indices = sample_relay_indices(config.relays, config.hops_per_circuit, circuit_id);
+        let hops = indices
+            .into_iter()
+            .map(|relay_idx| Hop {
+                addr: relays[relay_idx].0.to_string(),
+                identity: HopIdentity::Secp256k1(relays[relay_idx].1),
                 use_quic: true,
-            },
-            Hop {
-                addr: relays[triplet[1]].0.to_string(),
-                identity: HopIdentity::Secp256k1(relays[triplet[1]].1),
-                use_quic: true,
-            },
-            Hop {
-                addr: relays[triplet[2]].0.to_string(),
-                identity: HopIdentity::Secp256k1(relays[triplet[2]].1),
-                use_quic: true,
-            },
-        ];
+            })
+            .collect::<Vec<_>>();
         let circuit_config = CircuitRunConfig {
             target: echo_addr.to_string(),
             streams_per_circuit: config.streams_per_circuit,
