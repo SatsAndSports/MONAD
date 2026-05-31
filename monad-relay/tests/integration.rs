@@ -3040,6 +3040,54 @@ async fn test_nested_quic_tunnel() {
     conn_to_s.shutdown().await;
 }
 
+#[tokio::test]
+async fn test_relay_can_connect_to_itself_via_quic() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (relay_addr, relay_pubkey) = start_monad_relay().await;
+
+    let mut outer_conn = connect_client_quic_secp(relay_addr, &relay_pubkey).await;
+    fund_session(&mut outer_conn, TEST_SESSION_PAYMENT).await;
+
+    let mut inner_conn =
+        connect_nested_session_quic(&outer_conn, &relay_addr.to_string(), &relay_pubkey).await;
+    fund_session(&mut inner_conn, TEST_SESSION_PAYMENT).await;
+
+    let mut h2 = inner_conn.clone_send_request().await;
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"self quic hello").await;
+    assert_eq!(result, b"SELF QUIC HELLO");
+
+    drop(h2);
+    inner_conn.shutdown().await;
+    outer_conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_relay_can_connect_to_itself_via_tcp() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (relay_addr, relay_pubkey) = start_monad_relay().await;
+
+    let mut outer_conn = connect_client_quic_secp(relay_addr, &relay_pubkey).await;
+    fund_session(&mut outer_conn, TEST_SESSION_PAYMENT).await;
+
+    let mut inner_conn =
+        connect_nested_session(&outer_conn, &relay_addr.to_string(), &relay_pubkey).await;
+    fund_session(&mut inner_conn, TEST_SESSION_PAYMENT).await;
+
+    let mut h2 = inner_conn.clone_send_request().await;
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"self tcp hello").await;
+    assert_eq!(result, b"SELF TCP HELLO");
+
+    drop(h2);
+    inner_conn.shutdown().await;
+    outer_conn.shutdown().await;
+}
+
 /// Test: 2-hop nested route using the client connector with quic_pin on the Hop.
 ///
 /// Client → S (TCP) → T (QUIC) → uppercase
