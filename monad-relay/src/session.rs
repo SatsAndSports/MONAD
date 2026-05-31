@@ -515,7 +515,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                     }
                 }
                 Err(e) => {
-                    error!("h2 accept error: {e}");
+                    if is_expected_peer_close_error(&e) {
+                        debug!("h2 accept loop ended after peer close: {e}");
+                    } else {
+                        warn!("h2 accept error: {e}");
+                    }
                     break;
                 }
             }
@@ -524,6 +528,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
         info!("H2 connection closed");
         Ok(())
     }
+}
+
+fn is_expected_peer_close_error(error: &h2::Error) -> bool {
+    let message = error.to_string();
+    message.contains("connection lost")
+        || message.contains("sending stopped by peer")
+        || message.contains("broken pipe")
+        || message.contains("connection closed")
 }
 
 fn encode_server_message(message: &ServerMessage) -> io::Result<Bytes> {

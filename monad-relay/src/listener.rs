@@ -23,7 +23,7 @@ use std::sync::{
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Hardcoded trusted mint policy for now: mint URL -> allowed units.
 pub type TrustedMintUnits = BTreeMap<String, BTreeSet<String>>;
@@ -354,7 +354,11 @@ pub async fn run_with_payments(
                                 break;
                             }
                             Err(e) => {
-                                error!(%remote, error = %e, "QUIC accept_bi failed");
+                                if e.to_string().contains("timed out") {
+                                    warn!(%remote, error = %e, "QUIC accept_bi failed");
+                                } else {
+                                    error!(%remote, error = %e, "QUIC accept_bi failed");
+                                }
                                 break;
                             }
                         }
