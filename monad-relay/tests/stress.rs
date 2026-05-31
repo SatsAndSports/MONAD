@@ -1,4 +1,4 @@
-use monad_client::connector::{self, Hop, HopIdentity};
+use monad_client::connector::{self, ConnectorRuntime, Hop, HopIdentity};
 use monad_client::wallet::{MockWallet, MonadWallet};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
@@ -248,6 +248,7 @@ async fn run_stream_echo(
 
 async fn run_circuit(
     circuit_id: usize,
+    runtime: ConnectorRuntime,
     hops: [Hop; 3],
     target: String,
     streams_per_circuit: usize,
@@ -262,8 +263,7 @@ async fn run_circuit(
         println!("circuit {circuit_id}: connector will fund all hops via shared MockWallet");
     }
     let setup_start = Instant::now();
-    let wallet: Arc<dyn MonadWallet> = Arc::new(MockWallet::new());
-    let conn = connector::connect_through_chain_with_wallet(&hops, Some(wallet)).await?;
+    let conn = connector::connect_through_chain_with_runtime(&hops, &runtime).await?;
     if verbose {
         println!("circuit {circuit_id}: chain established and all hops funded");
     }
@@ -376,6 +376,8 @@ async fn run_stress_scenario(config: StressConfig) {
 
     let triplets = ordered_triplets(config.relays, config.hops_per_circuit);
     assert!(!triplets.is_empty(), "expected at least one relay triplet");
+    let runtime = ConnectorRuntime::new(Some(Arc::new(MockWallet::new()) as Arc<dyn MonadWallet>))
+        .expect("stress runtime should construct a shared first-hop QUIC pool");
 
     let total_start = Instant::now();
     let mut handles = Vec::with_capacity(config.circuits);
@@ -401,6 +403,7 @@ async fn run_stress_scenario(config: StressConfig) {
         let target = echo_addr.to_string();
         handles.push(tokio::spawn(run_circuit(
             circuit_id,
+            runtime.clone(),
             hops,
             target,
             config.streams_per_circuit,

@@ -6,6 +6,7 @@ use quinn::Endpoint;
 use tracing::{error, info};
 
 static CRYPTO_PROVIDER: Once = Once::new();
+const MONAD_QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn ensure_crypto_provider() {
     CRYPTO_PROVIDER.call_once(|| {
@@ -122,6 +123,9 @@ pub fn build_server_config(cert_pem: &str, key_pem: &str) -> Result<quinn::Serve
                                                        // Increase flow-control windows to support large payloads per stream
     transport.stream_receive_window(8_000_000u32.into());
     transport.receive_window(16_000_000u32.into());
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(MONAD_QUIC_IDLE_TIMEOUT).expect("valid QUIC idle timeout"),
+    ));
     server_config.transport_config(Arc::new(transport));
 
     Ok(server_config)

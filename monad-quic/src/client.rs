@@ -138,6 +138,8 @@ pub enum ClientAuthMode {
     Secp256k1(Secp256k1Pubkey),
 }
 
+const MONAD_QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub fn build_client_config_for_auth(auth: ClientAuthMode) -> Result<quinn::ClientConfig> {
     ensure_crypto_provider();
     let verifier: Arc<dyn ServerCertVerifier> = match auth {
@@ -166,10 +168,9 @@ pub fn build_client_config_for_auth(auth: ClientAuthMode) -> Result<quinn::Clien
     let mut transport = quinn::TransportConfig::default();
     transport.stream_receive_window(8_000_000u32.into());
     transport.receive_window(16_000_000u32.into());
-    // Send QUIC PINGs every 15 seconds to keep idle connections alive.
-    // Without this, Quinn's default 30-second idle timeout would close
-    // connections that have no active data flow.
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(MONAD_QUIC_IDLE_TIMEOUT).expect("valid QUIC idle timeout"),
+    ));
     client_config.transport_config(Arc::new(transport));
 
     Ok(client_config)
