@@ -19,6 +19,17 @@ stress-medium:
 stress-custom:
 	cargo test -p monad-relay --test stress -- --ignored stress_three_hop_quic_configurable --nocapture
 
+stress-stable-5hop:
+	ulimit -n 65536 && \
+	echo "ulimit -n=$$(ulimit -n)" && \
+	NO_COLOR=1 RUST_LOG=error \
+	MONAD_STRESS_RELAYS=10 \
+	MONAD_STRESS_CIRCUITS=200 \
+	MONAD_STRESS_HOPS=5 \
+	MONAD_STRESS_STREAMS=25 \
+	MONAD_STRESS_PAYLOAD_BYTES=3000 \
+	cargo test -p monad-relay --test stress -- --ignored stress_three_hop_quic_configurable --nocapture
+
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
 
