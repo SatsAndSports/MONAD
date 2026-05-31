@@ -7,7 +7,9 @@ use monad_relay::payments::testing::InMemoryRelayPayments;
 use std::collections::BTreeMap;
 use std::env;
 use std::io;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,6 +58,55 @@ struct CircuitStats {
     sent_bytes: u64,
     recv_bytes: u64,
     streams_ok: usize,
+}
+
+#[derive(Clone)]
+struct CircuitRunConfig {
+    target: String,
+    streams_per_circuit: usize,
+    payload_bytes: usize,
+    verbose: bool,
+    progress: ProgressTracker,
+}
+
+#[derive(Clone)]
+struct ProgressTracker {
+    enabled: bool,
+    total_streams: usize,
+    completed_streams: Arc<AtomicUsize>,
+}
+
+impl ProgressTracker {
+    fn new(enabled: bool, total_streams: usize) -> Self {
+        Self {
+            enabled,
+            total_streams,
+            completed_streams: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn record_stream_completed(&self) {
+        if !self.enabled {
+            return;
+        }
+
+        let completed = self.completed_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        print!(".");
+        let _ = std::io::stdout().flush();
+
+        if completed.is_multiple_of(50) || completed == self.total_streams {
+            println!(
+                " progress: {completed}/{} streams complete",
+                self.total_streams
+            );
+        }
+    }
+
+    fn finish_line(&self) {
+        if self.enabled {
+            println!();
+        }
+    }
 }
 
 async fn run_echo_server(listener: TcpListener) {
@@ -250,12 +301,9 @@ async fn run_circuit(
     circuit_id: usize,
     runtime: ConnectorRuntime,
     hops: [Hop; 3],
-    target: String,
-    streams_per_circuit: usize,
-    payload_bytes: usize,
-    verbose: bool,
+    config: CircuitRunConfig,
 ) -> io::Result<CircuitStats> {
-    if verbose {
+    if config.verbose {
         println!(
             "circuit {circuit_id}: building 3-hop QUIC chain via [{} -> {} -> {}]",
             hops[0].addr, hops[1].addr, hops[2].addr
@@ -264,25 +312,29 @@ async fn run_circuit(
     }
     let setup_start = Instant::now();
     let conn = connector::connect_through_chain_with_runtime(&hops, &runtime).await?;
-    if verbose {
+    if config.verbose {
         println!("circuit {circuit_id}: chain established and all hops funded");
     }
     let setup_elapsed = setup_start.elapsed();
 
     let conn = Arc::new(conn);
     let data_start = Instant::now();
-    let mut handles = Vec::with_capacity(streams_per_circuit);
+    let mut handles = Vec::with_capacity(config.streams_per_circuit);
 
-    if verbose {
+    if config.verbose {
         println!(
-            "circuit {circuit_id}: starting {streams_per_circuit} stream(s) with {payload_bytes} byte payloads to {target}"
+            "circuit {circuit_id}: starting {} stream(s) with {} byte payloads to {}",
+            config.streams_per_circuit, config.payload_bytes, config.target
         );
     }
 
-    for stream_idx in 0..streams_per_circuit {
+    for stream_idx in 0..config.streams_per_circuit {
         let conn = Arc::clone(&conn);
-        let target = target.clone();
+        let target = config.target.clone();
         let pattern = ((circuit_id + stream_idx) % 251) as u8;
+        let progress = config.progress.clone();
+        let verbose = config.verbose;
+        let payload_bytes = config.payload_bytes;
         handles.push(tokio::spawn(async move {
             if verbose {
                 println!("circuit {circuit_id} stream {stream_idx}: open");
@@ -298,6 +350,9 @@ async fn run_circuit(
                         "circuit {circuit_id} stream {stream_idx}: failed err={err}"
                     ),
                 }
+            }
+            if result.is_ok() {
+                progress.record_stream_completed();
             }
             result
         }));
@@ -319,7 +374,7 @@ async fn run_circuit(
 
     stats.data_micros = data_start.elapsed().as_micros();
 
-    if verbose {
+    if config.verbose {
         println!(
             "circuit {circuit_id}: complete setup_ms={:.2} data_ms={:.2} sent_bytes={} recv_bytes={} streams_ok={}",
             stats.setup_micros as f64 / 1000.0,
@@ -378,6 +433,8 @@ async fn run_stress_scenario(config: StressConfig) {
     assert!(!triplets.is_empty(), "expected at least one relay triplet");
     let runtime = ConnectorRuntime::new(Some(Arc::new(MockWallet::new()) as Arc<dyn MonadWallet>))
         .expect("stress runtime should construct a shared first-hop QUIC pool");
+    let total_streams = config.circuits * config.streams_per_circuit;
+    let progress = ProgressTracker::new(!config.verbose(), total_streams);
 
     let total_start = Instant::now();
     let mut handles = Vec::with_capacity(config.circuits);
@@ -400,15 +457,18 @@ async fn run_stress_scenario(config: StressConfig) {
                 use_quic: true,
             },
         ];
-        let target = echo_addr.to_string();
+        let circuit_config = CircuitRunConfig {
+            target: echo_addr.to_string(),
+            streams_per_circuit: config.streams_per_circuit,
+            payload_bytes: config.payload_bytes,
+            verbose: config.verbose(),
+            progress: progress.clone(),
+        };
         handles.push(tokio::spawn(run_circuit(
             circuit_id,
             runtime.clone(),
             hops,
-            target,
-            config.streams_per_circuit,
-            config.payload_bytes,
-            config.verbose(),
+            circuit_config,
         )));
     }
 
@@ -449,7 +509,7 @@ async fn run_stress_scenario(config: StressConfig) {
     }
 
     let total_elapsed = total_start.elapsed();
-    let total_streams = config.circuits * config.streams_per_circuit;
+    progress.finish_line();
     let total_sessions = config.circuits * config.hops_per_circuit;
     let total_bytes = sent_bytes.saturating_add(recv_bytes);
     let throughput_mib_per_s = if total_elapsed.as_secs_f64() > 0.0 {
