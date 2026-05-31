@@ -1,4 +1,5 @@
 use monad_common::protocol::KeysetAdvertisement;
+use rand::RngCore;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -174,7 +175,6 @@ pub struct MockWallet {
 #[derive(Debug, Default)]
 struct MockWalletInner {
     channels: BTreeMap<String, StoredChannel>,
-    next_channel_number: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -447,9 +447,14 @@ impl MonadWallet for MockWallet {
             .inner
             .lock()
             .map_err(|_| WalletError::Backend("wallet mutex poisoned".to_string()))?;
-        let channel_number = inner.next_channel_number;
-        inner.next_channel_number = inner.next_channel_number.saturating_add(1);
-        let channel_id = format!("mock-chan-{channel_number}");
+        let channel_id = loop {
+            let mut bytes = [0u8; 16];
+            rand::rng().fill_bytes(&mut bytes);
+            let candidate = format!("mock-chan-{}", hex::encode(bytes));
+            if !inner.channels.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let keyset_id = offer.accepted_keyset_ids.first().cloned().ok_or_else(|| {
             WalletError::OfferMismatch("offer has no accepted keysets".to_string())
         })?;

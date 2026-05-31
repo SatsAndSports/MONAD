@@ -264,6 +264,14 @@ impl RelayConnection {
         self.task_handles.push(handle);
     }
 
+    /// Move all background driver/task handles from another relay connection
+    /// into this one. Used when nested hop setup returns only the final hop but
+    /// we still need shutdown of earlier hop tasks to stay attached.
+    pub fn absorb_handles_from(&mut self, other: &mut Self) {
+        self.driver_handles.append(&mut other.driver_handles);
+        self.task_handles.append(&mut other.task_handles);
+    }
+
     /// Shut down the hop chain cleanly by dropping the shared H2 client handle
     /// and waiting for all per-hop H2 driver tasks to exit.
     pub async fn shutdown(self) {

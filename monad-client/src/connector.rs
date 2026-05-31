@@ -75,6 +75,27 @@ pub async fn connect(
 /// T only sees encrypted Noise bytes. It has no idea that inside those bytes
 /// is another MONAD session asking S to proxy onward.
 pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> {
+    connect_through_chain_internal(hops, Some(Arc::new(MockWallet::new())), false).await
+}
+
+/// Connect to a chain of MONAD relays, optionally funding every hop with the
+/// provided wallet.
+///
+/// When `wallet` is `Some`, every hop in the chain, including the final hop,
+/// is funded through the shared session payment driver before this function
+/// returns. When `wallet` is `None`, no funding is started automatically.
+pub async fn connect_through_chain_with_wallet(
+    hops: &[Hop],
+    wallet: Option<Arc<dyn MonadWallet>>,
+) -> io::Result<RelayConnection> {
+    connect_through_chain_internal(hops, wallet, true).await
+}
+
+async fn connect_through_chain_internal(
+    hops: &[Hop],
+    wallet: Option<Arc<dyn MonadWallet>>,
+    fund_last_hop: bool,
+) -> io::Result<RelayConnection> {
     if hops.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -83,7 +104,6 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
     }
 
     let first = &hops[0];
-    let wallet: Arc<dyn MonadWallet> = Arc::new(MockWallet::new());
 
     if first.use_quic {
         // Connect to the first hop via QUIC
@@ -121,15 +141,39 @@ pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> 
         let quic_stream = open_monad_stream_with_kind(&conn, STREAM_KIND_SECP_NOISE).await?;
         info!("QUIC connected to {}", first.addr);
 
-        chain_from_stream(quic_stream, hops, 0, wallet).await
+        chain_from_stream(quic_stream, hops, 0, wallet, fund_last_hop).await
     } else {
         // Connect to the first hop via TCP
         info!("connecting to first hop: {}", first.addr);
         let tcp_stream = TcpStream::connect(&first.addr).await?;
         info!("TCP connected to {}", first.addr);
 
-        chain_from_stream(tcp_stream, hops, 0, wallet).await
+        chain_from_stream(tcp_stream, hops, 0, wallet, fund_last_hop).await
     }
+}
+
+async fn optionally_fund_session(
+    mut conn: RelayConnection,
+    wallet: Option<Arc<dyn MonadWallet>>,
+    hop_label: &str,
+) -> io::Result<RelayConnection> {
+    let Some(wallet) = wallet else {
+        return Ok(conn);
+    };
+
+    info!("{hop_label}: opening funded control session");
+    let (control_task, ready_rx) =
+        session_driver::start_session_payment_driver(&conn, wallet, hop_label).await?;
+    info!("{hop_label}: waiting for funded session readiness");
+    ready_rx.await.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("control task exited before {hop_label} was funded"),
+        )
+    })?;
+    info!("{hop_label}: session funded and usable");
+    conn.add_task(control_task);
+    Ok(conn)
 }
 
 /// Recursively build the tunnel chain starting from a given stream and hop index.
@@ -143,7 +187,8 @@ fn chain_from_stream<S>(
     mut stream: S,
     hops: &[Hop],
     hop_idx: usize,
-    wallet: Arc<dyn MonadWallet>,
+    wallet: Option<Arc<dyn MonadWallet>>,
+    fund_last_hop: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<RelayConnection>> + Send>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -163,7 +208,7 @@ where
         );
 
         let label = format!("client hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
-        let (conn, driver) = match &hop.identity {
+        let (mut conn, driver) = match &hop.identity {
             HopIdentity::Secp256k1(pubkey) => {
                 let (send_cipher, recv_cipher, session_id) =
                     noise_secp256k1::handshake_initiator(&mut stream, pubkey).await?;
@@ -177,6 +222,7 @@ where
                 RelayConnection::from_transport_stream(secp_stream, session_id).await?
             }
         };
+        conn.add_driver(driver);
 
         info!(
             "hop {}/{}: H2 connection established",
@@ -184,18 +230,16 @@ where
             hops.len()
         );
 
-        if hop_idx < hops.len() - 1 {
-            let hop_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
-            let (control_task, ready_rx) =
-                session_driver::start_session_payment_driver(&conn, wallet.clone(), &hop_label)
-                    .await?;
-            ready_rx.await.map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    format!("control task exited before hop {} was funded", hop.addr),
-                )
-            })?;
+        let hop_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
+        let should_fund = wallet.is_some() && (hop_idx < hops.len() - 1 || fund_last_hop);
+        conn = optionally_fund_session(
+            conn,
+            if should_fund { wallet.clone() } else { None },
+            &hop_label,
+        )
+        .await?;
 
+        if hop_idx < hops.len() - 1 {
             // Not the last hop — open a CONNECT tunnel to the next hop
             let next = &hops[hop_idx + 1];
             info!(
@@ -219,15 +263,19 @@ where
 
             // Recurse: perform Noise + H2 over this tunnel for the next hop.
             // Attach this hop's driver to the final connection.
-            let mut next_conn =
-                chain_from_stream(h2_connect_stream, &hops, hop_idx + 1, wallet.clone()).await?;
-            next_conn.add_driver(driver);
-            next_conn.add_task(control_task);
+            let mut conn = conn;
+            let mut next_conn = chain_from_stream(
+                h2_connect_stream,
+                &hops,
+                hop_idx + 1,
+                wallet.clone(),
+                fund_last_hop,
+            )
+            .await?;
+            next_conn.absorb_handles_from(&mut conn);
             Ok(next_conn)
         } else {
-            // Last hop — attach the driver and return for actual use
-            let mut conn = conn;
-            conn.add_driver(driver);
+            // Last hop — return for actual use.
             info!("tunnel chain established ({} hops)", hops.len());
             Ok(conn)
         }

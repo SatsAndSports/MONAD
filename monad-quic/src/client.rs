@@ -180,10 +180,12 @@ pub async fn connect_with_auth(
     connect: SocketAddr,
     auth: ClientAuthMode,
 ) -> Result<quinn::Connection> {
+    info!(%connect, "starting QUIC transport connection");
     let conn = endpoint
         .connect(connect, "monad-relay")?
         .await
         .context("failed to connect")?;
+    info!(remote = %conn.remote_address(), "completed QUIC transport connection");
 
     if let ClientAuthMode::Secp256k1(pubkey) = auth {
         authenticate_connection(&conn, &pubkey).await?;

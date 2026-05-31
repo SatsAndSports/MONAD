@@ -4,6 +4,7 @@ use monad_common::secp_identity::{
 };
 use std::io;
 use tokio::io::AsyncWriteExt;
+use tracing::info;
 
 pub const AUTH_STREAM_KIND: u8 = 0x01;
 pub const STREAM_ERROR_UNKNOWN_KIND: u64 = 0x21;
@@ -49,12 +50,15 @@ pub async fn authenticate_connection(
     conn: &quinn::Connection,
     expected_pubkey: &Secp256k1Pubkey,
 ) -> Result<()> {
+    info!(remote = %conn.remote_address(), expected_pubkey = %expected_pubkey, "starting QUIC secp256k1 attestation");
     let challenge = rand::random::<[u8; 32]>();
     let signature = request_attestation_signature(conn, challenge).await?;
     let exporter = export_binding(conn)?;
     let digest = transport_auth_digest(EXPORTER_LABEL, &challenge, &exporter);
     verify_transport_auth_digest(expected_pubkey, &digest, &signature)
-        .map_err(|e| anyhow!("secp256k1 attestation verification failed: {e}"))
+        .map_err(|e| anyhow!("secp256k1 attestation verification failed: {e}"))?;
+    info!(remote = %conn.remote_address(), expected_pubkey = %expected_pubkey, "completed QUIC secp256k1 attestation");
+    Ok(())
 }
 
 pub async fn serve_attestation_stream(
