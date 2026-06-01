@@ -262,13 +262,12 @@ Control messages are JSON objects, newline-delimited, exchanged over the H2 cont
 ### Message Types
 
 Client to server (`ClientMessage`):
-- `Hello { version }` — first message; declares the highest protocol version the client supports
 - `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0 and funding proofs
 - `ChannelPayment { payment_json }` — increment session balance; requires a Spilman `Payment` signature for a higher balance than previously seen for this channel
 - `GetSessionStatus` — request a fresh session status snapshot
 
 Server to client (`ServerMessage`):
-- `SessionStatus { ... }` — primary state synchronization message; sent immediately after Hello and proactively whenever session state (balance, link, pricing) changes. Contains:
+- `SessionStatus { ... }` — primary state synchronization message; sent immediately after control stream establishment and proactively whenever session state (balance, link, pricing) changes. Contains:
   - `version`: Negotiated protocol version
   - `receiver_pubkey`: Server's secp256k1 key for Spilman
   - `advertisements`: List of supported `(Mint, Unit, Rates)` options
@@ -286,7 +285,9 @@ Server to client (`ServerMessage`):
 
 ### Version Negotiation
 
-The client sends `Hello { version }` as the first control message. The relay computes `negotiated = min(client_version, SERVER_MAX_VERSION)`. If `negotiated < SERVER_MIN_VERSION`, the relay sends an `Error` and closes the control stream. Otherwise it responds with a unified `SessionStatus` containing the negotiated version, available pricing options, and the initial zero-balance state.
+Here, "bootstrap" means the post-Noise negotiation step that establishes the session version, chosen session protocol, and relay capabilities before H2 begins.
+
+The client and relay now negotiate that bootstrap contract inside the two Noise handshake payloads before H2 starts. The client sends a hardcoded bootstrap request selecting the post-Noise session protocol (`h2` for now); the relay responds with a hardcoded accept or reject-with-reason payload. Today this bootstrap is intentionally strict rather than flexible capability negotiation: the client requests the one supported shape, and the relay either accepts exactly that shape or rejects with a reason.
 
 This bootstrap sequence stays outside the explicit session FSM. The reducer-style
 state machine begins only after the initial `SessionStatus` has been sent.
@@ -325,17 +326,16 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 
 ### Client Auto-Funding
 
-The client opens a control stream immediately after connecting and sends `Hello`. When it receives `SessionStatus`, the per-session payment driver either selects a matching local channel or provisions one from the relay's advertisements, sends `ChannelLink`, then sends `ChannelPayment` updates whenever the remaining session balance becomes non-positive. Intermediate hops in multi-hop chains use the same session-driver model.
+The client opens a control stream immediately after connecting. Once it receives the initial `SessionStatus`, the per-session payment driver either selects a matching local channel or provisions one from the relay's advertisements, sends `ChannelLink`, then sends `ChannelPayment` updates whenever the remaining session balance becomes non-positive. Intermediate hops in multi-hop chains use the same session-driver model.
 
 ### Client Session FSM
 
-After the client sends `Hello`, steady-state client behavior is also handled as a
+After the control stream is established and the initial `SessionStatus` arrives, steady-state client behavior is also handled as a
 serialized event/effect reducer, mirroring the relay-side FSM.
 
 Bootstrap stays outside the reducer:
 
 - open the control stream
-- send `Hello { version }`
 - wait for the first `SessionStatus`
 
 The first reducer-driving event is that initial `SessionStatus`.

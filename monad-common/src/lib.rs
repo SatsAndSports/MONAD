@@ -1,4 +1,5 @@
 pub mod blinded_hop;
+pub mod bootstrap;
 pub mod h2stream;
 pub mod noise_secp256k1;
 pub mod protocol;

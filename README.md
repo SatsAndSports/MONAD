@@ -18,6 +18,7 @@ Implemented today:
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
 - QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
+- Noise-payload bootstrap: after Noise completes but before H2 starts, client and relay negotiate the session version/capabilities; today this is an intentionally strict hardcoded bootstrap that selects `h2` or rejects with a reason
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
 - session payment system: paused-by-default sessions, Hello/SessionStatus handshake, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
 - relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit

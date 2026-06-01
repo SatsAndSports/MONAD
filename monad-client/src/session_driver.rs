@@ -14,8 +14,6 @@ use crate::session_fsm::{
 };
 use crate::wallet::{select_channel, MonadWallet, RelayPaymentOffer, WalletError};
 
-const CLIENT_VERSION: u8 = 0;
-
 fn encode_client_message(message: &monad_common::protocol::ClientMessage) -> io::Result<Bytes> {
     let bytes =
         serde_json::to_vec(message).map_err(|e| io::Error::other(format!("json error: {e}")))?;
@@ -89,20 +87,12 @@ async fn run_session_driver(
     ready_tx: oneshot::Sender<()>,
     config: SessionDriverConfig,
 ) -> io::Result<()> {
-    // Bootstrap stays outside the client reducer. We open the control stream,
-    // send Hello, and start the reducer only once the first SessionStatus
-    // arrives from the relay.
+    // Bootstrap stays outside the client reducer. Once the control stream is
+    // open, the relay immediately sends the first SessionStatus and only then
+    // do we start the reducer.
     let mut buf = Vec::new();
     let mut state = ClientSessionState::new();
     let mut ready_tx = Some(ready_tx);
-
-    send_control_message(
-        &mut h2_send,
-        &monad_common::protocol::ClientMessage::Hello {
-            version: CLIENT_VERSION,
-        },
-    )
-    .await?;
 
     while let Some(chunk) = h2_recv.data().await {
         let data = chunk.map_err(|e| io::Error::other(format!("h2 recv error: {e}")))?;

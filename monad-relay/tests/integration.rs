@@ -550,14 +550,12 @@ fn expect_session_status(message: ServerMessage) -> (u64, u64, u64, i64, bool) {
     }
 }
 
-/// Send Hello, read initial SessionStatus.
+/// Read the initial SessionStatus sent immediately after control attach.
 /// Returns the initial session status fields.
 async fn control_handshake(
-    h2_send: &mut h2::SendStream<Bytes>,
+    _h2_send: &mut h2::SendStream<Bytes>,
     h2_recv: &mut h2::RecvStream,
 ) -> (u64, u64, u64, i64, bool) {
-    send_control_message(h2_send, &ClientMessage::Hello { version: 0 }, false).await;
-
     let message = read_control_message(h2_recv).await;
     match &message {
         ServerMessage::SessionStatus {

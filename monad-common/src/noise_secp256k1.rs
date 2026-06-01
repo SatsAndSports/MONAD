@@ -9,6 +9,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use crate::bootstrap::{
+    decode_client_hello, decode_server_response, encode_client_hello, encode_server_response,
+    initial_client_hello, initial_server_accept, validate_initial_client_hello,
+    BootstrapServerResponse,
+};
 use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 
 const PROLOGUE: &[u8] = b"monad-noise-secp256k1-v1";
@@ -335,6 +340,38 @@ pub async fn handshake_initiator_with_pubkey<T: AsyncRead + AsyncWrite + Unpin>(
     CipherState<ChaCha20Poly1305>,
     [u8; 32],
 )> {
+    let client_payload = encode_client_hello(&initial_client_hello())?;
+    let (send, recv, session_id, server_payload) =
+        handshake_initiator_with_pubkey_and_payload(stream, server_pubkey, &client_payload).await?;
+    let response = decode_server_response(&server_payload)?;
+    match response {
+        BootstrapServerResponse::Accept { .. } => {
+            if response != initial_server_accept() {
+                return Err(io::Error::other(
+                    "relay bootstrap accept did not match the hardcoded expected response",
+                ));
+            }
+        }
+        BootstrapServerResponse::Reject { reason, .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("relay bootstrap rejected session: {reason}"),
+            ));
+        }
+    }
+    Ok((send, recv, session_id))
+}
+
+pub async fn handshake_initiator_with_pubkey_and_payload<T: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut T,
+    server_pubkey: [u8; 33],
+    payload: &[u8],
+) -> io::Result<(
+    CipherState<ChaCha20Poly1305>,
+    CipherState<ChaCha20Poly1305>,
+    [u8; 32],
+    Vec<u8>,
+)> {
     let rs = SecpPublicKeyBytes::from_slice(&server_pubkey);
     let mut hs = SecpHandshake::new(
         patterns::noise_nk(),
@@ -346,18 +383,19 @@ pub async fn handshake_initiator_with_pubkey<T: AsyncRead + AsyncWrite + Unpin>(
         None,
     );
     let msg1 = hs
-        .write_message_vec(&[])
+        .write_message_vec(payload)
         .map_err(|_| io::Error::other("initiator failed to write first handshake message"))?;
     write_handshake_msg(stream, &msg1).await?;
 
     let msg2 = read_handshake_msg(stream).await?;
-    hs.read_message_vec(&msg2)
+    let server_payload = hs
+        .read_message_vec(&msg2)
         .map_err(|_| io::Error::other("initiator failed to read second handshake message"))?;
 
     let mut session_id = [0u8; 32];
     session_id.copy_from_slice(hs.get_hash());
     let (send, recv) = hs.get_ciphers();
-    Ok((send, recv, session_id))
+    Ok((send, recv, session_id, server_payload))
 }
 
 pub async fn handshake_responder<T: AsyncRead + AsyncWrite + Unpin>(
@@ -379,6 +417,50 @@ pub async fn handshake_responder_with_secret_key_bytes<T: AsyncRead + AsyncWrite
     CipherState<ChaCha20Poly1305>,
     [u8; 32],
 )> {
+    handshake_responder_with_secret_key_bytes_and_payload_decider(
+        stream,
+        server_key,
+        |client_payload| {
+            let (response, accepted) = match decode_client_hello(&client_payload) {
+                Ok(client_hello) => match validate_initial_client_hello(&client_hello) {
+                    Ok(()) => (initial_server_accept(), true),
+                    Err(reason) => (
+                        BootstrapServerResponse::Reject {
+                            bootstrap_version: crate::bootstrap::BOOTSTRAP_VERSION,
+                            reason,
+                        },
+                        false,
+                    ),
+                },
+                Err(err) => (
+                    BootstrapServerResponse::Reject {
+                        bootstrap_version: crate::bootstrap::BOOTSTRAP_VERSION,
+                        reason: format!("invalid client bootstrap: {err}"),
+                    },
+                    false,
+                ),
+            };
+            encode_server_response(&response).map(|payload| (payload, accepted))
+        },
+    )
+    .await
+}
+
+pub async fn handshake_responder_with_secret_key_bytes_and_payload_decider<
+    T: AsyncRead + AsyncWrite + Unpin,
+    F,
+>(
+    stream: &mut T,
+    server_key: [u8; 32],
+    decide_payload: F,
+) -> io::Result<(
+    CipherState<ChaCha20Poly1305>,
+    CipherState<ChaCha20Poly1305>,
+    [u8; 32],
+)>
+where
+    F: FnOnce(Vec<u8>) -> io::Result<(Vec<u8>, bool)>,
+{
     let mut hs = SecpHandshake::new(
         patterns::noise_nk(),
         false,
@@ -389,12 +471,21 @@ pub async fn handshake_responder_with_secret_key_bytes<T: AsyncRead + AsyncWrite
         None,
     );
     let msg1 = read_handshake_msg(stream).await?;
-    hs.read_message_vec(&msg1)
+    let client_payload = hs
+        .read_message_vec(&msg1)
         .map_err(|_| io::Error::other("responder failed to read first handshake message"))?;
+    let (response_payload, accepted) = decide_payload(client_payload)?;
     let msg2 = hs
-        .write_message_vec(&[])
+        .write_message_vec(&response_payload)
         .map_err(|_| io::Error::other("responder failed to write second handshake message"))?;
     write_handshake_msg(stream, &msg2).await?;
+
+    if !accepted {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "client bootstrap was rejected",
+        ));
+    }
 
     let mut session_id = [0u8; 32];
     session_id.copy_from_slice(hs.get_hash());

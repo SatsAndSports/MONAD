@@ -62,8 +62,8 @@ cargo run -p monad-quic -- ...
 ### Control Protocol
 
 - Wire format: JSON newline-delimited messages on the H2 control stream (`POST /control`)
-- Handshake: client sends `Hello { version }`, relay responds with a unified `SessionStatus` containing advertisements and initial state
-- Version negotiation: `min(client_version, SERVER_MAX_VERSION)`, reject if < `SERVER_MIN_VERSION`
+- Bootstrap: the two Noise handshake payloads negotiate the session version/capabilities and post-Noise session protocol (`h2` today); this is currently hardcoded, and the relay can reject with a reason before H2 starts
+- Initial state: once the H2 control stream is established, the relay immediately sends a unified `SessionStatus` containing advertisements and initial state
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, integer-only via precomputed LCM
 - `CONNECT` rejected with 402 while paused

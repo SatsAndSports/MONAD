@@ -31,9 +31,6 @@ pub struct LinkedChannelStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    /// First message on the control stream. Declares the highest
-    /// protocol version the client supports.
-    Hello { version: u8 },
     /// Link a Spilman channel to this session.
     ///
     /// The payload is a serialized `cdk_spilman::Payment` JSON object with
@@ -52,8 +49,8 @@ pub enum ClientMessage {
 #[serde(tag = "type")]
 pub enum ServerMessage {
     /// Consolidated session accounting and state synchronization message.
-    /// Sent in response to `ClientMessage::Hello` and whenever the session
-    /// state changes (balance, link, pricing).
+    /// Sent immediately after control stream establishment and whenever the
+    /// session state changes (balance, link, pricing).
     SessionStatus {
         // --- Static/Advertisement Info ---
         version: u8,

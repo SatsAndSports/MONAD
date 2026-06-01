@@ -34,7 +34,6 @@ use tracing::{debug, error, info, warn};
 /// Custom header name for QUIC secp256k1 transport identity in CONNECT requests.
 pub const QUIC_SECP256K1_PUBKEY_HEADER: &str = "quic-secp256k1-pubkey";
 
-const SERVER_MIN_VERSION: u8 = 0;
 const SERVER_MAX_VERSION: u8 = 0;
 const DEFAULT_IN_BYTES_PER_MILLISAT: u64 = 1;
 const DEFAULT_OUT_BYTES_PER_MILLISAT: u64 = 1;
@@ -559,38 +558,6 @@ async fn send_control_message(
         .map_err(|e| io::Error::other(format!("h2 send error: {e}")))
 }
 
-/// Read one newline-delimited JSON message from the H2 recv stream.
-async fn read_one_control_message(
-    h2_recv: &mut h2::RecvStream,
-    buf: &mut Vec<u8>,
-) -> io::Result<Option<ClientMessage>> {
-    loop {
-        if let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buf.drain(..=newline_pos).collect();
-            let line = line.trim_ascii();
-            if line.is_empty() {
-                continue;
-            }
-            let msg = serde_json::from_slice::<ClientMessage>(line).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("invalid message: {e}"))
-            })?;
-            return Ok(Some(msg));
-        }
-
-        match h2_recv.data().await {
-            Some(Ok(data)) => {
-                let len = data.len();
-                let _ = h2_recv.flow_control().release_capacity(len);
-                buf.extend_from_slice(&data);
-            }
-            Some(Err(e)) => {
-                return Err(io::Error::other(format!("h2 recv error: {e}")));
-            }
-            None => return Ok(None),
-        }
-    }
-}
-
 /// Handle a long-lived control stream for one paid relay session.
 async fn handle_control_stream(
     mut h2_send: h2::SendStream<Bytes>,
@@ -600,53 +567,13 @@ async fn handle_control_stream(
 ) -> io::Result<()> {
     info!("control channel opened");
 
-    // Wait for the client's Hello message before sending the initial SessionStatus.
     let mut buf = Vec::new();
-    let client_version = match read_one_control_message(&mut h2_recv, &mut buf).await? {
-        Some(ClientMessage::Hello { version }) => {
-            debug!("control: client hello version={version}");
-            version
-        }
-        Some(other) => {
-            warn!("control: expected Hello, got {other:?}");
-            let err_msg = ServerMessage::Error {
-                message: "expected Hello as first message".to_string(),
-            };
-            send_control_message(&mut h2_send, &err_msg).await?;
-            state.detach_control().await;
-            let _ = h2_send.send_data(Bytes::new(), true);
-            return Ok(());
-        }
-        None => {
-            debug!("control channel closed before Hello");
-            state.detach_control().await;
-            return Ok(());
-        }
-    };
+    let negotiated_version = SERVER_MAX_VERSION;
 
-    if !(SERVER_MIN_VERSION..=SERVER_MAX_VERSION).contains(&client_version) {
-        warn!(
-            "control: unsupported client version {} (supported range {}..={})",
-            client_version, SERVER_MIN_VERSION, SERVER_MAX_VERSION
-        );
-        let err_msg = ServerMessage::Error {
-            message: format!(
-                "unsupported version: client offered {}, supported range is {}..={}",
-                client_version, SERVER_MIN_VERSION, SERVER_MAX_VERSION
-            ),
-        };
-        send_control_message(&mut h2_send, &err_msg).await?;
-        state.detach_control().await;
-        let _ = h2_send.send_data(Bytes::new(), true);
-        return Ok(());
-    }
-
-    let negotiated_version = client_version;
-
-    // Bootstrap stays outside the explicit steady-state session FSM. After
-    // version negotiation, we seed the session state with the negotiated
-    // version and send the initial SessionStatus before entering the reducer-
-    // driven control loop.
+    // Bootstrap stays outside the explicit steady-state session FSM. After the
+    // pre-H2 Noise bootstrap selected the session protocol, we seed the local
+    // session version and immediately send the initial SessionStatus before
+    // entering the reducer-driven control loop.
     {
         let mut inner = state.inner.lock().await;
         inner.pricing.version = negotiated_version;
@@ -696,13 +623,6 @@ async fn handle_control_stream(
                             }
 
                             match serde_json::from_slice::<ClientMessage>(line) {
-                                Ok(ClientMessage::Hello { .. }) => {
-                                    warn!("control: unexpected Hello after handshake");
-                                    let err_msg = ServerMessage::Error {
-                                        message: "Hello already received".to_string(),
-                                    };
-                                    send_control_message(&mut h2_send, &err_msg).await?;
-                                }
                                 Ok(ClientMessage::GetSessionStatus) => {
                                     terminate_session = process_session_event(
                                         &state,
