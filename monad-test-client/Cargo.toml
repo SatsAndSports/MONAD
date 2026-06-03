@@ -1,0 +1,22 @@
+[package]
+name = "monad-test-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+monad-client = { path = "../monad-client" }
+monad-common = { path = "../monad-common" }
+monad-quic = { path = "../monad-quic" }
+monad-relay = { path = "../monad-relay" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+bytes = "1"
+http = "1"
+h2 = "0.4"
+hex = "0.4"
+serde_json = "1"
+cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0", package = "cashu", default-features = false }
+quinn = "0.11"

@@ -9,6 +9,7 @@ use h2::client;
 use http::{Method, Request, Uri};
 use std::io;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -108,10 +109,10 @@ pub struct RelayConnection {
     /// The H2 client send handle — cloned for each new stream.
     h2_client: Arc<tokio::sync::Mutex<client::SendRequest<Bytes>>>,
     /// Background tasks driving the H2 connection(s) in the hop chain.
-    driver_handles: Vec<JoinHandle<()>>,
+    driver_handles: Mutex<Vec<JoinHandle<()>>>,
     /// Abortable background tasks associated with this relay connection, such as
     /// client-side control stream tasks.
-    task_handles: Vec<JoinHandle<()>>,
+    task_handles: Mutex<Vec<JoinHandle<()>>>,
     /// Noise handshake hash — unique session identifier agreed by both sides.
     session_id: [u8; 32],
     /// Session pricing metadata, set by the control task after receiving
@@ -139,14 +140,18 @@ impl RelayConnection {
 
         let driver_handle = tokio::spawn(async move {
             if let Err(e) = h2_conn.await {
-                tracing::error!("H2 connection error at hop: {e}");
+                if is_expected_h2_teardown_error(&e) {
+                    tracing::debug!("H2 connection at hop closed during teardown: {e}");
+                } else {
+                    tracing::error!("H2 connection error at hop: {e}");
+                }
             }
         });
 
         let conn = Self {
             h2_client: Arc::new(tokio::sync::Mutex::new(h2_client)),
-            driver_handles: Vec::new(),
-            task_handles: Vec::new(),
+            driver_handles: Mutex::new(Vec::new()),
+            task_handles: Mutex::new(Vec::new()),
             session_id,
             session_pricing: Arc::new(RwLock::new(None)),
             session_spilman_info: Arc::new(RwLock::new(None)),
@@ -256,28 +261,39 @@ impl RelayConnection {
 
     /// Append a driver handle from an intermediate hop in a multi-hop chain.
     pub fn add_driver(&mut self, handle: JoinHandle<()>) {
-        self.driver_handles.push(handle);
+        self.driver_handles.lock().unwrap().push(handle);
     }
 
     /// Append an abortable background task associated with this connection.
     pub fn add_task(&mut self, handle: JoinHandle<()>) {
-        self.task_handles.push(handle);
+        self.task_handles.lock().unwrap().push(handle);
     }
 
     /// Move all background driver/task handles from another relay connection
     /// into this one. Used when nested hop setup returns only the final hop but
     /// we still need shutdown of earlier hop tasks to stay attached.
     pub fn absorb_handles_from(&mut self, other: &mut Self) {
-        self.driver_handles.append(&mut other.driver_handles);
-        self.task_handles.append(&mut other.task_handles);
+        self.driver_handles
+            .get_mut()
+            .unwrap()
+            .append(other.driver_handles.get_mut().unwrap());
+        self.task_handles
+            .get_mut()
+            .unwrap()
+            .append(other.task_handles.get_mut().unwrap());
     }
 
-    /// Shut down the hop chain cleanly by dropping the shared H2 client handle
-    /// and waiting for all per-hop H2 driver tasks to exit.
-    pub async fn shutdown(self) {
-        drop(self.h2_client);
+    /// Force-close the hop chain by aborting all background tasks attached to it.
+    ///
+    /// This is used by callers that only hold `Arc<RelayConnection>` handles and
+    /// need to tear down a stale chain after swapping in a rebuilt replacement.
+    pub async fn close(&self) {
+        let task_handles = {
+            let mut handles = self.task_handles.lock().unwrap();
+            std::mem::take(&mut *handles)
+        };
 
-        for handle in self.task_handles {
+        for handle in task_handles {
             handle.abort();
             if let Err(e) = handle.await {
                 if !e.is_cancelled() {
@@ -286,7 +302,36 @@ impl RelayConnection {
             }
         }
 
-        for handle in self.driver_handles {
+        let driver_handles = {
+            let mut handles = self.driver_handles.lock().unwrap();
+            std::mem::take(&mut *handles)
+        };
+
+        for handle in driver_handles {
+            handle.abort();
+            if let Err(e) = handle.await {
+                if !e.is_cancelled() {
+                    tracing::error!("H2 driver task panicked: {e}");
+                }
+            }
+        }
+    }
+
+    /// Shut down the hop chain cleanly by dropping the shared H2 client handle
+    /// and waiting for all per-hop H2 driver tasks to exit.
+    pub async fn shutdown(self) {
+        drop(self.h2_client);
+
+        for handle in self.task_handles.into_inner().unwrap() {
+            handle.abort();
+            if let Err(e) = handle.await {
+                if !e.is_cancelled() {
+                    tracing::error!("background task panicked: {e}");
+                }
+            }
+        }
+
+        for handle in self.driver_handles.into_inner().unwrap() {
             if let Err(e) = handle.await {
                 tracing::error!("H2 driver task panicked: {e}");
             }
@@ -337,4 +382,16 @@ impl RelayConnection {
             Some(self.cleartext_byte_counters.clone()),
         ))
     }
+}
+
+fn is_expected_h2_teardown_error(error: &h2::Error) -> bool {
+    let message = error.to_string();
+    message.contains("sending stopped by peer")
+        || message.contains("broken pipe")
+        || message.contains("h2 send stream closed")
+        || message.contains("h2 recv error: h2 send stream closed")
+        || message.contains("h2 recv error: stream closed because of a broken pipe")
+        || message.contains("stream closed because of a broken pipe")
+        || message.contains("error 0")
+        || message.contains("connection closed")
 }

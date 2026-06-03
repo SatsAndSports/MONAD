@@ -123,6 +123,8 @@ async fn main() -> anyhow::Result<()> {
                 transport_key: Some(transport_key),
                 payment_receiver_secret: SecretKey::generate(),
                 trusted_mint_units,
+                default_in_bytes_per_millisat: 1,
+                default_out_bytes_per_millisat: 1,
             });
 
             let tcp_listener = TcpListener::bind(&listen).await?;

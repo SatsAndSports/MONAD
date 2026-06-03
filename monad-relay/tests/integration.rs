@@ -202,6 +202,8 @@ async fn start_monad_relay() -> (std::net::SocketAddr, Secp256k1Pubkey) {
         transport_key: Some(transport_key),
         payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
+        default_in_bytes_per_millisat: 1,
+        default_out_bytes_per_millisat: 1,
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
@@ -238,6 +240,8 @@ async fn start_monad_relay_with_test_payments() -> (
         transport_key: Some(transport_key),
         payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
+        default_in_bytes_per_millisat: 1,
+        default_out_bytes_per_millisat: 1,
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
@@ -274,6 +278,8 @@ async fn start_monad_relay_with_spilman(
         transport_key: Some(transport_key),
         payment_receiver_secret,
         trusted_mint_units,
+        default_in_bytes_per_millisat: 1,
+        default_out_bytes_per_millisat: 1,
     });
 
     let discovered_spilman_mint_cache = Arc::new(
@@ -341,6 +347,8 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
         transport_key: Some(transport_key),
         payment_receiver_secret: cashu::nuts::SecretKey::generate(),
         trusted_mint_units: BTreeMap::new(),
+        default_in_bytes_per_millisat: 1,
+        default_out_bytes_per_millisat: 1,
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());

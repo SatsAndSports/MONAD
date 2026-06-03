@@ -35,8 +35,6 @@ use tracing::{debug, error, info, warn};
 pub const QUIC_SECP256K1_PUBKEY_HEADER: &str = "quic-secp256k1-pubkey";
 
 const SERVER_MAX_VERSION: u8 = 0;
-const DEFAULT_IN_BYTES_PER_MILLISAT: u64 = 1;
-const DEFAULT_OUT_BYTES_PER_MILLISAT: u64 = 1;
 
 #[derive(Debug)]
 struct SessionInner {
@@ -92,8 +90,12 @@ impl SessionState {
         session_registry: Arc<SessionRegistry>,
         payment_receiver_secret: SecretKey,
         spilman_mint_cache: SpilmanMintCache,
+        default_in_bytes_per_millisat: u64,
+        default_out_bytes_per_millisat: u64,
     ) -> Self {
         let (pause_tx, _) = watch::channel(true);
+        let termination = CancellationToken::new();
+        session_registry.register_session(session_id, termination.clone());
         Self {
             inner: Arc::new(Mutex::new(SessionInner {
                 session_total_in: 0,
@@ -101,8 +103,8 @@ impl SessionState {
                 total_paid_millisats: 0,
                 pricing: SessionPricing::new(
                     SERVER_MAX_VERSION,
-                    DEFAULT_IN_BYTES_PER_MILLISAT,
-                    DEFAULT_OUT_BYTES_PER_MILLISAT,
+                    default_in_bytes_per_millisat.max(1),
+                    default_out_bytes_per_millisat.max(1),
                 ),
                 paused: true,
                 control_attached: false,
@@ -110,7 +112,7 @@ impl SessionState {
                 linked_channel_id: None,
             })),
             pause_tx,
-            termination: CancellationToken::new(),
+            termination,
             session_id,
             payments,
             session_registry,
@@ -189,7 +191,7 @@ impl SessionState {
 
         inner.control_attached = true;
         inner.control_tx = Some(tx.clone());
-        self.session_registry.register(self.session_id, tx);
+        self.session_registry.register_control(self.session_id, tx);
         Ok(())
     }
 
@@ -197,7 +199,7 @@ impl SessionState {
         let mut inner = self.inner.lock().await;
         inner.control_attached = false;
         inner.control_tx = None;
-        self.session_registry.deregister(&self.session_id);
+        self.session_registry.deregister_control(&self.session_id);
     }
 
     pub(crate) async fn note_outbound_bytes(&self, bytes: usize) -> bool {
@@ -255,14 +257,21 @@ pub struct RelaySession<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     state: SessionState,
 }
 
+#[derive(Clone)]
+pub struct RelaySessionConfig {
+    pub payments: Arc<dyn RelayPayments>,
+    pub session_registry: Arc<SessionRegistry>,
+    pub payment_receiver_secret: SecretKey,
+    pub spilman_mint_cache: SpilmanMintCache,
+    pub default_in_bytes_per_millisat: u64,
+    pub default_out_bytes_per_millisat: u64,
+}
+
 pub async fn relay_session_from_transport_stream<S>(
     stream: S,
     session_id: [u8; 32],
     quic_pool: Option<QuicPool>,
-    payments: Arc<dyn RelayPayments>,
-    session_registry: Arc<SessionRegistry>,
-    payment_receiver_secret: SecretKey,
-    spilman_mint_cache: SpilmanMintCache,
+    config: RelaySessionConfig,
 ) -> io::Result<RelaySession<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -282,10 +291,12 @@ where
         session_id,
         state: SessionState::new(
             session_id,
-            payments,
-            session_registry,
-            payment_receiver_secret,
-            spilman_mint_cache,
+            config.payments,
+            config.session_registry,
+            config.payment_receiver_secret,
+            config.spilman_mint_cache,
+            config.default_in_bytes_per_millisat,
+            config.default_out_bytes_per_millisat,
         ),
     })
 }
@@ -493,7 +504,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                             handle_control_stream(h2_send, h2_recv, state, event_rx)
                                                 .await
                                         {
-                                            error!("control channel error: {e}");
+                                            if is_expected_control_channel_error(&e) {
+                                                debug!(
+                                                    "control channel closed during teardown: {e}"
+                                                );
+                                            } else {
+                                                error!("control channel error: {e}");
+                                            }
                                         }
                                     });
                                 }
@@ -524,6 +541,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
             }
         }
 
+        self.state
+            .session_registry
+            .deregister_session(&self.session_id);
         info!("H2 connection closed");
         Ok(())
     }
@@ -535,6 +555,17 @@ fn is_expected_peer_close_error(error: &h2::Error) -> bool {
         || message.contains("sending stopped by peer")
         || message.contains("broken pipe")
         || message.contains("connection closed")
+}
+
+fn is_expected_control_channel_error(error: &io::Error) -> bool {
+    let message = error.to_string();
+    message.contains("h2 send stream closed")
+        || message.contains("h2 recv error: h2 send stream closed")
+        || message.contains("h2 recv error: stream closed because of a broken pipe")
+        || message.contains("broken pipe")
+        || message.contains("connection closed")
+        || message.contains("sending stopped by peer")
+        || message.contains("error 0")
 }
 
 fn encode_server_message(message: &ServerMessage) -> io::Result<Bytes> {

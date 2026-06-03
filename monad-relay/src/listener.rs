@@ -2,7 +2,7 @@
 
 use crate::payments::{RelayPayments, SpilmanRelayPayments};
 use crate::quic_pool::QuicPool;
-use crate::session::relay_session_from_transport_stream;
+use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
 use crate::session_registry::SessionRegistry;
 use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
@@ -47,6 +47,10 @@ pub struct ServerConfig {
     pub payment_receiver_secret: SecretKey,
     /// Hardcoded trusted mint policy.
     pub trusted_mint_units: TrustedMintUnits,
+    /// Default inbound bytes per millisat for sessions on this relay.
+    pub default_in_bytes_per_millisat: u64,
+    /// Default outbound bytes per millisat for sessions on this relay.
+    pub default_out_bytes_per_millisat: u64,
 }
 
 /// Discover all keyset IDs (active and inactive) and cache their keyset info JSON.
@@ -133,6 +137,25 @@ pub async fn run_with_payments(
     payments: Arc<dyn RelayPayments>,
     discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
 ) -> io::Result<()> {
+    run_with_payments_and_registry(
+        listener,
+        quic_endpoint,
+        config,
+        payments,
+        discovered_spilman_mint_cache,
+        Arc::new(SessionRegistry::new()),
+    )
+    .await
+}
+
+pub async fn run_with_payments_and_registry(
+    listener: TcpListener,
+    quic_endpoint: Option<quinn::Endpoint>,
+    config: Arc<ServerConfig>,
+    payments: Arc<dyn RelayPayments>,
+    discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
+    session_registry: Arc<SessionRegistry>,
+) -> io::Result<()> {
     let transport_key = config.transport_key.clone().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -147,8 +170,6 @@ pub async fn run_with_payments(
     // Create the QUIC connection pool for outbound CONNECT quic: forwarding.
     // This is separate from the QUIC endpoint (which handles inbound connections).
     let quic_pool = QuicPool::new().ok();
-    let session_registry = Arc::new(SessionRegistry::new());
-
     // Accept loop — runs until Ctrl+C
     loop {
         tokio::select! {
@@ -192,10 +213,14 @@ pub async fn run_with_payments(
                         secp_stream,
                         session_id,
                         quic_pool,
-                        payments,
-                        session_registry,
-                        config.payment_receiver_secret.clone(),
-                        discovered_spilman_mint_cache.as_ref().clone(),
+                        RelaySessionConfig {
+                            payments,
+                            session_registry,
+                            payment_receiver_secret: config.payment_receiver_secret.clone(),
+                            spilman_mint_cache: discovered_spilman_mint_cache.as_ref().clone(),
+                            default_in_bytes_per_millisat: config.default_in_bytes_per_millisat,
+                            default_out_bytes_per_millisat: config.default_out_bytes_per_millisat,
+                        },
                     )
                     .await {
                         Ok(session) => {
@@ -327,10 +352,14 @@ pub async fn run_with_payments(
                                                     secp_stream,
                                                     session_id,
                                                     quic_pool,
-                                                    payments,
-                                                    session_registry,
-                                                    config.payment_receiver_secret.clone(),
-                                                    discovered_spilman_mint_cache.as_ref().clone(),
+                                                    RelaySessionConfig {
+                                                        payments,
+                                                        session_registry,
+                                                        payment_receiver_secret: config.payment_receiver_secret.clone(),
+                                                        spilman_mint_cache: discovered_spilman_mint_cache.as_ref().clone(),
+                                                        default_in_bytes_per_millisat: config.default_in_bytes_per_millisat,
+                                                        default_out_bytes_per_millisat: config.default_out_bytes_per_millisat,
+                                                    },
                                                 )
                                             .await {
                                                 Ok(session) => {

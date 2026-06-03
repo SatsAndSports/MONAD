@@ -2355,6 +2355,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "monad-test-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "cashu",
+ "clap",
+ "h2",
+ "hex",
+ "http",
+ "monad-client",
+ "monad-common",
+ "monad-quic",
+ "monad-relay",
+ "quinn",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

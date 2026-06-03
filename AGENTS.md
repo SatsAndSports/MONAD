@@ -215,6 +215,24 @@ The test suite currently covers:
 - default integration-test relays advertise a synthetic test mint/keyset offer so connector-driven intermediate hops can provision mock channels without a real wallet backend
 - control detach releases linked channel ownership and tears down active/future streams
 
+### Stress Harness Notes
+
+- `monad-relay/tests/stress.rs` now supports transport-focused stress runs with:
+  - huge per-hop prefunding to keep payment timing out of the critical path
+  - `MONAD_STRESS_MAX_IN_FLIGHT_PER_CIRCUIT` to cap burst concurrency per circuit
+  - `MONAD_STRESS_TARGETS` to shard final-hop exits across many loopback targets in `127.127.x.y`
+- `make stress-transport-extreme` is the current high-end manual transport recipe and expects a high `ulimit -n`
+- `make stress-payment-buffered` is the current stable payment-focused recipe:
+  - one large-capacity channel per session
+  - repeated `ChannelPayment` topups on that same channel
+  - frequent `SessionStatus` polling to drive buffered refills
+  - high `ulimit -n` expected
+- `make stress-payment-relink` is the current stable relink-focused recipe:
+  - one active channel per session at a time
+  - fresh mocked channel provisioned and linked when the current channel lacks capacity for the next refill
+  - repeated buffered `ChannelPayment` topups continue on the newly linked channel
+  - high `ulimit -n` expected
+
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
 
 ## Documentation Expectations
