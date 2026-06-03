@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use monad_test_client::{
     run_fd_logger, run_socks_listener, start_local_relays, Circuit, CircuitConfig,
+    RebuildAfterFailureOutcome,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -110,26 +111,45 @@ async fn main() -> Result<()> {
                 }
 
                 let mut circuit = rebuild_circuit.lock().await;
-                if !circuit.failure_is_current(&failure) {
-                    break;
-                }
-
                 warn!(
-                    "hop {}/{} unhealthy (epoch {}): {}",
+                    "reported unhealthy hop {}/{} (epoch {}): {}",
                     failure.hop_idx + 1,
                     circuit.hop_count(),
                     failure.epoch,
                     failure.reason,
                 );
-                match circuit.rebuild_from(failure.hop_idx).await {
-                    Ok(()) => {
-                        info!("rebuilt circuit suffix from hop {}", failure.hop_idx + 1);
+                match circuit.rebuild_after_failure(failure.clone()).await {
+                    Ok(RebuildAfterFailureOutcome::Rebuilt) => {
+                        info!(
+                            "rebuilt circuit suffix from hop {}/{}",
+                            failure.hop_idx + 1,
+                            circuit.hop_count()
+                        );
+                        break;
+                    }
+                    Ok(RebuildAfterFailureOutcome::Stale) => {
+                        info!(
+                            "ignoring stale failure for hop {}/{} at epoch {}",
+                            failure.hop_idx + 1,
+                            circuit.hop_count(),
+                            failure.epoch
+                        );
+                        break;
+                    }
+                    Ok(RebuildAfterFailureOutcome::InvalidHop) => {
+                        warn!(
+                            "ignoring invalid failure for hop {}/{} at epoch {}",
+                            failure.hop_idx + 1,
+                            circuit.hop_count(),
+                            failure.epoch
+                        );
                         break;
                     }
                     Err(err) => {
                         warn!(
-                            "failed to rebuild circuit suffix from hop {}: {err}",
-                            failure.hop_idx + 1
+                            "failed to rebuild circuit suffix from hop {}/{}: {err}",
+                            failure.hop_idx + 1,
+                            circuit.hop_count()
                         );
                     }
                 }

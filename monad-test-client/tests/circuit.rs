@@ -1,6 +1,8 @@
-use monad_test_client::{Circuit, CircuitConfig, TestRelayHandle};
+use monad_test_client::{Circuit, CircuitConfig, RebuildAfterFailureOutcome, TestRelayHandle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio::time::Duration;
 
 async fn run_echo_server(listener: TcpListener) {
@@ -38,8 +40,13 @@ async fn assert_tunnel_works(circuit: &Circuit, target: &str, payload: &[u8]) {
     assert_eq!(out, payload);
 }
 
-async fn build_three_hop_circuit() -> (Circuit, Vec<TestRelayHandle>, String, Vec<Option<[u8; 32]>>)
-{
+async fn build_three_hop_circuit() -> (
+    Circuit,
+    mpsc::UnboundedReceiver<monad_test_client::HopFailure>,
+    Vec<TestRelayHandle>,
+    String,
+    Vec<Option<[u8; 32]>>,
+) {
     let relays = vec![
         TestRelayHandle::start_ephemeral().await.unwrap(),
         TestRelayHandle::start_ephemeral().await.unwrap(),
@@ -49,7 +56,7 @@ async fn build_three_hop_circuit() -> (Circuit, Vec<TestRelayHandle>, String, Ve
         .iter()
         .map(|relay| relay.spec.clone())
         .collect::<Vec<_>>();
-    let (mut circuit, _failure_rx) = Circuit::new(
+    let (mut circuit, failure_rx) = Circuit::new(
         specs,
         CircuitConfig {
             status_interval: Some(Duration::from_millis(100)),
@@ -68,7 +75,16 @@ async fn build_three_hop_circuit() -> (Circuit, Vec<TestRelayHandle>, String, Ve
     tokio::spawn(run_echo_server(target_listener));
     assert_tunnel_works(&circuit, &target_addr, b"before-rebuild").await;
 
-    (circuit, relays, target_addr, initial_ids)
+    (circuit, failure_rx, relays, target_addr, initial_ids)
+}
+
+async fn expect_failure(
+    failure_rx: &mut mpsc::UnboundedReceiver<monad_test_client::HopFailure>,
+) -> monad_test_client::HopFailure {
+    timeout(Duration::from_secs(5), failure_rx.recv())
+        .await
+        .expect("failure should arrive before timeout")
+        .expect("failure channel should stay open")
 }
 
 async fn assert_suffix_rebuild(
@@ -76,7 +92,8 @@ async fn assert_suffix_rebuild(
     rebuild_from: usize,
     unchanged_prefix_len: usize,
 ) {
-    let (mut circuit, relays, target_addr, initial_ids) = build_three_hop_circuit().await;
+    let (mut circuit, _failure_rx, relays, target_addr, initial_ids) =
+        build_three_hop_circuit().await;
 
     let killed_session_id = initial_ids[failed_hop_idx].expect("session id for failed hop");
     assert!(relays[failed_hop_idx].terminate_session(&killed_session_id));
@@ -98,6 +115,126 @@ async fn assert_suffix_rebuild(
     }
 
     assert_tunnel_works(&circuit, &target_addr, b"after-rebuild").await;
+}
+
+#[tokio::test]
+async fn rebuild_after_failure_rebuilds_middle_suffix_and_preserves_entry_session() {
+    let (mut circuit, mut failure_rx, relays, target_addr, initial_ids) =
+        build_three_hop_circuit().await;
+
+    let killed_session_id = initial_ids[1].expect("session id for failed hop");
+    assert!(relays[1].terminate_session(&killed_session_id));
+
+    let failure = expect_failure(&mut failure_rx).await;
+    assert_eq!(failure.hop_idx, 1);
+    assert_eq!(failure.epoch, circuit.hop_epoch(1).unwrap());
+
+    assert_eq!(
+        circuit.rebuild_after_failure(failure).await.unwrap(),
+        RebuildAfterFailureOutcome::Rebuilt
+    );
+
+    let rebuilt_ids = circuit.session_ids();
+    assert_eq!(rebuilt_ids[0], initial_ids[0]);
+    assert_ne!(rebuilt_ids[1], initial_ids[1]);
+    assert_ne!(rebuilt_ids[2], initial_ids[2]);
+    assert_tunnel_works(&circuit, &target_addr, b"after-middle-failure").await;
+}
+
+#[tokio::test]
+async fn rebuild_after_failure_rebuilds_only_final_hop_when_final_session_dies() {
+    let (mut circuit, mut failure_rx, relays, target_addr, initial_ids) =
+        build_three_hop_circuit().await;
+
+    let killed_session_id = initial_ids[2].expect("session id for failed hop");
+    assert!(relays[2].terminate_session(&killed_session_id));
+
+    let failure = expect_failure(&mut failure_rx).await;
+    assert_eq!(failure.hop_idx, 2);
+    assert_eq!(failure.epoch, circuit.hop_epoch(2).unwrap());
+
+    assert_eq!(
+        circuit.rebuild_after_failure(failure).await.unwrap(),
+        RebuildAfterFailureOutcome::Rebuilt
+    );
+
+    let rebuilt_ids = circuit.session_ids();
+    assert_eq!(rebuilt_ids[0], initial_ids[0]);
+    assert_eq!(rebuilt_ids[1], initial_ids[1]);
+    assert_ne!(rebuilt_ids[2], initial_ids[2]);
+    assert_tunnel_works(&circuit, &target_addr, b"after-final-failure").await;
+}
+
+#[tokio::test]
+async fn stale_failure_after_successful_rebuild_does_not_trigger_second_rebuild() {
+    let (mut circuit, mut failure_rx, relays, target_addr, initial_ids) =
+        build_three_hop_circuit().await;
+
+    let killed_session_id = initial_ids[1].expect("session id for failed hop");
+    assert!(relays[1].terminate_session(&killed_session_id));
+
+    let stale_failure = expect_failure(&mut failure_rx).await;
+    assert_eq!(stale_failure.hop_idx, 1);
+    assert_eq!(
+        circuit
+            .rebuild_after_failure(stale_failure.clone())
+            .await
+            .unwrap(),
+        RebuildAfterFailureOutcome::Rebuilt
+    );
+
+    let rebuilt_ids = circuit.session_ids();
+    assert_eq!(
+        circuit.rebuild_after_failure(stale_failure).await.unwrap(),
+        RebuildAfterFailureOutcome::Stale
+    );
+    assert_eq!(circuit.session_ids(), rebuilt_ids);
+    assert_tunnel_works(&circuit, &target_addr, b"stale-failure-ignored").await;
+}
+
+#[tokio::test]
+async fn failed_suffix_rebuild_preserves_prefix_and_clears_final_connection() {
+    let (mut circuit, _failure_rx, mut relays, _target_addr, initial_ids) =
+        build_three_hop_circuit().await;
+
+    let replacement = TestRelayHandle::start_ephemeral().await.unwrap();
+    let mut bad_spec = replacement.spec.clone();
+    bad_spec.pubkey = TestRelayHandle::start_ephemeral()
+        .await
+        .unwrap()
+        .spec
+        .pubkey;
+    relays.push(replacement);
+
+    circuit.set_hop_spec(2, bad_spec).unwrap();
+
+    let _err = circuit.rebuild_from(2).await.unwrap_err();
+    assert_eq!(circuit.session_ids()[0], initial_ids[0]);
+    assert_eq!(circuit.session_ids()[1], initial_ids[1]);
+    assert_eq!(circuit.hop_session_id(2), None);
+    assert_eq!(circuit.connected_hop_prefix_len(), 2);
+    assert!(!circuit.is_complete());
+    assert_eq!(circuit.first_incomplete_hop(), Some(2));
+    assert!(circuit.final_conn().is_none());
+}
+
+#[tokio::test]
+async fn set_hop_spec_and_rebuild_from_middle_switches_only_suffix() {
+    let (mut circuit, _failure_rx, mut relays, target_addr, initial_ids) =
+        build_three_hop_circuit().await;
+
+    let replacement = TestRelayHandle::start_ephemeral().await.unwrap();
+    let replacement_spec = replacement.spec.clone();
+    relays.push(replacement);
+
+    circuit.set_hop_spec(1, replacement_spec).unwrap();
+    circuit.rebuild_from(1).await.unwrap();
+
+    let rebuilt_ids = circuit.session_ids();
+    assert_eq!(rebuilt_ids[0], initial_ids[0]);
+    assert_ne!(rebuilt_ids[1], initial_ids[1]);
+    assert_ne!(rebuilt_ids[2], initial_ids[2]);
+    assert_tunnel_works(&circuit, &target_addr, b"spec-swap-rebuild").await;
 }
 
 #[tokio::test]

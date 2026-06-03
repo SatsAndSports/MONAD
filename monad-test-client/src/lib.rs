@@ -42,6 +42,13 @@ pub struct HopFailure {
     pub reason: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebuildAfterFailureOutcome {
+    Rebuilt,
+    Stale,
+    InvalidHop,
+}
+
 #[derive(Clone, Debug)]
 pub struct CircuitConfig {
     pub status_interval: Option<Duration>,
@@ -126,6 +133,20 @@ impl Circuit {
             .and_then(|slot| slot.conn.as_ref().map(|conn| *conn.session_id()))
     }
 
+    pub fn has_conn(&self, hop_idx: usize) -> bool {
+        self.hops
+            .get(hop_idx)
+            .and_then(|slot| slot.conn.as_ref())
+            .is_some()
+    }
+
+    pub fn connected_hop_prefix_len(&self) -> usize {
+        self.hops
+            .iter()
+            .take_while(|slot| slot.conn.is_some())
+            .count()
+    }
+
     pub fn session_ids(&self) -> Vec<Option<[u8; 32]>> {
         self.hops
             .iter()
@@ -137,6 +158,10 @@ impl Circuit {
         self.hops.last().and_then(|slot| slot.conn.clone())
     }
 
+    pub async fn active_final_conn_is_set(&self) -> bool {
+        self.active_final_conn.read().await.is_some()
+    }
+
     pub fn is_complete(&self) -> bool {
         self.hops.iter().all(|slot| slot.conn.is_some())
     }
@@ -145,7 +170,8 @@ impl Circuit {
         self.hops.iter().position(|slot| slot.conn.is_none())
     }
 
-    pub fn failure_is_current(&self, failure: &HopFailure) -> bool {
+    #[cfg(test)]
+    fn failure_is_current(&self, failure: &HopFailure) -> bool {
         self.hops
             .get(failure.hop_idx)
             .map(|slot| slot.epoch == failure.epoch)
@@ -227,12 +253,18 @@ impl Circuit {
         Ok(())
     }
 
-    pub async fn rebuild_after_failure(&mut self, failure: HopFailure) -> Result<bool> {
-        if !self.failure_is_current(&failure) {
-            return Ok(false);
+    pub async fn rebuild_after_failure(
+        &mut self,
+        failure: HopFailure,
+    ) -> Result<RebuildAfterFailureOutcome> {
+        let Some(slot) = self.hops.get(failure.hop_idx) else {
+            return Ok(RebuildAfterFailureOutcome::InvalidHop);
+        };
+        if slot.epoch != failure.epoch {
+            return Ok(RebuildAfterFailureOutcome::Stale);
         }
         self.rebuild_from(failure.hop_idx).await?;
-        Ok(true)
+        Ok(RebuildAfterFailureOutcome::Rebuilt)
     }
 }
 
@@ -877,21 +909,14 @@ mod tests {
 
     #[tokio::test]
     async fn invalidate_from_bumps_epochs_and_clears_suffix_shape() {
+        let relays = start_local_relays(3).await.unwrap();
         let specs = vec![
-            RelaySpec {
-                addr: "127.0.0.1:1".to_string(),
-                pubkey: SecpTransportKeypair::generate().pubkey(),
-            },
-            RelaySpec {
-                addr: "127.0.0.1:2".to_string(),
-                pubkey: SecpTransportKeypair::generate().pubkey(),
-            },
-            RelaySpec {
-                addr: "127.0.0.1:3".to_string(),
-                pubkey: SecpTransportKeypair::generate().pubkey(),
-            },
+            relays[0].spec.clone(),
+            relays[1].spec.clone(),
+            relays[2].spec.clone(),
         ];
         let (mut circuit, _) = Circuit::new(specs, CircuitConfig::default()).unwrap();
+        circuit.build_full().await.unwrap();
 
         let epochs_before = (0..circuit.hop_count())
             .map(|idx| circuit.hop_epoch(idx).unwrap())
@@ -902,7 +927,14 @@ mod tests {
         assert_eq!(circuit.hop_epoch(0), Some(epochs_before[0]));
         assert_eq!(circuit.hop_epoch(1), Some(epochs_before[1] + 1));
         assert_eq!(circuit.hop_epoch(2), Some(epochs_before[2] + 1));
-        assert_eq!(circuit.session_ids(), vec![None, None, None]);
+        assert!(circuit.has_conn(0));
+        assert!(!circuit.has_conn(1));
+        assert!(!circuit.has_conn(2));
+        assert_eq!(circuit.connected_hop_prefix_len(), 1);
+        assert!(!circuit.is_complete());
+        assert_eq!(circuit.first_incomplete_hop(), Some(1));
+        assert!(circuit.final_conn().is_none());
+        assert!(!circuit.active_final_conn_is_set().await);
     }
 
     #[tokio::test]
@@ -925,5 +957,93 @@ mod tests {
             epoch: original_epoch + 1,
             reason: "current".to_string(),
         }));
+    }
+
+    #[tokio::test]
+    async fn rebuild_after_failure_returns_stale_for_stale_epoch() {
+        let relay = TestRelayHandle::start_ephemeral().await.unwrap();
+        let (mut circuit, _) =
+            Circuit::new(vec![relay.spec.clone()], CircuitConfig::default()).unwrap();
+        circuit.build_full().await.unwrap();
+
+        let original_epoch = circuit.hop_epoch(0).unwrap();
+        let original_session_id = circuit.hop_session_id(0).unwrap();
+
+        circuit.invalidate_from(0).await;
+
+        let rebuilt = circuit
+            .rebuild_after_failure(HopFailure {
+                hop_idx: 0,
+                epoch: original_epoch,
+                reason: "stale".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rebuilt, RebuildAfterFailureOutcome::Stale);
+        assert_eq!(circuit.hop_epoch(0), Some(original_epoch + 1));
+        assert_eq!(circuit.hop_session_id(0), None);
+        assert_eq!(circuit.connected_hop_prefix_len(), 0);
+        assert_ne!(circuit.hop_session_id(0), Some(original_session_id));
+    }
+
+    #[tokio::test]
+    async fn rebuild_after_failure_returns_rebuilt_for_current_epoch() {
+        let relay = TestRelayHandle::start_ephemeral().await.unwrap();
+        let (mut circuit, _) =
+            Circuit::new(vec![relay.spec.clone()], CircuitConfig::default()).unwrap();
+        circuit.build_full().await.unwrap();
+
+        let original_epoch = circuit.hop_epoch(0).unwrap();
+        let original_session_id = circuit.hop_session_id(0).unwrap();
+
+        let rebuilt = circuit
+            .rebuild_after_failure(HopFailure {
+                hop_idx: 0,
+                epoch: original_epoch,
+                reason: "current".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rebuilt, RebuildAfterFailureOutcome::Rebuilt);
+        assert_eq!(circuit.hop_epoch(0), Some(original_epoch + 1));
+        assert!(circuit.is_complete());
+        assert_eq!(circuit.connected_hop_prefix_len(), 1);
+        assert!(circuit.active_final_conn_is_set().await);
+        assert_ne!(circuit.hop_session_id(0), Some(original_session_id));
+    }
+
+    #[tokio::test]
+    async fn rebuild_after_failure_returns_invalid_hop_for_out_of_range_failure() {
+        let relay = TestRelayHandle::start_ephemeral().await.unwrap();
+        let (mut circuit, _) =
+            Circuit::new(vec![relay.spec.clone()], CircuitConfig::default()).unwrap();
+        circuit.build_full().await.unwrap();
+
+        let outcome = circuit
+            .rebuild_after_failure(HopFailure {
+                hop_idx: 1,
+                epoch: 1,
+                reason: "bad-hop".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RebuildAfterFailureOutcome::InvalidHop);
+        assert!(circuit.is_complete());
+        assert_eq!(circuit.connected_hop_prefix_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rebuild_from_invalid_index_errors() {
+        let specs = vec![RelaySpec {
+            addr: "127.0.0.1:1".to_string(),
+            pubkey: SecpTransportKeypair::generate().pubkey(),
+        }];
+        let (mut circuit, _) = Circuit::new(specs, CircuitConfig::default()).unwrap();
+
+        let err = circuit.rebuild_from(1).await.unwrap_err();
+        assert!(err.to_string().contains("invalid hop index 1"));
     }
 }
