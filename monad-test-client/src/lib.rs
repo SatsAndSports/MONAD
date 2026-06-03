@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use monad_client::socks;
-use monad_client::wallet::{MockWallet, MonadWallet, RelayPaymentOffer};
+use monad_client::wallet::{MockWallet, MonadWallet, RelayPaymentOffer, WalletError};
 use monad_common::noise_secp256k1;
 use monad_common::protocol::{ClientMessage, ServerMessage};
 use monad_common::quic_cert_identity::QuicCertIdentity;
@@ -78,6 +78,83 @@ pub struct Circuit {
     config: CircuitConfig,
     active_final_conn: Arc<RwLock<Option<Arc<RelayConnection>>>>,
     failure_tx: mpsc::UnboundedSender<HopFailure>,
+}
+
+struct HopFundingState {
+    offer: Option<RelayPaymentOffer>,
+    channel_id: Option<String>,
+    phase: HopFundingPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HopFundingPhase {
+    NeedChannel,
+    AwaitingLinkedStatus,
+    NeedTopUp,
+    Funded,
+}
+
+impl HopFundingState {
+    fn new() -> Self {
+        Self {
+            offer: None,
+            channel_id: None,
+            phase: HopFundingPhase::NeedChannel,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.offer = None;
+        self.channel_id = None;
+        self.phase = HopFundingPhase::NeedChannel;
+    }
+
+    fn needs_channel(&self) -> bool {
+        self.offer.is_none()
+            || self.channel_id.is_none()
+            || matches!(self.phase, HopFundingPhase::NeedChannel)
+    }
+
+    fn set_active_channel(&mut self, offer: RelayPaymentOffer, channel_id: String) {
+        self.offer = Some(offer);
+        self.channel_id = Some(channel_id);
+        self.phase = HopFundingPhase::AwaitingLinkedStatus;
+    }
+
+    fn active_offer(&self) -> Option<&RelayPaymentOffer> {
+        self.offer.as_ref()
+    }
+
+    fn active_channel_id(&self) -> Option<&str> {
+        self.channel_id.as_deref()
+    }
+
+    fn mark_needs_topup(&mut self) {
+        self.phase = HopFundingPhase::NeedTopUp;
+    }
+
+    fn mark_awaiting_linked_status(&mut self) {
+        self.phase = HopFundingPhase::AwaitingLinkedStatus;
+    }
+
+    fn mark_funded(&mut self) {
+        self.phase = HopFundingPhase::Funded;
+    }
+
+    fn needs_topup(&self) -> bool {
+        matches!(
+            self.phase,
+            HopFundingPhase::AwaitingLinkedStatus | HopFundingPhase::NeedTopUp
+        )
+    }
+
+    fn is_funded(&self) -> bool {
+        matches!(self.phase, HopFundingPhase::Funded)
+    }
+
+    fn has_active_channel(&self) -> bool {
+        self.offer.is_some() && self.channel_id.is_some()
+    }
 }
 
 impl Circuit {
@@ -347,6 +424,10 @@ impl TestRelayHandle {
     pub fn terminate_session(&self, session_id: &[u8; 32]) -> bool {
         self.session_registry.terminate(session_id)
     }
+
+    pub fn notify_session(&self, session_id: &[u8; 32], msg: ServerMessage) -> bool {
+        self.session_registry.notify(session_id, msg)
+    }
 }
 
 impl Drop for TestRelayHandle {
@@ -564,9 +645,7 @@ async fn start_auto_control(
     let handle = tokio::spawn(async move {
         let mut buf = Vec::new();
         let mut ready_tx = Some(ready_tx);
-        let mut offer: Option<RelayPaymentOffer> = None;
-        let mut channel_id: Option<String> = None;
-        let mut funded_to_capacity = false;
+        let mut funding = HopFundingState::new();
         let mut last_status_received_at = Instant::now();
         let mut status_request_in_flight = false;
         let mut interval = config.status_interval.map(time::interval);
@@ -671,15 +750,10 @@ async fn start_auto_control(
                         status_request_in_flight = false;
                     }
 
-                    if offer.is_none() {
+                    if funding.needs_channel() {
                         let Some(advertisement) = advertisements.first() else {
-                            report_hop_failure(
-                                &failure_tx,
-                                hop_idx,
-                                epoch,
-                                "relay advertised no payment offers",
-                            );
-                            break;
+                            warn!("{hop_label}: relay advertised no payment offers yet");
+                            continue;
                         };
                         let relay_offer = RelayPaymentOffer::from_advertisement(
                             receiver_pubkey.clone(),
@@ -690,37 +764,22 @@ async fn start_auto_control(
                         {
                             Ok(id) => id,
                             Err(err) => {
-                                report_hop_failure(
-                                    &failure_tx,
-                                    hop_idx,
-                                    epoch,
-                                    format!("failed to provision mock channel: {err}"),
-                                );
-                                break;
+                                warn!("{hop_label}: failed to provision mock channel: {err}");
+                                continue;
                             }
                         };
                         if let Err(err) =
                             wallet.attach_channel_to_session(&new_channel_id, session_id)
                         {
-                            report_hop_failure(
-                                &failure_tx,
-                                hop_idx,
-                                epoch,
-                                format!("failed to attach mock channel: {err}"),
-                            );
-                            break;
+                            warn!("{hop_label}: failed to attach mock channel: {err}");
+                            continue;
                         }
                         let payment_json =
                             match wallet.build_link_request(&new_channel_id, &relay_offer) {
                                 Ok(payload) => payload,
                                 Err(err) => {
-                                    report_hop_failure(
-                                        &failure_tx,
-                                        hop_idx,
-                                        epoch,
-                                        format!("failed to build link request: {err}"),
-                                    );
-                                    break;
+                                    warn!("{hop_label}: failed to build link request: {err}");
+                                    continue;
                                 }
                             };
                         if let Err(err) = send_control_message(
@@ -748,42 +807,77 @@ async fn start_auto_control(
                                 .unwrap_or_default(),
                             keyset_info_json: String::new(),
                         });
-                        offer = Some(relay_offer);
-                        channel_id = Some(new_channel_id);
+                        funding.set_active_channel(relay_offer, new_channel_id);
                         continue;
                     }
 
-                    let Some(current_offer) = offer.as_ref() else {
+                    let Some(current_offer) = funding.active_offer().cloned() else {
                         continue;
                     };
-                    let Some(current_channel_id) = channel_id.as_ref() else {
+                    let Some(current_channel_id) = funding.active_channel_id().map(str::to_owned)
+                    else {
                         continue;
                     };
 
                     if let Some(linked) = linked_channel {
-                        if linked.channel_id == *current_channel_id && !funded_to_capacity {
-                            if let Err(err) = send_payment_to_capacity(
+                        if linked.channel_id == current_channel_id && !paused {
+                            funding.mark_funded();
+                        }
+                        if linked.channel_id == current_channel_id && funding.needs_topup() {
+                            funding.mark_needs_topup();
+                            let mut payment_complete = false;
+                            match build_payment_to_capacity(
                                 &wallet,
-                                current_channel_id,
-                                current_offer,
+                                &current_channel_id,
+                                &current_offer,
                                 &linked,
-                                &mut h2_send,
-                            )
-                            .await
-                            {
-                                report_hop_failure(
-                                    &failure_tx,
-                                    hop_idx,
-                                    epoch,
-                                    format!("failed to fund session to capacity: {err}"),
-                                );
-                                break;
+                            ) {
+                                Ok(Some(payment_json)) => {
+                                    if let Err(err) = send_control_message(
+                                        &mut h2_send,
+                                        &ClientMessage::ChannelPayment { payment_json },
+                                    )
+                                    .await
+                                    {
+                                        report_hop_failure(
+                                            &failure_tx,
+                                            hop_idx,
+                                            epoch,
+                                            format!("failed to send channel payment: {err}"),
+                                        );
+                                        break;
+                                    }
+                                    funding.mark_awaiting_linked_status();
+                                }
+                                Ok(None) => {
+                                    if paused {
+                                        warn!(
+                                            "{hop_label}: active channel reached capacity while session remains paused; reprovisioning"
+                                        );
+                                        funding.reset();
+                                    } else {
+                                        payment_complete = true;
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!("{hop_label}: failed to build funding payment: {err}");
+                                    if matches!(
+                                        err,
+                                        WalletError::NoNewFunds
+                                            | WalletError::InsufficientCapacity { .. }
+                                    ) && paused
+                                    {
+                                        funding.reset();
+                                    }
+                                }
                             }
-                            funded_to_capacity = true;
+                            if payment_complete && funding.has_active_channel() {
+                                funding.mark_funded();
+                            }
                         }
                     }
 
-                    if funded_to_capacity && !paused {
+                    if funding.is_funded() && !paused {
                         if let Some(tx) = ready_tx.take() {
                             let _ = tx.send(());
                         }
@@ -795,16 +889,24 @@ async fn start_auto_control(
                 } => {
                     info!("{hop_label}: linked mock channel {channel_id} (capacity={capacity})");
                 }
-                ServerMessage::ChannelEvicted { channel_id } => {
-                    report_hop_failure(
-                        &failure_tx,
-                        hop_idx,
-                        epoch,
-                        format!("linked channel evicted: {channel_id}"),
+                ServerMessage::ChannelEvicted {
+                    channel_id: evicted_channel_id,
+                } => {
+                    warn!(
+                        "{hop_label}: linked channel evicted: {evicted_channel_id}; recovering in-session"
                     );
-                    break;
+                    funding.reset();
                 }
                 ServerMessage::Error { message } => {
+                    if is_recoverable_funding_error(&message) {
+                        warn!(
+                            "{hop_label}: recoverable relay control error: {message}; staying on session"
+                        );
+                        if is_channel_resetting_error(&message) {
+                            funding.reset();
+                        }
+                        continue;
+                    }
                     report_hop_failure(
                         &failure_tx,
                         hop_idx,
@@ -824,6 +926,26 @@ async fn start_auto_control(
     Ok((handle, ready_rx))
 }
 
+fn is_channel_resetting_error(message: &str) -> bool {
+    [
+        "no new funds",
+        "wrong channel",
+        "channel expired",
+        "channel closed",
+        "receiver key mismatch",
+        "unsupported unit",
+        "mint or keyset not acceptable",
+        "link balance must be zero",
+        "wrong receiver",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn is_recoverable_funding_error(message: &str) -> bool {
+    is_channel_resetting_error(message) || message.contains("unknown channel")
+}
+
 fn report_hop_failure(
     failure_tx: &mpsc::UnboundedSender<HopFailure>,
     hop_idx: usize,
@@ -837,25 +959,23 @@ fn report_hop_failure(
     });
 }
 
-async fn send_payment_to_capacity(
+fn build_payment_to_capacity(
     wallet: &MockWallet,
     channel_id: &str,
     offer: &RelayPaymentOffer,
     linked_channel: &monad_common::protocol::LinkedChannelStatus,
-    h2_send: &mut h2::SendStream<bytes::Bytes>,
-) -> io::Result<()> {
+) -> Result<Option<String>, WalletError> {
     if linked_channel.balance_raw >= linked_channel.capacity_raw {
-        return Ok(());
+        return Ok(None);
     }
-    let payment_json = wallet
+    wallet
         .build_channel_payment(
             channel_id,
             offer,
             linked_channel.balance_raw,
             linked_channel.capacity_raw,
         )
-        .map_err(|e| io::Error::other(format!("failed to build mock top-up payment: {e}")))?;
-    send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await
+        .map(Some)
 }
 
 async fn send_control_message(

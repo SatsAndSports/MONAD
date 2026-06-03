@@ -1,7 +1,9 @@
+use monad_common::protocol::ServerMessage;
 use monad_test_client::{Circuit, CircuitConfig, RebuildAfterFailureOutcome, TestRelayHandle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tokio::time::timeout;
 use tokio::time::Duration;
 
@@ -235,6 +237,48 @@ async fn set_hop_spec_and_rebuild_from_middle_switches_only_suffix() {
     assert_ne!(rebuilt_ids[1], initial_ids[1]);
     assert_ne!(rebuilt_ids[2], initial_ids[2]);
     assert_tunnel_works(&circuit, &target_addr, b"spec-swap-rebuild").await;
+}
+
+#[tokio::test]
+async fn channel_evicted_does_not_force_rebuild_when_control_stays_healthy() {
+    let (circuit, mut failure_rx, relays, target_addr, initial_ids) =
+        build_three_hop_circuit().await;
+
+    let session_id = initial_ids[1].expect("middle hop session id");
+    assert!(relays[1].notify_session(
+        &session_id,
+        ServerMessage::ChannelEvicted {
+            channel_id: "synthetic-evict".to_string(),
+        }
+    ));
+
+    sleep(Duration::from_millis(300)).await;
+    assert!(timeout(Duration::from_millis(200), failure_rx.recv())
+        .await
+        .is_err());
+    assert_eq!(circuit.hop_session_id(1), Some(session_id));
+    assert_tunnel_works(&circuit, &target_addr, b"after-eviction-not-rebuild").await;
+}
+
+#[tokio::test]
+async fn recoverable_control_error_does_not_force_rebuild() {
+    let (circuit, mut failure_rx, relays, target_addr, initial_ids) =
+        build_three_hop_circuit().await;
+
+    let session_id = initial_ids[1].expect("middle hop session id");
+    assert!(relays[1].notify_session(
+        &session_id,
+        ServerMessage::Error {
+            message: "no new funds".to_string(),
+        }
+    ));
+
+    sleep(Duration::from_millis(300)).await;
+    assert!(timeout(Duration::from_millis(200), failure_rx.recv())
+        .await
+        .is_err());
+    assert_eq!(circuit.hop_session_id(1), Some(session_id));
+    assert_tunnel_works(&circuit, &target_addr, b"after-recoverable-error").await;
 }
 
 #[tokio::test]
