@@ -30,6 +30,7 @@ stress-stable-5hop:
 	MONAD_STRESS_PAYLOAD_BYTES=3000 \
 	cargo test -p monad-relay --test stress -- --ignored stress_three_hop_quic_configurable --nocapture
 
+# Approx wall time on clanker's machine: ~22m41s
 stress-transport-extreme:
 	ulimit -n 524288 && \
 	echo "ulimit -n=$$(ulimit -n)" && \
@@ -43,6 +44,7 @@ stress-transport-extreme:
 	MONAD_STRESS_PAYLOAD_BYTES=256 \
 	cargo test -p monad-relay --test stress -- --ignored stress_three_hop_quic_configurable --nocapture
 
+# Approx wall time on clanker's machine: ~1m59s
 stress-payment-buffered:
 	ulimit -n 524288 && \
 	echo "ulimit -n=$$(ulimit -n)" && \
@@ -61,6 +63,7 @@ stress-payment-buffered:
 	MONAD_STRESS_PAYLOAD_BYTES=256 \
 	cargo test -p monad-relay --test stress -- --ignored stress_three_hop_quic_configurable --nocapture
 
+# Approx wall time on clanker's machine: ~29s
 stress-payment-relink:
 	ulimit -n 524288 && \
 	echo "ulimit -n=$$(ulimit -n)" && \

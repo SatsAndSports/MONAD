@@ -111,12 +111,14 @@ struct PaymentStats {
     sessions_relinked_once: AtomicU64,
     max_links_on_one_session: AtomicU64,
     channel_link_failures: AtomicU64,
-    channel_payments_total: AtomicU64,
-    channel_payments_proactive: AtomicU64,
-    channel_payments_reactive: AtomicU64,
+    initial_payments: AtomicU64,
+    topups_total: AtomicU64,
+    topups_proactive: AtomicU64,
+    topups_reactive: AtomicU64,
     sessions_paused_once: AtomicU64,
     pause_events: AtomicU64,
-    unpause_events: AtomicU64,
+    startup_unpauses: AtomicU64,
+    recovery_unpause_events: AtomicU64,
     status_polls_sent: AtomicU64,
     status_updates_seen: AtomicU64,
     payment_no_new_funds: AtomicU64,
@@ -131,12 +133,14 @@ struct PaymentStatsSnapshot {
     sessions_relinked_once: u64,
     max_links_on_one_session: u64,
     channel_link_failures: u64,
-    channel_payments_total: u64,
-    channel_payments_proactive: u64,
-    channel_payments_reactive: u64,
+    initial_payments: u64,
+    topups_total: u64,
+    topups_proactive: u64,
+    topups_reactive: u64,
     sessions_paused_once: u64,
     pause_events: u64,
-    unpause_events: u64,
+    startup_unpauses: u64,
+    recovery_unpause_events: u64,
     status_polls_sent: u64,
     status_updates_seen: u64,
     payment_no_new_funds: u64,
@@ -152,12 +156,14 @@ impl PaymentStats {
             sessions_relinked_once: self.sessions_relinked_once.load(Ordering::Relaxed),
             max_links_on_one_session: self.max_links_on_one_session.load(Ordering::Relaxed),
             channel_link_failures: self.channel_link_failures.load(Ordering::Relaxed),
-            channel_payments_total: self.channel_payments_total.load(Ordering::Relaxed),
-            channel_payments_proactive: self.channel_payments_proactive.load(Ordering::Relaxed),
-            channel_payments_reactive: self.channel_payments_reactive.load(Ordering::Relaxed),
+            initial_payments: self.initial_payments.load(Ordering::Relaxed),
+            topups_total: self.topups_total.load(Ordering::Relaxed),
+            topups_proactive: self.topups_proactive.load(Ordering::Relaxed),
+            topups_reactive: self.topups_reactive.load(Ordering::Relaxed),
             sessions_paused_once: self.sessions_paused_once.load(Ordering::Relaxed),
             pause_events: self.pause_events.load(Ordering::Relaxed),
-            unpause_events: self.unpause_events.load(Ordering::Relaxed),
+            startup_unpauses: self.startup_unpauses.load(Ordering::Relaxed),
+            recovery_unpause_events: self.recovery_unpause_events.load(Ordering::Relaxed),
             status_polls_sent: self.status_polls_sent.load(Ordering::Relaxed),
             status_updates_seen: self.status_updates_seen.load(Ordering::Relaxed),
             payment_no_new_funds: self.payment_no_new_funds.load(Ordering::Relaxed),
@@ -600,6 +606,7 @@ async fn start_huge_funding_control(
         let mut active_channel_id: Option<String> = None;
         let mut link_in_flight: Option<String> = None;
         let mut channel_states = HashMap::<String, ChannelAttemptState>::new();
+        let mut session_became_usable = false;
         let mut last_paused: Option<bool> = None;
         let mut saw_pause_once = false;
         let mut successful_links = 0u64;
@@ -652,8 +659,10 @@ async fn start_huge_funding_control(
                                     .sessions_paused_once
                                     .fetch_add(1, Ordering::Relaxed);
                             }
-                        } else if previous_paused && !paused {
-                            payment_stats.unpause_events.fetch_add(1, Ordering::Relaxed);
+                        } else if previous_paused && !paused && saw_pause_once {
+                            payment_stats
+                                .recovery_unpause_events
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     last_paused = Some(paused);
@@ -733,8 +742,9 @@ async fn start_huge_funding_control(
                                 StressPaymentMode::Buffered | StressPaymentMode::RelinkBuffered
                             ) && remaining_milli_sats
                                 <= payment.target_buffer_msats as i64;
+                            let is_initial_payment = !channel_state.initial_payment_sent;
 
-                            let next_target_raw = if !channel_state.initial_payment_sent {
+                            let next_target_raw = if is_initial_payment {
                                 channel_state.initial_payment_sent = true;
                                 Some(match payment.mode {
                                     StressPaymentMode::Transport => linked.capacity_raw,
@@ -839,19 +849,21 @@ async fn start_huge_funding_control(
                                         );
                                         break;
                                     }
-                                    payment_stats
-                                        .channel_payments_total
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    if channel_state.initial_payment_sent && needs_reactive_topup {
+                                    if is_initial_payment {
                                         payment_stats
-                                            .channel_payments_reactive
+                                            .initial_payments
                                             .fetch_add(1, Ordering::Relaxed);
-                                    } else if channel_state.initial_payment_sent
-                                        && needs_proactive_topup
-                                    {
-                                        payment_stats
-                                            .channel_payments_proactive
-                                            .fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        payment_stats.topups_total.fetch_add(1, Ordering::Relaxed);
+                                        if needs_reactive_topup {
+                                            payment_stats
+                                                .topups_reactive
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        } else if needs_proactive_topup {
+                                            payment_stats
+                                                .topups_proactive
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                     channel_state.last_attempted_balance_raw =
                                         Some(next_target_raw);
@@ -867,6 +879,12 @@ async fn start_huge_funding_control(
                         .is_some_and(|state| state.initial_payment_sent)
                         && !paused
                     {
+                        if !session_became_usable {
+                            session_became_usable = true;
+                            payment_stats
+                                .startup_unpauses
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         if let Some(tx) = ready_tx.take() {
                             let _ = tx.send(());
                         }
@@ -1333,7 +1351,7 @@ async fn run_stress_scenario(config: StressConfig) {
     };
 
     println!(
-        "stress summary relays={} circuits={} sessions={} streams={} payload_bytes={} successes={} failures={} streams_ok={} sent_bytes={} recv_bytes={} total_bytes={} avg_setup_ms={:.2} avg_data_ms={:.2} total_elapsed_s={:.3} throughput_mib_per_s={:.2} sessions_linked={} channel_links_total={} channel_relinks_total={} sessions_relinked_once={} max_links_on_one_session={} channel_link_failures={} channel_payments_total={} channel_payments_proactive={} channel_payments_reactive={} sessions_paused_once={} pause_events={} unpause_events={} status_polls_sent={} status_updates_seen={} payment_no_new_funds={} control_errors={}",
+        "stress summary relays={} circuits={} sessions={} streams={} payload_bytes={} successes={} failures={} streams_ok={} sent_bytes={} recv_bytes={} total_bytes={} avg_setup_ms={:.2} avg_data_ms={:.2} total_elapsed_s={:.3} throughput_mib_per_s={:.2} sessions_linked={} channel_links_total={} channel_relinks_total={} sessions_relinked_once={} max_links_on_one_session={} channel_link_failures={} initial_payments={} topups_total={} topups_proactive={} topups_reactive={} sessions_paused_once={} pause_events={} startup_unpauses={} recovery_unpause_events={} status_polls_sent={} status_updates_seen={} payment_no_new_funds={} control_errors={}",
         config.relays,
         config.circuits,
         total_sessions,
@@ -1355,12 +1373,14 @@ async fn run_stress_scenario(config: StressConfig) {
         payment_snapshot.sessions_relinked_once,
         payment_snapshot.max_links_on_one_session,
         payment_snapshot.channel_link_failures,
-        payment_snapshot.channel_payments_total,
-        payment_snapshot.channel_payments_proactive,
-        payment_snapshot.channel_payments_reactive,
+        payment_snapshot.initial_payments,
+        payment_snapshot.topups_total,
+        payment_snapshot.topups_proactive,
+        payment_snapshot.topups_reactive,
         payment_snapshot.sessions_paused_once,
         payment_snapshot.pause_events,
-        payment_snapshot.unpause_events,
+        payment_snapshot.startup_unpauses,
+        payment_snapshot.recovery_unpause_events,
         payment_snapshot.status_polls_sent,
         payment_snapshot.status_updates_seen,
         payment_snapshot.payment_no_new_funds,
