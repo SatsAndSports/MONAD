@@ -53,7 +53,6 @@ pub enum ServerMessage {
     /// session state changes (balance, link, pricing).
     SessionStatus {
         // --- Static/Advertisement Info ---
-        version: u8,
         receiver_pubkey: String,
         advertisements: Vec<KeysetAdvertisement>,
 
@@ -69,9 +68,6 @@ pub enum ServerMessage {
         remaining_milli_sats: i64,
         paused: bool,
     },
-
-    /// The server validated and linked the Spilman channel to this session.
-    ChannelLinkAccepted { channel_id: String, capacity: u64 },
 
     /// Another session claimed the channel; this session is now Unlinked.
     ChannelEvicted { channel_id: String },

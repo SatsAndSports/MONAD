@@ -711,6 +711,28 @@ async fn start_huge_funding_control(
 
                     if let Some(linked) = linked_channel {
                         if link_in_flight.as_deref() == Some(linked.channel_id.as_str()) {
+                            successful_links = successful_links.saturating_add(1);
+                            payment_stats
+                                .channel_links_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            payment_stats
+                                .max_links_on_one_session
+                                .fetch_max(successful_links, Ordering::Relaxed);
+                            if successful_links == 1 {
+                                payment_stats
+                                    .sessions_linked
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                payment_stats
+                                    .channel_relinks_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if !counted_relinked_session {
+                                    counted_relinked_session = true;
+                                    payment_stats
+                                        .sessions_relinked_once
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                             active_channel_id = Some(linked.channel_id.clone());
                             link_in_flight = None;
                         } else if active_channel_id.as_deref() != Some(linked.channel_id.as_str()) {
@@ -889,31 +911,6 @@ async fn start_huge_funding_control(
                             let _ = tx.send(());
                         }
                     }
-                }
-                ServerMessage::ChannelLinkAccepted { channel_id, .. } => {
-                    successful_links = successful_links.saturating_add(1);
-                    payment_stats
-                        .channel_links_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    payment_stats
-                        .max_links_on_one_session
-                        .fetch_max(successful_links, Ordering::Relaxed);
-                    if successful_links == 1 {
-                        payment_stats
-                            .sessions_linked
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        payment_stats
-                            .channel_relinks_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        if !counted_relinked_session {
-                            counted_relinked_session = true;
-                            payment_stats
-                                .sessions_relinked_once
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    link_in_flight = Some(channel_id);
                 }
                 ServerMessage::ChannelEvicted { channel_id } => {
                     payment_stats.control_errors.fetch_add(1, Ordering::Relaxed);

@@ -68,12 +68,7 @@ pub(crate) fn step(
         SessionEvent::LinkValidationFinished(result) => match result {
             Ok(outcome) => {
                 state.linked_channel_id = Some(outcome.channel_id.clone());
-                let mut effects = vec![SessionEffect::SendControl(
-                    ServerMessage::ChannelLinkAccepted {
-                        channel_id: outcome.channel_id.clone(),
-                        capacity: outcome.capacity_millisats,
-                    },
-                )];
+                let mut effects = Vec::new();
                 if let Some(evicted_session) = outcome.evicted_session {
                     effects.push(SessionEffect::NotifySessionEvicted {
                         target_session_id: evicted_session,
@@ -181,7 +176,7 @@ mod tests {
 
     fn state() -> ServerSessionState {
         ServerSessionState {
-            pricing: SessionPricing::new(0, 1, 1),
+            pricing: SessionPricing::new(1, 1),
             session_total_in: 0,
             session_total_out: 0,
             total_paid_millisats: 0,
@@ -203,13 +198,7 @@ mod tests {
         );
 
         assert_eq!(next.linked_channel_id.as_deref(), Some("chan-a"));
-        assert!(matches!(
-            effects.as_slice(),
-            [
-                SessionEffect::SendControl(ServerMessage::ChannelLinkAccepted { channel_id, capacity }),
-                SessionEffect::SendStatus,
-            ] if channel_id == "chan-a" && *capacity == 123
-        ));
+        assert!(matches!(effects.as_slice(), [SessionEffect::SendStatus]));
     }
 
     #[test]

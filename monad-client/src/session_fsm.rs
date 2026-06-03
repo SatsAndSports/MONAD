@@ -77,9 +77,6 @@ pub(crate) enum ClientSessionEvent {
         kind: WalletOpKind,
         error: WalletError,
     },
-    ChannelLinkAccepted {
-        channel_id: String,
-    },
     ChannelEvicted {
         channel_id: String,
     },
@@ -270,10 +267,6 @@ pub(crate) fn step(
                 effects.push(ClientSessionEffect::SelectChannel);
             }
             effects
-        }
-        ClientSessionEvent::ChannelLinkAccepted { channel_id } => {
-            state.active_channel_id = Some(channel_id);
-            Vec::new()
         }
         ClientSessionEvent::ChannelEvicted { channel_id } => {
             let mut effects = Vec::new();
@@ -516,7 +509,7 @@ mod tests {
             ClientSessionState::new(),
             ClientSessionEvent::SessionStatusReceived {
                 snapshot: snapshot(true),
-                pricing: SessionPricing::new(0, 1, 1),
+                pricing: SessionPricing::new(1, 1),
             },
         );
 
@@ -590,7 +583,7 @@ mod tests {
             ClientSessionState::new(),
             ClientSessionEvent::SessionStatusReceived {
                 snapshot: snapshot(false),
-                pricing: SessionPricing::new(0, 1, 1),
+                pricing: SessionPricing::new(1, 1),
             },
         );
 

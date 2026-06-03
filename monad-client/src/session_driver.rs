@@ -111,7 +111,6 @@ async fn run_session_driver(
                 .map_err(|e| io::Error::other(format!("json error: {e}")))?;
             let event = match message {
                 ServerMessage::SessionStatus {
-                    version,
                     receiver_pubkey,
                     advertisements,
                     linked_channel,
@@ -123,11 +122,8 @@ async fn run_session_driver(
                     remaining_milli_sats,
                     paused,
                 } => {
-                    let pricing = monad_common::session::SessionPricing::new(
-                        version,
-                        active_in_rate,
-                        active_out_rate,
-                    );
+                    let pricing =
+                        monad_common::session::SessionPricing::new(active_in_rate, active_out_rate);
                     let due_now = pricing.amount_due_millisats(session_total_in, session_total_out);
                     info!(
                         "{} session status: paused={} balance={} paid={} due={} linked={:?}",
@@ -155,16 +151,6 @@ async fn run_session_driver(
                         config.hop_label
                     );
                     ClientSessionEvent::ChannelEvicted { channel_id }
-                }
-                ServerMessage::ChannelLinkAccepted {
-                    channel_id,
-                    capacity,
-                } => {
-                    info!(
-                        "{} channel {channel_id} linked successfully (capacity={capacity})",
-                        config.hop_label
-                    );
-                    ClientSessionEvent::ChannelLinkAccepted { channel_id }
                 }
                 ServerMessage::Error { message } => {
                     warn!("{} control error: {message}", config.hop_label);

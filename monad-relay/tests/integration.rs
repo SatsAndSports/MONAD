@@ -567,12 +567,10 @@ async fn control_handshake(
     let message = read_control_message(h2_recv).await;
     match &message {
         ServerMessage::SessionStatus {
-            version,
             active_in_rate,
             active_out_rate,
             ..
         } => {
-            assert_eq!(*version, 0);
             assert_eq!(*active_in_rate, 1);
             assert_eq!(*active_out_rate, 1);
         }
@@ -657,13 +655,6 @@ impl SessionPaymentChannel {
         TEST_CHANNEL_CAPACITY_UNITS
     }
 
-    fn expected_capacity_millisats(&self) -> u64 {
-        match self.unit {
-            "sat" => self.capacity_units() * 1000,
-            _ => self.capacity_units(),
-        }
-    }
-
     fn link_json(&self) -> String {
         serde_json::json!({
             "channel_id": self.channel_id,
@@ -695,17 +686,6 @@ impl SessionPaymentChannel {
             false,
         )
         .await;
-
-        match read_control_message(h2_recv).await {
-            ServerMessage::ChannelLinkAccepted {
-                channel_id,
-                capacity,
-            } => {
-                assert_eq!(channel_id, self.channel_id);
-                assert_eq!(capacity, self.expected_capacity_millisats());
-            }
-            other => panic!("expected ChannelLinkAccepted, got {other:?}"),
-        }
 
         match read_control_message(h2_recv).await {
             ServerMessage::SessionStatus {

@@ -34,8 +34,6 @@ use tracing::{debug, error, info, warn};
 /// Custom header name for QUIC secp256k1 transport identity in CONNECT requests.
 pub const QUIC_SECP256K1_PUBKEY_HEADER: &str = "quic-secp256k1-pubkey";
 
-const SERVER_MAX_VERSION: u8 = 0;
-
 #[derive(Debug)]
 struct SessionInner {
     session_total_in: u64,
@@ -102,7 +100,6 @@ impl SessionState {
                 session_total_out: 0,
                 total_paid_millisats: 0,
                 pricing: SessionPricing::new(
-                    SERVER_MAX_VERSION,
                     default_in_bytes_per_millisat.max(1),
                     default_out_bytes_per_millisat.max(1),
                 ),
@@ -128,7 +125,7 @@ impl SessionState {
         inner.total_paid_millisats as i128 - amount_due as i128
     }
 
-    async fn session_status_message(&self, negotiated_version: u8) -> ServerMessage {
+    async fn session_status_message(&self) -> ServerMessage {
         let inner = self.inner.lock().await;
 
         let mut advertisements = Vec::new();
@@ -146,7 +143,6 @@ impl SessionState {
         }
 
         ServerMessage::SessionStatus {
-            version: negotiated_version,
             receiver_pubkey: self.payment_receiver_secret.public_key().to_hex(),
             advertisements,
             linked_channel: inner
@@ -238,11 +234,7 @@ impl SessionState {
     }
 
     pub(crate) async fn push_status(&self) {
-        let version = {
-            let inner = self.inner.lock().await;
-            inner.pricing.version
-        };
-        let status = self.session_status_message(version).await;
+        let status = self.session_status_message().await;
         self.push_message(status).await;
     }
 }
@@ -599,18 +591,10 @@ async fn handle_control_stream(
     info!("control channel opened");
 
     let mut buf = Vec::new();
-    let negotiated_version = SERVER_MAX_VERSION;
-
     // Bootstrap stays outside the explicit steady-state session FSM. After the
-    // pre-H2 Noise bootstrap selected the session protocol, we seed the local
-    // session version and immediately send the initial SessionStatus before
-    // entering the reducer-driven control loop.
-    {
-        let mut inner = state.inner.lock().await;
-        inner.pricing.version = negotiated_version;
-    }
-
-    let initial_status = state.session_status_message(negotiated_version).await;
+    // pre-H2 Noise bootstrap selected the session protocol, we immediately send
+    // the initial SessionStatus before entering the reducer-driven control loop.
+    let initial_status = state.session_status_message().await;
     send_control_message(&mut h2_send, &initial_status).await?;
 
     let mut terminate_session = false;
@@ -624,7 +608,6 @@ async fn handle_control_stream(
                             terminate_session = process_session_event(
                                 &state,
                                 SessionEvent::ChannelEvicted { channel_id },
-                                negotiated_version,
                                 &mut h2_send,
                             )
                             .await?;
@@ -658,7 +641,6 @@ async fn handle_control_stream(
                                     terminate_session = process_session_event(
                                         &state,
                                         SessionEvent::ClientGetSessionStatus,
-                                        negotiated_version,
                                         &mut h2_send,
                                     )
                                     .await?;
@@ -667,7 +649,6 @@ async fn handle_control_stream(
                                     terminate_session = process_session_event(
                                         &state,
                                         SessionEvent::ClientChannelLink { payment_json },
-                                        negotiated_version,
                                         &mut h2_send,
                                     )
                                     .await?;
@@ -676,7 +657,6 @@ async fn handle_control_stream(
                                     terminate_session = process_session_event(
                                         &state,
                                         SessionEvent::ClientChannelPayment { payment_json },
-                                        negotiated_version,
                                         &mut h2_send,
                                     )
                                     .await?;
@@ -712,13 +692,7 @@ async fn handle_control_stream(
         }
     }
 
-    let _ = process_session_event(
-        &state,
-        SessionEvent::ControlDetached,
-        negotiated_version,
-        &mut h2_send,
-    )
-    .await?;
+    let _ = process_session_event(&state, SessionEvent::ControlDetached, &mut h2_send).await?;
 
     state.detach_control().await;
     let _ = h2_send.send_data(Bytes::new(), true);
@@ -729,7 +703,6 @@ async fn handle_control_stream(
 async fn process_session_event(
     state: &SessionState,
     initial_event: SessionEvent,
-    negotiated_version: u8,
     h2_send: &mut h2::SendStream<Bytes>,
 ) -> io::Result<bool> {
     // Run a small local event queue so effects like link/payment validation can
@@ -752,7 +725,7 @@ async fn process_session_event(
                     send_control_message(h2_send, &message).await?;
                 }
                 SessionEffect::SendStatus => {
-                    let status = state.session_status_message(negotiated_version).await;
+                    let status = state.session_status_message().await;
                     send_control_message(h2_send, &status).await?;
                 }
                 SessionEffect::RunLinkValidation { payment_json } => {

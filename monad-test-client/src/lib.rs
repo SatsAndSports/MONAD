@@ -706,7 +706,6 @@ async fn start_auto_control(
 
             match message {
                 ServerMessage::SessionStatus {
-                    version,
                     receiver_pubkey,
                     advertisements,
                     linked_channel,
@@ -720,7 +719,7 @@ async fn start_auto_control(
                     ..
                 } => {
                     last_status_received_at = Instant::now();
-                    let pricing = SessionPricing::new(version, active_in_rate, active_out_rate);
+                    let pricing = SessionPricing::new(active_in_rate, active_out_rate);
                     *pricing_handle.write().await = Some(pricing);
 
                     if status_request_in_flight {
@@ -882,12 +881,6 @@ async fn start_auto_control(
                             let _ = tx.send(());
                         }
                     }
-                }
-                ServerMessage::ChannelLinkAccepted {
-                    channel_id,
-                    capacity,
-                } => {
-                    info!("{hop_label}: linked mock channel {channel_id} (capacity={capacity})");
                 }
                 ServerMessage::ChannelEvicted {
                     channel_id: evicted_channel_id,
