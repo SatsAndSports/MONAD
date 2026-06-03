@@ -26,7 +26,7 @@ Important types:
   - wraps an H2 `SendStream + RecvStream` pair as a bidirectional async stream
   - allows another Noise+H2 session to run on top of an existing CONNECT tunnel
 - `ClientMessage` / `ServerMessage` (`protocol.rs`)
-  - wire protocol enums for the control stream (Hello, ChannelLink, ChannelPayment, GetSessionStatus, ChannelLinkAccepted, ChannelEvicted, SessionStatus, Error)
+  - wire protocol enums for the control stream (ChannelLink, ChannelPayment, GetSessionStatus, ChannelLinkAccepted, ChannelEvicted, SessionStatus, Error)
   - `KeysetAdvertisement` plus `LinkedChannelStatus` for mint offers and relay-authoritative linked-channel sync
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established secp Noise+H2 session
@@ -91,6 +91,34 @@ Also includes standalone echo tooling for transport testing:
 - `server` — QUIC echo server that accepts connections and streams
 - `client` — connect with a pinned key, open N bidirectional streams, send/verify echoed data
 
+### Why QUIC Still Uses Ed25519 Certificates
+
+MONAD now uses secp256k1 x-only keys for user-visible relay transport
+identity, plain MONAD transport authentication, and QUIC hop authentication.
+The remaining non-secp piece is the QUIC/TLS certificate layer itself.
+
+With the current `quinn` + `rustls` + `rcgen` stack, QUIC still needs a
+standard TLS certificate path. In practice that means MONAD keeps an Ed25519
+seed only for QUIC certificate generation and then binds the live QUIC channel
+to the configured secp256k1 relay identity using post-TLS secp attestation.
+
+So the current split is:
+- secp256k1 for MONAD transport identity and QUIC attestation
+- Ed25519 only for standards-compliant QUIC certificate plumbing
+
+The remaining blocker to a fully secp-only QUIC transport story is therefore in
+TLS/QUIC ecosystem support, not in MONAD's own transport identity model.
+
+### `monad-test-client`
+
+Developer-focused localhost test harness.
+
+Responsibilities:
+- spin up local relays in-process with mocked payment backends
+- build a persistent QUIC-only circuit for manual browser/SSH testing
+- monitor per-hop control state and process FD counts
+- exercise reusable per-hop circuit rebuild primitives and targeted session failure handling
+
 ## Terminology
 
 ### Hop
@@ -111,7 +139,7 @@ An H2 stream using:
 POST /control
 ```
 
-Used for session management: version negotiation (Hello), Spilman channel linking (ChannelLink/ChannelLinkAccepted), and unified session status synchronization (SessionStatus). See the "Control Protocol and Session Billing" section below for details.
+Used for session management after the Noise-payload bootstrap has already negotiated the session version/capabilities and selected the `h2` session protocol. The control stream then carries Spilman channel linking (`ChannelLink`/`ChannelLinkAccepted`) and unified session status synchronization (`SessionStatus`). See the "Control Protocol and Session Billing" section below for details.
 
 ### Data stream
 
@@ -327,6 +355,11 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 ### Client Auto-Funding
 
 The client opens a control stream immediately after connecting. Once it receives the initial `SessionStatus`, the per-session payment driver either selects a matching local channel or provisions one from the relay's advertisements, sends `ChannelLink`, then sends `ChannelPayment` updates whenever the remaining session balance becomes non-positive. Intermediate hops in multi-hop chains use the same session-driver model.
+
+The developer stress harness in `monad-relay/tests/stress.rs` can also run alternate payment policies on top of the same wire protocol:
+- transport-focused mode with one huge prefunding payment per hop session
+- buffered payment mode with frequent `SessionStatus` polling and repeated `ChannelPayment` topups on one linked channel
+- relink-buffered mode that provisions and links a fresh mocked channel when the current one lacks capacity for the next refill
 
 ### Client Session FSM
 
@@ -818,9 +851,9 @@ This gives the intended privacy property:
 - the hop still gets a normal authenticated nested Noise session
 - relay-to-relay transport remains standard QUIC underneath
 
-For the rationale behind MONAD's Ed25519-rooted identity design, and why the
-transport layer is not currently built on secp256k1, see
-`WHY_NOT_SECP256K1.md`.
+For the rationale behind MONAD's Ed25519-rooted QUIC certificate plumbing and
+why the transport layer is not currently fully secp256k1-native, see
+"Why QUIC Still Uses Ed25519 Certificates" above.
 
 
 

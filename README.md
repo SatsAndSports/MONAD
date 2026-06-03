@@ -17,10 +17,11 @@ Implemented today:
 - `monad-client`: provides the reusable selector / wallet / session-driver client library pieces for relay session funding and multi-hop connection setup
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
+- `monad-test-client`: localhost SOCKS5/manual test harness for mocked relay funding, circuit rebuild testing, and daily-driver browser/SSH experiments
 - QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
 - Noise-payload bootstrap: after Noise completes but before H2 starts, client and relay negotiate the session version/capabilities; today this is an intentionally strict hardcoded bootstrap that selects `h2` or rejects with a reason
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
-- session payment system: paused-by-default sessions, Hello/SessionStatus handshake, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
+- session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
 - relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - client-side session FSM for serialized per-session link/payment/relink decisions
@@ -42,6 +43,7 @@ monad-common/     Shared transport and protocol helpers
 monad-client/     Client library, wallet/driver logic, and binary entrypoint
 monad-relay/      Relay binary and library
 monad-quic/       Shared QUIC transport code plus standalone echo tooling
+monad-test-client/ Local SOCKS5/manual test harness with mocked funding
 ```
 
 ## Build
@@ -72,6 +74,13 @@ make lint
 make test
 make check
 ```
+
+The `Makefile` also includes named manual stress recipes for:
+- transport-focused stress (`make stress-transport-extreme`)
+- repeated `ChannelPayment` stress on one linked channel (`make stress-payment-buffered`)
+- repeated relink stress with one active channel per session at a time (`make stress-payment-relink`)
+
+These stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI.
 
 Current coverage includes:
 - Noise handshake and large-payload transport tests
