@@ -658,6 +658,20 @@ pub mod testing {
                 .get(channel_id)
                 .and_then(|record| record.owner)
         }
+
+        pub fn mark_closed(&self, channel_id: &str) -> bool {
+            match self.inner.lock() {
+                Ok(mut inner) => {
+                    if let Some(record) = inner.channels.get_mut(channel_id) {
+                        record.closed = true;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => false,
+            }
+        }
     }
 
     #[derive(Debug)]

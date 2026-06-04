@@ -692,6 +692,32 @@ mod tests {
     }
 
     #[test]
+    fn channel_closed_server_error_marks_channel_unusable() {
+        let mut state = ClientSessionState::new();
+        state.snapshot = Some(snapshot(true));
+        state.active_channel_id = Some("chan-a".to_string());
+        state.active_offer = Some(offer());
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::ServerError {
+                code: ServerErrorCode::ChannelClosed,
+                message: "channel closed".to_string(),
+            },
+        );
+
+        assert_eq!(state.active_channel_id, None);
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                ClientSessionEffect::MarkChannelUnusable { channel_id },
+                ClientSessionEffect::UpdateSpilmanInfoHandle(Some(_)),
+                ClientSessionEffect::SelectChannel,
+            ] if channel_id == "chan-a"
+        ));
+    }
+
+    #[test]
     fn control_detached_ends_session() {
         let mut state = ClientSessionState::new();
         state.active_channel_id = Some("chan-a".to_string());

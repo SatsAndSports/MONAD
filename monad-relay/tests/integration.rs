@@ -261,7 +261,11 @@ async fn start_monad_relay_with_test_payments() -> (
 async fn start_monad_relay_with_spilman(
     trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
     payment_receiver_secret: cashu::nuts::SecretKey,
-) -> (std::net::SocketAddr, Secp256k1Pubkey) {
+) -> (
+    std::net::SocketAddr,
+    Secp256k1Pubkey,
+    Arc<InMemoryRelayPayments>,
+) {
     let identity = QuicCertIdentity::generate().unwrap();
     let transport_key = SecpTransportKeypair::generate();
     let pubkey = transport_key.pubkey();
@@ -293,11 +297,11 @@ async fn start_monad_relay_with_spilman(
         listener,
         Some(quic_endpoint),
         config,
-        payments,
+        payments.clone(),
         discovered_spilman_mint_cache,
     ));
 
-    (addr, pubkey)
+    (addr, pubkey, payments)
 }
 
 async fn start_http_test_mint() -> (String, String, tokio::sync::oneshot::Sender<()>) {
@@ -1233,7 +1237,7 @@ async fn test_session_payment_driver_links_unpauses_and_allows_data_flow() {
     let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
     let mut trusted_mint_units = BTreeMap::new();
     trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
-    let (server_addr, pubkey) =
+    let (server_addr, pubkey, _payments) =
         start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
 
     let wallet = Arc::new(MockWallet::new());
@@ -1283,7 +1287,7 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
     let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
     let mut trusted_mint_units = BTreeMap::new();
     trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
-    let (server_addr, pubkey) =
+    let (server_addr, pubkey, _payments) =
         start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
 
     let wallet = Arc::new(MockWallet::new());
@@ -1333,13 +1337,68 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
 }
 
 #[tokio::test]
+async fn test_closed_channel_payment_is_rejected_after_successful_link_and_payment() {
+    let (server_addr, pubkey, payments) = start_monad_relay_with_test_payments().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let mut control = ControlSessionHarness::open(&conn).await;
+
+    let status0 = control.handshake().await;
+    assert!(status0.paused);
+
+    let mut channel = SessionPaymentChannel::for_explicit_id("chan-closed-later");
+    let (_in1, _out1, paid1, rem1, paused1) =
+        channel.link(&mut control.send, &mut control.recv).await;
+    assert_eq!(paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
+
+    let (_in2, _out2, paid2, rem2, paused2) =
+        channel.pay(&mut control.send, &mut control.recv, 50).await;
+    assert_eq!(paid2, 50);
+    assert_eq!(rem2, 50);
+    assert!(!paused2);
+
+    assert!(payments.mark_closed("chan-closed-later"));
+    channel.cumulative_balance_units = channel.cumulative_balance_units.saturating_add(1);
+    send_control_message(
+        &mut control.send,
+        &ClientMessage::ChannelPayment {
+            payment_json: channel.payment_json(),
+        },
+        false,
+    )
+    .await;
+
+    let (code, message) = control.expect_error().await;
+    assert_eq!(code, ServerErrorCode::ChannelClosed);
+    assert!(
+        message.contains("channel closed"),
+        "unexpected error: {message}"
+    );
+
+    let status = control.get_status().await;
+    status.assert_linked_channel(
+        "chan-closed-later",
+        50,
+        channel.capacity_units(),
+        channel.unit,
+    );
+    assert_eq!(status.total_paid_millisats, 50);
+    assert_eq!(status.remaining_milli_sats, 50);
+    assert!(!status.paused);
+
+    control.close().await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_session_payment_driver_detaches_evicted_channel() {
     let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
     let payment_receiver_secret = cashu::nuts::SecretKey::generate();
     let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
     let mut trusted_mint_units = BTreeMap::new();
     trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
-    let (server_addr, pubkey) =
+    let (server_addr, pubkey, _payments) =
         start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
 
     let wallet_a = Arc::new(MockWallet::new());
