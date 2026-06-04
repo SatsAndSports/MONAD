@@ -22,7 +22,7 @@ pub(crate) struct ClientSessionState {
     pub snapshot: Option<SessionSnapshot>,
     pub active_channel_id: Option<String>,
     pub active_offer: Option<RelayPaymentOffer>,
-    pub insufficient_channels: BTreeSet<String>,
+    pub session_excluded_channels: BTreeSet<String>,
     pub terminated: bool,
 }
 
@@ -32,7 +32,7 @@ impl ClientSessionState {
             snapshot: None,
             active_channel_id: None,
             active_offer: None,
-            insufficient_channels: BTreeSet::new(),
+            session_excluded_channels: BTreeSet::new(),
             terminated: false,
         }
     }
@@ -254,7 +254,7 @@ pub(crate) fn step(
                 WalletOpKind::PrepareLink { channel_id }
                 | WalletOpKind::PreparePayment { channel_id } => {
                     if exclude_on_wallet_error(&error) {
-                        state.insufficient_channels.insert(channel_id.clone());
+                        state.session_excluded_channels.insert(channel_id.clone());
                     }
                     if state.active_channel_id.as_deref() == Some(channel_id.as_str()) {
                         state.active_channel_id = None;
@@ -273,7 +273,7 @@ pub(crate) fn step(
         }
         ClientSessionEvent::ChannelEvicted { channel_id } => {
             let mut effects = Vec::new();
-            state.insufficient_channels.remove(&channel_id);
+            state.session_excluded_channels.insert(channel_id.clone());
             if state.active_channel_id.as_deref() == Some(channel_id.as_str()) {
                 state.active_channel_id = None;
                 state.active_offer = None;
@@ -356,7 +356,7 @@ fn payment_progress_effects(
 
     if next_balance_raw > linked_channel.capacity_raw {
         state
-            .insufficient_channels
+            .session_excluded_channels
             .insert(active_channel_id.clone());
         state.active_channel_id = None;
         state.active_offer = None;
@@ -627,7 +627,7 @@ mod tests {
         );
 
         assert_eq!(state.active_channel_id, None);
-        assert!(state.insufficient_channels.contains("chan-a"));
+        assert!(state.session_excluded_channels.contains("chan-a"));
         assert!(matches!(
             effects.as_slice(),
             [
@@ -654,6 +654,7 @@ mod tests {
         );
 
         assert_eq!(state.active_channel_id, None);
+        assert!(state.session_excluded_channels.contains("chan-a"));
         assert!(matches!(
             effects.as_slice(),
             [
@@ -725,7 +726,7 @@ mod tests {
         );
 
         assert!(state.active_channel_id.is_none());
-        assert!(state.insufficient_channels.contains("chan-a"));
+        assert!(state.session_excluded_channels.contains("chan-a"));
         assert!(matches!(
             effects.as_slice(),
             [

@@ -338,7 +338,11 @@ fn choose_channel_and_offer(
     let channels = wallet
         .list_channels()?
         .into_iter()
-        .filter(|channel| !state.insufficient_channels.contains(&channel.channel_id))
+        .filter(|channel| {
+            !state
+                .session_excluded_channels
+                .contains(&channel.channel_id)
+        })
         .collect::<Vec<_>>();
     for advertisement in &snapshot.advertisements {
         let offer =
