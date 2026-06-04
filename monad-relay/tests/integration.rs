@@ -8,7 +8,7 @@
 //! Validates:
 //!   - Noise NK handshake and encrypted transport
 //!   - H2 multiplexing: control + data streams coexisting
-//!   - Control channel: Hello/SessionStatus version negotiation, channel linking,
+//!   - Control channel: SessionStatus bootstrap, channel linking,
 //!     incremental channel payments, and linked-channel state synchronization
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
@@ -21,7 +21,7 @@ use monad_client::tunnel;
 use monad_client::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise_secp256k1;
-use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
@@ -963,7 +963,8 @@ async fn test_non_zero_channel_link_is_rejected_and_does_not_link_session() {
     .await;
 
     match read_control_message(&mut control_recv).await {
-        ServerMessage::Error { message } => {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::LinkNonZeroBalance);
             assert!(
                 message.contains("link balance must be zero"),
                 "unexpected error: {message}"
@@ -1022,7 +1023,8 @@ async fn test_unsupported_unit_channel_link_is_rejected_and_does_not_link_sessio
     .await;
 
     match read_control_message(&mut control_recv).await {
-        ServerMessage::Error { message } => {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::LinkUnsupportedUnit);
             assert!(
                 message.contains("unsupported unit"),
                 "unexpected error: {message}"
@@ -1124,7 +1126,8 @@ async fn test_channel_payment_with_funding_payload_is_rejected_and_state_is_unch
     .await;
 
     match read_control_message(&mut control_recv).await {
-        ServerMessage::Error { message } => {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::PaymentInvalid);
             assert!(
                 message.contains("must not include funding"),
                 "unexpected error: {message}"
@@ -1768,7 +1771,8 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
     )
     .await;
     match read_control_message(&mut control_recv).await {
-        ServerMessage::Error { message } => {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::PaymentWrongChannel);
             assert!(
                 message.contains("wrong channel"),
                 "unexpected error: {message}"

@@ -26,7 +26,7 @@ Important types:
   - wraps an H2 `SendStream + RecvStream` pair as a bidirectional async stream
   - allows another Noise+H2 session to run on top of an existing CONNECT tunnel
 - `ClientMessage` / `ServerMessage` (`protocol.rs`)
-  - wire protocol enums for the control stream (ChannelLink, ChannelPayment, GetSessionStatus, ChannelLinkAccepted, ChannelEvicted, SessionStatus, Error)
+  - wire protocol enums for the control stream (ChannelLink, ChannelPayment, GetSessionStatus, ChannelEvicted, SessionStatus, Error)
   - `KeysetAdvertisement` plus `LinkedChannelStatus` for mint offers and relay-authoritative linked-channel sync
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established secp Noise+H2 session
@@ -139,7 +139,7 @@ An H2 stream using:
 POST /control
 ```
 
-Used for session management after the Noise-payload bootstrap has already negotiated the session version/capabilities and selected the `h2` session protocol. The control stream then carries Spilman channel linking (`ChannelLink`/`ChannelLinkAccepted`) and unified session status synchronization (`SessionStatus`). See the "Control Protocol and Session Billing" section below for details.
+Used for session management after the Noise-payload bootstrap has already negotiated the session version/capabilities and selected the `h2` session protocol. The control stream then carries Spilman channel linking (`ChannelLink`) and unified session status synchronization (`SessionStatus`). See the "Control Protocol and Session Billing" section below for details.
 
 ### Data stream
 
@@ -307,9 +307,9 @@ Server to client (`ServerMessage`):
   - `total_paid_millisats`: Total payments received
   - `remaining_milli_sats`: Current session balance
   - `paused`: Boolean indicating if traffic is currently blocked
-- `ChannelLinkAccepted { channel_id, capacity }` — the relay validated and linked the Spilman channel to this session
+- `SessionStatus { ... linked_channel: Some(...) ... }` — authoritative relay state after a successful link or payment
 - `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
-- `Error { message }` — relay-initiated error or rejection
+- `Error { code, message }` — relay-initiated error or rejection
 
 ### Version Negotiation
 
@@ -422,7 +422,7 @@ Important steady-state events include:
 Important effects include:
 
 - send `SessionStatus`
-- send `ChannelLinkAccepted`, `ChannelEvicted`, or `Error`
+- send `SessionStatus`, `ChannelEvicted`, or `Error`
 - run link/payment validation outside the session mutex
 - notify another session that it has been evicted
 - release linked-channel ownership
@@ -506,7 +506,7 @@ That means:
 - end the underlying H2 / Noise session gracefully where easy, but fully
 
 If the relay itself decides to terminate the session while the control stream
-still exists, it can send `Error { message }` first. If the control stream is
+still exists, it can send `Error { code, message }` first. If the control stream is
 already gone, no final control error message is possible.
 
 #### 5. Session State Matrix

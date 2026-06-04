@@ -27,6 +27,25 @@ pub struct LinkedChannelStatus {
     pub unit: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ServerErrorCode {
+    ControlInvalidMessage,
+    LinkInvalidPayment,
+    LinkInvalidChannel,
+    LinkReceiverMismatch,
+    LinkMintOrKeysetUnacceptable,
+    LinkUnsupportedUnit,
+    LinkNonZeroBalance,
+    ChannelExpired,
+    ChannelClosed,
+    PaymentWrongChannel,
+    PaymentUnknownChannel,
+    PaymentInvalid,
+    PaymentNoNewFunds,
+    InternalError,
+}
+
 /// Messages sent from client to server on the control channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -73,5 +92,8 @@ pub enum ServerMessage {
     ChannelEvicted { channel_id: String },
 
     /// Server-initiated error or notification
-    Error { message: String },
+    Error {
+        code: ServerErrorCode,
+        message: String,
+    },
 }

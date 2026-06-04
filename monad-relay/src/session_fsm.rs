@@ -79,6 +79,7 @@ pub(crate) fn step(
                 effects
             }
             Err(err) => vec![SessionEffect::SendControl(ServerMessage::Error {
+                code: err.code(),
                 message: err.to_string(),
             })],
         },
@@ -90,6 +91,7 @@ pub(crate) fn step(
                 }]
             } else {
                 vec![SessionEffect::SendControl(ServerMessage::Error {
+                    code: ChannelPaymentError::WrongChannel.code(),
                     message: ChannelPaymentError::WrongChannel.to_string(),
                 })]
             }
@@ -108,6 +110,7 @@ pub(crate) fn step(
                 effects
             }
             Err(err) => vec![SessionEffect::SendControl(ServerMessage::Error {
+                code: err.code(),
                 message: err.to_string(),
             })],
         },
@@ -235,8 +238,9 @@ mod tests {
         assert_eq!(next, state());
         assert!(matches!(
             effects.as_slice(),
-            [SessionEffect::SendControl(ServerMessage::Error { message })]
-                if message == "wrong channel"
+            [SessionEffect::SendControl(ServerMessage::Error { code, message })]
+                if *code == monad_common::protocol::ServerErrorCode::PaymentWrongChannel
+                    && message == "wrong channel"
         ));
     }
 

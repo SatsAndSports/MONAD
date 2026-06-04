@@ -69,8 +69,8 @@ cargo run -p monad-quic -- ...
 - `CONNECT` rejected with 402 while paused
 - Balance can go negative (chunk-boundary overshoot); session repauses
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
-- `Error` for relay-initiated rejections (e.g. version mismatch)
-- `ChannelLink { payment_json }` links a Spilman channel to the session; relay validates and responds with `ChannelLinkAccepted { channel_id, capacity }` or `Error`. Only one session can own a channel at a time.
+- `Error { code, message }` for relay-initiated rejections and notifications
+- `ChannelLink { payment_json }` links a Spilman channel to the session; relay validates and then sends an authoritative `SessionStatus` on success or `Error` on failure. Only one session can own a channel at a time.
 - `ChannelPayment { payment_json }` increments the session balance based on the delta of the channel's max balance seen.
 - `SessionStatus.linked_channel` carries the relay-authoritative linked channel id, latest accepted raw balance, raw capacity, and unit.
 - control-stream detach fully ends the session: linked ownership is released, active streams are torn down, and new streams are no longer accepted.

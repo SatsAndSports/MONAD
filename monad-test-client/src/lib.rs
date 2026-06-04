@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use monad_client::socks;
 use monad_client::wallet::{MockWallet, MonadWallet, RelayPaymentOffer, WalletError};
 use monad_common::noise_secp256k1;
-use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::{RelayConnection, SessionPricing, SessionSpilmanInfo};
@@ -890,12 +890,12 @@ async fn start_auto_control(
                     );
                     funding.reset();
                 }
-                ServerMessage::Error { message } => {
-                    if is_recoverable_funding_error(&message) {
+                ServerMessage::Error { code, message } => {
+                    if is_recoverable_funding_error(&code) {
                         warn!(
                             "{hop_label}: recoverable relay control error: {message}; staying on session"
                         );
-                        if is_channel_resetting_error(&message) {
+                        if is_channel_resetting_error(&code) {
                             funding.reset();
                         }
                         continue;
@@ -919,24 +919,23 @@ async fn start_auto_control(
     Ok((handle, ready_rx))
 }
 
-fn is_channel_resetting_error(message: &str) -> bool {
-    [
-        "no new funds",
-        "wrong channel",
-        "channel expired",
-        "channel closed",
-        "receiver key mismatch",
-        "unsupported unit",
-        "mint or keyset not acceptable",
-        "link balance must be zero",
-        "wrong receiver",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
+fn is_channel_resetting_error(code: &ServerErrorCode) -> bool {
+    matches!(
+        code,
+        ServerErrorCode::PaymentNoNewFunds
+            | ServerErrorCode::PaymentWrongChannel
+            | ServerErrorCode::PaymentUnknownChannel
+            | ServerErrorCode::ChannelExpired
+            | ServerErrorCode::ChannelClosed
+            | ServerErrorCode::LinkReceiverMismatch
+            | ServerErrorCode::LinkUnsupportedUnit
+            | ServerErrorCode::LinkMintOrKeysetUnacceptable
+            | ServerErrorCode::LinkNonZeroBalance
+    )
 }
 
-fn is_recoverable_funding_error(message: &str) -> bool {
-    is_channel_resetting_error(message) || message.contains("unknown channel")
+fn is_recoverable_funding_error(code: &ServerErrorCode) -> bool {
+    is_channel_resetting_error(code)
 }
 
 fn report_hop_failure(

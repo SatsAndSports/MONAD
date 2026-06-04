@@ -1,7 +1,7 @@
 use monad_client::connector::{Hop, HopIdentity};
 use monad_client::wallet::{MockWallet, MonadWallet, RelayPaymentOffer};
 use monad_common::noise_secp256k1;
-use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
@@ -917,8 +917,8 @@ async fn start_huge_funding_control(
                     println!("{hop_label}: stress funding channel evicted: {channel_id}");
                     break;
                 }
-                ServerMessage::Error { message } => {
-                    if message == "no new funds" {
+                ServerMessage::Error { code, message } => {
+                    if code == ServerErrorCode::PaymentNoNewFunds {
                         payment_stats
                             .payment_no_new_funds
                             .fetch_add(1, Ordering::Relaxed);

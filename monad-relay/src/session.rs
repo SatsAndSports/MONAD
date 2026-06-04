@@ -17,7 +17,7 @@ use cashu::nuts::SecretKey;
 use h2::server;
 use http::{Method, Response, StatusCode};
 use monad_common::h2stream::wait_for_send_capacity;
-use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerMessage};
+use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerErrorCode, ServerMessage};
 use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::{clamp_i128_to_i64, SessionPricing};
 use monad_quic::client::ClientAuthMode;
@@ -664,6 +664,7 @@ async fn handle_control_stream(
                                 Err(e) => {
                                     warn!("control: invalid message: {e}");
                                     let err_msg = ServerMessage::Error {
+                                        code: ServerErrorCode::ControlInvalidMessage,
                                         message: format!("invalid message: {e}"),
                                     };
                                     send_control_message(&mut h2_send, &err_msg).await?;

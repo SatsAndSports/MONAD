@@ -152,9 +152,9 @@ async fn run_session_driver(
                     );
                     ClientSessionEvent::ChannelEvicted { channel_id }
                 }
-                ServerMessage::Error { message } => {
+                ServerMessage::Error { code, message } => {
                     warn!("{} control error: {message}", config.hop_label);
-                    ClientSessionEvent::ServerError { message }
+                    ClientSessionEvent::ServerError { code, message }
                 }
             };
 

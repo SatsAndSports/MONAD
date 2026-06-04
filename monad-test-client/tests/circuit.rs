@@ -1,4 +1,4 @@
-use monad_common::protocol::ServerMessage;
+use monad_common::protocol::{ServerErrorCode, ServerMessage};
 use monad_test_client::{Circuit, CircuitConfig, RebuildAfterFailureOutcome, TestRelayHandle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -269,6 +269,7 @@ async fn recoverable_control_error_does_not_force_rebuild() {
     assert!(relays[1].notify_session(
         &session_id,
         ServerMessage::Error {
+            code: ServerErrorCode::PaymentNoNewFunds,
             message: "no new funds".to_string(),
         }
     ));

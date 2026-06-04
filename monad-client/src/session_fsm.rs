@@ -1,5 +1,7 @@
 use crate::wallet::{RelayPaymentOffer, WalletChannel, WalletError};
-use monad_common::protocol::{ClientMessage, KeysetAdvertisement, LinkedChannelStatus};
+use monad_common::protocol::{
+    ClientMessage, KeysetAdvertisement, LinkedChannelStatus, ServerErrorCode,
+};
 use monad_common::session::{SessionPricing, SessionSpilmanInfo};
 use std::collections::BTreeSet;
 
@@ -81,6 +83,7 @@ pub(crate) enum ClientSessionEvent {
         channel_id: String,
     },
     ServerError {
+        code: ServerErrorCode,
         message: String,
     },
     ControlDetached,
@@ -284,10 +287,11 @@ pub(crate) fn step(
             }
             effects
         }
-        ClientSessionEvent::ServerError { message } => {
+        ClientSessionEvent::ServerError { code, message } => {
+            let _ = &message;
             let mut effects = Vec::new();
             if let Some(active_channel_id) = state.active_channel_id.take() {
-                if is_channel_invalidating_error(&message) {
+                if is_channel_invalidating_error(&code) {
                     effects.push(ClientSessionEffect::MarkChannelUnusable {
                         channel_id: active_channel_id,
                     });
@@ -437,18 +441,17 @@ fn exclude_on_wallet_error(error: &WalletError) -> bool {
     )
 }
 
-pub(crate) fn is_channel_invalidating_error(message: &str) -> bool {
-    [
-        "receiver key mismatch",
-        "unsupported unit",
-        "mint or keyset not acceptable",
-        "link balance must be zero",
-        "channel expired",
-        "channel closed",
-        "wrong receiver",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
+pub(crate) fn is_channel_invalidating_error(code: &ServerErrorCode) -> bool {
+    matches!(
+        code,
+        ServerErrorCode::LinkInvalidChannel
+            | ServerErrorCode::LinkReceiverMismatch
+            | ServerErrorCode::LinkMintOrKeysetUnacceptable
+            | ServerErrorCode::LinkUnsupportedUnit
+            | ServerErrorCode::LinkNonZeroBalance
+            | ServerErrorCode::ChannelExpired
+            | ServerErrorCode::ChannelClosed
+    )
 }
 
 #[cfg(test)]
@@ -459,7 +462,7 @@ mod tests {
     };
     use crate::wallet::{RelayPaymentOffer, WalletChannel, WalletChannelState, WalletError};
     use monad_common::protocol::ClientMessage;
-    use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus};
+    use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus, ServerErrorCode};
     use monad_common::session::SessionPricing;
 
     fn snapshot(paused: bool) -> SessionSnapshot {
@@ -671,6 +674,7 @@ mod tests {
         let (state, effects) = step(
             state,
             ClientSessionEvent::ServerError {
+                code: ServerErrorCode::LinkReceiverMismatch,
                 message: "receiver key mismatch".to_string(),
             },
         );

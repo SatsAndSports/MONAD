@@ -4,7 +4,7 @@ use cdk_spilman::{
     compute_channel_secret_from_hex, sign_with_tweaked_key_util, BridgeError, ChannelFunding,
     ChannelPolicy, ChannelState, ClosingData, Payment, PaymentProof, SpilmanBridge, SpilmanHost,
 };
-use monad_common::protocol::LinkedChannelStatus;
+use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -73,6 +73,22 @@ impl fmt::Display for LinkError {
 
 impl std::error::Error for LinkError {}
 
+impl LinkError {
+    pub(crate) fn code(&self) -> ServerErrorCode {
+        match self {
+            Self::InvalidPayment(_) => ServerErrorCode::LinkInvalidPayment,
+            Self::InvalidChannel(_) => ServerErrorCode::LinkInvalidChannel,
+            Self::MintOrKeysetNotAcceptable => ServerErrorCode::LinkMintOrKeysetUnacceptable,
+            Self::ReceiverKeyMismatch => ServerErrorCode::LinkReceiverMismatch,
+            Self::UnsupportedUnit(_) => ServerErrorCode::LinkUnsupportedUnit,
+            Self::NonZeroLinkBalance => ServerErrorCode::LinkNonZeroBalance,
+            Self::ChannelExpired => ServerErrorCode::ChannelExpired,
+            Self::ChannelClosed => ServerErrorCode::ChannelClosed,
+            Self::Internal(_) => ServerErrorCode::InternalError,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelPaymentError {
     WrongChannel,
@@ -97,6 +113,19 @@ impl fmt::Display for ChannelPaymentError {
 }
 
 impl std::error::Error for ChannelPaymentError {}
+
+impl ChannelPaymentError {
+    pub(crate) fn code(&self) -> ServerErrorCode {
+        match self {
+            Self::WrongChannel => ServerErrorCode::PaymentWrongChannel,
+            Self::UnknownChannel => ServerErrorCode::PaymentUnknownChannel,
+            Self::InvalidPayment(_) => ServerErrorCode::PaymentInvalid,
+            Self::NoNewFunds => ServerErrorCode::PaymentNoNewFunds,
+            Self::ChannelClosed => ServerErrorCode::ChannelClosed,
+            Self::Internal(_) => ServerErrorCode::InternalError,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelUnit {
