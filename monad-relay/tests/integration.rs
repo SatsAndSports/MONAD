@@ -603,6 +603,58 @@ async fn open_funded_control(
     (h2_send, h2_recv)
 }
 
+async fn open_two_control_sessions(
+    conn_a: &RelayConnection,
+    conn_b: &RelayConnection,
+) -> (
+    h2::SendStream<Bytes>,
+    h2::RecvStream,
+    h2::SendStream<Bytes>,
+    h2::RecvStream,
+) {
+    let (mut send_a, mut recv_a) = conn_a.open_control().await.unwrap();
+    let (mut send_b, mut recv_b) = conn_b.open_control().await.unwrap();
+    let _ = control_handshake(&mut send_a, &mut recv_a).await;
+    let _ = control_handshake(&mut send_b, &mut recv_b).await;
+    (send_a, recv_a, send_b, recv_b)
+}
+
+async fn assert_evicted_then_status(
+    recv: &mut h2::RecvStream,
+    expected_channel_id: &str,
+) -> (
+    Option<monad_common::protocol::LinkedChannelStatus>,
+    u64,
+    i64,
+    bool,
+) {
+    let evicted = timeout(Duration::from_millis(500), read_control_message(recv))
+        .await
+        .expect("expected eviction event");
+    match evicted {
+        ServerMessage::ChannelEvicted { channel_id } => {
+            assert_eq!(channel_id, expected_channel_id);
+        }
+        other => panic!("expected ChannelEvicted, got {other:?}"),
+    }
+
+    match read_control_message(recv).await {
+        ServerMessage::SessionStatus {
+            linked_channel,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            ..
+        } => (
+            linked_channel,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+        ),
+        other => panic!("expected SessionStatus for evicted session, got {other:?}"),
+    }
+}
+
 async fn fund_session(conn: &mut RelayConnection, milli_sats: u64) {
     let (h2_send, h2_recv) = open_funded_control(conn, milli_sats).await;
 
@@ -1384,41 +1436,96 @@ async fn test_channel_eviction_clears_linked_channel() {
     let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
     let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
 
-    let (mut send_a, mut recv_a) = conn_a.open_control().await.unwrap();
-    let (mut send_b, mut recv_b) = conn_b.open_control().await.unwrap();
-    let _ = control_handshake(&mut send_a, &mut recv_a).await;
-    let _ = control_handshake(&mut send_b, &mut recv_b).await;
+    let (mut send_a, mut recv_a, mut send_b, mut recv_b) =
+        open_two_control_sessions(&conn_a, &conn_b).await;
 
     let mut channel_a = SessionPaymentChannel::for_explicit_id("shared");
     let mut channel_b = SessionPaymentChannel::for_explicit_id("shared");
     let _ = channel_a.link(&mut send_a, &mut recv_a).await;
     let _ = channel_b.link(&mut send_b, &mut recv_b).await;
 
-    let evicted = timeout(
-        Duration::from_millis(500),
-        read_control_message(&mut recv_a),
-    )
-    .await
-    .expect("expected eviction event");
-    match evicted {
-        ServerMessage::ChannelEvicted { channel_id } => {
-            assert_eq!(channel_id, "shared");
-        }
-        other => panic!("expected ChannelEvicted, got {other:?}"),
-    }
+    let (linked_channel, _paid, _remaining, paused) =
+        assert_evicted_then_status(&mut recv_a, "shared").await;
+    assert_eq!(linked_channel, None);
+    assert!(paused);
 
-    match read_control_message(&mut recv_a).await {
+    let _ = send_a.send_data(Bytes::new(), true);
+    let _ = send_b.send_data(Bytes::new(), true);
+    drop(send_a);
+    drop(recv_a);
+    drop(send_b);
+    drop(recv_b);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn_a.shutdown().await;
+    conn_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_channel_eviction_preserves_existing_session_balance() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (server_addr, pubkey, payments) = start_monad_relay_with_test_payments().await;
+    let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
+    let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
+
+    let (mut send_a, mut recv_a, mut send_b, mut recv_b) =
+        open_two_control_sessions(&conn_a, &conn_b).await;
+
+    let mut channel_a = SessionPaymentChannel::for_explicit_id("shared-funded");
+    let channel_b = SessionPaymentChannel::for_explicit_id("shared-funded");
+    let _ = channel_a.link(&mut send_a, &mut recv_a).await;
+    let (_in, _out, paid_before_eviction, remaining_before_eviction, paused_before_eviction) =
+        channel_a
+            .pay(&mut send_a, &mut recv_a, TEST_SESSION_PAYMENT)
+            .await;
+    assert!(!paused_before_eviction);
+    assert!(remaining_before_eviction > 0);
+
+    send_control_message(
+        &mut send_b,
+        &ClientMessage::ChannelLink {
+            payment_json: channel_b.link_json(),
+        },
+        false,
+    )
+    .await;
+    match read_control_message(&mut recv_b).await {
         ServerMessage::SessionStatus {
             linked_channel,
-            paused,
+            paused: _,
             ..
         } => {
-            assert_eq!(linked_channel, None);
-            assert!(paused);
+            let linked_channel = linked_channel.expect("linked channel status after takeover link");
+            assert_eq!(linked_channel.channel_id, channel_b.channel_id);
+            assert_eq!(
+                linked_channel.balance_raw,
+                channel_a.cumulative_balance_units
+            );
+            assert_eq!(linked_channel.capacity_raw, channel_b.capacity_units());
         }
-        other => panic!("expected SessionStatus for evicted session, got {other:?}"),
+        other => panic!("expected SessionStatus after takeover link, got {other:?}"),
     }
 
+    let (linked_channel, paid_after_eviction, remaining_after_eviction, paused_after_eviction) =
+        assert_evicted_then_status(&mut recv_a, "shared-funded").await;
+    assert_eq!(linked_channel, None);
+    assert_eq!(paid_after_eviction, paid_before_eviction);
+    assert_eq!(remaining_after_eviction, remaining_before_eviction);
+    assert!(!paused_after_eviction);
+    assert_eq!(
+        payments.owner_of("shared-funded"),
+        Some(*conn_b.session_id()),
+        "ownership should transfer to the new session while credited balance remains usable"
+    );
+
+    let mut h2_a = conn_a.clone_send_request().await;
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let result = tunnel_roundtrip(&mut h2_a, &target, b"still funded").await;
+    assert_eq!(result, b"STILL FUNDED");
+
+    drop(h2_a);
     let _ = send_a.send_data(Bytes::new(), true);
     let _ = send_b.send_data(Bytes::new(), true);
     drop(send_a);
