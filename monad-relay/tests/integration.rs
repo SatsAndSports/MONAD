@@ -505,12 +505,82 @@ async fn read_control_message(h2_recv: &mut h2::RecvStream) -> ServerMessage {
     }
 }
 
-async fn request_session_status(
+#[derive(Debug, Clone)]
+struct TestSessionStatus {
+    linked_channel: Option<monad_common::protocol::LinkedChannelStatus>,
+    session_total_in: u64,
+    session_total_out: u64,
+    total_paid_millisats: u64,
+    remaining_milli_sats: i64,
+    paused: bool,
+}
+
+impl TestSessionStatus {
+    fn as_tuple(&self) -> (u64, u64, u64, i64, bool) {
+        (
+            self.session_total_in,
+            self.session_total_out,
+            self.total_paid_millisats,
+            self.remaining_milli_sats,
+            self.paused,
+        )
+    }
+
+    fn assert_linked_channel(
+        &self,
+        channel_id: &str,
+        balance_raw: u64,
+        capacity_raw: u64,
+        unit: &str,
+    ) {
+        let linked_channel = self
+            .linked_channel
+            .as_ref()
+            .expect("expected linked channel in SessionStatus");
+        assert_eq!(linked_channel.channel_id, channel_id);
+        assert_eq!(linked_channel.balance_raw, balance_raw);
+        assert_eq!(linked_channel.capacity_raw, capacity_raw);
+        assert_eq!(linked_channel.unit, unit);
+    }
+}
+
+struct ControlSessionHarness {
+    send: h2::SendStream<Bytes>,
+    recv: h2::RecvStream,
+}
+
+impl ControlSessionHarness {
+    async fn open(conn: &RelayConnection) -> Self {
+        let (send, recv) = conn.open_control().await.unwrap();
+        Self { send, recv }
+    }
+
+    async fn handshake(&mut self) -> TestSessionStatus {
+        control_handshake_status(&mut self.send, &mut self.recv).await
+    }
+
+    async fn get_status(&mut self) -> TestSessionStatus {
+        request_session_status_status(&mut self.send, &mut self.recv).await
+    }
+
+    async fn expect_error(&mut self) -> (ServerErrorCode, String) {
+        match read_control_message(&mut self.recv).await {
+            ServerMessage::Error { code, message } => (code, message),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    async fn close(mut self) {
+        let _ = self.send.send_data(Bytes::new(), true);
+    }
+}
+
+async fn request_session_status_status(
     h2_send: &mut h2::SendStream<Bytes>,
     h2_recv: &mut h2::RecvStream,
-) -> (u64, u64, u64, i64, bool) {
+) -> TestSessionStatus {
     send_control_message(h2_send, &ClientMessage::GetSessionStatus, false).await;
-    expect_session_status(read_control_message(h2_recv).await)
+    expect_session_status_struct(read_control_message(h2_recv).await)
 }
 
 type SessionStatusTuple = (u64, u64, u64, i64, bool);
@@ -524,13 +594,16 @@ async fn wait_for_session_totals(
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
 
     loop {
-        let status = request_session_status(h2_send, h2_recv).await;
-        if status.0 == expected_in && status.1 == expected_out {
-            return Ok(status);
+        let status = request_session_status_status(h2_send, h2_recv).await;
+        if status.session_total_in == expected_in && status.session_total_out == expected_out {
+            return Ok(status.as_tuple());
         }
 
         if tokio::time::Instant::now() >= deadline {
-            let (actual_in, actual_out, _paid, remaining, paused) = status;
+            let actual_in = status.session_total_in;
+            let actual_out = status.session_total_out;
+            let remaining = status.remaining_milli_sats;
+            let paused = status.paused;
             return Err(format!(
                 "timed out waiting for session totals: expected in={expected_in} out={expected_out}, got in={actual_in} out={actual_out} remaining={remaining} paused={paused}"
             ));
@@ -538,24 +611,30 @@ async fn wait_for_session_totals(
     }
 }
 
-fn expect_session_status(message: ServerMessage) -> (u64, u64, u64, i64, bool) {
+fn expect_session_status_struct(message: ServerMessage) -> TestSessionStatus {
     match message {
         ServerMessage::SessionStatus {
+            linked_channel,
             session_total_in,
             session_total_out,
             total_paid_millisats,
             remaining_milli_sats,
             paused,
             ..
-        } => (
+        } => TestSessionStatus {
+            linked_channel,
             session_total_in,
             session_total_out,
             total_paid_millisats,
             remaining_milli_sats,
             paused,
-        ),
+        },
         other => panic!("expected SessionStatus, got {other:?}"),
     }
+}
+
+fn expect_session_status(message: ServerMessage) -> (u64, u64, u64, i64, bool) {
+    expect_session_status_struct(message).as_tuple()
 }
 
 /// Read the initial SessionStatus sent immediately after control attach.
@@ -564,6 +643,13 @@ async fn control_handshake(
     _h2_send: &mut h2::SendStream<Bytes>,
     h2_recv: &mut h2::RecvStream,
 ) -> (u64, u64, u64, i64, bool) {
+    control_handshake_status(_h2_send, h2_recv).await.as_tuple()
+}
+
+async fn control_handshake_status(
+    _h2_send: &mut h2::SendStream<Bytes>,
+    h2_recv: &mut h2::RecvStream,
+) -> TestSessionStatus {
     let message = read_control_message(h2_recv).await;
     match &message {
         ServerMessage::SessionStatus {
@@ -577,7 +663,7 @@ async fn control_handshake(
         other => panic!("expected SessionStatus, got {other:?}"),
     }
 
-    expect_session_status(message)
+    expect_session_status_struct(message)
 }
 
 async fn open_funded_control(
@@ -586,9 +672,9 @@ async fn open_funded_control(
 ) -> (h2::SendStream<Bytes>, h2::RecvStream) {
     let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
 
-    let (_in0, _out0, _paid0, rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
-    assert!(paused0);
-    assert_eq!(rem0, 0);
+    let status0 = control_handshake_status(&mut h2_send, &mut h2_recv).await;
+    assert!(status0.paused);
+    assert_eq!(status0.remaining_milli_sats, 0);
 
     let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
     let (_in1, _out1, paid1, rem1, paused1) = channel.link(&mut h2_send, &mut h2_recv).await;
@@ -622,12 +708,7 @@ async fn open_two_control_sessions(
 async fn assert_evicted_then_status(
     recv: &mut h2::RecvStream,
     expected_channel_id: &str,
-) -> (
-    Option<monad_common::protocol::LinkedChannelStatus>,
-    u64,
-    i64,
-    bool,
-) {
+) -> TestSessionStatus {
     let evicted = timeout(Duration::from_millis(500), read_control_message(recv))
         .await
         .expect("expected eviction event");
@@ -638,21 +719,7 @@ async fn assert_evicted_then_status(
         other => panic!("expected ChannelEvicted, got {other:?}"),
     }
 
-    match read_control_message(recv).await {
-        ServerMessage::SessionStatus {
-            linked_channel,
-            total_paid_millisats,
-            remaining_milli_sats,
-            paused,
-            ..
-        } => (
-            linked_channel,
-            total_paid_millisats,
-            remaining_milli_sats,
-            paused,
-        ),
-        other => panic!("expected SessionStatus for evicted session, got {other:?}"),
-    }
+    expect_session_status_struct(read_control_message(recv).await)
 }
 
 async fn fund_session(conn: &mut RelayConnection, milli_sats: u64) {
@@ -725,11 +792,12 @@ impl SessionPaymentChannel {
         .to_string()
     }
 
-    async fn link(
+    async fn link_expect_balance(
         &mut self,
         h2_send: &mut h2::SendStream<Bytes>,
         h2_recv: &mut h2::RecvStream,
-    ) -> (u64, u64, u64, i64, bool) {
+        expected_balance_raw: u64,
+    ) -> TestSessionStatus {
         send_control_message(
             h2_send,
             &ClientMessage::ChannelLink {
@@ -739,31 +807,24 @@ impl SessionPaymentChannel {
         )
         .await;
 
-        match read_control_message(h2_recv).await {
-            ServerMessage::SessionStatus {
-                linked_channel,
-                session_total_in,
-                session_total_out,
-                total_paid_millisats,
-                remaining_milli_sats,
-                paused,
-                ..
-            } => {
-                let linked_channel = linked_channel.expect("linked channel status after link");
-                assert_eq!(linked_channel.channel_id, self.channel_id);
-                assert_eq!(linked_channel.balance_raw, 0);
-                assert_eq!(linked_channel.capacity_raw, self.capacity_units());
-                assert_eq!(linked_channel.unit, self.unit);
-                (
-                    session_total_in,
-                    session_total_out,
-                    total_paid_millisats,
-                    remaining_milli_sats,
-                    paused,
-                )
-            }
-            other => panic!("expected SessionStatus after link, got {other:?}"),
-        }
+        let status = expect_session_status_struct(read_control_message(h2_recv).await);
+        status.assert_linked_channel(
+            &self.channel_id,
+            expected_balance_raw,
+            self.capacity_units(),
+            self.unit,
+        );
+        status
+    }
+
+    async fn link(
+        &mut self,
+        h2_send: &mut h2::SendStream<Bytes>,
+        h2_recv: &mut h2::RecvStream,
+    ) -> (u64, u64, u64, i64, bool) {
+        self.link_expect_balance(h2_send, h2_recv, self.cumulative_balance_units)
+            .await
+            .as_tuple()
     }
 
     async fn pay(
@@ -794,31 +855,14 @@ impl SessionPaymentChannel {
         )
         .await;
 
-        match read_control_message(h2_recv).await {
-            ServerMessage::SessionStatus {
-                linked_channel,
-                session_total_in,
-                session_total_out,
-                total_paid_millisats,
-                remaining_milli_sats,
-                paused,
-                ..
-            } => {
-                let linked_channel = linked_channel.expect("linked channel status after payment");
-                assert_eq!(linked_channel.channel_id, self.channel_id);
-                assert_eq!(linked_channel.balance_raw, self.cumulative_balance_units);
-                assert_eq!(linked_channel.capacity_raw, self.capacity_units());
-                assert_eq!(linked_channel.unit, self.unit);
-                (
-                    session_total_in,
-                    session_total_out,
-                    total_paid_millisats,
-                    remaining_milli_sats,
-                    paused,
-                )
-            }
-            other => panic!("expected SessionStatus after payment, got {other:?}"),
-        }
+        let status = expect_session_status_struct(read_control_message(h2_recv).await);
+        status.assert_linked_channel(
+            &self.channel_id,
+            self.cumulative_balance_units,
+            self.capacity_units(),
+            self.unit,
+        );
+        status.as_tuple()
     }
 }
 
@@ -968,23 +1012,20 @@ async fn test_connect_rejected_while_paused() {
 async fn test_channel_link_does_not_unpause_session() {
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let mut control = ControlSessionHarness::open(&conn).await;
 
-    let (_in0, _out0, _paid0, rem0, paused0) =
-        control_handshake(&mut control_send, &mut control_recv).await;
-    assert!(paused0);
-    assert_eq!(rem0, 0);
+    let status0 = control.handshake().await;
+    assert!(status0.paused);
+    assert_eq!(status0.remaining_milli_sats, 0);
 
     let mut channel = SessionPaymentChannel::for_explicit_id("chan-msat");
     let (_in1, _out1, paid1, rem1, paused1) =
-        channel.link(&mut control_send, &mut control_recv).await;
+        channel.link(&mut control.send, &mut control.recv).await;
     assert_eq!(paid1, 0);
     assert_eq!(rem1, 0);
     assert!(paused1);
 
-    let _ = control_send.send_data(Bytes::new(), true);
-    drop(control_send);
-    drop(control_recv);
+    control.close().await;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     conn.shutdown().await;
 }
@@ -993,12 +1034,11 @@ async fn test_channel_link_does_not_unpause_session() {
 async fn test_non_zero_channel_link_is_rejected_and_does_not_link_session() {
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let mut control = ControlSessionHarness::open(&conn).await;
 
-    let (_in0, _out0, _paid0, rem0, paused0) =
-        control_handshake(&mut control_send, &mut control_recv).await;
-    assert!(paused0);
-    assert_eq!(rem0, 0);
+    let status0 = control.handshake().await;
+    assert!(status0.paused);
+    assert_eq!(status0.remaining_milli_sats, 0);
 
     let payment_json = serde_json::json!({
         "channel_id": "bad-link",
@@ -1008,43 +1048,26 @@ async fn test_non_zero_channel_link_is_rejected_and_does_not_link_session() {
     })
     .to_string();
     send_control_message(
-        &mut control_send,
+        &mut control.send,
         &ClientMessage::ChannelLink { payment_json },
         false,
     )
     .await;
 
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::Error { code, message } => {
-            assert_eq!(code, ServerErrorCode::LinkNonZeroBalance);
-            assert!(
-                message.contains("link balance must be zero"),
-                "unexpected error: {message}"
-            );
-        }
-        other => panic!("expected Error for non-zero ChannelLink, got {other:?}"),
-    }
+    let (code, message) = control.expect_error().await;
+    assert_eq!(code, ServerErrorCode::LinkNonZeroBalance);
+    assert!(
+        message.contains("link balance must be zero"),
+        "unexpected error: {message}"
+    );
 
-    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::SessionStatus {
-            linked_channel,
-            total_paid_millisats,
-            remaining_milli_sats,
-            paused,
-            ..
-        } => {
-            assert_eq!(linked_channel, None);
-            assert_eq!(total_paid_millisats, 0);
-            assert_eq!(remaining_milli_sats, 0);
-            assert!(paused);
-        }
-        other => panic!("expected SessionStatus after rejected link, got {other:?}"),
-    }
+    let status = control.get_status().await;
+    assert_eq!(status.linked_channel, None);
+    assert_eq!(status.total_paid_millisats, 0);
+    assert_eq!(status.remaining_milli_sats, 0);
+    assert!(status.paused);
 
-    let _ = control_send.send_data(Bytes::new(), true);
-    drop(control_send);
-    drop(control_recv);
+    control.close().await;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     conn.shutdown().await;
 }
@@ -1053,12 +1076,11 @@ async fn test_non_zero_channel_link_is_rejected_and_does_not_link_session() {
 async fn test_unsupported_unit_channel_link_is_rejected_and_does_not_link_session() {
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let mut control = ControlSessionHarness::open(&conn).await;
 
-    let (_in0, _out0, _paid0, rem0, paused0) =
-        control_handshake(&mut control_send, &mut control_recv).await;
-    assert!(paused0);
-    assert_eq!(rem0, 0);
+    let status0 = control.handshake().await;
+    assert!(status0.paused);
+    assert_eq!(status0.remaining_milli_sats, 0);
 
     let payment_json = serde_json::json!({
         "channel_id": "bad-unit",
@@ -1068,45 +1090,26 @@ async fn test_unsupported_unit_channel_link_is_rejected_and_does_not_link_sessio
     })
     .to_string();
     send_control_message(
-        &mut control_send,
+        &mut control.send,
         &ClientMessage::ChannelLink { payment_json },
         false,
     )
     .await;
 
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::Error { code, message } => {
-            assert_eq!(code, ServerErrorCode::LinkUnsupportedUnit);
-            assert!(
-                message.contains("unsupported unit"),
-                "unexpected error: {message}"
-            );
-        }
-        other => panic!("expected Error for unsupported-unit ChannelLink, got {other:?}"),
-    }
+    let (code, message) = control.expect_error().await;
+    assert_eq!(code, ServerErrorCode::LinkUnsupportedUnit);
+    assert!(
+        message.contains("unsupported unit"),
+        "unexpected error: {message}"
+    );
 
-    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::SessionStatus {
-            linked_channel,
-            total_paid_millisats,
-            remaining_milli_sats,
-            paused,
-            ..
-        } => {
-            assert_eq!(linked_channel, None);
-            assert_eq!(total_paid_millisats, 0);
-            assert_eq!(remaining_milli_sats, 0);
-            assert!(paused);
-        }
-        other => {
-            panic!("expected SessionStatus after rejected unsupported-unit link, got {other:?}")
-        }
-    }
+    let status = control.get_status().await;
+    assert_eq!(status.linked_channel, None);
+    assert_eq!(status.total_paid_millisats, 0);
+    assert_eq!(status.remaining_milli_sats, 0);
+    assert!(status.paused);
 
-    let _ = control_send.send_data(Bytes::new(), true);
-    drop(control_send);
-    drop(control_recv);
+    control.close().await;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     conn.shutdown().await;
 }
@@ -1444,10 +1447,9 @@ async fn test_channel_eviction_clears_linked_channel() {
     let _ = channel_a.link(&mut send_a, &mut recv_a).await;
     let _ = channel_b.link(&mut send_b, &mut recv_b).await;
 
-    let (linked_channel, _paid, _remaining, paused) =
-        assert_evicted_then_status(&mut recv_a, "shared").await;
-    assert_eq!(linked_channel, None);
-    assert!(paused);
+    let eviction_status = assert_evicted_then_status(&mut recv_a, "shared").await;
+    assert_eq!(eviction_status.linked_channel, None);
+    assert!(eviction_status.paused);
 
     let _ = send_a.send_data(Bytes::new(), true);
     let _ = send_b.send_data(Bytes::new(), true);
@@ -1474,7 +1476,7 @@ async fn test_channel_eviction_preserves_existing_session_balance() {
         open_two_control_sessions(&conn_a, &conn_b).await;
 
     let mut channel_a = SessionPaymentChannel::for_explicit_id("shared-funded");
-    let channel_b = SessionPaymentChannel::for_explicit_id("shared-funded");
+    let mut channel_b = SessionPaymentChannel::for_explicit_id("shared-funded");
     let _ = channel_a.link(&mut send_a, &mut recv_a).await;
     let (_in, _out, paid_before_eviction, remaining_before_eviction, paused_before_eviction) =
         channel_a
@@ -1483,37 +1485,25 @@ async fn test_channel_eviction_preserves_existing_session_balance() {
     assert!(!paused_before_eviction);
     assert!(remaining_before_eviction > 0);
 
-    send_control_message(
-        &mut send_b,
-        &ClientMessage::ChannelLink {
-            payment_json: channel_b.link_json(),
-        },
-        false,
-    )
-    .await;
-    match read_control_message(&mut recv_b).await {
-        ServerMessage::SessionStatus {
-            linked_channel,
-            paused: _,
-            ..
-        } => {
-            let linked_channel = linked_channel.expect("linked channel status after takeover link");
-            assert_eq!(linked_channel.channel_id, channel_b.channel_id);
-            assert_eq!(
-                linked_channel.balance_raw,
-                channel_a.cumulative_balance_units
-            );
-            assert_eq!(linked_channel.capacity_raw, channel_b.capacity_units());
-        }
-        other => panic!("expected SessionStatus after takeover link, got {other:?}"),
-    }
+    let takeover_status = channel_b
+        .link_expect_balance(&mut send_b, &mut recv_b, channel_a.cumulative_balance_units)
+        .await;
+    assert_eq!(
+        takeover_status
+            .linked_channel
+            .as_ref()
+            .map(|channel| channel.channel_id.as_str()),
+        Some("shared-funded")
+    );
 
-    let (linked_channel, paid_after_eviction, remaining_after_eviction, paused_after_eviction) =
-        assert_evicted_then_status(&mut recv_a, "shared-funded").await;
-    assert_eq!(linked_channel, None);
-    assert_eq!(paid_after_eviction, paid_before_eviction);
-    assert_eq!(remaining_after_eviction, remaining_before_eviction);
-    assert!(!paused_after_eviction);
+    let eviction_status = assert_evicted_then_status(&mut recv_a, "shared-funded").await;
+    assert_eq!(eviction_status.linked_channel, None);
+    assert_eq!(eviction_status.total_paid_millisats, paid_before_eviction);
+    assert_eq!(
+        eviction_status.remaining_milli_sats,
+        remaining_before_eviction
+    );
+    assert!(!eviction_status.paused);
     assert_eq!(
         payments.owner_of("shared-funded"),
         Some(*conn_b.session_id()),
