@@ -10,9 +10,10 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::bootstrap::{
-    decode_client_hello, decode_server_response, encode_client_hello, encode_server_response,
-    initial_client_hello, initial_server_accept, validate_initial_client_hello,
-    BootstrapServerResponse,
+    decode_client_hello, decode_server_response, decode_v1_client_hello, decode_v1_server_accept,
+    encode_client_hello, encode_server_response, highest_supported_version, initial_client_hello,
+    initial_server_accept, initial_server_accept_v1, supported_bootstrap_versions,
+    validate_v1_client_hello, BootstrapServerResponse, BOOTSTRAP_VERSION,
 };
 use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 
@@ -345,10 +346,19 @@ pub async fn handshake_initiator_with_pubkey<T: AsyncRead + AsyncWrite + Unpin>(
         handshake_initiator_with_pubkey_and_payload(stream, server_pubkey, &client_payload).await?;
     let response = decode_server_response(&server_payload)?;
     match response {
-        BootstrapServerResponse::Accept { .. } => {
-            if response != initial_server_accept() {
+        BootstrapServerResponse::Accept {
+            selected_version,
+            response,
+        } => {
+            if selected_version != BOOTSTRAP_VERSION {
+                return Err(io::Error::other(format!(
+                    "relay selected unsupported bootstrap version: {selected_version}"
+                )));
+            }
+            let accept = decode_v1_server_accept(response)?;
+            if accept != initial_server_accept_v1() {
                 return Err(io::Error::other(
-                    "relay bootstrap accept did not match the hardcoded expected response",
+                    "relay bootstrap accept did not match the hardcoded expected v1 response",
                 ));
             }
         }
@@ -422,19 +432,37 @@ pub async fn handshake_responder_with_secret_key_bytes<T: AsyncRead + AsyncWrite
         server_key,
         |client_payload| {
             let (response, accepted) = match decode_client_hello(&client_payload) {
-                Ok(client_hello) => match validate_initial_client_hello(&client_hello) {
-                    Ok(()) => (initial_server_accept(), true),
-                    Err(reason) => (
+                Ok(client_hello) => match highest_supported_version(&client_hello) {
+                    Some(BOOTSTRAP_VERSION) => match decode_v1_client_hello(&client_hello)
+                        .and_then(|hello| validate_v1_client_hello(&hello).map(|_| hello))
+                    {
+                        Ok(_) => (initial_server_accept(), true),
+                        Err(reason) => (
+                            BootstrapServerResponse::Reject {
+                                supported_versions: supported_bootstrap_versions(),
+                                reason,
+                            },
+                            false,
+                        ),
+                    },
+                    Some(other) => (
                         BootstrapServerResponse::Reject {
-                            bootstrap_version: crate::bootstrap::BOOTSTRAP_VERSION,
-                            reason,
+                            supported_versions: supported_bootstrap_versions(),
+                            reason: format!("selected bootstrap version is unsupported: {other}"),
+                        },
+                        false,
+                    ),
+                    None => (
+                        BootstrapServerResponse::Reject {
+                            supported_versions: supported_bootstrap_versions(),
+                            reason: "no supported bootstrap version".to_string(),
                         },
                         false,
                     ),
                 },
                 Err(err) => (
                     BootstrapServerResponse::Reject {
-                        bootstrap_version: crate::bootstrap::BOOTSTRAP_VERSION,
+                        supported_versions: supported_bootstrap_versions(),
                         reason: format!("invalid client bootstrap: {err}"),
                     },
                     false,

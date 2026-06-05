@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io;
 
 pub const BOOTSTRAP_VERSION: u8 = 1;
@@ -12,30 +14,49 @@ pub struct BootstrapCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BootstrapClientHello {
-    pub bootstrap_version: u8,
+pub struct BootstrapV1ClientHello {
+    pub session_protocols: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapV1ServerAccept {
     pub session_protocol: String,
+    pub capabilities: BootstrapCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct BootstrapClientHello {
+    pub versions: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum BootstrapServerResponse {
     Accept {
-        bootstrap_version: u8,
-        session_protocol: String,
-        capabilities: BootstrapCapabilities,
+        selected_version: u8,
+        response: Value,
     },
     Reject {
-        bootstrap_version: u8,
+        supported_versions: Vec<u8>,
         reason: String,
     },
 }
 
+fn version_key(version: u8) -> String {
+    version.to_string()
+}
+
 pub fn initial_client_hello() -> BootstrapClientHello {
-    BootstrapClientHello {
-        bootstrap_version: BOOTSTRAP_VERSION,
-        session_protocol: SESSION_PROTOCOL_H2.to_string(),
-    }
+    let mut versions = BTreeMap::new();
+    versions.insert(
+        version_key(BOOTSTRAP_VERSION),
+        serde_json::to_value(BootstrapV1ClientHello {
+            session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
+        })
+        .expect("initial bootstrap v1 hello is serializable"),
+    );
+    BootstrapClientHello { versions }
 }
 
 pub fn initial_server_capabilities() -> BootstrapCapabilities {
@@ -46,28 +67,60 @@ pub fn initial_server_capabilities() -> BootstrapCapabilities {
     }
 }
 
-pub fn initial_server_accept() -> BootstrapServerResponse {
-    BootstrapServerResponse::Accept {
-        bootstrap_version: BOOTSTRAP_VERSION,
+pub fn initial_server_accept_v1() -> BootstrapV1ServerAccept {
+    BootstrapV1ServerAccept {
         session_protocol: SESSION_PROTOCOL_H2.to_string(),
         capabilities: initial_server_capabilities(),
     }
 }
 
-pub fn validate_initial_client_hello(hello: &BootstrapClientHello) -> Result<(), String> {
-    if hello.bootstrap_version != BOOTSTRAP_VERSION {
-        return Err(format!(
-            "unsupported bootstrap version: {}",
-            hello.bootstrap_version
-        ));
+pub fn initial_server_accept() -> BootstrapServerResponse {
+    BootstrapServerResponse::Accept {
+        selected_version: BOOTSTRAP_VERSION,
+        response: serde_json::to_value(initial_server_accept_v1())
+            .expect("initial bootstrap v1 accept is serializable"),
     }
-    if hello.session_protocol != SESSION_PROTOCOL_H2 {
-        return Err(format!(
-            "unsupported session protocol: {}",
-            hello.session_protocol
-        ));
+}
+
+pub fn supported_bootstrap_versions() -> Vec<u8> {
+    vec![BOOTSTRAP_VERSION]
+}
+
+pub fn highest_supported_version(hello: &BootstrapClientHello) -> Option<u8> {
+    supported_bootstrap_versions()
+        .into_iter()
+        .filter(|version| hello.versions.contains_key(&version_key(*version)))
+        .max()
+}
+
+pub fn decode_v1_client_hello(
+    hello: &BootstrapClientHello,
+) -> Result<BootstrapV1ClientHello, String> {
+    let value = hello
+        .versions
+        .get(&version_key(BOOTSTRAP_VERSION))
+        .ok_or_else(|| format!("missing bootstrap version {}", BOOTSTRAP_VERSION))?
+        .clone();
+    serde_json::from_value(value).map_err(|e| format!("invalid bootstrap v1 payload: {e}"))
+}
+
+pub fn validate_v1_client_hello(hello: &BootstrapV1ClientHello) -> Result<(), String> {
+    if hello
+        .session_protocols
+        .iter()
+        .any(|protocol| protocol == SESSION_PROTOCOL_H2)
+    {
+        return Ok(());
     }
-    Ok(())
+    Err(format!(
+        "unsupported session protocols: {:?}",
+        hello.session_protocols
+    ))
+}
+
+pub fn decode_v1_server_accept(response: Value) -> io::Result<BootstrapV1ServerAccept> {
+    serde_json::from_value(response)
+        .map_err(|e| io::Error::other(format!("bootstrap json error: {e}")))
 }
 
 pub fn encode_client_hello(hello: &BootstrapClientHello) -> io::Result<Vec<u8>> {
@@ -91,6 +144,7 @@ pub fn decode_server_response(payload: &[u8]) -> io::Result<BootstrapServerRespo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn initial_bootstrap_round_trips() {
@@ -106,14 +160,32 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_protocol_is_rejected() {
+    fn highest_mutual_version_is_selected() {
         let hello = BootstrapClientHello {
-            bootstrap_version: BOOTSTRAP_VERSION,
-            session_protocol: "something-else".to_string(),
+            versions: BTreeMap::from([
+                ("1".to_string(), json!({"session_protocols": ["h2"]})),
+                ("2".to_string(), json!({"future": true})),
+            ]),
+        };
+        assert_eq!(highest_supported_version(&hello), Some(1));
+    }
+
+    #[test]
+    fn v1_accepts_h2_among_other_protocols() {
+        let hello = BootstrapV1ClientHello {
+            session_protocols: vec!["future".to_string(), "h2".to_string()],
+        };
+        assert_eq!(validate_v1_client_hello(&hello), Ok(()));
+    }
+
+    #[test]
+    fn v1_rejects_when_h2_missing() {
+        let hello = BootstrapV1ClientHello {
+            session_protocols: vec!["something-else".to_string()],
         };
         assert_eq!(
-            validate_initial_client_hello(&hello),
-            Err("unsupported session protocol: something-else".to_string())
+            validate_v1_client_hello(&hello),
+            Err("unsupported session protocols: [\"something-else\"]".to_string())
         );
     }
 }
