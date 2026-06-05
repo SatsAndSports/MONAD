@@ -139,7 +139,7 @@ An H2 stream using:
 POST /control
 ```
 
-Used for session management after the Noise-payload bootstrap has already negotiated the session version/capabilities and selected the `h2` session protocol. The control stream then carries Spilman channel linking (`ChannelLink`) and unified session status synchronization (`SessionStatus`). See the "Control Protocol and Session Billing" section below for details.
+Used for session management after the Noise-payload bootstrap has already negotiated the session version/capabilities and selected the `h2` session protocol. In this first version, HTTP/2 is the cleartext session protocol running inside the Noise transport, and the control stream then carries Spilman channel linking (`ChannelLink`) and unified session status synchronization (`SessionStatus`). See the "Control Protocol and Session Billing" section below for details.
 
 ### Data stream
 
@@ -313,9 +313,9 @@ Server to client (`ServerMessage`):
 
 ### Version Negotiation
 
-Here, "bootstrap" means the post-Noise negotiation step that establishes the session version, chosen session protocol, and relay capabilities before H2 begins.
+Here, "bootstrap" means the MONAD-specific negotiation carried inside the two Noise handshake payloads before the post-handshake session begins.
 
-The client and relay now negotiate that bootstrap contract inside the two Noise handshake payloads before H2 starts. The client sends a hardcoded bootstrap request selecting the post-Noise session protocol (`h2` for now); the relay responds with a hardcoded accept or reject-with-reason payload. Today this bootstrap is intentionally strict rather than flexible capability negotiation: the client requests the one supported shape, and the relay either accepts exactly that shape or rejects with a reason.
+MONAD currently uses the Noise `NK` pattern instantiated with secp256k1 DH, ChaCha20-Poly1305 for transport encryption, BLAKE2s for hashing, and the fixed prologue `monad-noise-secp256k1-v1`. The client sends a hardcoded bootstrap request in the first handshake payload, the relay replies with a hardcoded accept-or-reject payload in the second, and today this bootstrap is intentionally strict rather than flexible capability negotiation: the client requests the one supported shape, and the relay either accepts exactly that shape or rejects with a reason. In this first version, the only accepted post-handshake session protocol is `h2` (HTTP/2), which then carries `POST /control` and `CONNECT host:port` streams inside the Noise transport.
 
 This bootstrap sequence stays outside the explicit session FSM. The reducer-style
 state machine begins only after the initial `SessionStatus` has been sent.
@@ -350,7 +350,7 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 ### Two Pricing Structures
 
 - **Wire**: `ServerMessage::SessionStatus` carries the active rates and the list of alternatives. This is what crosses the network.
-- **Local**: `SessionPricing` (in `monad-common/src/session.rs`) includes the precomputed LCM and negotiated version. Both client and relay construct this from the active rates in `SessionStatus` for billing math.
+- **Local**: `SessionPricing` (in `monad-common/src/session.rs`) includes the precomputed LCM of the active rates. Both client and relay construct this from the active rates in `SessionStatus` for billing math.
 
 ### Client Auto-Funding
 

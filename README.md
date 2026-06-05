@@ -19,7 +19,7 @@ Implemented today:
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
 - `monad-test-client`: localhost SOCKS5/manual test harness for mocked relay funding, circuit rebuild testing, and daily-driver browser/SSH experiments
 - QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
-- Noise-payload bootstrap: after Noise completes but before H2 starts, client and relay negotiate the session version/capabilities; today this is an intentionally strict hardcoded bootstrap that selects `h2` or rejects with a reason
+- Noise-payload bootstrap: MONAD uses the Noise `NK` pattern over secp256k1 with ChaCha20-Poly1305 and BLAKE2s; the client sends a bootstrap request in the first Noise handshake payload, the relay replies in the second, and today this is an intentionally strict hardcoded bootstrap that either selects `h2` (HTTP/2) as the post-handshake session protocol or rejects with a reason
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
 - session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
 - relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
