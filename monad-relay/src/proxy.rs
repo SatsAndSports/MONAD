@@ -145,7 +145,7 @@ where
         debug!("proxy {label} target->h2 ended with error: {e}");
     }
 
-    let (open_connects, total_connects) = state.connect_closed().await;
+    let (open_connects, total_connects) = state.connect_closed();
 
     info!(
         "tunnel closed: {label} | session_id={} open_connects={} total_connects={} outbound={} inbound={} total={}",

@@ -24,6 +24,7 @@ use monad_quic::client::ClientAuthMode;
 use monad_quic::stream::STREAM_KIND_SECP_NOISE;
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -34,21 +35,19 @@ use tracing::{debug, error, info, warn};
 /// Custom header name for QUIC secp256k1 transport identity in CONNECT requests.
 pub const QUIC_SECP256K1_PUBKEY_HEADER: &str = "quic-secp256k1-pubkey";
 
+/// Authoritative per-session billing state used by the relay reducer and the
+/// data-path byte accounting fast path.
 #[derive(Debug)]
-struct SessionInner {
+struct BillingState {
     session_total_in: u64,
     session_total_out: u64,
     total_paid_millisats: u64,
-    open_connects: u32,
-    total_connects: u64,
     pricing: SessionPricing,
     paused: bool,
-    control_attached: bool,
-    control_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
     linked_channel_id: Option<String>,
 }
 
-impl SessionInner {
+impl BillingState {
     fn to_fsm_state(&self) -> ServerSessionState {
         ServerSessionState {
             pricing: self.pricing,
@@ -69,11 +68,88 @@ impl SessionInner {
         self.paused = state.paused;
         self.linked_channel_id = state.linked_channel_id.clone();
     }
+
+    fn remaining_milli_sats(&self) -> i128 {
+        let amount_due = self
+            .pricing
+            .amount_due_millisats(self.session_total_in, self.session_total_out);
+        self.total_paid_millisats as i128 - amount_due as i128
+    }
+}
+
+/// Control-stream attachment state kept separate from billing updates.
+#[derive(Debug, Default)]
+struct ControlState {
+    control_attached: bool,
+    control_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
+}
+
+impl ControlState {
+    fn attach(&mut self, tx: mpsc::UnboundedSender<ServerMessage>) -> Result<(), ()> {
+        if self.control_attached {
+            return Err(());
+        }
+
+        self.control_attached = true;
+        self.control_tx = Some(tx);
+        Ok(())
+    }
+
+    fn detach(&mut self) {
+        self.control_attached = false;
+        self.control_tx = None;
+    }
+
+    fn sender(&self) -> Option<mpsc::UnboundedSender<ServerMessage>> {
+        self.control_tx.clone()
+    }
+}
+
+/// Lightweight observability counters that do not participate in billing.
+#[derive(Debug, Default)]
+struct SessionCounters {
+    open_connects: AtomicU32,
+    total_connects: AtomicU64,
+}
+
+impl SessionCounters {
+    fn snapshot(&self) -> (u32, u64) {
+        (
+            self.open_connects.load(Ordering::Relaxed),
+            self.total_connects.load(Ordering::Relaxed),
+        )
+    }
+
+    fn connect_opened(&self) -> (u32, u64) {
+        let open_connects = self
+            .open_connects
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let total_connects = self
+            .total_connects
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        (open_connects, total_connects)
+    }
+
+    fn connect_closed(&self) -> (u32, u64) {
+        let open_connects = self
+            .open_connects
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .map(|previous| previous.saturating_sub(1))
+            .unwrap_or(0);
+        let total_connects = self.total_connects.load(Ordering::Relaxed);
+        (open_connects, total_connects)
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct SessionState {
-    inner: Arc<Mutex<SessionInner>>,
+    billing: Arc<Mutex<BillingState>>,
+    control: Arc<Mutex<ControlState>>,
+    counters: Arc<SessionCounters>,
     pause_tx: watch::Sender<bool>,
     termination: CancellationToken,
     session_id: [u8; 32],
@@ -84,6 +160,8 @@ pub(crate) struct SessionState {
 }
 
 impl SessionState {
+    // Lifecycle and shared handles.
+
     fn new(
         session_id: [u8; 32],
         payments: Arc<dyn RelayPayments>,
@@ -97,21 +175,19 @@ impl SessionState {
         let termination = CancellationToken::new();
         session_registry.register_session(session_id, termination.clone());
         Self {
-            inner: Arc::new(Mutex::new(SessionInner {
+            billing: Arc::new(Mutex::new(BillingState {
                 session_total_in: 0,
                 session_total_out: 0,
                 total_paid_millisats: 0,
-                open_connects: 0,
-                total_connects: 0,
                 pricing: SessionPricing::new(
                     default_in_bytes_per_millisat.max(1),
                     default_out_bytes_per_millisat.max(1),
                 ),
                 paused: true,
-                control_attached: false,
-                control_tx: None,
                 linked_channel_id: None,
             })),
+            control: Arc::new(Mutex::new(ControlState::default())),
+            counters: Arc::new(SessionCounters::default()),
             pause_tx,
             termination,
             session_id,
@@ -120,62 +196,6 @@ impl SessionState {
             payment_receiver_secret,
             spilman_mint_cache,
         }
-    }
-
-    fn remaining_milli_sats(inner: &SessionInner) -> i128 {
-        let amount_due = inner
-            .pricing
-            .amount_due_millisats(inner.session_total_in, inner.session_total_out);
-        inner.total_paid_millisats as i128 - amount_due as i128
-    }
-
-    async fn session_status_message(&self) -> ServerMessage {
-        let inner = self.inner.lock().await;
-
-        let mut advertisements = Vec::new();
-        for (mint_url, unit_map) in &self.spilman_mint_cache.advertised {
-            for (unit, keyset_ids) in unit_map {
-                advertisements.push(KeysetAdvertisement {
-                    mint_url: mint_url.clone(),
-                    unit: unit.clone(),
-                    keyset_ids: keyset_ids.clone(),
-                    // Use session defaults for now until we have per-advertisement config
-                    in_bytes_per_millisat: inner.pricing.in_bytes_per_millisat,
-                    out_bytes_per_millisat: inner.pricing.out_bytes_per_millisat,
-                });
-            }
-        }
-
-        ServerMessage::SessionStatus {
-            receiver_pubkey: self.payment_receiver_secret.public_key().to_hex(),
-            advertisements,
-            linked_channel: inner
-                .linked_channel_id
-                .as_deref()
-                .and_then(|channel_id| self.payments.linked_channel_status(channel_id)),
-            active_in_rate: inner.pricing.in_bytes_per_millisat,
-            active_out_rate: inner.pricing.out_bytes_per_millisat,
-            session_total_in: inner.session_total_in,
-            session_total_out: inner.session_total_out,
-            total_paid_millisats: inner.total_paid_millisats,
-            remaining_milli_sats: clamp_i128_to_i64(Self::remaining_milli_sats(&inner)),
-            paused: inner.paused,
-            open_connects: inner.open_connects,
-            total_connects: inner.total_connects,
-        }
-    }
-
-    pub(crate) async fn connect_opened(&self) -> (u32, u64) {
-        let mut inner = self.inner.lock().await;
-        inner.open_connects = inner.open_connects.saturating_add(1);
-        inner.total_connects = inner.total_connects.saturating_add(1);
-        (inner.open_connects, inner.total_connects)
-    }
-
-    pub(crate) async fn connect_closed(&self) -> (u32, u64) {
-        let mut inner = self.inner.lock().await;
-        inner.open_connects = inner.open_connects.saturating_sub(1);
-        (inner.open_connects, inner.total_connects)
     }
 
     pub(crate) fn session_id(&self) -> [u8; 32] {
@@ -198,26 +218,59 @@ impl SessionState {
         self.termination.is_cancelled()
     }
 
+    // Billing state and status snapshots.
+
+    async fn session_status_message(&self) -> ServerMessage {
+        let billing = self.billing.lock().await;
+        let (open_connects, total_connects) = self.counters.snapshot();
+
+        let mut advertisements = Vec::new();
+        for (mint_url, unit_map) in &self.spilman_mint_cache.advertised {
+            for (unit, keyset_ids) in unit_map {
+                advertisements.push(KeysetAdvertisement {
+                    mint_url: mint_url.clone(),
+                    unit: unit.clone(),
+                    keyset_ids: keyset_ids.clone(),
+                    // Use session defaults for now until we have per-advertisement config.
+                    in_bytes_per_millisat: billing.pricing.in_bytes_per_millisat,
+                    out_bytes_per_millisat: billing.pricing.out_bytes_per_millisat,
+                });
+            }
+        }
+
+        ServerMessage::SessionStatus {
+            receiver_pubkey: self.payment_receiver_secret.public_key().to_hex(),
+            advertisements,
+            linked_channel: billing
+                .linked_channel_id
+                .as_deref()
+                .and_then(|channel_id| self.payments.linked_channel_status(channel_id)),
+            active_in_rate: billing.pricing.in_bytes_per_millisat,
+            active_out_rate: billing.pricing.out_bytes_per_millisat,
+            session_total_in: billing.session_total_in,
+            session_total_out: billing.session_total_out,
+            total_paid_millisats: billing.total_paid_millisats,
+            remaining_milli_sats: clamp_i128_to_i64(billing.remaining_milli_sats()),
+            paused: billing.paused,
+            open_connects,
+            total_connects,
+        }
+    }
+
     async fn is_paused(&self) -> bool {
-        self.inner.lock().await.paused
+        self.billing.lock().await.paused
     }
 
     async fn attach_control(&self, tx: mpsc::UnboundedSender<ServerMessage>) -> Result<(), ()> {
-        let mut inner = self.inner.lock().await;
-        if inner.control_attached {
-            return Err(());
-        }
-
-        inner.control_attached = true;
-        inner.control_tx = Some(tx.clone());
+        let mut control = self.control.lock().await;
+        control.attach(tx.clone())?;
         self.session_registry.register_control(self.session_id, tx);
         Ok(())
     }
 
     async fn detach_control(&self) {
-        let mut inner = self.inner.lock().await;
-        inner.control_attached = false;
-        inner.control_tx = None;
+        let mut control = self.control.lock().await;
+        control.detach();
         self.session_registry.deregister_control(&self.session_id);
     }
 
@@ -230,25 +283,27 @@ impl SessionState {
     }
 
     async fn note_bytes(&self, bytes: usize, outbound: bool) -> bool {
-        let mut inner = self.inner.lock().await;
+        let mut billing = self.billing.lock().await;
         let direction = if outbound {
             ByteDirection::Outbound
         } else {
             ByteDirection::Inbound
         };
         let (next_state, pause_changed) =
-            apply_accounted_bytes(inner.to_fsm_state(), direction, bytes);
-        inner.apply_fsm_state(&next_state);
+            apply_accounted_bytes(billing.to_fsm_state(), direction, bytes);
+        billing.apply_fsm_state(&next_state);
         if let Some(paused) = pause_changed {
             let _ = self.pause_tx.send_replace(paused);
         }
         next_state.paused
     }
 
+    // Control-stream state.
+
     async fn push_message(&self, message: ServerMessage) {
         let tx = {
-            let inner = self.inner.lock().await;
-            inner.control_tx.clone()
+            let control = self.control.lock().await;
+            control.sender()
         };
 
         if let Some(tx) = tx {
@@ -259,6 +314,16 @@ impl SessionState {
     pub(crate) async fn push_status(&self) {
         let status = self.session_status_message().await;
         self.push_message(status).await;
+    }
+
+    // Observability counters.
+
+    pub(crate) fn connect_opened(&self) -> (u32, u64) {
+        self.counters.connect_opened()
+    }
+
+    pub(crate) fn connect_closed(&self) -> (u32, u64) {
+        self.counters.connect_closed()
     }
 }
 
@@ -426,7 +491,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                                 let state = self.state.clone();
                                                 let session_id = self.session_id;
                                                 let (open_connects, total_connects) =
-                                                    state.connect_opened().await;
+                                                    state.connect_opened();
                                                 info!(
                                                     "CONNECT opened: {authority} (via QUIC secp256k1 auth) | session_id={} open_connects={} total_connects={}",
                                                     hex::encode(session_id),
@@ -479,7 +544,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                                 let state = self.state.clone();
                                                 let session_id = self.session_id;
                                                 let (open_connects, total_connects) =
-                                                    state.connect_opened().await;
+                                                    state.connect_opened();
                                                 info!(
                                                     "CONNECT opened: {authority} | session_id={} open_connects={} total_connects={}",
                                                     hex::encode(session_id),
@@ -753,9 +818,9 @@ async fn process_session_event(
 
     while let Some(event) = pending.pop_front() {
         let effects = {
-            let mut inner = state.inner.lock().await;
-            let (next_state, effects) = step(inner.to_fsm_state(), event);
-            inner.apply_fsm_state(&next_state);
+            let mut billing = state.billing.lock().await;
+            let (next_state, effects) = step(billing.to_fsm_state(), event);
+            billing.apply_fsm_state(&next_state);
             effects
         };
 
