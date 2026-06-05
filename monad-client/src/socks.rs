@@ -12,6 +12,36 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::warn;
+
+fn socks_method_name(method: u8) -> &'static str {
+    match method {
+        0x00 => "NO_AUTH",
+        0x01 => "GSSAPI",
+        0x02 => "USERNAME_PASSWORD",
+        0x03..=0x7f => "IANA_ASSIGNED",
+        0x80..=0xfe => "PRIVATE",
+        0xff => "NO_ACCEPTABLE_METHODS",
+    }
+}
+
+fn socks_command_name(cmd: u8) -> &'static str {
+    match cmd {
+        0x01 => "CONNECT",
+        0x02 => "BIND",
+        0x03 => "UDP_ASSOCIATE",
+        _ => "UNKNOWN",
+    }
+}
+
+fn socks_atyp_name(atyp: u8) -> &'static str {
+    match atyp {
+        0x01 => "IPV4",
+        0x03 => "DOMAINNAME",
+        0x04 => "IPV6",
+        _ => "UNKNOWN",
+    }
+}
 
 /// The destination extracted from a SOCKS5 CONNECT request.
 #[derive(Debug, Clone)]
@@ -29,6 +59,7 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
     // Client sends: VER (1) | NMETHODS (1) | METHODS (1-255)
     let ver = stream.read_u8().await?;
     if ver != 0x05 {
+        warn!("SOCKS5 greeting rejected: unsupported_version=0x{ver:02x}");
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported SOCKS version: {ver}"),
@@ -43,6 +74,14 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
     if !methods.contains(&0x00) {
         // Send back "no acceptable methods"
         stream.write_all(&[0x05, 0xFF]).await?;
+        let offered_methods = methods
+            .iter()
+            .map(|method| format!("0x{method:02x}({})", socks_method_name(*method)))
+            .collect::<Vec<_>>()
+            .join(",");
+        warn!(
+            "SOCKS5 auth negotiation rejected: offered_methods=[{offered_methods}], required_method=0x00(NO_AUTH)"
+        );
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "client does not support no-auth",
@@ -56,6 +95,7 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
     // Client sends: VER (1) | CMD (1) | RSV (1) | ATYP (1) | DST.ADDR (variable) | DST.PORT (2)
     let ver = stream.read_u8().await?;
     if ver != 0x05 {
+        warn!("SOCKS5 request rejected: unexpected_request_version=0x{ver:02x}");
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unexpected version in request",
@@ -67,6 +107,10 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
         // Only CONNECT (0x01) is supported
         // Send error reply: command not supported
         send_reply(stream, 0x07, "0.0.0.0", 0).await?;
+        warn!(
+            "SOCKS5 request rejected: unsupported_command=0x{cmd:02x}({}), supported_command=0x01(CONNECT)",
+            socks_command_name(cmd)
+        );
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("unsupported SOCKS5 command: {cmd}"),
@@ -89,6 +133,7 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
             let mut domain = vec![0u8; len];
             stream.read_exact(&mut domain).await?;
             String::from_utf8(domain).map_err(|_| {
+                warn!("SOCKS5 request rejected: invalid_domain_encoding");
                 io::Error::new(io::ErrorKind::InvalidData, "invalid domain name encoding")
             })?
         }
@@ -100,6 +145,10 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
         }
         _ => {
             send_reply(stream, 0x08, "0.0.0.0", 0).await?;
+            warn!(
+                "SOCKS5 request rejected: unsupported_atyp=0x{atyp:02x}({}), supported_atyp=[0x01(IPV4),0x03(DOMAINNAME),0x04(IPV6)]",
+                socks_atyp_name(atyp)
+            );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported address type: {atyp}"),
@@ -172,6 +221,71 @@ mod tests {
             request.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
             request.extend_from_slice(&7777u16.to_be_bytes());
             stream.write_all(&request).await.unwrap();
+        });
+
+        server.await.unwrap();
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_handshake_rejects_unsupported_auth_methods() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let err = socks5_handshake(&mut stream).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("client does not support no-auth"));
+        });
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+
+            // Greeting: VER=5, NMETHODS=1, METHODS=[USERNAME/PASSWORD]
+            stream.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+
+            let mut reply = [0u8; 2];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [0x05, 0xFF]);
+        });
+
+        server.await.unwrap();
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_handshake_rejects_unsupported_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let err = socks5_handshake(&mut stream).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+            assert!(err.to_string().contains("unsupported SOCKS5 command: 3"));
+        });
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+
+            // Greeting: VER=5, NMETHODS=1, METHODS=[NO AUTH]
+            stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+
+            let mut method_select = [0u8; 2];
+            stream.read_exact(&mut method_select).await.unwrap();
+            assert_eq!(method_select, [0x05, 0x00]);
+
+            // Request: VER=5, CMD=UDP_ASSOCIATE, RSV=0, ATYP=IPv4, DST.ADDR=127.0.0.1, DST.PORT=7777
+            let mut request = vec![0x05, 0x03, 0x00, 0x01];
+            request.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
+            request.extend_from_slice(&7777u16.to_be_bytes());
+            stream.write_all(&request).await.unwrap();
+
+            let mut reply = [0u8; 10];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[0], 0x05);
+            assert_eq!(reply[1], 0x07);
         });
 
         server.await.unwrap();
