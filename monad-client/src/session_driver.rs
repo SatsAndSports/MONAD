@@ -81,6 +81,30 @@ impl From<&RelayConnection> for RelayConnectionProxy {
     }
 }
 
+fn validate_session_pricing(
+    established_pricing: &mut Option<monad_common::session::SessionPricing>,
+    candidate: monad_common::session::SessionPricing,
+) -> io::Result<()> {
+    if let Some(previous) = established_pricing {
+        if *previous != candidate {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "protocol violation: relay changed active session pricing from in={} out={} to in={} out={}",
+                    previous.in_bytes_per_millisat,
+                    previous.out_bytes_per_millisat,
+                    candidate.in_bytes_per_millisat,
+                    candidate.out_bytes_per_millisat,
+                ),
+            ));
+        }
+    } else {
+        *established_pricing = Some(candidate);
+    }
+
+    Ok(())
+}
+
 async fn run_session_driver(
     mut h2_send: h2::SendStream<Bytes>,
     mut h2_recv: h2::RecvStream,
@@ -93,6 +117,7 @@ async fn run_session_driver(
     let mut buf = Vec::new();
     let mut state = ClientSessionState::new();
     let mut ready_tx = Some(ready_tx);
+    let mut established_pricing = None;
 
     while let Some(chunk) = h2_recv.data().await {
         let data = chunk.map_err(|e| io::Error::other(format!("h2 recv error: {e}")))?;
@@ -126,6 +151,7 @@ async fn run_session_driver(
                 } => {
                     let pricing =
                         monad_common::session::SessionPricing::new(active_in_rate, active_out_rate);
+                    validate_session_pricing(&mut established_pricing, pricing)?;
                     let due_now = pricing.amount_due_millisats(session_total_in, session_total_out);
                     info!(
                         "{} session status: open_connects={} total_connects={} paused={} balance={} paid={} due={} linked={:?}",
@@ -395,9 +421,11 @@ fn io_wallet_error(err: WalletError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::inspect_and_adopt_linked_channel;
+    use super::{inspect_and_adopt_linked_channel, validate_session_pricing};
     use crate::wallet::{MockWallet, RelayPaymentOffer, WalletChannel, WalletChannelState};
     use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus};
+    use monad_common::session::SessionPricing;
+    use std::io;
 
     fn channel(id: &str) -> WalletChannel {
         WalletChannel {
@@ -450,5 +478,42 @@ mod tests {
                 out_bytes_per_millisat: 1,
             }
         );
+    }
+
+    #[test]
+    fn validate_session_pricing_allows_initial_and_matching_rates() {
+        let mut established = None;
+        let pricing = SessionPricing::new(1, 2);
+
+        validate_session_pricing(&mut established, pricing).unwrap();
+        validate_session_pricing(&mut established, pricing).unwrap();
+
+        assert_eq!(established, Some(pricing));
+    }
+
+    #[test]
+    fn validate_session_pricing_rejects_rate_change() {
+        let mut established = Some(SessionPricing::new(1, 2));
+        let err =
+            validate_session_pricing(&mut established, SessionPricing::new(3, 2)).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("protocol violation: relay changed active session pricing"));
+    }
+
+    #[test]
+    fn validate_session_pricing_rejects_changed_rates_after_initial_baseline() {
+        let mut established = None;
+
+        validate_session_pricing(&mut established, SessionPricing::new(1, 1)).unwrap();
+        let err = validate_session_pricing(&mut established, SessionPricing::new(2, 1))
+            .expect_err("later pricing change should be rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("protocol violation: relay changed active session pricing"));
     }
 }

@@ -50,7 +50,6 @@ struct BillingState {
 impl BillingState {
     fn to_fsm_state(&self) -> ServerSessionState {
         ServerSessionState {
-            pricing: self.pricing,
             session_total_in: self.session_total_in,
             session_total_out: self.session_total_out,
             total_paid_millisats: self.total_paid_millisats,
@@ -61,7 +60,6 @@ impl BillingState {
     }
 
     fn apply_fsm_state(&mut self, state: &ServerSessionState) {
-        self.pricing = state.pricing;
         self.session_total_in = state.session_total_in;
         self.session_total_out = state.session_total_out;
         self.total_paid_millisats = state.total_paid_millisats;
@@ -289,8 +287,9 @@ impl SessionState {
         } else {
             ByteDirection::Inbound
         };
+        let pricing = billing.pricing;
         let (next_state, pause_changed) =
-            apply_accounted_bytes(billing.to_fsm_state(), direction, bytes);
+            apply_accounted_bytes(billing.to_fsm_state(), pricing, direction, bytes);
         billing.apply_fsm_state(&next_state);
         if let Some(paused) = pause_changed {
             let _ = self.pause_tx.send_replace(paused);
@@ -819,7 +818,8 @@ async fn process_session_event(
     while let Some(event) = pending.pop_front() {
         let effects = {
             let mut billing = state.billing.lock().await;
-            let (next_state, effects) = step(billing.to_fsm_state(), event);
+            let pricing = billing.pricing;
+            let (next_state, effects) = step(billing.to_fsm_state(), event, pricing);
             billing.apply_fsm_state(&next_state);
             effects
         };

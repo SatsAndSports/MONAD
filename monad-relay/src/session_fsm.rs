@@ -4,7 +4,6 @@ use monad_common::session::SessionPricing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerSessionState {
-    pub pricing: SessionPricing,
     pub session_total_in: u64,
     pub session_total_out: u64,
     pub total_paid_millisats: u64,
@@ -55,6 +54,7 @@ pub(crate) enum ByteDirection {
 pub(crate) fn step(
     mut state: ServerSessionState,
     event: SessionEvent,
+    pricing: SessionPricing,
 ) -> (ServerSessionState, Vec<SessionEffect>) {
     if state.terminated {
         return (state, Vec::new());
@@ -101,7 +101,7 @@ pub(crate) fn step(
                 state.total_paid_millisats = state
                     .total_paid_millisats
                     .saturating_add(outcome.delta_millisats);
-                let pause_changed = refresh_pause_state(&mut state);
+                let pause_changed = refresh_pause_state(&mut state, pricing);
                 let mut effects = Vec::new();
                 if let Some(paused) = pause_changed {
                     effects.push(SessionEffect::UpdatePauseWatch(paused));
@@ -139,6 +139,7 @@ pub(crate) fn step(
 
 pub(crate) fn apply_accounted_bytes(
     mut state: ServerSessionState,
+    pricing: SessionPricing,
     direction: ByteDirection,
     bytes: usize,
 ) -> (ServerSessionState, Option<bool>) {
@@ -151,20 +152,18 @@ pub(crate) fn apply_accounted_bytes(
         }
     }
 
-    let pause_changed = refresh_pause_state(&mut state);
+    let pause_changed = refresh_pause_state(&mut state, pricing);
     (state, pause_changed)
 }
 
-fn refresh_pause_state(state: &mut ServerSessionState) -> Option<bool> {
+fn refresh_pause_state(state: &mut ServerSessionState, pricing: SessionPricing) -> Option<bool> {
     let was_paused = state.paused;
-    state.paused = remaining_milli_sats(state) <= 0;
+    state.paused = remaining_milli_sats(state, pricing) <= 0;
     (state.paused != was_paused).then_some(state.paused)
 }
 
-fn remaining_milli_sats(state: &ServerSessionState) -> i128 {
-    let amount_due = state
-        .pricing
-        .amount_due_millisats(state.session_total_in, state.session_total_out);
+fn remaining_milli_sats(state: &ServerSessionState, pricing: SessionPricing) -> i128 {
+    let amount_due = pricing.amount_due_millisats(state.session_total_in, state.session_total_out);
     state.total_paid_millisats as i128 - amount_due as i128
 }
 
@@ -179,7 +178,6 @@ mod tests {
 
     fn state() -> ServerSessionState {
         ServerSessionState {
-            pricing: SessionPricing::new(1, 1),
             session_total_in: 0,
             session_total_out: 0,
             total_paid_millisats: 0,
@@ -198,6 +196,7 @@ mod tests {
                 capacity_millisats: 123,
                 evicted_session: None,
             })),
+            SessionPricing::new(1, 1),
         );
 
         assert_eq!(next.linked_channel_id.as_deref(), Some("chan-a"));
@@ -215,6 +214,7 @@ mod tests {
                 channel_id: "chan-a".to_string(),
                 delta_millisats: 5,
             })),
+            SessionPricing::new(1, 1),
         );
 
         assert_eq!(next.total_paid_millisats, 5);
@@ -233,6 +233,7 @@ mod tests {
         let (next, effects) = step(
             state(),
             SessionEvent::PaymentValidationFinished(Err(ChannelPaymentError::WrongChannel)),
+            SessionPricing::new(1, 1),
         );
 
         assert_eq!(next, state());
@@ -254,6 +255,7 @@ mod tests {
             SessionEvent::ChannelEvicted {
                 channel_id: "chan-a".to_string(),
             },
+            SessionPricing::new(1, 1),
         );
 
         assert_eq!(next.linked_channel_id, None);
@@ -271,7 +273,11 @@ mod tests {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());
 
-        let (next, effects) = step(current, SessionEvent::ControlDetached);
+        let (next, effects) = step(
+            current,
+            SessionEvent::ControlDetached,
+            SessionPricing::new(1, 1),
+        );
 
         assert!(next.terminated);
         assert_eq!(next.linked_channel_id, None);
@@ -290,11 +296,17 @@ mod tests {
         current.total_paid_millisats = 10;
         current.paused = false;
 
-        let (next, pause_changed) = apply_accounted_bytes(current, ByteDirection::Outbound, 4);
+        let (next, pause_changed) = apply_accounted_bytes(
+            current,
+            SessionPricing::new(1, 1),
+            ByteDirection::Outbound,
+            4,
+        );
         assert_eq!(next.session_total_out, 4);
         assert_eq!(pause_changed, None);
 
-        let (next, pause_changed) = apply_accounted_bytes(next, ByteDirection::Outbound, 6);
+        let (next, pause_changed) =
+            apply_accounted_bytes(next, SessionPricing::new(1, 1), ByteDirection::Outbound, 6);
         assert_eq!(next.session_total_out, 10);
         assert_eq!(pause_changed, Some(true));
         assert!(next.paused);

@@ -512,6 +512,8 @@ async fn read_control_message(h2_recv: &mut h2::RecvStream) -> ServerMessage {
 #[derive(Debug, Clone)]
 struct TestSessionStatus {
     linked_channel: Option<monad_common::protocol::LinkedChannelStatus>,
+    active_in_rate: u64,
+    active_out_rate: u64,
     session_total_in: u64,
     session_total_out: u64,
     total_paid_millisats: u64,
@@ -621,6 +623,8 @@ fn expect_session_status_struct(message: ServerMessage) -> TestSessionStatus {
     match message {
         ServerMessage::SessionStatus {
             linked_channel,
+            active_in_rate,
+            active_out_rate,
             session_total_in,
             session_total_out,
             total_paid_millisats,
@@ -631,6 +635,8 @@ fn expect_session_status_struct(message: ServerMessage) -> TestSessionStatus {
             ..
         } => TestSessionStatus {
             linked_channel,
+            active_in_rate,
+            active_out_rate,
             session_total_in,
             session_total_out,
             total_paid_millisats,
@@ -660,20 +666,10 @@ async fn control_handshake_status(
     _h2_send: &mut h2::SendStream<Bytes>,
     h2_recv: &mut h2::RecvStream,
 ) -> TestSessionStatus {
-    let message = read_control_message(h2_recv).await;
-    match &message {
-        ServerMessage::SessionStatus {
-            active_in_rate,
-            active_out_rate,
-            ..
-        } => {
-            assert_eq!(*active_in_rate, 1);
-            assert_eq!(*active_out_rate, 1);
-        }
-        other => panic!("expected SessionStatus, got {other:?}"),
-    }
-
-    expect_session_status_struct(message)
+    let status = expect_session_status_struct(read_control_message(h2_recv).await);
+    assert_eq!(status.active_in_rate, 1);
+    assert_eq!(status.active_out_rate, 1);
+    status
 }
 
 async fn open_funded_control(
@@ -977,6 +973,33 @@ async fn test_session_starts_paused() {
     let _ = h2_send.send_data(Bytes::new(), true);
     drop(h2_send);
     drop(h2_recv);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_session_active_rates_remain_immutable_across_status_updates() {
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let mut control = ControlSessionHarness::open(&conn).await;
+
+    let initial = control.handshake().await;
+    assert_eq!(initial.active_in_rate, 1);
+    assert_eq!(initial.active_out_rate, 1);
+
+    let mut channel = SessionPaymentChannel::for_explicit_id("chan-rates");
+    let linked = channel
+        .link_expect_balance(&mut control.send, &mut control.recv, 0)
+        .await;
+    assert_eq!(linked.active_in_rate, initial.active_in_rate);
+    assert_eq!(linked.active_out_rate, initial.active_out_rate);
+
+    let _ = channel.pay(&mut control.send, &mut control.recv, 10).await;
+    let funded = control.get_status().await;
+    assert_eq!(funded.active_in_rate, initial.active_in_rate);
+    assert_eq!(funded.active_out_rate, initial.active_out_rate);
+
+    control.close().await;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     conn.shutdown().await;
 }
