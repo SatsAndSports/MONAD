@@ -107,6 +107,17 @@ async fn main() -> Result<()> {
             loop {
                 let delay = rebuild_backoff(attempt);
                 if !delay.is_zero() {
+                    let hop_count = {
+                        let circuit = rebuild_circuit.lock().await;
+                        circuit.hop_count()
+                    };
+                    info!(
+                        "waiting {:?} before rebuild attempt {} for hop {}/{}",
+                        delay,
+                        attempt + 1,
+                        failure.hop_idx + 1,
+                        hop_count
+                    );
                     time::sleep(delay).await;
                 }
 
@@ -118,12 +129,19 @@ async fn main() -> Result<()> {
                     failure.epoch,
                     failure.reason,
                 );
+                info!(
+                    "rebuild attempt {} starting from hop {}/{}",
+                    attempt + 1,
+                    failure.hop_idx + 1,
+                    circuit.hop_count()
+                );
                 match circuit.rebuild_after_failure(failure.clone()).await {
                     Ok(RebuildAfterFailureOutcome::Rebuilt) => {
                         info!(
-                            "rebuilt circuit suffix from hop {}/{}",
+                            "rebuilt circuit suffix from hop {}/{} on attempt {}",
                             failure.hop_idx + 1,
-                            circuit.hop_count()
+                            circuit.hop_count(),
+                            attempt + 1
                         );
                         break;
                     }

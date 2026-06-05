@@ -264,6 +264,11 @@ impl Circuit {
             return;
         }
 
+        info!(
+            "circuit final hop unavailable while rebuilding suffix from hop {}/{}",
+            hop_idx + 1,
+            self.hops.len()
+        );
         *self.active_final_conn.write().await = None;
 
         for slot in &mut self.hops[hop_idx..] {
@@ -279,9 +284,20 @@ impl Circuit {
             return Err(anyhow!("invalid hop index {hop_idx}"));
         }
 
+        info!(
+            "starting circuit suffix rebuild from hop {}/{}",
+            hop_idx + 1,
+            self.hops.len()
+        );
         self.invalidate_from(hop_idx).await;
 
         for idx in hop_idx..self.hops.len() {
+            info!(
+                "reconnecting hop {}/{} via {}",
+                idx + 1,
+                self.hops.len(),
+                self.hops[idx].spec.addr
+            );
             let conn = if idx == 0 {
                 let stream = self
                     .first_hop_quic_pool
@@ -324,9 +340,20 @@ impl Circuit {
             };
 
             self.hops[idx].conn = Some(conn);
+            info!(
+                "reconnected hop {}/{} via {}",
+                idx + 1,
+                self.hops.len(),
+                self.hops[idx].spec.addr
+            );
         }
 
         *self.active_final_conn.write().await = self.final_conn();
+        info!(
+            "circuit final hop restored after rebuild from hop {}/{}",
+            hop_idx + 1,
+            self.hops.len()
+        );
         Ok(())
     }
 
@@ -647,6 +674,8 @@ async fn start_auto_control(
         let mut ready_tx = Some(ready_tx);
         let mut funding = HopFundingState::new();
         let mut last_status_received_at = Instant::now();
+        let mut last_status_requested_at: Option<Instant> = None;
+        let mut was_usable = false;
         let mut status_request_in_flight = false;
         let mut interval = config.status_interval.map(time::interval);
         if let Some(interval) = interval.as_mut() {
@@ -669,6 +698,10 @@ async fn start_auto_control(
                         if status_request_in_flight {
                             continue;
                         }
+                        info!(
+                            "{hop_label}: sending health check status poll (timeout {:?})",
+                            config.status_timeout
+                        );
                         if let Err(err) = send_control_message(&mut h2_send, &ClientMessage::GetSessionStatus).await {
                             report_hop_failure(
                                 &failure_tx,
@@ -678,6 +711,7 @@ async fn start_auto_control(
                             );
                             break;
                         }
+                        last_status_requested_at = Some(Instant::now());
                         status_request_in_flight = true;
                         continue;
                     }
@@ -716,6 +750,8 @@ async fn start_auto_control(
                     total_paid_millisats,
                     remaining_milli_sats,
                     paused,
+                    open_connects,
+                    total_connects,
                     ..
                 } => {
                     last_status_received_at = Instant::now();
@@ -738,7 +774,9 @@ async fn start_auto_control(
                             })
                             .unwrap_or_else(|| "none".to_string());
                         info!(
-                            "{hop_label} | paused={paused} remaining={}msat paid={}msat due={}msat totals(in={}, out={}) linked={}",
+                            "{hop_label} | open_connects={} total_connects={} paused={paused} remaining={}msat paid={}msat due={}msat totals(in={}, out={}) linked={}",
+                            open_connects,
+                            total_connects,
                             remaining_milli_sats,
                             total_paid_millisats,
                             due_now,
@@ -746,6 +784,12 @@ async fn start_auto_control(
                             session_total_out,
                             linked_summary,
                         );
+                        if let Some(started_at) = last_status_requested_at.take() {
+                            info!(
+                                "{hop_label}: health check status poll completed in {:?}",
+                                started_at.elapsed()
+                            );
+                        }
                         status_request_in_flight = false;
                     }
 
@@ -795,6 +839,7 @@ async fn start_auto_control(
                             );
                             break;
                         }
+                        info!("{hop_label}: sent channel link request for new mock channel");
                         *spilman_info_handle.write().await = Some(SessionSpilmanInfo {
                             receiver_pubkey: relay_offer.receiver_pubkey.clone(),
                             mint_url: relay_offer.mint_url.clone(),
@@ -846,6 +891,9 @@ async fn start_auto_control(
                                         );
                                         break;
                                     }
+                                    info!(
+                                        "{hop_label}: sent channel payment to restore session balance"
+                                    );
                                     funding.mark_awaiting_linked_status();
                                 }
                                 Ok(None) => {
@@ -876,7 +924,13 @@ async fn start_auto_control(
                         }
                     }
 
-                    if funding.is_funded() && !paused {
+                    let is_usable = funding.is_funded() && !paused;
+                    if is_usable && !was_usable {
+                        info!("{hop_label}: hop is healthy and funded");
+                    }
+                    was_usable = is_usable;
+
+                    if is_usable {
                         if let Some(tx) = ready_tx.take() {
                             let _ = tx.send(());
                         }

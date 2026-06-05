@@ -121,13 +121,17 @@ async fn run_session_driver(
                     total_paid_millisats,
                     remaining_milli_sats,
                     paused,
+                    open_connects,
+                    total_connects,
                 } => {
                     let pricing =
                         monad_common::session::SessionPricing::new(active_in_rate, active_out_rate);
                     let due_now = pricing.amount_due_millisats(session_total_in, session_total_out);
                     info!(
-                        "{} session status: paused={} balance={} paid={} due={} linked={:?}",
+                        "{} session status: open_connects={} total_connects={} paused={} balance={} paid={} due={} linked={:?}",
                         config.hop_label,
+                        open_connects,
+                        total_connects,
                         paused,
                         remaining_milli_sats,
                         total_paid_millisats,

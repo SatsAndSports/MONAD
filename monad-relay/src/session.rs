@@ -39,6 +39,8 @@ struct SessionInner {
     session_total_in: u64,
     session_total_out: u64,
     total_paid_millisats: u64,
+    open_connects: u32,
+    total_connects: u64,
     pricing: SessionPricing,
     paused: bool,
     control_attached: bool,
@@ -99,6 +101,8 @@ impl SessionState {
                 session_total_in: 0,
                 session_total_out: 0,
                 total_paid_millisats: 0,
+                open_connects: 0,
+                total_connects: 0,
                 pricing: SessionPricing::new(
                     default_in_bytes_per_millisat.max(1),
                     default_out_bytes_per_millisat.max(1),
@@ -156,7 +160,26 @@ impl SessionState {
             total_paid_millisats: inner.total_paid_millisats,
             remaining_milli_sats: clamp_i128_to_i64(Self::remaining_milli_sats(&inner)),
             paused: inner.paused,
+            open_connects: inner.open_connects,
+            total_connects: inner.total_connects,
         }
+    }
+
+    pub(crate) async fn connect_opened(&self) -> (u32, u64) {
+        let mut inner = self.inner.lock().await;
+        inner.open_connects = inner.open_connects.saturating_add(1);
+        inner.total_connects = inner.total_connects.saturating_add(1);
+        (inner.open_connects, inner.total_connects)
+    }
+
+    pub(crate) async fn connect_closed(&self) -> (u32, u64) {
+        let mut inner = self.inner.lock().await;
+        inner.open_connects = inner.open_connects.saturating_sub(1);
+        (inner.open_connects, inner.total_connects)
+    }
+
+    pub(crate) fn session_id(&self) -> [u8; 32] {
+        self.session_id
     }
 
     pub(crate) fn pause_receiver(&self) -> watch::Receiver<bool> {
@@ -392,7 +415,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                     .await
                                 {
                                     Ok(quic_stream) => {
-                                        info!("QUIC stream opened to {authority}");
                                         let resp = Response::builder()
                                             .status(StatusCode::OK)
                                             .body(())
@@ -402,6 +424,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                                 let (_, h2_recv) = request.into_parts();
                                                 let label = format!("quic:{authority}");
                                                 let state = self.state.clone();
+                                                let session_id = self.session_id;
+                                                let (open_connects, total_connects) =
+                                                    state.connect_opened().await;
+                                                info!(
+                                                    "CONNECT opened: {authority} (via QUIC secp256k1 auth) | session_id={} open_connects={} total_connects={}",
+                                                    hex::encode(session_id),
+                                                    open_connects,
+                                                    total_connects
+                                                );
                                                 tokio::spawn(async move {
                                                     if let Err(e) =
                                                         proxy::proxy_bidirectional_accounted(
@@ -438,7 +469,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
 
                                 match TcpStream::connect(&authority).await {
                                     Ok(tcp_stream) => {
-                                        info!("connected to {authority}");
                                         let resp = Response::builder()
                                             .status(StatusCode::OK)
                                             .body(())
@@ -447,6 +477,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                             Ok(h2_send) => {
                                                 let (_, h2_recv) = request.into_parts();
                                                 let state = self.state.clone();
+                                                let session_id = self.session_id;
+                                                let (open_connects, total_connects) =
+                                                    state.connect_opened().await;
+                                                info!(
+                                                    "CONNECT opened: {authority} | session_id={} open_connects={} total_connects={}",
+                                                    hex::encode(session_id),
+                                                    open_connects,
+                                                    total_connects
+                                                );
                                                 tokio::spawn(async move {
                                                     if let Err(e) =
                                                         proxy::proxy_bidirectional_accounted(

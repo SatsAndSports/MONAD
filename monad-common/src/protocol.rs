@@ -86,6 +86,8 @@ pub enum ServerMessage {
         total_paid_millisats: u64,
         remaining_milli_sats: i64,
         paused: bool,
+        open_connects: u32,
+        total_connects: u64,
     },
 
     /// Another session claimed the channel; this session is now Unlinked.

@@ -517,6 +517,8 @@ struct TestSessionStatus {
     total_paid_millisats: u64,
     remaining_milli_sats: i64,
     paused: bool,
+    open_connects: u32,
+    total_connects: u64,
 }
 
 impl TestSessionStatus {
@@ -624,6 +626,8 @@ fn expect_session_status_struct(message: ServerMessage) -> TestSessionStatus {
             total_paid_millisats,
             remaining_milli_sats,
             paused,
+            open_connects,
+            total_connects,
             ..
         } => TestSessionStatus {
             linked_channel,
@@ -632,6 +636,8 @@ fn expect_session_status_struct(message: ServerMessage) -> TestSessionStatus {
             total_paid_millisats,
             remaining_milli_sats,
             paused,
+            open_connects,
+            total_connects,
         },
         other => panic!("expected SessionStatus, got {other:?}"),
     }
@@ -910,6 +916,26 @@ async fn tunnel_roundtrip(
     }
 
     result
+}
+
+async fn open_connect_tunnel(
+    h2_client: &mut client::SendRequest<Bytes>,
+    target_authority: &str,
+) -> (h2::SendStream<Bytes>, h2::RecvStream) {
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(target_authority)
+        .body(())
+        .unwrap();
+
+    let (response_future, h2_send) = h2_client.send_request(request, false).unwrap();
+    let response = response_future.await.unwrap();
+    assert!(
+        response.status().is_success(),
+        "CONNECT failed: {}",
+        response.status()
+    );
+    (h2_send, response.into_body())
 }
 
 fn mock_wallet_channel(
@@ -2505,6 +2531,79 @@ async fn test_funded_data_channel() {
     let result = tunnel_roundtrip(&mut h2, &target, b"hello world").await;
     assert_eq!(result, b"HELLO WORLD");
 
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_session_status_reports_open_and_total_connect_counts() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((_stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+        }
+    });
+
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (control_send, control_recv) = open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
+    let mut control = ControlSessionHarness {
+        send: control_send,
+        recv: control_recv,
+    };
+
+    let initial = control.get_status().await;
+    assert_eq!(initial.open_connects, 0);
+    assert_eq!(initial.total_connects, 0);
+
+    let mut h2 = conn.clone_send_request().await;
+    let target = format!("127.0.0.1:{}", target_addr.port());
+
+    let (mut tunnel1_send, tunnel1_recv) = open_connect_tunnel(&mut h2, &target).await;
+    let status1 = control.get_status().await;
+    assert_eq!(status1.open_connects, 1);
+    assert_eq!(status1.total_connects, 1);
+
+    let (mut tunnel2_send, tunnel2_recv) = open_connect_tunnel(&mut h2, &target).await;
+    let status2 = control.get_status().await;
+    assert_eq!(status2.open_connects, 2);
+    assert_eq!(status2.total_connects, 2);
+
+    let _ = tunnel1_send.send_data(Bytes::new(), true);
+    drop(tunnel1_send);
+    drop(tunnel1_recv);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let status = control.get_status().await;
+            if status.open_connects == 1 && status.total_connects == 2 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("open CONNECT count should drop after first tunnel closes");
+
+    let _ = tunnel2_send.send_data(Bytes::new(), true);
+    drop(tunnel2_send);
+    drop(tunnel2_recv);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let status = control.get_status().await;
+            if status.open_connects == 0 && status.total_connects == 2 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("open CONNECT count should drop to zero after all tunnels close");
+
+    control.close().await;
     drop(h2);
     conn.shutdown().await;
 }
