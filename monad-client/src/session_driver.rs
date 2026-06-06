@@ -7,10 +7,11 @@ use std::io;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::session_fsm::{
-    ClientSessionEffect, ClientSessionEvent, ClientSessionState, SessionSnapshot, WalletOpKind,
+    ClientSessionEffect, ClientSessionEvent, ClientSessionState, ControlOpInFlight,
+    FundingBlockedReason, SessionSnapshot, WalletOpKind,
 };
 use crate::wallet::{select_channel, MonadWallet, RelayPaymentOffer, WalletError};
 
@@ -103,6 +104,77 @@ fn validate_session_pricing(
     }
 
     Ok(())
+}
+
+fn validate_event_invariants(
+    state: &ClientSessionState,
+    event: &ClientSessionEvent,
+) -> io::Result<()> {
+    let acquire_in_flight = matches!(
+        state.control_op_in_flight,
+        Some(ControlOpInFlight::AcquireChannel)
+    );
+    let payment_in_flight = matches!(
+        state.control_op_in_flight,
+        Some(ControlOpInFlight::Payment { .. })
+    );
+
+    let message = match event {
+        ClientSessionEvent::ChannelSelected { .. }
+        | ClientSessionEvent::ChannelProvisioned { .. }
+        | ClientSessionEvent::NoSelectableChannel
+        | ClientSessionEvent::RelayLinkedChannelAdopted { .. }
+        | ClientSessionEvent::RelayLinkedChannelUnavailable { .. }
+        | ClientSessionEvent::LinkRequestBuilt { .. }
+            if !acquire_in_flight =>
+        {
+            Some(format!(
+                "{:?} received without acquire op in flight",
+                event
+            ))
+        }
+        ClientSessionEvent::ChannelPaymentBuilt { .. } if state.active_channel_id.is_none() => {
+            Some("ChannelPaymentBuilt received without active channel".to_string())
+        }
+        ClientSessionEvent::ChannelPaymentBuilt { .. } if payment_in_flight => Some(
+            "ChannelPaymentBuilt received while payment op already in flight".to_string(),
+        ),
+        _ => None,
+    };
+
+    if let Some(message) = message {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("client session invariant violation: {message}"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn pre_ready_blocked_error(
+    ready_tx: &Option<oneshot::Sender<()>>,
+    previous_blocked_reason: Option<FundingBlockedReason>,
+    event: &ClientSessionEvent,
+    next_state: &ClientSessionState,
+) -> Option<io::Error> {
+    if ready_tx.is_none()
+        || previous_blocked_reason == next_state.funding_blocked_reason
+        || next_state.funding_blocked_reason.is_none()
+    {
+        return None;
+    }
+
+    let blocked_reason = next_state.funding_blocked_reason.as_ref().unwrap();
+    let detail = match event {
+        ClientSessionEvent::WalletOperationFailed { error, .. } => format!(" ({error})"),
+        _ => String::new(),
+    };
+
+    Some(io::Error::other(format!(
+        "session funding blocked before readiness: {:?}{detail}",
+        blocked_reason,
+    )))
 }
 
 async fn run_session_driver(
@@ -222,7 +294,38 @@ async fn process_client_event(
     let mut terminate = false;
 
     while let Some(event) = pending.pop_front() {
+        let event_for_logging = event.clone();
+        if let Err(err) = validate_event_invariants(state, &event_for_logging) {
+            error!(
+                "{} invariant violation: event={:?} op={:?} active_channel={:?} blocked={:?}: {}",
+                config.hop_label,
+                event_for_logging,
+                state.control_op_in_flight,
+                state.active_channel_id,
+                state.funding_blocked_reason,
+                err,
+            );
+            return Err(err);
+        }
+        let previous_control_op = state.control_op_in_flight.clone();
+        let previous_blocked_reason = state.funding_blocked_reason.clone();
         let (next_state, effects) = crate::session_fsm::step(state.clone(), event);
+        log_control_state_transition(
+            config,
+            &event_for_logging,
+            previous_control_op,
+            previous_blocked_reason.clone(),
+            &next_state,
+        );
+        if let Some(err) = pre_ready_blocked_error(
+            ready_tx,
+            previous_blocked_reason,
+            &event_for_logging,
+            &next_state,
+        ) {
+            warn!("{} {err}", config.hop_label);
+            return Err(err);
+        }
         *state = next_state;
 
         for effect in effects {
@@ -238,12 +341,14 @@ async fn process_client_event(
                         config.wallet.as_ref(),
                         state,
                         config.conn.session_id,
-                    )
-                    .map_err(io_wallet_error)?
-                    {
-                        Some((channel, offer)) => pending
+                    ) {
+                        Ok(Some((channel, offer))) => pending
                             .push_back(ClientSessionEvent::ChannelSelected { channel, offer }),
-                        None => pending.push_back(ClientSessionEvent::NoSelectableChannel),
+                        Ok(None) => pending.push_back(ClientSessionEvent::NoSelectableChannel),
+                        Err(error) => pending.push_back(ClientSessionEvent::WalletOperationFailed {
+                            kind: WalletOpKind::AcquireChannel,
+                            error,
+                        }),
                     }
                 }
                 ClientSessionEffect::ProvisionChannel {
@@ -357,6 +462,44 @@ async fn process_client_event(
     Ok(terminate)
 }
 
+fn log_control_state_transition(
+    config: &SessionDriverConfig,
+    event: &ClientSessionEvent,
+    previous_control_op: Option<ControlOpInFlight>,
+    previous_blocked_reason: Option<FundingBlockedReason>,
+    next_state: &ClientSessionState,
+) {
+    if previous_control_op != next_state.control_op_in_flight {
+        debug!(
+            "{} control op transition: {:?} -> {:?}",
+            config.hop_label,
+            previous_control_op,
+            next_state.control_op_in_flight,
+        );
+    }
+
+    if previous_blocked_reason != next_state.funding_blocked_reason {
+        if let Some(reason) = &next_state.funding_blocked_reason {
+            match event {
+                ClientSessionEvent::WalletOperationFailed { error, .. } => {
+                    warn!(
+                        "{} funding blocked: {:?} ({error})",
+                        config.hop_label,
+                        reason,
+                    );
+                }
+                _ => {
+                    warn!(
+                        "{} funding blocked: {:?}",
+                        config.hop_label,
+                        reason,
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn choose_channel_and_offer(
     wallet: &dyn MonadWallet,
     state: &ClientSessionState,
@@ -415,17 +558,21 @@ fn inspect_and_adopt_linked_channel(
     Some((linked_channel.channel_id.clone(), offer))
 }
 
-fn io_wallet_error(err: WalletError) -> io::Error {
-    io::Error::other(err.to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{inspect_and_adopt_linked_channel, validate_session_pricing};
+    use super::{
+        inspect_and_adopt_linked_channel, pre_ready_blocked_error, validate_event_invariants,
+        validate_session_pricing,
+    };
+    use crate::session_fsm::{
+        ClientSessionEvent, ClientSessionState, ControlOpInFlight, FundingBlockedReason,
+        WalletOpKind,
+    };
     use crate::wallet::{MockWallet, RelayPaymentOffer, WalletChannel, WalletChannelState};
     use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus};
     use monad_common::session::SessionPricing;
     use std::io;
+    use tokio::sync::oneshot;
 
     fn channel(id: &str) -> WalletChannel {
         WalletChannel {
@@ -515,5 +662,136 @@ mod tests {
         assert!(err
             .to_string()
             .contains("protocol violation: relay changed active session pricing"));
+    }
+
+    #[test]
+    fn validate_event_invariants_rejects_channel_selected_without_acquire() {
+        let err = validate_event_invariants(
+            &ClientSessionState::new(),
+            &ClientSessionEvent::ChannelSelected {
+                channel: channel("chan-a"),
+                offer: RelayPaymentOffer {
+                    receiver_pubkey: "receiver".to_string(),
+                    mint_url: "https://mint".to_string(),
+                    unit: "msat".to_string(),
+                    accepted_keyset_ids: vec!["keyset-a".to_string()],
+                    in_bytes_per_millisat: 1,
+                    out_bytes_per_millisat: 1,
+                },
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("ChannelSelected"));
+    }
+
+    #[test]
+    fn validate_event_invariants_allows_channel_selected_during_acquire() {
+        let mut state = ClientSessionState::new();
+        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
+
+        validate_event_invariants(
+            &state,
+            &ClientSessionEvent::ChannelSelected {
+                channel: channel("chan-a"),
+                offer: RelayPaymentOffer {
+                    receiver_pubkey: "receiver".to_string(),
+                    mint_url: "https://mint".to_string(),
+                    unit: "msat".to_string(),
+                    accepted_keyset_ids: vec!["keyset-a".to_string()],
+                    in_bytes_per_millisat: 1,
+                    out_bytes_per_millisat: 1,
+                },
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_event_invariants_rejects_payment_built_without_active_channel() {
+        let err = validate_event_invariants(
+            &ClientSessionState::new(),
+            &ClientSessionEvent::ChannelPaymentBuilt {
+                payment_json: "{}".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("ChannelPaymentBuilt received without active channel"));
+    }
+
+    #[test]
+    fn validate_event_invariants_rejects_payment_built_while_payment_in_flight() {
+        let mut state = ClientSessionState::new();
+        state.active_channel_id = Some("chan-a".to_string());
+        state.control_op_in_flight = Some(ControlOpInFlight::Payment {
+            channel_id: "chan-a".to_string(),
+        });
+
+        let err = validate_event_invariants(
+            &state,
+            &ClientSessionEvent::ChannelPaymentBuilt {
+                payment_json: "{}".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("payment op already in flight"));
+    }
+
+    #[test]
+    fn pre_ready_blocked_error_fires_when_session_newly_blocks_before_readiness() {
+        let (ready_tx, _ready_rx) = oneshot::channel();
+        let next_state = ClientSessionState {
+            funding_blocked_reason: Some(FundingBlockedReason::AcquireFailed),
+            ..ClientSessionState::new()
+        };
+
+        let err = pre_ready_blocked_error(
+            &Some(ready_tx),
+            None,
+            &ClientSessionEvent::WalletOperationFailed {
+                kind: WalletOpKind::AcquireChannel,
+                error: crate::wallet::WalletError::Backend("wallet down".to_string()),
+            },
+            &next_state,
+        )
+        .expect("pre-ready blocked session should fail fast");
+
+        assert!(err
+            .to_string()
+            .contains("session funding blocked before readiness"));
+        assert!(err.to_string().contains("AcquireFailed"));
+    }
+
+    #[test]
+    fn pre_ready_blocked_error_does_not_fire_after_readiness() {
+        let next_state = ClientSessionState {
+            funding_blocked_reason: Some(FundingBlockedReason::PaymentBuildFailed),
+            ..ClientSessionState::new()
+        };
+
+        let err = pre_ready_blocked_error(
+            &None,
+            None,
+            &ClientSessionEvent::WalletOperationFailed {
+                kind: WalletOpKind::PreparePayment {
+                    channel_id: "chan-a".to_string(),
+                },
+                error: crate::wallet::WalletError::Backend("wallet down".to_string()),
+            },
+            &next_state,
+        );
+
+        assert!(err.is_none());
     }
 }

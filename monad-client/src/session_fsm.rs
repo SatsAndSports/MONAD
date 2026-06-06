@@ -17,12 +17,28 @@ pub(crate) struct SessionSnapshot {
     pub paused: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlOpInFlight {
+    AcquireChannel,
+    Link { channel_id: String },
+    Payment { channel_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FundingBlockedReason {
+    AcquireFailed,
+    LinkBuildFailed,
+    PaymentBuildFailed,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ClientSessionState {
     pub snapshot: Option<SessionSnapshot>,
     pub active_channel_id: Option<String>,
     pub active_offer: Option<RelayPaymentOffer>,
     pub session_excluded_channels: BTreeSet<String>,
+    pub control_op_in_flight: Option<ControlOpInFlight>,
+    pub funding_blocked_reason: Option<FundingBlockedReason>,
     pub terminated: bool,
 }
 
@@ -33,6 +49,8 @@ impl ClientSessionState {
             active_channel_id: None,
             active_offer: None,
             session_excluded_channels: BTreeSet::new(),
+            control_op_in_flight: None,
+            funding_blocked_reason: None,
             terminated: false,
         }
     }
@@ -40,6 +58,7 @@ impl ClientSessionState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WalletOpKind {
+    AcquireChannel,
     ProvisionChannel,
     PrepareLink { channel_id: String },
     PreparePayment { channel_id: String },
@@ -134,6 +153,8 @@ pub(crate) fn step(
 
     let effects = match event {
         ClientSessionEvent::SessionStatusReceived { snapshot, pricing } => {
+            let resolved_control_op = clear_resolved_control_op_on_status(&mut state);
+            let resolved_payment = matches!(resolved_control_op, Some(ControlOpInFlight::Payment { .. }));
             state.snapshot = Some(snapshot.clone());
             let mut effects = vec![ClientSessionEffect::UpdatePricingHandle(pricing)];
             if !snapshot.paused {
@@ -147,7 +168,9 @@ pub(crate) fn step(
                     effects.push(ClientSessionEffect::UpdateSpilmanInfoHandle(
                         spilman_info_for(snapshot_for(&state), state.active_offer.as_ref()),
                     ));
-                    effects.extend(payment_progress_effects(&mut state, linked_channel));
+                    if !resolved_payment {
+                        effects.extend(payment_progress_effects(&mut state, linked_channel));
+                    }
                 } else {
                     if let Some(active_channel_id) = state.active_channel_id.take() {
                         effects.push(ClientSessionEffect::DetachChannel {
@@ -158,11 +181,14 @@ pub(crate) fn step(
                     effects.push(ClientSessionEffect::UpdateSpilmanInfoHandle(
                         spilman_info_for(snapshot_for(&state), state.active_offer.as_ref()),
                     ));
-                    effects.push(ClientSessionEffect::InspectLinkedChannel {
-                        linked_channel,
-                        receiver_pubkey: snapshot.receiver_pubkey,
-                        advertisements: snapshot.advertisements,
-                    });
+                    if can_start_acquire(&state) {
+                        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
+                        effects.push(ClientSessionEffect::InspectLinkedChannel {
+                            linked_channel,
+                            receiver_pubkey: snapshot.receiver_pubkey,
+                            advertisements: snapshot.advertisements,
+                        });
+                    }
                 }
             } else {
                 if let Some(active_channel_id) = state.active_channel_id.take() {
@@ -174,9 +200,7 @@ pub(crate) fn step(
                 effects.push(ClientSessionEffect::UpdateSpilmanInfoHandle(
                     spilman_info_for(snapshot_for(&state), state.active_offer.as_ref()),
                 ));
-                if snapshot.paused {
-                    effects.push(ClientSessionEffect::SelectChannel);
-                }
+                maybe_start_acquire(&mut state, &mut effects, snapshot.paused);
             }
 
             effects
@@ -194,6 +218,13 @@ pub(crate) fn step(
             ]
         }
         ClientSessionEvent::NoSelectableChannel => {
+            if !matches!(
+                state.control_op_in_flight,
+                Some(ControlOpInFlight::AcquireChannel)
+            ) || state.funding_blocked_reason.is_some()
+            {
+                return (state, Vec::new());
+            }
             match snapshot_for(&state).and_then(|snapshot| {
                 snapshot
                     .advertisements
@@ -215,6 +246,12 @@ pub(crate) fn step(
             channel_id,
             offer,
         } => {
+            if matches!(
+                state.control_op_in_flight,
+                Some(ControlOpInFlight::AcquireChannel)
+            ) {
+                state.control_op_in_flight = None;
+            }
             state.active_channel_id = Some(channel_id);
             state.active_offer = Some(offer);
             let mut effects = vec![ClientSessionEffect::UpdateSpilmanInfoHandle(
@@ -224,35 +261,47 @@ pub(crate) fn step(
             effects
         }
         ClientSessionEvent::RelayLinkedChannelUnavailable { _linked_channel: _ } => {
+            if matches!(
+                state.control_op_in_flight,
+                Some(ControlOpInFlight::AcquireChannel)
+            ) {
+                state.control_op_in_flight = None;
+            }
             state.active_channel_id = None;
             state.active_offer = None;
             let mut effects = vec![ClientSessionEffect::UpdateSpilmanInfoHandle(
                 spilman_info_for(snapshot_for(&state), state.active_offer.as_ref()),
             )];
-            if snapshot_for(&state).is_some_and(|snapshot| snapshot.paused) {
-                effects.push(ClientSessionEffect::SelectChannel);
-            }
+            let session_paused = snapshot_for(&state).is_some_and(|snapshot| snapshot.paused);
+            maybe_start_acquire(&mut state, &mut effects, session_paused);
             effects
         }
         ClientSessionEvent::LinkRequestBuilt {
             channel_id,
             payment_json,
         } => {
+            state.control_op_in_flight = Some(ControlOpInFlight::Link {
+                channel_id: channel_id.clone(),
+            });
             state.active_channel_id = Some(channel_id);
             vec![ClientSessionEffect::SendControl(
                 ClientMessage::ChannelLink { payment_json },
             )]
         }
         ClientSessionEvent::ChannelPaymentBuilt { payment_json } => {
+            if let Some(channel_id) = state.active_channel_id.clone() {
+                state.control_op_in_flight = Some(ControlOpInFlight::Payment { channel_id });
+            }
             vec![ClientSessionEffect::SendControl(
                 ClientMessage::ChannelPayment { payment_json },
             )]
         }
         ClientSessionEvent::WalletOperationFailed { kind, error } => {
+            clear_failed_control_op(&mut state, &kind);
             match kind {
-                WalletOpKind::ProvisionChannel => {}
-                WalletOpKind::PrepareLink { channel_id }
-                | WalletOpKind::PreparePayment { channel_id } => {
+                WalletOpKind::AcquireChannel | WalletOpKind::ProvisionChannel => {}
+                WalletOpKind::PrepareLink { ref channel_id }
+                | WalletOpKind::PreparePayment { ref channel_id } => {
                     if exclude_on_wallet_error(&error) {
                         state.session_excluded_channels.insert(channel_id.clone());
                     }
@@ -263,16 +312,20 @@ pub(crate) fn step(
                 }
             }
 
+            if let Some(blocked_reason) = blocked_reason_for_wallet_failure(&kind, &error) {
+                state.funding_blocked_reason = Some(blocked_reason);
+            }
+
             let mut effects = vec![ClientSessionEffect::UpdateSpilmanInfoHandle(
                 spilman_info_for(snapshot_for(&state), state.active_offer.as_ref()),
             )];
-            if snapshot_for(&state).is_some_and(|snapshot| snapshot.paused) {
-                effects.push(ClientSessionEffect::SelectChannel);
-            }
+            let session_paused = snapshot_for(&state).is_some_and(|snapshot| snapshot.paused);
+            maybe_start_acquire(&mut state, &mut effects, session_paused);
             effects
         }
         ClientSessionEvent::ChannelEvicted { channel_id } => {
             let mut effects = Vec::new();
+            clear_channel_control_op(&mut state, &channel_id);
             state.session_excluded_channels.insert(channel_id.clone());
             if state.active_channel_id.as_deref() == Some(channel_id.as_str()) {
                 state.active_channel_id = None;
@@ -282,13 +335,13 @@ pub(crate) fn step(
             effects.push(ClientSessionEffect::UpdateSpilmanInfoHandle(
                 spilman_info_for(snapshot_for(&state), state.active_offer.as_ref()),
             ));
-            if snapshot_for(&state).is_some_and(|snapshot| snapshot.paused) {
-                effects.push(ClientSessionEffect::SelectChannel);
-            }
+            let session_paused = snapshot_for(&state).is_some_and(|snapshot| snapshot.paused);
+            maybe_start_acquire(&mut state, &mut effects, session_paused);
             effects
         }
         ClientSessionEvent::ServerError { code, message } => {
             let _ = &message;
+            clear_resolved_control_op_on_error(&mut state);
             let mut effects = Vec::new();
             if let Some(active_channel_id) = state.active_channel_id.take() {
                 if is_channel_invalidating_error(&code) {
@@ -305,13 +358,14 @@ pub(crate) fn step(
             effects.push(ClientSessionEffect::UpdateSpilmanInfoHandle(
                 spilman_info_for(snapshot_for(&state), state.active_offer.as_ref()),
             ));
-            if snapshot_for(&state).is_some_and(|snapshot| snapshot.paused) {
-                effects.push(ClientSessionEffect::SelectChannel);
-            }
+            let session_paused = snapshot_for(&state).is_some_and(|snapshot| snapshot.paused);
+            maybe_start_acquire(&mut state, &mut effects, session_paused);
             effects
         }
         ClientSessionEvent::ControlDetached => {
             state.terminated = true;
+            state.control_op_in_flight = None;
+            state.funding_blocked_reason = None;
             let mut effects = Vec::new();
             if let Some(active_channel_id) = state.active_channel_id.take() {
                 effects.push(ClientSessionEffect::DetachChannel {
@@ -331,6 +385,9 @@ fn payment_progress_effects(
     state: &mut ClientSessionState,
     linked_channel: LinkedChannelStatus,
 ) -> Vec<ClientSessionEffect> {
+    if state.funding_blocked_reason.is_some() || state.control_op_in_flight.is_some() {
+        return Vec::new();
+    }
     let Some(snapshot) = snapshot_for(state) else {
         return Vec::new();
     };
@@ -360,6 +417,7 @@ fn payment_progress_effects(
             .insert(active_channel_id.clone());
         state.active_channel_id = None;
         state.active_offer = None;
+        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
         return vec![
             ClientSessionEffect::DetachChannel {
                 channel_id: active_channel_id,
@@ -441,6 +499,86 @@ fn exclude_on_wallet_error(error: &WalletError) -> bool {
     )
 }
 
+fn can_start_acquire(state: &ClientSessionState) -> bool {
+    state.funding_blocked_reason.is_none() && state.control_op_in_flight.is_none()
+}
+
+fn maybe_start_acquire(
+    state: &mut ClientSessionState,
+    effects: &mut Vec<ClientSessionEffect>,
+    session_paused: bool,
+) {
+    if session_paused && can_start_acquire(state) {
+        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
+        effects.push(ClientSessionEffect::SelectChannel);
+    }
+}
+
+fn clear_resolved_control_op_on_status(
+    state: &mut ClientSessionState,
+) -> Option<ControlOpInFlight> {
+    match &state.control_op_in_flight {
+        Some(ControlOpInFlight::Link { .. }) | Some(ControlOpInFlight::Payment { .. }) => {
+            state.control_op_in_flight.take()
+        }
+        _ => None,
+    }
+}
+
+fn clear_resolved_control_op_on_error(state: &mut ClientSessionState) {
+    clear_resolved_control_op_on_status(state);
+}
+
+fn clear_failed_control_op(state: &mut ClientSessionState, kind: &WalletOpKind) {
+    match kind {
+        WalletOpKind::AcquireChannel | WalletOpKind::ProvisionChannel => {
+            if matches!(
+                state.control_op_in_flight,
+                Some(ControlOpInFlight::AcquireChannel)
+            ) {
+                state.control_op_in_flight = None;
+            }
+        }
+        WalletOpKind::PrepareLink { channel_id } => {
+            clear_channel_control_op(state, channel_id);
+        }
+        WalletOpKind::PreparePayment { channel_id } => {
+            clear_channel_control_op(state, channel_id);
+        }
+    }
+}
+
+fn clear_channel_control_op(state: &mut ClientSessionState, channel_id: &str) {
+    match &state.control_op_in_flight {
+        Some(ControlOpInFlight::Link {
+            channel_id: in_flight_channel,
+        })
+        | Some(ControlOpInFlight::Payment {
+            channel_id: in_flight_channel,
+        }) if in_flight_channel == channel_id => {
+            state.control_op_in_flight = None;
+        }
+        _ => {}
+    }
+}
+
+fn blocked_reason_for_wallet_failure(
+    kind: &WalletOpKind,
+    error: &WalletError,
+) -> Option<FundingBlockedReason> {
+    if !matches!(error, WalletError::Backend(_)) {
+        return None;
+    }
+
+    Some(match kind {
+        WalletOpKind::AcquireChannel | WalletOpKind::ProvisionChannel => {
+            FundingBlockedReason::AcquireFailed
+        }
+        WalletOpKind::PrepareLink { .. } => FundingBlockedReason::LinkBuildFailed,
+        WalletOpKind::PreparePayment { .. } => FundingBlockedReason::PaymentBuildFailed,
+    })
+}
+
 pub(crate) fn is_channel_invalidating_error(code: &ServerErrorCode) -> bool {
     matches!(
         code,
@@ -457,8 +595,9 @@ pub(crate) fn is_channel_invalidating_error(code: &ServerErrorCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        step, ClientSessionEffect, ClientSessionEvent, ClientSessionState, SessionSnapshot,
-        WalletOpKind, DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS,
+        step, ClientSessionEffect, ClientSessionEvent, ClientSessionState, ControlOpInFlight,
+        FundingBlockedReason, SessionSnapshot, WalletOpKind,
+        DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS,
     };
     use crate::wallet::{RelayPaymentOffer, WalletChannel, WalletChannelState, WalletError};
     use monad_common::protocol::ClientMessage;
@@ -517,6 +656,10 @@ mod tests {
         );
 
         assert_eq!(state.active_channel_id, None);
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::AcquireChannel)
+        );
         assert!(matches!(
             effects.as_slice(),
             [
@@ -531,6 +674,7 @@ mod tests {
     fn no_selectable_channel_provisions_from_first_advertisement() {
         let mut state = ClientSessionState::new();
         state.snapshot = Some(snapshot(true));
+        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
         let (_state, effects) = step(state, ClientSessionEvent::NoSelectableChannel);
 
         assert!(matches!(
@@ -544,6 +688,7 @@ mod tests {
     fn selected_channel_prepares_link() {
         let mut state = ClientSessionState::new();
         state.snapshot = Some(snapshot(true));
+        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
         let (state, effects) = step(
             state,
             ClientSessionEvent::ChannelSelected {
@@ -564,8 +709,10 @@ mod tests {
 
     #[test]
     fn link_request_built_sends_channel_link() {
+        let mut state = ClientSessionState::new();
+        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
         let (state, effects) = step(
-            ClientSessionState::new(),
+            state,
             ClientSessionEvent::LinkRequestBuilt {
                 channel_id: "chan-a".to_string(),
                 payment_json: "{}".to_string(),
@@ -573,6 +720,12 @@ mod tests {
         );
 
         assert_eq!(state.active_channel_id.as_deref(), Some("chan-a"));
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::Link {
+                channel_id: "chan-a".to_string(),
+            })
+        );
         assert!(matches!(
             effects.as_slice(),
             [ClientSessionEffect::SendControl(ClientMessage::ChannelLink { payment_json })]
@@ -628,6 +781,10 @@ mod tests {
 
         assert_eq!(state.active_channel_id, None);
         assert!(state.session_excluded_channels.contains("chan-a"));
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::AcquireChannel)
+        );
         assert!(matches!(
             effects.as_slice(),
             [
@@ -645,6 +802,9 @@ mod tests {
         state.snapshot = Some(snapshot(true));
         state.active_channel_id = Some("chan-a".to_string());
         state.active_offer = Some(offer());
+        state.control_op_in_flight = Some(ControlOpInFlight::Payment {
+            channel_id: "chan-a".to_string(),
+        });
 
         let (state, effects) = step(
             state,
@@ -655,6 +815,10 @@ mod tests {
 
         assert_eq!(state.active_channel_id, None);
         assert!(state.session_excluded_channels.contains("chan-a"));
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::AcquireChannel)
+        );
         assert!(matches!(
             effects.as_slice(),
             [
@@ -671,6 +835,9 @@ mod tests {
         state.snapshot = Some(snapshot(true));
         state.active_channel_id = Some("chan-a".to_string());
         state.active_offer = Some(offer());
+        state.control_op_in_flight = Some(ControlOpInFlight::Link {
+            channel_id: "chan-a".to_string(),
+        });
 
         let (state, effects) = step(
             state,
@@ -681,6 +848,10 @@ mod tests {
         );
 
         assert_eq!(state.active_channel_id, None);
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::AcquireChannel)
+        );
         assert!(matches!(
             effects.as_slice(),
             [
@@ -697,6 +868,9 @@ mod tests {
         state.snapshot = Some(snapshot(true));
         state.active_channel_id = Some("chan-a".to_string());
         state.active_offer = Some(offer());
+        state.control_op_in_flight = Some(ControlOpInFlight::Link {
+            channel_id: "chan-a".to_string(),
+        });
 
         let (state, effects) = step(
             state,
@@ -707,6 +881,10 @@ mod tests {
         );
 
         assert_eq!(state.active_channel_id, None);
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::AcquireChannel)
+        );
         assert!(matches!(
             effects.as_slice(),
             [
@@ -721,10 +899,16 @@ mod tests {
     fn control_detached_ends_session() {
         let mut state = ClientSessionState::new();
         state.active_channel_id = Some("chan-a".to_string());
+        state.control_op_in_flight = Some(ControlOpInFlight::Link {
+            channel_id: "chan-a".to_string(),
+        });
+        state.funding_blocked_reason = Some(FundingBlockedReason::AcquireFailed);
 
         let (state, effects) = step(state, ClientSessionEvent::ControlDetached);
 
         assert!(state.terminated);
+        assert_eq!(state.control_op_in_flight, None);
+        assert_eq!(state.funding_blocked_reason, None);
         assert!(matches!(
             effects.as_slice(),
             [
@@ -753,6 +937,10 @@ mod tests {
 
         assert!(state.active_channel_id.is_none());
         assert!(state.session_excluded_channels.contains("chan-a"));
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::AcquireChannel)
+        );
         assert!(matches!(
             effects.as_slice(),
             [
@@ -760,5 +948,348 @@ mod tests {
                 ClientSessionEffect::SelectChannel,
             ]
         ));
+    }
+
+    #[test]
+    fn repeated_paused_status_does_not_duplicate_select_while_acquire_in_flight() {
+        let mut state = ClientSessionState::new();
+        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::SessionStatusReceived {
+                snapshot: snapshot(true),
+                pricing: SessionPricing::new(1, 1),
+            },
+        );
+
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::AcquireChannel)
+        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::SelectChannel)));
+    }
+
+    #[test]
+    fn repeated_status_does_not_duplicate_payment_while_payment_in_flight() {
+        let mut state = ClientSessionState::new();
+        state.snapshot = Some(SessionSnapshot {
+            linked_channel: Some(LinkedChannelStatus {
+                channel_id: "chan-a".to_string(),
+                balance_raw: 5,
+                capacity_raw: 100,
+                unit: "msat".to_string(),
+            }),
+            remaining_milli_sats: -5,
+            paused: true,
+            ..snapshot(true)
+        });
+        state.active_channel_id = Some("chan-a".to_string());
+        state.active_offer = Some(offer());
+        state.control_op_in_flight = Some(ControlOpInFlight::Payment {
+            channel_id: "chan-a".to_string(),
+        });
+
+        let (_state, effects) = step(
+            state,
+            ClientSessionEvent::SessionStatusReceived {
+                snapshot: SessionSnapshot {
+                    linked_channel: Some(LinkedChannelStatus {
+                        channel_id: "chan-a".to_string(),
+                        balance_raw: 5,
+                        capacity_raw: 100,
+                        unit: "msat".to_string(),
+                    }),
+                    remaining_milli_sats: -5,
+                    paused: true,
+                    ..snapshot(true)
+                },
+                pricing: SessionPricing::new(1, 1),
+            },
+        );
+
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::BuildChannelPayment { .. })));
+    }
+
+    #[test]
+    fn link_in_flight_status_clears_op_without_restarting_acquire() {
+        let mut state = ClientSessionState::new();
+        state.snapshot = Some(snapshot(false));
+        state.active_channel_id = Some("chan-a".to_string());
+        state.active_offer = Some(offer());
+        state.control_op_in_flight = Some(ControlOpInFlight::Link {
+            channel_id: "chan-a".to_string(),
+        });
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::SessionStatusReceived {
+                snapshot: SessionSnapshot {
+                    linked_channel: Some(LinkedChannelStatus {
+                        channel_id: "chan-a".to_string(),
+                        balance_raw: 0,
+                        capacity_raw: 100,
+                        unit: "msat".to_string(),
+                    }),
+                    remaining_milli_sats: 10,
+                    paused: false,
+                    ..snapshot(false)
+                },
+                pricing: SessionPricing::new(1, 1),
+            },
+        );
+
+        assert_eq!(state.control_op_in_flight, None);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::SelectChannel)));
+    }
+
+    #[test]
+    fn link_in_flight_paused_unlinked_status_does_not_duplicate_select() {
+        let mut state = ClientSessionState::new();
+        state.control_op_in_flight = Some(ControlOpInFlight::Link {
+            channel_id: "chan-a".to_string(),
+        });
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::SessionStatusReceived {
+                snapshot: snapshot(true),
+                pricing: SessionPricing::new(1, 1),
+            },
+        );
+
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::AcquireChannel)
+        );
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::SelectChannel)));
+    }
+
+    #[test]
+    fn channel_payment_built_sets_payment_in_flight() {
+        let mut state = ClientSessionState::new();
+        state.active_channel_id = Some("chan-a".to_string());
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::ChannelPaymentBuilt {
+                payment_json: "{}".to_string(),
+            },
+        );
+
+        assert_eq!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::Payment {
+                channel_id: "chan-a".to_string(),
+            })
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [ClientSessionEffect::SendControl(ClientMessage::ChannelPayment { payment_json })]
+                if payment_json == "{}"
+        ));
+    }
+
+    #[test]
+    fn backend_wallet_failure_blocks_and_suppresses_reselect() {
+        let mut state = ClientSessionState::new();
+        state.snapshot = Some(snapshot(true));
+        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::WalletOperationFailed {
+                kind: WalletOpKind::AcquireChannel,
+                error: WalletError::Backend("wallet down".to_string()),
+            },
+        );
+
+        assert_eq!(state.control_op_in_flight, None);
+        assert_eq!(
+            state.funding_blocked_reason,
+            Some(FundingBlockedReason::AcquireFailed)
+        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::SelectChannel)));
+    }
+
+    #[test]
+    fn blocked_linked_channel_status_does_not_restart_inspection() {
+        let mut state = ClientSessionState::new();
+        state.funding_blocked_reason = Some(FundingBlockedReason::AcquireFailed);
+
+        let (_state, effects) = step(
+            state,
+            ClientSessionEvent::SessionStatusReceived {
+                snapshot: SessionSnapshot {
+                    linked_channel: Some(LinkedChannelStatus {
+                        channel_id: "chan-a".to_string(),
+                        balance_raw: 0,
+                        capacity_raw: 100,
+                        unit: "msat".to_string(),
+                    }),
+                    remaining_milli_sats: 0,
+                    paused: true,
+                    ..snapshot(true)
+                },
+                pricing: SessionPricing::new(1, 1),
+            },
+        );
+
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            ClientSessionEffect::InspectLinkedChannel { .. }
+        )));
+    }
+
+    #[test]
+    fn blocked_paused_status_does_not_restart_acquire() {
+        let mut state = ClientSessionState::new();
+        state.funding_blocked_reason = Some(FundingBlockedReason::AcquireFailed);
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::SessionStatusReceived {
+                snapshot: snapshot(true),
+                pricing: SessionPricing::new(1, 1),
+            },
+        );
+
+        assert_eq!(
+            state.funding_blocked_reason,
+            Some(FundingBlockedReason::AcquireFailed)
+        );
+        assert_eq!(state.control_op_in_flight, None);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::SelectChannel)));
+    }
+
+    #[test]
+    fn blocked_server_error_does_not_restart_acquire() {
+        let mut state = ClientSessionState::new();
+        state.snapshot = Some(snapshot(true));
+        state.active_channel_id = Some("chan-a".to_string());
+        state.active_offer = Some(offer());
+        state.funding_blocked_reason = Some(FundingBlockedReason::LinkBuildFailed);
+        state.control_op_in_flight = Some(ControlOpInFlight::Link {
+            channel_id: "chan-a".to_string(),
+        });
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::ServerError {
+                code: ServerErrorCode::PaymentWrongChannel,
+                message: "wrong channel".to_string(),
+            },
+        );
+
+        assert_eq!(
+            state.funding_blocked_reason,
+            Some(FundingBlockedReason::LinkBuildFailed)
+        );
+        assert_eq!(state.control_op_in_flight, None);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::SelectChannel)));
+    }
+
+    #[test]
+    fn payment_in_flight_server_error_clears_payment_op() {
+        let mut state = ClientSessionState::new();
+        state.snapshot = Some(snapshot(false));
+        state.active_channel_id = Some("chan-a".to_string());
+        state.active_offer = Some(offer());
+        state.control_op_in_flight = Some(ControlOpInFlight::Payment {
+            channel_id: "chan-a".to_string(),
+        });
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::ServerError {
+                code: ServerErrorCode::PaymentWrongChannel,
+                message: "wrong channel".to_string(),
+            },
+        );
+
+        assert_eq!(state.control_op_in_flight, None);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::SelectChannel)));
+    }
+
+    #[test]
+    fn blocked_payment_server_error_stays_blocked_without_restarting_acquire() {
+        let mut state = ClientSessionState::new();
+        state.snapshot = Some(snapshot(true));
+        state.active_channel_id = Some("chan-a".to_string());
+        state.active_offer = Some(offer());
+        state.funding_blocked_reason = Some(FundingBlockedReason::PaymentBuildFailed);
+        state.control_op_in_flight = Some(ControlOpInFlight::Payment {
+            channel_id: "chan-a".to_string(),
+        });
+
+        let (state, effects) = step(
+            state,
+            ClientSessionEvent::ServerError {
+                code: ServerErrorCode::PaymentWrongChannel,
+                message: "wrong channel".to_string(),
+            },
+        );
+
+        assert_eq!(state.control_op_in_flight, None);
+        assert_eq!(
+            state.funding_blocked_reason,
+            Some(FundingBlockedReason::PaymentBuildFailed)
+        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::SelectChannel)));
+    }
+
+    #[test]
+    fn blocked_state_suppresses_payment_progress() {
+        let mut state = ClientSessionState::new();
+        state.snapshot = Some(SessionSnapshot {
+            linked_channel: Some(LinkedChannelStatus {
+                channel_id: "chan-a".to_string(),
+                balance_raw: 5,
+                capacity_raw: 100,
+                unit: "msat".to_string(),
+            }),
+            remaining_milli_sats: -5,
+            paused: true,
+            ..snapshot(true)
+        });
+        state.active_channel_id = Some("chan-a".to_string());
+        state.active_offer = Some(offer());
+        state.funding_blocked_reason = Some(FundingBlockedReason::PaymentBuildFailed);
+
+        let (_state, effects) = step(
+            state,
+            ClientSessionEvent::RelayLinkedChannelAdopted {
+                linked_channel: LinkedChannelStatus {
+                    channel_id: "chan-a".to_string(),
+                    balance_raw: 5,
+                    capacity_raw: 100,
+                    unit: "msat".to_string(),
+                },
+                channel_id: "chan-a".to_string(),
+                offer: offer(),
+            },
+        );
+
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::BuildChannelPayment { .. })));
     }
 }
