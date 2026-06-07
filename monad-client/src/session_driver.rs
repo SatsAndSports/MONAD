@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use monad_common::h2stream::wait_for_send_capacity;
-use monad_common::protocol::{LinkedChannelStatus, ServerMessage};
+use monad_common::protocol::ClientMessage;
+use monad_common::protocol::ServerMessage;
 use monad_common::session::RelayConnection;
 use std::collections::VecDeque;
 use std::io;
@@ -13,7 +14,7 @@ use crate::session_fsm::{
     ClientSessionEffect, ClientSessionEvent, ClientSessionState, ControlOpInFlight,
     FundingBlockedReason, SessionSnapshot, WalletOpKind,
 };
-use crate::wallet::{select_channel, MonadWallet, RelayPaymentOffer, WalletError};
+use crate::wallet::{select_channel, MonadWallet, RelayPaymentOffer, WalletChannel, WalletError};
 
 fn encode_client_message(message: &monad_common::protocol::ClientMessage) -> io::Result<Bytes> {
     let bytes =
@@ -110,26 +111,12 @@ fn validate_event_invariants(
     state: &ClientSessionState,
     event: &ClientSessionEvent,
 ) -> io::Result<()> {
-    let acquire_in_flight = matches!(
-        state.control_op_in_flight,
-        Some(ControlOpInFlight::AcquireChannel)
-    );
     let payment_in_flight = matches!(
         state.control_op_in_flight,
         Some(ControlOpInFlight::Payment { .. })
     );
 
     let message = match event {
-        ClientSessionEvent::ChannelSelected { .. }
-        | ClientSessionEvent::ChannelProvisioned { .. }
-        | ClientSessionEvent::NoSelectableChannel
-        | ClientSessionEvent::RelayLinkedChannelAdopted { .. }
-        | ClientSessionEvent::RelayLinkedChannelUnavailable { .. }
-        | ClientSessionEvent::LinkRequestBuilt { .. }
-            if !acquire_in_flight =>
-        {
-            Some(format!("{:?} received without acquire op in flight", event))
-        }
         ClientSessionEvent::ChannelPaymentBuilt { .. } if state.active_channel_id.is_none() => {
             Some("ChannelPaymentBuilt received without active channel".to_string())
         }
@@ -147,6 +134,269 @@ fn validate_event_invariants(
     }
 
     Ok(())
+}
+
+fn relay_linked_channel_id(state: &ClientSessionState) -> Option<&str> {
+    state
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.linked_channel.as_ref())
+        .map(|channel| channel.channel_id.as_str())
+}
+
+fn session_is_paused(state: &ClientSessionState) -> bool {
+    state
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.paused)
+}
+
+fn relay_confirms_active_channel(state: &ClientSessionState) -> bool {
+    state.active_channel_id.is_some()
+        && state.active_channel_id.as_deref() == relay_linked_channel_id(state)
+}
+
+fn set_blocked_reason(
+    config: &SessionDriverConfig,
+    state: &mut ClientSessionState,
+    ready_tx: &Option<oneshot::Sender<()>>,
+    reason: FundingBlockedReason,
+    detail: &str,
+) -> io::Result<()> {
+    warn!(
+        "{} funding blocked: {:?} ({detail})",
+        config.hop_label, reason
+    );
+    state.funding_blocked_reason = Some(reason.clone());
+    if ready_tx.is_some() {
+        return Err(io::Error::other(format!(
+            "session funding blocked before readiness: {:?} ({detail})",
+            reason,
+        )));
+    }
+    Ok(())
+}
+
+async fn send_channel_link(
+    config: &SessionDriverConfig,
+    state: &mut ClientSessionState,
+    h2_send: &mut h2::SendStream<Bytes>,
+    channel_id: String,
+    offer: RelayPaymentOffer,
+    payment_json: String,
+) -> io::Result<()> {
+    send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await?;
+    state.active_channel_id = Some(channel_id.clone());
+    state.active_offer = Some(offer.clone());
+    *config.conn.spilman_info_handle.write().await =
+        Some(monad_common::session::SessionSpilmanInfo {
+            receiver_pubkey: offer.receiver_pubkey.clone(),
+            mint_url: offer.mint_url.clone(),
+            unit: offer.unit.clone(),
+            keyset_id: offer
+                .accepted_keyset_ids
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            keyset_info_json: String::new(),
+        });
+    state.control_op_in_flight = Some(ControlOpInFlight::Link { channel_id });
+    Ok(())
+}
+
+async fn try_link_channel(
+    config: &SessionDriverConfig,
+    state: &mut ClientSessionState,
+    h2_send: &mut h2::SendStream<Bytes>,
+    ready_tx: &Option<oneshot::Sender<()>>,
+    channel: WalletChannel,
+    offer: RelayPaymentOffer,
+) -> io::Result<bool> {
+    let channel_id = channel.channel_id.clone();
+    if let Err(error) = config
+        .wallet
+        .attach_channel_to_session(&channel_id, config.conn.session_id)
+    {
+        if matches!(error, WalletError::Backend(_)) {
+            set_blocked_reason(
+                config,
+                state,
+                ready_tx,
+                FundingBlockedReason::Acquire,
+                &error.to_string(),
+            )?;
+            return Ok(false);
+        }
+        if exclude_channel_for_link_failure(&error) {
+            state.session_excluded_channels.insert(channel_id.clone());
+        }
+        return Ok(true);
+    }
+
+    match config.wallet.build_link_request(&channel_id, &offer) {
+        Ok(payment_json) => {
+            send_channel_link(config, state, h2_send, channel_id, offer, payment_json).await?;
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = config
+                .wallet
+                .detach_channel_from_session(&channel_id, config.conn.session_id);
+            if matches!(error, WalletError::Backend(_)) {
+                set_blocked_reason(
+                    config,
+                    state,
+                    ready_tx,
+                    FundingBlockedReason::LinkBuild,
+                    &error.to_string(),
+                )?;
+                return Ok(false);
+            }
+            if exclude_channel_for_link_failure(&error) {
+                state.session_excluded_channels.insert(channel_id.clone());
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn exclude_channel_for_link_failure(error: &WalletError) -> bool {
+    matches!(
+        error,
+        WalletError::NotFound
+            | WalletError::NotOpen
+            | WalletError::AttachedToDifferentSession { .. }
+            | WalletError::InsufficientCapacity { .. }
+            | WalletError::ChannelUnusable
+            | WalletError::OfferMismatch(_)
+    )
+}
+
+async fn maybe_ensure_linked_channel(
+    config: &SessionDriverConfig,
+    state: &mut ClientSessionState,
+    h2_send: &mut h2::SendStream<Bytes>,
+    ready_tx: &Option<oneshot::Sender<()>>,
+) -> io::Result<()> {
+    if state.terminated || state.funding_blocked_reason.is_some() || !session_is_paused(state) {
+        return Ok(());
+    }
+    if matches!(
+        state.control_op_in_flight,
+        Some(ControlOpInFlight::Link { .. })
+    ) || matches!(
+        state.control_op_in_flight,
+        Some(ControlOpInFlight::Payment { .. })
+    ) {
+        return Ok(());
+    }
+    if relay_confirms_active_channel(state) {
+        return Ok(());
+    }
+
+    loop {
+        if let (Some(channel_id), Some(offer)) =
+            (state.active_channel_id.clone(), state.active_offer.clone())
+        {
+            let channel = match config.wallet.get_channel(&channel_id) {
+                Ok(channel) => channel,
+                Err(error) => {
+                    if matches!(error, WalletError::Backend(_)) {
+                        set_blocked_reason(
+                            config,
+                            state,
+                            ready_tx,
+                            FundingBlockedReason::Acquire,
+                            &error.to_string(),
+                        )?;
+                        return Ok(());
+                    }
+                    state.session_excluded_channels.insert(channel_id.clone());
+                    state.active_channel_id = None;
+                    state.active_offer = None;
+                    let _ = config
+                        .wallet
+                        .detach_channel_from_session(&channel_id, config.conn.session_id);
+                    continue;
+                }
+            };
+            if !try_link_channel(config, state, h2_send, ready_tx, channel, offer).await? {
+                return Ok(());
+            }
+            state.active_channel_id = None;
+            state.active_offer = None;
+            continue;
+        }
+
+        match choose_channel_and_offer(config.wallet.as_ref(), state, config.conn.session_id) {
+            Ok(Some((channel, offer))) => {
+                if !try_link_channel(config, state, h2_send, ready_tx, channel, offer).await? {
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                let Some(snapshot) = state.snapshot.as_ref() else {
+                    return Ok(());
+                };
+                let Some(advertisement) = snapshot.advertisements.first() else {
+                    return Ok(());
+                };
+                let offer = RelayPaymentOffer::from_advertisement(
+                    snapshot.receiver_pubkey.clone(),
+                    advertisement,
+                );
+                let channel_id = match config.wallet.provision_channel(
+                    &offer,
+                    crate::session_fsm::DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS,
+                ) {
+                    Ok(channel_id) => channel_id,
+                    Err(error) => {
+                        if matches!(error, WalletError::Backend(_)) {
+                            set_blocked_reason(
+                                config,
+                                state,
+                                ready_tx,
+                                FundingBlockedReason::Acquire,
+                                &error.to_string(),
+                            )?;
+                            return Ok(());
+                        }
+                        return Ok(());
+                    }
+                };
+                let channel = match config.wallet.get_channel(&channel_id) {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        if matches!(error, WalletError::Backend(_)) {
+                            set_blocked_reason(
+                                config,
+                                state,
+                                ready_tx,
+                                FundingBlockedReason::Acquire,
+                                &error.to_string(),
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                };
+                if !try_link_channel(config, state, h2_send, ready_tx, channel, offer).await? {
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                if matches!(error, WalletError::Backend(_)) {
+                    set_blocked_reason(
+                        config,
+                        state,
+                        ready_tx,
+                        FundingBlockedReason::Acquire,
+                        &error.to_string(),
+                    )?;
+                }
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn pre_ready_blocked_error(
@@ -333,89 +583,6 @@ async fn process_client_event(
                 ClientSessionEffect::UpdateSpilmanInfoHandle(info) => {
                     *config.conn.spilman_info_handle.write().await = info;
                 }
-                ClientSessionEffect::SelectChannel => {
-                    match choose_channel_and_offer(
-                        config.wallet.as_ref(),
-                        state,
-                        config.conn.session_id,
-                    ) {
-                        Ok(Some((channel, offer))) => pending
-                            .push_back(ClientSessionEvent::ChannelSelected { channel, offer }),
-                        Ok(None) => pending.push_back(ClientSessionEvent::NoSelectableChannel),
-                        Err(error) => {
-                            pending.push_back(ClientSessionEvent::WalletOperationFailed {
-                                kind: WalletOpKind::AcquireChannel,
-                                error,
-                            })
-                        }
-                    }
-                }
-                ClientSessionEffect::ProvisionChannel {
-                    offer,
-                    capacity_msats,
-                } => match config.wallet.provision_channel(&offer, capacity_msats) {
-                    Ok(channel_id) => match config.wallet.get_channel(&channel_id) {
-                        Ok(channel) => pending
-                            .push_back(ClientSessionEvent::ChannelProvisioned { channel, offer }),
-                        Err(error) => {
-                            pending.push_back(ClientSessionEvent::WalletOperationFailed {
-                                kind: WalletOpKind::ProvisionChannel,
-                                error,
-                            })
-                        }
-                    },
-                    Err(error) => pending.push_back(ClientSessionEvent::WalletOperationFailed {
-                        kind: WalletOpKind::ProvisionChannel,
-                        error,
-                    }),
-                },
-                ClientSessionEffect::PrepareLink { channel, offer } => {
-                    let channel_id = channel.channel_id.clone();
-                    let result = config
-                        .wallet
-                        .attach_channel_to_session(&channel_id, config.conn.session_id)
-                        .and_then(|_| config.wallet.build_link_request(&channel_id, &offer));
-                    match result {
-                        Ok(payment_json) => {
-                            pending.push_back(ClientSessionEvent::LinkRequestBuilt {
-                                channel_id,
-                                payment_json,
-                            })
-                        }
-                        Err(error) => {
-                            let _ = config
-                                .wallet
-                                .detach_channel_from_session(&channel_id, config.conn.session_id);
-                            pending.push_back(ClientSessionEvent::WalletOperationFailed {
-                                kind: WalletOpKind::PrepareLink { channel_id },
-                                error,
-                            });
-                        }
-                    }
-                }
-                ClientSessionEffect::InspectLinkedChannel {
-                    linked_channel,
-                    receiver_pubkey,
-                    advertisements,
-                } => {
-                    if let Some((channel_id, offer)) = inspect_and_adopt_linked_channel(
-                        config.wallet.as_ref(),
-                        config.conn.session_id,
-                        &linked_channel,
-                        &receiver_pubkey,
-                        &advertisements,
-                    ) {
-                        pending.push_back(ClientSessionEvent::RelayLinkedChannelAdopted {
-                            linked_channel,
-                            channel_id,
-                            offer,
-                        });
-                    } else {
-                        pending.push_back(ClientSessionEvent::RelayLinkedChannelUnavailable {
-                            _linked_channel: linked_channel,
-                        });
-                    }
-                }
                 ClientSessionEffect::BuildChannelPayment {
                     channel_id,
                     offer,
@@ -456,6 +623,8 @@ async fn process_client_event(
                 }
             }
         }
+
+        maybe_ensure_linked_channel(config, state, h2_send, ready_tx).await?;
     }
 
     Ok(terminate)
@@ -519,104 +688,39 @@ fn choose_channel_and_offer(
     Ok(None)
 }
 
-fn inspect_and_adopt_linked_channel(
-    wallet: &dyn MonadWallet,
-    session_id: [u8; 32],
-    linked_channel: &LinkedChannelStatus,
-    receiver_pubkey: &str,
-    advertisements: &[monad_common::protocol::KeysetAdvertisement],
-) -> Option<(String, RelayPaymentOffer)> {
-    let channel = wallet.get_channel(&linked_channel.channel_id).ok()?;
-    let offer = advertisements.iter().find_map(|advertisement| {
-        let offer =
-            RelayPaymentOffer::from_advertisement(receiver_pubkey.to_string(), advertisement);
-        if channel.receiver_pubkey == offer.receiver_pubkey
-            && channel.mint_url == offer.mint_url
-            && channel.unit == offer.unit
-            && offer
-                .accepted_keyset_ids
-                .iter()
-                .any(|keyset| keyset == &channel.keyset_id)
-        {
-            Some(offer)
-        } else {
-            None
-        }
-    })?;
-
-    wallet
-        .attach_channel_to_session(&linked_channel.channel_id, session_id)
-        .ok()?;
-    Some((linked_channel.channel_id.clone(), offer))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        inspect_and_adopt_linked_channel, pre_ready_blocked_error, validate_event_invariants,
+        pre_ready_blocked_error, relay_confirms_active_channel, validate_event_invariants,
         validate_session_pricing,
     };
     use crate::session_fsm::{
         ClientSessionEvent, ClientSessionState, ControlOpInFlight, FundingBlockedReason,
         WalletOpKind,
     };
-    use crate::wallet::{MockWallet, RelayPaymentOffer, WalletChannel, WalletChannelState};
-    use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus};
+    use monad_common::protocol::LinkedChannelStatus;
     use monad_common::session::SessionPricing;
     use std::io;
     use tokio::sync::oneshot;
 
-    fn channel(id: &str) -> WalletChannel {
-        WalletChannel {
-            channel_id: id.to_string(),
-            state: WalletChannelState::Open,
-            receiver_pubkey: "receiver".to_string(),
-            mint_url: "https://mint".to_string(),
-            unit: "msat".to_string(),
-            keyset_id: "keyset-a".to_string(),
-            attached_session_id: None,
-            capacity_msats: 100,
-            current_signed_balance_msats: 0,
-        }
-    }
-
     #[test]
-    fn inspect_and_adopt_linked_channel_returns_matching_offer() {
-        let wallet = MockWallet::new();
-        wallet.insert_channel(channel("chan-a")).unwrap();
-
-        let adopted = inspect_and_adopt_linked_channel(
-            &wallet,
-            [1; 32],
-            &LinkedChannelStatus {
+    fn relay_confirms_active_channel_matches_ids() {
+        let mut state = ClientSessionState::new();
+        state.active_channel_id = Some("chan-a".to_string());
+        state.snapshot = Some(crate::session_fsm::SessionSnapshot {
+            receiver_pubkey: "receiver".to_string(),
+            advertisements: vec![],
+            linked_channel: Some(LinkedChannelStatus {
                 channel_id: "chan-a".to_string(),
                 balance_raw: 0,
                 capacity_raw: 100,
                 unit: "msat".to_string(),
-            },
-            "receiver",
-            &[KeysetAdvertisement {
-                mint_url: "https://mint".to_string(),
-                unit: "msat".to_string(),
-                keyset_ids: vec!["keyset-a".to_string()],
-                in_bytes_per_millisat: 1,
-                out_bytes_per_millisat: 1,
-            }],
-        )
-        .unwrap();
+            }),
+            remaining_milli_sats: 0,
+            paused: true,
+        });
 
-        assert_eq!(adopted.0, "chan-a");
-        assert_eq!(
-            adopted.1,
-            RelayPaymentOffer {
-                receiver_pubkey: "receiver".to_string(),
-                mint_url: "https://mint".to_string(),
-                unit: "msat".to_string(),
-                accepted_keyset_ids: vec!["keyset-a".to_string()],
-                in_bytes_per_millisat: 1,
-                out_bytes_per_millisat: 1,
-            }
-        );
+        assert!(relay_confirms_active_channel(&state));
     }
 
     #[test]
@@ -654,50 +758,6 @@ mod tests {
         assert!(err
             .to_string()
             .contains("protocol violation: relay changed active session pricing"));
-    }
-
-    #[test]
-    fn validate_event_invariants_rejects_channel_selected_without_acquire() {
-        let err = validate_event_invariants(
-            &ClientSessionState::new(),
-            &ClientSessionEvent::ChannelSelected {
-                channel: channel("chan-a"),
-                offer: RelayPaymentOffer {
-                    receiver_pubkey: "receiver".to_string(),
-                    mint_url: "https://mint".to_string(),
-                    unit: "msat".to_string(),
-                    accepted_keyset_ids: vec!["keyset-a".to_string()],
-                    in_bytes_per_millisat: 1,
-                    out_bytes_per_millisat: 1,
-                },
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("ChannelSelected"));
-    }
-
-    #[test]
-    fn validate_event_invariants_allows_channel_selected_during_acquire() {
-        let mut state = ClientSessionState::new();
-        state.control_op_in_flight = Some(ControlOpInFlight::AcquireChannel);
-
-        validate_event_invariants(
-            &state,
-            &ClientSessionEvent::ChannelSelected {
-                channel: channel("chan-a"),
-                offer: RelayPaymentOffer {
-                    receiver_pubkey: "receiver".to_string(),
-                    mint_url: "https://mint".to_string(),
-                    unit: "msat".to_string(),
-                    accepted_keyset_ids: vec!["keyset-a".to_string()],
-                    in_bytes_per_millisat: 1,
-                    out_bytes_per_millisat: 1,
-                },
-            },
-        )
-        .unwrap();
     }
 
     #[test]
@@ -748,7 +808,9 @@ mod tests {
             &Some(ready_tx),
             None,
             &ClientSessionEvent::WalletOperationFailed {
-                kind: WalletOpKind::AcquireChannel,
+                kind: WalletOpKind::PreparePayment {
+                    channel_id: "chan-a".to_string(),
+                },
                 error: crate::wallet::WalletError::Backend("wallet down".to_string()),
             },
             &next_state,
