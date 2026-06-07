@@ -128,17 +128,14 @@ fn validate_event_invariants(
         | ClientSessionEvent::LinkRequestBuilt { .. }
             if !acquire_in_flight =>
         {
-            Some(format!(
-                "{:?} received without acquire op in flight",
-                event
-            ))
+            Some(format!("{:?} received without acquire op in flight", event))
         }
         ClientSessionEvent::ChannelPaymentBuilt { .. } if state.active_channel_id.is_none() => {
             Some("ChannelPaymentBuilt received without active channel".to_string())
         }
-        ClientSessionEvent::ChannelPaymentBuilt { .. } if payment_in_flight => Some(
-            "ChannelPaymentBuilt received while payment op already in flight".to_string(),
-        ),
+        ClientSessionEvent::ChannelPaymentBuilt { .. } if payment_in_flight => {
+            Some("ChannelPaymentBuilt received while payment op already in flight".to_string())
+        }
         _ => None,
     };
 
@@ -345,10 +342,12 @@ async fn process_client_event(
                         Ok(Some((channel, offer))) => pending
                             .push_back(ClientSessionEvent::ChannelSelected { channel, offer }),
                         Ok(None) => pending.push_back(ClientSessionEvent::NoSelectableChannel),
-                        Err(error) => pending.push_back(ClientSessionEvent::WalletOperationFailed {
-                            kind: WalletOpKind::AcquireChannel,
-                            error,
-                        }),
+                        Err(error) => {
+                            pending.push_back(ClientSessionEvent::WalletOperationFailed {
+                                kind: WalletOpKind::AcquireChannel,
+                                error,
+                            })
+                        }
                     }
                 }
                 ClientSessionEffect::ProvisionChannel {
@@ -472,9 +471,7 @@ fn log_control_state_transition(
     if previous_control_op != next_state.control_op_in_flight {
         debug!(
             "{} control op transition: {:?} -> {:?}",
-            config.hop_label,
-            previous_control_op,
-            next_state.control_op_in_flight,
+            config.hop_label, previous_control_op, next_state.control_op_in_flight,
         );
     }
 
@@ -484,16 +481,11 @@ fn log_control_state_transition(
                 ClientSessionEvent::WalletOperationFailed { error, .. } => {
                     warn!(
                         "{} funding blocked: {:?} ({error})",
-                        config.hop_label,
-                        reason,
+                        config.hop_label, reason,
                     );
                 }
                 _ => {
-                    warn!(
-                        "{} funding blocked: {:?}",
-                        config.hop_label,
-                        reason,
-                    );
+                    warn!("{} funding blocked: {:?}", config.hop_label, reason,);
                 }
             }
         }
@@ -683,9 +675,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err
-            .to_string()
-            .contains("ChannelSelected"));
+        assert!(err.to_string().contains("ChannelSelected"));
     }
 
     #[test]
@@ -743,16 +733,14 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err
-            .to_string()
-            .contains("payment op already in flight"));
+        assert!(err.to_string().contains("payment op already in flight"));
     }
 
     #[test]
     fn pre_ready_blocked_error_fires_when_session_newly_blocks_before_readiness() {
         let (ready_tx, _ready_rx) = oneshot::channel();
         let next_state = ClientSessionState {
-            funding_blocked_reason: Some(FundingBlockedReason::AcquireFailed),
+            funding_blocked_reason: Some(FundingBlockedReason::Acquire),
             ..ClientSessionState::new()
         };
 
@@ -770,13 +758,13 @@ mod tests {
         assert!(err
             .to_string()
             .contains("session funding blocked before readiness"));
-        assert!(err.to_string().contains("AcquireFailed"));
+        assert!(err.to_string().contains("Acquire"));
     }
 
     #[test]
     fn pre_ready_blocked_error_does_not_fire_after_readiness() {
         let next_state = ClientSessionState {
-            funding_blocked_reason: Some(FundingBlockedReason::PaymentBuildFailed),
+            funding_blocked_reason: Some(FundingBlockedReason::PaymentBuild),
             ..ClientSessionState::new()
         };
 

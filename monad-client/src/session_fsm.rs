@@ -26,9 +26,9 @@ pub(crate) enum ControlOpInFlight {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FundingBlockedReason {
-    AcquireFailed,
-    LinkBuildFailed,
-    PaymentBuildFailed,
+    Acquire,
+    LinkBuild,
+    PaymentBuild,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +154,8 @@ pub(crate) fn step(
     let effects = match event {
         ClientSessionEvent::SessionStatusReceived { snapshot, pricing } => {
             let resolved_control_op = clear_resolved_control_op_on_status(&mut state);
-            let resolved_payment = matches!(resolved_control_op, Some(ControlOpInFlight::Payment { .. }));
+            let resolved_payment =
+                matches!(resolved_control_op, Some(ControlOpInFlight::Payment { .. }));
             state.snapshot = Some(snapshot.clone());
             let mut effects = vec![ClientSessionEffect::UpdatePricingHandle(pricing)];
             if !snapshot.paused {
@@ -572,10 +573,10 @@ fn blocked_reason_for_wallet_failure(
 
     Some(match kind {
         WalletOpKind::AcquireChannel | WalletOpKind::ProvisionChannel => {
-            FundingBlockedReason::AcquireFailed
+            FundingBlockedReason::Acquire
         }
-        WalletOpKind::PrepareLink { .. } => FundingBlockedReason::LinkBuildFailed,
-        WalletOpKind::PreparePayment { .. } => FundingBlockedReason::PaymentBuildFailed,
+        WalletOpKind::PrepareLink { .. } => FundingBlockedReason::LinkBuild,
+        WalletOpKind::PreparePayment { .. } => FundingBlockedReason::PaymentBuild,
     })
 }
 
@@ -902,7 +903,7 @@ mod tests {
         state.control_op_in_flight = Some(ControlOpInFlight::Link {
             channel_id: "chan-a".to_string(),
         });
-        state.funding_blocked_reason = Some(FundingBlockedReason::AcquireFailed);
+        state.funding_blocked_reason = Some(FundingBlockedReason::Acquire);
 
         let (state, effects) = step(state, ClientSessionEvent::ControlDetached);
 
@@ -1115,7 +1116,7 @@ mod tests {
         assert_eq!(state.control_op_in_flight, None);
         assert_eq!(
             state.funding_blocked_reason,
-            Some(FundingBlockedReason::AcquireFailed)
+            Some(FundingBlockedReason::Acquire)
         );
         assert!(!effects
             .iter()
@@ -1125,7 +1126,7 @@ mod tests {
     #[test]
     fn blocked_linked_channel_status_does_not_restart_inspection() {
         let mut state = ClientSessionState::new();
-        state.funding_blocked_reason = Some(FundingBlockedReason::AcquireFailed);
+        state.funding_blocked_reason = Some(FundingBlockedReason::Acquire);
 
         let (_state, effects) = step(
             state,
@@ -1145,16 +1146,15 @@ mod tests {
             },
         );
 
-        assert!(!effects.iter().any(|effect| matches!(
-            effect,
-            ClientSessionEffect::InspectLinkedChannel { .. }
-        )));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ClientSessionEffect::InspectLinkedChannel { .. })));
     }
 
     #[test]
     fn blocked_paused_status_does_not_restart_acquire() {
         let mut state = ClientSessionState::new();
-        state.funding_blocked_reason = Some(FundingBlockedReason::AcquireFailed);
+        state.funding_blocked_reason = Some(FundingBlockedReason::Acquire);
 
         let (state, effects) = step(
             state,
@@ -1166,7 +1166,7 @@ mod tests {
 
         assert_eq!(
             state.funding_blocked_reason,
-            Some(FundingBlockedReason::AcquireFailed)
+            Some(FundingBlockedReason::Acquire)
         );
         assert_eq!(state.control_op_in_flight, None);
         assert!(!effects
@@ -1180,7 +1180,7 @@ mod tests {
         state.snapshot = Some(snapshot(true));
         state.active_channel_id = Some("chan-a".to_string());
         state.active_offer = Some(offer());
-        state.funding_blocked_reason = Some(FundingBlockedReason::LinkBuildFailed);
+        state.funding_blocked_reason = Some(FundingBlockedReason::LinkBuild);
         state.control_op_in_flight = Some(ControlOpInFlight::Link {
             channel_id: "chan-a".to_string(),
         });
@@ -1195,7 +1195,7 @@ mod tests {
 
         assert_eq!(
             state.funding_blocked_reason,
-            Some(FundingBlockedReason::LinkBuildFailed)
+            Some(FundingBlockedReason::LinkBuild)
         );
         assert_eq!(state.control_op_in_flight, None);
         assert!(!effects
@@ -1233,7 +1233,7 @@ mod tests {
         state.snapshot = Some(snapshot(true));
         state.active_channel_id = Some("chan-a".to_string());
         state.active_offer = Some(offer());
-        state.funding_blocked_reason = Some(FundingBlockedReason::PaymentBuildFailed);
+        state.funding_blocked_reason = Some(FundingBlockedReason::PaymentBuild);
         state.control_op_in_flight = Some(ControlOpInFlight::Payment {
             channel_id: "chan-a".to_string(),
         });
@@ -1249,7 +1249,7 @@ mod tests {
         assert_eq!(state.control_op_in_flight, None);
         assert_eq!(
             state.funding_blocked_reason,
-            Some(FundingBlockedReason::PaymentBuildFailed)
+            Some(FundingBlockedReason::PaymentBuild)
         );
         assert!(!effects
             .iter()
@@ -1272,7 +1272,7 @@ mod tests {
         });
         state.active_channel_id = Some("chan-a".to_string());
         state.active_offer = Some(offer());
-        state.funding_blocked_reason = Some(FundingBlockedReason::PaymentBuildFailed);
+        state.funding_blocked_reason = Some(FundingBlockedReason::PaymentBuild);
 
         let (_state, effects) = step(
             state,
