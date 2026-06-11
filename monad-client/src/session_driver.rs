@@ -206,6 +206,30 @@ fn relay_confirms_intended_channel(state: &DriverState) -> bool {
         && state.intended_channel_id.as_deref() == relay_linked_channel_id(state)
 }
 
+fn state_summary(state: &DriverState) -> String {
+    let relay_linked = relay_linked_channel_id(state).unwrap_or("none");
+    let intended = state.intended_channel_id.as_deref().unwrap_or("none");
+    let paused = state
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.paused);
+    let remaining = state
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.remaining_milli_sats.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "paused={} remaining={} relay_linked={} intended={} op={:?} blocked={:?} ready={}",
+        paused,
+        remaining,
+        relay_linked,
+        intended,
+        state.control_op_in_flight,
+        state.funding_blocked_reason,
+        state.ready_signaled,
+    )
+}
+
 fn current_spilman_info(state: &DriverState) -> Option<SessionSpilmanInfo> {
     if let Some(offer) = &state.intended_offer {
         return Some(SessionSpilmanInfo {
@@ -374,6 +398,12 @@ async fn send_channel_link(
     offer: RelayPaymentOffer,
     payment_json: String,
 ) -> io::Result<()> {
+    info!(
+        "{} sending ChannelLink for {} | {}",
+        config.hop_label,
+        channel_id,
+        state_summary(state)
+    );
     send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await?;
     state.intended_channel_id = Some(channel_id.clone());
     state.intended_offer = Some(offer);
@@ -453,7 +483,33 @@ async fn maybe_ensure_linked_channel(
         return Ok(());
     }
     if relay_confirms_intended_channel(state) {
+        info!(
+            "{} relay confirms intended channel {} | {}",
+            config.hop_label,
+            state.intended_channel_id.as_deref().unwrap_or("none"),
+            state_summary(state)
+        );
         return Ok(());
+    }
+
+    if let Some(intended_channel_id) = state.intended_channel_id.as_deref() {
+        let relay_linked = relay_linked_channel_id(state).unwrap_or("none");
+        if relay_linked != "none" && relay_linked != intended_channel_id {
+            info!(
+                "{} relay linked channel mismatch: relay={} intended={} | {}",
+                config.hop_label,
+                relay_linked,
+                intended_channel_id,
+                state_summary(state)
+            );
+        } else if relay_linked == "none" {
+            info!(
+                "{} relay reports no linked channel; keeping intended channel {} | {}",
+                config.hop_label,
+                intended_channel_id,
+                state_summary(state)
+            );
+        }
     }
 
     loop {
@@ -477,6 +533,12 @@ async fn maybe_ensure_linked_channel(
                     continue;
                 }
             };
+            info!(
+                "{} retrying ChannelLink for intended channel {} | {}",
+                config.hop_label,
+                channel.channel_id,
+                state_summary(state)
+            );
             if !try_link_channel(config, state, h2_send, channel, offer).await? {
                 return Ok(());
             }
@@ -486,6 +548,12 @@ async fn maybe_ensure_linked_channel(
 
         match choose_channel_and_offer(config.wallet.as_ref(), state, config.conn.session_id) {
             Ok(Some((channel, offer))) => {
+                info!(
+                    "{} selected existing channel {} | {}",
+                    config.hop_label,
+                    channel.channel_id,
+                    state_summary(state)
+                );
                 if !try_link_channel(config, state, h2_send, channel, offer).await? {
                     return Ok(());
                 }
@@ -497,6 +565,11 @@ async fn maybe_ensure_linked_channel(
                 let Some(advertisement) = snapshot.advertisements.first() else {
                     return Ok(());
                 };
+                info!(
+                    "{} provisioning new channel from first advertisement | {}",
+                    config.hop_label,
+                    state_summary(state)
+                );
                 let offer = RelayPaymentOffer::from_advertisement(
                     snapshot.receiver_pubkey.clone(),
                     advertisement,
@@ -581,6 +654,15 @@ async fn maybe_progress_payment(
         return Ok(());
     };
     if linked_channel.channel_id != intended_channel_id || snapshot.remaining_milli_sats > 0 {
+        if linked_channel.channel_id != intended_channel_id {
+            info!(
+                "{} payment skipped: relay linked channel {} does not match intended {} | {}",
+                config.hop_label,
+                linked_channel.channel_id,
+                intended_channel_id,
+                state_summary(state)
+            );
+        }
         return Ok(());
     }
 
@@ -594,6 +676,14 @@ async fn maybe_progress_payment(
     };
 
     if next_balance_raw > linked_channel.capacity_raw {
+        warn!(
+            "{} abandoning exhausted channel {}: next_balance_raw={} capacity_raw={} | {}",
+            config.hop_label,
+            intended_channel_id,
+            next_balance_raw,
+            linked_channel.capacity_raw,
+            state_summary(state)
+        );
         abandon_intended_channel(config, state, intended_channel_id, true).await;
         return Ok(());
     }
@@ -605,6 +695,15 @@ async fn maybe_progress_payment(
         next_balance_raw,
     ) {
         Ok(payment_json) => {
+            info!(
+                "{} sending ChannelPayment for {}: remaining={} target={} next_balance_raw={} | {}",
+                config.hop_label,
+                intended_channel_id,
+                snapshot.remaining_milli_sats,
+                TARGET_TOPUP_BUFFER_MSATS,
+                next_balance_raw,
+                state_summary(state)
+            );
             send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await?;
             state.control_op_in_flight = Some(ControlOpInFlight::Payment {
                 channel_id: intended_channel_id,
@@ -619,6 +718,13 @@ async fn maybe_progress_payment(
                     &error.to_string(),
                 )?;
             } else if exclude_on_wallet_error(&error) {
+                warn!(
+                    "{} abandoning channel {} after payment build failure: {} | {}",
+                    config.hop_label,
+                    intended_channel_id,
+                    error,
+                    state_summary(state)
+                );
                 abandon_intended_channel(config, state, intended_channel_id, true).await;
             }
         }
@@ -742,7 +848,7 @@ async fn run_session_driver(
                     validate_session_pricing(&mut state.established_pricing, pricing)?;
                     let due_now = pricing.amount_due_millisats(session_total_in, session_total_out);
                     info!(
-                        "{} session status: open_connects={} total_connects={} paused={} balance={} paid={} due={} linked={:?}",
+                        "{} session status: open_connects={} total_connects={} paused={} balance={} paid={} due={} linked={:?} intended={} op={:?} blocked={:?}",
                         config.hop_label,
                         open_connects,
                         total_connects,
@@ -751,6 +857,9 @@ async fn run_session_driver(
                         total_paid_millisats,
                         due_now,
                         linked_channel.as_ref().map(|channel| &channel.channel_id),
+                        state.intended_channel_id.as_deref().unwrap_or("none"),
+                        state.control_op_in_flight,
+                        state.funding_blocked_reason,
                     );
                     let resolved = apply_session_status(
                         &mut state,
@@ -769,14 +878,21 @@ async fn run_session_driver(
                 }
                 ServerMessage::ChannelEvicted { channel_id } => {
                     warn!(
-                        "{} channel {channel_id} evicted from this session",
-                        config.hop_label
+                        "{} channel {channel_id} evicted from this session | {}",
+                        config.hop_label,
+                        state_summary(&state)
                     );
                     apply_channel_evicted(&config, &mut state, channel_id).await;
                     false
                 }
                 ServerMessage::Error { code, message } => {
-                    warn!("{} control error: {message}", config.hop_label);
+                    warn!(
+                        "{} control error: code={:?} message={} | {}",
+                        config.hop_label,
+                        code,
+                        message,
+                        state_summary(&state)
+                    );
                     apply_server_error(&config, &mut state, code).await;
                     false
                 }

@@ -24,7 +24,7 @@ Implemented today:
 - session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
 - relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
-- client-side session FSM for serialized per-session link/payment/relink decisions
+- client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments
 - mock wallet runtime path for tests and connector flows: `MockWallet` plus `session_driver` funds relay sessions without a real wallet backend
 - low-level blinded-hop building blocks: blinded blob encryption/decryption, even-Y tweak rejection sampling, reverse-tweak key recovery, compact binary payload encoding, and a mixed cleartext/blinded path data model in `monad-common`
 - integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
