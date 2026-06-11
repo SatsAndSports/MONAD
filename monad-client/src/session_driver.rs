@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::session_fsm::{
     ClientSessionEffect, ClientSessionEvent, ClientSessionState, ControlOpInFlight,
-    FundingBlockedReason, SessionSnapshot, WalletOpKind,
+    FundingBlockedReason, SessionSnapshot,
 };
 use crate::wallet::{select_channel, MonadWallet, RelayPaymentOffer, WalletChannel, WalletError};
 
@@ -108,31 +108,9 @@ fn validate_session_pricing(
 }
 
 fn validate_event_invariants(
-    state: &ClientSessionState,
-    event: &ClientSessionEvent,
+    _state: &ClientSessionState,
+    _event: &ClientSessionEvent,
 ) -> io::Result<()> {
-    let payment_in_flight = matches!(
-        state.control_op_in_flight,
-        Some(ControlOpInFlight::Payment { .. })
-    );
-
-    let message = match event {
-        ClientSessionEvent::ChannelPaymentBuilt { .. } if state.active_channel_id.is_none() => {
-            Some("ChannelPaymentBuilt received without active channel".to_string())
-        }
-        ClientSessionEvent::ChannelPaymentBuilt { .. } if payment_in_flight => {
-            Some("ChannelPaymentBuilt received while payment op already in flight".to_string())
-        }
-        _ => None,
-    };
-
-    if let Some(message) = message {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("client session invariant violation: {message}"),
-        ));
-    }
-
     Ok(())
 }
 
@@ -154,6 +132,19 @@ fn session_is_paused(state: &ClientSessionState) -> bool {
 fn relay_confirms_active_channel(state: &ClientSessionState) -> bool {
     state.active_channel_id.is_some()
         && state.active_channel_id.as_deref() == relay_linked_channel_id(state)
+}
+
+fn status_resolved_payment(
+    previous_control_op: &Option<ControlOpInFlight>,
+    event: &ClientSessionEvent,
+    next_state: &ClientSessionState,
+) -> bool {
+    matches!(event, ClientSessionEvent::SessionStatusReceived { .. })
+        && matches!(previous_control_op, Some(ControlOpInFlight::Payment { .. }))
+        && !matches!(
+            next_state.control_op_in_flight,
+            Some(ControlOpInFlight::Payment { .. })
+        )
 }
 
 fn set_blocked_reason(
@@ -261,15 +252,123 @@ async fn try_link_channel(
 }
 
 fn exclude_channel_for_link_failure(error: &WalletError) -> bool {
-    matches!(
-        error,
-        WalletError::NotFound
-            | WalletError::NotOpen
-            | WalletError::AttachedToDifferentSession { .. }
-            | WalletError::InsufficientCapacity { .. }
-            | WalletError::ChannelUnusable
-            | WalletError::OfferMismatch(_)
-    )
+    crate::session_fsm::exclude_on_wallet_error(error)
+}
+
+fn requested_delta_msats(remaining_milli_sats: i64) -> u64 {
+    let target_remaining = crate::session_fsm::TARGET_TOPUP_BUFFER_MSATS as i128;
+    let delta = target_remaining - remaining_milli_sats as i128;
+    if delta <= 0 {
+        return 0;
+    }
+    delta.min(u64::MAX as i128) as u64
+}
+
+fn delta_msats_to_raw_units(unit: &str, delta_msats: u64) -> u64 {
+    match unit {
+        "msat" => delta_msats,
+        "sat" => delta_msats.div_ceil(1000),
+        _ => 0,
+    }
+}
+
+async fn abandon_active_channel(
+    config: &SessionDriverConfig,
+    state: &mut ClientSessionState,
+    channel_id: String,
+    exclude_for_session: bool,
+) {
+    if exclude_for_session {
+        state.session_excluded_channels.insert(channel_id.clone());
+    }
+    let _ = config
+        .wallet
+        .detach_channel_from_session(&channel_id, config.conn.session_id);
+    state.active_channel_id = None;
+    state.active_offer = None;
+    state.control_op_in_flight = None;
+    *config.conn.spilman_info_handle.write().await = None;
+}
+
+async fn maybe_progress_payment_on_status(
+    config: &SessionDriverConfig,
+    state: &mut ClientSessionState,
+    h2_send: &mut h2::SendStream<Bytes>,
+    ready_tx: &Option<oneshot::Sender<()>>,
+    skip_for_resolved_payment: bool,
+) -> io::Result<()> {
+    if skip_for_resolved_payment
+        || state.terminated
+        || state.funding_blocked_reason.is_some()
+        || matches!(
+            state.control_op_in_flight,
+            Some(ControlOpInFlight::Payment { .. })
+        )
+    {
+        return Ok(());
+    }
+
+    let Some(snapshot) = state.snapshot.as_ref() else {
+        return Ok(());
+    };
+    let Some(linked_channel) = snapshot.linked_channel.as_ref() else {
+        return Ok(());
+    };
+    let Some(active_channel_id) = state.active_channel_id.clone() else {
+        return Ok(());
+    };
+    let Some(active_offer) = state.active_offer.clone() else {
+        return Ok(());
+    };
+    if linked_channel.channel_id != active_channel_id || snapshot.remaining_milli_sats > 0 {
+        return Ok(());
+    }
+
+    let requested_delta_msats = requested_delta_msats(snapshot.remaining_milli_sats);
+    if requested_delta_msats == 0 {
+        return Ok(());
+    }
+
+    let requested_delta_raw = delta_msats_to_raw_units(&linked_channel.unit, requested_delta_msats);
+    let Some(next_balance_raw) = linked_channel.balance_raw.checked_add(requested_delta_raw) else {
+        return Ok(());
+    };
+
+    if next_balance_raw > linked_channel.capacity_raw {
+        abandon_active_channel(config, state, active_channel_id, true).await;
+        return Ok(());
+    }
+
+    match config.wallet.build_channel_payment(
+        &active_channel_id,
+        &active_offer,
+        linked_channel.balance_raw,
+        next_balance_raw,
+    ) {
+        Ok(payment_json) => {
+            send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await?;
+            state.control_op_in_flight = Some(ControlOpInFlight::Payment {
+                channel_id: active_channel_id,
+            });
+        }
+        Err(error) => {
+            if matches!(error, WalletError::Backend(_)) {
+                set_blocked_reason(
+                    config,
+                    state,
+                    ready_tx,
+                    FundingBlockedReason::PaymentBuild,
+                    &error.to_string(),
+                )?;
+                return Ok(());
+            }
+            if exclude_channel_for_link_failure(&error) {
+                abandon_active_channel(config, state, active_channel_id, true).await;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn maybe_ensure_linked_channel(
@@ -402,7 +501,7 @@ async fn maybe_ensure_linked_channel(
 fn pre_ready_blocked_error(
     ready_tx: &Option<oneshot::Sender<()>>,
     previous_blocked_reason: Option<FundingBlockedReason>,
-    event: &ClientSessionEvent,
+    _event: &ClientSessionEvent,
     next_state: &ClientSessionState,
 ) -> Option<io::Error> {
     if ready_tx.is_none()
@@ -413,10 +512,7 @@ fn pre_ready_blocked_error(
     }
 
     let blocked_reason = next_state.funding_blocked_reason.as_ref().unwrap();
-    let detail = match event {
-        ClientSessionEvent::WalletOperationFailed { error, .. } => format!(" ({error})"),
-        _ => String::new(),
-    };
+    let detail = String::new();
 
     Some(io::Error::other(format!(
         "session funding blocked before readiness: {:?}{detail}",
@@ -557,9 +653,10 @@ async fn process_client_event(
         let previous_control_op = state.control_op_in_flight.clone();
         let previous_blocked_reason = state.funding_blocked_reason.clone();
         let (next_state, effects) = crate::session_fsm::step(state.clone(), event);
+        let resolved_payment =
+            status_resolved_payment(&previous_control_op, &event_for_logging, &next_state);
         log_control_state_transition(
             config,
-            &event_for_logging,
             previous_control_op,
             previous_blocked_reason.clone(),
             &next_state,
@@ -583,25 +680,6 @@ async fn process_client_event(
                 ClientSessionEffect::UpdateSpilmanInfoHandle(info) => {
                     *config.conn.spilman_info_handle.write().await = info;
                 }
-                ClientSessionEffect::BuildChannelPayment {
-                    channel_id,
-                    offer,
-                    latest_server_balance_raw,
-                    next_balance_raw,
-                } => match config.wallet.build_channel_payment(
-                    &channel_id,
-                    &offer,
-                    latest_server_balance_raw,
-                    next_balance_raw,
-                ) {
-                    Ok(payment_json) => {
-                        pending.push_back(ClientSessionEvent::ChannelPaymentBuilt { payment_json })
-                    }
-                    Err(error) => pending.push_back(ClientSessionEvent::WalletOperationFailed {
-                        kind: WalletOpKind::PreparePayment { channel_id },
-                        error,
-                    }),
-                },
                 ClientSessionEffect::DetachChannel { channel_id } => {
                     let _ = config
                         .wallet
@@ -609,9 +687,6 @@ async fn process_client_event(
                 }
                 ClientSessionEffect::MarkChannelUnusable { channel_id } => {
                     let _ = config.wallet.mark_channel_unusable(&channel_id);
-                }
-                ClientSessionEffect::SendControl(message) => {
-                    send_control_message(h2_send, &message).await?;
                 }
                 ClientSessionEffect::SignalUsable => {
                     if let Some(tx) = ready_tx.take() {
@@ -625,6 +700,9 @@ async fn process_client_event(
         }
 
         maybe_ensure_linked_channel(config, state, h2_send, ready_tx).await?;
+        maybe_progress_payment_on_status(config, state, h2_send, ready_tx, resolved_payment)
+            .await?;
+        maybe_ensure_linked_channel(config, state, h2_send, ready_tx).await?;
     }
 
     Ok(terminate)
@@ -632,7 +710,6 @@ async fn process_client_event(
 
 fn log_control_state_transition(
     config: &SessionDriverConfig,
-    event: &ClientSessionEvent,
     previous_control_op: Option<ControlOpInFlight>,
     previous_blocked_reason: Option<FundingBlockedReason>,
     next_state: &ClientSessionState,
@@ -646,17 +723,7 @@ fn log_control_state_transition(
 
     if previous_blocked_reason != next_state.funding_blocked_reason {
         if let Some(reason) = &next_state.funding_blocked_reason {
-            match event {
-                ClientSessionEvent::WalletOperationFailed { error, .. } => {
-                    warn!(
-                        "{} funding blocked: {:?} ({error})",
-                        config.hop_label, reason,
-                    );
-                }
-                _ => {
-                    warn!("{} funding blocked: {:?}", config.hop_label, reason,);
-                }
-            }
+            warn!("{} funding blocked: {:?}", config.hop_label, reason,);
         }
     }
 }
@@ -691,13 +758,10 @@ fn choose_channel_and_offer(
 #[cfg(test)]
 mod tests {
     use super::{
-        pre_ready_blocked_error, relay_confirms_active_channel, validate_event_invariants,
-        validate_session_pricing,
+        pre_ready_blocked_error, relay_confirms_active_channel, requested_delta_msats,
+        validate_event_invariants, validate_session_pricing,
     };
-    use crate::session_fsm::{
-        ClientSessionEvent, ClientSessionState, ControlOpInFlight, FundingBlockedReason,
-        WalletOpKind,
-    };
+    use crate::session_fsm::{ClientSessionEvent, ClientSessionState, FundingBlockedReason};
     use monad_common::protocol::LinkedChannelStatus;
     use monad_common::session::SessionPricing;
     use std::io;
@@ -761,39 +825,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_event_invariants_rejects_payment_built_without_active_channel() {
-        let err = validate_event_invariants(
-            &ClientSessionState::new(),
-            &ClientSessionEvent::ChannelPaymentBuilt {
-                payment_json: "{}".to_string(),
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err
-            .to_string()
-            .contains("ChannelPaymentBuilt received without active channel"));
+    fn requested_delta_targets_buffer_from_negative_remaining() {
+        assert_eq!(
+            requested_delta_msats(-5),
+            crate::session_fsm::TARGET_TOPUP_BUFFER_MSATS + 5
+        );
     }
 
     #[test]
-    fn validate_event_invariants_rejects_payment_built_while_payment_in_flight() {
-        let mut state = ClientSessionState::new();
-        state.active_channel_id = Some("chan-a".to_string());
-        state.control_op_in_flight = Some(ControlOpInFlight::Payment {
-            channel_id: "chan-a".to_string(),
-        });
-
-        let err = validate_event_invariants(
-            &state,
-            &ClientSessionEvent::ChannelPaymentBuilt {
-                payment_json: "{}".to_string(),
-            },
+    fn validate_event_invariants_is_noop_for_remaining_server_events() {
+        validate_event_invariants(
+            &ClientSessionState::new(),
+            &ClientSessionEvent::ControlDetached,
         )
-        .unwrap_err();
-
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("payment op already in flight"));
+        .unwrap();
     }
 
     #[test]
@@ -807,11 +852,9 @@ mod tests {
         let err = pre_ready_blocked_error(
             &Some(ready_tx),
             None,
-            &ClientSessionEvent::WalletOperationFailed {
-                kind: WalletOpKind::PreparePayment {
-                    channel_id: "chan-a".to_string(),
-                },
-                error: crate::wallet::WalletError::Backend("wallet down".to_string()),
+            &ClientSessionEvent::ServerError {
+                code: monad_common::protocol::ServerErrorCode::InternalError,
+                message: "wallet down".to_string(),
             },
             &next_state,
         )
@@ -833,11 +876,9 @@ mod tests {
         let err = pre_ready_blocked_error(
             &None,
             None,
-            &ClientSessionEvent::WalletOperationFailed {
-                kind: WalletOpKind::PreparePayment {
-                    channel_id: "chan-a".to_string(),
-                },
-                error: crate::wallet::WalletError::Backend("wallet down".to_string()),
+            &ClientSessionEvent::ServerError {
+                code: monad_common::protocol::ServerErrorCode::InternalError,
+                message: "wallet down".to_string(),
             },
             &next_state,
         );
