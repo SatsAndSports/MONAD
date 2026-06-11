@@ -3,12 +3,14 @@ use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::protocol::{
     ClientMessage, KeysetAdvertisement, LinkedChannelStatus, ServerErrorCode, ServerMessage,
 };
+use monad_common::proxy::CleartextByteCounters;
 use monad_common::session::{RelayConnection, SessionPricing, SessionSpilmanInfo};
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time::{self, Duration, MissedTickBehavior};
 use tracing::{info, warn};
 
 use crate::wallet::{select_channel, MonadWallet, RelayPaymentOffer, WalletChannel, WalletError};
@@ -69,6 +71,7 @@ struct RelayConnectionProxy {
     session_id: [u8; 32],
     pricing_handle: Arc<tokio::sync::RwLock<Option<SessionPricing>>>,
     spilman_info_handle: Arc<tokio::sync::RwLock<Option<SessionSpilmanInfo>>>,
+    cleartext_byte_counters: CleartextByteCounters,
 }
 
 impl From<&RelayConnection> for RelayConnectionProxy {
@@ -77,6 +80,7 @@ impl From<&RelayConnection> for RelayConnectionProxy {
             session_id: *conn.session_id(),
             pricing_handle: conn.session_pricing_handle(),
             spilman_info_handle: conn.session_spilman_info_handle(),
+            cleartext_byte_counters: conn.cleartext_byte_counters(),
         }
     }
 }
@@ -86,6 +90,9 @@ struct AuthoritativeSnapshot {
     receiver_pubkey: String,
     advertisements: Vec<KeysetAdvertisement>,
     linked_channel: Option<LinkedChannelStatus>,
+    session_total_in: u64,
+    session_total_out: u64,
+    total_paid_millisats: u64,
     remaining_milli_sats: i64,
     paused: bool,
 }
@@ -206,7 +213,27 @@ fn relay_confirms_intended_channel(state: &DriverState) -> bool {
         && state.intended_channel_id.as_deref() == relay_linked_channel_id(state)
 }
 
-fn state_summary(state: &DriverState) -> String {
+fn compute_estimated_remaining(
+    state: &DriverState,
+    counters: &CleartextByteCounters,
+) -> Option<i64> {
+    let snapshot = state.snapshot.as_ref()?;
+    let pricing = state.established_pricing?;
+    let (local_inbound, local_outbound) = counters.snapshot();
+    let estimated_total_in = snapshot
+        .session_total_in
+        .saturating_add(local_inbound.saturating_sub(snapshot.session_total_in));
+    let estimated_total_out = snapshot
+        .session_total_out
+        .saturating_add(local_outbound.saturating_sub(snapshot.session_total_out));
+    let estimated_due = pricing.amount_due_millisats(estimated_total_in, estimated_total_out);
+    Some(
+        (snapshot.total_paid_millisats as i128 - estimated_due as i128)
+            .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+    )
+}
+
+fn state_summary(state: &DriverState, counters: &CleartextByteCounters) -> String {
     let relay_linked = relay_linked_channel_id(state).unwrap_or("none");
     let intended = state.intended_channel_id.as_deref().unwrap_or("none");
     let paused = state
@@ -218,10 +245,14 @@ fn state_summary(state: &DriverState) -> String {
         .as_ref()
         .map(|snapshot| snapshot.remaining_milli_sats.to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let local_remaining = compute_estimated_remaining(state, counters)
+        .map(|remaining| remaining.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     format!(
-        "paused={} remaining={} relay_linked={} intended={} op={:?} blocked={:?} ready={}",
+        "paused={} remaining={} local_remaining={} relay_linked={} intended={} op={:?} blocked={:?} ready={}",
         paused,
         remaining,
+        local_remaining,
         relay_linked,
         intended,
         state.control_op_in_flight,
@@ -402,7 +433,7 @@ async fn send_channel_link(
         "{} sending ChannelLink for {} | {}",
         config.hop_label,
         channel_id,
-        state_summary(state)
+        state_summary(state, &config.conn.cleartext_byte_counters)
     );
     send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await?;
     state.intended_channel_id = Some(channel_id.clone());
@@ -487,7 +518,7 @@ async fn maybe_ensure_linked_channel(
             "{} relay confirms intended channel {} | {}",
             config.hop_label,
             state.intended_channel_id.as_deref().unwrap_or("none"),
-            state_summary(state)
+            state_summary(state, &config.conn.cleartext_byte_counters)
         );
         return Ok(());
     }
@@ -500,14 +531,14 @@ async fn maybe_ensure_linked_channel(
                 config.hop_label,
                 relay_linked,
                 intended_channel_id,
-                state_summary(state)
+                state_summary(state, &config.conn.cleartext_byte_counters)
             );
         } else if relay_linked == "none" {
             info!(
                 "{} relay reports no linked channel; keeping intended channel {} | {}",
                 config.hop_label,
                 intended_channel_id,
-                state_summary(state)
+                state_summary(state, &config.conn.cleartext_byte_counters)
             );
         }
     }
@@ -537,7 +568,7 @@ async fn maybe_ensure_linked_channel(
                 "{} retrying ChannelLink for intended channel {} | {}",
                 config.hop_label,
                 channel.channel_id,
-                state_summary(state)
+                state_summary(state, &config.conn.cleartext_byte_counters)
             );
             if !try_link_channel(config, state, h2_send, channel, offer).await? {
                 return Ok(());
@@ -552,7 +583,7 @@ async fn maybe_ensure_linked_channel(
                     "{} selected existing channel {} | {}",
                     config.hop_label,
                     channel.channel_id,
-                    state_summary(state)
+                    state_summary(state, &config.conn.cleartext_byte_counters)
                 );
                 if !try_link_channel(config, state, h2_send, channel, offer).await? {
                     return Ok(());
@@ -568,7 +599,7 @@ async fn maybe_ensure_linked_channel(
                 info!(
                     "{} provisioning new channel from first advertisement | {}",
                     config.hop_label,
-                    state_summary(state)
+                    state_summary(state, &config.conn.cleartext_byte_counters)
                 );
                 let offer = RelayPaymentOffer::from_advertisement(
                     snapshot.receiver_pubkey.clone(),
@@ -653,20 +684,28 @@ async fn maybe_progress_payment(
     let Some(intended_offer) = state.intended_offer.clone() else {
         return Ok(());
     };
-    if linked_channel.channel_id != intended_channel_id || snapshot.remaining_milli_sats > 0 {
+    let Some(estimated_remaining) =
+        compute_estimated_remaining(state, &config.conn.cleartext_byte_counters)
+    else {
+        return Ok(());
+    };
+    let should_pay = snapshot.paused
+        || snapshot.remaining_milli_sats <= 0
+        || estimated_remaining < TARGET_TOPUP_BUFFER_MSATS as i64;
+    if linked_channel.channel_id != intended_channel_id || !should_pay {
         if linked_channel.channel_id != intended_channel_id {
             info!(
                 "{} payment skipped: relay linked channel {} does not match intended {} | {}",
                 config.hop_label,
                 linked_channel.channel_id,
                 intended_channel_id,
-                state_summary(state)
+                state_summary(state, &config.conn.cleartext_byte_counters)
             );
         }
         return Ok(());
     }
 
-    let requested_delta_msats = requested_delta_msats(snapshot.remaining_milli_sats);
+    let requested_delta_msats = requested_delta_msats(estimated_remaining);
     if requested_delta_msats == 0 {
         return Ok(());
     }
@@ -682,7 +721,7 @@ async fn maybe_progress_payment(
             intended_channel_id,
             next_balance_raw,
             linked_channel.capacity_raw,
-            state_summary(state)
+            state_summary(state, &config.conn.cleartext_byte_counters)
         );
         abandon_intended_channel(config, state, intended_channel_id, true).await;
         return Ok(());
@@ -699,10 +738,10 @@ async fn maybe_progress_payment(
                 "{} sending ChannelPayment for {}: remaining={} target={} next_balance_raw={} | {}",
                 config.hop_label,
                 intended_channel_id,
-                snapshot.remaining_milli_sats,
+                estimated_remaining,
                 TARGET_TOPUP_BUFFER_MSATS,
                 next_balance_raw,
-                state_summary(state)
+                state_summary(state, &config.conn.cleartext_byte_counters)
             );
             send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await?;
             state.control_op_in_flight = Some(ControlOpInFlight::Payment {
@@ -723,7 +762,7 @@ async fn maybe_progress_payment(
                     config.hop_label,
                     intended_channel_id,
                     error,
-                    state_summary(state)
+                    state_summary(state, &config.conn.cleartext_byte_counters)
                 );
                 abandon_intended_channel(config, state, intended_channel_id, true).await;
             }
@@ -733,22 +772,9 @@ async fn maybe_progress_payment(
     Ok(())
 }
 
-fn apply_session_status(
-    state: &mut DriverState,
-    receiver_pubkey: String,
-    advertisements: Vec<KeysetAdvertisement>,
-    linked_channel: Option<LinkedChannelStatus>,
-    remaining_milli_sats: i64,
-    paused: bool,
-) -> bool {
+fn apply_session_status(state: &mut DriverState, snapshot: AuthoritativeSnapshot) -> bool {
     let resolved_payment = clear_resolved_control_op_on_status(state);
-    state.snapshot = Some(AuthoritativeSnapshot {
-        receiver_pubkey,
-        advertisements,
-        linked_channel,
-        remaining_milli_sats,
-        paused,
-    });
+    state.snapshot = Some(snapshot);
     resolved_payment
 }
 
@@ -813,98 +839,122 @@ async fn run_session_driver(
     let mut state = DriverState::default();
     let mut ready_tx = Some(ready_tx);
 
-    while let Some(chunk) = h2_recv.data().await {
-        let data = chunk.map_err(|e| io::Error::other(format!("h2 recv error: {e}")))?;
-        let len = data.len();
-        let _ = h2_recv.flow_control().release_capacity(len);
-        buf.extend_from_slice(&data);
+    let mut payment_tick = time::interval(Duration::from_millis(250));
+    payment_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buf.drain(..=newline_pos).collect();
-            let line = line.trim_ascii();
-            if line.is_empty() {
-                continue;
-            }
+    loop {
+        tokio::select! {
+            maybe_chunk = h2_recv.data() => {
+                let Some(chunk) = maybe_chunk else {
+                    break;
+                };
+                let data = chunk.map_err(|e| io::Error::other(format!("h2 recv error: {e}")))?;
+                let len = data.len();
+                let _ = h2_recv.flow_control().release_capacity(len);
+                buf.extend_from_slice(&data);
 
-            let message: ServerMessage = serde_json::from_slice(line)
-                .map_err(|e| io::Error::other(format!("json error: {e}")))?;
-
-            let resolved_payment = match message {
-                ServerMessage::SessionStatus {
-                    receiver_pubkey,
-                    advertisements,
-                    linked_channel,
-                    active_in_rate,
-                    active_out_rate,
-                    session_total_in,
-                    session_total_out,
-                    total_paid_millisats,
-                    remaining_milli_sats,
-                    paused,
-                    open_connects,
-                    total_connects,
-                } => {
-                    let pricing = SessionPricing::new(active_in_rate, active_out_rate);
-                    validate_session_pricing(&mut state.established_pricing, pricing)?;
-                    let due_now = pricing.amount_due_millisats(session_total_in, session_total_out);
-                    info!(
-                        "{} session status: open_connects={} total_connects={} paused={} balance={} paid={} due={} linked={:?} intended={} op={:?} blocked={:?}",
-                        config.hop_label,
-                        open_connects,
-                        total_connects,
-                        paused,
-                        remaining_milli_sats,
-                        total_paid_millisats,
-                        due_now,
-                        linked_channel.as_ref().map(|channel| &channel.channel_id),
-                        state.intended_channel_id.as_deref().unwrap_or("none"),
-                        state.control_op_in_flight,
-                        state.funding_blocked_reason,
-                    );
-                    let resolved = apply_session_status(
-                        &mut state,
-                        receiver_pubkey,
-                        advertisements,
-                        linked_channel,
-                        remaining_milli_sats,
-                        paused,
-                    );
-                    publish_pricing(&config, pricing).await;
-                    publish_spilman_info(&config, &state).await;
-                    if !paused {
-                        signal_ready(&mut state, &mut ready_tx).await;
+                while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=newline_pos).collect();
+                    let line = line.trim_ascii();
+                    if line.is_empty() {
+                        continue;
                     }
-                    resolved
-                }
-                ServerMessage::ChannelEvicted { channel_id } => {
-                    warn!(
-                        "{} channel {channel_id} evicted from this session | {}",
-                        config.hop_label,
-                        state_summary(&state)
-                    );
-                    apply_channel_evicted(&config, &mut state, channel_id).await;
-                    false
-                }
-                ServerMessage::Error { code, message } => {
-                    warn!(
-                        "{} control error: code={:?} message={} | {}",
-                        config.hop_label,
-                        code,
-                        message,
-                        state_summary(&state)
-                    );
-                    apply_server_error(&config, &mut state, code).await;
-                    false
-                }
-            };
 
-            if state.terminated {
-                return Ok(());
+                    let message: ServerMessage = serde_json::from_slice(line)
+                        .map_err(|e| io::Error::other(format!("json error: {e}")))?;
+
+                    let resolved_payment = match message {
+                        ServerMessage::SessionStatus {
+                            receiver_pubkey,
+                            advertisements,
+                            linked_channel,
+                            active_in_rate,
+                            active_out_rate,
+                            session_total_in,
+                            session_total_out,
+                            total_paid_millisats,
+                            remaining_milli_sats,
+                            paused,
+                            open_connects,
+                            total_connects,
+                        } => {
+                            let pricing = SessionPricing::new(active_in_rate, active_out_rate);
+                            validate_session_pricing(&mut state.established_pricing, pricing)?;
+                            let due_now = pricing.amount_due_millisats(session_total_in, session_total_out);
+                            info!(
+                                "{} session status: open_connects={} total_connects={} paused={} balance={} paid={} due={} linked={:?} intended={} op={:?} blocked={:?} local_remaining={:?}",
+                                config.hop_label,
+                                open_connects,
+                                total_connects,
+                                paused,
+                                remaining_milli_sats,
+                                total_paid_millisats,
+                                due_now,
+                                linked_channel.as_ref().map(|channel| &channel.channel_id),
+                                state.intended_channel_id.as_deref().unwrap_or("none"),
+                                state.control_op_in_flight,
+                                state.funding_blocked_reason,
+                                compute_estimated_remaining(&state, &config.conn.cleartext_byte_counters),
+                            );
+                            let resolved = apply_session_status(
+                                &mut state,
+                                AuthoritativeSnapshot {
+                                    receiver_pubkey,
+                                    advertisements,
+                                    linked_channel,
+                                    session_total_in,
+                                    session_total_out,
+                                    total_paid_millisats,
+                                    remaining_milli_sats,
+                                    paused,
+                                },
+                            );
+                            publish_pricing(&config, pricing).await;
+                            publish_spilman_info(&config, &state).await;
+                            if !paused {
+                                signal_ready(&mut state, &mut ready_tx).await;
+                            }
+                            resolved
+                        }
+                        ServerMessage::ChannelEvicted { channel_id } => {
+                            warn!(
+                                "{} channel {channel_id} evicted from this session | {}",
+                                config.hop_label,
+                                state_summary(&state, &config.conn.cleartext_byte_counters)
+                            );
+                            apply_channel_evicted(&config, &mut state, channel_id).await;
+                            false
+                        }
+                        ServerMessage::Error { code, message } => {
+                            warn!(
+                                "{} control error: code={:?} message={} | {}",
+                                config.hop_label,
+                                code,
+                                message,
+                                state_summary(&state, &config.conn.cleartext_byte_counters)
+                            );
+                            apply_server_error(&config, &mut state, code).await;
+                            false
+                        }
+                    };
+
+                    if state.terminated {
+                        return Ok(());
+                    }
+
+                    maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
+                    maybe_progress_payment(&config, &mut state, &mut h2_send, resolved_payment).await?;
+                    maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
+                }
             }
-
-            maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
-            maybe_progress_payment(&config, &mut state, &mut h2_send, resolved_payment).await?;
-            maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
+            _ = payment_tick.tick() => {
+                if state.terminated {
+                    return Ok(());
+                }
+                maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
+                maybe_progress_payment(&config, &mut state, &mut h2_send, false).await?;
+                maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
+            }
         }
     }
 
@@ -921,6 +971,7 @@ mod tests {
     use super::{AuthoritativeSnapshot, DriverState, FundingBlockedReason};
     use crate::wallet::WalletError;
     use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus, ServerErrorCode};
+    use monad_common::proxy::CleartextByteCounters;
     use monad_common::session::SessionPricing;
     use std::io;
     use tokio::sync::oneshot;
@@ -936,6 +987,9 @@ mod tests {
                 out_bytes_per_millisat: 1,
             }],
             linked_channel: None,
+            session_total_in: 0,
+            session_total_out: 0,
+            total_paid_millisats: if paused { 0 } else { 10 },
             remaining_milli_sats: if paused { 0 } else { 10 },
             paused,
         }
@@ -954,6 +1008,9 @@ mod tests {
                     capacity_raw: 100,
                     unit: "msat".to_string(),
                 }),
+                session_total_in: 0,
+                session_total_out: 0,
+                total_paid_millisats: 0,
                 remaining_milli_sats: 0,
                 paused: true,
             }),
@@ -1005,6 +1062,28 @@ mod tests {
         assert_eq!(
             requested_delta_msats(-5),
             super::TARGET_TOPUP_BUFFER_MSATS + 5
+        );
+    }
+
+    #[test]
+    fn estimated_remaining_uses_local_counter_deltas() {
+        let counters = CleartextByteCounters::default();
+        counters.note_inbound(4);
+        counters.note_outbound(6);
+        let state = DriverState {
+            snapshot: Some(AuthoritativeSnapshot {
+                session_total_in: 1,
+                session_total_out: 2,
+                total_paid_millisats: 20,
+                ..snapshot(true)
+            }),
+            established_pricing: Some(SessionPricing::new(1, 1)),
+            ..DriverState::default()
+        };
+
+        assert_eq!(
+            super::compute_estimated_remaining(&state, &counters),
+            Some(10)
         );
     }
 
