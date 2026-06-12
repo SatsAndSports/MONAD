@@ -1330,6 +1330,151 @@ async fn test_session_payment_driver_links_unpauses_and_allows_data_flow() {
 }
 
 #[tokio::test]
+async fn test_session_payment_driver_proactively_pays_from_local_counters() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
+    let (server_addr, pubkey, _payments) =
+        start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
+
+    let wallet = Arc::new(MockWallet::new());
+    wallet
+        .insert_channel(mock_wallet_channel(
+            "driver-chan",
+            receiver_pubkey,
+            mint_url,
+            keyset_id,
+        ))
+        .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (driver_handle, ready_rx) = start_session_payment_driver(
+        &conn,
+        wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "integration hop",
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("driver should ready")
+        .expect("driver ready signal");
+
+    let initial_payment_builds = wallet
+        .successful_payment_build_count("driver-chan")
+        .unwrap();
+    assert_eq!(initial_payment_builds, 1);
+
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let mut tunnel = conn.open_tunnel(&target).await.unwrap();
+    tunnel.write_all(b"wallet proactive").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"WALLET PROACTIVE");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if wallet
+                .successful_payment_build_count("driver-chan")
+                .unwrap()
+                >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("timer-driven local-counter payment should happen");
+
+    driver_handle.abort();
+    let _ = driver_handle.await;
+    conn.shutdown().await;
+    let _ = mint_shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_session_payment_driver_timer_does_not_duplicate_payment_builds() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
+    let (server_addr, pubkey, _payments) =
+        start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
+
+    let wallet = Arc::new(MockWallet::new());
+    wallet
+        .insert_channel(mock_wallet_channel(
+            "driver-chan",
+            receiver_pubkey,
+            mint_url,
+            keyset_id,
+        ))
+        .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (driver_handle, ready_rx) = start_session_payment_driver(
+        &conn,
+        wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "integration hop",
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("driver should ready")
+        .expect("driver ready signal");
+
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    let mut tunnel = conn.open_tunnel(&target).await.unwrap();
+    tunnel.write_all(b"wallet one topup").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"WALLET ONE TOPUP");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if wallet
+                .successful_payment_build_count("driver-chan")
+                .unwrap()
+                >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("one additional payment build should happen");
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        wallet
+            .successful_payment_build_count("driver-chan")
+            .unwrap(),
+        2
+    );
+
+    driver_handle.abort();
+    let _ = driver_handle.await;
+    conn.shutdown().await;
+    let _ = mint_shutdown.send(());
+}
+
+#[tokio::test]
 async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
     let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
     let payment_receiver_secret = cashu::nuts::SecretKey::generate();

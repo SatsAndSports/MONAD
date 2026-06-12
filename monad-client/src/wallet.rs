@@ -187,6 +187,7 @@ struct StoredChannel {
     next_payment_invalid: bool,
     last_link_payload: Option<String>,
     last_payment_payload: Option<String>,
+    successful_payment_builds: u64,
 }
 
 impl StoredChannel {
@@ -223,6 +224,7 @@ impl MockWallet {
                 next_payment_invalid: false,
                 last_link_payload: None,
                 last_payment_payload: None,
+                successful_payment_builds: 0,
             },
         );
         Ok(())
@@ -330,6 +332,18 @@ impl MockWallet {
             .ok_or(WalletError::NotFound)?
             .channel
             .attached_session_id)
+    }
+
+    pub fn successful_payment_build_count(&self, channel_id: &str) -> Result<u64, WalletError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| WalletError::Backend("wallet mutex poisoned".to_string()))?;
+        Ok(inner
+            .channels
+            .get(channel_id)
+            .ok_or(WalletError::NotFound)?
+            .successful_payment_builds)
     }
 
     fn set_flag(
@@ -485,6 +499,7 @@ impl MonadWallet for MockWallet {
                 next_payment_invalid: false,
                 last_link_payload: None,
                 last_payment_payload: None,
+                successful_payment_builds: 0,
             },
         );
         Ok(channel_id)
@@ -585,6 +600,7 @@ impl MonadWallet for MockWallet {
         stored.current_signed_balance_raw = next_balance_raw;
         stored.channel.current_signed_balance_msats =
             raw_to_msats(&stored.channel.unit, next_balance_raw)?;
+        stored.successful_payment_builds = stored.successful_payment_builds.saturating_add(1);
         let payload = payload.to_string();
         stored.last_payment_payload = Some(payload.clone());
         Ok(payload)
