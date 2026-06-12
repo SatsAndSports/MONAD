@@ -116,9 +116,10 @@ pub struct RelayConnection {
     session_pricing: Arc<RwLock<Option<SessionPricing>>>,
     /// Spilman mint/keyset info fetched by the client for this session.
     session_spilman_info: Arc<RwLock<Option<SessionSpilmanInfo>>>,
-    /// Client-side passive cleartext byte counters for this relay session.
+    /// Client-side cleartext byte counters for this relay session.
     /// Semantics intentionally mirror the relay's `session_total_in/out`
-    /// billing counters for CONNECT payload bytes.
+    /// billing counters for CONNECT payload bytes and are read by the client
+    /// session driver when estimating current spend between relay status updates.
     cleartext_byte_counters: CleartextByteCounters,
 }
 
@@ -246,11 +247,14 @@ impl RelayConnection {
     }
 
     /// Get a snapshot of `(inbound, outbound)` client-side cleartext bytes for this session.
+    ///
+    /// This is primarily useful for tests and diagnostics; the client payment
+    /// driver reads the same counters directly when estimating local spend.
     pub fn local_session_totals(&self) -> (u64, u64) {
         self.cleartext_byte_counters.snapshot()
     }
 
-    /// Clone the per-session cleartext byte counters for passive tracking.
+    /// Clone the per-session cleartext byte counters for local spend estimation.
     pub fn cleartext_byte_counters(&self) -> CleartextByteCounters {
         self.cleartext_byte_counters.clone()
     }

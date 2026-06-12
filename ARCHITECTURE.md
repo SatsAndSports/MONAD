@@ -354,49 +354,53 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 
 ### Client Auto-Funding
 
-The client opens a control stream immediately after connecting. Once it receives the initial `SessionStatus`, the per-session payment driver either selects a matching local channel or provisions one from the relay's advertisements, sends `ChannelLink`, then sends `ChannelPayment` updates whenever the remaining session balance becomes non-positive. Intermediate hops in multi-hop chains use the same session-driver model.
+The client opens a control stream immediately after connecting. Once it receives the initial `SessionStatus`, the per-session payment driver runs one serialized direct control loop. That loop chooses or provisions a local channel, sends `ChannelLink`, and later sends `ChannelPayment` updates. Intermediate hops in multi-hop chains use the same session-driver model.
+
+The relay remains authoritative for:
+
+- which channel is currently linked
+- the latest accepted linked-channel balance
+- the accepted session-total baseline (`session_total_in`, `session_total_out`, `total_paid_millisats`)
+- whether the session is currently paused
+
+The client combines that authoritative baseline with its own local cleartext byte counters to estimate current spend between relay status updates. A small periodic timer in the control loop checks those counters and can trigger proactive `ChannelPayment` updates before the relay sends another `SessionStatus`.
 
 The developer stress harness in `monad-relay/tests/stress.rs` can also run alternate payment policies on top of the same wire protocol:
 - transport-focused mode with one huge prefunding payment per hop session
 - buffered payment mode with frequent `SessionStatus` polling and repeated `ChannelPayment` topups on one linked channel
 - relink-buffered mode that provisions and links a fresh mocked channel when the current one lacks capacity for the next refill
 
-### Client Session FSM
+### Client Control Loop
 
-After the control stream is established and the initial `SessionStatus` arrives, steady-state client behavior is also handled as a
-serialized event/effect reducer, mirroring the relay-side FSM.
+After the control stream is established and the initial `SessionStatus` arrives, steady-state client behavior is handled by one serialized direct control loop in `monad-client/src/session_driver.rs`.
 
-Bootstrap stays outside the reducer:
+That loop keeps small local state for:
 
-- open the control stream
-- wait for the first `SessionStatus`
+- the latest relay-authoritative session snapshot
+- immutable session pricing
+- the client's intended active channel / offer
+- session-local excluded channels
+- link/payment operations currently in flight
+- blocked funding reason and readiness state
 
-The first reducer-driving event is that initial `SessionStatus`.
+On each relay control message, and on a small periodic timer tick, the loop can:
 
-The client reducer is responsible for:
-
-- tracking the latest relay-authoritative session snapshot
-- reconciling the local active channel with the relay-reported linked channel
-- selecting or provisioning channels
-- deciding when to send `ChannelLink`
-- deciding when to send `ChannelPayment`
-- reacting to `ChannelEvicted`
-- classifying relay `Error` messages into channel-invalidating vs session-local outcomes
-- ending the local session on control detach
+- reconcile the relay-linked channel against the client's intended channel
+- ensure a channel is selected/provisioned and linked when funding needs it
+- size payments from the client's own cleartext byte counters using the latest authoritative relay baseline
+- react to `ChannelEvicted`
+- classify relay `Error` messages into channel-invalidating vs non-rejecting outcomes
+- end the local session on control detach
 
 Important design points:
 
 - one client relay session is handled by one serialized executor loop
-- the per-session client FSM state does not need a mutex
+- the per-session client state does not need a mutex
 - `paused` is the real operational state; there is no separate long-lived `ready`
-  state inside the reducer
+  state inside the funding logic
 - the startup oneshot waiter is executor-only coordination, not session state
-- wallet operations (select, provision, build link/payment payloads) are executed
-  as reducer effects and their results are fed back in as reducer events
-
-When a parent session dies in a nested route, deeper nested client sessions end
-indirectly when the underlying transport collapses; the client FSM does not walk
-an explicit tree of child sessions.
+- a parent session collapse still indirectly ends deeper nested client sessions via
+  transport teardown rather than explicit tree-walking
 
 ### Server Session FSM
 

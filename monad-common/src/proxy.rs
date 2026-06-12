@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info};
 
-/// Passive per-session cleartext byte counters for a MONAD relay session.
+/// Per-session cleartext byte counters for a MONAD relay session.
 ///
 /// Semantics mirror the relay-side `session_total_in` / `session_total_out`
 /// accounting used for billing:
@@ -24,7 +24,9 @@ use tracing::{debug, info};
 ///   toward the client
 ///
 /// These counters intentionally exclude control-stream traffic and all H2 /
-/// Noise framing overhead.
+/// Noise framing overhead. On the client side they are also read by the
+/// session driver to estimate local spend between authoritative relay status
+/// updates.
 #[derive(Clone, Debug, Default)]
 pub struct CleartextByteCounters {
     inbound: Arc<AtomicU64>,

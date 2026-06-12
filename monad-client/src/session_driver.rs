@@ -123,6 +123,11 @@ struct DriverState {
     terminated: bool,
 }
 
+// Relay status is the authoritative baseline for linked channel state,
+// accepted session totals, and pause state. The client combines that baseline
+// with its own cleartext byte counters to estimate current spend when sizing
+// proactive payments.
+
 fn validate_session_pricing(
     established_pricing: &mut Option<SessionPricing>,
     candidate: SessionPricing,
@@ -232,6 +237,10 @@ fn compute_estimated_remaining(
             .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
     )
 }
+
+// One serialized control loop handles both authoritative relay messages and
+// periodic local payment checks. Link/payment in-flight markers keep the timer
+// path from racing with message-driven funding work.
 
 fn state_summary(state: &DriverState, counters: &CleartextByteCounters) -> String {
     let relay_linked = relay_linked_channel_id(state).unwrap_or("none");
