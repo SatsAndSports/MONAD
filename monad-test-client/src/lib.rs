@@ -54,6 +54,8 @@ pub struct CircuitConfig {
     pub status_interval: Option<Duration>,
     pub status_timeout: Duration,
     pub mock_channel_capacity_msats: u64,
+    pub target_topup_buffer_msats: u64,
+    pub minimum_topup_msats: u64,
 }
 
 impl Default for CircuitConfig {
@@ -62,6 +64,8 @@ impl Default for CircuitConfig {
             status_interval: Some(Duration::from_secs(5)),
             status_timeout: Duration::from_secs(15),
             mock_channel_capacity_msats: DEFAULT_MOCK_CHANNEL_CAPACITY_MSATS,
+            target_topup_buffer_msats: 10_000_000,
+            minimum_topup_msats: 0,
         }
     }
 }

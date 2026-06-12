@@ -16,8 +16,21 @@ use tracing::{info, warn};
 use crate::wallet::{select_channel, MonadWallet, RelayPaymentOffer, WalletChannel, WalletError};
 
 const DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS: u64 = 100_000_000;
-const TARGET_TOPUP_BUFFER_MSATS: u64 = 10_000_000;
-const MINIMUM_TOPUP_MSATS: u64 = 0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaymentPolicy {
+    pub target_topup_buffer_msats: u64,
+    pub minimum_topup_msats: u64,
+}
+
+impl Default for PaymentPolicy {
+    fn default() -> Self {
+        Self {
+            target_topup_buffer_msats: 10_000_000,
+            minimum_topup_msats: 0,
+        }
+    }
+}
 
 fn encode_client_message(message: &ClientMessage) -> io::Result<Bytes> {
     let bytes =
@@ -44,12 +57,14 @@ struct SessionDriverConfig {
     wallet: Arc<dyn MonadWallet>,
     conn: RelayConnectionProxy,
     hop_label: String,
+    payment_policy: PaymentPolicy,
 }
 
 pub async fn start_session_payment_driver(
     conn: &RelayConnection,
     wallet: Arc<dyn MonadWallet>,
     hop_label: &str,
+    payment_policy: PaymentPolicy,
 ) -> io::Result<(JoinHandle<()>, oneshot::Receiver<()>)> {
     let (control_send, control_recv) = conn.open_control().await?;
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -57,6 +72,7 @@ pub async fn start_session_payment_driver(
         wallet,
         conn: RelayConnectionProxy::from(conn),
         hop_label: hop_label.to_string(),
+        payment_policy,
     };
 
     let handle = tokio::spawn(async move {
@@ -154,8 +170,8 @@ fn validate_session_pricing(
 }
 
 #[cfg(test)]
-fn requested_delta_msats(remaining_milli_sats: i64) -> u64 {
-    let target_remaining = TARGET_TOPUP_BUFFER_MSATS as i128;
+fn requested_delta_msats(remaining_milli_sats: i64, target_topup_buffer_msats: u64) -> u64 {
+    let target_remaining = target_topup_buffer_msats as i128;
     let delta = target_remaining - remaining_milli_sats as i128;
     if delta <= 0 {
         return 0;
@@ -757,7 +773,7 @@ async fn maybe_progress_payment(
     };
     let should_pay = snapshot.paused
         || snapshot.remaining_milli_sats <= 0
-        || estimated_remaining < TARGET_TOPUP_BUFFER_MSATS as i64;
+        || estimated_remaining < config.payment_policy.target_topup_buffer_msats as i64;
     if linked_channel.channel_id != intended_channel_id || !should_pay {
         if linked_channel.channel_id != intended_channel_id {
             info!(
@@ -773,8 +789,8 @@ async fn maybe_progress_payment(
 
     let plan = plan_payment_topup(
         estimated_remaining,
-        TARGET_TOPUP_BUFFER_MSATS,
-        MINIMUM_TOPUP_MSATS,
+        config.payment_policy.target_topup_buffer_msats,
+        config.payment_policy.minimum_topup_msats,
         linked_channel,
     );
 
@@ -811,7 +827,7 @@ async fn maybe_progress_payment(
                 config.hop_label,
                 intended_channel_id,
                 estimated_remaining,
-                TARGET_TOPUP_BUFFER_MSATS,
+                config.payment_policy.target_topup_buffer_msats,
                 reaches_capacity,
                 next_balance_raw,
                 state_summary(state, &config.conn.cleartext_byte_counters)
@@ -1041,7 +1057,7 @@ mod tests {
         exclude_on_wallet_error, plan_payment_topup, pre_ready_blocked_error,
         relay_confirms_intended_channel, requested_delta_msats, validate_session_pricing,
     };
-    use super::{AuthoritativeSnapshot, DriverState, FundingBlockedReason};
+    use super::{AuthoritativeSnapshot, DriverState, FundingBlockedReason, PaymentPolicy};
     use crate::wallet::WalletError;
     use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus, ServerErrorCode};
     use monad_common::proxy::CleartextByteCounters;
@@ -1133,8 +1149,8 @@ mod tests {
     #[test]
     fn requested_delta_targets_buffer_from_negative_remaining() {
         assert_eq!(
-            requested_delta_msats(-5),
-            super::TARGET_TOPUP_BUFFER_MSATS + 5
+            requested_delta_msats(-5, PaymentPolicy::default().target_topup_buffer_msats),
+            PaymentPolicy::default().target_topup_buffer_msats + 5
         );
     }
 
@@ -1148,7 +1164,12 @@ mod tests {
         };
 
         assert_eq!(
-            plan_payment_topup(10_000_001, super::TARGET_TOPUP_BUFFER_MSATS, 0, &linked),
+            plan_payment_topup(
+                10_000_001,
+                PaymentPolicy::default().target_topup_buffer_msats,
+                0,
+                &linked,
+            ),
             super::PaymentTopupPlan::NoPaymentNeeded,
         );
     }
@@ -1163,7 +1184,12 @@ mod tests {
         };
 
         assert_eq!(
-            plan_payment_topup(9_999_500, super::TARGET_TOPUP_BUFFER_MSATS, 1_000, &linked),
+            plan_payment_topup(
+                9_999_500,
+                PaymentPolicy::default().target_topup_buffer_msats,
+                1_000,
+                &linked,
+            ),
             super::PaymentTopupPlan::Pay {
                 requested_delta_msats: 1_000,
                 next_balance_raw: 1_000,
@@ -1182,7 +1208,12 @@ mod tests {
         };
 
         assert_eq!(
-            plan_payment_topup(-5, super::TARGET_TOPUP_BUFFER_MSATS, 1_000, &linked),
+            plan_payment_topup(
+                -5,
+                PaymentPolicy::default().target_topup_buffer_msats,
+                1_000,
+                &linked,
+            ),
             super::PaymentTopupPlan::Pay {
                 requested_delta_msats: 10_000_005,
                 next_balance_raw: 100,
@@ -1201,7 +1232,12 @@ mod tests {
         };
 
         assert_eq!(
-            plan_payment_topup(9_999_500, super::TARGET_TOPUP_BUFFER_MSATS, 750, &linked),
+            plan_payment_topup(
+                9_999_500,
+                PaymentPolicy::default().target_topup_buffer_msats,
+                750,
+                &linked,
+            ),
             super::PaymentTopupPlan::Pay {
                 requested_delta_msats: 750,
                 next_balance_raw: 1,
@@ -1220,7 +1256,12 @@ mod tests {
         };
 
         assert_eq!(
-            plan_payment_topup(-5, super::TARGET_TOPUP_BUFFER_MSATS, 0, &linked),
+            plan_payment_topup(
+                -5,
+                PaymentPolicy::default().target_topup_buffer_msats,
+                0,
+                &linked,
+            ),
             super::PaymentTopupPlan::ExhaustedChannel,
         );
     }

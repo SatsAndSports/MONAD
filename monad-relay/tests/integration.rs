@@ -1304,6 +1304,7 @@ async fn test_session_payment_driver_links_unpauses_and_allows_data_flow() {
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
+        monad_client::session_driver::PaymentPolicy::default(),
     )
     .await
     .unwrap();
@@ -1358,6 +1359,7 @@ async fn test_session_payment_driver_proactively_pays_from_local_counters() {
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
+        monad_client::session_driver::PaymentPolicy::default(),
     )
     .await
     .unwrap();
@@ -1429,6 +1431,7 @@ async fn test_session_payment_driver_timer_does_not_duplicate_payment_builds() {
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
+        monad_client::session_driver::PaymentPolicy::default(),
     )
     .await
     .unwrap();
@@ -1508,6 +1511,7 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
+        monad_client::session_driver::PaymentPolicy::default(),
     )
     .await
     .unwrap();
@@ -1613,6 +1617,7 @@ async fn test_session_payment_driver_detaches_evicted_channel() {
         &conn_a,
         wallet_a.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "driver a",
+        monad_client::session_driver::PaymentPolicy::default(),
     )
     .await
     .unwrap();
@@ -1627,6 +1632,7 @@ async fn test_session_payment_driver_detaches_evicted_channel() {
         &conn_b,
         wallet_b.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "driver b",
+        monad_client::session_driver::PaymentPolicy::default(),
     )
     .await
     .unwrap();

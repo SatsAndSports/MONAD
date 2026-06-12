@@ -6,6 +6,7 @@
 //! N hops:       Each hop wraps the previous one via H2ConnectStream.
 
 use crate::session_driver;
+use crate::session_driver::PaymentPolicy;
 use crate::wallet::{MockWallet, MonadWallet};
 use monad_common::noise_secp256k1;
 use monad_common::secp_identity::Secp256k1Pubkey;
@@ -22,13 +23,22 @@ use tracing::info;
 pub struct ConnectorRuntime {
     wallet: Option<Arc<dyn MonadWallet>>,
     first_hop_quic_pool: Arc<QuicPool>,
+    payment_policy: PaymentPolicy,
 }
 
 impl ConnectorRuntime {
     pub fn new(wallet: Option<Arc<dyn MonadWallet>>) -> io::Result<Self> {
+        Self::with_payment_policy(wallet, PaymentPolicy::default())
+    }
+
+    pub fn with_payment_policy(
+        wallet: Option<Arc<dyn MonadWallet>>,
+        payment_policy: PaymentPolicy,
+    ) -> io::Result<Self> {
         Ok(Self {
             wallet,
             first_hop_quic_pool: Arc::new(QuicPool::new()?),
+            payment_policy,
         })
     }
 
@@ -160,14 +170,20 @@ async fn optionally_fund_session(
     mut conn: RelayConnection,
     wallet: Option<Arc<dyn MonadWallet>>,
     hop_label: &str,
+    payment_policy: PaymentPolicy,
 ) -> io::Result<RelayConnection> {
     let Some(wallet) = wallet else {
         return Ok(conn);
     };
 
     info!("{hop_label}: opening funded control session");
-    let (control_task, ready_rx) =
-        session_driver::start_session_payment_driver(&conn, wallet, hop_label).await?;
+    let (control_task, ready_rx) = session_driver::start_session_payment_driver(
+        &conn,
+        wallet,
+        hop_label,
+        payment_policy,
+    )
+    .await?;
     info!("{hop_label}: waiting for funded session readiness");
     ready_rx.await.map_err(|_| {
         io::Error::new(
@@ -244,6 +260,7 @@ where
                 None
             },
             &hop_label,
+            runtime.payment_policy,
         )
         .await?;
 
