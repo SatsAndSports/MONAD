@@ -26,7 +26,7 @@ use tracing::{debug, info};
 /// These counters intentionally exclude control-stream traffic and all H2 /
 /// Noise framing overhead. On the client side they are also read by the
 /// session driver to estimate local spend between authoritative relay status
-/// updates.
+/// updates and to size proactive payments.
 #[derive(Clone, Debug, Default)]
 pub struct CleartextByteCounters {
     inbound: Arc<AtomicU64>,

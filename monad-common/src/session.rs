@@ -119,7 +119,8 @@ pub struct RelayConnection {
     /// Client-side cleartext byte counters for this relay session.
     /// Semantics intentionally mirror the relay's `session_total_in/out`
     /// billing counters for CONNECT payload bytes and are read by the client
-    /// session driver when estimating current spend between relay status updates.
+    /// session driver when estimating current spend between relay status updates
+    /// and sizing proactive payments.
     cleartext_byte_counters: CleartextByteCounters,
 }
 
@@ -249,12 +250,14 @@ impl RelayConnection {
     /// Get a snapshot of `(inbound, outbound)` client-side cleartext bytes for this session.
     ///
     /// This is primarily useful for tests and diagnostics; the client payment
-    /// driver reads the same counters directly when estimating local spend.
+    /// driver reads the same counters directly when estimating local spend and
+    /// sizing payments.
     pub fn local_session_totals(&self) -> (u64, u64) {
         self.cleartext_byte_counters.snapshot()
     }
 
-    /// Clone the per-session cleartext byte counters for local spend estimation.
+    /// Clone the per-session cleartext byte counters for local spend estimation
+    /// and payment sizing.
     pub fn cleartext_byte_counters(&self) -> CleartextByteCounters {
         self.cleartext_byte_counters.clone()
     }

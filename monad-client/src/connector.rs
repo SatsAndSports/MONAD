@@ -177,13 +177,9 @@ async fn optionally_fund_session(
     };
 
     info!("{hop_label}: opening funded control session");
-    let (control_task, ready_rx) = session_driver::start_session_payment_driver(
-        &conn,
-        wallet,
-        hop_label,
-        payment_policy,
-    )
-    .await?;
+    let (control_task, ready_rx) =
+        session_driver::start_session_payment_driver(&conn, wallet, hop_label, payment_policy)
+            .await?;
     info!("{hop_label}: waiting for funded session readiness");
     ready_rx.await.map_err(|_| {
         io::Error::new(

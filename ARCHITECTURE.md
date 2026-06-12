@@ -365,6 +365,10 @@ The relay remains authoritative for:
 
 The client combines that authoritative baseline with its own local cleartext byte counters to estimate current spend between relay status updates. A small periodic timer in the control loop checks those counters and can trigger proactive `ChannelPayment` updates before the relay sends another `SessionStatus`.
 
+The client still only treats the relay as authoritative for accepted state. The
+local estimate is used to decide how much to pay, not whether a link or payment
+has already been accepted.
+
 The developer stress harness in `monad-relay/tests/stress.rs` can also run alternate payment policies on top of the same wire protocol:
 - transport-focused mode with one huge prefunding payment per hop session
 - buffered payment mode with frequent `SessionStatus` polling and repeated `ChannelPayment` topups on one linked channel
@@ -391,6 +395,13 @@ On each relay control message, and on a small periodic timer tick, the loop can:
 - react to `ChannelEvicted`
 - classify relay `Error` messages into channel-invalidating vs non-rejecting outcomes
 - end the local session on control detach
+
+When payment is needed, the client currently plans the topup by taking the gap
+between a configured target remaining balance and the locally estimated
+remaining balance, clamping that delta to at least the configured minimum
+topup, converting into channel raw units, and then capping at the linked
+channel's remaining raw capacity. A capped non-zero payment smaller than the
+minimum is still allowed when it exactly fills the channel to capacity.
 
 Important design points:
 

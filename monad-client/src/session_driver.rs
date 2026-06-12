@@ -19,7 +19,12 @@ const DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS: u64 = 100_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaymentPolicy {
+    /// Target positive remaining balance the client tries to restore whenever
+    /// funding is needed.
     pub target_topup_buffer_msats: u64,
+    /// Lower bound for a normal individual topup. A smaller non-zero payment is
+    /// still allowed if that is exactly what fills the current channel to
+    /// capacity.
     pub minimum_topup_msats: u64,
 }
 
@@ -198,6 +203,11 @@ enum PaymentTopupPlan {
     },
 }
 
+// Starting from a client-estimated remaining balance, compute the next payment
+// target in raw channel units. The millisat delta is first clamped to at least
+// the configured minimum topup, then capped to the linked channel's remaining
+// raw capacity. If that cap is what pushes the payment below the minimum, the
+// smaller non-zero payment is still allowed when it exactly fills the channel.
 fn plan_payment_topup(
     estimated_remaining_msats: i64,
     target_remaining_msats: u64,
@@ -313,7 +323,8 @@ fn compute_estimated_remaining(
 
 // One serialized control loop handles both authoritative relay messages and
 // periodic local payment checks. Link/payment in-flight markers keep the timer
-// path from racing with message-driven funding work.
+// path from racing with message-driven funding work, so timer ticks and relay
+// messages are just two ordered inputs into the same funding logic.
 
 fn state_summary(state: &DriverState, counters: &CleartextByteCounters) -> String {
     let relay_linked = relay_linked_channel_id(state).unwrap_or("none");
