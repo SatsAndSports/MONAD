@@ -17,6 +17,7 @@ use crate::wallet::{select_channel, MonadWallet, RelayPaymentOffer, WalletChanne
 
 const DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS: u64 = 100_000_000;
 const TARGET_TOPUP_BUFFER_MSATS: u64 = 10_000_000;
+const MINIMUM_TOPUP_MSATS: u64 = 0;
 
 fn encode_client_message(message: &ClientMessage) -> io::Result<Bytes> {
     let bytes =
@@ -152,6 +153,7 @@ fn validate_session_pricing(
     Ok(())
 }
 
+#[cfg(test)]
 fn requested_delta_msats(remaining_milli_sats: i64) -> u64 {
     let target_remaining = TARGET_TOPUP_BUFFER_MSATS as i128;
     let delta = target_remaining - remaining_milli_sats as i128;
@@ -166,6 +168,61 @@ fn delta_msats_to_raw_units(unit: &str, delta_msats: u64) -> u64 {
         "msat" => delta_msats,
         "sat" => delta_msats.div_ceil(1000),
         _ => 0,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaymentTopupPlan {
+    NoPaymentNeeded,
+    ExhaustedChannel,
+    Pay {
+        requested_delta_msats: u64,
+        next_balance_raw: u64,
+        reaches_capacity: bool,
+    },
+}
+
+fn plan_payment_topup(
+    estimated_remaining_msats: i64,
+    target_remaining_msats: u64,
+    minimum_topup_msats: u64,
+    linked_channel: &LinkedChannelStatus,
+) -> PaymentTopupPlan {
+    let base_delta_msats = {
+        let delta = target_remaining_msats as i128 - estimated_remaining_msats as i128;
+        if delta <= 0 {
+            0
+        } else {
+            delta.min(u64::MAX as i128) as u64
+        }
+    };
+    if base_delta_msats == 0 {
+        return PaymentTopupPlan::NoPaymentNeeded;
+    }
+
+    let requested_delta_msats = base_delta_msats.max(minimum_topup_msats);
+    let requested_delta_raw = delta_msats_to_raw_units(&linked_channel.unit, requested_delta_msats);
+    let remaining_capacity_raw = linked_channel
+        .capacity_raw
+        .saturating_sub(linked_channel.balance_raw);
+
+    if remaining_capacity_raw == 0 {
+        return PaymentTopupPlan::ExhaustedChannel;
+    }
+
+    let actual_delta_raw = requested_delta_raw.min(remaining_capacity_raw);
+    if actual_delta_raw == 0 {
+        return PaymentTopupPlan::ExhaustedChannel;
+    }
+
+    let Some(next_balance_raw) = linked_channel.balance_raw.checked_add(actual_delta_raw) else {
+        return PaymentTopupPlan::ExhaustedChannel;
+    };
+
+    PaymentTopupPlan::Pay {
+        requested_delta_msats,
+        next_balance_raw,
+        reaches_capacity: actual_delta_raw == remaining_capacity_raw,
     }
 }
 
@@ -714,27 +771,33 @@ async fn maybe_progress_payment(
         return Ok(());
     }
 
-    let requested_delta_msats = requested_delta_msats(estimated_remaining);
-    if requested_delta_msats == 0 {
-        return Ok(());
-    }
-    let requested_delta_raw = delta_msats_to_raw_units(&linked_channel.unit, requested_delta_msats);
-    let Some(next_balance_raw) = linked_channel.balance_raw.checked_add(requested_delta_raw) else {
-        return Ok(());
-    };
+    let plan = plan_payment_topup(
+        estimated_remaining,
+        TARGET_TOPUP_BUFFER_MSATS,
+        MINIMUM_TOPUP_MSATS,
+        linked_channel,
+    );
 
-    if next_balance_raw > linked_channel.capacity_raw {
-        warn!(
-            "{} abandoning exhausted channel {}: next_balance_raw={} capacity_raw={} | {}",
-            config.hop_label,
-            intended_channel_id,
+    let (_requested_delta_msats, next_balance_raw, reaches_capacity) = match plan {
+        PaymentTopupPlan::NoPaymentNeeded => return Ok(()),
+        PaymentTopupPlan::ExhaustedChannel => {
+            warn!(
+                "{} abandoning exhausted channel {}: balance_raw={} capacity_raw={} | {}",
+                config.hop_label,
+                intended_channel_id,
+                linked_channel.balance_raw,
+                linked_channel.capacity_raw,
+                state_summary(state, &config.conn.cleartext_byte_counters)
+            );
+            abandon_intended_channel(config, state, intended_channel_id, true).await;
+            return Ok(());
+        }
+        PaymentTopupPlan::Pay {
+            requested_delta_msats,
             next_balance_raw,
-            linked_channel.capacity_raw,
-            state_summary(state, &config.conn.cleartext_byte_counters)
-        );
-        abandon_intended_channel(config, state, intended_channel_id, true).await;
-        return Ok(());
-    }
+            reaches_capacity,
+        } => (requested_delta_msats, next_balance_raw, reaches_capacity),
+    };
 
     match config.wallet.build_channel_payment(
         &intended_channel_id,
@@ -744,11 +807,12 @@ async fn maybe_progress_payment(
     ) {
         Ok(payment_json) => {
             info!(
-                "{} sending ChannelPayment for {}: remaining={} target={} next_balance_raw={} | {}",
+                "{} sending ChannelPayment for {}: remaining={} target={} reaches_capacity={} next_balance_raw={} | {}",
                 config.hop_label,
                 intended_channel_id,
                 estimated_remaining,
                 TARGET_TOPUP_BUFFER_MSATS,
+                reaches_capacity,
                 next_balance_raw,
                 state_summary(state, &config.conn.cleartext_byte_counters)
             );
@@ -974,8 +1038,8 @@ async fn run_session_driver(
 #[cfg(test)]
 mod tests {
     use super::{
-        exclude_on_wallet_error, pre_ready_blocked_error, relay_confirms_intended_channel,
-        requested_delta_msats, validate_session_pricing,
+        exclude_on_wallet_error, plan_payment_topup, pre_ready_blocked_error,
+        relay_confirms_intended_channel, requested_delta_msats, validate_session_pricing,
     };
     use super::{AuthoritativeSnapshot, DriverState, FundingBlockedReason};
     use crate::wallet::WalletError;
@@ -1071,6 +1135,93 @@ mod tests {
         assert_eq!(
             requested_delta_msats(-5),
             super::TARGET_TOPUP_BUFFER_MSATS + 5
+        );
+    }
+
+    #[test]
+    fn payment_plan_returns_no_payment_when_remaining_above_target() {
+        let linked = LinkedChannelStatus {
+            channel_id: "chan-a".to_string(),
+            balance_raw: 0,
+            capacity_raw: 100,
+            unit: "msat".to_string(),
+        };
+
+        assert_eq!(
+            plan_payment_topup(10_000_001, super::TARGET_TOPUP_BUFFER_MSATS, 0, &linked),
+            super::PaymentTopupPlan::NoPaymentNeeded,
+        );
+    }
+
+    #[test]
+    fn payment_plan_applies_minimum_topup_floor() {
+        let linked = LinkedChannelStatus {
+            channel_id: "chan-a".to_string(),
+            balance_raw: 0,
+            capacity_raw: 10_000,
+            unit: "msat".to_string(),
+        };
+
+        assert_eq!(
+            plan_payment_topup(9_999_500, super::TARGET_TOPUP_BUFFER_MSATS, 1_000, &linked),
+            super::PaymentTopupPlan::Pay {
+                requested_delta_msats: 1_000,
+                next_balance_raw: 1_000,
+                reaches_capacity: false,
+            },
+        );
+    }
+
+    #[test]
+    fn payment_plan_allows_under_minimum_when_filling_capacity() {
+        let linked = LinkedChannelStatus {
+            channel_id: "chan-a".to_string(),
+            balance_raw: 95,
+            capacity_raw: 100,
+            unit: "msat".to_string(),
+        };
+
+        assert_eq!(
+            plan_payment_topup(-5, super::TARGET_TOPUP_BUFFER_MSATS, 1_000, &linked),
+            super::PaymentTopupPlan::Pay {
+                requested_delta_msats: 10_000_005,
+                next_balance_raw: 100,
+                reaches_capacity: true,
+            },
+        );
+    }
+
+    #[test]
+    fn payment_plan_rounds_up_sat_unit() {
+        let linked = LinkedChannelStatus {
+            channel_id: "chan-a".to_string(),
+            balance_raw: 0,
+            capacity_raw: 100,
+            unit: "sat".to_string(),
+        };
+
+        assert_eq!(
+            plan_payment_topup(9_999_500, super::TARGET_TOPUP_BUFFER_MSATS, 750, &linked),
+            super::PaymentTopupPlan::Pay {
+                requested_delta_msats: 750,
+                next_balance_raw: 1,
+                reaches_capacity: false,
+            },
+        );
+    }
+
+    #[test]
+    fn payment_plan_reports_exhausted_channel() {
+        let linked = LinkedChannelStatus {
+            channel_id: "chan-a".to_string(),
+            balance_raw: 100,
+            capacity_raw: 100,
+            unit: "msat".to_string(),
+        };
+
+        assert_eq!(
+            plan_payment_topup(-5, super::TARGET_TOPUP_BUFFER_MSATS, 0, &linked),
+            super::PaymentTopupPlan::ExhaustedChannel,
         );
     }
 
