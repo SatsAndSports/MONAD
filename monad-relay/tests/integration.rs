@@ -1626,6 +1626,15 @@ async fn test_session_payment_driver_detaches_evicted_channel() {
         .expect("driver a should ready")
         .expect("driver a ready signal");
     assert!(wallet_a.attachment("shared-channel").unwrap().is_some());
+    wallet_b
+        .set_balance(
+            "shared-channel",
+            wallet_a
+                .get_channel("shared-channel")
+                .unwrap()
+                .current_signed_balance_msats,
+        )
+        .unwrap();
 
     let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
     let (driver_b, ready_b) = start_session_payment_driver(

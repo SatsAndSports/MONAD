@@ -301,6 +301,65 @@ fn relay_confirms_intended_channel(state: &DriverState) -> bool {
         && state.intended_channel_id.as_deref() == relay_linked_channel_id(state)
 }
 
+// Convert the locally stored signed balance into the channel's raw unit so it
+// can be compared directly against relay-reported `linked_channel.balance_raw`.
+fn channel_signed_balance_raw(channel: &WalletChannel) -> Result<u64, WalletError> {
+    match channel.unit.as_str() {
+        "msat" => Ok(channel.current_signed_balance_msats),
+        "sat" => Ok(channel.current_signed_balance_msats.div_ceil(1000)),
+        other => Err(WalletError::OfferMismatch(format!(
+            "unsupported unit: {other}"
+        ))),
+    }
+}
+
+// The relay is allowed to report the currently linked channel and its accepted
+// balance, but it must not claim a balance higher than the client has ever
+// signed locally for that same channel.
+//
+// If the relay could inflate `linked_channel.balance_raw`, it could trick the
+// client into building the next `ChannelPayment` from an artificially large
+// baseline, causing overpayment or premature channel exhaustion.
+//
+// Treat that as a protocol violation and fail the session.
+fn validate_linked_channel_balance_against_wallet(
+    wallet: &dyn MonadWallet,
+    state: &DriverState,
+) -> io::Result<()> {
+    let Some(intended_channel_id) = state.intended_channel_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(snapshot) = state.snapshot.as_ref() else {
+        return Ok(());
+    };
+    let Some(linked_channel) = snapshot.linked_channel.as_ref() else {
+        return Ok(());
+    };
+    if linked_channel.channel_id != intended_channel_id {
+        return Ok(());
+    }
+
+    let channel = wallet
+        .get_channel(intended_channel_id)
+        .map_err(|e| io::Error::other(format!("wallet channel lookup failed: {e}")))?;
+    let local_signed_balance_raw = channel_signed_balance_raw(&channel)
+        .map_err(|e| io::Error::other(format!("wallet channel balance conversion failed: {e}")))?;
+
+    if linked_channel.balance_raw > local_signed_balance_raw {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "protocol violation: relay reported linked balance_raw={} above client local signed balance_raw={} for channel {}",
+                linked_channel.balance_raw,
+                local_signed_balance_raw,
+                linked_channel.channel_id,
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 fn compute_estimated_remaining(
     state: &DriverState,
     counters: &CleartextByteCounters,
@@ -1011,6 +1070,13 @@ async fn run_session_driver(
                             );
                             publish_pricing(&config, pricing).await;
                             publish_spilman_info(&config, &state).await;
+                            // Reject relay-reported linked balances that exceed
+                            // the client's own signed channel state before
+                            // using that balance as a payment baseline.
+                            validate_linked_channel_balance_against_wallet(
+                                config.wallet.as_ref(),
+                                &state,
+                            )?;
                             if !paused {
                                 signal_ready(&mut state, &mut ready_tx).await;
                             }
@@ -1065,8 +1131,9 @@ async fn run_session_driver(
 #[cfg(test)]
 mod tests {
     use super::{
-        exclude_on_wallet_error, plan_payment_topup, pre_ready_blocked_error,
-        relay_confirms_intended_channel, requested_delta_msats, validate_session_pricing,
+        channel_signed_balance_raw, exclude_on_wallet_error, plan_payment_topup,
+        pre_ready_blocked_error, relay_confirms_intended_channel, requested_delta_msats,
+        validate_linked_channel_balance_against_wallet, validate_session_pricing,
     };
     use super::{AuthoritativeSnapshot, DriverState, FundingBlockedReason, PaymentPolicy};
     use crate::wallet::WalletError;
@@ -1118,6 +1185,78 @@ mod tests {
         };
 
         assert!(relay_confirms_intended_channel(&state));
+    }
+
+    #[test]
+    fn channel_signed_balance_raw_matches_msat_and_sat_units() {
+        let msat_channel = crate::wallet::WalletChannel {
+            channel_id: "chan-msat".to_string(),
+            state: crate::wallet::WalletChannelState::Open,
+            receiver_pubkey: "receiver".to_string(),
+            mint_url: "https://mint".to_string(),
+            unit: "msat".to_string(),
+            keyset_id: "keyset-a".to_string(),
+            attached_session_id: None,
+            capacity_msats: 10,
+            current_signed_balance_msats: 7,
+        };
+        let sat_channel = crate::wallet::WalletChannel {
+            channel_id: "chan-sat".to_string(),
+            state: crate::wallet::WalletChannelState::Open,
+            receiver_pubkey: "receiver".to_string(),
+            mint_url: "https://mint".to_string(),
+            unit: "sat".to_string(),
+            keyset_id: "keyset-a".to_string(),
+            attached_session_id: None,
+            capacity_msats: 2_000,
+            current_signed_balance_msats: 1_001,
+        };
+
+        assert_eq!(channel_signed_balance_raw(&msat_channel).unwrap(), 7);
+        assert_eq!(channel_signed_balance_raw(&sat_channel).unwrap(), 2);
+    }
+
+    #[test]
+    fn validate_linked_channel_balance_rejects_relay_balance_above_local_signed_balance() {
+        let wallet = crate::wallet::MockWallet::new();
+        wallet
+            .insert_channel(crate::wallet::WalletChannel {
+                channel_id: "chan-a".to_string(),
+                state: crate::wallet::WalletChannelState::Open,
+                receiver_pubkey: "receiver".to_string(),
+                mint_url: "https://mint".to_string(),
+                unit: "msat".to_string(),
+                keyset_id: "keyset-a".to_string(),
+                attached_session_id: None,
+                capacity_msats: 100,
+                current_signed_balance_msats: 7,
+            })
+            .unwrap();
+        let state = DriverState {
+            intended_channel_id: Some("chan-a".to_string()),
+            snapshot: Some(AuthoritativeSnapshot {
+                receiver_pubkey: "receiver".to_string(),
+                advertisements: vec![],
+                linked_channel: Some(LinkedChannelStatus {
+                    channel_id: "chan-a".to_string(),
+                    balance_raw: 8,
+                    capacity_raw: 100,
+                    unit: "msat".to_string(),
+                }),
+                session_total_in: 0,
+                session_total_out: 0,
+                total_paid_millisats: 0,
+                remaining_milli_sats: 0,
+                paused: true,
+            }),
+            ..DriverState::default()
+        };
+
+        let err = validate_linked_channel_balance_against_wallet(&wallet, &state).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains(
+            "relay reported linked balance_raw=8 above client local signed balance_raw=7"
+        ));
     }
 
     #[test]
