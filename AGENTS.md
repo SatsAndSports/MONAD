@@ -81,6 +81,7 @@ cargo run -p monad-quic -- ...
 - `monad-client` library now has a wallet abstraction plus per-session payment driver.
 - client steady-state control/payment behavior now lives in a direct imperative control loop in `session_driver.rs`; the relay stays authoritative for linked channel / accepted balance / pause state, while the client uses its local cleartext counters to size payments against the latest authoritative relay baseline.
 - channel-payment sizing now follows an explicit target/minimum-topup policy in that control loop: the client computes a local estimated remaining balance, clamps the desired refill to at least the configured minimum topup, then caps it at the linked channel's remaining raw capacity.
+- the main client no longer needs frequent `GetSessionStatus` polling for payment sizing; the relay stress harness and `monad-test-client` still poll periodically for load generation, health checks, and observability.
 - `connector.rs` uses `MockWallet` + `session_driver` so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` flow.
 - the `monad-client` binary intentionally exits early until the real wallet backend exists.
 - relay-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.

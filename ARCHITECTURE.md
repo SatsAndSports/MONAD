@@ -369,7 +369,7 @@ The client still only treats the relay as authoritative for accepted state. The
 local estimate is used to decide how much to pay, not whether a link or payment
 has already been accepted.
 
-The developer stress harness in `monad-relay/tests/stress.rs` can also run alternate payment policies on top of the same wire protocol:
+The developer stress harness in `monad-relay/tests/stress.rs` can also run alternate payment policies on top of the same wire protocol. Unlike the main client, those stress modes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load:
 - transport-focused mode with one huge prefunding payment per hop session
 - buffered payment mode with frequent `SessionStatus` polling and repeated `ChannelPayment` topups on one linked channel
 - relink-buffered mode that provisions and links a fresh mocked channel when the current one lacks capacity for the next refill

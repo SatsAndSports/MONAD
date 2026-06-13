@@ -80,7 +80,7 @@ The `Makefile` also includes named manual stress recipes for:
 - repeated `ChannelPayment` stress on one linked channel (`make stress-payment-buffered`)
 - repeated relink stress with one active channel per session at a time (`make stress-payment-relink`)
 
-These stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI.
+These stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
 
 Current coverage includes:
 - Noise handshake and large-payload transport tests

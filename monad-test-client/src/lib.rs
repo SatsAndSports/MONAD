@@ -681,6 +681,10 @@ async fn start_auto_control(
         let mut last_status_requested_at: Option<Instant> = None;
         let mut was_usable = false;
         let mut status_request_in_flight = false;
+        // This polling path is primarily for health checks and observability.
+        // Unlike the main client, the test harness still sends periodic
+        // `GetSessionStatus` requests so it can detect stalled control channels
+        // and log fresh authoritative hop state while circuits stay alive.
         let mut interval = config.status_interval.map(time::interval);
         if let Some(interval) = interval.as_mut() {
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
