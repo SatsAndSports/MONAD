@@ -285,7 +285,7 @@ At intermediate hops in a nested route, the inner hop connection is itself just 
 
 ### Wire Format
 
-Control messages are JSON objects, newline-delimited, exchanged over the H2 control stream (`POST /control`). Each message is a single JSON line terminated by `\n`.
+Control messages are JSON objects, newline-delimited, exchanged over the H2 control stream (`POST /control`). Each message is a single compact JSON line terminated by `\n`. Blank lines are not protocol-significant and are ignored defensively by both sides' parsers.
 
 ### Message Types
 
