@@ -228,12 +228,33 @@ The test suite currently covers:
   - one large-capacity channel per session
   - repeated `ChannelPayment` topups on that same channel
   - frequent `SessionStatus` polling to drive buffered refills
+  - expected summary pattern:
+    - `channel_relinks_total=0`
+    - `max_links_on_one_session=1`
+    - `topups_proactive` should dominate `topups_reactive`
+    - `payment_no_new_funds=0` or near-zero
+    - `pause_events` should stay rare
+    - `failures=0` and `control_errors=0`
   - high `ulimit -n` expected
 - `make stress-payment-relink` is the current stable relink-focused recipe:
   - one active channel per session at a time
   - fresh mocked channel provisioned and linked when the current channel lacks capacity for the next refill
   - repeated buffered `ChannelPayment` topups continue on the newly linked channel
+  - expected summary pattern:
+    - `channel_relinks_total` should be high
+    - `channel_link_failures=0`
+    - most or all sessions should relink at least once over a meaningful run
+    - `topups_proactive` should dominate `topups_reactive`
+    - `pause_events` should stay rare
+    - `failures=0` and `control_errors=0`
   - high `ulimit -n` expected
+
+### Stress Result Reading
+
+- `stress-transport-extreme` should usually show only large initial prefunding, little or no follow-up payment traffic, and `failures=0` / `control_errors=0`.
+- `stress-payment-buffered` should usually keep one linked channel per session and produce many proactive topups with little or no relink activity.
+- `stress-payment-relink` should usually produce many successful relinks with little or no link failures and only rare pauses.
+- small amounts of pause/recovery activity can still be acceptable because chunk-boundary overshoot is allowed, but repeated control errors, repeated `payment_no_new_funds`, or non-zero `channel_link_failures` are warning signs worth investigating.
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
 
