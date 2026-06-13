@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use monad_client::socks;
 use monad_client::wallet::{MockWallet, MonadWallet, RelayPaymentOffer, WalletError};
+use monad_common::control_codec::{send_json_line, try_decode_json_line};
 use monad_common::noise_secp256k1;
 use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::quic_cert_identity::QuicCertIdentity;
@@ -54,8 +55,6 @@ pub struct CircuitConfig {
     pub status_interval: Option<Duration>,
     pub status_timeout: Duration,
     pub mock_channel_capacity_msats: u64,
-    pub target_topup_buffer_msats: u64,
-    pub minimum_topup_msats: u64,
 }
 
 impl Default for CircuitConfig {
@@ -64,8 +63,6 @@ impl Default for CircuitConfig {
             status_interval: Some(Duration::from_secs(5)),
             status_timeout: Duration::from_secs(15),
             mock_channel_capacity_msats: DEFAULT_MOCK_CHANNEL_CAPACITY_MSATS,
-            target_topup_buffer_msats: 10_000_000,
-            minimum_topup_msats: 0,
         }
     }
 }
@@ -1036,16 +1033,7 @@ async fn send_control_message(
     h2_send: &mut h2::SendStream<bytes::Bytes>,
     message: &ClientMessage,
 ) -> io::Result<()> {
-    let bytes =
-        serde_json::to_vec(message).map_err(|e| io::Error::other(format!("json error: {e}")))?;
-    let mut frame = Vec::with_capacity(bytes.len() + 1);
-    frame.extend_from_slice(&bytes);
-    frame.push(b'\n');
-    h2_send.reserve_capacity(frame.len());
-    monad_common::h2stream::wait_for_send_capacity(h2_send).await?;
-    h2_send
-        .send_data(bytes::Bytes::from(frame), false)
-        .map_err(|e| io::Error::other(format!("h2 send error: {e}")))
+    send_json_line(h2_send, message).await
 }
 
 async fn read_control_message(
@@ -1053,16 +1041,8 @@ async fn read_control_message(
     buf: &mut Vec<u8>,
 ) -> io::Result<Option<ServerMessage>> {
     loop {
-        if let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buf.drain(..=newline_pos).collect();
-            let line = line.trim_ascii();
-            if line.is_empty() {
-                continue;
-            }
-            let msg = serde_json::from_slice::<ServerMessage>(line).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("invalid message: {e}"))
-            })?;
-            return Ok(Some(msg));
+        if let Some(message) = try_decode_json_line::<ServerMessage>(buf)? {
+            return Ok(Some(message));
         }
 
         match h2_recv.data().await {

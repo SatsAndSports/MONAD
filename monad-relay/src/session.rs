@@ -16,7 +16,7 @@ use bytes::Bytes;
 use cashu::nuts::SecretKey;
 use h2::server;
 use http::{Method, Response, StatusCode};
-use monad_common::h2stream::wait_for_send_capacity;
+use monad_common::control_codec::{send_json_line, try_decode_json_line};
 use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerErrorCode, ServerMessage};
 use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::{clamp_i128_to_i64, SessionPricing};
@@ -663,25 +663,11 @@ fn is_expected_control_channel_error(error: &io::Error) -> bool {
         || message.contains("error 0")
 }
 
-fn encode_server_message(message: &ServerMessage) -> io::Result<Bytes> {
-    let bytes =
-        serde_json::to_vec(message).map_err(|e| io::Error::other(format!("json error: {e}")))?;
-    let mut frame = Vec::with_capacity(bytes.len() + 1);
-    frame.extend_from_slice(&bytes);
-    frame.push(b'\n');
-    Ok(Bytes::from(frame))
-}
-
 async fn send_control_message(
     h2_send: &mut h2::SendStream<Bytes>,
     message: &ServerMessage,
 ) -> io::Result<()> {
-    let frame = encode_server_message(message)?;
-    h2_send.reserve_capacity(frame.len());
-    wait_for_send_capacity(h2_send).await?;
-    h2_send
-        .send_data(frame, false)
-        .map_err(|e| io::Error::other(format!("h2 send error: {e}")))
+    send_json_line(h2_send, message).await
 }
 
 /// Handle a long-lived control stream for one paid relay session.
@@ -731,39 +717,10 @@ async fn handle_control_stream(
                         let _ = h2_recv.flow_control().release_capacity(len);
                         buf.extend_from_slice(&data);
 
-                        while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
-                            let line: Vec<u8> = buf.drain(..=newline_pos).collect();
-                            let line = line.trim_ascii();
-
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            match serde_json::from_slice::<ClientMessage>(line) {
-                                Ok(ClientMessage::GetSessionStatus) => {
-                                    terminate_session = process_session_event(
-                                        &state,
-                                        SessionEvent::ClientGetSessionStatus,
-                                        &mut h2_send,
-                                    )
-                                    .await?;
-                                }
-                                Ok(ClientMessage::ChannelLink { payment_json }) => {
-                                    terminate_session = process_session_event(
-                                        &state,
-                                        SessionEvent::ClientChannelLink { payment_json },
-                                        &mut h2_send,
-                                    )
-                                    .await?;
-                                }
-                                Ok(ClientMessage::ChannelPayment { payment_json }) => {
-                                    terminate_session = process_session_event(
-                                        &state,
-                                        SessionEvent::ClientChannelPayment { payment_json },
-                                        &mut h2_send,
-                                    )
-                                    .await?;
-                                }
+                        loop {
+                            let message = match try_decode_json_line::<ClientMessage>(&mut buf) {
+                                Ok(Some(message)) => message,
+                                Ok(None) => break,
                                 Err(e) => {
                                     warn!("control: invalid message: {e}");
                                     let err_msg = ServerMessage::Error {
@@ -771,6 +728,34 @@ async fn handle_control_stream(
                                         message: format!("invalid message: {e}"),
                                     };
                                     send_control_message(&mut h2_send, &err_msg).await?;
+                                    continue;
+                                }
+                            };
+
+                            match message {
+                                ClientMessage::GetSessionStatus => {
+                                    terminate_session = process_session_event(
+                                        &state,
+                                        SessionEvent::ClientGetSessionStatus,
+                                        &mut h2_send,
+                                    )
+                                    .await?;
+                                }
+                                ClientMessage::ChannelLink { payment_json } => {
+                                    terminate_session = process_session_event(
+                                        &state,
+                                        SessionEvent::ClientChannelLink { payment_json },
+                                        &mut h2_send,
+                                    )
+                                    .await?;
+                                }
+                                ClientMessage::ChannelPayment { payment_json } => {
+                                    terminate_session = process_session_event(
+                                        &state,
+                                        SessionEvent::ClientChannelPayment { payment_json },
+                                        &mut h2_send,
+                                    )
+                                    .await?;
                                 }
                             }
 

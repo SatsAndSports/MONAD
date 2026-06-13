@@ -1,8 +1,13 @@
+use monad_common::payment_units::{
+    msats_to_raw_units as common_msats_to_raw_units,
+    raw_units_to_msats as common_raw_units_to_msats,
+};
 use monad_common::protocol::KeysetAdvertisement;
 use rand::RngCore;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -645,25 +650,15 @@ fn raw_amounts_for_channel(
 }
 
 fn msats_to_raw_units(unit: &str, amount_msats: u64) -> Result<u64, WalletError> {
-    match unit {
-        "msat" => Ok(amount_msats),
-        "sat" => Ok(amount_msats.div_ceil(1000)),
-        other => Err(WalletError::OfferMismatch(format!(
-            "unsupported unit: {other}"
-        ))),
-    }
+    common_msats_to_raw_units(unit, amount_msats)
+        .map_err(|e| WalletError::OfferMismatch(e.to_string()))
 }
 
 fn raw_to_msats(unit: &str, amount_raw: u64) -> Result<u64, WalletError> {
-    match unit {
-        "msat" => Ok(amount_raw),
-        "sat" => amount_raw
-            .checked_mul(1000)
-            .ok_or_else(|| WalletError::Backend("raw amount overflow".to_string())),
-        other => Err(WalletError::OfferMismatch(format!(
-            "unsupported unit: {other}"
-        ))),
-    }
+    common_raw_units_to_msats(unit, amount_raw).map_err(|e| match e.kind() {
+        io::ErrorKind::InvalidInput => WalletError::OfferMismatch(e.to_string()),
+        _ => WalletError::Backend(e.to_string()),
+    })
 }
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
 pub mod blinded_hop;
 pub mod bootstrap;
+pub mod control_codec;
 pub mod h2stream;
 pub mod noise_secp256k1;
+pub mod payment_units;
 pub mod protocol;
 pub mod proxy;
 pub mod quic_cert_identity;

@@ -1,0 +1,274 @@
+use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus};
+use monad_common::proxy::CleartextByteCounters;
+use monad_common::session::{RelayConnection, SessionPricing, SessionSpilmanInfo};
+use std::collections::BTreeSet;
+use std::io;
+use std::sync::Arc;
+use tokio::sync::oneshot;
+use tracing::warn;
+
+use crate::session_driver::PaymentPolicy;
+use crate::wallet::{MonadWallet, RelayPaymentOffer};
+
+#[derive(Clone)]
+pub(super) struct SessionDriverConfig {
+    pub(super) wallet: Arc<dyn MonadWallet>,
+    pub(super) conn: RelayConnectionHandles,
+    pub(super) hop_label: String,
+    pub(super) payment_policy: PaymentPolicy,
+}
+
+#[derive(Clone)]
+pub(super) struct RelayConnectionHandles {
+    pub(super) session_id: [u8; 32],
+    pub(super) pricing_handle: Arc<tokio::sync::RwLock<Option<SessionPricing>>>,
+    pub(super) spilman_info_handle: Arc<tokio::sync::RwLock<Option<SessionSpilmanInfo>>>,
+    pub(super) cleartext_byte_counters: CleartextByteCounters,
+}
+
+impl From<&RelayConnection> for RelayConnectionHandles {
+    fn from(conn: &RelayConnection) -> Self {
+        Self {
+            session_id: *conn.session_id(),
+            pricing_handle: conn.session_pricing_handle(),
+            spilman_info_handle: conn.session_spilman_info_handle(),
+            cleartext_byte_counters: conn.cleartext_byte_counters(),
+        }
+    }
+}
+
+// Latest control snapshot reported by the relay.
+//
+// This is relay-reported state, not a blanket trust boundary. The client uses
+// some fields here as authoritative coordination state (for example pause state
+// and the relay-reported linked channel), but it prioritizes its own local byte
+// counters and locally authorized session-paid total when sizing payments.
+//
+// In particular, the client does not use relay `session_total_in` for payment
+// math, because inbound bytes may legitimately be observed by the relay before
+// the client has drained them locally. The field is still retained for
+// diagnostics and relay-state visibility.
+#[derive(Debug, Clone)]
+pub(super) struct RelaySnapshot {
+    pub(super) receiver_pubkey: String,
+    pub(super) advertisements: Vec<KeysetAdvertisement>,
+    pub(super) linked_channel: Option<LinkedChannelStatus>,
+    pub(super) session_total_in: u64,
+    pub(super) session_total_out: u64,
+    pub(super) total_paid_millisats: u64,
+    pub(super) remaining_milli_sats: i64,
+    pub(super) paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ControlOpInFlight {
+    Link { channel_id: String },
+    Payment { channel_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FundingBlockedReason {
+    ChannelAcquire,
+    LinkRequestBuild,
+    PaymentRequestBuild,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DriverState {
+    pub(super) relay_snapshot: Option<RelaySnapshot>,
+    pub(super) established_pricing: Option<SessionPricing>,
+    pub(super) local_session_paid_msats: u64,
+    pub(super) intended_channel_id: Option<String>,
+    pub(super) intended_offer: Option<RelayPaymentOffer>,
+    pub(super) session_excluded_channels: BTreeSet<String>,
+    pub(super) control_op_in_flight: Option<ControlOpInFlight>,
+    pub(super) funding_blocked_reason: Option<FundingBlockedReason>,
+    pub(super) ready_signaled: bool,
+    pub(super) terminated: bool,
+}
+
+pub(super) fn relay_linked_channel_id(state: &DriverState) -> Option<&str> {
+    state
+        .relay_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.linked_channel.as_ref())
+        .map(|channel| channel.channel_id.as_str())
+}
+
+pub(super) fn session_is_paused(state: &DriverState) -> bool {
+    state
+        .relay_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.paused)
+}
+
+pub(super) fn relay_confirms_intended_channel(state: &DriverState) -> bool {
+    state.intended_channel_id.is_some()
+        && state.intended_channel_id.as_deref() == relay_linked_channel_id(state)
+}
+
+pub(super) fn state_summary(state: &DriverState, counters: &CleartextByteCounters) -> String {
+    let relay_linked = relay_linked_channel_id(state).unwrap_or("none");
+    let intended = state.intended_channel_id.as_deref().unwrap_or("none");
+    let paused = state
+        .relay_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.paused);
+    let remaining = state
+        .relay_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.remaining_milli_sats.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let relay_in = state
+        .relay_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.session_total_in.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let relay_out = state
+        .relay_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.session_total_out.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let local_remaining = super::payment::compute_estimated_remaining(state, counters)
+        .map(|remaining| remaining.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "paused={} remaining={} local_remaining={} relay_in={} relay_out={} relay_linked={} intended={} op={:?} blocked={:?} ready={}",
+        paused,
+        remaining,
+        local_remaining,
+        relay_in,
+        relay_out,
+        relay_linked,
+        intended,
+        state.control_op_in_flight,
+        state.funding_blocked_reason,
+        state.ready_signaled,
+    )
+}
+
+pub(super) fn current_spilman_info(state: &DriverState) -> Option<SessionSpilmanInfo> {
+    if let Some(offer) = &state.intended_offer {
+        return Some(SessionSpilmanInfo {
+            receiver_pubkey: offer.receiver_pubkey.clone(),
+            mint_url: offer.mint_url.clone(),
+            unit: offer.unit.clone(),
+            keyset_id: offer
+                .accepted_keyset_ids
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            keyset_info_json: String::new(),
+        });
+    }
+
+    let snapshot = state.relay_snapshot.as_ref()?;
+    let advertisement = snapshot.advertisements.first()?;
+    Some(SessionSpilmanInfo {
+        receiver_pubkey: snapshot.receiver_pubkey.clone(),
+        mint_url: advertisement.mint_url.clone(),
+        unit: advertisement.unit.clone(),
+        keyset_id: advertisement
+            .keyset_ids
+            .first()
+            .cloned()
+            .unwrap_or_default(),
+        keyset_info_json: String::new(),
+    })
+}
+
+pub(super) async fn publish_spilman_info(config: &SessionDriverConfig, state: &DriverState) {
+    *config.conn.spilman_info_handle.write().await = current_spilman_info(state);
+}
+
+pub(super) async fn publish_pricing(config: &SessionDriverConfig, pricing: SessionPricing) {
+    *config.conn.pricing_handle.write().await = Some(pricing);
+}
+
+fn clear_resolved_control_op_on_status(state: &mut DriverState) -> bool {
+    let resolved_payment = matches!(
+        state.control_op_in_flight,
+        Some(ControlOpInFlight::Payment { .. })
+    );
+    if matches!(
+        state.control_op_in_flight,
+        Some(ControlOpInFlight::Link { .. }) | Some(ControlOpInFlight::Payment { .. })
+    ) {
+        state.control_op_in_flight = None;
+    }
+    resolved_payment
+}
+
+pub(super) fn clear_channel_control_op(state: &mut DriverState, channel_id: &str) {
+    match &state.control_op_in_flight {
+        Some(ControlOpInFlight::Link {
+            channel_id: in_flight_channel,
+        })
+        | Some(ControlOpInFlight::Payment {
+            channel_id: in_flight_channel,
+        }) if in_flight_channel == channel_id => {
+            state.control_op_in_flight = None;
+        }
+        _ => {}
+    }
+}
+
+pub(super) async fn signal_ready(
+    state: &mut DriverState,
+    ready_tx: &mut Option<oneshot::Sender<()>>,
+) {
+    if !state.ready_signaled {
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(());
+        }
+        state.ready_signaled = true;
+    }
+}
+
+pub(super) fn set_blocked_reason(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    reason: FundingBlockedReason,
+    detail: &str,
+) -> io::Result<()> {
+    warn!(
+        "{} funding blocked: {:?} ({detail})",
+        config.hop_label, reason
+    );
+    state.funding_blocked_reason = Some(reason.clone());
+    if !state.ready_signaled {
+        return Err(io::Error::other(format!(
+            "session funding blocked before readiness: {:?} ({detail})",
+            reason,
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn pre_ready_blocked_error(
+    ready_tx: &Option<oneshot::Sender<()>>,
+    previous_blocked_reason: Option<FundingBlockedReason>,
+    next_state: &DriverState,
+) -> Option<io::Error> {
+    if ready_tx.is_none()
+        || previous_blocked_reason == next_state.funding_blocked_reason
+        || next_state.funding_blocked_reason.is_none()
+    {
+        return None;
+    }
+
+    let blocked_reason = next_state.funding_blocked_reason.as_ref().unwrap();
+    Some(io::Error::other(format!(
+        "session funding blocked before readiness: {:?}",
+        blocked_reason,
+    )))
+}
+
+// A `SessionStatus` both refreshes the relay-authoritative baseline and clears
+// any link/payment operation that was waiting for the next status update.
+pub(super) fn apply_session_status(state: &mut DriverState, snapshot: RelaySnapshot) -> bool {
+    let resolved_payment = clear_resolved_control_op_on_status(state);
+    state.relay_snapshot = Some(snapshot);
+    resolved_payment
+}

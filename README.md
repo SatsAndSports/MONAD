@@ -116,6 +116,25 @@ Current coverage includes:
 - relay advertises multiple mint/unit pricing options
 - control detach releases linked channels and tears down active / future streams
 
+## Payment Code Map
+
+The canonical client funding implementation lives in `monad-client/src/session_driver/`:
+
+- `session_driver.rs` exposes `PaymentPolicy` and `start_session_payment_driver(...)`
+- `runtime.rs` runs the serialized control loop
+- `state.rs` holds local driver state and publishing helpers
+- `funding.rs` handles channel selection, link, payment, eviction, and recovery
+- `payment.rs` holds payment math and relay/client safety checks
+
+Shared protocol helpers used by client, relay, and harness code live in:
+
+- `monad-common/src/control_codec.rs` for newline-delimited control messages
+- `monad-common/src/payment_units.rs` for `msat` / `sat` raw-unit conversion
+
+For maintainers, the most focused reference is `docs/payments.md`. `ARCHITECTURE.md`
+stays the higher-level protocol overview, and `WALLET.md` covers wallet/backend
+responsibilities.
+
 ## Transport Identities
 
 MONAD transport now uses secp256k1 identities throughout:

@@ -1,6 +1,8 @@
 use monad_client::connector::{Hop, HopIdentity};
 use monad_client::wallet::{MockWallet, MonadWallet, RelayPaymentOffer};
+use monad_common::control_codec::{send_json_line, try_decode_json_line};
 use monad_common::noise_secp256k1;
+use monad_common::payment_units::msats_to_raw_units;
 use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
@@ -363,14 +365,6 @@ fn pick_target(
     &targets[global_stream_idx % targets.len()]
 }
 
-fn msats_to_raw_units(unit: &str, msats: u64) -> u64 {
-    match unit {
-        "msat" => msats,
-        "sat" => msats.div_ceil(1000),
-        _ => 0,
-    }
-}
-
 fn next_balance_raw_for_delta(
     current_balance_raw: u64,
     capacity_raw: u64,
@@ -378,7 +372,7 @@ fn next_balance_raw_for_delta(
     delta_msats: u64,
 ) -> u64 {
     current_balance_raw
-        .saturating_add(msats_to_raw_units(unit, delta_msats))
+        .saturating_add(msats_to_raw_units(unit, delta_msats).unwrap_or(0))
         .min(capacity_raw)
 }
 
@@ -537,16 +531,7 @@ async fn send_control_message(
     h2_send: &mut h2::SendStream<bytes::Bytes>,
     message: &ClientMessage,
 ) -> io::Result<()> {
-    let bytes =
-        serde_json::to_vec(message).map_err(|e| io::Error::other(format!("json error: {e}")))?;
-    let mut frame = Vec::with_capacity(bytes.len() + 1);
-    frame.extend_from_slice(&bytes);
-    frame.push(b'\n');
-    h2_send.reserve_capacity(frame.len());
-    monad_common::h2stream::wait_for_send_capacity(h2_send).await?;
-    h2_send
-        .send_data(bytes::Bytes::from(frame), false)
-        .map_err(|e| io::Error::other(format!("h2 send error: {e}")))
+    send_json_line(h2_send, message).await
 }
 
 async fn read_control_message(
@@ -554,16 +539,8 @@ async fn read_control_message(
     buf: &mut Vec<u8>,
 ) -> io::Result<Option<ServerMessage>> {
     loop {
-        if let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buf.drain(..=newline_pos).collect();
-            let line = line.trim_ascii();
-            if line.is_empty() {
-                continue;
-            }
-            let msg = serde_json::from_slice::<ServerMessage>(line).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("invalid message: {e}"))
-            })?;
-            return Ok(Some(msg));
+        if let Some(message) = try_decode_json_line::<ServerMessage>(buf)? {
+            return Ok(Some(message));
         }
 
         match h2_recv.data().await {
@@ -820,7 +797,8 @@ async fn start_huge_funding_control(
                                 None
                             } else if needs_reactive_topup || needs_proactive_topup {
                                 let desired_next_balance_raw = base_balance_raw.saturating_add(
-                                    msats_to_raw_units(&linked.unit, payment.payment_chunk_msats),
+                                    msats_to_raw_units(&linked.unit, payment.payment_chunk_msats)
+                                        .unwrap_or(0),
                                 );
                                 if payment.mode == StressPaymentMode::RelinkBuffered
                                     && desired_next_balance_raw > linked.capacity_raw

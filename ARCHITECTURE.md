@@ -378,6 +378,19 @@ The developer stress harness in `monad-relay/tests/stress.rs` can also run alter
 
 After the control stream is established and the initial `SessionStatus` arrives, steady-state client behavior is handled by one serialized direct control loop in `monad-client/src/session_driver.rs`.
 
+The current code is organized as:
+
+- `monad-client/src/session_driver.rs` - public entrypoints only
+- `monad-client/src/session_driver/runtime.rs` - executor loop and input ordering
+- `monad-client/src/session_driver/state.rs` - local driver state and publishing helpers
+- `monad-client/src/session_driver/funding.rs` - channel acquisition / link / payment progression
+- `monad-client/src/session_driver/payment.rs` - payment math and protocol-safety checks
+
+Shared control-stream framing and raw-unit conversion helpers are intentionally
+kept out of the client driver and live in `monad-common/src/control_codec.rs`
+and `monad-common/src/payment_units.rs` so relay and harness code use the same
+wire framing and `msat` / `sat` conversions.
+
 That loop keeps small local state for:
 
 - the latest relay-authoritative session snapshot
@@ -412,6 +425,11 @@ Important design points:
 - the startup oneshot waiter is executor-only coordination, not session state
 - a parent session collapse still indirectly ends deeper nested client sessions via
   transport teardown rather than explicit tree-walking
+
+The canonical maintainer reference for this code path is `docs/payments.md`.
+The stress harness and localhost test client intentionally keep separate control
+orchestration for observability and alternate payment modes, but they are not the
+source of truth for main client funding behavior.
 
 ### Server Session FSM
 

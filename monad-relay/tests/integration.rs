@@ -19,6 +19,7 @@ use monad_client::connector::{self, Hop, HopIdentity};
 use monad_client::session_driver::start_session_payment_driver;
 use monad_client::tunnel;
 use monad_client::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
+use monad_common::control_codec::{encode_json_line, try_decode_json_line};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise_secp256k1;
 use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
@@ -479,23 +480,18 @@ async fn send_control_message(
     message: &ClientMessage,
     end_stream: bool,
 ) {
-    let bytes = serde_json::to_vec(message).unwrap();
-    let mut frame = Vec::with_capacity(bytes.len() + 1);
-    frame.extend_from_slice(&bytes);
-    frame.push(b'\n');
-
+    let frame = encode_json_line(message).unwrap();
     h2_send.reserve_capacity(frame.len());
     wait_for_send_capacity(h2_send).await.unwrap();
-    h2_send.send_data(Bytes::from(frame), end_stream).unwrap();
+    h2_send.send_data(frame, end_stream).unwrap();
 }
 
 async fn read_control_message(h2_recv: &mut h2::RecvStream) -> ServerMessage {
     let mut response_buf = Vec::new();
 
     loop {
-        if let Some(newline_pos) = response_buf.iter().position(|&b| b == b'\n') {
-            let line = &response_buf[..newline_pos];
-            return serde_json::from_slice(line).unwrap();
+        if let Some(message) = try_decode_json_line::<ServerMessage>(&mut response_buf).unwrap() {
+            return message;
         }
 
         let chunk = h2_recv
