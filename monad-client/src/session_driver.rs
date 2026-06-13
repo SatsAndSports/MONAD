@@ -107,8 +107,19 @@ impl From<&RelayConnection> for RelayConnectionProxy {
     }
 }
 
+// Latest control snapshot reported by the relay.
+//
+// This is relay-reported state, not a blanket trust boundary. The client uses
+// some fields here as authoritative coordination state (for example pause state
+// and the relay-reported linked channel), but it prioritizes its own local byte
+// counters and locally authorized session-paid total when sizing payments.
+//
+// In particular, the client does not use relay `session_total_in` for payment
+// math, because inbound bytes may legitimately be observed by the relay before
+// the client has drained them locally. The field is still retained for
+// diagnostics and relay-state visibility.
 #[derive(Debug, Clone)]
-struct AuthoritativeSnapshot {
+struct RelaySnapshot {
     receiver_pubkey: String,
     advertisements: Vec<KeysetAdvertisement>,
     linked_channel: Option<LinkedChannelStatus>,
@@ -134,8 +145,9 @@ enum FundingBlockedReason {
 
 #[derive(Debug, Default)]
 struct DriverState {
-    snapshot: Option<AuthoritativeSnapshot>,
+    snapshot: Option<RelaySnapshot>,
     established_pricing: Option<SessionPricing>,
+    local_session_paid_msats: u64,
     intended_channel_id: Option<String>,
     intended_offer: Option<RelayPaymentOffer>,
     session_excluded_channels: BTreeSet<String>,
@@ -313,6 +325,18 @@ fn channel_signed_balance_raw(channel: &WalletChannel) -> Result<u64, WalletErro
     }
 }
 
+fn raw_amount_to_msats(unit: &str, amount_raw: u64) -> Result<u64, WalletError> {
+    match unit {
+        "msat" => Ok(amount_raw),
+        "sat" => amount_raw
+            .checked_mul(1000)
+            .ok_or_else(|| WalletError::Backend("raw amount overflow".to_string())),
+        other => Err(WalletError::OfferMismatch(format!(
+            "unsupported unit: {other}"
+        ))),
+    }
+}
+
 // The relay is allowed to report the currently linked channel and its accepted
 // balance, but it must not claim a balance higher than the client has ever
 // signed locally for that same channel.
@@ -324,7 +348,7 @@ fn channel_signed_balance_raw(channel: &WalletChannel) -> Result<u64, WalletErro
 // Treat that as a protocol violation and fail the session.
 fn validate_linked_channel_balance_against_wallet(
     wallet: &dyn MonadWallet,
-    state: &DriverState,
+    state: &mut DriverState,
 ) -> io::Result<()> {
     let Some(intended_channel_id) = state.intended_channel_id.as_deref() else {
         return Ok(());
@@ -335,7 +359,9 @@ fn validate_linked_channel_balance_against_wallet(
     let Some(linked_channel) = snapshot.linked_channel.as_ref() else {
         return Ok(());
     };
-    if linked_channel.channel_id != intended_channel_id {
+    let linked_channel_id = linked_channel.channel_id.clone();
+    let linked_balance_raw = linked_channel.balance_raw;
+    if linked_channel_id != intended_channel_id {
         return Ok(());
     }
 
@@ -345,14 +371,46 @@ fn validate_linked_channel_balance_against_wallet(
     let local_signed_balance_raw = channel_signed_balance_raw(&channel)
         .map_err(|e| io::Error::other(format!("wallet channel balance conversion failed: {e}")))?;
 
-    if linked_channel.balance_raw > local_signed_balance_raw {
+    if linked_balance_raw > local_signed_balance_raw {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "protocol violation: relay reported linked balance_raw={} above client local signed balance_raw={} for channel {}",
-                linked_channel.balance_raw,
+                linked_balance_raw,
                 local_signed_balance_raw,
-                linked_channel.channel_id,
+                linked_channel_id,
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_session_status_baseline_against_local_counters(
+    state: &DriverState,
+    counters: &CleartextByteCounters,
+) -> io::Result<()> {
+    let Some(snapshot) = state.snapshot.as_ref() else {
+        return Ok(());
+    };
+    let (_local_inbound, local_outbound) = counters.snapshot();
+
+    if snapshot.session_total_out > local_outbound {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "protocol violation: relay reported session_total_out={} above client local outbound total={}",
+                snapshot.session_total_out, local_outbound,
+            ),
+        ));
+    }
+
+    if snapshot.total_paid_millisats > state.local_session_paid_msats {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "protocol violation: relay reported total_paid_millisats={} above client locally authorized total={}",
+                snapshot.total_paid_millisats, state.local_session_paid_msats,
             ),
         ));
     }
@@ -364,18 +422,11 @@ fn compute_estimated_remaining(
     state: &DriverState,
     counters: &CleartextByteCounters,
 ) -> Option<i64> {
-    let snapshot = state.snapshot.as_ref()?;
     let pricing = state.established_pricing?;
     let (local_inbound, local_outbound) = counters.snapshot();
-    let estimated_total_in = snapshot
-        .session_total_in
-        .saturating_add(local_inbound.saturating_sub(snapshot.session_total_in));
-    let estimated_total_out = snapshot
-        .session_total_out
-        .saturating_add(local_outbound.saturating_sub(snapshot.session_total_out));
-    let estimated_due = pricing.amount_due_millisats(estimated_total_in, estimated_total_out);
+    let estimated_due = pricing.amount_due_millisats(local_inbound, local_outbound);
     Some(
-        (snapshot.total_paid_millisats as i128 - estimated_due as i128)
+        (state.local_session_paid_msats as i128 - estimated_due as i128)
             .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
     )
 }
@@ -397,14 +448,26 @@ fn state_summary(state: &DriverState, counters: &CleartextByteCounters) -> Strin
         .as_ref()
         .map(|snapshot| snapshot.remaining_milli_sats.to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let relay_in = state
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.session_total_in.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let relay_out = state
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.session_total_out.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     let local_remaining = compute_estimated_remaining(state, counters)
         .map(|remaining| remaining.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     format!(
-        "paused={} remaining={} local_remaining={} relay_linked={} intended={} op={:?} blocked={:?} ready={}",
+        "paused={} remaining={} local_remaining={} relay_in={} relay_out={} relay_linked={} intended={} op={:?} blocked={:?} ready={}",
         paused,
         remaining,
         local_remaining,
+        relay_in,
+        relay_out,
         relay_linked,
         intended,
         state.control_op_in_flight,
@@ -892,6 +955,11 @@ async fn maybe_progress_payment(
         next_balance_raw,
     ) {
         Ok(payment_json) => {
+            let authorized_delta_msats = raw_amount_to_msats(
+                &linked_channel.unit,
+                next_balance_raw.saturating_sub(linked_channel.balance_raw),
+            )
+            .map_err(|e| io::Error::other(format!("payment delta conversion failed: {e}")))?;
             info!(
                 "{} sending ChannelPayment for {}: remaining={} target={} reaches_capacity={} next_balance_raw={} | {}",
                 config.hop_label,
@@ -903,6 +971,9 @@ async fn maybe_progress_payment(
                 state_summary(state, &config.conn.cleartext_byte_counters)
             );
             send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await?;
+            state.local_session_paid_msats = state
+                .local_session_paid_msats
+                .saturating_add(authorized_delta_msats);
             state.control_op_in_flight = Some(ControlOpInFlight::Payment {
                 channel_id: intended_channel_id,
             });
@@ -931,7 +1002,7 @@ async fn maybe_progress_payment(
     Ok(())
 }
 
-fn apply_session_status(state: &mut DriverState, snapshot: AuthoritativeSnapshot) -> bool {
+fn apply_session_status(state: &mut DriverState, snapshot: RelaySnapshot) -> bool {
     let resolved_payment = clear_resolved_control_op_on_status(state);
     state.snapshot = Some(snapshot);
     resolved_payment
@@ -1057,7 +1128,7 @@ async fn run_session_driver(
                             );
                             let resolved = apply_session_status(
                                 &mut state,
-                                AuthoritativeSnapshot {
+                                RelaySnapshot {
                                     receiver_pubkey,
                                     advertisements,
                                     linked_channel,
@@ -1075,7 +1146,11 @@ async fn run_session_driver(
                             // using that balance as a payment baseline.
                             validate_linked_channel_balance_against_wallet(
                                 config.wallet.as_ref(),
+                                &mut state,
+                            )?;
+                            validate_session_status_baseline_against_local_counters(
                                 &state,
+                                &config.conn.cleartext_byte_counters,
                             )?;
                             if !paused {
                                 signal_ready(&mut state, &mut ready_tx).await;
@@ -1132,10 +1207,11 @@ async fn run_session_driver(
 mod tests {
     use super::{
         channel_signed_balance_raw, exclude_on_wallet_error, plan_payment_topup,
-        pre_ready_blocked_error, relay_confirms_intended_channel, requested_delta_msats,
-        validate_linked_channel_balance_against_wallet, validate_session_pricing,
+        pre_ready_blocked_error, raw_amount_to_msats, relay_confirms_intended_channel,
+        requested_delta_msats, validate_linked_channel_balance_against_wallet,
+        validate_session_pricing, validate_session_status_baseline_against_local_counters,
     };
-    use super::{AuthoritativeSnapshot, DriverState, FundingBlockedReason, PaymentPolicy};
+    use super::{DriverState, FundingBlockedReason, PaymentPolicy, RelaySnapshot};
     use crate::wallet::WalletError;
     use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus, ServerErrorCode};
     use monad_common::proxy::CleartextByteCounters;
@@ -1143,8 +1219,8 @@ mod tests {
     use std::io;
     use tokio::sync::oneshot;
 
-    fn snapshot(paused: bool) -> AuthoritativeSnapshot {
-        AuthoritativeSnapshot {
+    fn snapshot(paused: bool) -> RelaySnapshot {
+        RelaySnapshot {
             receiver_pubkey: "receiver".to_string(),
             advertisements: vec![KeysetAdvertisement {
                 mint_url: "https://mint".to_string(),
@@ -1166,7 +1242,7 @@ mod tests {
     fn relay_confirms_active_channel_matches_ids() {
         let state = DriverState {
             intended_channel_id: Some("chan-a".to_string()),
-            snapshot: Some(AuthoritativeSnapshot {
+            snapshot: Some(RelaySnapshot {
                 receiver_pubkey: "receiver".to_string(),
                 advertisements: vec![],
                 linked_channel: Some(LinkedChannelStatus {
@@ -1217,6 +1293,12 @@ mod tests {
     }
 
     #[test]
+    fn raw_amount_to_msats_matches_msat_and_sat_units() {
+        assert_eq!(raw_amount_to_msats("msat", 7).unwrap(), 7);
+        assert_eq!(raw_amount_to_msats("sat", 2).unwrap(), 2_000);
+    }
+
+    #[test]
     fn validate_linked_channel_balance_rejects_relay_balance_above_local_signed_balance() {
         let wallet = crate::wallet::MockWallet::new();
         wallet
@@ -1234,7 +1316,7 @@ mod tests {
             .unwrap();
         let state = DriverState {
             intended_channel_id: Some("chan-a".to_string()),
-            snapshot: Some(AuthoritativeSnapshot {
+            snapshot: Some(RelaySnapshot {
                 receiver_pubkey: "receiver".to_string(),
                 advertisements: vec![],
                 linked_channel: Some(LinkedChannelStatus {
@@ -1249,13 +1331,55 @@ mod tests {
                 remaining_milli_sats: 0,
                 paused: true,
             }),
+            local_session_paid_msats: 7,
             ..DriverState::default()
         };
 
-        let err = validate_linked_channel_balance_against_wallet(&wallet, &state).unwrap_err();
+        let mut state = state;
+        let err = validate_linked_channel_balance_against_wallet(&wallet, &mut state).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains(
             "relay reported linked balance_raw=8 above client local signed balance_raw=7"
+        ));
+    }
+
+    #[test]
+    fn validate_session_status_baseline_rejects_relay_overreported_outbound_usage() {
+        let counters = CleartextByteCounters::default();
+        counters.note_outbound(4);
+        let state = DriverState {
+            snapshot: Some(RelaySnapshot {
+                session_total_out: 5,
+                ..snapshot(true)
+            }),
+            ..DriverState::default()
+        };
+
+        let err =
+            validate_session_status_baseline_against_local_counters(&state, &counters).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("relay reported session_total_out=5 above client local outbound total=4"));
+    }
+
+    #[test]
+    fn validate_session_status_baseline_rejects_relay_paid_above_local_authorized_total() {
+        let counters = CleartextByteCounters::default();
+        let state = DriverState {
+            snapshot: Some(RelaySnapshot {
+                total_paid_millisats: 11,
+                ..snapshot(true)
+            }),
+            local_session_paid_msats: 10,
+            ..DriverState::default()
+        };
+
+        let err =
+            validate_session_status_baseline_against_local_counters(&state, &counters).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains(
+            "relay reported total_paid_millisats=11 above client locally authorized total=10"
         ));
     }
 
@@ -1422,13 +1546,13 @@ mod tests {
         counters.note_inbound(4);
         counters.note_outbound(6);
         let state = DriverState {
-            snapshot: Some(AuthoritativeSnapshot {
-                session_total_in: 1,
+            snapshot: Some(RelaySnapshot {
                 session_total_out: 2,
                 total_paid_millisats: 20,
                 ..snapshot(true)
             }),
             established_pricing: Some(SessionPricing::new(1, 1)),
+            local_session_paid_msats: 20,
             ..DriverState::default()
         };
 
