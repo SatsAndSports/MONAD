@@ -123,6 +123,8 @@ struct PaymentStats {
     status_updates_seen: AtomicU64,
     payment_no_new_funds: AtomicU64,
     control_errors: AtomicU64,
+    channels_abandoned_due_to_capacity: AtomicU64,
+    channels_abandoned_not_at_capacity: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -145,6 +147,8 @@ struct PaymentStatsSnapshot {
     status_updates_seen: u64,
     payment_no_new_funds: u64,
     control_errors: u64,
+    channels_abandoned_due_to_capacity: u64,
+    channels_abandoned_not_at_capacity: u64,
 }
 
 impl PaymentStats {
@@ -168,6 +172,12 @@ impl PaymentStats {
             status_updates_seen: self.status_updates_seen.load(Ordering::Relaxed),
             payment_no_new_funds: self.payment_no_new_funds.load(Ordering::Relaxed),
             control_errors: self.control_errors.load(Ordering::Relaxed),
+            channels_abandoned_due_to_capacity: self
+                .channels_abandoned_due_to_capacity
+                .load(Ordering::Relaxed),
+            channels_abandoned_not_at_capacity: self
+                .channels_abandoned_not_at_capacity
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -175,6 +185,7 @@ impl PaymentStats {
 #[derive(Debug, Default, Clone, Copy)]
 struct ChannelAttemptState {
     last_confirmed_balance_raw: u64,
+    last_confirmed_capacity_raw: u64,
     last_attempted_balance_raw: Option<u64>,
     initial_payment_sent: bool,
 }
@@ -710,6 +721,7 @@ async fn start_huge_funding_control(
                     }
 
                     if let Some(linked) = linked_channel {
+                        let previous_active_channel_id = active_channel_id.clone();
                         if link_in_flight.as_deref() == Some(linked.channel_id.as_str()) {
                             successful_links = successful_links.saturating_add(1);
                             payment_stats
@@ -739,6 +751,29 @@ async fn start_huge_funding_control(
                             active_channel_id = Some(linked.channel_id.clone());
                         }
 
+                        if let (Some(previous_channel_id), Some(current_channel_id)) = (
+                            previous_active_channel_id.as_ref(),
+                            active_channel_id.as_ref(),
+                        ) {
+                            if previous_channel_id != current_channel_id {
+                                if let Some(previous_state) =
+                                    channel_states.get(previous_channel_id)
+                                {
+                                    if previous_state.last_confirmed_balance_raw
+                                        >= previous_state.last_confirmed_capacity_raw
+                                    {
+                                        payment_stats
+                                            .channels_abandoned_due_to_capacity
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        payment_stats
+                                            .channels_abandoned_not_at_capacity
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+
                         let Some(current_channel_id) = active_channel_id.as_ref() else {
                             continue;
                         };
@@ -747,6 +782,7 @@ async fn start_huge_funding_control(
                             let channel_state =
                                 channel_states.entry(linked.channel_id.clone()).or_default();
                             channel_state.last_confirmed_balance_raw = linked.balance_raw;
+                            channel_state.last_confirmed_capacity_raw = linked.capacity_raw;
                             if channel_state
                                 .last_attempted_balance_raw
                                 .is_some_and(|target| linked.balance_raw >= target)
@@ -1348,7 +1384,7 @@ async fn run_stress_scenario(config: StressConfig) {
     };
 
     println!(
-        "stress summary relays={} circuits={} sessions={} streams={} payload_bytes={} successes={} failures={} streams_ok={} sent_bytes={} recv_bytes={} total_bytes={} avg_setup_ms={:.2} avg_data_ms={:.2} total_elapsed_s={:.3} throughput_mib_per_s={:.2} sessions_linked={} channel_links_total={} channel_relinks_total={} sessions_relinked_once={} max_links_on_one_session={} channel_link_failures={} initial_payments={} topups_total={} topups_proactive={} topups_reactive={} sessions_paused_once={} pause_events={} startup_unpauses={} recovery_unpause_events={} status_polls_sent={} status_updates_seen={} payment_no_new_funds={} control_errors={}",
+        "stress summary relays={} circuits={} sessions={} streams={} payload_bytes={} successes={} failures={} streams_ok={} sent_bytes={} recv_bytes={} total_bytes={} avg_setup_ms={:.2} avg_data_ms={:.2} total_elapsed_s={:.3} throughput_mib_per_s={:.2} sessions_linked={} channel_links_total={} channel_relinks_total={} sessions_relinked_once={} max_links_on_one_session={} channel_link_failures={} initial_payments={} topups_total={} topups_proactive={} topups_reactive={} sessions_paused_once={} pause_events={} startup_unpauses={} recovery_unpause_events={} status_polls_sent={} status_updates_seen={} payment_no_new_funds={} control_errors={} channels_abandoned_due_to_capacity={} channels_abandoned_not_at_capacity={}",
         config.relays,
         config.circuits,
         total_sessions,
@@ -1382,6 +1418,8 @@ async fn run_stress_scenario(config: StressConfig) {
         payment_snapshot.status_updates_seen,
         payment_snapshot.payment_no_new_funds,
         payment_snapshot.control_errors,
+        payment_snapshot.channels_abandoned_due_to_capacity,
+        payment_snapshot.channels_abandoned_not_at_capacity,
     );
 
     if let Some(ref first_error) = first_error {
