@@ -932,7 +932,7 @@ async fn start_huge_funding_control(
                     break;
                 }
                 ServerMessage::Error { code, message } => {
-                    if code == ServerErrorCode::PaymentNoNewFunds {
+                    if matches!(code, ServerErrorCode::PaymentNoNewFunds) {
                         payment_stats
                             .payment_no_new_funds
                             .fetch_add(1, Ordering::Relaxed);

@@ -102,8 +102,11 @@ pub(super) fn plan_payment_topup(
         return PaymentTopupPlan::ExhaustedChannel;
     };
 
+    let actual_delta_msats =
+        common_raw_units_to_msats(&linked_channel.unit, actual_delta_raw).unwrap_or(0);
+
     PaymentTopupPlan::Pay {
-        requested_delta_msats,
+        requested_delta_msats: actual_delta_msats,
         next_balance_raw,
         reaches_capacity: actual_delta_raw == remaining_capacity_raw,
     }

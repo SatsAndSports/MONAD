@@ -46,7 +46,7 @@ Important types:
 Responsibilities:
 - parse local SOCKS5 requests
 - build a single-hop or multi-hop MONAD chain
-- expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers`) once the real wallet backend exists
+- expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers`) through the library; the binary entrypoint is gated on a real wallet backend
 - open H2 `CONNECT` streams to final targets
 - run one payment/session driver per relay session
 - keep a shared wallet across relay sessions
@@ -115,7 +115,7 @@ Developer-focused localhost test harness.
 
 Responsibilities:
 - spin up local relays in-process with mocked payment backends
-- build a persistent QUIC-only circuit for manual browser/SSH testing
+- build a persistent TCP or QUIC circuit for manual browser/SSH testing
 - monitor per-hop control state and process FD counts
 - exercise reusable per-hop circuit rebuild primitives and targeted session failure handling
 
@@ -139,7 +139,7 @@ An H2 stream using:
 POST /control
 ```
 
-Used for session management after the Noise-payload bootstrap has already negotiated the session version/capabilities and selected the `h2` session protocol. In this first version, HTTP/2 is the cleartext session protocol running inside the Noise transport, and the control stream then carries Spilman channel linking (`ChannelLink`) and unified session status synchronization (`SessionStatus`). See the "Control Protocol and Session Billing" section below for details.
+Used for session management after the Noise-payload bootstrap has already negotiated the session version/capabilities and selected the `h2` session protocol. In this first version, HTTP/2 is the session protocol running inside the Noise transport, and the control stream then carries Spilman channel linking (`ChannelLink`) and unified session status synchronization (`SessionStatus`). See the "Control Protocol and Session Billing" section below for details.
 
 ### Data stream
 
@@ -1201,7 +1201,7 @@ The full QUIC transport chain is implemented and tested:
 
 ## Current Limitations
 
-- Spilman channel implementation is currently being transitioned from a proof-of-concept to the "Proper" delta-based model described above.
+- Spilman channel implementation follows the delta-based model described above, but is exercised only through the mock wallet path in tests and the localhost test harness.
 - relay does not yet persist Spilman channel state across restarts (registry is in-memory).
 - multi-hop Spilman channel funding is wired but not yet fully tested with the new lifecycle.
 - no persistent route configuration file yet.
