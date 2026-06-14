@@ -11,6 +11,11 @@ use crate::h2stream::wait_for_send_capacity;
 // decoder skips them defensively so that extra separators cannot stall either
 // side's control-loop parser.
 
+/// Maximum allowed length for a single control-line, excluding the trailing
+/// newline. Lines longer than this are treated as a protocol error so a peer
+/// cannot grow a control-stream buffer unbounded.
+pub const MAX_CONTROL_LINE_LEN: usize = 1_048_576;
+
 pub fn encode_json_line<T: Serialize>(message: &T) -> io::Result<Bytes> {
     let bytes =
         serde_json::to_vec(message).map_err(|e| io::Error::other(format!("json error: {e}")))?;
@@ -42,10 +47,30 @@ pub async fn send_json_line<T: Serialize>(
 /// Blank or whitespace-only lines are consumed and ignored; the decoder keeps
 /// scanning for the next non-empty line without returning `Ok(None)`.
 pub fn try_decode_json_line<T: DeserializeOwned>(buf: &mut Vec<u8>) -> io::Result<Option<T>> {
+    try_decode_json_line_with_limit(buf, MAX_CONTROL_LINE_LEN)
+}
+
+fn try_decode_json_line_with_limit<T: DeserializeOwned>(
+    buf: &mut Vec<u8>,
+    max_line_len: usize,
+) -> io::Result<Option<T>> {
     loop {
         let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') else {
+            if buf.len() > max_line_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("control line exceeds maximum length of {max_line_len} bytes"),
+                ));
+            }
             return Ok(None);
         };
+
+        if newline_pos > max_line_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("control line exceeds maximum length of {max_line_len} bytes"),
+            ));
+        }
 
         let line: Vec<u8> = buf.drain(..=newline_pos).collect();
         let line = line.trim_ascii();
@@ -129,5 +154,42 @@ mod tests {
         assert!(try_decode_json_line::<TestMessage>(&mut buf)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn line_at_exact_limit_decodes() {
+        let message = TestMessage { x: 42 };
+        let frame = encode_json_line(&message).unwrap();
+        let line_len = frame.len() - 1; // exclude trailing newline
+        let small_limit = line_len;
+
+        let mut buf = frame.to_vec();
+        let decoded: TestMessage = try_decode_json_line_with_limit(&mut buf, small_limit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, message);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn line_over_limit_errors() {
+        let message = TestMessage { x: 42 };
+        let frame = encode_json_line(&message).unwrap();
+        let line_len = frame.len() - 1; // exclude trailing newline
+        let small_limit = line_len - 1;
+
+        let mut buf = frame.to_vec();
+        let err =
+            try_decode_json_line_with_limit::<TestMessage>(&mut buf, small_limit).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn unterminated_line_over_limit_errors() {
+        let mut buf = vec![b'x'; 17]; // no newline
+        let err = try_decode_json_line_with_limit::<TestMessage>(&mut buf, 16).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds maximum length"));
     }
 }

@@ -48,8 +48,9 @@ pub(super) fn requested_delta_msats(
     delta.min(u64::MAX as i128) as u64
 }
 
-fn delta_msats_to_raw_units(unit: &str, delta_msats: u64) -> u64 {
-    common_msats_to_raw_units(unit, delta_msats).unwrap_or(0)
+fn delta_msats_to_raw_units(unit: &str, delta_msats: u64) -> Result<u64, WalletError> {
+    common_msats_to_raw_units(unit, delta_msats)
+        .map_err(|e| WalletError::OfferMismatch(e.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +71,7 @@ pub(super) fn plan_payment_topup(
     target_remaining_msats: u64,
     minimum_topup_msats: u64,
     linked_channel: &LinkedChannelStatus,
-) -> PaymentTopupPlan {
+) -> Result<PaymentTopupPlan, WalletError> {
     let base_delta_msats = {
         let delta = target_remaining_msats as i128 - estimated_remaining_msats as i128;
         if delta <= 0 {
@@ -80,36 +81,37 @@ pub(super) fn plan_payment_topup(
         }
     };
     if base_delta_msats == 0 {
-        return PaymentTopupPlan::NoPaymentNeeded;
+        return Ok(PaymentTopupPlan::NoPaymentNeeded);
     }
 
     let requested_delta_msats = base_delta_msats.max(minimum_topup_msats);
-    let requested_delta_raw = delta_msats_to_raw_units(&linked_channel.unit, requested_delta_msats);
+    let requested_delta_raw =
+        delta_msats_to_raw_units(&linked_channel.unit, requested_delta_msats)?;
     let remaining_capacity_raw = linked_channel
         .capacity_raw
         .saturating_sub(linked_channel.balance_raw);
 
     if remaining_capacity_raw == 0 {
-        return PaymentTopupPlan::ExhaustedChannel;
+        return Ok(PaymentTopupPlan::ExhaustedChannel);
     }
 
     let actual_delta_raw = requested_delta_raw.min(remaining_capacity_raw);
     if actual_delta_raw == 0 {
-        return PaymentTopupPlan::ExhaustedChannel;
+        return Ok(PaymentTopupPlan::ExhaustedChannel);
     }
 
     let Some(next_balance_raw) = linked_channel.balance_raw.checked_add(actual_delta_raw) else {
-        return PaymentTopupPlan::ExhaustedChannel;
+        return Ok(PaymentTopupPlan::ExhaustedChannel);
     };
 
-    let actual_delta_msats =
-        common_raw_units_to_msats(&linked_channel.unit, actual_delta_raw).unwrap_or(0);
+    let actual_delta_msats = common_raw_units_to_msats(&linked_channel.unit, actual_delta_raw)
+        .map_err(|e| WalletError::OfferMismatch(e.to_string()))?;
 
-    PaymentTopupPlan::Pay {
+    Ok(PaymentTopupPlan::Pay {
         requested_delta_msats: actual_delta_msats,
         next_balance_raw,
         reaches_capacity: actual_delta_raw == remaining_capacity_raw,
-    }
+    })
 }
 
 pub(super) fn exclude_on_wallet_error(error: &WalletError) -> bool {

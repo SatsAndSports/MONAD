@@ -354,12 +354,25 @@ pub(super) async fn maybe_progress_payment(
         return Ok(());
     }
 
-    let plan = plan_payment_topup(
+    let plan = match plan_payment_topup(
         estimated_remaining,
         config.payment_policy.target_topup_buffer_msats,
         config.payment_policy.minimum_topup_msats,
         linked_channel,
-    );
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!(
+                "{} abandoning channel {} after payment plan failure: {} | {}",
+                config.hop_label,
+                intended_channel_id,
+                error,
+                state_summary(state, &config.conn.cleartext_byte_counters)
+            );
+            abandon_intended_channel(config, state, intended_channel_id, true).await;
+            return Ok(());
+        }
+    };
 
     let (_requested_delta_msats, next_balance_raw, reaches_capacity) = match plan {
         PaymentTopupPlan::NoPaymentNeeded => return Ok(()),

@@ -303,7 +303,8 @@ mod tests {
                 PaymentPolicy::default().target_topup_buffer_msats,
                 0,
                 &linked,
-            ),
+            )
+            .unwrap(),
             PaymentTopupPlan::NoPaymentNeeded,
         );
     }
@@ -323,7 +324,8 @@ mod tests {
                 PaymentPolicy::default().target_topup_buffer_msats,
                 1_000,
                 &linked,
-            ),
+            )
+            .unwrap(),
             PaymentTopupPlan::Pay {
                 requested_delta_msats: 1_000,
                 next_balance_raw: 1_000,
@@ -347,7 +349,8 @@ mod tests {
                 PaymentPolicy::default().target_topup_buffer_msats,
                 1_000,
                 &linked,
-            ),
+            )
+            .unwrap(),
             PaymentTopupPlan::Pay {
                 requested_delta_msats: 5,
                 next_balance_raw: 100,
@@ -371,7 +374,8 @@ mod tests {
                 PaymentPolicy::default().target_topup_buffer_msats,
                 750,
                 &linked,
-            ),
+            )
+            .unwrap(),
             PaymentTopupPlan::Pay {
                 requested_delta_msats: 1_000,
                 next_balance_raw: 1,
@@ -395,7 +399,8 @@ mod tests {
                 PaymentPolicy::default().target_topup_buffer_msats,
                 0,
                 &linked,
-            ),
+            )
+            .unwrap(),
             PaymentTopupPlan::ExhaustedChannel,
         );
     }
@@ -419,7 +424,8 @@ mod tests {
                 PaymentPolicy::default().target_topup_buffer_msats,
                 1_000,
                 &linked,
-            ),
+            )
+            .unwrap(),
             PaymentTopupPlan::Pay {
                 requested_delta_msats: 5_000,
                 next_balance_raw: 100,
@@ -445,13 +451,34 @@ mod tests {
                 PaymentPolicy::default().target_topup_buffer_msats,
                 0,
                 &linked,
-            ),
+            )
+            .unwrap(),
             PaymentTopupPlan::Pay {
                 requested_delta_msats: 499,
                 next_balance_raw: 499,
                 reaches_capacity: false,
             },
         );
+    }
+
+    #[test]
+    fn payment_plan_rejects_unsupported_unit() {
+        let linked = LinkedChannelStatus {
+            channel_id: "chan-a".to_string(),
+            balance_raw: 0,
+            capacity_raw: 10_000,
+            unit: "btc".to_string(),
+        };
+
+        let err = plan_payment_topup(
+            9_999_500,
+            PaymentPolicy::default().target_topup_buffer_msats,
+            1_000,
+            &linked,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, WalletError::OfferMismatch(_)));
     }
 
     #[test]
