@@ -8,9 +8,7 @@ use tokio::time::{self, Duration, MissedTickBehavior};
 use tracing::{info, warn};
 
 use super::funding::{apply_channel_evicted, apply_server_error};
-use super::funding::{
-    handle_control_detached, maybe_ensure_linked_channel, maybe_progress_payment,
-};
+use super::funding::{handle_control_detached, run_funding_cycle};
 use super::payment::{
     compute_estimated_remaining, validate_linked_channel_balance_against_wallet,
     validate_session_pricing, validate_session_status_baseline_against_local_counters,
@@ -136,18 +134,14 @@ pub(super) async fn run_session_driver(
                         return Ok(());
                     }
 
-                    maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
-                    maybe_progress_payment(&config, &mut state, &mut h2_send, resolved_payment).await?;
-                    maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
+                    run_funding_cycle(&config, &mut state, &mut h2_send, resolved_payment).await?;
                 }
             }
             _ = payment_tick.tick() => {
                 if state.terminated {
                     return Ok(());
                 }
-                maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
-                maybe_progress_payment(&config, &mut state, &mut h2_send, false).await?;
-                maybe_ensure_linked_channel(&config, &mut state, &mut h2_send).await?;
+                run_funding_cycle(&config, &mut state, &mut h2_send, false).await?;
             }
         }
     }

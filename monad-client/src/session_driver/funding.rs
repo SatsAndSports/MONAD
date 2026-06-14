@@ -427,6 +427,21 @@ pub(super) async fn maybe_progress_payment(
     Ok(())
 }
 
+/// Run one funding cycle: ensure a channel is linked, try to progress payment,
+/// then ensure a channel is linked again in case payment planning abandoned the
+/// previous one.
+pub(super) async fn run_funding_cycle(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    h2_send: &mut h2::SendStream<Bytes>,
+    skip_for_resolved_payment: bool,
+) -> io::Result<()> {
+    maybe_ensure_linked_channel(config, state, h2_send).await?;
+    maybe_progress_payment(config, state, h2_send, skip_for_resolved_payment).await?;
+    maybe_ensure_linked_channel(config, state, h2_send).await?;
+    Ok(())
+}
+
 pub(super) async fn apply_channel_evicted(
     config: &SessionDriverConfig,
     state: &mut DriverState,
