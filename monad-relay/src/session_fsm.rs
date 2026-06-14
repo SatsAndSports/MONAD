@@ -162,7 +162,7 @@ fn refresh_pause_state(state: &mut ServerSessionState, pricing: SessionPricing) 
     (state.paused != was_paused).then_some(state.paused)
 }
 
-fn remaining_milli_sats(state: &ServerSessionState, pricing: SessionPricing) -> i128 {
+pub(crate) fn remaining_milli_sats(state: &ServerSessionState, pricing: SessionPricing) -> i128 {
     let amount_due = pricing.amount_due_millisats(state.session_total_in, state.session_total_out);
     state.total_paid_millisats as i128 - amount_due as i128
 }

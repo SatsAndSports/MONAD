@@ -9,7 +9,8 @@ use crate::payments::RelayPayments;
 use crate::proxy;
 use crate::quic_pool::QuicPool;
 use crate::session_fsm::{
-    apply_accounted_bytes, step, ByteDirection, ServerSessionState, SessionEffect, SessionEvent,
+    apply_accounted_bytes, remaining_milli_sats, step, ByteDirection, ServerSessionState,
+    SessionEffect, SessionEvent,
 };
 use crate::session_registry::SessionRegistry;
 use bytes::Bytes;
@@ -37,41 +38,18 @@ pub const QUIC_SECP256K1_PUBKEY_HEADER: &str = "quic-secp256k1-pubkey";
 
 /// Authoritative per-session billing state used by the relay reducer and the
 /// data-path byte accounting fast path.
+///
+/// `state` is the canonical reducer state shared with `session_fsm`; `pricing`
+/// is the immutable session pricing used to compute amount due and pause state.
 #[derive(Debug)]
 struct BillingState {
-    session_total_in: u64,
-    session_total_out: u64,
-    total_paid_millisats: u64,
+    state: ServerSessionState,
     pricing: SessionPricing,
-    paused: bool,
-    linked_channel_id: Option<String>,
 }
 
 impl BillingState {
-    fn to_fsm_state(&self) -> ServerSessionState {
-        ServerSessionState {
-            session_total_in: self.session_total_in,
-            session_total_out: self.session_total_out,
-            total_paid_millisats: self.total_paid_millisats,
-            paused: self.paused,
-            linked_channel_id: self.linked_channel_id.clone(),
-            terminated: false,
-        }
-    }
-
-    fn apply_fsm_state(&mut self, state: &ServerSessionState) {
-        self.session_total_in = state.session_total_in;
-        self.session_total_out = state.session_total_out;
-        self.total_paid_millisats = state.total_paid_millisats;
-        self.paused = state.paused;
-        self.linked_channel_id = state.linked_channel_id.clone();
-    }
-
     fn remaining_milli_sats(&self) -> i128 {
-        let amount_due = self
-            .pricing
-            .amount_due_millisats(self.session_total_in, self.session_total_out);
-        self.total_paid_millisats as i128 - amount_due as i128
+        remaining_milli_sats(&self.state, self.pricing)
     }
 }
 
@@ -174,15 +152,18 @@ impl SessionState {
         session_registry.register_session(session_id, termination.clone());
         Self {
             billing: Arc::new(Mutex::new(BillingState {
-                session_total_in: 0,
-                session_total_out: 0,
-                total_paid_millisats: 0,
+                state: ServerSessionState {
+                    session_total_in: 0,
+                    session_total_out: 0,
+                    total_paid_millisats: 0,
+                    paused: true,
+                    linked_channel_id: None,
+                    terminated: false,
+                },
                 pricing: SessionPricing::new(
                     default_in_bytes_per_millisat.max(1),
                     default_out_bytes_per_millisat.max(1),
                 ),
-                paused: true,
-                linked_channel_id: None,
             })),
             control: Arc::new(Mutex::new(ControlState::default())),
             counters: Arc::new(SessionCounters::default()),
@@ -240,23 +221,24 @@ impl SessionState {
             receiver_pubkey: self.payment_receiver_secret.public_key().to_hex(),
             advertisements,
             linked_channel: billing
+                .state
                 .linked_channel_id
                 .as_deref()
                 .and_then(|channel_id| self.payments.linked_channel_status(channel_id)),
             active_in_rate: billing.pricing.in_bytes_per_millisat,
             active_out_rate: billing.pricing.out_bytes_per_millisat,
-            session_total_in: billing.session_total_in,
-            session_total_out: billing.session_total_out,
-            total_paid_millisats: billing.total_paid_millisats,
+            session_total_in: billing.state.session_total_in,
+            session_total_out: billing.state.session_total_out,
+            total_paid_millisats: billing.state.total_paid_millisats,
             remaining_milli_sats: clamp_i128_to_i64(billing.remaining_milli_sats()),
-            paused: billing.paused,
+            paused: billing.state.paused,
             open_connects,
             total_connects,
         }
     }
 
     async fn is_paused(&self) -> bool {
-        self.billing.lock().await.paused
+        self.billing.lock().await.state.paused
     }
 
     async fn attach_control(&self, tx: mpsc::UnboundedSender<ServerMessage>) -> Result<(), ()> {
@@ -287,14 +269,13 @@ impl SessionState {
         } else {
             ByteDirection::Inbound
         };
-        let pricing = billing.pricing;
         let (next_state, pause_changed) =
-            apply_accounted_bytes(billing.to_fsm_state(), pricing, direction, bytes);
-        billing.apply_fsm_state(&next_state);
+            apply_accounted_bytes(billing.state.clone(), billing.pricing, direction, bytes);
+        billing.state = next_state;
         if let Some(paused) = pause_changed {
             let _ = self.pause_tx.send_replace(paused);
         }
-        next_state.paused
+        billing.state.paused
     }
 
     // Control-stream state.
@@ -803,9 +784,8 @@ async fn process_session_event(
     while let Some(event) = pending.pop_front() {
         let effects = {
             let mut billing = state.billing.lock().await;
-            let pricing = billing.pricing;
-            let (next_state, effects) = step(billing.to_fsm_state(), event, pricing);
-            billing.apply_fsm_state(&next_state);
+            let (next_state, effects) = step(billing.state.clone(), event, billing.pricing);
+            billing.state = next_state;
             effects
         };
 
