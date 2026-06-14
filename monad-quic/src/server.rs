@@ -3,7 +3,7 @@ use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result};
 use quinn::Endpoint;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 static CRYPTO_PROVIDER: Once = Once::new();
 const MONAD_QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -54,8 +54,14 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
                     }
                 });
             }
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                info!(%remote, "connection closed by peer");
+            Err(quinn::ConnectionError::ApplicationClosed(_))
+            | Err(quinn::ConnectionError::ConnectionClosed(_))
+            | Err(quinn::ConnectionError::LocallyClosed) => {
+                info!(%remote, "connection closed");
+                break;
+            }
+            Err(quinn::ConnectionError::TimedOut) => {
+                warn!(%remote, "accept_bi timed out");
                 break;
             }
             Err(e) => {

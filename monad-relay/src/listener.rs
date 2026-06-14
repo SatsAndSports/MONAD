@@ -378,16 +378,18 @@ pub async fn run_with_payments_and_registry(
                                     info!("QUIC stream {stream_id:?} from {remote} closed");
                                 });
                             }
-                            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                                info!(%remote, "QUIC connection closed by peer");
+                            Err(quinn::ConnectionError::ApplicationClosed(_))
+                            | Err(quinn::ConnectionError::ConnectionClosed(_))
+                            | Err(quinn::ConnectionError::LocallyClosed) => {
+                                info!(%remote, "QUIC connection closed");
+                                break;
+                            }
+                            Err(quinn::ConnectionError::TimedOut) => {
+                                warn!(%remote, "QUIC accept_bi timed out");
                                 break;
                             }
                             Err(e) => {
-                                if e.to_string().contains("timed out") {
-                                    warn!(%remote, error = %e, "QUIC accept_bi failed");
-                                } else {
-                                    error!(%remote, error = %e, "QUIC accept_bi failed");
-                                }
+                                error!(%remote, error = %e, "QUIC accept_bi failed");
                                 break;
                             }
                         }
