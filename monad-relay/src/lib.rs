@@ -1,3 +1,4 @@
+mod control_driver;
 pub mod listener;
 pub mod payments;
 pub mod proxy;

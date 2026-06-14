@@ -4,13 +4,14 @@
 //! stream. The session starts paused-by-default with zero balance. A long-lived
 //! `POST /control` stream is used to fund and observe the whole session.
 
+use crate::control_driver::ControlDriver;
 use crate::listener::SpilmanMintCache;
 use crate::payments::RelayPayments;
 use crate::proxy;
 use crate::quic_pool::QuicPool;
 use crate::session_fsm::{
     apply_accounted_bytes, remaining_milli_sats, step, ByteDirection, ServerSessionState,
-    SessionEffect, SessionEvent,
+    SessionEvent,
 };
 use crate::session_registry::SessionRegistry;
 use bytes::Bytes;
@@ -197,9 +198,43 @@ impl SessionState {
         self.termination.is_cancelled()
     }
 
+    // Driver-facing accessors for payment / registry / pause side effects.
+
+    pub(crate) fn link_channel(
+        &self,
+        payment_json: &str,
+    ) -> Result<crate::payments::LinkOutcome, crate::payments::LinkError> {
+        self.payments.link_channel(self.session_id, payment_json)
+    }
+
+    pub(crate) fn apply_channel_payment(
+        &self,
+        expected_channel_id: &str,
+        payment_json: &str,
+    ) -> Result<crate::payments::PaymentOutcome, crate::payments::ChannelPaymentError> {
+        self.payments
+            .apply_channel_payment(expected_channel_id, payment_json)
+    }
+
+    pub(crate) fn notify_session_evicted(&self, target_session_id: &[u8; 32], channel_id: String) {
+        let _ = self.session_registry.notify(
+            target_session_id,
+            ServerMessage::ChannelEvicted { channel_id },
+        );
+    }
+
+    pub(crate) fn release_channel_ownership(&self, channel_id: &str) {
+        self.payments
+            .release_channel_ownership(self.session_id, channel_id);
+    }
+
+    pub(crate) fn update_pause_watch(&self, paused: bool) {
+        let _ = self.pause_tx.send_replace(paused);
+    }
+
     // Billing state and status snapshots.
 
-    async fn session_status_message(&self) -> ServerMessage {
+    pub(crate) async fn session_status_message(&self) -> ServerMessage {
         let billing = self.billing.lock().await;
         let (open_connects, total_connects) = self.counters.snapshot();
 
@@ -635,7 +670,7 @@ fn is_expected_control_channel_error(error: &io::Error) -> bool {
         || message.contains("error 0")
 }
 
-async fn send_control_message(
+pub(crate) async fn send_control_message(
     h2_send: &mut h2::SendStream<Bytes>,
     message: &ServerMessage,
 ) -> io::Result<()> {
@@ -771,6 +806,7 @@ async fn process_session_event(
     // session mutex during validation.
     let mut pending = VecDeque::from([initial_event]);
     let mut terminate = false;
+    let mut driver = ControlDriver::new(state, h2_send);
 
     while let Some(event) = pending.pop_front() {
         let effects = {
@@ -781,50 +817,8 @@ async fn process_session_event(
         };
 
         for effect in effects {
-            match effect {
-                SessionEffect::SendControl(message) => {
-                    send_control_message(h2_send, &message).await?;
-                }
-                SessionEffect::SendStatus => {
-                    let status = state.session_status_message().await;
-                    send_control_message(h2_send, &status).await?;
-                }
-                SessionEffect::RunLinkValidation { payment_json } => {
-                    pending.push_back(SessionEvent::LinkValidationFinished(
-                        state.payments.link_channel(state.session_id, &payment_json),
-                    ));
-                }
-                SessionEffect::RunPaymentValidation {
-                    expected_channel_id,
-                    payment_json,
-                } => {
-                    pending.push_back(SessionEvent::PaymentValidationFinished(
-                        state
-                            .payments
-                            .apply_channel_payment(&expected_channel_id, &payment_json),
-                    ));
-                }
-                SessionEffect::NotifySessionEvicted {
-                    target_session_id,
-                    channel_id,
-                } => {
-                    let _ = state.session_registry.notify(
-                        &target_session_id,
-                        ServerMessage::ChannelEvicted { channel_id },
-                    );
-                }
-                SessionEffect::ReleaseLinkedChannelOwnership { channel_id } => {
-                    state
-                        .payments
-                        .release_channel_ownership(state.session_id, &channel_id);
-                }
-                SessionEffect::UpdatePauseWatch(paused) => {
-                    let _ = state.pause_tx.send_replace(paused);
-                }
-                SessionEffect::EndSession => {
-                    state.terminate();
-                    terminate = true;
-                }
+            if driver.interpret(effect, &mut pending).await? {
+                terminate = true;
             }
         }
     }
