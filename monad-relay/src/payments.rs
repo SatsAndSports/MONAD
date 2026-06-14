@@ -1,3 +1,4 @@
+use crate::channel_store::ChannelStore;
 use crate::listener::SpilmanMintCache;
 use cashu::nuts::{CurrencyUnit, Id, PublicKey, SecretKey};
 use cdk_spilman::{
@@ -5,10 +6,8 @@ use cdk_spilman::{
     ChannelPolicy, ChannelState, ClosingData, Payment, PaymentProof, SpilmanBridge, SpilmanHost,
 };
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
-use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub trait RelayPayments: Send + Sync + 'static {
@@ -128,13 +127,13 @@ impl ChannelPaymentError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChannelUnit {
+pub(crate) enum ChannelUnit {
     Sat,
     Msat,
 }
 
 impl ChannelUnit {
-    fn from_str(value: &str) -> Result<Self, LinkError> {
+    pub(crate) fn from_str(value: &str) -> Result<Self, LinkError> {
         match value {
             "sat" => Ok(Self::Sat),
             "msat" => Ok(Self::Msat),
@@ -150,7 +149,7 @@ impl ChannelUnit {
         }
     }
 
-    fn capacity_millisats(self, capacity_raw: u64) -> Result<u64, LinkError> {
+    pub(crate) fn capacity_millisats(self, capacity_raw: u64) -> Result<u64, LinkError> {
         match self {
             Self::Msat => Ok(capacity_raw),
             Self::Sat => capacity_raw
@@ -159,7 +158,7 @@ impl ChannelUnit {
         }
     }
 
-    fn delta_millisats(self, delta_raw: u64) -> Result<u64, ChannelPaymentError> {
+    pub(crate) fn delta_millisats(self, delta_raw: u64) -> Result<u64, ChannelPaymentError> {
         match self {
             Self::Msat => Ok(delta_raw),
             Self::Sat => delta_raw
@@ -168,7 +167,7 @@ impl ChannelUnit {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Sat => "sat",
             Self::Msat => "msat",
@@ -182,45 +181,29 @@ enum PaymentContext {
 }
 
 #[derive(Debug, Clone)]
-struct StoredChannel {
-    funding: ChannelFunding,
-    latest_payment: PaymentProof,
-    state: ChannelState,
-    closing_data: Option<ClosingData>,
-    unit: ChannelUnit,
-    capacity_raw: u64,
-    owner: Option<[u8; 32]>,
-}
-
-#[derive(Debug, Default)]
-struct StoredState {
-    channels: HashMap<String, StoredChannel>,
-}
-
-#[derive(Debug, Clone)]
 struct MonadHost {
     receiver_secret: SecretKey,
     mint_cache: SpilmanMintCache,
-    state: Arc<Mutex<StoredState>>,
+    store: ChannelStore,
 }
 
 #[derive(Debug)]
 pub struct SpilmanRelayPayments {
     bridge: SpilmanBridge<MonadHost, PaymentContext>,
-    state: Arc<Mutex<StoredState>>,
+    store: ChannelStore,
 }
 
 impl SpilmanRelayPayments {
     pub fn new(receiver_secret: SecretKey, mint_cache: SpilmanMintCache) -> Self {
-        let state = Arc::new(Mutex::new(StoredState::default()));
+        let store = ChannelStore::new();
         let host = MonadHost {
             receiver_secret,
             mint_cache,
-            state: state.clone(),
+            store: store.clone(),
         };
         Self {
             bridge: SpilmanBridge::new(host),
-            state,
+            store,
         }
     }
 }
@@ -242,19 +225,14 @@ impl RelayPayments for SpilmanRelayPayments {
             .fund_channel_via_json(payment_json)
             .map_err(map_link_bridge_error)?;
 
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| LinkError::Internal("mutex poisoned".to_string()))?;
-        let channel = state.channels.get_mut(&payment.channel_id).ok_or_else(|| {
+        let evicted_session = self
+            .store
+            .set_channel_owner(&payment.channel_id, session_id)
+            .map_err(LinkError::Internal)?;
+
+        let channel = self.store.get_channel(&payment.channel_id).ok_or_else(|| {
             LinkError::Internal("linked channel missing after validation".to_string())
         })?;
-
-        let evicted_session = match channel.owner {
-            Some(owner) if owner != session_id => Some(owner),
-            _ => None,
-        };
-        channel.owner = Some(session_id);
 
         Ok(LinkOutcome {
             channel_id: payment.channel_id,
@@ -280,13 +258,9 @@ impl RelayPayments for SpilmanRelayPayments {
         }
 
         let (previous_balance, unit, state_kind) = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| ChannelPaymentError::Internal("mutex poisoned".to_string()))?;
-            let channel = state
-                .channels
-                .get(expected_channel_id)
+            let channel = self
+                .store
+                .get_channel(expected_channel_id)
                 .ok_or(ChannelPaymentError::UnknownChannel)?;
             (channel.latest_payment.balance, channel.unit, channel.state)
         };
@@ -316,24 +290,11 @@ impl RelayPayments for SpilmanRelayPayments {
     }
 
     fn linked_channel_status(&self, channel_id: &str) -> Option<LinkedChannelStatus> {
-        let state = self.state.lock().ok()?;
-        let channel = state.channels.get(channel_id)?;
-        Some(LinkedChannelStatus {
-            channel_id: channel_id.to_string(),
-            balance_raw: channel.latest_payment.balance,
-            capacity_raw: channel.capacity_raw,
-            unit: channel.unit.as_str().to_string(),
-        })
+        self.store.linked_channel_status(channel_id)
     }
 
     fn release_channel_ownership(&self, session_id: [u8; 32], channel_id: &str) {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(channel) = state.channels.get_mut(channel_id) {
-                if channel.owner == Some(session_id) {
-                    channel.owner = None;
-                }
-            }
-        }
+        let _ = self.store.release_channel_owner(channel_id, session_id);
     }
 }
 
@@ -350,12 +311,9 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     }
 
     fn get_funding(&self, channel_id: &str) -> Option<ChannelFunding> {
-        self.state.lock().ok().and_then(|state| {
-            state
-                .channels
-                .get(channel_id)
-                .map(|channel| channel.funding.clone())
-        })
+        self.store
+            .get_channel(channel_id)
+            .map(|channel| channel.funding.clone())
     }
 
     fn save_funding(
@@ -366,50 +324,26 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     ) {
         let metadata = parse_channel_metadata(&funding.params_json)
             .expect("validated channel params must contain supported unit and capacity");
-        let mut state = self
-            .state
-            .lock()
+        self.store
+            .save_funding(channel_id, funding, initial_payment, metadata.0, metadata.1)
             .expect("state mutex must not be poisoned while saving funding");
-        state.channels.insert(
-            channel_id.to_string(),
-            StoredChannel {
-                funding,
-                latest_payment: initial_payment,
-                state: ChannelState::Open,
-                closing_data: None,
-                unit: metadata.0,
-                capacity_raw: metadata.1,
-                owner: None,
-            },
-        );
     }
 
     fn get_amount_due(&self, channel_id: &str, _context: Option<&PaymentContext>) -> u64 {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|state| {
-                state
-                    .channels
-                    .get(channel_id)
-                    .map(|channel| channel.latest_payment.balance)
-            })
+        self.store
+            .get_channel(channel_id)
+            .map(|channel| channel.latest_payment.balance)
             .unwrap_or(0)
     }
 
     fn record_payment(&self, channel_id: &str, payment: PaymentProof, _context: &PaymentContext) {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(channel) = state.channels.get_mut(channel_id) {
-                channel.latest_payment = payment;
-            }
-        }
+        let _ = self.store.record_payment(channel_id, payment);
     }
 
     fn get_channel_state(&self, channel_id: &str) -> ChannelState {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|state| state.channels.get(channel_id).map(|channel| channel.state))
+        self.store
+            .get_channel(channel_id)
+            .map(|channel| channel.state)
             .unwrap_or(ChannelState::Open)
     }
 
@@ -419,30 +353,14 @@ impl SpilmanHost<PaymentContext> for MonadHost {
         expiry_timestamp: u64,
         payment: PaymentProof,
     ) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "state mutex poisoned".to_string())?;
-        let channel = state
-            .channels
-            .get_mut(channel_id)
-            .ok_or_else(|| format!("unknown channel: {channel_id}"))?;
-        channel.state = ChannelState::Closing;
-        channel.closing_data = Some(ClosingData {
-            expiry_timestamp,
-            balance: payment.balance,
-            signature: payment.signature,
-        });
-        Ok(())
+        self.store
+            .mark_channel_closing(channel_id, expiry_timestamp, payment)
     }
 
     fn get_closing_data(&self, channel_id: &str) -> Option<ClosingData> {
-        self.state.lock().ok().and_then(|state| {
-            state
-                .channels
-                .get(channel_id)
-                .and_then(|channel| channel.closing_data.clone())
-        })
+        self.store
+            .get_channel(channel_id)
+            .and_then(|channel| channel.closing_data.clone())
     }
 
     fn get_channel_policy(&self, unit: &str) -> Option<ChannelPolicy> {
@@ -467,12 +385,9 @@ impl SpilmanHost<PaymentContext> for MonadHost {
         &self,
         channel_id: &str,
     ) -> Option<PaymentProof> {
-        self.state.lock().ok().and_then(|state| {
-            state
-                .channels
-                .get(channel_id)
-                .map(|channel| channel.latest_payment.clone())
-        })
+        self.store
+            .get_channel(channel_id)
+            .map(|channel| channel.latest_payment.clone())
     }
 
     fn get_active_keyset_ids(&self, mint: &str, unit: &CurrencyUnit) -> Vec<Id> {
@@ -504,17 +419,7 @@ impl SpilmanHost<PaymentContext> for MonadHost {
         _receiver_sum: u64,
         _sender_sum: u64,
     ) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "state mutex poisoned".to_string())?;
-        let channel = state
-            .channels
-            .get_mut(channel_id)
-            .ok_or_else(|| format!("unknown channel: {channel_id}"))?;
-        channel.state = ChannelState::Closed;
-        channel.closing_data = None;
-        Ok(())
+        self.store.mark_channel_closed(channel_id)
     }
 
     fn compute_channel_secret(
