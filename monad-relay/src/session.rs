@@ -15,8 +15,8 @@ use crate::session_fsm::{
 use crate::session_registry::SessionRegistry;
 use bytes::Bytes;
 use cashu::nuts::SecretKey;
-use h2::server;
-use http::{Method, Response, StatusCode};
+use h2::{server, RecvStream};
+use http::{Method, Request, Response, StatusCode};
 use monad_common::control_codec::{send_json_line, try_decode_json_line};
 use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerErrorCode, ServerMessage};
 use monad_common::secp_identity::Secp256k1Pubkey;
@@ -362,6 +362,45 @@ where
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
+    /// Spawn a CONNECT tunnel once the upstream connection has been established.
+    ///
+    /// Sends the `200 OK` response, bumps the session connect counters, logs the
+    /// tunnel opening, and spawns the proxied byte-pipe task.
+    async fn spawn_tunnel<T>(
+        &self,
+        respond: &mut server::SendResponse<Bytes>,
+        request: Request<RecvStream>,
+        target: T,
+        authority: &str,
+        label: &str,
+    ) -> Result<(), h2::Error>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+        let h2_send = respond.send_response(resp, false)?;
+        let (_, h2_recv) = request.into_parts();
+        let state = self.state.clone();
+        let session_id = self.session_id;
+        let (open_connects, total_connects) = state.connect_opened();
+        info!(
+            "CONNECT opened: {authority} ({label}) | session_id={} open_connects={} total_connects={}",
+            hex::encode(session_id),
+            open_connects,
+            total_connects
+        );
+        let authority = authority.to_string();
+        let label = label.to_string();
+        tokio::spawn(async move {
+            if let Err(e) =
+                proxy::proxy_bidirectional_accounted(h2_send, h2_recv, target, &label, state).await
+            {
+                error!("tunnel to {authority} ({label}) error: {e}");
+            }
+        });
+        Ok(())
+    }
+
     /// Run the accept loop: accept H2 streams and dispatch them to handlers.
     pub async fn run(mut self) -> io::Result<()> {
         let termination = self.state.termination_token();
@@ -460,44 +499,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                     .await
                                 {
                                     Ok(quic_stream) => {
-                                        let resp = Response::builder()
-                                            .status(StatusCode::OK)
-                                            .body(())
-                                            .unwrap();
-                                        match respond.send_response(resp, false) {
-                                            Ok(h2_send) => {
-                                                let (_, h2_recv) = request.into_parts();
-                                                let label = format!("quic:{authority}");
-                                                let state = self.state.clone();
-                                                let session_id = self.session_id;
-                                                let (open_connects, total_connects) =
-                                                    state.connect_opened();
-                                                info!(
-                                                    "CONNECT opened: {authority} (via QUIC secp256k1 auth) | session_id={} open_connects={} total_connects={}",
-                                                    hex::encode(session_id),
-                                                    open_connects,
-                                                    total_connects
-                                                );
-                                                tokio::spawn(async move {
-                                                    if let Err(e) =
-                                                        proxy::proxy_bidirectional_accounted(
-                                                            h2_send,
-                                                            h2_recv,
-                                                            quic_stream,
-                                                            &label,
-                                                            state,
-                                                        )
-                                                        .await
-                                                    {
-                                                        error!(
-                                                            "tunnel to quic:{authority} error: {e}"
-                                                        );
-                                                    }
-                                                });
-                                            }
-                                            Err(e) => {
-                                                error!("h2 send response error: {e}");
-                                            }
+                                        if let Err(e) = self
+                                            .spawn_tunnel(
+                                                &mut respond,
+                                                request,
+                                                quic_stream,
+                                                &authority,
+                                                &format!("quic:{authority}"),
+                                            )
+                                            .await
+                                        {
+                                            error!("h2 send response error: {e}");
                                         }
                                     }
                                     Err(e) => {
@@ -514,38 +526,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
 
                                 match TcpStream::connect(&authority).await {
                                     Ok(tcp_stream) => {
-                                        let resp = Response::builder()
-                                            .status(StatusCode::OK)
-                                            .body(())
-                                            .unwrap();
-                                        match respond.send_response(resp, false) {
-                                            Ok(h2_send) => {
-                                                let (_, h2_recv) = request.into_parts();
-                                                let state = self.state.clone();
-                                                let session_id = self.session_id;
-                                                let (open_connects, total_connects) =
-                                                    state.connect_opened();
-                                                info!(
-                                                    "CONNECT opened: {authority} | session_id={} open_connects={} total_connects={}",
-                                                    hex::encode(session_id),
-                                                    open_connects,
-                                                    total_connects
-                                                );
-                                                tokio::spawn(async move {
-                                                    if let Err(e) =
-                                                        proxy::proxy_bidirectional_accounted(
-                                                            h2_send, h2_recv, tcp_stream,
-                                                            &authority, state,
-                                                        )
-                                                        .await
-                                                    {
-                                                        error!("tunnel to {authority} error: {e}");
-                                                    }
-                                                });
-                                            }
-                                            Err(e) => {
-                                                error!("h2 send response error: {e}");
-                                            }
+                                        if let Err(e) = self
+                                            .spawn_tunnel(
+                                                &mut respond,
+                                                request,
+                                                tcp_stream,
+                                                &authority,
+                                                &authority,
+                                            )
+                                            .await
+                                        {
+                                            error!("h2 send response error: {e}");
                                         }
                                     }
                                     Err(e) => {
