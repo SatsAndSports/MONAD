@@ -11,9 +11,10 @@ use super::payment::{
     server_error_invalidates_channel, server_error_rejects_intended_channel, PaymentTopupPlan,
 };
 use super::state::{
-    clear_channel_control_op, publish_spilman_info, relay_confirms_intended_channel,
-    relay_linked_channel_id, session_is_paused, set_blocked_reason, state_summary,
-    ControlOpInFlight, DriverState, FundingBlockedReason, SessionDriverConfig,
+    abandon_intended_channel, clear_control_op, exclude_channel, publish_spilman_info,
+    relay_confirms_intended_channel, relay_linked_channel_id, session_is_paused,
+    set_blocked_reason, set_link_in_flight, set_payment_in_flight, state_summary,
+    terminate_session, ControlOpInFlight, DriverState, FundingBlockedReason, SessionDriverConfig,
 };
 
 const DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS: u64 = 100_000_000;
@@ -23,24 +24,6 @@ pub(super) async fn send_control_message(
     message: &ClientMessage,
 ) -> io::Result<()> {
     send_json_line(h2_send, message).await
-}
-
-async fn abandon_intended_channel(
-    config: &SessionDriverConfig,
-    state: &mut DriverState,
-    channel_id: String,
-    exclude_for_session: bool,
-) {
-    if exclude_for_session {
-        state.session_excluded_channels.insert(channel_id.clone());
-    }
-    let _ = config
-        .wallet
-        .detach_channel_from_session(&channel_id, config.conn.session_id);
-    state.intended_channel_id = None;
-    state.intended_offer = None;
-    clear_channel_control_op(state, &channel_id);
-    publish_spilman_info(config, state).await;
 }
 
 fn choose_channel_and_offer(
@@ -85,10 +68,7 @@ async fn send_channel_link(
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
     send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await?;
-    state.intended_channel_id = Some(channel_id.clone());
-    state.intended_offer = Some(offer);
-    state.control_op_in_flight = Some(ControlOpInFlight::Link { channel_id });
-    publish_spilman_info(config, state).await;
+    set_link_in_flight(state, channel_id, offer);
     Ok(())
 }
 
@@ -114,7 +94,7 @@ async fn try_link_channel(
             return Ok(false);
         }
         if exclude_on_wallet_error(&error) {
-            state.session_excluded_channels.insert(channel_id.clone());
+            exclude_channel(state, &channel_id);
         }
         return Ok(true);
     }
@@ -138,7 +118,7 @@ async fn try_link_channel(
                 return Ok(false);
             }
             if exclude_on_wallet_error(&error) {
-                state.session_excluded_channels.insert(channel_id.clone());
+                exclude_channel(state, &channel_id);
             }
             Ok(true)
         }
@@ -421,9 +401,7 @@ pub(super) async fn maybe_progress_payment(
             state.local_session_paid_msats = state
                 .local_session_paid_msats
                 .saturating_add(authorized_delta_msats);
-            state.control_op_in_flight = Some(ControlOpInFlight::Payment {
-                channel_id: intended_channel_id,
-            });
+            set_payment_in_flight(state, intended_channel_id);
         }
         Err(error) => {
             if matches!(error, WalletError::Backend(_)) {
@@ -454,12 +432,8 @@ pub(super) async fn apply_channel_evicted(
     state: &mut DriverState,
     channel_id: String,
 ) {
-    clear_channel_control_op(state, &channel_id);
-    state.session_excluded_channels.insert(channel_id.clone());
-    if state.intended_channel_id.as_deref() == Some(channel_id.as_str()) {
-        abandon_intended_channel(config, state, channel_id, false).await;
-    }
-    publish_spilman_info(config, state).await;
+    exclude_channel(state, &channel_id);
+    abandon_intended_channel(config, state, channel_id, false).await;
 }
 
 pub(super) async fn apply_server_error(
@@ -467,12 +441,7 @@ pub(super) async fn apply_server_error(
     state: &mut DriverState,
     code: ServerErrorCode,
 ) {
-    if matches!(
-        state.control_op_in_flight,
-        Some(ControlOpInFlight::Link { .. }) | Some(ControlOpInFlight::Payment { .. })
-    ) {
-        state.control_op_in_flight = None;
-    }
+    clear_control_op(state);
 
     if server_error_rejects_intended_channel(&code) {
         if let Some(channel_id) = state.intended_channel_id.clone() {
@@ -480,22 +449,15 @@ pub(super) async fn apply_server_error(
                 let _ = config.wallet.mark_channel_unusable(&channel_id);
             }
             abandon_intended_channel(config, state, channel_id, false).await;
+            return;
         }
     }
 
+    // No intended channel was rejected, but we still need to republish Spilman
+    // info because the in-flight operation was cleared above.
     publish_spilman_info(config, state).await;
 }
 
 pub(super) async fn handle_control_detached(config: &SessionDriverConfig, state: &mut DriverState) {
-    if let Some(channel_id) = state.intended_channel_id.clone() {
-        let _ = config
-            .wallet
-            .detach_channel_from_session(&channel_id, config.conn.session_id);
-    }
-    state.intended_channel_id = None;
-    state.intended_offer = None;
-    state.control_op_in_flight = None;
-    state.funding_blocked_reason = None;
-    state.terminated = true;
-    publish_spilman_info(config, state).await;
+    terminate_session(config, state).await;
 }

@@ -213,6 +213,79 @@ pub(super) fn clear_channel_control_op(state: &mut DriverState, channel_id: &str
     }
 }
 
+// ---------------------------------------------------------------------------
+// Channel-state transition helpers
+//
+// These are the only places that should mutate intended-channel state,
+// in-flight control operations, and the session-local excluded-channel set.
+// Keep them small and explicit so callers cannot accidentally leave the driver
+// in an inconsistent state.
+// ---------------------------------------------------------------------------
+
+pub(super) fn exclude_channel(state: &mut DriverState, channel_id: &str) {
+    state
+        .session_excluded_channels
+        .insert(channel_id.to_owned());
+}
+
+pub(super) fn set_link_in_flight(
+    state: &mut DriverState,
+    channel_id: String,
+    offer: RelayPaymentOffer,
+) {
+    state.intended_channel_id = Some(channel_id.clone());
+    state.intended_offer = Some(offer);
+    state.control_op_in_flight = Some(ControlOpInFlight::Link { channel_id });
+}
+
+pub(super) fn set_payment_in_flight(state: &mut DriverState, channel_id: String) {
+    state.control_op_in_flight = Some(ControlOpInFlight::Payment { channel_id });
+}
+
+pub(super) fn clear_control_op(state: &mut DriverState) {
+    state.control_op_in_flight = None;
+}
+
+/// Abandon the intended channel: detach it from the wallet, optionally exclude it
+/// for the remainder of the session, clear intended/offer/in-flight state if it
+/// still belongs to this channel, and republish Spilman info.
+pub(super) async fn abandon_intended_channel(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    channel_id: String,
+    exclude_for_session: bool,
+) {
+    if exclude_for_session {
+        state.session_excluded_channels.insert(channel_id.clone());
+    }
+    let _ = config
+        .wallet
+        .detach_channel_from_session(&channel_id, config.conn.session_id);
+    if state.intended_channel_id.as_deref() == Some(channel_id.as_str()) {
+        state.intended_channel_id = None;
+        state.intended_offer = None;
+    }
+    clear_channel_control_op(state, &channel_id);
+    publish_spilman_info(config, state).await;
+}
+
+/// Mark the session as terminated: detach any intended channel, clear all
+/// channel/in-flight/blocked state, set the terminated flag, and republish
+/// Spilman info.
+pub(super) async fn terminate_session(config: &SessionDriverConfig, state: &mut DriverState) {
+    if let Some(channel_id) = state.intended_channel_id.clone() {
+        let _ = config
+            .wallet
+            .detach_channel_from_session(&channel_id, config.conn.session_id);
+    }
+    state.intended_channel_id = None;
+    state.intended_offer = None;
+    state.control_op_in_flight = None;
+    state.funding_blocked_reason = None;
+    state.terminated = true;
+    publish_spilman_info(config, state).await;
+}
+
 pub(super) async fn signal_ready(
     state: &mut DriverState,
     ready_tx: &mut Option<oneshot::Sender<()>>,
