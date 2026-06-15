@@ -12,8 +12,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::bootstrap::{
     decode_client_hello, decode_server_response, decode_v1_client_hello, decode_v1_server_accept,
     encode_client_hello, encode_server_response, highest_supported_version, initial_client_hello,
-    initial_server_accept, initial_server_accept_v1, supported_bootstrap_versions,
-    validate_v1_client_hello, BootstrapServerResponse, BOOTSTRAP_VERSION,
+    initial_server_accept, supported_bootstrap_versions, validate_v1_client_hello,
+    validate_v1_server_accept, BootstrapServerResponse, BOOTSTRAP_VERSION,
 };
 use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 
@@ -356,11 +356,8 @@ pub async fn handshake_initiator_with_pubkey<T: AsyncRead + AsyncWrite + Unpin>(
                 )));
             }
             let accept = decode_v1_server_accept(response)?;
-            if accept != initial_server_accept_v1() {
-                return Err(io::Error::other(
-                    "relay bootstrap accept did not match the hardcoded expected v1 response",
-                ));
-            }
+            validate_v1_server_accept(&accept)
+                .map_err(|e| io::Error::other(format!("invalid relay bootstrap accept: {e}")))?;
         }
         BootstrapServerResponse::Reject { reason, .. } => {
             return Err(io::Error::new(

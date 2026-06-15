@@ -8,9 +8,16 @@ pub const SESSION_PROTOCOL_H2: &str = "h2";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapCapabilities {
+    #[serde(default)]
     pub direct_tcp_exit: bool,
+    #[serde(default)]
     pub nested_monad_over_tcp: bool,
+    #[serde(default)]
     pub nested_monad_over_quic: bool,
+    #[serde(default)]
+    pub blinded_connect_v1: bool,
+    #[serde(default)]
+    pub tweaked_noise_v1: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +71,8 @@ pub fn initial_server_capabilities() -> BootstrapCapabilities {
         direct_tcp_exit: true,
         nested_monad_over_tcp: true,
         nested_monad_over_quic: true,
+        blinded_connect_v1: false,
+        tweaked_noise_v1: false,
     }
 }
 
@@ -118,6 +127,16 @@ pub fn validate_v1_client_hello(hello: &BootstrapV1ClientHello) -> Result<(), St
     ))
 }
 
+pub fn validate_v1_server_accept(accept: &BootstrapV1ServerAccept) -> Result<(), String> {
+    if accept.session_protocol != SESSION_PROTOCOL_H2 {
+        return Err(format!(
+            "unsupported session protocol: {}",
+            accept.session_protocol
+        ));
+    }
+    Ok(())
+}
+
 pub fn decode_v1_server_accept(response: Value) -> io::Result<BootstrapV1ServerAccept> {
     serde_json::from_value(response)
         .map_err(|e| io::Error::other(format!("bootstrap json error: {e}")))
@@ -160,6 +179,43 @@ mod tests {
     }
 
     #[test]
+    fn old_capability_payload_defaults_new_blinded_flags_to_false() {
+        let response = serde_json::json!({
+            "session_protocol": "h2",
+            "capabilities": {
+                "direct_tcp_exit": true,
+                "nested_monad_over_tcp": true,
+                "nested_monad_over_quic": true
+            }
+        });
+
+        let decoded: BootstrapV1ServerAccept = serde_json::from_value(response).unwrap();
+        assert!(decoded.capabilities.direct_tcp_exit);
+        assert!(decoded.capabilities.nested_monad_over_tcp);
+        assert!(decoded.capabilities.nested_monad_over_quic);
+        assert!(!decoded.capabilities.blinded_connect_v1);
+        assert!(!decoded.capabilities.tweaked_noise_v1);
+    }
+
+    #[test]
+    fn blinded_capability_flags_round_trip() {
+        let accept = BootstrapV1ServerAccept {
+            session_protocol: SESSION_PROTOCOL_H2.to_string(),
+            capabilities: BootstrapCapabilities {
+                direct_tcp_exit: true,
+                nested_monad_over_tcp: true,
+                nested_monad_over_quic: true,
+                blinded_connect_v1: true,
+                tweaked_noise_v1: true,
+            },
+        };
+
+        let encoded = serde_json::to_value(&accept).unwrap();
+        let decoded: BootstrapV1ServerAccept = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, accept);
+    }
+
+    #[test]
     fn highest_mutual_version_is_selected() {
         let hello = BootstrapClientHello {
             versions: BTreeMap::from([
@@ -186,6 +242,18 @@ mod tests {
         assert_eq!(
             validate_v1_client_hello(&hello),
             Err("unsupported session protocols: [\"something-else\"]".to_string())
+        );
+    }
+
+    #[test]
+    fn v1_server_accept_rejects_unknown_session_protocol() {
+        let accept = BootstrapV1ServerAccept {
+            session_protocol: "future".to_string(),
+            capabilities: initial_server_capabilities(),
+        };
+        assert_eq!(
+            validate_v1_server_accept(&accept),
+            Err("unsupported session protocol: future".to_string())
         );
     }
 }
