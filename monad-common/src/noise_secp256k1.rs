@@ -12,9 +12,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::bootstrap::{
     decode_client_hello, decode_server_response, decode_v1_client_hello, decode_v1_server_accept,
     encode_client_hello, encode_server_response, highest_supported_version, initial_client_hello,
-    initial_server_accept, is_supported_cashu_spilman_protocol_version, server_accept,
-    supported_bootstrap_versions, validate_v1_client_hello, validate_v1_server_accept,
-    BootstrapServerResponse, BootstrapV1ClientHello, BootstrapV1ServerAccept, BOOTSTRAP_VERSION,
+    initial_server_accept, is_supported_cashu_spilman_protocol_version,
+    is_supported_pricing_policy, server_accept, supported_bootstrap_versions,
+    validate_v1_client_hello, validate_v1_server_accept, BootstrapServerResponse,
+    BootstrapV1ClientHello, BootstrapV1ServerAccept, BOOTSTRAP_VERSION,
 };
 use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 
@@ -383,6 +384,16 @@ pub async fn handshake_initiator_with_pubkey_and_server_accept<
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("relay selected unsupported cashu_spilman_protocol_version: {version}"),
+                ));
+            }
+            let pricing_policy = accept
+                .pricing_policy
+                .as_deref()
+                .ok_or_else(|| io::Error::other("relay omitted pricing_policy"))?;
+            if !is_supported_pricing_policy(pricing_policy) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("relay selected unsupported pricing_policy: {pricing_policy}"),
                 ));
             }
             Ok((send, recv, session_id, accept))

@@ -6,6 +6,7 @@ use std::io;
 pub const BOOTSTRAP_VERSION: u8 = 1;
 pub const SESSION_PROTOCOL_H2: &str = "h2";
 pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20: &str = "2026-03-20";
+pub const PRICING_POLICY_SESSION_CONSTANT: &str = "session_constant";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapCapabilities {
@@ -25,6 +26,7 @@ pub struct BootstrapCapabilities {
 pub struct BootstrapV1ClientHello {
     pub session_protocols: Vec<String>,
     pub cashu_spilman_protocol_versions: Vec<String>,
+    pub pricing_policies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,6 +34,7 @@ pub struct BootstrapV1ServerAccept {
     pub session_protocol: String,
     pub capabilities: BootstrapCapabilities,
     pub cashu_spilman_protocol_version: Option<String>,
+    pub pricing_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +67,7 @@ pub fn initial_client_hello() -> BootstrapClientHello {
         serde_json::to_value(BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
             cashu_spilman_protocol_versions: supported_cashu_spilman_protocol_versions(),
+            pricing_policies: supported_pricing_policies(),
         })
         .expect("initial bootstrap v1 hello is serializable"),
     );
@@ -85,6 +89,7 @@ pub fn server_accept_v1(capabilities: BootstrapCapabilities) -> BootstrapV1Serve
         session_protocol: SESSION_PROTOCOL_H2.to_string(),
         capabilities,
         cashu_spilman_protocol_version: Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()),
+        pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
     }
 }
 
@@ -122,6 +127,21 @@ pub fn select_cashu_spilman_protocol_version(client_versions: &[String]) -> Opti
         .cloned()
 }
 
+pub fn supported_pricing_policies() -> Vec<String> {
+    vec![PRICING_POLICY_SESSION_CONSTANT.to_string()]
+}
+
+pub fn is_supported_pricing_policy(policy: &str) -> bool {
+    policy == PRICING_POLICY_SESSION_CONSTANT
+}
+
+pub fn select_pricing_policy(client_policies: &[String]) -> Option<String> {
+    client_policies
+        .iter()
+        .find(|policy| is_supported_pricing_policy(policy))
+        .cloned()
+}
+
 pub fn highest_supported_version(hello: &BootstrapClientHello) -> Option<u8> {
     supported_bootstrap_versions()
         .into_iter()
@@ -147,7 +167,13 @@ pub fn validate_v1_client_hello(hello: &BootstrapV1ClientHello) -> Result<(), St
         .any(|protocol| protocol == SESSION_PROTOCOL_H2)
     {
         if select_cashu_spilman_protocol_version(&hello.cashu_spilman_protocol_versions).is_some() {
-            return Ok(());
+            if select_pricing_policy(&hello.pricing_policies).is_some() {
+                return Ok(());
+            }
+            return Err(format!(
+                "unsupported pricing_policies: {:?}",
+                hello.pricing_policies
+            ));
         }
         return Err(format!(
             "unsupported cashu_spilman_protocol_versions: {:?}",
@@ -176,6 +202,13 @@ pub fn validate_v1_server_accept(accept: &BootstrapV1ServerAccept) -> Result<(),
             "unsupported cashu_spilman_protocol_version: {}",
             version
         ));
+    }
+    let pricing_policy = accept
+        .pricing_policy
+        .as_deref()
+        .ok_or_else(|| "missing pricing_policy".to_string())?;
+    if !is_supported_pricing_policy(pricing_policy) {
+        return Err(format!("unsupported pricing_policy: {}", pricing_policy));
     }
     Ok(())
 }
@@ -230,7 +263,8 @@ mod tests {
                 "nested_monad_over_tcp": true,
                 "nested_monad_over_quic": true
             },
-            "cashu_spilman_protocol_version": "2026-03-20"
+            "cashu_spilman_protocol_version": "2026-03-20",
+            "pricing_policy": "session_constant"
         });
 
         let decoded: BootstrapV1ServerAccept = serde_json::from_value(response).unwrap();
@@ -242,6 +276,10 @@ mod tests {
         assert_eq!(
             decoded.cashu_spilman_protocol_version.as_deref(),
             Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20)
+        );
+        assert_eq!(
+            decoded.pricing_policy.as_deref(),
+            Some(PRICING_POLICY_SESSION_CONSTANT)
         );
     }
 
@@ -259,6 +297,7 @@ mod tests {
             cashu_spilman_protocol_version: Some(
                 CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
             ),
+            pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
 
         let encoded = serde_json::to_value(&accept).unwrap();
@@ -274,7 +313,8 @@ mod tests {
                     "1".to_string(),
                     json!({
                         "session_protocols": ["h2"],
-                        "cashu_spilman_protocol_versions": ["2026-03-20"]
+                        "cashu_spilman_protocol_versions": ["2026-03-20"],
+                        "pricing_policies": ["session_constant"]
                     }),
                 ),
                 ("2".to_string(), json!({"future": true})),
@@ -290,6 +330,7 @@ mod tests {
             cashu_spilman_protocol_versions: vec![
                 CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
             ],
+            pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
         assert_eq!(validate_v1_client_hello(&hello), Ok(()));
     }
@@ -301,6 +342,7 @@ mod tests {
             cashu_spilman_protocol_versions: vec![
                 CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
             ],
+            pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
         assert_eq!(
             validate_v1_client_hello(&hello),
@@ -316,6 +358,7 @@ mod tests {
             cashu_spilman_protocol_version: Some(
                 CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
             ),
+            pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
         assert_eq!(
             validate_v1_server_accept(&accept),
@@ -328,6 +371,7 @@ mod tests {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
             cashu_spilman_protocol_versions: vec![],
+            pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
         assert_eq!(
             validate_v1_client_hello(&hello),
@@ -340,6 +384,7 @@ mod tests {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
             cashu_spilman_protocol_versions: vec!["future".to_string()],
+            pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
         assert_eq!(
             validate_v1_client_hello(&hello),
@@ -365,6 +410,7 @@ mod tests {
             session_protocol: SESSION_PROTOCOL_H2.to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: None,
+            pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
         assert_eq!(
             validate_v1_server_accept(&accept),
@@ -378,10 +424,82 @@ mod tests {
             session_protocol: SESSION_PROTOCOL_H2.to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: Some("future".to_string()),
+            pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
         assert_eq!(
             validate_v1_server_accept(&accept),
             Err("unsupported cashu_spilman_protocol_version: future".to_string())
+        );
+    }
+
+    #[test]
+    fn v1_rejects_when_pricing_policy_missing() {
+        let hello = BootstrapV1ClientHello {
+            session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
+            cashu_spilman_protocol_versions: vec![
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
+            ],
+            pricing_policies: vec![],
+        };
+        assert_eq!(
+            validate_v1_client_hello(&hello),
+            Err("unsupported pricing_policies: []".to_string())
+        );
+    }
+
+    #[test]
+    fn v1_rejects_when_pricing_policy_unsupported() {
+        let hello = BootstrapV1ClientHello {
+            session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
+            cashu_spilman_protocol_versions: vec![
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
+            ],
+            pricing_policies: vec!["future".to_string()],
+        };
+        assert_eq!(
+            validate_v1_client_hello(&hello),
+            Err("unsupported pricing_policies: [\"future\"]".to_string())
+        );
+    }
+
+    #[test]
+    fn select_pricing_policy_prefers_first_mutual_client_entry() {
+        let selected = select_pricing_policy(&[
+            "future".to_string(),
+            PRICING_POLICY_SESSION_CONSTANT.to_string(),
+        ]);
+        assert_eq!(selected.as_deref(), Some(PRICING_POLICY_SESSION_CONSTANT));
+    }
+
+    #[test]
+    fn v1_server_accept_rejects_missing_pricing_policy() {
+        let accept = BootstrapV1ServerAccept {
+            session_protocol: SESSION_PROTOCOL_H2.to_string(),
+            capabilities: initial_server_capabilities(),
+            cashu_spilman_protocol_version: Some(
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+            ),
+            pricing_policy: None,
+        };
+        assert_eq!(
+            validate_v1_server_accept(&accept),
+            Err("missing pricing_policy".to_string())
+        );
+    }
+
+    #[test]
+    fn v1_server_accept_rejects_unknown_pricing_policy() {
+        let accept = BootstrapV1ServerAccept {
+            session_protocol: SESSION_PROTOCOL_H2.to_string(),
+            capabilities: initial_server_capabilities(),
+            cashu_spilman_protocol_version: Some(
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+            ),
+            pricing_policy: Some("future".to_string()),
+        };
+        assert_eq!(
+            validate_v1_server_accept(&accept),
+            Err("unsupported pricing_policy: future".to_string())
         );
     }
 }

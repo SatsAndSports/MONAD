@@ -8,8 +8,8 @@ use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
 use monad_common::bootstrap::{
-    initial_server_accept_v1, select_cashu_spilman_protocol_version, BootstrapCapabilities,
-    BootstrapV1ClientHello, BootstrapV1ServerAccept,
+    initial_server_accept_v1, select_cashu_spilman_protocol_version, select_pricing_policy,
+    BootstrapCapabilities, BootstrapV1ClientHello, BootstrapV1ServerAccept,
 };
 use monad_common::noise_secp256k1;
 use monad_common::protocol::MintUnitKeysets;
@@ -142,11 +142,13 @@ impl ServerConfig {
                 session_protocol: initial_server_accept_v1().session_protocol,
                 capabilities: capabilities.clone(),
                 cashu_spilman_protocol_version: None,
+                pricing_policy: None,
             },
             None => initial_server_accept_v1(),
         };
         accept.cashu_spilman_protocol_version =
             select_cashu_spilman_protocol_version(&hello.cashu_spilman_protocol_versions);
+        accept.pricing_policy = select_pricing_policy(&hello.pricing_policies);
         accept
     }
 }
