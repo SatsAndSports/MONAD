@@ -1,5 +1,8 @@
 use crate::secp_identity::Secp256k1Pubkey;
 use crate::secp_identity::SecpTransportKeypair;
+use k256::elliptic_curve::ff::Field;
+use k256::Scalar;
+use rand_core::OsRng;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlindedHopError {
@@ -31,9 +34,12 @@ impl HopTweak {
     // Raw random tweak generation stays private so callers go through
     // identity-aware helpers that enforce an even tweaked pubkey.
     pub(super) fn generate() -> Result<Self, BlindedHopError> {
-        Ok(Self(
-            SecpTransportKeypair::generate().normalized_secret_bytes(),
-        ))
+        loop {
+            let scalar = Scalar::random(&mut OsRng);
+            if !bool::from(scalar.is_zero()) {
+                return Ok(Self(scalar.to_bytes().into()));
+            }
+        }
     }
 
     #[allow(dead_code)]

@@ -125,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
                 trusted_mint_units,
                 default_in_bytes_per_millisat: 1,
                 default_out_bytes_per_millisat: 1,
+                bootstrap_capabilities: None,
             });
 
             let tcp_listener = TcpListener::bind(&listen).await?;

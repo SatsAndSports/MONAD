@@ -598,10 +598,10 @@ already gone, no final control error message is possible.
 ```
 
 
-## Blinded Routing (Planned)
+## Blinded Routing
 
 MONAD's normal routing model assumes the client knows every hop's real
-`addr:port` and published Ed25519 public key up front. A blinded route changes
+`addr:port` and published secp256k1 x-only public key up front. A blinded route changes
  that model: the client only knows the public **introduction hop**, then learns
  each subsequent hop one layer at a time by establishing nested sessions through
  the existing MONAD tunneling machinery.
@@ -624,31 +624,21 @@ lets one relay open the next relay connection without the client knowing the
 next relay's real identity or real address. Once that blinded hop is
 established, the existing nested Noise+H2 model takes over unchanged.
 
-### Current Low-Level State
-
-The low-level crypto and path-shape pieces now exist in `monad-common`, but the
-transport integration described below is still planned.
+### Current State
 
 Implemented today:
 
 - blinded-hop blob encryption/decryption `(E, ciphertext)`
-- even-Y tweak rejection sampling for MONAD's secp256k1 x-only identity model
+- deterministic adjusted-tweak derivation for MONAD's secp256k1 x-only identity model
 - reverse-tweak recovery of the original secp256k1 x-only public key from
   `(tweaked_pubkey, tweak)`
 - a mixed client-facing `Path` model with:
   - a required cleartext first hop
   - later hops that may be cleartext or blinded
-- deterministic low-level tests showing even-Y tweak rejection sampling succeeds in about 2 attempts on average
-- a 1-byte QUIC stream-kind preamble for MONAD QUIC streams, with `0x00`
-  currently reserved for ordinary nested Noise sessions
-
-Planned next:
-
-- `CONNECT /blinded_hop_v1` transport integration
-- a second QUIC stream kind carrying the tweak preamble for blinded forwarded
-  sessions
-- end-to-end client/relay blinded-hop routing on top of the existing nesting
-  machinery
+- `CONNECT blinded.monad.invalid:443` transport integration using blinded hop headers
+- QUIC `STREAM_KIND_TWEAKED_NOISE` carrying a 32-byte tweak preamble before the nested Noise handshake
+- end-to-end client/relay blinded-hop routing on top of the existing nesting machinery
+- `RouteHop::Blinded` / `Route` connector integration with bootstrap capability enforcement
 
 ### Published Path Shape
 
@@ -767,16 +757,17 @@ The receiving relay applies the tweak on its private side before serving the
 Noise handshake.
 
 In MONAD's current x-only/even-Y transport identity model, blinded-hop
-construction uses **rejection sampling**:
+construction does **not** use rejection sampling anymore.
 
-- sample a candidate tweak
-- derive `tweaked_public = S + t*G`
-- require that `tweaked_public` has even Y so it can be represented as a 32-byte x-only pubkey
-- if not, discard the tweak and try again
+- sample a candidate tweak `t`
+- derive the candidate tweaked private scalar `s + t`
+- if `(s + t)G` has even Y, keep it
+- if `(s + t)G` has odd Y, negate the tweaked secret to `-(s + t)` and adjust the transmitted tweak to `t' = -(s + t) - s`
 
-This succeeds quickly in practice (about 2 attempts on average in the current
-low-level tests). Once an acceptable tweak is found, the receiving relay uses
-the corresponding tweaked private scalar directly for the next Noise handshake.
+This preserves the same x-only public key while ensuring the hidden relay serves
+the even-Y representative that matches MONAD's 32-byte x-only identity format.
+The hidden relay later reconstructs the correct tweaked secret with the normal
+formula `real_secret + tweak` using that adjusted tweak value.
 
 The original long-lived public key can later be recovered from:
 
@@ -797,48 +788,48 @@ relay using the next relay's **real** identity. The QUIC layer is therefore:
 - unchanged from today's relay-to-relay QUIC pool design
 
 Implemented today, all MONAD QUIC streams begin with a 1-byte stream-kind
-preamble. Only one kind is currently accepted:
+preamble. Two kinds are accepted:
 
 ```text
 [1 byte stream kind = secp-noise-v1]
 [then normal Noise handshake bytes]
-```
 
-Unknown kinds are rejected immediately at the QUIC stream layer.
-
-Planned next, blinded forwarded sessions will use a second stream kind. Before
-the nested Noise handshake bytes begin on that QUIC stream, the current relay
-will send a short preamble telling the next relay which tweak to apply:
-
-```text
 [1 byte stream kind = tweaked-noise-v1]
 [32 bytes tweak scalar]
 [then normal Noise handshake bytes]
 ```
+
+Unknown kinds are rejected immediately at the QUIC stream layer.
 
 This keeps the tweak delivery inside the already-encrypted QUIC relay-to-relay
 channel.
 
 ### Blinded CONNECT Dispatch
 
-Planned transport integration uses a special CONNECT target instead of a real
-`host:port` authority:
+Blinded transport integration uses a special CONNECT authority instead of a real
+`host:port` target:
 
 ```text
-CONNECT /blinded_hop_v1
+CONNECT blinded.monad.invalid:443
 ```
 
-The exact on-wire carriage for the blinded material is not finalized yet. The
-current design direction is that the request carries enough data for the relay
-to recover:
+The request carries enough data for the relay to recover:
 
 ```text
-E
-ciphertext
 tweaked_pubkey
+ephemeral_pubkey
+ciphertext
 ```
 
-The relay will interpret `/blinded_hop_v1` as:
+In the current implementation these are sent as H2 headers:
+
+```text
+monad-blinded-tweaked-pubkey
+monad-blinded-ephemeral-pubkey
+monad-blinded-ciphertext
+```
+
+The relay interprets `blinded.monad.invalid:443` as:
 
 - do **not** parse the authority as an address
 - decrypt the blinded payload using the relay's real private key and `E`
@@ -846,6 +837,11 @@ The relay will interpret `/blinded_hop_v1` as:
 - open the next relay connection over QUIC
 - send the tweak preamble
 - then proxy bytes exactly as MONAD already does today
+
+The client-facing connector also checks the relay's bootstrap capability bits
+before attempting the next hop. For example, a route containing
+`RouteHop::Blinded` hard-fails if the current relay does not advertise
+`blinded_connect_v1`.
 
 ### Sequential Client-Driven Progression
 
@@ -855,12 +851,12 @@ of the blinded hops.
 Example:
 
 1. Client connects to the public introduction relay Bob using Bob's real key
-2. Client asks Bob for `CONNECT /blinded_hop_v1` with Bob's blinded blob for
+2. Client asks Bob for `CONNECT blinded.monad.invalid:443` with Bob's blinded blob for
    Carol
 3. Bob decrypts that blob, learns Carol's real address and tweak, opens QUIC to
    Carol, sends the tweak preamble
 4. Client runs a nested Noise+H2 session to Carol using **Carol's tweaked key**
-5. Inside that nested session, client performs another `CONNECT /blinded_hop_v1`
+5. Inside that nested session, client performs another `CONNECT blinded.monad.invalid:443`
    for the next blinded hop
 
 So each hop only needs to decrypt **its own** blob. The client does not need to

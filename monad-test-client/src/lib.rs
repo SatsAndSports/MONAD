@@ -552,6 +552,7 @@ async fn spawn_relay_task(
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
         default_out_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
+        bootstrap_capabilities: None,
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());

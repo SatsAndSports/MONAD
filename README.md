@@ -26,7 +26,7 @@ Implemented today:
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments, with periodic local cleartext-counter checks sizing payments against the latest authoritative relay baseline
 - mock wallet runtime path for tests and connector flows: `MockWallet` plus `session_driver` funds relay sessions without a real wallet backend
-- low-level blinded-hop building blocks: blinded blob encryption/decryption, even-Y tweak rejection sampling, reverse-tweak key recovery, compact binary payload encoding, and a mixed cleartext/blinded path data model in `monad-common`
+- blinded-hop routing over QUIC: `CONNECT blinded.monad.invalid:443`, tweak-prefixed QUIC forwarded sessions, `RouteHop` / `Route` connector support, reverse-tweak key recovery, and deterministic adjusted-tweak derivation for MONAD's x-only secp256k1 identity model
 - integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
 
 Not implemented yet:
@@ -34,7 +34,6 @@ Not implemented yet:
 - usable `monad-client` CLI runtime on top of that real wallet backend
 - relay-side Spilman channel state persistence across restarts
 - persistent route configuration file
-- blinded transport integration (`CONNECT /blinded_hop_v1`, tweak-prefixed QUIC forwarded sessions, and end-to-end client/relay blinded routing)
 
 ## Workspace
 
@@ -108,6 +107,9 @@ Current coverage includes:
 - QUIC control + data channels
 - nested QUIC tunnel (TCP relay forwarding to QUIC relay)
 - client connector with QUIC hop (end-to-end `--hop quic:` path)
+- connector blinded hop route (`RouteHop::Blinded`)
+- connector two-consecutive-blinded-hop route
+- connector hard-fails when a relay lacks required blinded/nested capability bits
 - concurrent QUIC pool access
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
@@ -148,7 +150,7 @@ but that is no longer a client-facing MONAD transport identity.
 
 Identity model:
 - long-lived relay identities are 32-byte x-only secp256k1 pubkeys with implied even Y
-- blinded-hop tweaked pubkeys are also 32-byte x-only secp256k1 pubkeys, enforced even via rejection sampling
+- blinded-hop tweaked pubkeys are also 32-byte x-only secp256k1 pubkeys, kept even via deterministic tweak adjustment
 - ephemeral ECDH pubkeys remain 33-byte compressed curve points
 - Noise DH operates on full curve points internally even though the configured relay identities are x-only
 
@@ -254,6 +256,8 @@ RUST_LOG=info cargo run -p monad-client -- \
 ```
 
 The client connects directly to the first hop via QUIC, then runs the same Noise+H2 session on top using the secp QUIC path.
+
+Blinded routes are currently exposed through the Rust library route model (`RouteHop::Blinded`) rather than the CLI `--hop` parser.
 
 ## Example Usage
 

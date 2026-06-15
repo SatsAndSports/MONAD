@@ -22,6 +22,7 @@ use monad_client::tunnel;
 use monad_client::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
 use monad_common::blinded_connect::BlindedConnectRequest;
 use monad_common::blinded_hop::{build_blinded_hop_descriptor, BlindedHopDescriptor};
+use monad_common::bootstrap::{initial_server_capabilities, BootstrapCapabilities};
 use monad_common::control_codec::{encode_json_line, try_decode_json_line};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise_secp256k1;
@@ -193,8 +194,9 @@ async fn start_monad_relay() -> (std::net::SocketAddr, Secp256k1Pubkey) {
     start_monad_relay_with_transport_key(SecpTransportKeypair::generate()).await
 }
 
-async fn start_monad_relay_with_transport_key(
+async fn start_monad_relay_with_transport_key_and_capabilities(
     transport_key: SecpTransportKeypair,
+    bootstrap_capabilities: BootstrapCapabilities,
 ) -> (std::net::SocketAddr, Secp256k1Pubkey) {
     let identity = QuicCertIdentity::generate().unwrap();
     let pubkey = transport_key.pubkey();
@@ -213,6 +215,7 @@ async fn start_monad_relay_with_transport_key(
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
+        bootstrap_capabilities: Some(bootstrap_capabilities),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
@@ -226,6 +229,16 @@ async fn start_monad_relay_with_transport_key(
     ));
 
     (addr, pubkey)
+}
+
+async fn start_monad_relay_with_transport_key(
+    transport_key: SecpTransportKeypair,
+) -> (std::net::SocketAddr, Secp256k1Pubkey) {
+    start_monad_relay_with_transport_key_and_capabilities(
+        transport_key,
+        initial_server_capabilities(),
+    )
+    .await
 }
 
 async fn start_monad_relay_with_test_payments() -> (
@@ -251,6 +264,7 @@ async fn start_monad_relay_with_test_payments() -> (
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
@@ -293,6 +307,7 @@ async fn start_monad_relay_with_spilman(
         trusted_mint_units,
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
     });
 
     let discovered_spilman_mint_cache = Arc::new(
@@ -362,6 +377,7 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
@@ -3825,6 +3841,40 @@ async fn test_connector_blinded_hop() {
 
     drop(h2);
     conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_connector_rejects_blinded_hop_when_relay_lacks_capability() {
+    let hidden_transport_key = SecpTransportKeypair::generate();
+    let (hidden_addr, _hidden_pubkey) =
+        start_monad_relay_with_transport_key(hidden_transport_key.clone()).await;
+
+    let mut capabilities = initial_server_capabilities();
+    capabilities.blinded_connect_v1 = false;
+    let (intro_addr, intro_pubkey) = start_monad_relay_with_transport_key_and_capabilities(
+        SecpTransportKeypair::generate(),
+        capabilities,
+    )
+    .await;
+
+    let descriptor = build_blinded_hop_descriptor(
+        intro_pubkey.to_compressed_bytes(),
+        &hidden_addr.to_string(),
+        &hidden_transport_key,
+    )
+    .unwrap();
+
+    let route = Route::new(vec![
+        cleartext_route_hop(intro_addr.to_string(), intro_pubkey, true),
+        RouteHop::Blinded { descriptor },
+    ])
+    .unwrap();
+    let err = match connector::connect_route(&route).await {
+        Ok(_) => panic!("expected connector route to fail on missing blinded capability"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    assert!(err.to_string().contains("cannot forward"));
 }
 
 #[tokio::test]

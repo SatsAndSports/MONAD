@@ -76,19 +76,26 @@ pub fn initial_server_capabilities() -> BootstrapCapabilities {
     }
 }
 
-pub fn initial_server_accept_v1() -> BootstrapV1ServerAccept {
+pub fn server_accept_v1(capabilities: BootstrapCapabilities) -> BootstrapV1ServerAccept {
     BootstrapV1ServerAccept {
         session_protocol: SESSION_PROTOCOL_H2.to_string(),
-        capabilities: initial_server_capabilities(),
+        capabilities,
+    }
+}
+
+pub fn initial_server_accept_v1() -> BootstrapV1ServerAccept {
+    server_accept_v1(initial_server_capabilities())
+}
+
+pub fn server_accept(accept: BootstrapV1ServerAccept) -> BootstrapServerResponse {
+    BootstrapServerResponse::Accept {
+        selected_version: BOOTSTRAP_VERSION,
+        response: serde_json::to_value(accept).expect("bootstrap v1 accept is serializable"),
     }
 }
 
 pub fn initial_server_accept() -> BootstrapServerResponse {
-    BootstrapServerResponse::Accept {
-        selected_version: BOOTSTRAP_VERSION,
-        response: serde_json::to_value(initial_server_accept_v1())
-            .expect("initial bootstrap v1 accept is serializable"),
-    }
+    server_accept(initial_server_accept_v1())
 }
 
 pub fn supported_bootstrap_versions() -> Vec<u8> {

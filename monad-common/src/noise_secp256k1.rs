@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::bootstrap::{
     decode_client_hello, decode_server_response, decode_v1_client_hello, decode_v1_server_accept,
     encode_client_hello, encode_server_response, highest_supported_version, initial_client_hello,
-    initial_server_accept, supported_bootstrap_versions, validate_v1_client_hello,
+    initial_server_accept, server_accept, supported_bootstrap_versions, validate_v1_client_hello,
     validate_v1_server_accept, BootstrapServerResponse, BootstrapV1ServerAccept, BOOTSTRAP_VERSION,
 };
 use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
@@ -428,6 +428,67 @@ pub async fn handshake_responder<T: AsyncRead + AsyncWrite + Unpin>(
     [u8; 32],
 )> {
     handshake_responder_with_secret_key_bytes(stream, server_key.normalized_secret_bytes()).await
+}
+
+pub async fn handshake_responder_with_secret_key_bytes_and_server_accept<
+    T: AsyncRead + AsyncWrite + Unpin,
+>(
+    stream: &mut T,
+    server_key: [u8; 32],
+    accept: BootstrapV1ServerAccept,
+) -> io::Result<(
+    CipherState<ChaCha20Poly1305>,
+    CipherState<ChaCha20Poly1305>,
+    [u8; 32],
+)> {
+    handshake_responder_with_secret_key_bytes_and_payload_decider(
+        stream,
+        server_key,
+        move |client_payload| {
+            let (response, accepted) = match decode_client_hello(&client_payload) {
+                Ok(client_hello) => match highest_supported_version(&client_hello) {
+                    Some(BOOTSTRAP_VERSION) => match decode_v1_client_hello(&client_hello)
+                        .and_then(|hello| validate_v1_client_hello(&hello).map(|_| hello))
+                    {
+                        Ok(_) => (server_accept(accept.clone()), true),
+                        Err(reason) => (
+                            BootstrapServerResponse::Reject {
+                                supported_versions: supported_bootstrap_versions(),
+                                reason,
+                            },
+                            false,
+                        ),
+                    },
+                    Some(other) => (
+                        BootstrapServerResponse::Reject {
+                            supported_versions: supported_bootstrap_versions(),
+                            reason: format!(
+                                "unsupported bootstrap version selected by relay: {other}"
+                            ),
+                        },
+                        false,
+                    ),
+                    None => (
+                        BootstrapServerResponse::Reject {
+                            supported_versions: supported_bootstrap_versions(),
+                            reason: "no mutually supported bootstrap version".to_string(),
+                        },
+                        false,
+                    ),
+                },
+                Err(reason) => (
+                    BootstrapServerResponse::Reject {
+                        supported_versions: supported_bootstrap_versions(),
+                        reason: format!("invalid bootstrap hello: {reason}"),
+                    },
+                    false,
+                ),
+            };
+            let payload = encode_server_response(&response)?;
+            Ok((payload, accepted))
+        },
+    )
+    .await
 }
 
 pub async fn handshake_responder_with_secret_key_bytes<T: AsyncRead + AsyncWrite + Unpin>(

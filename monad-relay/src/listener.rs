@@ -7,6 +7,9 @@ use crate::session_registry::SessionRegistry;
 use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
+use monad_common::bootstrap::{
+    initial_server_accept_v1, BootstrapCapabilities, BootstrapV1ServerAccept,
+};
 use monad_common::noise_secp256k1;
 use monad_common::protocol::MintUnitKeysets;
 use monad_common::quic_cert_identity::QuicCertIdentity;
@@ -45,10 +48,12 @@ async fn run_quic_noise_session(
     runtime: QuicSessionRuntime,
 ) {
     let mut quic_stream = quic_stream;
+    let bootstrap_accept = runtime.config.bootstrap_accept_v1();
     let (send_cipher, recv_cipher, session_id) =
-        match noise_secp256k1::handshake_responder_with_secret_key_bytes(
+        match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_server_accept(
             &mut quic_stream,
             responder_secret_key,
+            bootstrap_accept,
         )
         .await
         {
@@ -125,6 +130,20 @@ pub struct ServerConfig {
     pub default_in_bytes_per_millisat: u64,
     /// Default outbound bytes per millisat for sessions on this relay.
     pub default_out_bytes_per_millisat: u64,
+    /// Optional bootstrap capability override, primarily for tests.
+    pub bootstrap_capabilities: Option<BootstrapCapabilities>,
+}
+
+impl ServerConfig {
+    fn bootstrap_accept_v1(&self) -> BootstrapV1ServerAccept {
+        match &self.bootstrap_capabilities {
+            Some(capabilities) => BootstrapV1ServerAccept {
+                session_protocol: initial_server_accept_v1().session_protocol,
+                capabilities: capabilities.clone(),
+            },
+            None => initial_server_accept_v1(),
+        }
+    }
 }
 
 /// Discover all keyset IDs (active and inactive) and cache their keyset info JSON.
@@ -259,10 +278,14 @@ pub async fn run_with_payments_and_registry(
                 let session_registry = session_registry.clone();
 
                 sessions.spawn(async move {
+                    let bootstrap_accept = config.bootstrap_accept_v1();
                     let (send_cipher, recv_cipher, session_id) =
-                        match noise_secp256k1::handshake_responder(&mut tcp_stream, &transport_key)
-                            .await
-                        {
+                        match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_server_accept(
+                            &mut tcp_stream,
+                            transport_key.normalized_secret_bytes(),
+                            bootstrap_accept,
+                        )
+                        .await {
                             Ok(v) => {
                                 info!("secp noise handshake complete with {peer_addr} (TCP)");
                                 v

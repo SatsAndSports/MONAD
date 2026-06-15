@@ -451,6 +451,7 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
