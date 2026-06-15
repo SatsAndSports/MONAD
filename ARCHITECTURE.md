@@ -31,7 +31,7 @@ Important types:
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established secp Noise+H2 session
   - manages H2 client, driver handles, task handles, session pricing, session ID
-  - stores fetched `SessionSpilmanInfo` (mint, keyset, receiver pubkey) for the active channel
+  - stores fetched `SessionSpilmanInfo` (mint, keyset, receiver pubkey, negotiated Cashu Spilman protocol version) for the active channel
 - `SessionPricing` (`session.rs`)
   - local billing metadata with precomputed LCM for integer-only arithmetic
 - `proxy_bidirectional` (`proxy.rs`)
@@ -315,7 +315,7 @@ Server to client (`ServerMessage`):
 
 Here, "bootstrap" means the MONAD-specific negotiation carried inside the two Noise handshake payloads before the post-handshake session begins.
 
-MONAD currently uses the Noise `NK` pattern instantiated with secp256k1 DH, ChaCha20-Poly1305 for transport encryption, BLAKE2s for hashing, and the fixed prologue `monad-noise-secp256k1-v1`. The client sends a hardcoded bootstrap request in the first handshake payload, the relay replies with a hardcoded accept-or-reject payload in the second, and today this bootstrap is intentionally strict rather than flexible capability negotiation: the client requests the one supported shape, and the relay either accepts exactly that shape or rejects with a reason. In this first version, the only accepted post-handshake session protocol is `h2` (HTTP/2), which then carries `POST /control` and `CONNECT host:port` streams inside the Noise transport.
+MONAD currently uses the Noise `NK` pattern instantiated with secp256k1 DH, ChaCha20-Poly1305 for transport encryption, BLAKE2s for hashing, and the fixed prologue `monad-noise-secp256k1-v1`. The client sends a bootstrap request in the first handshake payload, the relay replies with an accept-or-reject payload in the second, and this bootstrap is intentionally strict rather than open-ended negotiation: the client must offer `h2` plus at least one mutually supported Cashu Spilman channel protocol version, and the relay selects exactly one of those versions or rejects the session before H2 starts. Today the only accepted post-handshake session protocol is `h2` (HTTP/2), and the only supported Cashu Spilman channel protocol version is `2026-03-20`.
 
 This bootstrap sequence stays outside the explicit session FSM. The reducer-style
 state machine begins only after the initial `SessionStatus` has been sent.
@@ -487,13 +487,13 @@ Each Noise NK handshake produces a 32-byte **handshake hash** that is identical 
 - Not transmitted over the wire — derived locally from the shared transcript
 - Will be used for channel_id → session_id binding (enforcing one channel per session)
 
-MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The design enforces channel exclusivity and uses delta-based accounting.
+MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The design enforces channel exclusivity and uses delta-based accounting. Before any `ChannelLink` or `ChannelPayment` traffic can happen, the client and relay must already have negotiated a mutually supported Cashu Spilman channel protocol version during the Noise bootstrap.
 
 #### 1. Server Advertisement
 The relay is configured with a map of `Mint -> Unit -> Rates`. In the `SessionStatus` message, it advertises these options to the client as a list of `KeysetAdvertisement` objects. Each option includes the `in_bytes_per_millisat` and `out_bytes_per_millisat` specific to that mint/unit choice.
 
 #### 2. Channel Linking
-The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs.
+The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs. If the bootstrap did not negotiate a supported Cashu Spilman channel protocol version, the relay rejects linking immediately.
 - **One Session Per Channel**: The relay maintains a global registry of `ChannelId -> SessionId`.
 - **Exclusivity**: If a channel is already linked to another session, the relay sends `ChannelEvicted` to the old session and links the channel to the new one.
 - **Stateless Session Start**: Every new Noise session starts with a `total_paid_millisats` of 0. Only *new* payments made within the current session count as credit.

@@ -138,6 +138,7 @@ pub(crate) struct SessionState {
     transport_key: SecpTransportKeypair,
     payment_receiver_secret: SecretKey,
     spilman_mint_cache: SpilmanMintCache,
+    cashu_spilman_protocol_version: Option<String>,
 }
 
 impl SessionState {
@@ -174,6 +175,7 @@ impl SessionState {
             transport_key: config.transport_key.clone(),
             payment_receiver_secret: config.payment_receiver_secret.clone(),
             spilman_mint_cache: config.spilman_mint_cache.clone(),
+            cashu_spilman_protocol_version: config.cashu_spilman_protocol_version.clone(),
         }
     }
 
@@ -203,6 +205,9 @@ impl SessionState {
         &self,
         payment_json: &str,
     ) -> Result<crate::payments::LinkOutcome, crate::payments::LinkError> {
+        if self.cashu_spilman_protocol_version.is_none() {
+            return Err(crate::payments::LinkError::UnsupportedCashuSpilmanProtocolVersion);
+        }
         self.payments.link_channel(self.session_id, payment_json)
     }
 
@@ -358,6 +363,7 @@ pub struct RelaySessionConfig {
     pub transport_key: SecpTransportKeypair,
     pub payment_receiver_secret: SecretKey,
     pub spilman_mint_cache: SpilmanMintCache,
+    pub cashu_spilman_protocol_version: Option<String>,
     pub default_in_bytes_per_millisat: u64,
     pub default_out_bytes_per_millisat: u64,
 }

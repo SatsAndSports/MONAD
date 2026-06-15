@@ -668,6 +668,7 @@ async fn start_auto_control(
     let session_id = *conn.session_id();
     let pricing_handle = conn.session_pricing_handle();
     let spilman_info_handle = conn.session_spilman_info_handle();
+    let cashu_spilman_protocol_version = conn.cashu_spilman_protocol_version().await;
     let wallet = Arc::new(MockWallet::new());
     let (ready_tx, ready_rx) = oneshot::channel();
 
@@ -856,6 +857,7 @@ async fn start_auto_control(
                                 .cloned()
                                 .unwrap_or_default(),
                             keyset_info_json: String::new(),
+                            cashu_spilman_protocol_version: cashu_spilman_protocol_version.clone(),
                         });
                         funding.set_active_channel(relay_offer, new_channel_id);
                         continue;

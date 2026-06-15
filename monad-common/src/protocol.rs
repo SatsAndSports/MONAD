@@ -35,6 +35,7 @@ pub enum ServerErrorCode {
     LinkInvalidChannel,
     LinkReceiverMismatch,
     LinkMintOrKeysetUnacceptable,
+    LinkUnsupportedCashuSpilmanProtocolVersion,
     LinkUnsupportedUnit,
     LinkNonZeroBalance,
     ChannelExpired,

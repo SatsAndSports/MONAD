@@ -25,7 +25,15 @@ pub(super) async fn run_session_driver(
     config: SessionDriverConfig,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
-    let mut state = DriverState::default();
+    let mut state = DriverState {
+        cashu_spilman_protocol_version: config
+            .conn
+            .cashu_spilman_protocol_version_handle
+            .read()
+            .await
+            .clone(),
+        ..DriverState::default()
+    };
     let mut ready_tx = Some(ready_tx);
 
     let mut payment_tick = time::interval(Duration::from_millis(250));

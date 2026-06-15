@@ -67,6 +67,7 @@ pub struct SessionSpilmanInfo {
     pub unit: String,
     pub keyset_id: String,
     pub keyset_info_json: String,
+    pub cashu_spilman_protocol_version: Option<String>,
 }
 
 impl SessionPricing {
@@ -117,6 +118,8 @@ pub struct RelayConnection {
     session_pricing: Arc<RwLock<Option<SessionPricing>>>,
     /// Spilman mint/keyset info fetched by the client for this session.
     session_spilman_info: Arc<RwLock<Option<SessionSpilmanInfo>>>,
+    /// Bootstrap-negotiated Cashu Spilman protocol version for this session.
+    cashu_spilman_protocol_version: Arc<RwLock<Option<String>>>,
     /// Client-side cleartext byte counters for this relay session.
     /// Semantics intentionally mirror the relay's `session_total_in/out`
     /// billing counters for CONNECT payload bytes and are read by the client
@@ -154,6 +157,7 @@ impl RelayConnection {
             session_id,
             session_pricing: Arc::new(RwLock::new(None)),
             session_spilman_info: Arc::new(RwLock::new(None)),
+            cashu_spilman_protocol_version: Arc::new(RwLock::new(None)),
             cleartext_byte_counters: CleartextByteCounters::default(),
         };
 
@@ -251,9 +255,21 @@ impl RelayConnection {
         self.session_spilman_info.read().await.clone()
     }
 
+    pub async fn cashu_spilman_protocol_version(&self) -> Option<String> {
+        self.cashu_spilman_protocol_version.read().await.clone()
+    }
+
+    pub async fn set_cashu_spilman_protocol_version(&self, version: Option<String>) {
+        *self.cashu_spilman_protocol_version.write().await = version;
+    }
+
     /// Get a shared handle to the Spilman session metadata storage.
     pub fn session_spilman_info_handle(&self) -> Arc<RwLock<Option<SessionSpilmanInfo>>> {
         self.session_spilman_info.clone()
+    }
+
+    pub fn cashu_spilman_protocol_version_handle(&self) -> Arc<RwLock<Option<String>>> {
+        self.cashu_spilman_protocol_version.clone()
     }
 
     /// Get a snapshot of `(inbound, outbound)` client-side cleartext bytes for this session.

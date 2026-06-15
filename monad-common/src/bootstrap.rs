@@ -5,6 +5,7 @@ use std::io;
 
 pub const BOOTSTRAP_VERSION: u8 = 1;
 pub const SESSION_PROTOCOL_H2: &str = "h2";
+pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20: &str = "2026-03-20";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapCapabilities {
@@ -23,12 +24,14 @@ pub struct BootstrapCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapV1ClientHello {
     pub session_protocols: Vec<String>,
+    pub cashu_spilman_protocol_versions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapV1ServerAccept {
     pub session_protocol: String,
     pub capabilities: BootstrapCapabilities,
+    pub cashu_spilman_protocol_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +63,7 @@ pub fn initial_client_hello() -> BootstrapClientHello {
         version_key(BOOTSTRAP_VERSION),
         serde_json::to_value(BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
+            cashu_spilman_protocol_versions: supported_cashu_spilman_protocol_versions(),
         })
         .expect("initial bootstrap v1 hello is serializable"),
     );
@@ -80,6 +84,7 @@ pub fn server_accept_v1(capabilities: BootstrapCapabilities) -> BootstrapV1Serve
     BootstrapV1ServerAccept {
         session_protocol: SESSION_PROTOCOL_H2.to_string(),
         capabilities,
+        cashu_spilman_protocol_version: Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()),
     }
 }
 
@@ -100,6 +105,21 @@ pub fn initial_server_accept() -> BootstrapServerResponse {
 
 pub fn supported_bootstrap_versions() -> Vec<u8> {
     vec![BOOTSTRAP_VERSION]
+}
+
+pub fn supported_cashu_spilman_protocol_versions() -> Vec<String> {
+    vec![CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()]
+}
+
+pub fn is_supported_cashu_spilman_protocol_version(version: &str) -> bool {
+    version == CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20
+}
+
+pub fn select_cashu_spilman_protocol_version(client_versions: &[String]) -> Option<String> {
+    client_versions
+        .iter()
+        .find(|version| is_supported_cashu_spilman_protocol_version(version))
+        .cloned()
 }
 
 pub fn highest_supported_version(hello: &BootstrapClientHello) -> Option<u8> {
@@ -126,7 +146,13 @@ pub fn validate_v1_client_hello(hello: &BootstrapV1ClientHello) -> Result<(), St
         .iter()
         .any(|protocol| protocol == SESSION_PROTOCOL_H2)
     {
-        return Ok(());
+        if select_cashu_spilman_protocol_version(&hello.cashu_spilman_protocol_versions).is_some() {
+            return Ok(());
+        }
+        return Err(format!(
+            "unsupported cashu_spilman_protocol_versions: {:?}",
+            hello.cashu_spilman_protocol_versions
+        ));
     }
     Err(format!(
         "unsupported session protocols: {:?}",
@@ -139,6 +165,16 @@ pub fn validate_v1_server_accept(accept: &BootstrapV1ServerAccept) -> Result<(),
         return Err(format!(
             "unsupported session protocol: {}",
             accept.session_protocol
+        ));
+    }
+    let version = accept
+        .cashu_spilman_protocol_version
+        .as_deref()
+        .ok_or_else(|| "missing cashu_spilman_protocol_version".to_string())?;
+    if !is_supported_cashu_spilman_protocol_version(version) {
+        return Err(format!(
+            "unsupported cashu_spilman_protocol_version: {}",
+            version
         ));
     }
     Ok(())
@@ -193,7 +229,8 @@ mod tests {
                 "direct_tcp_exit": true,
                 "nested_monad_over_tcp": true,
                 "nested_monad_over_quic": true
-            }
+            },
+            "cashu_spilman_protocol_version": "2026-03-20"
         });
 
         let decoded: BootstrapV1ServerAccept = serde_json::from_value(response).unwrap();
@@ -202,6 +239,10 @@ mod tests {
         assert!(decoded.capabilities.nested_monad_over_quic);
         assert!(!decoded.capabilities.blinded_connect_v1);
         assert!(!decoded.capabilities.tweaked_noise_v1);
+        assert_eq!(
+            decoded.cashu_spilman_protocol_version.as_deref(),
+            Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20)
+        );
     }
 
     #[test]
@@ -215,6 +256,9 @@ mod tests {
                 blinded_connect_v1: true,
                 tweaked_noise_v1: true,
             },
+            cashu_spilman_protocol_version: Some(
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+            ),
         };
 
         let encoded = serde_json::to_value(&accept).unwrap();
@@ -226,7 +270,13 @@ mod tests {
     fn highest_mutual_version_is_selected() {
         let hello = BootstrapClientHello {
             versions: BTreeMap::from([
-                ("1".to_string(), json!({"session_protocols": ["h2"]})),
+                (
+                    "1".to_string(),
+                    json!({
+                        "session_protocols": ["h2"],
+                        "cashu_spilman_protocol_versions": ["2026-03-20"]
+                    }),
+                ),
                 ("2".to_string(), json!({"future": true})),
             ]),
         };
@@ -237,6 +287,9 @@ mod tests {
     fn v1_accepts_h2_among_other_protocols() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec!["future".to_string(), "h2".to_string()],
+            cashu_spilman_protocol_versions: vec![
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
+            ],
         };
         assert_eq!(validate_v1_client_hello(&hello), Ok(()));
     }
@@ -245,6 +298,9 @@ mod tests {
     fn v1_rejects_when_h2_missing() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec!["something-else".to_string()],
+            cashu_spilman_protocol_versions: vec![
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
+            ],
         };
         assert_eq!(
             validate_v1_client_hello(&hello),
@@ -257,10 +313,75 @@ mod tests {
         let accept = BootstrapV1ServerAccept {
             session_protocol: "future".to_string(),
             capabilities: initial_server_capabilities(),
+            cashu_spilman_protocol_version: Some(
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+            ),
         };
         assert_eq!(
             validate_v1_server_accept(&accept),
             Err("unsupported session protocol: future".to_string())
+        );
+    }
+
+    #[test]
+    fn v1_rejects_when_cashu_spilman_version_missing() {
+        let hello = BootstrapV1ClientHello {
+            session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
+            cashu_spilman_protocol_versions: vec![],
+        };
+        assert_eq!(
+            validate_v1_client_hello(&hello),
+            Err("unsupported cashu_spilman_protocol_versions: []".to_string())
+        );
+    }
+
+    #[test]
+    fn v1_rejects_when_cashu_spilman_version_unsupported() {
+        let hello = BootstrapV1ClientHello {
+            session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
+            cashu_spilman_protocol_versions: vec!["future".to_string()],
+        };
+        assert_eq!(
+            validate_v1_client_hello(&hello),
+            Err("unsupported cashu_spilman_protocol_versions: [\"future\"]".to_string())
+        );
+    }
+
+    #[test]
+    fn select_cashu_spilman_protocol_version_prefers_first_mutual_client_entry() {
+        let selected = select_cashu_spilman_protocol_version(&[
+            "future".to_string(),
+            CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+        ]);
+        assert_eq!(
+            selected.as_deref(),
+            Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20)
+        );
+    }
+
+    #[test]
+    fn v1_server_accept_rejects_missing_cashu_spilman_protocol_version() {
+        let accept = BootstrapV1ServerAccept {
+            session_protocol: SESSION_PROTOCOL_H2.to_string(),
+            capabilities: initial_server_capabilities(),
+            cashu_spilman_protocol_version: None,
+        };
+        assert_eq!(
+            validate_v1_server_accept(&accept),
+            Err("missing cashu_spilman_protocol_version".to_string())
+        );
+    }
+
+    #[test]
+    fn v1_server_accept_rejects_unknown_cashu_spilman_protocol_version() {
+        let accept = BootstrapV1ServerAccept {
+            session_protocol: SESSION_PROTOCOL_H2.to_string(),
+            capabilities: initial_server_capabilities(),
+            cashu_spilman_protocol_version: Some("future".to_string()),
+        };
+        assert_eq!(
+            validate_v1_server_accept(&accept),
+            Err("unsupported cashu_spilman_protocol_version: future".to_string())
         );
     }
 }

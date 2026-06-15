@@ -46,6 +46,7 @@ pub enum LinkError {
     InvalidPayment(String),
     InvalidChannel(String),
     MintOrKeysetNotAcceptable,
+    UnsupportedCashuSpilmanProtocolVersion,
     ReceiverKeyMismatch,
     UnsupportedUnit(String),
     NonZeroLinkBalance,
@@ -60,6 +61,9 @@ impl fmt::Display for LinkError {
             Self::InvalidPayment(s) => write!(f, "invalid payment: {s}"),
             Self::InvalidChannel(s) => write!(f, "invalid channel: {s}"),
             Self::MintOrKeysetNotAcceptable => write!(f, "mint or keyset not acceptable"),
+            Self::UnsupportedCashuSpilmanProtocolVersion => {
+                write!(f, "unsupported cashu spilman protocol version")
+            }
             Self::ReceiverKeyMismatch => write!(f, "receiver key mismatch"),
             Self::UnsupportedUnit(unit) => write!(f, "unsupported unit: {unit}"),
             Self::NonZeroLinkBalance => write!(f, "link balance must be zero"),
@@ -78,6 +82,9 @@ impl LinkError {
             Self::InvalidPayment(_) => ServerErrorCode::LinkInvalidPayment,
             Self::InvalidChannel(_) => ServerErrorCode::LinkInvalidChannel,
             Self::MintOrKeysetNotAcceptable => ServerErrorCode::LinkMintOrKeysetUnacceptable,
+            Self::UnsupportedCashuSpilmanProtocolVersion => {
+                ServerErrorCode::LinkUnsupportedCashuSpilmanProtocolVersion
+            }
             Self::ReceiverKeyMismatch => ServerErrorCode::LinkReceiverMismatch,
             Self::UnsupportedUnit(_) => ServerErrorCode::LinkUnsupportedUnit,
             Self::NonZeroLinkBalance => ServerErrorCode::LinkNonZeroBalance,

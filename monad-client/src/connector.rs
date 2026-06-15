@@ -258,6 +258,10 @@ where
         let (mut conn, driver) =
             RelayConnection::from_transport_stream(noise_stream, session_id).await?;
         conn.add_driver(driver);
+        conn.set_cashu_spilman_protocol_version(
+            server_accept.cashu_spilman_protocol_version.clone(),
+        )
+        .await;
 
         info!(
             "hop {}/{}: H2 connection established",

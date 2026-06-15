@@ -22,7 +22,11 @@ use monad_client::tunnel;
 use monad_client::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
 use monad_common::blinded_connect::BlindedConnectRequest;
 use monad_common::blinded_hop::{build_blinded_hop_descriptor, BlindedHopDescriptor};
-use monad_common::bootstrap::{initial_server_capabilities, BootstrapCapabilities};
+use monad_common::bootstrap::{
+    decode_server_response, encode_client_hello, initial_server_capabilities,
+    BootstrapCapabilities, BootstrapClientHello, BootstrapV1ClientHello, BOOTSTRAP_VERSION,
+    CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20,
+};
 use monad_common::control_codec::{encode_json_line, try_decode_json_line};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise_secp256k1;
@@ -43,7 +47,7 @@ use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
@@ -3875,6 +3879,60 @@ async fn test_connector_rejects_blinded_hop_when_relay_lacks_capability() {
     };
     assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     assert!(err.to_string().contains("cannot forward"));
+}
+
+#[tokio::test]
+async fn test_connector_stores_negotiated_cashu_spilman_protocol_version() {
+    let (relay_addr, relay_pubkey) = start_monad_relay().await;
+
+    let conn = connect_route_hops(vec![cleartext_route_hop(
+        relay_addr.to_string(),
+        relay_pubkey,
+        true,
+    )])
+    .await;
+
+    assert_eq!(
+        conn.cashu_spilman_protocol_version().await.as_deref(),
+        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20)
+    );
+
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_bootstrap_rejects_client_without_mutual_cashu_spilman_protocol_version() {
+    let (relay_addr, relay_pubkey) = start_monad_relay().await;
+    let mut stream = TcpStream::connect(relay_addr).await.unwrap();
+    let hello = BootstrapClientHello {
+        versions: BTreeMap::from([(
+            BOOTSTRAP_VERSION.to_string(),
+            serde_json::to_value(BootstrapV1ClientHello {
+                session_protocols: vec!["h2".to_string()],
+                cashu_spilman_protocol_versions: vec!["future".to_string()],
+            })
+            .unwrap(),
+        )]),
+    };
+    let payload = encode_client_hello(&hello).unwrap();
+
+    let (_, _, _, server_payload) = noise_secp256k1::handshake_initiator_with_pubkey_and_payload(
+        &mut stream,
+        relay_pubkey.to_compressed_bytes(),
+        &payload,
+    )
+    .await
+    .unwrap();
+    let response = decode_server_response(&server_payload).unwrap();
+
+    match response {
+        monad_common::bootstrap::BootstrapServerResponse::Reject { reason, .. } => {
+            assert!(reason.contains("unsupported cashu_spilman_protocol_versions"));
+        }
+        monad_common::bootstrap::BootstrapServerResponse::Accept { .. } => {
+            panic!("expected bootstrap handshake to be rejected")
+        }
+    }
 }
 
 #[tokio::test]

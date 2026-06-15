@@ -685,6 +685,9 @@ mod tests {
                         session_id: [0; 32],
                         pricing_handle: Arc::new(tokio::sync::RwLock::new(None)),
                         spilman_info_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                        cashu_spilman_protocol_version_handle: Arc::new(tokio::sync::RwLock::new(
+                            None,
+                        )),
                         cleartext_byte_counters: CleartextByteCounters::default(),
                     },
                     hop_label: "test".to_string(),

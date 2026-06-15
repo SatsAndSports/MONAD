@@ -12,8 +12,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::bootstrap::{
     decode_client_hello, decode_server_response, decode_v1_client_hello, decode_v1_server_accept,
     encode_client_hello, encode_server_response, highest_supported_version, initial_client_hello,
-    initial_server_accept, server_accept, supported_bootstrap_versions, validate_v1_client_hello,
-    validate_v1_server_accept, BootstrapServerResponse, BootstrapV1ServerAccept, BOOTSTRAP_VERSION,
+    initial_server_accept, is_supported_cashu_spilman_protocol_version, server_accept,
+    supported_bootstrap_versions, validate_v1_client_hello, validate_v1_server_accept,
+    BootstrapServerResponse, BootstrapV1ClientHello, BootstrapV1ServerAccept, BOOTSTRAP_VERSION,
 };
 use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 
@@ -374,6 +375,16 @@ pub async fn handshake_initiator_with_pubkey_and_server_accept<
             let accept = decode_v1_server_accept(response)?;
             validate_v1_server_accept(&accept)
                 .map_err(|e| io::Error::other(format!("invalid relay bootstrap accept: {e}")))?;
+            let version = accept
+                .cashu_spilman_protocol_version
+                .as_deref()
+                .ok_or_else(|| io::Error::other("relay omitted cashu_spilman_protocol_version"))?;
+            if !is_supported_cashu_spilman_protocol_version(version) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("relay selected unsupported cashu_spilman_protocol_version: {version}"),
+                ));
+            }
             Ok((send, recv, session_id, accept))
         }
         BootstrapServerResponse::Reject { reason, .. } => Err(io::Error::new(
@@ -489,6 +500,90 @@ pub async fn handshake_responder_with_secret_key_bytes_and_server_accept<
         },
     )
     .await
+}
+
+pub async fn handshake_responder_with_secret_key_bytes_and_accept_builder<
+    T: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(&BootstrapV1ClientHello) -> BootstrapV1ServerAccept,
+>(
+    stream: &mut T,
+    server_key: [u8; 32],
+    build_accept: F,
+) -> io::Result<(
+    CipherState<ChaCha20Poly1305>,
+    CipherState<ChaCha20Poly1305>,
+    [u8; 32],
+    BootstrapV1ServerAccept,
+)> {
+    use std::sync::{Arc, Mutex};
+
+    let accepted = Arc::new(Mutex::new(None::<BootstrapV1ServerAccept>));
+    let accepted_out = accepted.clone();
+    let (send, recv, session_id) = handshake_responder_with_secret_key_bytes_and_payload_decider(
+        stream,
+        server_key,
+        move |client_payload| {
+            let (response, is_accepted, accept) = match decode_client_hello(&client_payload) {
+                Ok(client_hello) => match highest_supported_version(&client_hello) {
+                    Some(BOOTSTRAP_VERSION) => match decode_v1_client_hello(&client_hello)
+                        .and_then(|hello| validate_v1_client_hello(&hello).map(|_| hello))
+                    {
+                        Ok(hello) => {
+                            let accept = build_accept(&hello);
+                            (server_accept(accept.clone()), true, Some(accept))
+                        }
+                        Err(reason) => (
+                            BootstrapServerResponse::Reject {
+                                supported_versions: supported_bootstrap_versions(),
+                                reason,
+                            },
+                            false,
+                            None,
+                        ),
+                    },
+                    Some(other) => (
+                        BootstrapServerResponse::Reject {
+                            supported_versions: supported_bootstrap_versions(),
+                            reason: format!(
+                                "unsupported bootstrap version selected by relay: {other}"
+                            ),
+                        },
+                        false,
+                        None,
+                    ),
+                    None => (
+                        BootstrapServerResponse::Reject {
+                            supported_versions: supported_bootstrap_versions(),
+                            reason: "no mutually supported bootstrap version".to_string(),
+                        },
+                        false,
+                        None,
+                    ),
+                },
+                Err(reason) => (
+                    BootstrapServerResponse::Reject {
+                        supported_versions: supported_bootstrap_versions(),
+                        reason: format!("invalid bootstrap hello: {reason}"),
+                    },
+                    false,
+                    None,
+                ),
+            };
+            if let Some(accept) = accept {
+                *accepted.lock().unwrap() = Some(accept);
+            }
+            let payload = encode_server_response(&response)?;
+            Ok((payload, is_accepted))
+        },
+    )
+    .await?;
+
+    let accept = accepted_out
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| io::Error::other("bootstrap accept builder did not produce accept"))?;
+    Ok((send, recv, session_id, accept))
 }
 
 pub async fn handshake_responder_with_secret_key_bytes<T: AsyncRead + AsyncWrite + Unpin>(

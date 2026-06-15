@@ -8,7 +8,8 @@ use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
 use monad_common::bootstrap::{
-    initial_server_accept_v1, BootstrapCapabilities, BootstrapV1ServerAccept,
+    initial_server_accept_v1, select_cashu_spilman_protocol_version, BootstrapCapabilities,
+    BootstrapV1ClientHello, BootstrapV1ServerAccept,
 };
 use monad_common::noise_secp256k1;
 use monad_common::protocol::MintUnitKeysets;
@@ -48,12 +49,11 @@ async fn run_quic_noise_session(
     runtime: QuicSessionRuntime,
 ) {
     let mut quic_stream = quic_stream;
-    let bootstrap_accept = runtime.config.bootstrap_accept_v1();
-    let (send_cipher, recv_cipher, session_id) =
-        match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_server_accept(
+    let (send_cipher, recv_cipher, session_id, bootstrap_accept) =
+        match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_accept_builder(
             &mut quic_stream,
             responder_secret_key,
-            bootstrap_accept,
+            |hello| runtime.config.bootstrap_accept_v1(hello),
         )
         .await
         {
@@ -87,6 +87,7 @@ async fn run_quic_noise_session(
             transport_key: runtime.transport_key,
             payment_receiver_secret: runtime.config.payment_receiver_secret.clone(),
             spilman_mint_cache: runtime.discovered_spilman_mint_cache.as_ref().clone(),
+            cashu_spilman_protocol_version: bootstrap_accept.cashu_spilman_protocol_version,
             default_in_bytes_per_millisat: runtime.config.default_in_bytes_per_millisat,
             default_out_bytes_per_millisat: runtime.config.default_out_bytes_per_millisat,
         },
@@ -135,14 +136,18 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    fn bootstrap_accept_v1(&self) -> BootstrapV1ServerAccept {
-        match &self.bootstrap_capabilities {
+    fn bootstrap_accept_v1(&self, hello: &BootstrapV1ClientHello) -> BootstrapV1ServerAccept {
+        let mut accept = match &self.bootstrap_capabilities {
             Some(capabilities) => BootstrapV1ServerAccept {
                 session_protocol: initial_server_accept_v1().session_protocol,
                 capabilities: capabilities.clone(),
+                cashu_spilman_protocol_version: None,
             },
             None => initial_server_accept_v1(),
-        }
+        };
+        accept.cashu_spilman_protocol_version =
+            select_cashu_spilman_protocol_version(&hello.cashu_spilman_protocol_versions);
+        accept
     }
 }
 
@@ -278,12 +283,11 @@ pub async fn run_with_payments_and_registry(
                 let session_registry = session_registry.clone();
 
                 sessions.spawn(async move {
-                    let bootstrap_accept = config.bootstrap_accept_v1();
-                    let (send_cipher, recv_cipher, session_id) =
-                        match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_server_accept(
+                    let (send_cipher, recv_cipher, session_id, bootstrap_accept) =
+                        match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_accept_builder(
                             &mut tcp_stream,
                             transport_key.normalized_secret_bytes(),
-                            bootstrap_accept,
+                            |hello| config.bootstrap_accept_v1(hello),
                         )
                         .await {
                             Ok(v) => {
@@ -316,6 +320,8 @@ pub async fn run_with_payments_and_registry(
                             transport_key: transport_key.clone(),
                             payment_receiver_secret: config.payment_receiver_secret.clone(),
                             spilman_mint_cache: discovered_spilman_mint_cache.as_ref().clone(),
+                            cashu_spilman_protocol_version: bootstrap_accept
+                                .cashu_spilman_protocol_version,
                             default_in_bytes_per_millisat: config.default_in_bytes_per_millisat,
                             default_out_bytes_per_millisat: config.default_out_bytes_per_millisat,
                         },
