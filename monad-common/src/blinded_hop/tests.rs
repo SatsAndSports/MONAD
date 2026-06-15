@@ -10,6 +10,9 @@ use super::types::HopTweak;
 use super::*;
 use crate::noise_secp256k1;
 use crate::secp_identity::SecpTransportKeypair;
+use k256::elliptic_curve::ff::PrimeField;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::SecretKey;
 use sha2::{Digest, Sha512};
 
 const SAMPLE_COUNT: usize = 64;
@@ -33,6 +36,12 @@ fn sample_secret_bytes(label: &[u8], i: u32) -> [u8; 32] {
 
 fn sample_identity(i: u32) -> SecpTransportKeypair {
     SecpTransportKeypair::from_secret_bytes(&sample_secret_bytes(b"monad-secp-hop-key", i)).unwrap()
+}
+
+fn sample_scalar(bytes: [u8; 32]) -> k256::Scalar {
+    let scalar = Option::<k256::Scalar>::from(k256::Scalar::from_repr(bytes.into())).unwrap();
+    assert!(!bool::from(scalar.is_zero()));
+    scalar
 }
 
 fn assert_descriptor_matches_hidden_hop(
@@ -88,6 +97,48 @@ fn test_derive_tweaked_responder_secret_matches_descriptor_pubkey() {
         derive_tweaked_responder_secret(&hidden_identity, resolved.tweak).unwrap();
     let derived_pubkey = pubkey_from_secret_bytes(&responder_secret).unwrap();
     assert_eq!(derived_pubkey, descriptor.tweaked_pubkey);
+}
+
+#[test]
+fn test_odd_candidate_uses_adjusted_tweak_for_even_representative() {
+    let identity = sample_identity(0);
+    let base_scalar = sample_scalar(identity.normalized_secret_bytes());
+
+    let (original_tweak, candidate_scalar) = loop {
+        let tweak = HopTweak::generate().unwrap();
+        let candidate_scalar = base_scalar + tweak.scalar().unwrap();
+        let candidate_secret_key = match SecretKey::from_slice(&candidate_scalar.to_bytes()) {
+            Ok(secret_key) => secret_key,
+            Err(_) => continue,
+        };
+        if candidate_secret_key
+            .public_key()
+            .to_encoded_point(true)
+            .as_bytes()[0]
+            != 0x02
+        {
+            break (tweak, candidate_scalar);
+        }
+    };
+
+    let adjusted_scalar = -candidate_scalar;
+    let adjusted_tweak_bytes: [u8; 32] = (adjusted_scalar - base_scalar).to_bytes().into();
+    let adjusted_tweak = HopTweak::from_bytes(adjusted_tweak_bytes);
+    let recomputed_scalar = base_scalar + adjusted_tweak.scalar().unwrap();
+    assert_eq!(recomputed_scalar, adjusted_scalar);
+
+    let derived_secret = derive_tweaked_responder_secret(&identity, adjusted_tweak_bytes).unwrap();
+    assert_eq!(derived_secret, <[u8; 32]>::from(adjusted_scalar.to_bytes()));
+
+    let tweaked_pubkey = tweak_pubkey(identity.pubkey(), &adjusted_tweak).unwrap();
+    assert_eq!(tweaked_pubkey.to_compressed_bytes()[0], 0x02);
+    assert_eq!(
+        tweaked_pubkey,
+        pubkey_from_secret_bytes(&derived_secret).unwrap(),
+    );
+
+    let original_pubkey = tweak_pubkey(identity.pubkey(), &original_tweak).unwrap();
+    assert_eq!(original_pubkey, tweaked_pubkey);
 }
 
 #[test]

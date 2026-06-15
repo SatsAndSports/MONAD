@@ -1,8 +1,8 @@
 use super::types::{BlindedHopError, HopTweak, TweakedHopIdentity, TweakedHopPublic};
 use crate::secp_identity::Secp256k1Pubkey;
 use crate::secp_identity::SecpTransportKeypair;
+use k256::elliptic_curve::ff::PrimeField;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::schnorr::SigningKey;
 use k256::{ProjectivePoint, PublicKey, Scalar, SecretKey};
 
 pub(super) fn public_key_from_bytes(pubkey: &[u8; 33]) -> Result<PublicKey, BlindedHopError> {
@@ -27,33 +27,62 @@ fn is_even_point(public_key: &PublicKey) -> bool {
 
 impl HopTweak {
     pub(super) fn scalar(&self) -> Result<Scalar, BlindedHopError> {
-        let signing_key =
-            SigningKey::from_bytes(&self.raw_bytes()).map_err(|_| BlindedHopError::InvalidTweak)?;
-        Ok(*signing_key.as_nonzero_scalar().as_ref())
+        nonzero_scalar_from_bytes(self.raw_bytes())
     }
 }
 
-// Keep sampling until P + tG lands on an even-Y point so the published
-// tweaked hop identity can remain a 32-byte x-only pubkey.
+fn nonzero_scalar_from_bytes(bytes: [u8; 32]) -> Result<Scalar, BlindedHopError> {
+    let scalar = Option::<Scalar>::from(Scalar::from_repr(bytes.into()))
+        .ok_or(BlindedHopError::InvalidTweak)?;
+    if bool::from(scalar.is_zero()) {
+        return Err(BlindedHopError::InvalidTweak);
+    }
+    Ok(scalar)
+}
+
+// Sample one tweak scalar, then if P + tG lands on an odd-Y point, negate the
+// tweaked secret and adjust the transmitted tweak so the published tweaked hop
+// identity still uses the even-Y representative of the same x-only pubkey.
 pub(super) fn derive_even_tweaked_secret_key(
     identity: &SecpTransportKeypair,
 ) -> Result<(HopTweak, [u8; 32], Secp256k1Pubkey), BlindedHopError> {
-    let base_key = SigningKey::from_bytes(&identity.normalized_secret_bytes())
-        .map_err(|_| BlindedHopError::InvalidTweak)?;
+    let base_scalar = nonzero_scalar_from_bytes(identity.normalized_secret_bytes())?;
 
     loop {
-        let tweak = HopTweak::generate()?;
-        let tweaked_scalar = *base_key.as_nonzero_scalar().as_ref() + tweak.scalar()?;
+        let candidate_tweak = HopTweak::generate()?;
+        let candidate_scalar = base_scalar + candidate_tweak.scalar()?;
+        let candidate_secret_key = match SecretKey::from_slice(&candidate_scalar.to_bytes()) {
+            Ok(secret_key) => secret_key,
+            Err(_) => continue,
+        };
+        let candidate_public = candidate_secret_key.public_key();
+
+        let (tweaked_scalar, tweak_bytes) = if is_even_point(&candidate_public) {
+            (candidate_scalar, candidate_tweak.raw_bytes())
+        } else {
+            let adjusted_scalar = -candidate_scalar;
+            let adjusted_tweak_scalar = adjusted_scalar - base_scalar;
+            let adjusted_tweak_bytes: [u8; 32] = adjusted_tweak_scalar.to_bytes().into();
+            if nonzero_scalar_from_bytes(adjusted_tweak_bytes).is_err() {
+                continue;
+            }
+            (adjusted_scalar, adjusted_tweak_bytes)
+        };
+
         let responder_secret_key: [u8; 32] = tweaked_scalar.to_bytes().into();
-        let secret_key = SecretKey::from_slice(&responder_secret_key)
-            .map_err(|_| BlindedHopError::InvalidTweak)?;
+        let secret_key = match SecretKey::from_slice(&responder_secret_key) {
+            Ok(secret_key) => secret_key,
+            Err(_) => continue,
+        };
         let tweaked_public = secret_key.public_key();
-        if is_even_point(&tweaked_public) {
-            let tweaked_pubkey =
-                Secp256k1Pubkey::from_compressed_bytes(compressed_bytes(&tweaked_public))
-                    .map_err(|_| BlindedHopError::InvalidPublicKey)?;
-            return Ok((tweak, responder_secret_key, tweaked_pubkey));
-        }
+        let tweaked_pubkey =
+            Secp256k1Pubkey::from_compressed_bytes(compressed_bytes(&tweaked_public))
+                .map_err(|_| BlindedHopError::InvalidPublicKey)?;
+        return Ok((
+            HopTweak::from_bytes(tweak_bytes),
+            responder_secret_key,
+            tweaked_pubkey,
+        ));
     }
 }
 
@@ -65,8 +94,12 @@ pub(super) fn tweak_pubkey(
     let public = pubkey
         .to_public_key()
         .map_err(|_| BlindedHopError::InvalidPublicKey)?;
-    let tweaked_point =
+    let mut tweaked_point =
         ProjectivePoint::from(public) + ProjectivePoint::GENERATOR * tweak.scalar()?;
+    let tweaked_public = public_key_from_point(tweaked_point)?;
+    if !is_even_point(&tweaked_public) {
+        tweaked_point = -tweaked_point;
+    }
     let tweaked_public = public_key_from_point(tweaked_point)?;
     let tweaked_compressed = compressed_bytes(&tweaked_public);
     Secp256k1Pubkey::from_compressed_bytes(tweaked_compressed)
@@ -114,10 +147,9 @@ pub(super) fn derive_tweaked_responder_secret_key(
     identity: &SecpTransportKeypair,
     tweak_bytes: [u8; 32],
 ) -> Result<[u8; 32], BlindedHopError> {
-    let base_key = SigningKey::from_bytes(&identity.normalized_secret_bytes())
-        .map_err(|_| BlindedHopError::InvalidTweak)?;
+    let base_scalar = nonzero_scalar_from_bytes(identity.normalized_secret_bytes())?;
     let tweak = HopTweak::from_bytes(tweak_bytes);
-    let tweaked_scalar = *base_key.as_nonzero_scalar().as_ref() + tweak.scalar()?;
+    let tweaked_scalar = base_scalar + tweak.scalar()?;
     Ok(tweaked_scalar.to_bytes().into())
 }
 
