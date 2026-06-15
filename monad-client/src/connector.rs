@@ -1,13 +1,16 @@
-//! Establishes a connection to a MONAD relay, optionally through a chain
-//! of intermediate hops (onion routing / nested tunneling).
+//! Establishes a connection to a MONAD relay, optionally through a route of
+//! intermediate hops.
 //!
-//! Single hop:   TCP → Noise(S) → H2
-//! Two hops:     TCP → Noise(T) → H2 → CONNECT(S) → Noise(S) → H2
-//! N hops:       Each hop wraps the previous one via H2ConnectStream.
+//! Single hop:   TCP/QUIC -> Noise(S) -> H2
+//! Two hops:     TCP/QUIC -> Noise(T) -> H2 -> CONNECT(S) -> Noise(S) -> H2
+//! N hops:       Each hop wraps the previous one via `H2ConnectStream`.
 
+use crate::route::{Route, RouteHop};
 use crate::session_driver;
 use crate::session_driver::PaymentPolicy;
 use crate::wallet::{MockWallet, MonadWallet};
+use monad_common::blinded_connect::BlindedConnectRequest;
+use monad_common::bootstrap::BootstrapCapabilities;
 use monad_common::noise_secp256k1;
 use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::RelayConnection;
@@ -47,122 +50,73 @@ impl ConnectorRuntime {
     }
 }
 
-/// A hop identity for transport authentication.
-#[derive(Debug, Clone)]
-pub enum HopIdentity {
-    Secp256k1(Secp256k1Pubkey),
-}
-
-impl HopIdentity {
-    pub fn describe(&self) -> &'static str {
-        match self {
-            Self::Secp256k1(_) => "secp256k1",
-        }
-    }
-}
-
-/// A hop in the tunnel chain: relay address and its transport identity.
-///
-/// MONAD transport now uses secp256k1 identities for both plain TCP and QUIC.
-///
-/// If `use_quic` is true, the previous relay in the chain will connect to this
-/// hop via QUIC instead of TCP.
-#[derive(Debug, Clone)]
-pub struct Hop {
-    pub addr: String,
-    /// Transport identity for this hop.
-    pub identity: HopIdentity,
-    /// Whether the previous relay should connect to this hop via QUIC.
-    pub use_quic: bool,
-}
-
-/// Connect to a MONAD relay directly (single hop).
-///
-/// Equivalent to `connect_through_chain(&[hop])`.
-#[allow(dead_code)]
 pub async fn connect(
     relay_addr: &str,
     relay_pubkey: Secp256k1Pubkey,
 ) -> io::Result<RelayConnection> {
-    connect_through_chain(&[Hop {
+    let route = Route::new(vec![RouteHop::Cleartext {
         addr: relay_addr.to_string(),
-        identity: HopIdentity::Secp256k1(relay_pubkey),
+        pubkey: relay_pubkey,
         use_quic: false,
-    }])
-    .await
-}
-
-/// Connect to a chain of MONAD relays.
-///
-/// `hops` must have at least one entry. The first hop is connected to via TCP.
-/// Each subsequent hop is reached by opening an H2 CONNECT tunnel through the
-/// previous hop. The returned `RelayConnection` is for the *last* hop in the chain.
-///
-/// Example with 2 hops [T, S]:
-///   TCP → Noise(T) → H2 → CONNECT(S:port) → Noise(S) → H2 → (returned client)
-///
-/// T only sees encrypted Noise bytes. It has no idea that inside those bytes
-/// is another MONAD session asking S to proxy onward.
-pub async fn connect_through_chain(hops: &[Hop]) -> io::Result<RelayConnection> {
+    }])?;
     let runtime = ConnectorRuntime::with_mock_wallet()?;
-    connect_through_chain_internal(hops, runtime, false).await
+    connect_route_internal(&route, runtime, false).await
 }
 
-/// Connect to a chain of MONAD relays, optionally funding every hop with the
-/// provided wallet.
-///
-/// When `wallet` is `Some`, every hop in the chain, including the final hop,
-/// is funded through the shared session payment driver before this function
-/// returns. When `wallet` is `None`, no funding is started automatically.
-pub async fn connect_through_chain_with_wallet(
-    hops: &[Hop],
+pub async fn connect_route(route: &Route) -> io::Result<RelayConnection> {
+    let runtime = ConnectorRuntime::with_mock_wallet()?;
+    connect_route_internal(route, runtime, false).await
+}
+
+pub async fn connect_route_with_wallet(
+    route: &Route,
     wallet: Option<Arc<dyn MonadWallet>>,
 ) -> io::Result<RelayConnection> {
     let runtime = ConnectorRuntime::new(wallet)?;
-    connect_through_chain_internal(hops, runtime, true).await
+    connect_route_internal(route, runtime, true).await
 }
 
-pub async fn connect_through_chain_with_runtime(
-    hops: &[Hop],
+pub async fn connect_route_with_runtime(
+    route: &Route,
     runtime: &ConnectorRuntime,
 ) -> io::Result<RelayConnection> {
-    connect_through_chain_internal(hops, runtime.clone(), true).await
+    connect_route_internal(route, runtime.clone(), true).await
 }
 
-async fn connect_through_chain_internal(
-    hops: &[Hop],
+async fn connect_route_internal(
+    route: &Route,
     runtime: ConnectorRuntime,
     fund_last_hop: bool,
 ) -> io::Result<RelayConnection> {
-    if hops.is_empty() {
+    let first = route.hops().first().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "at least one hop is required")
+    })?;
+
+    let RouteHop::Cleartext {
+        addr,
+        pubkey,
+        use_quic,
+    } = first
+    else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "at least one hop is required",
+            "the first hop must be cleartext",
         ));
-    }
+    };
 
-    let first = &hops[0];
-
-    if first.use_quic {
-        // Connect to the first hop via QUIC
-        info!("connecting to first hop via QUIC: {}", first.addr);
-        let auth = match &first.identity {
-            HopIdentity::Secp256k1(pubkey) => ClientAuthMode::Secp256k1(*pubkey),
-        };
+    if *use_quic {
+        info!("connecting to first hop via QUIC: {addr}");
         let quic_stream = runtime
             .first_hop_quic_pool
-            .open_stream(&first.addr, auth)
+            .open_stream(addr, ClientAuthMode::Secp256k1(*pubkey))
             .await?;
-        info!("QUIC connected to {}", first.addr);
-
-        chain_from_stream(quic_stream, hops, 0, runtime, fund_last_hop).await
+        info!("QUIC connected to {addr}");
+        chain_from_stream(quic_stream, route.clone(), 0, runtime, fund_last_hop).await
     } else {
-        // Connect to the first hop via TCP
-        info!("connecting to first hop: {}", first.addr);
-        let tcp_stream = TcpStream::connect(&first.addr).await?;
-        info!("TCP connected to {}", first.addr);
-
-        chain_from_stream(tcp_stream, hops, 0, runtime, fund_last_hop).await
+        info!("connecting to first hop: {addr}");
+        let tcp_stream = TcpStream::connect(addr).await?;
+        info!("TCP connected to {addr}");
+        chain_from_stream(tcp_stream, route.clone(), 0, runtime, fund_last_hop).await
     }
 }
 
@@ -192,16 +146,75 @@ async fn optionally_fund_session(
     Ok(conn)
 }
 
-/// Recursively build the tunnel chain starting from a given stream and hop index.
-///
-/// This function performs the Noise handshake and H2 setup for `hops[hop_idx]`,
-/// then if there are more hops, opens a CONNECT tunnel and recurses.
-///
-/// The returned future is boxed to allow async recursion with different stream types
-/// at each nesting level.
+fn hop_display_label(hop: &RouteHop) -> String {
+    match hop {
+        RouteHop::Cleartext { addr, use_quic, .. } => {
+            if *use_quic {
+                format!("quic:{addr}")
+            } else {
+                addr.clone()
+            }
+        }
+        RouteHop::Blinded { descriptor } => {
+            format!("blinded:{}", descriptor.tweaked_pubkey.to_hex())
+        }
+    }
+}
+
+fn ensure_next_hop_capabilities(
+    route: &Route,
+    hop_idx: usize,
+    capabilities: &BootstrapCapabilities,
+) -> io::Result<()> {
+    let Some(next_hop) = route.hops().get(hop_idx + 1) else {
+        return Ok(());
+    };
+
+    let requirements = next_hop.previous_hop_capability_requirements();
+    if requirements.is_satisfied_by(capabilities) {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "hop {}/{} cannot forward to {}: relay capabilities {:?} do not satisfy {:?}",
+            hop_idx + 1,
+            route.hops().len(),
+            hop_display_label(next_hop),
+            capabilities,
+            requirements,
+        ),
+    ))
+}
+
+async fn open_next_hop_tunnel(
+    conn: &RelayConnection,
+    next_hop: &RouteHop,
+) -> io::Result<monad_common::h2stream::H2ConnectStream> {
+    match next_hop {
+        RouteHop::Cleartext {
+            addr,
+            pubkey,
+            use_quic,
+        } => {
+            if *use_quic {
+                conn.open_tunnel_quic_secp256k1(addr, &pubkey.to_hex())
+                    .await
+            } else {
+                conn.open_tunnel(addr).await
+            }
+        }
+        RouteHop::Blinded { descriptor } => {
+            let request = BlindedConnectRequest::from_descriptor(descriptor);
+            conn.open_tunnel_blinded_hop(&request).await
+        }
+    }
+}
+
 fn chain_from_stream<S>(
     mut stream: S,
-    hops: &[Hop],
+    route: Route,
     hop_idx: usize,
     runtime: ConnectorRuntime,
     fund_last_hop: bool,
@@ -209,45 +222,57 @@ fn chain_from_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Clone what we need since we're moving into a boxed future
-    let hops = hops.to_vec();
     let runtime = runtime.clone();
 
     Box::pin(async move {
-        let hop = &hops[hop_idx];
+        let hop = &route.hops()[hop_idx];
+        let hop_label = hop_display_label(hop);
 
         info!(
             "hop {}/{}: Noise handshake with {}",
             hop_idx + 1,
-            hops.len(),
-            hop.addr
+            route.hops().len(),
+            hop_label
         );
 
-        let label = format!("client hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
-        let (mut conn, driver) = match &hop.identity {
-            HopIdentity::Secp256k1(pubkey) => {
-                let (send_cipher, recv_cipher, session_id) =
-                    noise_secp256k1::handshake_initiator(&mut stream, pubkey).await?;
-                let secp_stream = noise_secp256k1::SecpNoiseStream::new(
-                    stream,
-                    send_cipher,
-                    recv_cipher,
-                    session_id,
-                    label,
-                );
-                RelayConnection::from_transport_stream(secp_stream, session_id).await?
-            }
-        };
+        let (send_cipher, recv_cipher, session_id, server_accept) =
+            noise_secp256k1::handshake_initiator_with_pubkey_and_server_accept(
+                &mut stream,
+                hop.handshake_pubkey().to_compressed_bytes(),
+            )
+            .await?;
+        let capabilities = server_accept.capabilities.clone();
+
+        let noise_stream = noise_secp256k1::SecpNoiseStream::new(
+            stream,
+            send_cipher,
+            recv_cipher,
+            session_id,
+            format!(
+                "client hop {}/{} to {}",
+                hop_idx + 1,
+                route.hops().len(),
+                hop_label
+            ),
+        );
+        let (mut conn, driver) =
+            RelayConnection::from_transport_stream(noise_stream, session_id).await?;
         conn.add_driver(driver);
 
         info!(
             "hop {}/{}: H2 connection established",
             hop_idx + 1,
-            hops.len()
+            route.hops().len()
         );
 
-        let hop_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
-        let should_fund = runtime.wallet.is_some() && (hop_idx < hops.len() - 1 || fund_last_hop);
+        let funding_label = format!(
+            "hop {}/{} to {}",
+            hop_idx + 1,
+            route.hops().len(),
+            hop_label
+        );
+        let should_fund =
+            runtime.wallet.is_some() && (hop_idx < route.hops().len() - 1 || fund_last_hop);
         conn = optionally_fund_session(
             conn,
             if should_fund {
@@ -255,39 +280,28 @@ where
             } else {
                 None
             },
-            &hop_label,
+            &funding_label,
             runtime.payment_policy,
         )
         .await?;
 
-        if hop_idx < hops.len() - 1 {
-            // Not the last hop — open a CONNECT tunnel to the next hop
-            let next = &hops[hop_idx + 1];
+        if hop_idx < route.hops().len() - 1 {
+            let next_hop = &route.hops()[hop_idx + 1];
+            ensure_next_hop_capabilities(&route, hop_idx, &capabilities)?;
+
             info!(
                 "hop {}/{}: opening CONNECT tunnel to next hop {}",
                 hop_idx + 1,
-                hops.len(),
-                next.addr
+                route.hops().len(),
+                hop_display_label(next_hop)
             );
 
-            // Open the CONNECT tunnel, with QUIC pin if the next hop uses QUIC
-            let h2_connect_stream = if next.use_quic {
-                match &next.identity {
-                    HopIdentity::Secp256k1(pubkey) => {
-                        conn.open_tunnel_quic_secp256k1(&next.addr, &pubkey.to_hex())
-                            .await?
-                    }
-                }
-            } else {
-                conn.open_tunnel(&next.addr).await?
-            };
+            let h2_connect_stream = open_next_hop_tunnel(&conn, next_hop).await?;
 
-            // Recurse: perform Noise + H2 over this tunnel for the next hop.
-            // Attach this hop's driver to the final connection.
             let mut conn = conn;
             let mut next_conn = chain_from_stream(
                 h2_connect_stream,
-                &hops,
+                route.clone(),
                 hop_idx + 1,
                 runtime.clone(),
                 fund_last_hop,
@@ -296,9 +310,54 @@ where
             next_conn.absorb_handles_from(&mut conn);
             Ok(next_conn)
         } else {
-            // Last hop — return for actual use.
-            info!("tunnel chain established ({} hops)", hops.len());
+            info!("tunnel route established ({} hops)", route.hops().len());
             Ok(conn)
         }
-    }) // close Box::pin(async move { ... })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monad_common::blinded_hop::BlindedHopDescriptor;
+    use monad_common::blinded_hop::BlindedHopMessage;
+    use monad_common::bootstrap::initial_server_capabilities;
+    use monad_common::secp_identity::SecpTransportKeypair;
+
+    fn sample_pubkey(seed: u8) -> Secp256k1Pubkey {
+        SecpTransportKeypair::from_secret_bytes(&[seed; 32])
+            .unwrap()
+            .pubkey()
+    }
+
+    fn sample_blinded_descriptor() -> BlindedHopDescriptor {
+        BlindedHopDescriptor {
+            tweaked_pubkey: sample_pubkey(9),
+            message: BlindedHopMessage {
+                ephemeral_pubkey: sample_pubkey(10).to_compressed_bytes(),
+                ciphertext: vec![1, 2, 3],
+            },
+        }
+    }
+
+    #[test]
+    fn capability_check_hard_fails_when_next_hop_requires_missing_flag() {
+        let route = Route::new(vec![
+            RouteHop::Cleartext {
+                addr: "127.0.0.1:9000".to_string(),
+                pubkey: sample_pubkey(1),
+                use_quic: true,
+            },
+            RouteHop::Blinded {
+                descriptor: sample_blinded_descriptor(),
+            },
+        ])
+        .unwrap();
+        let mut capabilities = initial_server_capabilities();
+        capabilities.blinded_connect_v1 = false;
+
+        let err = ensure_next_hop_capabilities(&route, 0, &capabilities).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("cannot forward"));
+    }
 }

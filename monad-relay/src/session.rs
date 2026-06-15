@@ -18,16 +18,19 @@ use bytes::Bytes;
 use cashu::nuts::SecretKey;
 use h2::{server, RecvStream};
 use http::{Method, Request, Response, StatusCode};
+use monad_common::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
+use monad_common::blinded_hop::resolve_blinded_hop_for_intro;
 use monad_common::control_codec::{send_json_line, try_decode_json_line};
 use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerErrorCode, ServerMessage};
-use monad_common::secp_identity::Secp256k1Pubkey;
+use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::{clamp_i128_to_i64, SessionPricing};
 use monad_quic::client::ClientAuthMode;
-use monad_quic::stream::STREAM_KIND_SECP_NOISE;
+use monad_quic::stream::{STREAM_KIND_SECP_NOISE, STREAM_KIND_TWEAKED_NOISE};
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -132,6 +135,7 @@ pub(crate) struct SessionState {
     session_id: [u8; 32],
     payments: Arc<dyn RelayPayments>,
     session_registry: Arc<SessionRegistry>,
+    transport_key: SecpTransportKeypair,
     payment_receiver_secret: SecretKey,
     spilman_mint_cache: SpilmanMintCache,
 }
@@ -139,18 +143,12 @@ pub(crate) struct SessionState {
 impl SessionState {
     // Lifecycle and shared handles.
 
-    fn new(
-        session_id: [u8; 32],
-        payments: Arc<dyn RelayPayments>,
-        session_registry: Arc<SessionRegistry>,
-        payment_receiver_secret: SecretKey,
-        spilman_mint_cache: SpilmanMintCache,
-        default_in_bytes_per_millisat: u64,
-        default_out_bytes_per_millisat: u64,
-    ) -> Self {
+    fn new(session_id: [u8; 32], config: &RelaySessionConfig) -> Self {
         let (pause_tx, _) = watch::channel(true);
         let termination = CancellationToken::new();
-        session_registry.register_session(session_id, termination.clone());
+        config
+            .session_registry
+            .register_session(session_id, termination.clone());
         Self {
             billing: Arc::new(Mutex::new(BillingState {
                 state: ServerSessionState {
@@ -162,8 +160,8 @@ impl SessionState {
                     terminated: false,
                 },
                 pricing: SessionPricing::new(
-                    default_in_bytes_per_millisat.max(1),
-                    default_out_bytes_per_millisat.max(1),
+                    config.default_in_bytes_per_millisat.max(1),
+                    config.default_out_bytes_per_millisat.max(1),
                 ),
             })),
             control: Arc::new(Mutex::new(ControlState::default())),
@@ -171,10 +169,11 @@ impl SessionState {
             pause_tx,
             termination,
             session_id,
-            payments,
-            session_registry,
-            payment_receiver_secret,
-            spilman_mint_cache,
+            payments: config.payments.clone(),
+            session_registry: config.session_registry.clone(),
+            transport_key: config.transport_key.clone(),
+            payment_receiver_secret: config.payment_receiver_secret.clone(),
+            spilman_mint_cache: config.spilman_mint_cache.clone(),
         }
     }
 
@@ -356,6 +355,7 @@ pub struct RelaySession<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
 pub struct RelaySessionConfig {
     pub payments: Arc<dyn RelayPayments>,
     pub session_registry: Arc<SessionRegistry>,
+    pub transport_key: SecpTransportKeypair,
     pub payment_receiver_secret: SecretKey,
     pub spilman_mint_cache: SpilmanMintCache,
     pub default_in_bytes_per_millisat: u64,
@@ -384,15 +384,7 @@ where
         h2_conn,
         quic_pool,
         session_id,
-        state: SessionState::new(
-            session_id,
-            config.payments,
-            config.session_registry,
-            config.payment_receiver_secret,
-            config.spilman_mint_cache,
-            config.default_in_bytes_per_millisat,
-            config.default_out_bytes_per_millisat,
-        ),
+        state: SessionState::new(session_id, &config),
     })
 }
 
@@ -434,6 +426,116 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
             }
         });
         Ok(())
+    }
+
+    async fn handle_blinded_connect(
+        &self,
+        respond: &mut server::SendResponse<Bytes>,
+        request: Request<RecvStream>,
+    ) {
+        let connect_request = match BlindedConnectRequest::from_headers(request.headers()) {
+            Ok(request) => request,
+            Err(e) => {
+                warn!("invalid blinded CONNECT request headers: {e}");
+                let resp = Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(())
+                    .unwrap();
+                let _ = respond.send_response(resp, true);
+                return;
+            }
+        };
+        let descriptor = connect_request.into_descriptor();
+        let resolved = match resolve_blinded_hop_for_intro(&self.state.transport_key, &descriptor) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                warn!("failed to resolve blinded CONNECT descriptor: {e}");
+                let resp = Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(())
+                    .unwrap();
+                let _ = respond.send_response(resp, true);
+                return;
+            }
+        };
+
+        let pool = match &self.quic_pool {
+            Some(p) => p.clone(),
+            None => {
+                warn!("blinded CONNECT requested but QUIC pool is not available");
+                let resp = Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(())
+                    .unwrap();
+                let _ = respond.send_response(resp, true);
+                return;
+            }
+        };
+
+        info!(
+            "CONNECT {} (via blinded QUIC secp256k1 auth)",
+            resolved.next_hop_addr
+        );
+
+        match pool
+            .open_stream_with_kind(
+                &resolved.next_hop_addr,
+                ClientAuthMode::Secp256k1(resolved.next_hop_real_pubkey),
+                STREAM_KIND_TWEAKED_NOISE,
+            )
+            .await
+        {
+            Ok(mut quic_stream) => {
+                if let Err(e) = quic_stream.write_all(&resolved.tweak).await {
+                    warn!(
+                        "failed to write blinded QUIC tweak preamble to {}: {e}",
+                        resolved.next_hop_addr
+                    );
+                    let resp = Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(resp, true);
+                    return;
+                }
+                if let Err(e) = quic_stream.flush().await {
+                    warn!(
+                        "failed to flush blinded QUIC tweak preamble to {}: {e}",
+                        resolved.next_hop_addr
+                    );
+                    let resp = Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(resp, true);
+                    return;
+                }
+
+                if let Err(e) = self
+                    .spawn_tunnel(
+                        respond,
+                        request,
+                        quic_stream,
+                        &resolved.next_hop_addr,
+                        &format!("quic-blinded:{}", resolved.next_hop_addr),
+                    )
+                    .await
+                {
+                    error!("h2 send response error: {e}");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "failed to connect via blinded QUIC to {}: {e}",
+                    resolved.next_hop_addr
+                );
+                let resp = Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(())
+                    .unwrap();
+                let _ = respond.send_response(resp, true);
+            }
+        }
     }
 
     /// Run the accept loop: accept H2 streams and dispatch them to handlers.
@@ -478,6 +580,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                 .authority()
                                 .map(|a| a.to_string())
                                 .unwrap_or_else(|| uri.to_string());
+
+                            if authority == BLINDED_HOP_CONNECT_AUTHORITY {
+                                self.handle_blinded_connect(&mut respond, request).await;
+                                continue;
+                            }
 
                             if authority.is_empty() {
                                 warn!("CONNECT request missing authority");

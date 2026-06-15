@@ -10,6 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub const STREAM_KIND_SECP_NOISE: u8 = 0x02;
+pub const STREAM_KIND_TWEAKED_NOISE: u8 = 0x03;
 
 /// A bidirectional QUIC stream that implements `AsyncRead + AsyncWrite`.
 ///

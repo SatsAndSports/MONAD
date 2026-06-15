@@ -110,6 +110,17 @@ pub(super) fn derive_tweaked_hop_identity(
     })
 }
 
+pub(super) fn derive_tweaked_responder_secret_key(
+    identity: &SecpTransportKeypair,
+    tweak_bytes: [u8; 32],
+) -> Result<[u8; 32], BlindedHopError> {
+    let base_key = SigningKey::from_bytes(&identity.normalized_secret_bytes())
+        .map_err(|_| BlindedHopError::InvalidTweak)?;
+    let tweak = HopTweak::from_bytes(tweak_bytes);
+    let tweaked_scalar = *base_key.as_nonzero_scalar().as_ref() + tweak.scalar()?;
+    Ok(tweaked_scalar.to_bytes().into())
+}
+
 #[cfg(test)]
 pub(super) fn pubkey_from_secret_bytes(
     secret_bytes: &[u8; 32],

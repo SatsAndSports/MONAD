@@ -1,4 +1,4 @@
-use monad_client::connector::{Hop, HopIdentity};
+use monad_client::route::RouteHop;
 use monad_client::wallet::{MockWallet, MonadWallet, RelayPaymentOffer};
 use monad_common::control_codec::{send_json_line, try_decode_json_line};
 use monad_common::noise_secp256k1;
@@ -36,6 +36,13 @@ const DEFAULT_PAYMENT_STATUS_POLL_MS: u64 = 100;
 const DEFAULT_INITIAL_PAYMENT_MSATS: u64 = 100_000;
 const DEFAULT_PAYMENT_CHUNK_MSATS: u64 = 100_000;
 const DEFAULT_TARGET_BUFFER_MSATS: u64 = 20_000;
+
+fn hop_label(hop: &RouteHop) -> &str {
+    match hop {
+        RouteHop::Cleartext { addr, .. } => addr,
+        RouteHop::Blinded { .. } => "blinded",
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StressPaymentMode {
@@ -984,7 +991,7 @@ async fn fund_session_huge(
 
 fn connect_through_chain_prefunded(
     mut stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    hops: &[Hop],
+    hops: &[RouteHop],
     hop_idx: usize,
     payment: StressPaymentConfig,
     payment_stats: Arc<PaymentStats>,
@@ -993,9 +1000,14 @@ fn connect_through_chain_prefunded(
 
     Box::pin(async move {
         let hop = &hops[hop_idx];
-        let label = format!("stress hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
-        let (mut conn, driver) = match &hop.identity {
-            HopIdentity::Secp256k1(pubkey) => {
+        let label = format!(
+            "stress hop {}/{} to {}",
+            hop_idx + 1,
+            hops.len(),
+            hop_label(hop)
+        );
+        let (mut conn, driver) = match hop {
+            RouteHop::Cleartext { pubkey, .. } => {
                 let (send_cipher, recv_cipher, session_id) =
                     noise_secp256k1::handshake_initiator(&mut stream, pubkey).await?;
                 let secp_stream = noise_secp256k1::SecpNoiseStream::new(
@@ -1007,23 +1019,39 @@ fn connect_through_chain_prefunded(
                 );
                 RelayConnection::from_transport_stream(secp_stream, session_id).await?
             }
+            RouteHop::Blinded { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "stress harness does not support blinded hops yet",
+                ));
+            }
         };
         conn.add_driver(driver);
 
-        let hop_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop.addr);
-        conn = fund_session_huge(conn, &hop_label, payment, payment_stats.clone()).await?;
+        let funding_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop_label(hop));
+        conn = fund_session_huge(conn, &funding_label, payment, payment_stats.clone()).await?;
 
         if hop_idx < hops.len() - 1 {
             let next = &hops[hop_idx + 1];
-            let h2_connect_stream = if next.use_quic {
-                match &next.identity {
-                    HopIdentity::Secp256k1(pubkey) => {
-                        conn.open_tunnel_quic_secp256k1(&next.addr, &pubkey.to_hex())
+            let h2_connect_stream = match next {
+                RouteHop::Cleartext {
+                    addr,
+                    pubkey,
+                    use_quic,
+                } => {
+                    if *use_quic {
+                        conn.open_tunnel_quic_secp256k1(addr, &pubkey.to_hex())
                             .await?
+                    } else {
+                        conn.open_tunnel(addr).await?
                     }
                 }
-            } else {
-                conn.open_tunnel(&next.addr).await?
+                RouteHop::Blinded { .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "stress harness does not support blinded hops yet",
+                    ));
+                }
             };
 
             let mut conn = conn;
@@ -1045,7 +1073,7 @@ fn connect_through_chain_prefunded(
 
 async fn connect_quic_chain_prefunded(
     first_hop_pool: &QuicPool,
-    hops: &[Hop],
+    hops: &[RouteHop],
     payment: StressPaymentConfig,
     payment_stats: Arc<PaymentStats>,
 ) -> io::Result<RelayConnection> {
@@ -1057,17 +1085,26 @@ async fn connect_quic_chain_prefunded(
     }
 
     let first = &hops[0];
-    let auth = match &first.identity {
-        HopIdentity::Secp256k1(pubkey) => ClientAuthMode::Secp256k1(*pubkey),
+    let RouteHop::Cleartext {
+        addr,
+        pubkey,
+        use_quic,
+    } = first
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stress harness expects a cleartext first hop",
+        ));
     };
-    let stream = if first.use_quic {
-        first_hop_pool.open_stream(&first.addr, auth).await?
-    } else {
+    if !use_quic {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "stress harness expects QUIC first hop",
         ));
-    };
+    }
+    let stream = first_hop_pool
+        .open_stream(addr, ClientAuthMode::Secp256k1(*pubkey))
+        .await?;
 
     connect_through_chain_prefunded(stream, hops, 0, payment, payment_stats).await
 }
@@ -1075,15 +1112,11 @@ async fn connect_quic_chain_prefunded(
 async fn run_circuit(
     circuit_id: usize,
     first_hop_pool: Arc<QuicPool>,
-    hops: Vec<Hop>,
+    hops: Vec<RouteHop>,
     config: CircuitRunConfig,
 ) -> io::Result<CircuitStats> {
     if config.verbose {
-        let hop_path = hops
-            .iter()
-            .map(|hop| hop.addr.as_str())
-            .collect::<Vec<_>>()
-            .join(" -> ");
+        let hop_path = hops.iter().map(hop_label).collect::<Vec<_>>().join(" -> ");
         println!(
             "circuit {circuit_id}: building {}-hop QUIC chain via [{hop_path}]",
             hops.len(),
@@ -1290,9 +1323,9 @@ async fn run_stress_scenario(config: StressConfig) {
         let indices = sample_relay_indices(config.relays, config.hops_per_circuit, circuit_id);
         let hops = indices
             .into_iter()
-            .map(|relay_idx| Hop {
+            .map(|relay_idx| RouteHop::Cleartext {
                 addr: relays[relay_idx].0.to_string(),
-                identity: HopIdentity::Secp256k1(relays[relay_idx].1),
+                pubkey: relays[relay_idx].1,
                 use_quic: true,
             })
             .collect::<Vec<_>>();

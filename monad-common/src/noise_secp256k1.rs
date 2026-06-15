@@ -13,7 +13,7 @@ use crate::bootstrap::{
     decode_client_hello, decode_server_response, decode_v1_client_hello, decode_v1_server_accept,
     encode_client_hello, encode_server_response, highest_supported_version, initial_client_hello,
     initial_server_accept, supported_bootstrap_versions, validate_v1_client_hello,
-    validate_v1_server_accept, BootstrapServerResponse, BOOTSTRAP_VERSION,
+    validate_v1_server_accept, BootstrapServerResponse, BootstrapV1ServerAccept, BOOTSTRAP_VERSION,
 };
 use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 
@@ -341,6 +341,22 @@ pub async fn handshake_initiator_with_pubkey<T: AsyncRead + AsyncWrite + Unpin>(
     CipherState<ChaCha20Poly1305>,
     [u8; 32],
 )> {
+    let (send, recv, session_id, _) =
+        handshake_initiator_with_pubkey_and_server_accept(stream, server_pubkey).await?;
+    Ok((send, recv, session_id))
+}
+
+pub async fn handshake_initiator_with_pubkey_and_server_accept<
+    T: AsyncRead + AsyncWrite + Unpin,
+>(
+    stream: &mut T,
+    server_pubkey: [u8; 33],
+) -> io::Result<(
+    CipherState<ChaCha20Poly1305>,
+    CipherState<ChaCha20Poly1305>,
+    [u8; 32],
+    BootstrapV1ServerAccept,
+)> {
     let client_payload = encode_client_hello(&initial_client_hello())?;
     let (send, recv, session_id, server_payload) =
         handshake_initiator_with_pubkey_and_payload(stream, server_pubkey, &client_payload).await?;
@@ -358,15 +374,13 @@ pub async fn handshake_initiator_with_pubkey<T: AsyncRead + AsyncWrite + Unpin>(
             let accept = decode_v1_server_accept(response)?;
             validate_v1_server_accept(&accept)
                 .map_err(|e| io::Error::other(format!("invalid relay bootstrap accept: {e}")))?;
+            Ok((send, recv, session_id, accept))
         }
-        BootstrapServerResponse::Reject { reason, .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("relay bootstrap rejected session: {reason}"),
-            ));
-        }
+        BootstrapServerResponse::Reject { reason, .. } => Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("relay bootstrap rejected session: {reason}"),
+        )),
     }
-    Ok((send, recv, session_id))
 }
 
 pub async fn handshake_initiator_with_pubkey_and_payload<T: AsyncRead + AsyncWrite + Unpin>(

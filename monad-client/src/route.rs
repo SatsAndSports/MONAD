@@ -264,10 +264,10 @@ mod tests {
             ..RouteHopCapabilityRequirements::default()
         };
 
-        assert!(!requirements.is_satisfied_by(&capabilities));
-
-        capabilities.blinded_connect_v1 = true;
-        capabilities.tweaked_noise_v1 = true;
         assert!(requirements.is_satisfied_by(&capabilities));
+
+        capabilities.blinded_connect_v1 = false;
+        capabilities.tweaked_noise_v1 = false;
+        assert!(!requirements.is_satisfied_by(&capabilities));
     }
 }

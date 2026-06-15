@@ -6,6 +6,7 @@ use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
 use crate::session_registry::SessionRegistry;
 use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
+use monad_common::blinded_hop::derive_tweaked_responder_secret;
 use monad_common::noise_secp256k1;
 use monad_common::protocol::MintUnitKeysets;
 use monad_common::quic_cert_identity::QuicCertIdentity;
@@ -14,7 +15,7 @@ use monad_quic::auth::{
     reject_stream, serve_attestation_stream, AUTH_STREAM_KIND, STREAM_ERROR_AUTH_REQUIRED,
     STREAM_ERROR_UNKNOWN_KIND,
 };
-use monad_quic::stream::{QuicStream, STREAM_KIND_SECP_NOISE};
+use monad_quic::stream::{QuicStream, STREAM_KIND_SECP_NOISE, STREAM_KIND_TWEAKED_NOISE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::{
@@ -24,6 +25,79 @@ use std::sync::{
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
+
+#[derive(Clone)]
+struct QuicSessionRuntime {
+    quic_pool: Option<QuicPool>,
+    config: Arc<ServerConfig>,
+    transport_key: SecpTransportKeypair,
+    discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
+    payments: Arc<dyn RelayPayments>,
+    session_registry: Arc<SessionRegistry>,
+}
+
+async fn run_quic_noise_session(
+    quic_stream: QuicStream,
+    responder_secret_key: [u8; 32],
+    remote: std::net::SocketAddr,
+    stream_id: quinn::StreamId,
+    label_suffix: &str,
+    runtime: QuicSessionRuntime,
+) {
+    let mut quic_stream = quic_stream;
+    let (send_cipher, recv_cipher, session_id) =
+        match noise_secp256k1::handshake_responder_with_secret_key_bytes(
+            &mut quic_stream,
+            responder_secret_key,
+        )
+        .await
+        {
+            Ok(v) => {
+                info!("secp noise handshake complete with {remote} (QUIC {stream_id:?} {label_suffix})");
+                v
+            }
+            Err(e) => {
+                error!("secp noise handshake failed with {remote} (QUIC {stream_id:?} {label_suffix}): {e}");
+                return;
+            }
+        };
+    let secp_stream = noise_secp256k1::SecpNoiseStream::new(
+        quic_stream,
+        send_cipher,
+        recv_cipher,
+        session_id,
+        format!(
+            "{} <-> {remote} (QUIC {stream_id:?} {label_suffix})",
+            "quic"
+        ),
+    );
+
+    match relay_session_from_transport_stream(
+        secp_stream,
+        session_id,
+        runtime.quic_pool,
+        RelaySessionConfig {
+            payments: runtime.payments,
+            session_registry: runtime.session_registry,
+            transport_key: runtime.transport_key,
+            payment_receiver_secret: runtime.config.payment_receiver_secret.clone(),
+            spilman_mint_cache: runtime.discovered_spilman_mint_cache.as_ref().clone(),
+            default_in_bytes_per_millisat: runtime.config.default_in_bytes_per_millisat,
+            default_out_bytes_per_millisat: runtime.config.default_out_bytes_per_millisat,
+        },
+    )
+    .await
+    {
+        Ok(session) => {
+            if let Err(e) = session.run().await {
+                error!("session error with {remote} (QUIC {stream_id:?} {label_suffix}): {e}");
+            }
+        }
+        Err(e) => {
+            error!("H2 handshake failed with {remote} (QUIC {stream_id:?} {label_suffix}): {e}");
+        }
+    }
+}
 
 /// Hardcoded trusted mint policy for now: mint URL -> allowed units.
 pub type TrustedMintUnits = BTreeMap<String, BTreeSet<String>>;
@@ -216,6 +290,7 @@ pub async fn run_with_payments_and_registry(
                         RelaySessionConfig {
                             payments,
                             session_registry,
+                            transport_key: transport_key.clone(),
                             payment_receiver_secret: config.payment_receiver_secret.clone(),
                             spilman_mint_cache: discovered_spilman_mint_cache.as_ref().clone(),
                             default_in_bytes_per_millisat: config.default_in_bytes_per_millisat,
@@ -309,7 +384,9 @@ pub async fn run_with_payments_and_registry(
                                         return;
                                     }
 
-                                    if kind[0] != STREAM_KIND_SECP_NOISE {
+                                    if kind[0] != STREAM_KIND_SECP_NOISE
+                                        && kind[0] != STREAM_KIND_TWEAKED_NOISE
+                                    {
                                         reject_stream(&mut send, &mut recv, STREAM_ERROR_UNKNOWN_KIND);
                                         return;
                                     }
@@ -320,57 +397,65 @@ pub async fn run_with_payments_and_registry(
                                                 reject_stream(&mut send, &mut recv, STREAM_ERROR_AUTH_REQUIRED);
                                                 return;
                                             }
-                                            let mut quic_stream = QuicStream::new(send, recv);
-                                            let (send_cipher, recv_cipher, session_id) =
-                                                match noise_secp256k1::handshake_responder(
-                                                    &mut quic_stream,
-                                                    &transport_key,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(v) => {
-                                                        info!("secp noise handshake complete with {remote} (QUIC {stream_id:?})");
-                                                        v
-                                                    }
-                                                    Err(e) => {
-                                                        error!("secp noise handshake failed with {remote} (QUIC {stream_id:?}): {e}");
-                                                        return;
-                                                    }
-                                                };
-                                            let secp_stream = noise_secp256k1::SecpNoiseStream::new(
-                                                quic_stream,
-                                                send_cipher,
-                                                recv_cipher,
-                                                session_id,
-                                                format!(
-                                                    "{} <-> {remote} (QUIC {stream_id:?} secp)",
-                                                    "quic"
-                                                ),
-                                            );
-
-                                                match relay_session_from_transport_stream(
-                                                    secp_stream,
-                                                    session_id,
-                                                    quic_pool,
-                                                    RelaySessionConfig {
-                                                        payments,
-                                                        session_registry,
-                                                        payment_receiver_secret: config.payment_receiver_secret.clone(),
-                                                        spilman_mint_cache: discovered_spilman_mint_cache.as_ref().clone(),
-                                                        default_in_bytes_per_millisat: config.default_in_bytes_per_millisat,
-                                                        default_out_bytes_per_millisat: config.default_out_bytes_per_millisat,
-                                                    },
-                                                )
-                                            .await {
-                                                Ok(session) => {
-                                                    if let Err(e) = session.run().await {
-                                                        error!("session error with {remote} (QUIC {stream_id:?}): {e}");
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("H2 handshake failed with {remote} (QUIC {stream_id:?}): {e}");
-                                                }
+                                            let runtime = QuicSessionRuntime {
+                                                quic_pool,
+                                                config,
+                                                transport_key,
+                                                discovered_spilman_mint_cache,
+                                                payments,
+                                                session_registry,
+                                            };
+                                            run_quic_noise_session(
+                                                QuicStream::new(send, recv),
+                                                runtime.transport_key.normalized_secret_bytes(),
+                                                remote,
+                                                stream_id,
+                                                "secp",
+                                                runtime,
+                                            )
+                                            .await;
+                                        }
+                                        STREAM_KIND_TWEAKED_NOISE => {
+                                            if !authenticated.load(Ordering::Acquire) {
+                                                reject_stream(&mut send, &mut recv, STREAM_ERROR_AUTH_REQUIRED);
+                                                return;
                                             }
+
+                                            let mut tweak = [0u8; 32];
+                                            if let Err(e) = recv.read_exact(&mut tweak).await {
+                                                error!("failed to read tweaked QUIC preamble with {remote} ({stream_id:?}): {e}");
+                                                return;
+                                            }
+
+                                            let responder_secret_key = match derive_tweaked_responder_secret(
+                                                &transport_key,
+                                                tweak,
+                                            ) {
+                                                Ok(secret) => secret,
+                                                Err(e) => {
+                                                    error!("failed to derive tweaked responder key with {remote} (QUIC {stream_id:?}): {e}");
+                                                    return;
+                                                }
+                                            };
+
+                                            let runtime = QuicSessionRuntime {
+                                                quic_pool,
+                                                config,
+                                                transport_key,
+                                                discovered_spilman_mint_cache,
+                                                payments,
+                                                session_registry,
+                                            };
+
+                                            run_quic_noise_session(
+                                                QuicStream::new(send, recv),
+                                                responder_secret_key,
+                                                remote,
+                                                stream_id,
+                                                "tweaked secp",
+                                                runtime,
+                                            )
+                                            .await;
                                         }
                                         _ => unreachable!(),
                                     }

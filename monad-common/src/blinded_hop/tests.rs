@@ -54,6 +54,43 @@ fn assert_descriptor_matches_hidden_hop(
 }
 
 #[test]
+fn test_resolve_blinded_hop_for_intro_roundtrip() {
+    let intro_identity = sample_identity(0);
+    let hidden_identity = sample_identity(1);
+    let descriptor = build_blinded_hop_descriptor(
+        intro_identity.pubkey().to_compressed_bytes(),
+        "10.1.2.3:9050",
+        &hidden_identity,
+    )
+    .unwrap();
+
+    let resolved = resolve_blinded_hop_for_intro(&intro_identity, &descriptor).unwrap();
+    assert_eq!(resolved.next_hop_addr, "10.1.2.3:9050");
+    assert_eq!(resolved.next_hop_real_pubkey, hidden_identity.pubkey());
+
+    let plaintext = decrypt_blinded_hop_for_intro(&intro_identity, &descriptor.message).unwrap();
+    assert_eq!(resolved.tweak, plaintext.next_hop_tweak.raw_bytes());
+}
+
+#[test]
+fn test_derive_tweaked_responder_secret_matches_descriptor_pubkey() {
+    let intro_identity = sample_identity(0);
+    let hidden_identity = sample_identity(1);
+    let descriptor = build_blinded_hop_descriptor(
+        intro_identity.pubkey().to_compressed_bytes(),
+        "10.1.2.3:9050",
+        &hidden_identity,
+    )
+    .unwrap();
+
+    let resolved = resolve_blinded_hop_for_intro(&intro_identity, &descriptor).unwrap();
+    let responder_secret =
+        derive_tweaked_responder_secret(&hidden_identity, resolved.tweak).unwrap();
+    let derived_pubkey = pubkey_from_secret_bytes(&responder_secret).unwrap();
+    assert_eq!(derived_pubkey, descriptor.tweaked_pubkey);
+}
+
+#[test]
 fn test_tweak_pubkey_differs_from_original() {
     let identity = sample_identity(0);
     let tweak = derive_even_tweaked_secret_key(&identity).unwrap().0;

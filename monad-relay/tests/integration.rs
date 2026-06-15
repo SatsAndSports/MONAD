@@ -15,10 +15,13 @@
 use bytes::Bytes;
 use h2::client;
 use http::{Method, Request};
-use monad_client::connector::{self, Hop, HopIdentity};
+use monad_client::connector;
+use monad_client::route::{Route, RouteHop};
 use monad_client::session_driver::start_session_payment_driver;
 use monad_client::tunnel;
 use monad_client::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
+use monad_common::blinded_connect::BlindedConnectRequest;
+use monad_common::blinded_hop::{build_blinded_hop_descriptor, BlindedHopDescriptor};
 use monad_common::control_codec::{encode_json_line, try_decode_json_line};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise_secp256k1;
@@ -187,8 +190,13 @@ fn synthetic_test_mint_cache() -> SpilmanMintCache {
 
 /// Spin up a MONAD relay and return `(relay_addr, secp256k1 pubkey)`.
 async fn start_monad_relay() -> (std::net::SocketAddr, Secp256k1Pubkey) {
+    start_monad_relay_with_transport_key(SecpTransportKeypair::generate()).await
+}
+
+async fn start_monad_relay_with_transport_key(
+    transport_key: SecpTransportKeypair,
+) -> (std::net::SocketAddr, Secp256k1Pubkey) {
     let identity = QuicCertIdentity::generate().unwrap();
-    let transport_key = SecpTransportKeypair::generate();
     let pubkey = transport_key.pubkey();
     let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
     let quic_server_config =
@@ -384,26 +392,42 @@ async fn connect_client_quic_secp(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
-    connector::connect_through_chain(&[Hop {
-        addr: server_addr.to_string(),
-        identity: HopIdentity::Secp256k1(*pubkey),
-        use_quic: true,
-    }])
+    connect_route_hops(vec![cleartext_route_hop(
+        server_addr.to_string(),
+        *pubkey,
+        true,
+    )])
     .await
-    .unwrap()
 }
 
 async fn connect_client_tcp(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
 ) -> RelayConnection {
-    connector::connect_through_chain(&[Hop {
-        addr: server_addr.to_string(),
-        identity: HopIdentity::Secp256k1(*pubkey),
-        use_quic: false,
-    }])
+    connect_route_hops(vec![cleartext_route_hop(
+        server_addr.to_string(),
+        *pubkey,
+        false,
+    )])
     .await
-    .unwrap()
+}
+
+fn cleartext_route_hop(
+    addr: impl Into<String>,
+    pubkey: Secp256k1Pubkey,
+    use_quic: bool,
+) -> RouteHop {
+    RouteHop::Cleartext {
+        addr: addr.into(),
+        pubkey,
+        use_quic,
+    }
+}
+
+async fn connect_route_hops(hops: Vec<RouteHop>) -> RelayConnection {
+    connector::connect_route(&Route::new(hops).unwrap())
+        .await
+        .unwrap()
 }
 
 async fn connect_nested_session(
@@ -449,6 +473,30 @@ async fn connect_nested_session_quic(
         recv_cipher,
         session_id,
         format!("nested quic session to {next_hop_addr}"),
+    );
+    let (mut conn, driver) = RelayConnection::from_transport_stream(noise_stream, session_id)
+        .await
+        .unwrap();
+    conn.add_driver(driver);
+    conn
+}
+
+async fn connect_nested_session_blinded(
+    parent_conn: &RelayConnection,
+    descriptor: &BlindedHopDescriptor,
+) -> RelayConnection {
+    let request = BlindedConnectRequest::from_descriptor(descriptor);
+    let mut stream = parent_conn.open_tunnel_blinded_hop(&request).await.unwrap();
+    let (send_cipher, recv_cipher, session_id) =
+        noise_secp256k1::handshake_initiator(&mut stream, &descriptor.tweaked_pubkey)
+            .await
+            .unwrap();
+    let noise_stream = noise_secp256k1::SecpNoiseStream::new(
+        stream,
+        send_cipher,
+        recv_cipher,
+        session_id,
+        "nested blinded session",
     );
     let (mut conn, driver) = RelayConnection::from_transport_stream(noise_stream, session_id)
         .await
@@ -3012,20 +3060,11 @@ async fn test_nested_tunnel() {
     let (t_addr, t_pubkey) = start_monad_relay().await;
 
     // Client connects through T → S
-    let mut conn = connector::connect_through_chain(&[
-        Hop {
-            addr: t_addr.to_string(),
-            identity: HopIdentity::Secp256k1(t_pubkey),
-            use_quic: true,
-        },
-        Hop {
-            addr: s_addr.to_string(),
-            identity: HopIdentity::Secp256k1(s_pubkey),
-            use_quic: true,
-        },
+    let mut conn = connect_route_hops(vec![
+        cleartext_route_hop(t_addr.to_string(), t_pubkey, true),
+        cleartext_route_hop(s_addr.to_string(), s_pubkey, true),
     ])
-    .await
-    .unwrap();
+    .await;
     fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -3237,20 +3276,11 @@ async fn test_nested_plain_tcp_tunnel() {
     let (s_addr, s_pubkey) = start_monad_relay().await;
     let (t_addr, t_pubkey) = start_monad_relay().await;
 
-    let mut conn = connector::connect_through_chain(&[
-        Hop {
-            addr: t_addr.to_string(),
-            identity: HopIdentity::Secp256k1(t_pubkey),
-            use_quic: false,
-        },
-        Hop {
-            addr: s_addr.to_string(),
-            identity: HopIdentity::Secp256k1(s_pubkey),
-            use_quic: false,
-        },
+    let mut conn = connect_route_hops(vec![
+        cleartext_route_hop(t_addr.to_string(), t_pubkey, false),
+        cleartext_route_hop(s_addr.to_string(), s_pubkey, false),
     ])
-    .await
-    .unwrap();
+    .await;
     fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -3273,25 +3303,12 @@ async fn test_three_hop_tunnel() {
     let (b_addr, b_pubkey) = start_monad_relay().await;
     let (c_addr, c_pubkey) = start_monad_relay().await;
 
-    let mut conn = connector::connect_through_chain(&[
-        Hop {
-            addr: a_addr.to_string(),
-            identity: HopIdentity::Secp256k1(a_pubkey),
-            use_quic: true,
-        },
-        Hop {
-            addr: b_addr.to_string(),
-            identity: HopIdentity::Secp256k1(b_pubkey),
-            use_quic: true,
-        },
-        Hop {
-            addr: c_addr.to_string(),
-            identity: HopIdentity::Secp256k1(c_pubkey),
-            use_quic: true,
-        },
+    let mut conn = connect_route_hops(vec![
+        cleartext_route_hop(a_addr.to_string(), a_pubkey, true),
+        cleartext_route_hop(b_addr.to_string(), b_pubkey, true),
+        cleartext_route_hop(c_addr.to_string(), c_pubkey, true),
     ])
-    .await
-    .unwrap();
+    .await;
     fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -3359,20 +3376,11 @@ async fn test_mixed_ipv4_ipv6_hops() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let mut conn = connector::connect_through_chain(&[
-        Hop {
-            addr: ipv4_hop_addr.to_string(),
-            identity: HopIdentity::Secp256k1(ipv4_hop_pubkey),
-            use_quic: true,
-        },
-        Hop {
-            addr: ipv6_hop_addr.to_string(),
-            identity: HopIdentity::Secp256k1(ipv6_hop_pubkey),
-            use_quic: true,
-        },
+    let mut conn = connect_route_hops(vec![
+        cleartext_route_hop(ipv4_hop_addr.to_string(), ipv4_hop_pubkey, true),
+        cleartext_route_hop(ipv6_hop_addr.to_string(), ipv6_hop_pubkey, true),
     ])
-    .await
-    .unwrap();
+    .await;
     fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -3413,13 +3421,12 @@ async fn test_quic_secp256k1_first_hop_single_hop() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_relay().await;
-    let mut conn = connector::connect_through_chain(&[Hop {
-        addr: server_addr.to_string(),
-        identity: HopIdentity::Secp256k1(pubkey),
-        use_quic: true,
-    }])
-    .await
-    .unwrap();
+    let mut conn = connect_route_hops(vec![cleartext_route_hop(
+        server_addr.to_string(),
+        pubkey,
+        true,
+    )])
+    .await;
     fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -3439,20 +3446,11 @@ async fn test_two_hop_quic_secp_chain() {
     let (first_addr, first_pubkey) = start_monad_relay().await;
     let (second_addr, second_pubkey) = start_monad_relay().await;
 
-    let mut conn = connector::connect_through_chain(&[
-        Hop {
-            addr: first_addr.to_string(),
-            identity: HopIdentity::Secp256k1(first_pubkey),
-            use_quic: true,
-        },
-        Hop {
-            addr: second_addr.to_string(),
-            identity: HopIdentity::Secp256k1(second_pubkey),
-            use_quic: true,
-        },
+    let mut conn = connect_route_hops(vec![
+        cleartext_route_hop(first_addr.to_string(), first_pubkey, true),
+        cleartext_route_hop(second_addr.to_string(), second_pubkey, true),
     ])
-    .await
-    .unwrap();
+    .await;
     fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -3678,6 +3676,40 @@ async fn test_nested_quic_tunnel() {
 }
 
 #[tokio::test]
+async fn test_nested_blinded_quic_tunnel() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let hidden_transport_key = SecpTransportKeypair::generate();
+    let (hidden_addr, _hidden_pubkey) =
+        start_monad_relay_with_transport_key(hidden_transport_key.clone()).await;
+
+    let (intro_addr, intro_pubkey) = start_monad_relay().await;
+
+    let descriptor = build_blinded_hop_descriptor(
+        intro_pubkey.to_compressed_bytes(),
+        &hidden_addr.to_string(),
+        &hidden_transport_key,
+    )
+    .unwrap();
+
+    let mut intro_conn = connect_client_quic_secp(intro_addr, &intro_pubkey).await;
+    fund_session(&mut intro_conn, TEST_SESSION_PAYMENT).await;
+
+    let mut hidden_conn = connect_nested_session_blinded(&intro_conn, &descriptor).await;
+    fund_session(&mut hidden_conn, TEST_SESSION_PAYMENT).await;
+
+    let mut h2 = hidden_conn.clone_send_request().await;
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"nested blinded hello").await;
+    assert_eq!(result, b"NESTED BLINDED HELLO");
+
+    drop(h2);
+    hidden_conn.shutdown().await;
+    intro_conn.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_relay_can_connect_to_itself_via_quic() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
@@ -3743,26 +3775,101 @@ async fn test_connector_quic_hop() {
     let (s_addr, s_pubkey) = start_monad_relay().await;
 
     // Use the client connector with a QUIC hop (single key per hop)
-    let mut conn = connector::connect_through_chain(&[
-        Hop {
-            addr: s_addr.to_string(),
-            identity: HopIdentity::Secp256k1(s_pubkey),
-            use_quic: true,
-        },
-        Hop {
-            addr: format!("127.0.0.1:{}", t_addr.port()),
-            identity: HopIdentity::Secp256k1(t_pubkey),
-            use_quic: true,
-        },
+    let mut conn = connect_route_hops(vec![
+        cleartext_route_hop(s_addr.to_string(), s_pubkey, true),
+        cleartext_route_hop(format!("127.0.0.1:{}", t_addr.port()), t_pubkey, true),
     ])
-    .await
-    .unwrap();
+    .await;
     fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"connector quic hop").await;
     assert_eq!(result, b"CONNECTOR QUIC HOP");
+
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_connector_blinded_hop() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let hidden_transport_key = SecpTransportKeypair::generate();
+    let (hidden_addr, _hidden_pubkey) =
+        start_monad_relay_with_transport_key(hidden_transport_key.clone()).await;
+    let (intro_addr, intro_pubkey) = start_monad_relay().await;
+
+    let descriptor = build_blinded_hop_descriptor(
+        intro_pubkey.to_compressed_bytes(),
+        &hidden_addr.to_string(),
+        &hidden_transport_key,
+    )
+    .unwrap();
+
+    let route = Route::new(vec![
+        cleartext_route_hop(intro_addr.to_string(), intro_pubkey, true),
+        RouteHop::Blinded {
+            descriptor: descriptor.clone(),
+        },
+    ])
+    .unwrap();
+    let mut conn = connector::connect_route(&route).await.unwrap();
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+
+    let mut h2 = conn.clone_send_request().await;
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"connector blinded hop").await;
+    assert_eq!(result, b"CONNECTOR BLINDED HOP");
+
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_connector_two_consecutive_blinded_hops() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let hidden_b_transport_key = SecpTransportKeypair::generate();
+    let hidden_c_transport_key = SecpTransportKeypair::generate();
+    let (hidden_b_addr, hidden_b_pubkey) =
+        start_monad_relay_with_transport_key(hidden_b_transport_key.clone()).await;
+    let (hidden_c_addr, _hidden_c_pubkey) =
+        start_monad_relay_with_transport_key(hidden_c_transport_key.clone()).await;
+    let (intro_addr, intro_pubkey) = start_monad_relay().await;
+
+    let descriptor_ab = build_blinded_hop_descriptor(
+        intro_pubkey.to_compressed_bytes(),
+        &hidden_b_addr.to_string(),
+        &hidden_b_transport_key,
+    )
+    .unwrap();
+    let descriptor_bc = build_blinded_hop_descriptor(
+        hidden_b_pubkey.to_compressed_bytes(),
+        &hidden_c_addr.to_string(),
+        &hidden_c_transport_key,
+    )
+    .unwrap();
+
+    let route = Route::new(vec![
+        cleartext_route_hop(intro_addr.to_string(), intro_pubkey, true),
+        RouteHop::Blinded {
+            descriptor: descriptor_ab,
+        },
+        RouteHop::Blinded {
+            descriptor: descriptor_bc,
+        },
+    ])
+    .unwrap();
+    let mut conn = connector::connect_route(&route).await.unwrap();
+    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+
+    let mut h2 = conn.clone_send_request().await;
+    let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"two blinded hops").await;
+    assert_eq!(result, b"TWO BLINDED HOPS");
 
     drop(h2);
     conn.shutdown().await;
@@ -3793,20 +3900,11 @@ async fn test_concurrent_quic_pool_access() {
     let mut handles = Vec::new();
     for i in 0..5 {
         handles.push(tokio::spawn(async move {
-            let mut conn = connector::connect_through_chain(&[
-                Hop {
-                    addr: s_addr.to_string(),
-                    identity: HopIdentity::Secp256k1(s_pubkey),
-                    use_quic: true,
-                },
-                Hop {
-                    addr: format!("127.0.0.1:{t_port}"),
-                    identity: HopIdentity::Secp256k1(t_pubkey),
-                    use_quic: true,
-                },
+            let mut conn = connect_route_hops(vec![
+                cleartext_route_hop(s_addr.to_string(), s_pubkey, true),
+                cleartext_route_hop(format!("127.0.0.1:{t_port}"), t_pubkey, true),
             ])
-            .await
-            .unwrap();
+            .await;
             fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
             let mut h2 = conn.clone_send_request().await;
 
@@ -3835,13 +3933,12 @@ async fn test_quic_first_hop() {
     let (server_addr, pubkey) = start_monad_relay().await;
 
     // Client connects directly via QUIC (use_quic on the first hop)
-    let mut conn = connector::connect_through_chain(&[Hop {
-        addr: server_addr.to_string(),
-        identity: HopIdentity::Secp256k1(pubkey),
-        use_quic: true,
-    }])
-    .await
-    .unwrap();
+    let mut conn = connect_route_hops(vec![cleartext_route_hop(
+        server_addr.to_string(),
+        pubkey,
+        true,
+    )])
+    .await;
     fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
@@ -3863,20 +3960,11 @@ async fn test_quic_first_hop_then_tcp() {
     let (t_addr, t_pubkey) = start_monad_relay().await;
 
     // Client connects to S via QUIC, then S forwards to T via TCP
-    let mut conn = connector::connect_through_chain(&[
-        Hop {
-            addr: s_addr.to_string(),
-            identity: HopIdentity::Secp256k1(s_pubkey),
-            use_quic: true,
-        },
-        Hop {
-            addr: t_addr.to_string(),
-            identity: HopIdentity::Secp256k1(t_pubkey),
-            use_quic: true,
-        },
+    let mut conn = connect_route_hops(vec![
+        cleartext_route_hop(s_addr.to_string(), s_pubkey, true),
+        cleartext_route_hop(t_addr.to_string(), t_pubkey, true),
     ])
-    .await
-    .unwrap();
+    .await;
     fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 

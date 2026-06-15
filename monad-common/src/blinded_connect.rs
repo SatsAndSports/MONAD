@@ -2,8 +2,7 @@ use crate::blinded_hop::{BlindedHopDescriptor, BlindedHopMessage};
 use crate::secp_identity::Secp256k1Pubkey;
 use http::HeaderMap;
 
-pub const BLINDED_HOP_CONNECT_URI: &str = "http://monad/blinded_hop_v1";
-pub const BLINDED_HOP_CONNECT_PATH: &str = "/blinded_hop_v1";
+pub const BLINDED_HOP_CONNECT_AUTHORITY: &str = "blinded.monad.invalid:443";
 pub const BLINDED_TWEAKED_PUBKEY_HEADER: &str = "monad-blinded-tweaked-pubkey";
 pub const BLINDED_EPHEMERAL_PUBKEY_HEADER: &str = "monad-blinded-ephemeral-pubkey";
 pub const BLINDED_CIPHERTEXT_HEADER: &str = "monad-blinded-ciphertext";

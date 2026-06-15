@@ -1,6 +1,5 @@
 use clap::Parser;
-use monad_client::connector;
-use monad_client::connector::Hop;
+use monad_client::route::{Route, RouteHop};
 use monad_common::secp_identity::Secp256k1Pubkey;
 use tracing::info;
 
@@ -31,11 +30,11 @@ struct Cli {
     socks: String,
 }
 
-fn parse_hop_identity(identity: &str, addr: &str) -> anyhow::Result<connector::HopIdentity> {
+fn parse_hop_pubkey(identity: &str, addr: &str) -> anyhow::Result<Secp256k1Pubkey> {
     if let Some(rest) = identity.strip_prefix("secp256k1:") {
         let pubkey = Secp256k1Pubkey::from_hex(rest)
             .map_err(|e| anyhow::anyhow!("bad secp256k1 public key for hop {addr}: {e}"))?;
-        return Ok(connector::HopIdentity::Secp256k1(pubkey));
+        return Ok(pubkey);
     }
 
     if identity.starts_with("ed25519:") {
@@ -49,7 +48,7 @@ fn parse_hop_identity(identity: &str, addr: &str) -> anyhow::Result<connector::H
     )
 }
 
-fn parse_hop(s: &str) -> anyhow::Result<Hop> {
+fn parse_hop(s: &str) -> anyhow::Result<RouteHop> {
     // Check for quic: prefix
     let (rest, use_quic) = if let Some(rest) = s.strip_prefix("quic:") {
         (rest, true)
@@ -62,11 +61,11 @@ fn parse_hop(s: &str) -> anyhow::Result<Hop> {
         .rsplit_once(',')
         .ok_or_else(|| anyhow::anyhow!("hop must be addr:port,<identity> — got: {s}"))?;
 
-    let identity = parse_hop_identity(identity, addr)?;
+    let pubkey = parse_hop_pubkey(identity, addr)?;
 
-    Ok(Hop {
+    Ok(RouteHop::Cleartext {
         addr: addr.to_string(),
-        identity,
+        pubkey,
         use_quic,
     })
 }
@@ -82,24 +81,31 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Parse hops
-    let hops: Vec<Hop> = cli
+    let hops: Vec<RouteHop> = cli
         .hop
         .iter()
         .map(|s| parse_hop(s))
         .collect::<Result<_, _>>()?;
 
-    if hops.is_empty() {
-        anyhow::bail!("at least one --hop is required");
-    }
+    let route = Route::new(hops)?;
 
     info!(
         "connecting through {} hop(s): {}",
-        hops.len(),
-        hops.iter()
-            .map(|h| if h.use_quic {
-                format!("quic:{}({})", h.addr, h.identity.describe())
-            } else {
-                format!("{}({})", h.addr, h.identity.describe())
+        route.hops().len(),
+        route
+            .hops()
+            .iter()
+            .map(|hop| match hop {
+                RouteHop::Cleartext { addr, use_quic, .. } => {
+                    if *use_quic {
+                        format!("quic:{addr}(secp256k1)")
+                    } else {
+                        format!("{addr}(secp256k1)")
+                    }
+                }
+                RouteHop::Blinded { descriptor } => {
+                    format!("blinded:{}", descriptor.tweaked_pubkey.to_hex())
+                }
             })
             .collect::<Vec<_>>()
             .join(" → ")
@@ -140,6 +146,6 @@ mod tests {
         let pubkey = keypair.pubkey().to_hex();
         let hop = parse_hop(&format!("127.0.0.1:9050,secp256k1:{pubkey}")).unwrap();
 
-        assert!(matches!(hop.identity, connector::HopIdentity::Secp256k1(_)));
+        assert!(matches!(hop, RouteHop::Cleartext { .. }));
     }
 }

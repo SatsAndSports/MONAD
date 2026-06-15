@@ -71,8 +71,8 @@ pub fn initial_server_capabilities() -> BootstrapCapabilities {
         direct_tcp_exit: true,
         nested_monad_over_tcp: true,
         nested_monad_over_quic: true,
-        blinded_connect_v1: false,
-        tweaked_noise_v1: false,
+        blinded_connect_v1: true,
+        tweaked_noise_v1: true,
     }
 }
 

@@ -71,6 +71,14 @@ pub struct BlindedHopDescriptor {
     pub message: BlindedHopMessage,
 }
 
+/// Relay-facing result of decrypting a blinded-hop descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBlindedHop {
+    pub next_hop_addr: String,
+    pub next_hop_real_pubkey: Secp256k1Pubkey,
+    pub tweak: [u8; 32],
+}
+
 /// A cleartext hop whose real address and published secp256k1 pubkey are known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleartextHop {

@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use crate::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_URI};
+use crate::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
 use crate::h2stream::H2ConnectStream;
 use crate::proxy::CleartextByteCounters;
 
@@ -187,7 +187,7 @@ impl RelayConnection {
         request: &BlindedConnectRequest,
     ) -> io::Result<H2ConnectStream> {
         let headers = request.header_pairs();
-        self.open_tunnel_with_headers(BLINDED_HOP_CONNECT_URI, &headers)
+        self.open_tunnel_with_headers(BLINDED_HOP_CONNECT_AUTHORITY, &headers)
             .await
     }
 
