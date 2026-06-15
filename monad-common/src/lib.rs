@@ -1,3 +1,4 @@
+pub mod blinded_connect;
 pub mod blinded_hop;
 pub mod bootstrap;
 pub mod control_codec;

@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+use crate::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_URI};
 use crate::h2stream::H2ConnectStream;
 use crate::proxy::CleartextByteCounters;
 
@@ -164,7 +165,7 @@ impl RelayConnection {
     /// Returns an `H2ConnectStream` that implements `AsyncRead + AsyncWrite`,
     /// suitable for running a nested Noise+H2 session on top.
     pub async fn open_tunnel(&self, target_authority: &str) -> io::Result<H2ConnectStream> {
-        self.open_tunnel_inner(target_authority, None).await
+        self.open_tunnel_with_headers(target_authority, &[]).await
     }
 
     /// Open an H2 CONNECT tunnel with a `quic-secp256k1-pubkey` header, telling the relay
@@ -175,11 +176,19 @@ impl RelayConnection {
         target_authority: &str,
         pubkey_hex: &str,
     ) -> io::Result<H2ConnectStream> {
-        self.open_tunnel_inner(
-            target_authority,
-            Some(("quic-secp256k1-pubkey", pubkey_hex.to_owned())),
-        )
-        .await
+        let headers = [("quic-secp256k1-pubkey", pubkey_hex.to_owned())];
+        self.open_tunnel_with_headers(target_authority, &headers)
+            .await
+    }
+
+    /// Open an H2 CONNECT tunnel carrying a blinded-hop descriptor in headers.
+    pub async fn open_tunnel_blinded_hop(
+        &self,
+        request: &BlindedConnectRequest,
+    ) -> io::Result<H2ConnectStream> {
+        let headers = request.header_pairs();
+        self.open_tunnel_with_headers(BLINDED_HOP_CONNECT_URI, &headers)
+            .await
     }
 
     /// Clone the underlying `SendRequest` handle for direct H2 stream use
@@ -341,11 +350,11 @@ impl RelayConnection {
         }
     }
 
-    /// Internal: open a CONNECT tunnel with an optional QUIC transport header.
-    async fn open_tunnel_inner(
+    /// Internal: open a CONNECT tunnel with arbitrary extra headers.
+    pub async fn open_tunnel_with_headers(
         &self,
         target_authority: &str,
-        quic_header: Option<(&str, String)>,
+        extra_headers: &[(&'static str, String)],
     ) -> io::Result<H2ConnectStream> {
         let mut h2_client = self.clone_send_request().await;
 
@@ -355,8 +364,8 @@ impl RelayConnection {
 
         let mut builder = Request::builder().method(Method::CONNECT).uri(uri);
 
-        if let Some((header_name, header_value)) = quic_header {
-            builder = builder.header(header_name, header_value);
+        for (header_name, header_value) in extra_headers {
+            builder = builder.header(*header_name, header_value);
         }
 
         let request = builder.body(()).map_err(|e| {
