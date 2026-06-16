@@ -39,7 +39,6 @@ use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
-use cdk_spilman::configurable_host::SqliteStorage;
 use cdk_spilman::ChannelState;
 use cdk_spilman_test_mint::{
     build_router, build_test_mint, InMemoryMintNetworking, TestMintConfig, TestMintHelper,
@@ -455,53 +454,21 @@ async fn start_persistent_relay(
     tokio::sync::oneshot::Sender<()>,
     Arc<SpilmanRelayPayments>,
 )> {
-    let identity = QuicCertIdentity::generate().unwrap();
-    let pubkey = transport_key.pubkey();
-    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
-    let quic_server_config =
-        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
-    let (listener, quic_endpoint, addr) =
-        bind_tcp_and_quic_on_same_port(bind_addr, quic_server_config).await?;
-
-    let config = Arc::new(ServerConfig {
-        identity,
-        transport_key: Some(transport_key.clone()),
-        payment_receiver_secret,
-        trusted_mint_units,
-        default_in_bytes_per_millisat: 1,
-        default_out_bytes_per_millisat: 1,
-        bootstrap_capabilities: None,
-        relay_wallet_name: "test-relay".to_string(),
-        spilman_storage_path: storage_path.to_string(),
-    });
-
-    let storage = Arc::new(
-        SqliteStorage::open(storage_path)
-            .map_err(|e| io::Error::other(format!("failed to open spilman storage: {e}")))?,
+    let wallet_name = format!(
+        "test-relay-{}",
+        payment_receiver_secret.public_key().to_hex()
     );
-    let payments = Arc::new(SpilmanRelayPayments::new(
-        config.payment_receiver_secret.clone(),
-        mint_cache.clone(),
-        storage,
-    ));
-    let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
-    let mint_cache = Arc::new(mint_cache);
-    let session_registry = Arc::new(SessionRegistry::new());
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::spawn(run_with_payments_and_registry_and_shutdown(
-        listener,
-        Some(quic_endpoint),
-        config,
-        payments_for_spawn,
+    let wallet_manager = Arc::new(RelayWalletManager::open(storage_path)?);
+    start_managed_persistent_relay(
+        bind_addr,
+        transport_key,
+        payment_receiver_secret,
+        &wallet_name,
+        wallet_manager,
         mint_cache,
-        session_registry,
-        async {
-            let _ = shutdown_rx.await;
-        },
-    ));
-
-    Ok((addr, pubkey, handle, shutdown_tx, payments))
+        trusted_mint_units,
+    )
+    .await
 }
 
 async fn start_managed_persistent_relay(
