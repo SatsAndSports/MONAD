@@ -89,8 +89,8 @@ async fn run_quic_noise_session(
             receiver_pubkey_hex: runtime.config.receiver_pubkey_hex.clone(),
             spilman_mint_cache: runtime.discovered_spilman_mint_cache.as_ref().clone(),
             cashu_spilman_protocol_version: bootstrap_accept.cashu_spilman_protocol_version,
-            default_in_bytes_per_millisat: runtime.config.default_in_bytes_per_millisat,
-            default_out_bytes_per_millisat: runtime.config.default_out_bytes_per_millisat,
+            in_bytes_per_millisat: runtime.config.in_bytes_per_millisat,
+            out_bytes_per_millisat: runtime.config.out_bytes_per_millisat,
         },
     )
     .await
@@ -129,9 +129,9 @@ pub struct ServerConfig {
     /// Hardcoded trusted mint policy.
     pub trusted_mint_units: TrustedMintUnits,
     /// Default inbound bytes per millisat for sessions on this relay.
-    pub default_in_bytes_per_millisat: u64,
+    pub in_bytes_per_millisat: u64,
     /// Default outbound bytes per millisat for sessions on this relay.
-    pub default_out_bytes_per_millisat: u64,
+    pub out_bytes_per_millisat: u64,
     /// Optional bootstrap capability override, primarily for tests.
     pub bootstrap_capabilities: Option<BootstrapCapabilities>,
     /// Wallet-manager relay identity name used to look up the receiver key and
@@ -251,8 +251,8 @@ pub async fn run_with_wallet_manager(
         transport_key: config.transport_key.clone(),
         receiver_pubkey_hex,
         trusted_mint_units: config.trusted_mint_units.clone(),
-        default_in_bytes_per_millisat: config.default_in_bytes_per_millisat,
-        default_out_bytes_per_millisat: config.default_out_bytes_per_millisat,
+        in_bytes_per_millisat: config.in_bytes_per_millisat,
+        out_bytes_per_millisat: config.out_bytes_per_millisat,
         bootstrap_capabilities: config.bootstrap_capabilities.clone(),
         relay_wallet_name: config.relay_wallet_name.clone(),
         spilman_storage_path: config.spilman_storage_path.clone(),
@@ -388,8 +388,8 @@ where
                             spilman_mint_cache: discovered_spilman_mint_cache.as_ref().clone(),
                             cashu_spilman_protocol_version: bootstrap_accept
                                 .cashu_spilman_protocol_version,
-                            default_in_bytes_per_millisat: config.default_in_bytes_per_millisat,
-                            default_out_bytes_per_millisat: config.default_out_bytes_per_millisat,
+                            in_bytes_per_millisat: config.in_bytes_per_millisat,
+                            out_bytes_per_millisat: config.out_bytes_per_millisat,
                         },
                     )
                     .await {

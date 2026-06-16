@@ -53,8 +53,8 @@ relays:
     trusted_mints:
       - url: https://dev.mint.camelus.app
         units: [sat]
-    default_in_bytes_per_millisat: 1
-    default_out_bytes_per_millisat: 1
+    in_bytes_per_millisat: 1
+    out_bytes_per_millisat: 1
 ```
 
 Environment variables are substituted from the process environment or from a `.env` file in the same directory as the config.  Defaults are supported: `${VAR:-default}`.
@@ -239,6 +239,8 @@ relays:
     transport_key: "${HOP1_SECP_KEY}"
     listen: 127.0.0.1:9051
     quic: false
+    in_bytes_per_millisat: 1
+    out_bytes_per_millisat: 1
     trusted_mints:
       - url: https://dev.mint.camelus.app
         units: [sat]
@@ -250,10 +252,14 @@ relays:
     transport_key: "${HOP2_SECP_KEY}"
     listen: 127.0.0.1:9052
     quic: true
+    in_bytes_per_millisat: 1
+    out_bytes_per_millisat: 1
     trusted_mints:
       - url: https://dev.mint.camelus.app
         units: [sat]
 ```
+
+The pricing fields are required for every relay entry and must be greater than zero.
 
 Single hop (TCP only):
 

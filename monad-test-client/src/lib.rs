@@ -550,8 +550,8 @@ async fn spawn_relay_task(
         transport_key: Some(transport_key.clone()),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
-        default_in_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
-        default_out_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
+        in_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
+        out_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
         bootstrap_capabilities: None,
         relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: std::env::temp_dir()

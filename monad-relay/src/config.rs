@@ -9,9 +9,6 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
-const DEFAULT_IN_BYTES_PER_MILLISAT: u64 = 1;
-const DEFAULT_OUT_BYTES_PER_MILLISAT: u64 = 1;
-
 /// Top-level MONAD configuration file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MonadConfig {
@@ -119,6 +116,20 @@ impl MonadConfig {
             if relay.trusted_mints.is_empty() {
                 anyhow::bail!("relay '{}' must have at least one trusted mint", relay.name);
             }
+
+            if relay.in_bytes_per_millisat == 0 {
+                anyhow::bail!(
+                    "relay '{}' in_bytes_per_millisat must be greater than zero",
+                    relay.name
+                );
+            }
+
+            if relay.out_bytes_per_millisat == 0 {
+                anyhow::bail!(
+                    "relay '{}' out_bytes_per_millisat must be greater than zero",
+                    relay.name
+                );
+            }
         }
 
         Ok(())
@@ -154,13 +165,11 @@ pub struct RelayConfig {
     /// Mints this relay trusts and the units it will accept from each.
     pub trusted_mints: Vec<TrustedMintConfig>,
 
-    /// Default inbound bytes per millisat for sessions on this relay.
-    #[serde(default = "default_in_bytes_per_millisat")]
-    pub default_in_bytes_per_millisat: u64,
+    /// Inbound bytes per millisat for sessions on this relay.
+    pub in_bytes_per_millisat: u64,
 
-    /// Default outbound bytes per millisat for sessions on this relay.
-    #[serde(default = "default_out_bytes_per_millisat")]
-    pub default_out_bytes_per_millisat: u64,
+    /// Outbound bytes per millisat for sessions on this relay.
+    pub out_bytes_per_millisat: u64,
 }
 
 impl RelayConfig {
@@ -183,14 +192,6 @@ impl RelayConfig {
 pub struct TrustedMintConfig {
     pub url: String,
     pub units: Vec<String>,
-}
-
-fn default_in_bytes_per_millisat() -> u64 {
-    DEFAULT_IN_BYTES_PER_MILLISAT
-}
-
-fn default_out_bytes_per_millisat() -> u64 {
-    DEFAULT_OUT_BYTES_PER_MILLISAT
 }
 
 /// Replace `${VAR}` and `${VAR:-default}` placeholders with values from the
@@ -291,6 +292,8 @@ relays:
     quic_cert_seed: "0000000000000000000000000000000000000000000000000000000000000000"
     transport_key: "0000000000000000000000000000000000000000000000000000000000000000"
     listen: 0.0.0.0:9050
+    in_bytes_per_millisat: 10
+    out_bytes_per_millisat: 20
     trusted_mints:
       - url: https://mint.example
         units: [sat]
@@ -309,6 +312,8 @@ relays:
     quic_cert_seed: "0000000000000000000000000000000000000000000000000000000000000000"
     transport_key: "0000000000000000000000000000000000000000000000000000000000000000"
     listen: 0.0.0.0:9050
+    in_bytes_per_millisat: 10
+    out_bytes_per_millisat: 20
     trusted_mints:
       - url: https://mint.example
         units: [sat]
@@ -317,6 +322,8 @@ relays:
     quic_cert_seed: "0000000000000000000000000000000000000000000000000000000000000001"
     transport_key: "0000000000000000000000000000000000000000000000000000000000000001"
     listen: 0.0.0.0:9051
+    in_bytes_per_millisat: 10
+    out_bytes_per_millisat: 20
     trusted_mints:
       - url: https://mint.example
         units: [sat]
@@ -335,6 +342,8 @@ relays:
     quic_cert_seed: "0000000000000000000000000000000000000000000000000000000000000000"
     transport_key: "0000000000000000000000000000000000000000000000000000000000000000"
     listen: 0.0.0.0:9050
+    in_bytes_per_millisat: 10
+    out_bytes_per_millisat: 20
     trusted_mints:
       - url: https://mint.example
         units: [sat]
@@ -344,6 +353,8 @@ relays:
     quic_cert_seed: "0000000000000000000000000000000000000000000000000000000000000002"
     transport_key: "0000000000000000000000000000000000000000000000000000000000000002"
     listen: 0.0.0.0:9051
+    in_bytes_per_millisat: 10
+    out_bytes_per_millisat: 20
     trusted_mints:
       - url: https://mint.example
         units: [sat]
@@ -384,6 +395,8 @@ relays:
     quic_cert_seed: "${{MONAD_CFG_TEST_QUIC}}"
     transport_key: "${{MONAD_CFG_TEST_TRANSPORT}}"
     listen: 127.0.0.1:9050
+    in_bytes_per_millisat: 10
+    out_bytes_per_millisat: 20
     trusted_mints:
       - url: ${{MONAD_CFG_TEST_MINT}}
         units: [sat, msat]
@@ -402,5 +415,81 @@ relays:
         assert_eq!(relay.receiver_secret_hex, Some("0".repeat(63) + "3"));
         assert_eq!(relay.trusted_mints[0].url, "https://env.mint.example");
         assert_eq!(relay.trusted_mints[0].units, vec!["sat", "msat"]);
+        assert_eq!(relay.in_bytes_per_millisat, 10);
+        assert_eq!(relay.out_bytes_per_millisat, 20);
+    }
+
+    #[test]
+    fn missing_inbound_pricing_is_rejected() {
+        let yaml = r#"
+relays:
+  - name: r1
+    wallet_db_path: /tmp/r.db
+    quic_cert_seed: "0000000000000000000000000000000000000000000000000000000000000000"
+    transport_key: "0000000000000000000000000000000000000000000000000000000000000000"
+    listen: 0.0.0.0:9050
+    out_bytes_per_millisat: 20
+    trusted_mints:
+      - url: https://mint.example
+        units: [sat]
+"#;
+        assert!(serde_yaml::from_str::<MonadConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn missing_outbound_pricing_is_rejected() {
+        let yaml = r#"
+relays:
+  - name: r1
+    wallet_db_path: /tmp/r.db
+    quic_cert_seed: "0000000000000000000000000000000000000000000000000000000000000000"
+    transport_key: "0000000000000000000000000000000000000000000000000000000000000000"
+    listen: 0.0.0.0:9050
+    in_bytes_per_millisat: 10
+    trusted_mints:
+      - url: https://mint.example
+        units: [sat]
+"#;
+        assert!(serde_yaml::from_str::<MonadConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn zero_inbound_pricing_is_rejected() {
+        let yaml = r#"
+relays:
+  - name: r1
+    wallet_db_path: /tmp/r.db
+    quic_cert_seed: "0000000000000000000000000000000000000000000000000000000000000000"
+    transport_key: "0000000000000000000000000000000000000000000000000000000000000000"
+    listen: 0.0.0.0:9050
+    in_bytes_per_millisat: 0
+    out_bytes_per_millisat: 20
+    trusted_mints:
+      - url: https://mint.example
+        units: [sat]
+"#;
+        let config: MonadConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("in_bytes_per_millisat must be greater than zero"));
+    }
+
+    #[test]
+    fn zero_outbound_pricing_is_rejected() {
+        let yaml = r#"
+relays:
+  - name: r1
+    wallet_db_path: /tmp/r.db
+    quic_cert_seed: "0000000000000000000000000000000000000000000000000000000000000000"
+    transport_key: "0000000000000000000000000000000000000000000000000000000000000000"
+    listen: 0.0.0.0:9050
+    in_bytes_per_millisat: 10
+    out_bytes_per_millisat: 0
+    trusted_mints:
+      - url: https://mint.example
+        units: [sat]
+"#;
+        let config: MonadConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("out_bytes_per_millisat must be greater than zero"));
     }
 }

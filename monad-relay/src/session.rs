@@ -160,8 +160,8 @@ impl SessionState {
                     terminated: false,
                 },
                 pricing: SessionPricing::new(
-                    config.default_in_bytes_per_millisat.max(1),
-                    config.default_out_bytes_per_millisat.max(1),
+                    config.in_bytes_per_millisat.max(1),
+                    config.out_bytes_per_millisat.max(1),
                 ),
             })),
             control: Arc::new(Mutex::new(ControlState::default())),
@@ -363,8 +363,8 @@ pub struct RelaySessionConfig {
     pub receiver_pubkey_hex: String,
     pub spilman_mint_cache: SpilmanMintCache,
     pub cashu_spilman_protocol_version: Option<String>,
-    pub default_in_bytes_per_millisat: u64,
-    pub default_out_bytes_per_millisat: u64,
+    pub in_bytes_per_millisat: u64,
+    pub out_bytes_per_millisat: u64,
 }
 
 pub async fn relay_session_from_transport_stream<S>(

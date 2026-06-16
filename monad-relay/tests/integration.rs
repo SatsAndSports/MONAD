@@ -230,8 +230,8 @@ async fn start_monad_relay_with_transport_key_and_capabilities(
         transport_key: Some(transport_key),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
-        default_in_bytes_per_millisat: 1,
-        default_out_bytes_per_millisat: 1,
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
         bootstrap_capabilities: Some(bootstrap_capabilities),
         relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
@@ -286,8 +286,8 @@ async fn start_monad_relay_with_test_payments() -> (
         transport_key: Some(transport_key),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
-        default_in_bytes_per_millisat: 1,
-        default_out_bytes_per_millisat: 1,
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
         relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
@@ -336,8 +336,8 @@ async fn start_monad_relay_with_spilman(
         transport_key: Some(transport_key),
         receiver_pubkey_hex: payment_receiver_secret.public_key().to_hex(),
         trusted_mint_units,
-        default_in_bytes_per_millisat: 1,
-        default_out_bytes_per_millisat: 1,
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
         relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
@@ -413,8 +413,8 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
         transport_key: Some(transport_key),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
-        default_in_bytes_per_millisat: 1,
-        default_out_bytes_per_millisat: 1,
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
         relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
@@ -503,8 +503,8 @@ async fn start_managed_persistent_relay(
         transport_key: Some(transport_key.clone()),
         receiver_pubkey_hex: payment_receiver_secret.public_key().to_hex(),
         trusted_mint_units,
-        default_in_bytes_per_millisat: 1,
-        default_out_bytes_per_millisat: 1,
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
         relay_wallet_name: wallet_name.to_string(),
         spilman_storage_path: String::new(),
@@ -582,8 +582,8 @@ async fn start_relay_from_config(
         transport_key: Some(transport_key),
         receiver_pubkey_hex,
         trusted_mint_units,
-        default_in_bytes_per_millisat: relay_config.default_in_bytes_per_millisat,
-        default_out_bytes_per_millisat: relay_config.default_out_bytes_per_millisat,
+        in_bytes_per_millisat: relay_config.in_bytes_per_millisat,
+        out_bytes_per_millisat: relay_config.out_bytes_per_millisat,
         bootstrap_capabilities: None,
         relay_wallet_name: relay_config.name.clone(),
         spilman_storage_path: relay_config.wallet_db_path.clone(),
@@ -952,10 +952,7 @@ async fn control_handshake_status(
     _h2_send: &mut h2::SendStream<Bytes>,
     h2_recv: &mut h2::RecvStream,
 ) -> TestSessionStatus {
-    let status = expect_session_status_struct(read_control_message(h2_recv).await);
-    assert_eq!(status.active_in_rate, 1);
-    assert_eq!(status.active_out_rate, 1);
-    status
+    expect_session_status_struct(read_control_message(h2_recv).await)
 }
 
 async fn open_funded_control(
@@ -3747,8 +3744,8 @@ relays:
     trusted_mints:
       - url: {}
         units: [sat]
-    default_in_bytes_per_millisat: 1
-    default_out_bytes_per_millisat: 1
+    in_bytes_per_millisat: 1
+    out_bytes_per_millisat: 1
 "#,
         db_path.to_str().unwrap(),
         receiver_secret_hex,
@@ -3782,6 +3779,134 @@ relays:
     conn.shutdown().await;
     let _ = shutdown_tx.send(());
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_yaml_config_allows_distinct_per_relay_pricing() {
+    use monad_relay::config::MonadConfig;
+    use std::fs;
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("relay.yaml");
+    let db_path_a = temp_dir.path().join("relay-a.db");
+    let db_path_b = temp_dir.path().join("relay-b.db");
+    let listen_a = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let listen_b = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    let receiver_secret_a = cashu::nuts::SecretKey::generate();
+    let receiver_secret_b = cashu::nuts::SecretKey::generate();
+    let transport_key_a = SecpTransportKeypair::generate();
+    let transport_key_b = SecpTransportKeypair::generate();
+    let quic_cert_a = QuicCertIdentity::generate().unwrap();
+    let quic_cert_b = QuicCertIdentity::generate().unwrap();
+
+    let yaml = format!(
+        r#"
+relays:
+  - name: relay-a
+    wallet_db_path: {}
+    receiver_secret_hex: {}
+    quic_cert_seed: {}
+    transport_key: {}
+    listen: {}
+    quic: true
+    in_bytes_per_millisat: 11
+    out_bytes_per_millisat: 22
+    trusted_mints:
+      - url: {}
+        units: [sat]
+  - name: relay-b
+    wallet_db_path: {}
+    receiver_secret_hex: {}
+    quic_cert_seed: {}
+    transport_key: {}
+    listen: {}
+    quic: true
+    in_bytes_per_millisat: 33
+    out_bytes_per_millisat: 44
+    trusted_mints:
+      - url: {}
+        units: [sat]
+"#,
+        db_path_a.to_str().unwrap(),
+        receiver_secret_a.to_secret_hex(),
+        hex::encode(quic_cert_a.seed()),
+        hex::encode(transport_key_a.normalized_secret_bytes()),
+        listen_a,
+        mint_url,
+        db_path_b.to_str().unwrap(),
+        receiver_secret_b.to_secret_hex(),
+        hex::encode(quic_cert_b.seed()),
+        hex::encode(transport_key_b.normalized_secret_bytes()),
+        listen_b,
+        mint_url,
+    );
+    fs::write(&config_path, yaml).unwrap();
+
+    let config = MonadConfig::load(&config_path).unwrap();
+    let relay_a = config.select_relay(Some("relay-a")).unwrap();
+    let relay_b = config.select_relay(Some("relay-b")).unwrap();
+
+    let wallet_manager_a = Arc::new(RelayWalletManager::open(&relay_a.wallet_db_path).unwrap());
+    let (server_addr_a, pubkey_a, handle_a, shutdown_tx_a, _payments_a) =
+        start_relay_from_config(relay_a, wallet_manager_a, mint_cache.clone())
+            .await
+            .unwrap();
+    let wallet_manager_b = Arc::new(RelayWalletManager::open(&relay_b.wallet_db_path).unwrap());
+    let (server_addr_b, pubkey_b, handle_b, shutdown_tx_b, _payments_b) =
+        start_relay_from_config(relay_b, wallet_manager_b, mint_cache)
+            .await
+            .unwrap();
+
+    let conn_a = connect_client_quic_secp(server_addr_a, &pubkey_a).await;
+    let mut control_a = ControlSessionHarness::open(&conn_a).await;
+    let status_a = control_a.handshake().await;
+    assert_eq!(status_a.active_in_rate, 11);
+    assert_eq!(status_a.active_out_rate, 22);
+    assert_eq!(status_a.advertisements.len(), 1);
+    assert_eq!(status_a.advertisements[0].in_bytes_per_millisat, 11);
+    assert_eq!(status_a.advertisements[0].out_bytes_per_millisat, 22);
+
+    let conn_b = connect_client_quic_secp(server_addr_b, &pubkey_b).await;
+    let mut control_b = ControlSessionHarness::open(&conn_b).await;
+    let status_b = control_b.handshake().await;
+    assert_eq!(status_b.active_in_rate, 33);
+    assert_eq!(status_b.active_out_rate, 44);
+    assert_eq!(status_b.advertisements.len(), 1);
+    assert_eq!(status_b.advertisements[0].in_bytes_per_millisat, 33);
+    assert_eq!(status_b.advertisements[0].out_bytes_per_millisat, 44);
+
+    control_a.close().await;
+    control_b.close().await;
+    conn_a.shutdown().await;
+    conn_b.shutdown().await;
+    let _ = shutdown_tx_a.send(());
+    let _ = shutdown_tx_b.send(());
+    handle_a.await.unwrap().unwrap();
+    handle_b.await.unwrap().unwrap();
 }
 
 /// End-to-end test that the relay can unilaterally close a funded Spilman

@@ -449,8 +449,8 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
         transport_key: Some(transport_key),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
-        default_in_bytes_per_millisat: 1,
-        default_out_bytes_per_millisat: 1,
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
         relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
