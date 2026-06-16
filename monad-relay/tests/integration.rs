@@ -41,11 +41,9 @@ use monad_common::session::RelayConnection;
 
 use cdk_spilman::configurable_host::SqliteStorage;
 use cdk_spilman::ChannelState;
-use cdk_spilman_test_mint::TestMintHelper;
 use cdk_spilman_test_mint::{
     build_router, build_test_mint, InMemoryMintNetworking, TestMintConfig,
 };
-use common::signing_wallet::TestSigningWallet;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
 use monad_relay::listener::{
     discover_spilman_mint_cache, run_with_payments, run_with_payments_and_registry_and_shutdown,
@@ -2896,25 +2894,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    // Real in-memory Cashu mint for funding proofs.
-    let mint_helper = TestMintHelper::new().await.unwrap();
-    let mint_url = "https://test-mint.invalid".to_string();
-    let keyset_id = mint_helper.keyset_id().to_string();
-    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-
-    let mut trusted_mint_units = BTreeMap::new();
-    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
-
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_fixture = common::real_mint_fixture::shared_real_mint().await;
 
     let temp_db = tempfile::NamedTempFile::new().unwrap();
     let storage_path = temp_db.path().to_str().unwrap().to_string();
@@ -2929,22 +2909,13 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
         &transport_key,
         payment_receiver_secret.clone(),
         &storage_path,
-        mint_cache.clone(),
-        trusted_mint_units.clone(),
+        mint_fixture.mint_cache(),
+        mint_fixture.trusted_mint_units(),
     )
     .await
     .unwrap();
 
-    let wallet = Arc::new(
-        TestSigningWallet::new(
-            mint_helper.mint(),
-            receiver_pubkey_hex.clone(),
-            mint_url.clone(),
-            keyset_id.clone(),
-            keyset_info_json.clone(),
-        )
-        .await,
-    );
+    let wallet = Arc::new(mint_fixture.wallet_for(receiver_pubkey_hex.clone()).await);
     let channel_id = wallet.pre_create_channel(1000).await.unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
@@ -2998,8 +2969,8 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
         &transport_key,
         payment_receiver_secret,
         &storage_path,
-        mint_cache,
-        trusted_mint_units,
+        mint_fixture.mint_cache(),
+        mint_fixture.trusted_mint_units(),
     )
     .await
     .unwrap();
@@ -3108,24 +3079,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let mint_helper = TestMintHelper::new().await.unwrap();
-    let mint_url = "https://test-mint.invalid".to_string();
-    let keyset_id = mint_helper.keyset_id().to_string();
-    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-
-    let mut trusted_mint_units = BTreeMap::new();
-    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
-
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_fixture = common::real_mint_fixture::shared_real_mint().await;
 
     let temp_db = tempfile::NamedTempFile::new().unwrap();
     let storage_path = temp_db.path().to_str().unwrap().to_string();
@@ -3139,22 +3093,13 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
         &transport_key,
         payment_receiver_secret,
         &storage_path,
-        mint_cache,
-        trusted_mint_units,
+        mint_fixture.mint_cache(),
+        mint_fixture.trusted_mint_units(),
     )
     .await
     .unwrap();
 
-    let wallet = Arc::new(
-        TestSigningWallet::new(
-            mint_helper.mint(),
-            receiver_pubkey_hex.clone(),
-            mint_url.clone(),
-            keyset_id.clone(),
-            keyset_info_json.clone(),
-        )
-        .await,
-    );
+    let wallet = Arc::new(mint_fixture.wallet_for(receiver_pubkey_hex.clone()).await);
     let channel_id = wallet.pre_create_channel(1000).await.unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
@@ -3216,7 +3161,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     assert_eq!(result, b"BEFORE CLOSE");
 
     // Close the channel through the relay, using the in-memory mint networking.
-    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let mint_networking = InMemoryMintNetworking::new(mint_fixture.mint());
     let close_success = payments
         .close_channel(&channel_id, &mint_networking)
         .expect("relay should close the channel");
