@@ -447,7 +447,7 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
     let config = Arc::new(ServerConfig {
         identity,
         transport_key: Some(transport_key),
-        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
+        receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,

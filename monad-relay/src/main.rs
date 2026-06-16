@@ -136,14 +136,15 @@ async fn main() -> anyhow::Result<()> {
             );
 
             let wallet_manager = Arc::new(RelayWalletManager::open(&wallet_db_path)?);
-            let payment_receiver_secret = match receiver_secret_hex {
+            let receiver_pubkey_hex = match receiver_secret_hex {
                 Some(secret_hex) => {
                     let secret = SecretKey::from_hex(&secret_hex)
                         .map_err(|e| anyhow::anyhow!("bad receiver secret: {e}"))?;
-                    wallet_manager.register_identity(&wallet_name, secret.clone())?;
-                    secret
+                    let receiver_pubkey_hex = secret.public_key().to_hex();
+                    wallet_manager.register_identity(&wallet_name, secret)?;
+                    receiver_pubkey_hex
                 }
-                None => wallet_manager.receiver_secret(&wallet_name).map_err(|e| {
+                None => wallet_manager.receiver_pubkey_hex(&wallet_name).map_err(|e| {
                     anyhow::anyhow!(
                         "unknown wallet identity '{wallet_name}' and no --receiver-secret-hex provided: {e}"
                     )
@@ -153,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
             let config = Arc::new(listener::ServerConfig {
                 identity,
                 transport_key: Some(transport_key),
-                payment_receiver_secret,
+                receiver_pubkey_hex,
                 trusted_mint_units,
                 default_in_bytes_per_millisat: 1,
                 default_out_bytes_per_millisat: 1,

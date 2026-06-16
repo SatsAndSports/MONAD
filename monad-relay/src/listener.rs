@@ -5,7 +5,6 @@ use crate::quic_pool::QuicPool;
 use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
 use crate::session_registry::SessionRegistry;
 use crate::wallet_manager::RelayWalletManager;
-use cashu::nuts::SecretKey;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
 use monad_common::bootstrap::{
@@ -87,7 +86,7 @@ async fn run_quic_noise_session(
             payments: runtime.payments,
             session_registry: runtime.session_registry,
             transport_key: runtime.transport_key,
-            payment_receiver_secret: runtime.config.payment_receiver_secret.clone(),
+            receiver_pubkey_hex: runtime.config.receiver_pubkey_hex.clone(),
             spilman_mint_cache: runtime.discovered_spilman_mint_cache.as_ref().clone(),
             cashu_spilman_protocol_version: bootstrap_accept.cashu_spilman_protocol_version,
             default_in_bytes_per_millisat: runtime.config.default_in_bytes_per_millisat,
@@ -125,8 +124,8 @@ pub struct ServerConfig {
     pub identity: QuicCertIdentity,
     /// Optional shared secp256k1 transport identity for secp-authenticated transports.
     pub transport_key: Option<SecpTransportKeypair>,
-    /// Receiver secp256k1 secret used for Spilman channel validation.
-    pub payment_receiver_secret: SecretKey,
+    /// Receiver secp256k1 pubkey advertised in SessionStatus.
+    pub receiver_pubkey_hex: String,
     /// Hardcoded trusted mint policy.
     pub trusted_mint_units: TrustedMintUnits,
     /// Default inbound bytes per millisat for sessions on this relay.
@@ -222,10 +221,6 @@ pub async fn run(
     config: Arc<ServerConfig>,
 ) -> io::Result<()> {
     let wallet_manager = Arc::new(RelayWalletManager::open(&config.spilman_storage_path)?);
-    wallet_manager.register_identity(
-        &config.relay_wallet_name,
-        config.payment_receiver_secret.clone(),
-    )?;
     run_with_wallet_manager(listener, quic_endpoint, config, wallet_manager).await
 }
 
@@ -237,10 +232,23 @@ pub async fn run_with_wallet_manager(
 ) -> io::Result<()> {
     let discovered_spilman_mint_cache =
         Arc::new(discover_spilman_mint_cache(&config.trusted_mint_units).await?);
+    let receiver_pubkey_hex = wallet_manager.receiver_pubkey_hex(&config.relay_wallet_name)?;
     let payments = wallet_manager.payments_for(
         &config.relay_wallet_name,
         discovered_spilman_mint_cache.as_ref().clone(),
     )?;
+    let config = Arc::new(ServerConfig {
+        identity: QuicCertIdentity::from_seed(*config.identity.seed())
+            .map_err(|e| io::Error::other(format!("clone relay identity: {e}")))?,
+        transport_key: config.transport_key.clone(),
+        receiver_pubkey_hex,
+        trusted_mint_units: config.trusted_mint_units.clone(),
+        default_in_bytes_per_millisat: config.default_in_bytes_per_millisat,
+        default_out_bytes_per_millisat: config.default_out_bytes_per_millisat,
+        bootstrap_capabilities: config.bootstrap_capabilities.clone(),
+        relay_wallet_name: config.relay_wallet_name.clone(),
+        spilman_storage_path: config.spilman_storage_path.clone(),
+    });
     run_with_payments(
         listener,
         quic_endpoint,
@@ -368,7 +376,7 @@ where
                             payments,
                             session_registry,
                             transport_key: transport_key.clone(),
-                            payment_receiver_secret: config.payment_receiver_secret.clone(),
+                            receiver_pubkey_hex: config.receiver_pubkey_hex.clone(),
                             spilman_mint_cache: discovered_spilman_mint_cache.as_ref().clone(),
                             cashu_spilman_protocol_version: bootstrap_accept
                                 .cashu_spilman_protocol_version,

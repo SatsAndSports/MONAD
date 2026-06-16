@@ -548,7 +548,7 @@ async fn spawn_relay_task(
     let config = Arc::new(ServerConfig {
         identity: QuicCertIdentity::from_seed(*identity.seed())?,
         transport_key: Some(transport_key.clone()),
-        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
+        receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
         default_out_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,

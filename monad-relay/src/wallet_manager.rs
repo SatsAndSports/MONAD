@@ -167,6 +167,10 @@ impl RelayWalletManager {
         })
     }
 
+    pub fn receiver_pubkey_hex(&self, relay_name: &str) -> io::Result<String> {
+        Ok(self.receiver_secret(relay_name)?.public_key().to_hex())
+    }
+
     pub fn payments_for(
         &self,
         relay_name: &str,

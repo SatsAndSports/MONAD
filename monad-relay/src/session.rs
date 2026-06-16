@@ -15,7 +15,6 @@ use crate::session_fsm::{
 };
 use crate::session_registry::SessionRegistry;
 use bytes::Bytes;
-use cashu::nuts::SecretKey;
 use h2::{server, RecvStream};
 use http::{Method, Request, Response, StatusCode};
 use monad_common::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
@@ -136,7 +135,7 @@ pub(crate) struct SessionState {
     payments: Arc<dyn RelayPayments>,
     session_registry: Arc<SessionRegistry>,
     transport_key: SecpTransportKeypair,
-    payment_receiver_secret: SecretKey,
+    receiver_pubkey_hex: String,
     spilman_mint_cache: SpilmanMintCache,
     cashu_spilman_protocol_version: Option<String>,
 }
@@ -173,7 +172,7 @@ impl SessionState {
             payments: config.payments.clone(),
             session_registry: config.session_registry.clone(),
             transport_key: config.transport_key.clone(),
-            payment_receiver_secret: config.payment_receiver_secret.clone(),
+            receiver_pubkey_hex: config.receiver_pubkey_hex.clone(),
             spilman_mint_cache: config.spilman_mint_cache.clone(),
             cashu_spilman_protocol_version: config.cashu_spilman_protocol_version.clone(),
         }
@@ -257,7 +256,7 @@ impl SessionState {
         }
 
         ServerMessage::SessionStatus {
-            receiver_pubkey: self.payment_receiver_secret.public_key().to_hex(),
+            receiver_pubkey: self.receiver_pubkey_hex.clone(),
             advertisements,
             linked_channel: billing
                 .state
@@ -361,7 +360,7 @@ pub struct RelaySessionConfig {
     pub payments: Arc<dyn RelayPayments>,
     pub session_registry: Arc<SessionRegistry>,
     pub transport_key: SecpTransportKeypair,
-    pub payment_receiver_secret: SecretKey,
+    pub receiver_pubkey_hex: String,
     pub spilman_mint_cache: SpilmanMintCache,
     pub cashu_spilman_protocol_version: Option<String>,
     pub default_in_bytes_per_millisat: u64,

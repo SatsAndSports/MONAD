@@ -226,7 +226,7 @@ async fn start_monad_relay_with_transport_key_and_capabilities(
     let config = Arc::new(ServerConfig {
         identity,
         transport_key: Some(transport_key),
-        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
+        receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
@@ -282,7 +282,7 @@ async fn start_monad_relay_with_test_payments() -> (
     let config = Arc::new(ServerConfig {
         identity,
         transport_key: Some(transport_key),
-        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
+        receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
@@ -332,7 +332,7 @@ async fn start_monad_relay_with_spilman(
     let config = Arc::new(ServerConfig {
         identity,
         transport_key: Some(transport_key),
-        payment_receiver_secret,
+        receiver_pubkey_hex: payment_receiver_secret.public_key().to_hex(),
         trusted_mint_units,
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
@@ -409,7 +409,7 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
     let config = Arc::new(ServerConfig {
         identity,
         transport_key: Some(transport_key),
-        payment_receiver_secret: cashu::nuts::SecretKey::generate(),
+        receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: BTreeMap::new(),
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
@@ -499,7 +499,7 @@ async fn start_managed_persistent_relay(
     let config = Arc::new(ServerConfig {
         identity,
         transport_key: Some(transport_key.clone()),
-        payment_receiver_secret,
+        receiver_pubkey_hex: payment_receiver_secret.public_key().to_hex(),
         trusted_mint_units,
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
