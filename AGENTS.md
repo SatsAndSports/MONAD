@@ -216,6 +216,7 @@ The test suite currently covers:
 - relay advertises multiple mint/unit pricing options
 - default integration-test relays advertise a synthetic test mint/keyset offer so connector-driven intermediate hops can provision mock channels without a real wallet backend
 - control detach releases linked channel ownership and tears down active/future streams
+- relay restart preserves accepted Spilman channel state in SQLite; the client re-links the same channel and delta accounting resumes from the persisted balance (`TestSigningWallet` produces real BIP-340 Cashu signatures for the full `SpilmanRelayPayments` validation path)
 
 ### Stress Harness Notes
 

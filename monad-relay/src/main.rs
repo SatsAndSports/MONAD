@@ -40,6 +40,10 @@ enum Command {
         /// Ed25519 seed. If omitted, only TCP is accepted.
         #[arg(long)]
         quic: bool,
+
+        /// Path to the SQLite database used for persistent Spilman channel state.
+        #[arg(long, default_value = "monad-relay.db")]
+        db_path: String,
     },
 }
 
@@ -97,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
             quic_cert_seed,
             transport_key,
             quic,
+            db_path,
         } => {
             let identity = QuicCertIdentity::from_hex(&quic_cert_seed)
                 .map_err(|e| anyhow::anyhow!("bad QUIC cert seed: {e}"))?;
@@ -126,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
                 default_in_bytes_per_millisat: 1,
                 default_out_bytes_per_millisat: 1,
                 bootstrap_capabilities: None,
+                spilman_storage_path: db_path,
             });
 
             let tcp_listener = TcpListener::bind(&listen).await?;

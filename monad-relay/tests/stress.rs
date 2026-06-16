@@ -452,6 +452,12 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
+        spilman_storage_path: tempfile::NamedTempFile::new()
+            .unwrap()
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());

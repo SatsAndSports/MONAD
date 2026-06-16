@@ -12,6 +12,8 @@
 //!     incremental channel payments, and linked-channel state synchronization
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
+mod common;
+
 use bytes::Bytes;
 use h2::client;
 use http::{Method, Request};
@@ -19,7 +21,9 @@ use monad_client::connector;
 use monad_client::route::{Route, RouteHop};
 use monad_client::session_driver::start_session_payment_driver;
 use monad_client::tunnel;
-use monad_client::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
+use monad_client::wallet::{
+    MockWallet, MonadWallet, RelayPaymentOffer, WalletChannel, WalletChannelState,
+};
 use monad_common::blinded_connect::BlindedConnectRequest;
 use monad_common::blinded_hop::{build_blinded_hop_descriptor, BlindedHopDescriptor};
 use monad_common::bootstrap::{
@@ -35,13 +39,18 @@ use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
+use cdk_spilman::configurable_host::SqliteStorage;
+use cdk_spilman_test_mint::TestMintHelper;
 use cdk_spilman_test_mint::{build_router, build_test_mint, TestMintConfig};
+use common::signing_wallet::TestSigningWallet;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
 use monad_relay::listener::{
-    discover_spilman_mint_cache, run_with_payments, ServerConfig, SpilmanMintCache,
+    discover_spilman_mint_cache, run_with_payments, run_with_payments_and_registry_and_shutdown,
+    ServerConfig, SpilmanMintCache,
 };
-use monad_relay::payments::testing::InMemoryRelayPayments;
+use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
 use monad_relay::quic_pool::QuicPool;
+use monad_relay::session_registry::SessionRegistry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -220,6 +229,12 @@ async fn start_monad_relay_with_transport_key_and_capabilities(
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: Some(bootstrap_capabilities),
+        spilman_storage_path: tempfile::NamedTempFile::new()
+            .unwrap()
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
@@ -269,6 +284,12 @@ async fn start_monad_relay_with_test_payments() -> (
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
+        spilman_storage_path: tempfile::NamedTempFile::new()
+            .unwrap()
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
@@ -312,6 +333,12 @@ async fn start_monad_relay_with_spilman(
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
+        spilman_storage_path: tempfile::NamedTempFile::new()
+            .unwrap()
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string(),
     });
 
     let discovered_spilman_mint_cache = Arc::new(
@@ -382,6 +409,12 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
+        spilman_storage_path: tempfile::NamedTempFile::new()
+            .unwrap()
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
@@ -395,6 +428,69 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
     ));
 
     Some((addr, pubkey))
+}
+
+/// Spin up a MONAD relay with durable `SpilmanRelayPayments` and a graceful
+/// shutdown signal. Returns the bound address, transport pubkey, join handle,
+/// and a oneshot sender that can be used to trigger shutdown.
+async fn start_persistent_relay(
+    bind_addr: SocketAddr,
+    transport_key: &SecpTransportKeypair,
+    payment_receiver_secret: cashu::nuts::SecretKey,
+    storage_path: &str,
+    mint_cache: SpilmanMintCache,
+    trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
+) -> io::Result<(
+    SocketAddr,
+    Secp256k1Pubkey,
+    tokio::task::JoinHandle<io::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+)> {
+    let identity = QuicCertIdentity::generate().unwrap();
+    let pubkey = transport_key.pubkey();
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let (listener, quic_endpoint, addr) =
+        bind_tcp_and_quic_on_same_port(bind_addr, quic_server_config).await?;
+
+    let config = Arc::new(ServerConfig {
+        identity,
+        transport_key: Some(transport_key.clone()),
+        payment_receiver_secret,
+        trusted_mint_units,
+        default_in_bytes_per_millisat: 1,
+        default_out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
+        spilman_storage_path: storage_path.to_string(),
+    });
+
+    let storage = Arc::new(
+        SqliteStorage::open(storage_path)
+            .map_err(|e| io::Error::other(format!("failed to open spilman storage: {e}")))?,
+    );
+    let payments: Arc<dyn RelayPayments> = Arc::new(SpilmanRelayPayments::new(
+        config.payment_receiver_secret.clone(),
+        mint_cache.clone(),
+        storage,
+    ));
+    let mint_cache = Arc::new(mint_cache);
+    let session_registry = Arc::new(SessionRegistry::new());
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(run_with_payments_and_registry_and_shutdown(
+        listener,
+        Some(quic_endpoint),
+        config,
+        payments,
+        mint_cache,
+        session_registry,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    Ok((addr, pubkey, handle, shutdown_tx))
 }
 
 async fn bind_ipv6_listener() -> Option<TcpListener> {
@@ -575,6 +671,7 @@ async fn read_control_message(h2_recv: &mut h2::RecvStream) -> ServerMessage {
 
 #[derive(Debug, Clone)]
 struct TestSessionStatus {
+    advertisements: Vec<monad_common::protocol::KeysetAdvertisement>,
     linked_channel: Option<monad_common::protocol::LinkedChannelStatus>,
     active_in_rate: u64,
     active_out_rate: u64,
@@ -686,6 +783,7 @@ async fn wait_for_session_totals(
 fn expect_session_status_struct(message: ServerMessage) -> TestSessionStatus {
     match message {
         ServerMessage::SessionStatus {
+            advertisements,
             linked_channel,
             active_in_rate,
             active_out_rate,
@@ -698,6 +796,7 @@ fn expect_session_status_struct(message: ServerMessage) -> TestSessionStatus {
             total_connects,
             ..
         } => TestSessionStatus {
+            advertisements,
             linked_channel,
             active_in_rate,
             active_out_rate,
@@ -2780,6 +2879,219 @@ async fn test_funded_data_channel() {
 
     drop(h2);
     conn.shutdown().await;
+}
+
+/// End-to-end test that a relay restart preserves accepted Spilman channel
+/// state in its SQLite backing store, using real Cashu signatures and the
+/// full `SpilmanRelayPayments` validation path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    // Real in-memory Cashu mint for funding proofs.
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
+
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage_path = temp_db.path().to_str().unwrap().to_string();
+
+    let transport_key = SecpTransportKeypair::generate();
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
+
+    // Phase A: first relay session, driven by the payment driver.
+    let (server_addr, pubkey, handle, shutdown_tx) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret.clone(),
+        &storage_path,
+        mint_cache.clone(),
+        trusted_mint_units.clone(),
+    )
+    .await
+    .unwrap();
+
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (driver_handle, ready_rx) = start_session_payment_driver(
+        &conn,
+        wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "real-crypto hop",
+        monad_client::session_driver::PaymentPolicy {
+            target_topup_buffer_msats: 1000,
+            minimum_topup_msats: 1000,
+        },
+    )
+    .await
+    .unwrap();
+
+    timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .expect("driver should ready")
+        .expect("driver ready signal");
+
+    let mut tunnel = conn.open_tunnel(&upper_addr.to_string()).await.unwrap();
+    tunnel.write_all(b"before restart").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"BEFORE RESTART");
+
+    let first_session_id = *conn.session_id();
+    let stored_balance_msats = wallet
+        .get_channel(&channel_id)
+        .unwrap()
+        .current_signed_balance_msats;
+    assert_eq!(
+        stored_balance_msats, 1000,
+        "first session should be credited exactly 1000 msats"
+    );
+
+    driver_handle.abort();
+    let _ = driver_handle.await;
+    conn.shutdown().await;
+
+    // Phase B: graceful relay shutdown.
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+
+    // Phase C: restart the relay with the same SQLite file and identity. Use
+    // a fresh port; graceful shutdown may leave the old socket in TIME_WAIT
+    // briefly, and persistence does not depend on the endpoint address.
+    let (server_addr2, pubkey2, handle2, shutdown_tx2) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret,
+        &storage_path,
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pubkey2, pubkey);
+
+    // Phase D: reconnect and explicitly verify persistence.
+    let conn2 = connect_client_quic_secp(server_addr2, &pubkey2).await;
+    let (mut control_send2, mut control_recv2) = conn2.open_control().await.unwrap();
+    let status0 = control_handshake_status(&mut control_send2, &mut control_recv2).await;
+    assert!(status0.paused, "new session should start paused");
+    assert!(status0.linked_channel.is_none());
+
+    // Detach from the old session and attach to the new one so the wallet can
+    // build signed link/payment payloads for this session.
+    wallet
+        .detach_channel_from_session(&channel_id, first_session_id)
+        .unwrap();
+    wallet
+        .attach_channel_to_session(&channel_id, *conn2.session_id())
+        .unwrap();
+
+    let offer = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_hex,
+        status0
+            .advertisements
+            .iter()
+            .find(|a| a.unit == "sat")
+            .expect("relay should advertise sat keyset"),
+    );
+
+    let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+    send_control_message(
+        &mut control_send2,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+
+    let status_after_link =
+        expect_session_status_struct(read_control_message(&mut control_recv2).await);
+    let linked_channel = status_after_link
+        .linked_channel
+        .as_ref()
+        .expect("channel should be linked after restart");
+    assert_eq!(linked_channel.channel_id, channel_id);
+    assert_eq!(
+        linked_channel.balance_raw,
+        stored_balance_msats / 1000,
+        "stored balance should survive restart"
+    );
+
+    // Pay an additional 1 sat above the stored balance to prove delta
+    // accounting resumes from the persisted balance.
+    let stored_balance_raw = stored_balance_msats / 1000;
+    let delta_raw = 1u64;
+    let payment_json = wallet
+        .build_channel_payment(
+            &channel_id,
+            &offer,
+            stored_balance_raw,
+            stored_balance_raw + delta_raw,
+        )
+        .unwrap();
+    send_control_message(
+        &mut control_send2,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+
+    let status_after_pay =
+        expect_session_status_struct(read_control_message(&mut control_recv2).await);
+    assert!(
+        !status_after_pay.paused,
+        "session should unpause after payment"
+    );
+    assert_eq!(
+        status_after_pay.total_paid_millisats,
+        delta_raw * 1000,
+        "only the delta should credit the new session"
+    );
+
+    let mut tunnel2 = conn2.open_tunnel(&upper_addr.to_string()).await.unwrap();
+    tunnel2.write_all(b"after restart").await.unwrap();
+    tunnel2.shutdown().await.unwrap();
+    let mut result2 = Vec::new();
+    tunnel2.read_to_end(&mut result2).await.unwrap();
+    assert_eq!(result2, b"AFTER RESTART");
+
+    let _ = control_send2.send_data(Bytes::new(), true);
+    drop(control_send2);
+    drop(control_recv2);
+    conn2.shutdown().await;
+
+    let _ = shutdown_tx2.send(());
+    handle2.await.unwrap().unwrap();
 }
 
 #[tokio::test]

@@ -2,12 +2,15 @@ use crate::channel_store::ChannelStore;
 use crate::listener::SpilmanMintCache;
 use cashu::nuts::{CurrencyUnit, Id, PublicKey, SecretKey};
 use cdk_spilman::{
-    compute_channel_secret_from_hex, sign_with_tweaked_key_util, BridgeError, ChannelFunding,
-    ChannelPolicy, ChannelState, ClosingData, Payment, PaymentProof, SpilmanBridge, SpilmanHost,
+    compute_channel_secret_from_hex,
+    configurable_host::{ClosedDataView, SpilmanStorage},
+    sign_with_tweaked_key_util, BridgeError, ChannelFunding, ChannelPolicy, ChannelState,
+    ClosingData, Payment, PaymentProof, SpilmanBridge, SpilmanHost,
 };
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub trait RelayPayments: Send + Sync + 'static {
@@ -148,14 +151,6 @@ impl ChannelUnit {
         }
     }
 
-    fn from_str_bridge(value: &str) -> Result<Self, BridgeError> {
-        match value {
-            "sat" => Ok(Self::Sat),
-            "msat" => Ok(Self::Msat),
-            other => Err(BridgeError::UnsupportedUnit(other.to_string())),
-        }
-    }
-
     pub(crate) fn capacity_millisats(self, capacity_raw: u64) -> Result<u64, LinkError> {
         match self {
             Self::Msat => Ok(capacity_raw),
@@ -201,8 +196,12 @@ pub struct SpilmanRelayPayments {
 }
 
 impl SpilmanRelayPayments {
-    pub fn new(receiver_secret: SecretKey, mint_cache: SpilmanMintCache) -> Self {
-        let store = ChannelStore::new();
+    pub fn new(
+        receiver_secret: SecretKey,
+        mint_cache: SpilmanMintCache,
+        storage: Arc<dyn SpilmanStorage>,
+    ) -> Self {
+        let store = ChannelStore::new(storage);
         let host = MonadHost {
             receiver_secret,
             mint_cache,
@@ -237,9 +236,13 @@ impl RelayPayments for SpilmanRelayPayments {
             .set_channel_owner(&payment.channel_id, session_id)
             .map_err(LinkError::Internal)?;
 
-        let channel = self.store.get_channel(&payment.channel_id).ok_or_else(|| {
-            LinkError::Internal("linked channel missing after validation".to_string())
-        })?;
+        let channel = self
+            .store
+            .get_channel(&payment.channel_id)
+            .map_err(LinkError::Internal)?
+            .ok_or_else(|| {
+                LinkError::Internal("linked channel missing after validation".to_string())
+            })?;
 
         Ok(LinkOutcome {
             channel_id: payment.channel_id,
@@ -268,6 +271,7 @@ impl RelayPayments for SpilmanRelayPayments {
             let channel = self
                 .store
                 .get_channel(expected_channel_id)
+                .map_err(ChannelPaymentError::Internal)?
                 .ok_or(ChannelPaymentError::UnknownChannel)?;
             (channel.latest_payment.balance, channel.unit, channel.state)
         };
@@ -320,6 +324,8 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     fn get_funding(&self, channel_id: &str) -> Option<ChannelFunding> {
         self.store
             .get_channel(channel_id)
+            .ok()
+            .flatten()
             .map(|channel| channel.funding.clone())
     }
 
@@ -329,16 +335,16 @@ impl SpilmanHost<PaymentContext> for MonadHost {
         funding: ChannelFunding,
         initial_payment: PaymentProof,
     ) {
-        let metadata = parse_channel_metadata(&funding.params_json)
-            .expect("validated channel params must contain supported unit and capacity");
         self.store
-            .save_funding(channel_id, funding, initial_payment, metadata.0, metadata.1)
-            .expect("state mutex must not be poisoned while saving funding");
+            .save_funding(channel_id, funding, initial_payment)
+            .expect("validated channel funding must be persistable");
     }
 
     fn get_amount_due(&self, channel_id: &str, _context: Option<&PaymentContext>) -> u64 {
         self.store
             .get_channel(channel_id)
+            .ok()
+            .flatten()
             .map(|channel| channel.latest_payment.balance)
             .unwrap_or(0)
     }
@@ -350,6 +356,8 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     fn get_channel_state(&self, channel_id: &str) -> ChannelState {
         self.store
             .get_channel(channel_id)
+            .ok()
+            .flatten()
             .map(|channel| channel.state)
             .unwrap_or(ChannelState::Open)
     }
@@ -367,6 +375,8 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     fn get_closing_data(&self, channel_id: &str) -> Option<ClosingData> {
         self.store
             .get_channel(channel_id)
+            .ok()
+            .flatten()
             .and_then(|channel| channel.closing_data.clone())
     }
 
@@ -394,6 +404,8 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     ) -> Option<PaymentProof> {
         self.store
             .get_channel(channel_id)
+            .ok()
+            .flatten()
             .map(|channel| channel.latest_payment.clone())
     }
 
@@ -419,14 +431,25 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     fn mark_channel_closed(
         &self,
         channel_id: &str,
-        _expiry_timestamp: u64,
-        _balance: u64,
-        _receiver_proofs_json: &str,
-        _sender_proofs_json: &str,
-        _receiver_sum: u64,
-        _sender_sum: u64,
+        expiry_timestamp: u64,
+        balance: u64,
+        receiver_proofs_json: &str,
+        sender_proofs_json: &str,
+        receiver_sum: u64,
+        sender_sum: u64,
     ) -> Result<(), String> {
-        self.store.mark_channel_closed(channel_id)
+        self.store.mark_channel_closed(
+            channel_id,
+            ClosedDataView {
+                expiry_timestamp,
+                closed_amount: balance,
+                value_after_stage1: balance,
+                receiver_sum,
+                sender_sum,
+                receiver_proofs_json: receiver_proofs_json.to_string(),
+                sender_proofs_json: sender_proofs_json.to_string(),
+            },
+        )
     }
 
     fn compute_channel_secret(
@@ -463,18 +486,6 @@ impl SpilmanHost<PaymentContext> for MonadHost {
             tweak_scalar_hex,
         )
     }
-}
-
-fn parse_channel_metadata(params_json: &str) -> Result<(ChannelUnit, u64), BridgeError> {
-    let params: serde_json::Value =
-        serde_json::from_str(params_json).map_err(|e| BridgeError::Internal(e.to_string()))?;
-    let unit = params["unit"]
-        .as_str()
-        .ok_or_else(|| BridgeError::Internal("missing unit in stored params".to_string()))?;
-    let capacity = params["capacity"]
-        .as_u64()
-        .ok_or_else(|| BridgeError::Internal("missing capacity in stored params".to_string()))?;
-    Ok((ChannelUnit::from_str_bridge(unit)?, capacity))
 }
 
 fn map_link_bridge_error(err: BridgeError) -> LinkError {

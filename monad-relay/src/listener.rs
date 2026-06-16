@@ -5,6 +5,7 @@ use crate::quic_pool::QuicPool;
 use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
 use crate::session_registry::SessionRegistry;
 use cashu::nuts::SecretKey;
+use cdk_spilman::configurable_host::SqliteStorage;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
 use monad_common::bootstrap::{
@@ -21,6 +22,7 @@ use monad_quic::auth::{
 };
 use monad_quic::stream::{QuicStream, STREAM_KIND_SECP_NOISE, STREAM_KIND_TWEAKED_NOISE};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -133,6 +135,8 @@ pub struct ServerConfig {
     pub default_out_bytes_per_millisat: u64,
     /// Optional bootstrap capability override, primarily for tests.
     pub bootstrap_capabilities: Option<BootstrapCapabilities>,
+    /// Path to the SQLite database used for persistent Spilman channel state.
+    pub spilman_storage_path: String,
 }
 
 impl ServerConfig {
@@ -216,9 +220,14 @@ pub async fn run(
 ) -> io::Result<()> {
     let discovered_spilman_mint_cache =
         Arc::new(discover_spilman_mint_cache(&config.trusted_mint_units).await?);
+    let storage = Arc::new(
+        SqliteStorage::open(&config.spilman_storage_path)
+            .map_err(|e| io::Error::other(format!("failed to open spilman storage: {e}")))?,
+    );
     let payments: Arc<dyn RelayPayments> = Arc::new(SpilmanRelayPayments::new(
         config.payment_receiver_secret.clone(),
         discovered_spilman_mint_cache.as_ref().clone(),
+        storage,
     ));
     run_with_payments(
         listener,
@@ -256,6 +265,33 @@ pub async fn run_with_payments_and_registry(
     discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
     session_registry: Arc<SessionRegistry>,
 ) -> io::Result<()> {
+    run_with_payments_and_registry_and_shutdown(
+        listener,
+        quic_endpoint,
+        config,
+        payments,
+        discovered_spilman_mint_cache,
+        session_registry,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
+    .await
+}
+
+pub async fn run_with_payments_and_registry_and_shutdown<S>(
+    listener: TcpListener,
+    quic_endpoint: Option<quinn::Endpoint>,
+    config: Arc<ServerConfig>,
+    payments: Arc<dyn RelayPayments>,
+    discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
+    session_registry: Arc<SessionRegistry>,
+    shutdown: S,
+) -> io::Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
+    let mut shutdown = std::pin::pin!(shutdown);
     let transport_key = config.transport_key.clone().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -270,7 +306,7 @@ pub async fn run_with_payments_and_registry(
     // Create the QUIC connection pool for outbound CONNECT quic: forwarding.
     // This is separate from the QUIC endpoint (which handles inbound connections).
     let quic_pool = QuicPool::new().ok();
-    // Accept loop — runs until Ctrl+C
+    // Accept loop — runs until shutdown signal
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -518,8 +554,8 @@ pub async fn run_with_payments_and_registry(
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutting down (Ctrl+C)...");
+            _ = &mut shutdown => {
+                info!("shutting down (signal)...");
                 break;
             }
         }

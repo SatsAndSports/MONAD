@@ -27,4 +27,6 @@ monad-client = { path = "../monad-client" }
 monad-quic = { path = "../monad-quic" }
 quinn = "0.11"
 cdk-spilman-test-mint = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman-test-mint", default-features = false, features = ["http"] }
+cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0", package = "cdk", default-features = false, features = ["mint"] }
 axum = "0.8.9"
+tempfile = "3"

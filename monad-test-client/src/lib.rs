@@ -553,6 +553,10 @@ async fn spawn_relay_task(
         default_in_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
         default_out_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
         bootstrap_capabilities: None,
+        spilman_storage_path: std::env::temp_dir()
+            .join(format!("monad-test-client-relay-{}.db", addr.port()))
+            .to_string_lossy()
+            .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());

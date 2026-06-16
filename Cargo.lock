@@ -2272,6 +2272,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "cdk-spilman",
  "clap",
  "h2",
  "hex",
@@ -2336,6 +2337,7 @@ dependencies = [
  "axum",
  "bytes",
  "cashu",
+ "cdk",
  "cdk-spilman",
  "cdk-spilman-test-mint",
  "clap",
@@ -2348,6 +2350,7 @@ dependencies = [
  "quinn",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
