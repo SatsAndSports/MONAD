@@ -172,6 +172,10 @@ impl ChannelStore {
         Some(self.storage.get_state(channel_id))
     }
 
+    pub(crate) fn closed_data(&self, channel_id: &str) -> Option<ClosedDataView> {
+        self.storage.get_closed_data(channel_id)
+    }
+
     pub(crate) fn linked_channel_status(&self, channel_id: &str) -> Option<LinkedChannelStatus> {
         let channel = self.get_channel(channel_id).ok()??;
         Some(LinkedChannelStatus {

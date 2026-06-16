@@ -223,6 +223,11 @@ impl SpilmanRelayPayments {
     ) -> Result<CloseSuccess, CloseError> {
         self.bridge.execute_unilateral_close(channel_id, net)
     }
+
+    /// Test/observability accessor for the stored closed-channel data.
+    pub fn closed_data(&self, channel_id: &str) -> Option<ClosedDataView> {
+        self.store.closed_data(channel_id)
+    }
 }
 
 impl RelayPayments for SpilmanRelayPayments {
@@ -458,7 +463,7 @@ impl SpilmanHost<PaymentContext> for MonadHost {
             ClosedDataView {
                 expiry_timestamp,
                 closed_amount: balance,
-                value_after_stage1: balance,
+                value_after_stage1: receiver_sum + sender_sum,
                 receiver_sum,
                 sender_sum,
                 receiver_proofs_json: receiver_proofs_json.to_string(),

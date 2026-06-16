@@ -497,6 +497,12 @@ async fn start_persistent_relay(
     Ok((addr, pubkey, handle, shutdown_tx, payments))
 }
 
+fn sum_proof_amounts(proofs_json: &str) -> u64 {
+    let proofs: Vec<cashu::nuts::Proof> =
+        serde_json::from_str(proofs_json).unwrap_or_else(|_| Vec::new());
+    proofs.iter().map(|p| u64::from(p.amount)).sum()
+}
+
 async fn bind_ipv6_listener() -> Option<TcpListener> {
     match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await {
         Ok(listener) => Some(listener),
@@ -3177,6 +3183,28 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
         payments.channel_state(&channel_id),
         Some(ChannelState::Closed),
         "channel should be Closed after unilateral close"
+    );
+
+    // Verify the stored closed-channel proofs actually carry the expected
+    // total value. With the zero-fee test mint, the sums should match exactly.
+    let closed_data = payments
+        .closed_data(&channel_id)
+        .expect("closed data should be present after successful close");
+    let receiver_proof_sum = sum_proof_amounts(&closed_data.receiver_proofs_json);
+    let sender_proof_sum = sum_proof_amounts(&closed_data.sender_proofs_json);
+    assert_eq!(
+        receiver_proof_sum, funded_balance_raw,
+        "receiver proofs should sum to the accepted channel balance"
+    );
+    assert_eq!(
+        sender_proof_sum,
+        capacity_raw - funded_balance_raw,
+        "sender proofs should sum to the remaining channel value"
+    );
+    assert_eq!(
+        receiver_proof_sum + sender_proof_sum,
+        closed_data.value_after_stage1,
+        "proof sums should match the stage-1 close value"
     );
 
     // A further payment on the same linked channel must be rejected because
