@@ -3222,7 +3222,22 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let mint_fixture = common::real_mint_fixture::shared_real_mint().await;
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
 
     let temp_db = tempfile::NamedTempFile::new().unwrap();
     let storage_path = temp_db.path().to_str().unwrap().to_string();
@@ -3237,13 +3252,22 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
         &transport_key,
         payment_receiver_secret.clone(),
         &storage_path,
-        mint_fixture.mint_cache(),
-        mint_fixture.trusted_mint_units(),
+        mint_cache.clone(),
+        trusted_mint_units.clone(),
     )
     .await
     .unwrap();
 
-    let wallet = Arc::new(mint_fixture.wallet_for(receiver_pubkey_hex.clone()).await);
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
     let channel_id = wallet.pre_create_channel(1000).await.unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
@@ -3297,8 +3321,8 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
         &transport_key,
         payment_receiver_secret,
         &storage_path,
-        mint_fixture.mint_cache(),
-        mint_fixture.trusted_mint_units(),
+        mint_cache,
+        trusted_mint_units,
     )
     .await
     .unwrap();
@@ -3399,6 +3423,203 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     handle2.await.unwrap().unwrap();
 }
 
+/// End-to-end test that changing the relay's current trusted mint policy does
+/// not invalidate an already-accepted stored channel. The relay should stop
+/// advertising that mint for new channels, but the client must still be able to
+/// re-link and continue paying on the old channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_works() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let allowed_mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+    let allowed_trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage_path = temp_db.path().to_str().unwrap().to_string();
+
+    let transport_key = SecpTransportKeypair::generate();
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
+
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret.clone(),
+        &storage_path,
+        allowed_mint_cache,
+        allowed_trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let status0 = control_handshake_status(&mut control_send, &mut control_recv).await;
+    let offer = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_hex.clone(),
+        status0
+            .advertisements
+            .iter()
+            .find(|a| a.unit == "sat")
+            .expect("relay should advertise sat keyset before policy change"),
+    );
+
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+    let _ = expect_session_status_struct(read_control_message(&mut control_recv).await);
+
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, &offer, 0, 1)
+        .unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+    let status_after_pay =
+        expect_session_status_struct(read_control_message(&mut control_recv).await);
+    assert_eq!(status_after_pay.total_paid_millisats, 1000);
+
+    let first_session_id = *conn.session_id();
+    let stored_balance_msats = wallet
+        .get_channel(&channel_id)
+        .unwrap()
+        .current_signed_balance_msats;
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+
+    let disallowed_mint_cache = SpilmanMintCache::default();
+    let disallowed_trusted_mint_units = BTreeMap::new();
+    let (server_addr2, pubkey2, handle2, shutdown_tx2, _payments2) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret,
+        &storage_path,
+        disallowed_mint_cache,
+        disallowed_trusted_mint_units,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pubkey2, pubkey);
+
+    let conn2 = connect_client_quic_secp(server_addr2, &pubkey2).await;
+    let (mut control_send2, mut control_recv2) = conn2.open_control().await.unwrap();
+    let status_after_restart =
+        control_handshake_status(&mut control_send2, &mut control_recv2).await;
+    assert!(
+        status_after_restart
+            .advertisements
+            .iter()
+            .all(|a| a.unit != "sat"),
+        "relay should stop advertising sat mint after policy change"
+    );
+
+    wallet
+        .detach_channel_from_session(&channel_id, first_session_id)
+        .unwrap();
+    wallet
+        .attach_channel_to_session(&channel_id, *conn2.session_id())
+        .unwrap();
+
+    let old_offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex,
+        mint_url,
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![keyset_id],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let link_json = wallet.build_link_request(&channel_id, &old_offer).unwrap();
+    send_control_message(
+        &mut control_send2,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+    let status_after_link =
+        expect_session_status_struct(read_control_message(&mut control_recv2).await);
+    status_after_link.assert_linked_channel(&channel_id, stored_balance_msats / 1000, 1000, "sat");
+
+    let stored_balance_raw = stored_balance_msats / 1000;
+    let payment_json = wallet
+        .build_channel_payment(
+            &channel_id,
+            &old_offer,
+            stored_balance_raw,
+            stored_balance_raw + 1,
+        )
+        .unwrap();
+    send_control_message(
+        &mut control_send2,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+    let status_after_second_pay =
+        expect_session_status_struct(read_control_message(&mut control_recv2).await);
+    assert_eq!(status_after_second_pay.total_paid_millisats, 1000);
+
+    let mut tunnel = conn2.open_tunnel(&upper_addr.to_string()).await.unwrap();
+    tunnel.write_all(b"after policy change").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"AFTER POLICY CHANGE");
+
+    let _ = control_send2.send_data(Bytes::new(), true);
+    drop(control_send2);
+    drop(control_recv2);
+    conn2.shutdown().await;
+    let _ = shutdown_tx2.send(());
+    handle2.await.unwrap().unwrap();
+}
+
 /// End-to-end test that the relay can unilaterally close a funded Spilman
 /// channel and that further payments on that channel are rejected.
 #[tokio::test(flavor = "multi_thread")]
@@ -3407,7 +3628,22 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let mint_fixture = common::real_mint_fixture::shared_real_mint().await;
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
 
     let temp_db = tempfile::NamedTempFile::new().unwrap();
     let storage_path = temp_db.path().to_str().unwrap().to_string();
@@ -3421,13 +3657,22 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
         &transport_key,
         payment_receiver_secret,
         &storage_path,
-        mint_fixture.mint_cache(),
-        mint_fixture.trusted_mint_units(),
+        mint_cache,
+        trusted_mint_units,
     )
     .await
     .unwrap();
 
-    let wallet = Arc::new(mint_fixture.wallet_for(receiver_pubkey_hex.clone()).await);
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
     let channel_id = wallet.pre_create_channel(1000).await.unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
@@ -3489,7 +3734,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     assert_eq!(result, b"BEFORE CLOSE");
 
     // Close the channel through the relay, using the in-memory mint networking.
-    let mint_networking = InMemoryMintNetworking::new(mint_fixture.mint());
+    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
     let close_success = payments
         .close_channel(&channel_id, &mint_networking)
         .expect("relay should close the channel");

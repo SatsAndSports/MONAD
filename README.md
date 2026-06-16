@@ -136,6 +136,7 @@ Current coverage includes:
 - session funding and incremental payments via `ChannelLink` / `ChannelPayment`
 - relay advertises multiple mint/unit pricing options
 - control detach releases linked channels and tears down active / future streams
+- changing a relay's current trusted mint policy stops new advertisement/acceptance for that mint without invalidating previously stored channels
 
 ## Payment Code Map
 

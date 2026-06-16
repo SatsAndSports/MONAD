@@ -91,7 +91,6 @@ pub struct RelayWalletManager {
     storage: Arc<dyn SpilmanStorage>,
     metadata: Arc<ChannelMetadataStore>,
     identities: Arc<Mutex<HashMap<String, SecretKey>>>,
-    payments: Arc<Mutex<HashMap<String, Arc<SpilmanRelayPayments>>>>,
 }
 
 impl std::fmt::Debug for RelayWalletManager {
@@ -120,7 +119,6 @@ impl RelayWalletManager {
             storage,
             metadata,
             identities,
-            payments: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -182,16 +180,6 @@ impl RelayWalletManager {
         relay_name: &str,
         mint_cache: SpilmanMintCache,
     ) -> io::Result<Arc<SpilmanRelayPayments>> {
-        if let Some(existing) = self
-            .payments
-            .lock()
-            .map_err(|_| io::Error::other("relay wallet payments mutex poisoned"))?
-            .get(relay_name)
-            .cloned()
-        {
-            return Ok(existing);
-        }
-
         let receiver_secret = self.receiver_secret(relay_name)?;
         let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
         let store = ChannelStore::with_relay_metadata(
@@ -200,16 +188,11 @@ impl RelayWalletManager {
             relay_name.to_string(),
             receiver_pubkey_hex,
         );
-        let payments = Arc::new(SpilmanRelayPayments::from_store(
+        Ok(Arc::new(SpilmanRelayPayments::from_store(
             receiver_secret,
             mint_cache,
             store,
-        ));
-        self.payments
-            .lock()
-            .map_err(|_| io::Error::other("relay wallet payments mutex poisoned"))?
-            .insert(relay_name.to_string(), payments.clone());
-        Ok(payments)
+        )))
     }
 
     pub fn relay_name_for_channel(&self, channel_id: &str) -> io::Result<Option<String>> {
