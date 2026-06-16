@@ -19,7 +19,7 @@ use h2::client;
 use http::{Method, Request};
 use monad_client::connector;
 use monad_client::route::{Route, RouteHop};
-use monad_client::session_driver::start_session_payment_driver;
+use monad_client::session_driver::{start_session_payment_driver, PaymentPolicy};
 use monad_client::tunnel;
 use monad_client::wallet::{
     MockWallet, MonadWallet, RelayPaymentOffer, WalletChannel, WalletChannelState,
@@ -1700,6 +1700,108 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
     assert!(wallet.last_link_payload("a-bad").unwrap().is_some());
     assert!(wallet.last_link_payload("b-good").unwrap().is_some());
     assert!(wallet.last_payment_payload("b-good").unwrap().is_some());
+
+    driver_handle.abort();
+    let _ = driver_handle.await;
+    conn.shutdown().await;
+    let _ = mint_shutdown.send(());
+}
+
+/// End-to-end test that the session payment driver marks a channel unusable
+/// and reselects to another channel when the relay rejects a payment with
+/// `ChannelClosed`.
+#[tokio::test]
+async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
+    let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
+    let (server_addr, pubkey, payments) =
+        start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
+
+    let wallet = Arc::new(MockWallet::new());
+    wallet
+        .insert_channel(mock_wallet_channel(
+            "a-first",
+            receiver_pubkey.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+        ))
+        .unwrap();
+    wallet
+        .insert_channel(mock_wallet_channel(
+            "b-second",
+            receiver_pubkey,
+            mint_url,
+            keyset_id,
+        ))
+        .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (driver_handle, ready_rx) = start_session_payment_driver(
+        &conn,
+        wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "integration hop",
+        PaymentPolicy {
+            target_topup_buffer_msats: 1000,
+            minimum_topup_msats: 1000,
+        },
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("driver should ready")
+        .expect("driver ready signal");
+
+    // The driver linked and paid "a-first" to reach the target buffer. Close
+    // it from the relay side to simulate a unilateral close.
+    assert!(
+        payments.mark_closed("a-first"),
+        "relay should have recorded the channel"
+    );
+
+    // Send exactly the remaining balance worth of outbound data. The relay
+    // proxies it, then pauses. The driver tries to top up the now-closed
+    // channel, gets ChannelClosed, marks it unusable, and reselects.
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_counting_server(upper_listener, 1000, b"OK"));
+    let mut tunnel = conn.open_tunnel(&upper_addr.to_string()).await.unwrap();
+    tunnel.write_all(&[b'x'; 1000]).await.unwrap();
+    tunnel.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"OK");
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let first_state = wallet.get_channel("a-first").unwrap().state;
+            let second_linked = wallet.last_link_payload("b-second").unwrap().is_some();
+            let second_paid = wallet.last_payment_payload("b-second").unwrap().is_some();
+            if first_state != WalletChannelState::Open && second_linked && second_paid {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("driver should mark first channel unusable and reselect second channel");
+
+    assert_eq!(
+        wallet.get_channel("a-first").unwrap().state,
+        WalletChannelState::Closing,
+        "closed channel should be marked unusable"
+    );
+    assert!(
+        wallet.last_link_payload("b-second").unwrap().is_some(),
+        "second channel should be linked"
+    );
+    assert!(
+        wallet.last_payment_payload("b-second").unwrap().is_some(),
+        "second channel should receive a payment"
+    );
 
     driver_handle.abort();
     let _ = driver_handle.await;
