@@ -13,7 +13,7 @@ It provides:
 ## Status
 
 Implemented today:
-- `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup
+- `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup, and persists relay-side Spilman channel state in SQLite
 - `monad-client`: provides the reusable selector / wallet / session-driver client library pieces for relay session funding and multi-hop connection setup
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
@@ -24,6 +24,7 @@ Implemented today:
 - session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
 - relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
+- in-process relay wallet manager: multiple hosted relays can share one SQLite-backed relay wallet database while keeping distinct Cashu receiver keys / wallet names
 - client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments, with periodic local cleartext-counter checks sizing payments against the latest authoritative relay baseline
 - mock wallet runtime path for tests and connector flows: `MockWallet` plus `session_driver` funds relay sessions without a real wallet backend
 - blinded-hop routing over QUIC: `CONNECT blinded.monad.invalid:443`, tweak-prefixed QUIC forwarded sessions, `RouteHop` / `Route` connector support, reverse-tweak key recovery, and deterministic adjusted-tweak derivation for MONAD's x-only secp256k1 identity model
@@ -32,8 +33,26 @@ Implemented today:
 Not implemented yet:
 - real `MonadWallet` backend over `cashu_spilman_channels`
 - usable `monad-client` CLI runtime on top of that real wallet backend
-- relay-side Spilman channel state persistence across restarts
 - persistent route configuration file
+
+## Relay Wallet
+
+`monad-relay` now uses a named relay-wallet identity inside a shared SQLite relay-wallet database.
+
+Single-relay example:
+
+```bash
+monad-relay run \
+  --listen 0.0.0.0:9050 \
+  --quic \
+  --quic-cert-seed <ed25519-seed-hex> \
+  --transport-key <secp256k1-transport-key-hex> \
+  --wallet-db-path monad-relay.db \
+  --wallet-name relay-a \
+  --receiver-secret-hex <cashu-receiver-key-hex>
+```
+
+On later restarts of the same relay wallet identity, omit `--receiver-secret-hex`; the relay will load the existing receiver key for `--wallet-name` from the shared wallet DB.
 
 ## Workspace
 

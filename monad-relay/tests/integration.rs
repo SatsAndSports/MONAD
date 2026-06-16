@@ -42,8 +42,9 @@ use monad_common::session::RelayConnection;
 use cdk_spilman::configurable_host::SqliteStorage;
 use cdk_spilman::ChannelState;
 use cdk_spilman_test_mint::{
-    build_router, build_test_mint, InMemoryMintNetworking, TestMintConfig,
+    build_router, build_test_mint, InMemoryMintNetworking, TestMintConfig, TestMintHelper,
 };
+use common::signing_wallet::TestSigningWallet;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
 use monad_relay::listener::{
     discover_spilman_mint_cache, run_with_payments, run_with_payments_and_registry_and_shutdown,
@@ -52,6 +53,7 @@ use monad_relay::listener::{
 use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
 use monad_relay::quic_pool::QuicPool;
 use monad_relay::session_registry::SessionRegistry;
+use monad_relay::wallet_manager::RelayWalletManager;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -230,6 +232,7 @@ async fn start_monad_relay_with_transport_key_and_capabilities(
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: Some(bootstrap_capabilities),
+        relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
             .unwrap()
             .path()
@@ -285,6 +288,7 @@ async fn start_monad_relay_with_test_payments() -> (
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
+        relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
             .unwrap()
             .path()
@@ -334,6 +338,7 @@ async fn start_monad_relay_with_spilman(
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
+        relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
             .unwrap()
             .path()
@@ -410,6 +415,7 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
+        relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
             .unwrap()
             .path()
@@ -465,6 +471,7 @@ async fn start_persistent_relay(
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
+        relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: storage_path.to_string(),
     });
 
@@ -477,6 +484,64 @@ async fn start_persistent_relay(
         mint_cache.clone(),
         storage,
     ));
+    let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
+    let mint_cache = Arc::new(mint_cache);
+    let session_registry = Arc::new(SessionRegistry::new());
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(run_with_payments_and_registry_and_shutdown(
+        listener,
+        Some(quic_endpoint),
+        config,
+        payments_for_spawn,
+        mint_cache,
+        session_registry,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    Ok((addr, pubkey, handle, shutdown_tx, payments))
+}
+
+async fn start_managed_persistent_relay(
+    bind_addr: SocketAddr,
+    transport_key: &SecpTransportKeypair,
+    payment_receiver_secret: cashu::nuts::SecretKey,
+    wallet_name: &str,
+    wallet_manager: Arc<RelayWalletManager>,
+    mint_cache: SpilmanMintCache,
+    trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
+) -> io::Result<(
+    SocketAddr,
+    Secp256k1Pubkey,
+    tokio::task::JoinHandle<io::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+    Arc<SpilmanRelayPayments>,
+)> {
+    wallet_manager.register_identity(wallet_name, payment_receiver_secret.clone())?;
+
+    let identity = QuicCertIdentity::generate().unwrap();
+    let pubkey = transport_key.pubkey();
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let (listener, quic_endpoint, addr) =
+        bind_tcp_and_quic_on_same_port(bind_addr, quic_server_config).await?;
+
+    let config = Arc::new(ServerConfig {
+        identity,
+        transport_key: Some(transport_key.clone()),
+        payment_receiver_secret,
+        trusted_mint_units,
+        default_in_bytes_per_millisat: 1,
+        default_out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
+        relay_wallet_name: wallet_name.to_string(),
+        spilman_storage_path: String::new(),
+    });
+
+    let payments = wallet_manager.spilman_payments_for(wallet_name, mint_cache.clone())?;
     let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
     let mint_cache = Arc::new(mint_cache);
     let session_registry = Arc::new(SessionRegistry::new());
@@ -2996,6 +3061,194 @@ async fn test_funded_data_channel() {
 /// End-to-end test that a relay restart preserves accepted Spilman channel
 /// state in its SQLite backing store, using real Cashu signatures and the
 /// full `SpilmanRelayPayments` validation path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_two_relays_share_one_wallet_manager_db() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage_path = temp_db.path().to_str().unwrap().to_string();
+    let wallet_manager = Arc::new(RelayWalletManager::open(&storage_path).unwrap());
+
+    let receiver_secret_a = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_a = receiver_secret_a.public_key().to_hex();
+    let wallet_a = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_a.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
+    let channel_id_a = wallet_a.pre_create_channel(1000).await.unwrap();
+
+    let receiver_secret_b = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_b = receiver_secret_b.public_key().to_hex();
+    let wallet_b = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_b.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
+    let channel_id_b = wallet_b.pre_create_channel(1000).await.unwrap();
+
+    let transport_key_a = SecpTransportKeypair::generate();
+    let (server_addr_a, pubkey_a, handle_a, shutdown_tx_a, _payments_a) =
+        start_managed_persistent_relay(
+            "127.0.0.1:0".parse().unwrap(),
+            &transport_key_a,
+            receiver_secret_a,
+            "relay-a",
+            wallet_manager.clone(),
+            mint_cache.clone(),
+            trusted_mint_units.clone(),
+        )
+        .await
+        .unwrap();
+
+    let transport_key_b = SecpTransportKeypair::generate();
+    let (server_addr_b, pubkey_b, handle_b, shutdown_tx_b, _payments_b) =
+        start_managed_persistent_relay(
+            "127.0.0.1:0".parse().unwrap(),
+            &transport_key_b,
+            receiver_secret_b,
+            "relay-b",
+            wallet_manager.clone(),
+            mint_cache,
+            trusted_mint_units,
+        )
+        .await
+        .unwrap();
+
+    let conn_a = connect_client_quic_secp(server_addr_a, &pubkey_a).await;
+    let (mut control_send_a, mut control_recv_a) = conn_a.open_control().await.unwrap();
+    let status0_a = control_handshake_status(&mut control_send_a, &mut control_recv_a).await;
+    let offer_a = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_a,
+        status0_a
+            .advertisements
+            .iter()
+            .find(|a| a.unit == "sat")
+            .expect("relay-a should advertise sat keyset"),
+    );
+    wallet_a
+        .attach_channel_to_session(&channel_id_a, *conn_a.session_id())
+        .unwrap();
+    let link_json_a = wallet_a
+        .build_link_request(&channel_id_a, &offer_a)
+        .unwrap();
+    send_control_message(
+        &mut control_send_a,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json_a,
+        },
+        false,
+    )
+    .await;
+    let _ = expect_session_status_struct(read_control_message(&mut control_recv_a).await);
+    let payment_json_a = wallet_a
+        .build_channel_payment(&channel_id_a, &offer_a, 0, 1)
+        .unwrap();
+    send_control_message(
+        &mut control_send_a,
+        &ClientMessage::ChannelPayment {
+            payment_json: payment_json_a,
+        },
+        false,
+    )
+    .await;
+    let paid_a = expect_session_status_struct(read_control_message(&mut control_recv_a).await);
+    assert_eq!(paid_a.total_paid_millisats, 1000);
+
+    let conn_b = connect_client_quic_secp(server_addr_b, &pubkey_b).await;
+    let (mut control_send_b, mut control_recv_b) = conn_b.open_control().await.unwrap();
+    let status0_b = control_handshake_status(&mut control_send_b, &mut control_recv_b).await;
+    let offer_b = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_b,
+        status0_b
+            .advertisements
+            .iter()
+            .find(|a| a.unit == "sat")
+            .expect("relay-b should advertise sat keyset"),
+    );
+    wallet_b
+        .attach_channel_to_session(&channel_id_b, *conn_b.session_id())
+        .unwrap();
+    let link_json_b = wallet_b
+        .build_link_request(&channel_id_b, &offer_b)
+        .unwrap();
+    send_control_message(
+        &mut control_send_b,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json_b,
+        },
+        false,
+    )
+    .await;
+    let _ = expect_session_status_struct(read_control_message(&mut control_recv_b).await);
+    let payment_json_b = wallet_b
+        .build_channel_payment(&channel_id_b, &offer_b, 0, 1)
+        .unwrap();
+    send_control_message(
+        &mut control_send_b,
+        &ClientMessage::ChannelPayment {
+            payment_json: payment_json_b,
+        },
+        false,
+    )
+    .await;
+    let paid_b = expect_session_status_struct(read_control_message(&mut control_recv_b).await);
+    assert_eq!(paid_b.total_paid_millisats, 1000);
+
+    assert_ne!(channel_id_a, channel_id_b);
+    assert_eq!(
+        wallet_manager
+            .relay_name_for_channel(&channel_id_a)
+            .unwrap(),
+        Some("relay-a".to_string())
+    );
+    assert_eq!(
+        wallet_manager
+            .relay_name_for_channel(&channel_id_b)
+            .unwrap(),
+        Some("relay-b".to_string())
+    );
+
+    let _ = control_send_a.send_data(Bytes::new(), true);
+    drop(control_send_a);
+    drop(control_recv_a);
+    conn_a.shutdown().await;
+    let _ = control_send_b.send_data(Bytes::new(), true);
+    drop(control_send_b);
+    drop(control_recv_b);
+    conn_b.shutdown().await;
+
+    let _ = shutdown_tx_a.send(());
+    handle_a.await.unwrap().unwrap();
+    let _ = shutdown_tx_b.send(());
+    handle_b.await.unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

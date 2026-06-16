@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::SecpTransportKeypair;
 use monad_relay::listener;
+use monad_relay::wallet_manager::RelayWalletManager;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -43,7 +44,16 @@ enum Command {
 
         /// Path to the SQLite database used for persistent Spilman channel state.
         #[arg(long, default_value = "monad-relay.db")]
-        db_path: String,
+        wallet_db_path: String,
+
+        /// Relay wallet identity name within the shared wallet database.
+        #[arg(long)]
+        wallet_name: String,
+
+        /// Receiver secp256k1 private key (hex-encoded, 32 bytes) used for
+        /// Spilman channels. Required when creating a new wallet identity.
+        #[arg(long, env = "MONAD_RECEIVER_KEY")]
+        receiver_secret_hex: Option<String>,
     },
 }
 
@@ -101,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
             quic_cert_seed,
             transport_key,
             quic,
-            db_path,
+            wallet_db_path,
+            wallet_name,
+            receiver_secret_hex,
         } => {
             let identity = QuicCertIdentity::from_hex(&quic_cert_seed)
                 .map_err(|e| anyhow::anyhow!("bad QUIC cert seed: {e}"))?;
@@ -123,15 +135,31 @@ async fn main() -> anyhow::Result<()> {
                 BTreeSet::from(["sat".to_string()]),
             );
 
+            let wallet_manager = Arc::new(RelayWalletManager::open(&wallet_db_path)?);
+            let payment_receiver_secret = match receiver_secret_hex {
+                Some(secret_hex) => {
+                    let secret = SecretKey::from_hex(&secret_hex)
+                        .map_err(|e| anyhow::anyhow!("bad receiver secret: {e}"))?;
+                    wallet_manager.register_identity(&wallet_name, secret.clone())?;
+                    secret
+                }
+                None => wallet_manager.receiver_secret(&wallet_name).map_err(|e| {
+                    anyhow::anyhow!(
+                        "unknown wallet identity '{wallet_name}' and no --receiver-secret-hex provided: {e}"
+                    )
+                })?,
+            };
+
             let config = Arc::new(listener::ServerConfig {
                 identity,
                 transport_key: Some(transport_key),
-                payment_receiver_secret: SecretKey::generate(),
+                payment_receiver_secret,
                 trusted_mint_units,
                 default_in_bytes_per_millisat: 1,
                 default_out_bytes_per_millisat: 1,
                 bootstrap_capabilities: None,
-                spilman_storage_path: db_path,
+                relay_wallet_name: wallet_name,
+                spilman_storage_path: wallet_db_path,
             });
 
             let tcp_listener = TcpListener::bind(&listen).await?;
@@ -146,7 +174,8 @@ async fn main() -> anyhow::Result<()> {
             };
 
             info!("relay starting");
-            listener::run(tcp_listener, quic_endpoint, config).await?;
+            listener::run_with_wallet_manager(tcp_listener, quic_endpoint, config, wallet_manager)
+                .await?;
         }
     }
 

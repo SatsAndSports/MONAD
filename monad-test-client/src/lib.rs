@@ -553,6 +553,7 @@ async fn spawn_relay_task(
         default_in_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
         default_out_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
         bootstrap_capabilities: None,
+        relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: std::env::temp_dir()
             .join(format!("monad-test-client-relay-{}.db", addr.port()))
             .to_string_lossy()

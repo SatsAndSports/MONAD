@@ -7,3 +7,4 @@ pub mod quic_pool;
 pub mod session;
 mod session_fsm;
 pub mod session_registry;
+pub mod wallet_manager;

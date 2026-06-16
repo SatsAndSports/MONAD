@@ -10,6 +10,7 @@
 //! testable rather than being scattered across bridge callbacks.
 
 use crate::payments::ChannelUnit;
+use crate::wallet_manager::ChannelMetadataStore;
 use cdk_spilman::{
     configurable_host::{ClosedDataView, SpilmanStorage},
     ChannelFunding, ChannelState, ClosingData, PaymentProof,
@@ -38,6 +39,9 @@ pub(crate) struct OwnershipState {
 pub(crate) struct ChannelStore {
     storage: Arc<dyn SpilmanStorage>,
     ownership: Arc<Mutex<OwnershipState>>,
+    metadata: Option<Arc<ChannelMetadataStore>>,
+    relay_name: Option<String>,
+    receiver_pubkey_hex: Option<String>,
 }
 
 impl fmt::Debug for ChannelStore {
@@ -51,6 +55,24 @@ impl ChannelStore {
         Self {
             storage,
             ownership: Arc::new(Mutex::new(OwnershipState::default())),
+            metadata: None,
+            relay_name: None,
+            receiver_pubkey_hex: None,
+        }
+    }
+
+    pub(crate) fn with_relay_metadata(
+        storage: Arc<dyn SpilmanStorage>,
+        metadata: Arc<ChannelMetadataStore>,
+        relay_name: String,
+        receiver_pubkey_hex: String,
+    ) -> Self {
+        Self {
+            storage,
+            ownership: Arc::new(Mutex::new(OwnershipState::default())),
+            metadata: Some(metadata),
+            relay_name: Some(relay_name),
+            receiver_pubkey_hex: Some(receiver_pubkey_hex),
         }
     }
 
@@ -71,6 +93,13 @@ impl ChannelStore {
         // initial payment proof must be stored separately so that later
         // get_balance calls return a real balance + signature.
         self.storage.update_balance(channel_id, initial_payment)?;
+        if let (Some(metadata), Some(relay_name), Some(receiver_pubkey_hex)) = (
+            self.metadata.as_ref(),
+            self.relay_name.as_deref(),
+            self.receiver_pubkey_hex.as_deref(),
+        ) {
+            metadata.record_channel(channel_id, relay_name, receiver_pubkey_hex)?;
+        }
         Ok(())
     }
 

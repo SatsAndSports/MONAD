@@ -527,6 +527,21 @@ The client driver then computes the next requested cumulative balance from:
 and asks the wallet backend to build a payment for that exact next balance.
 - **Eviction Fairness**: If a session is evicted, it **remains Active** as long as it has a positive balance. The user can spend their existing credit, but cannot send further `ChannelPayment` updates until they link a new channel.
 
+### Relay Wallet Layer
+
+Relay-side Spilman validation and durable channel state are now mediated by an
+in-process relay wallet manager.
+
+That manager owns:
+
+- the shared SQLite relay-wallet database
+- the registry of `relay_wallet_name -> Cashu receiver key`
+- one cached `SpilmanRelayPayments` instance per relay wallet name
+
+This lets one MONAD process host multiple relays with different receiver keys
+while still sharing one persistent relay-wallet DB. Transport identity remains a
+separate concern from the Cashu receiver identity used for Spilman channels.
+
 #### 6. Session Teardown on Control Detach
 
 If the control stream detaches, the relay treats the session as fully ended.

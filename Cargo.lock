@@ -2349,6 +2349,7 @@ dependencies = [
  "monad-quic",
  "quinn",
  "reqwest",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",

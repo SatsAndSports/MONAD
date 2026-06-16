@@ -452,6 +452,7 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
         default_in_bytes_per_millisat: 1,
         default_out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
+        relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
             .unwrap()
             .path()

@@ -204,7 +204,14 @@ impl SpilmanRelayPayments {
         mint_cache: SpilmanMintCache,
         storage: Arc<dyn SpilmanStorage>,
     ) -> Self {
-        let store = ChannelStore::new(storage);
+        Self::from_store(receiver_secret, mint_cache, ChannelStore::new(storage))
+    }
+
+    pub(crate) fn from_store(
+        receiver_secret: SecretKey,
+        mint_cache: SpilmanMintCache,
+        store: ChannelStore,
+    ) -> Self {
         let host = MonadHost {
             receiver_secret,
             mint_cache,

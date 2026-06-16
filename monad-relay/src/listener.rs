@@ -1,11 +1,11 @@
 //! TCP and QUIC listener that accepts connections and performs the Noise NK handshake.
 
-use crate::payments::{RelayPayments, SpilmanRelayPayments};
+use crate::payments::RelayPayments;
 use crate::quic_pool::QuicPool;
 use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
 use crate::session_registry::SessionRegistry;
+use crate::wallet_manager::RelayWalletManager;
 use cashu::nuts::SecretKey;
-use cdk_spilman::configurable_host::SqliteStorage;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
 use monad_common::bootstrap::{
@@ -135,6 +135,9 @@ pub struct ServerConfig {
     pub default_out_bytes_per_millisat: u64,
     /// Optional bootstrap capability override, primarily for tests.
     pub bootstrap_capabilities: Option<BootstrapCapabilities>,
+    /// Wallet-manager relay identity name used to look up the receiver key and
+    /// shared persistent payment state.
+    pub relay_wallet_name: String,
     /// Path to the SQLite database used for persistent Spilman channel state.
     pub spilman_storage_path: String,
 }
@@ -218,17 +221,26 @@ pub async fn run(
     quic_endpoint: Option<quinn::Endpoint>,
     config: Arc<ServerConfig>,
 ) -> io::Result<()> {
+    let wallet_manager = Arc::new(RelayWalletManager::open(&config.spilman_storage_path)?);
+    wallet_manager.register_identity(
+        &config.relay_wallet_name,
+        config.payment_receiver_secret.clone(),
+    )?;
+    run_with_wallet_manager(listener, quic_endpoint, config, wallet_manager).await
+}
+
+pub async fn run_with_wallet_manager(
+    listener: TcpListener,
+    quic_endpoint: Option<quinn::Endpoint>,
+    config: Arc<ServerConfig>,
+    wallet_manager: Arc<RelayWalletManager>,
+) -> io::Result<()> {
     let discovered_spilman_mint_cache =
         Arc::new(discover_spilman_mint_cache(&config.trusted_mint_units).await?);
-    let storage = Arc::new(
-        SqliteStorage::open(&config.spilman_storage_path)
-            .map_err(|e| io::Error::other(format!("failed to open spilman storage: {e}")))?,
-    );
-    let payments: Arc<dyn RelayPayments> = Arc::new(SpilmanRelayPayments::new(
-        config.payment_receiver_secret.clone(),
+    let payments = wallet_manager.payments_for(
+        &config.relay_wallet_name,
         discovered_spilman_mint_cache.as_ref().clone(),
-        storage,
-    ));
+    )?;
     run_with_payments(
         listener,
         quic_endpoint,

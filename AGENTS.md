@@ -218,6 +218,7 @@ The test suite currently covers:
 - control detach releases linked channel ownership and tears down active/future streams
 - relay restart preserves accepted Spilman channel state in SQLite; the client re-links the same channel and delta accounting resumes from the persisted balance (`TestSigningWallet` produces real BIP-340 Cashu signatures for the full `SpilmanRelayPayments` validation path)
 - relay unilateral channel close moves the stored channel to `Closed`, returns the correct receiver/sender split, and rejects further `ChannelLink` / `ChannelPayment` attempts on that channel
+- two hosted relays with different receiver keys can share one in-process relay wallet manager / SQLite DB while keeping distinct channel ownership metadata keyed by relay wallet name
 
 ### Stress Harness Notes
 
