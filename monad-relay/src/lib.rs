@@ -1,4 +1,5 @@
 mod channel_store;
+pub mod config;
 mod control_driver;
 pub mod listener;
 pub mod payments;

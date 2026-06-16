@@ -45,6 +45,7 @@ use cdk_spilman_test_mint::{
 };
 use common::signing_wallet::TestSigningWallet;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
+use monad_relay::config::RelayConfig;
 use monad_relay::listener::{
     discover_spilman_mint_cache, run_with_payments, run_with_payments_and_registry_and_shutdown,
     ServerConfig, SpilmanMintCache,
@@ -509,6 +510,85 @@ async fn start_managed_persistent_relay(
     });
 
     let payments = wallet_manager.spilman_payments_for(wallet_name, mint_cache.clone())?;
+    let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
+    let mint_cache = Arc::new(mint_cache);
+    let session_registry = Arc::new(SessionRegistry::new());
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(run_with_payments_and_registry_and_shutdown(
+        listener,
+        Some(quic_endpoint),
+        config,
+        payments_for_spawn,
+        mint_cache,
+        session_registry,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    Ok((addr, pubkey, handle, shutdown_tx, payments))
+}
+
+/// Start a relay using a YAML-derived `RelayConfig`.  This exercises the same
+/// config-to-runtime conversion path as the production binary.
+async fn start_relay_from_config(
+    relay_config: &RelayConfig,
+    wallet_manager: Arc<RelayWalletManager>,
+    mint_cache: SpilmanMintCache,
+) -> io::Result<(
+    SocketAddr,
+    Secp256k1Pubkey,
+    tokio::task::JoinHandle<io::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+    Arc<SpilmanRelayPayments>,
+)> {
+    use cashu::nuts::SecretKey;
+    use monad_common::quic_cert_identity::QuicCertIdentity;
+
+    let identity = QuicCertIdentity::from_hex(&relay_config.quic_cert_seed)
+        .map_err(|e| io::Error::other(format!("bad quic cert seed: {e}")))?;
+    let transport_key = SecpTransportKeypair::from_secret_bytes(
+        &hex::decode(&relay_config.transport_key)
+            .map_err(|e| io::Error::other(format!("bad transport key hex: {e}")))?
+            .try_into()
+            .map_err(|_| io::Error::other("transport key must be 32 bytes"))?,
+    )
+    .map_err(|e| io::Error::other(format!("bad transport key: {e}")))?;
+    let pubkey = transport_key.pubkey();
+
+    if let Some(secret_hex) = &relay_config.receiver_secret_hex {
+        let secret = SecretKey::from_hex(secret_hex)
+            .map_err(|e| io::Error::other(format!("bad receiver secret: {e}")))?;
+        wallet_manager.register_identity(&relay_config.name, secret)?;
+    }
+
+    let receiver_pubkey_hex = wallet_manager.receiver_pubkey_hex(&relay_config.name)?;
+    let trusted_mint_units = relay_config.trusted_mint_units();
+
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let bind_addr: SocketAddr = relay_config
+        .listen
+        .parse()
+        .map_err(|e| io::Error::other(format!("invalid listen address: {e}")))?;
+    let (listener, quic_endpoint, addr) =
+        bind_tcp_and_quic_on_same_port(bind_addr, quic_server_config).await?;
+
+    let config = Arc::new(ServerConfig {
+        identity,
+        transport_key: Some(transport_key),
+        receiver_pubkey_hex,
+        trusted_mint_units,
+        default_in_bytes_per_millisat: relay_config.default_in_bytes_per_millisat,
+        default_out_bytes_per_millisat: relay_config.default_out_bytes_per_millisat,
+        bootstrap_capabilities: None,
+        relay_wallet_name: relay_config.name.clone(),
+        spilman_storage_path: relay_config.wallet_db_path.clone(),
+    });
+
+    let payments = wallet_manager.spilman_payments_for(&relay_config.name, mint_cache.clone())?;
     let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
     let mint_cache = Arc::new(mint_cache);
     let session_registry = Arc::new(SessionRegistry::new());
@@ -3618,6 +3698,89 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
     conn2.shutdown().await;
     let _ = shutdown_tx2.send(());
     handle2.await.unwrap().unwrap();
+}
+
+/// A relay can be started from a YAML config file and advertises exactly the
+/// mints/units configured for that relay.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_relay_starts_from_yaml_config_and_advertises_configured_mints() {
+    use monad_relay::config::MonadConfig;
+    use std::fs;
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("relay.yaml");
+    let db_path = temp_dir.path().join("relay.db");
+
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_secret_hex = receiver_secret.to_secret_hex();
+    let transport_key = SecpTransportKeypair::generate();
+    let transport_key_hex = hex::encode(transport_key.normalized_secret_bytes());
+    let quic_cert = QuicCertIdentity::generate().unwrap();
+    let quic_seed_hex = hex::encode(quic_cert.seed());
+
+    let yaml = format!(
+        r#"
+relays:
+  - name: yaml-relay
+    wallet_db_path: {}
+    receiver_secret_hex: {}
+    quic_cert_seed: {}
+    transport_key: {}
+    listen: 127.0.0.1:0
+    quic: true
+    trusted_mints:
+      - url: {}
+        units: [sat]
+    default_in_bytes_per_millisat: 1
+    default_out_bytes_per_millisat: 1
+"#,
+        db_path.to_str().unwrap(),
+        receiver_secret_hex,
+        quic_seed_hex,
+        transport_key_hex,
+        mint_url,
+    );
+    fs::write(&config_path, yaml).unwrap();
+
+    let config = MonadConfig::load(&config_path).unwrap();
+    let relay = config.select_relay(None).unwrap();
+
+    let wallet_manager = Arc::new(RelayWalletManager::open(&relay.wallet_db_path).unwrap());
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) =
+        start_relay_from_config(relay, wallet_manager, mint_cache)
+            .await
+            .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let status = control_handshake_status(&mut control_send, &mut control_recv).await;
+
+    assert_eq!(status.advertisements.len(), 1);
+    assert_eq!(status.advertisements[0].mint_url, mint_url);
+    assert_eq!(status.advertisements[0].unit, "sat");
+    assert!(status.advertisements[0].keyset_ids.contains(&keyset_id));
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
 }
 
 /// End-to-end test that the relay can unilaterally close a funded Spilman

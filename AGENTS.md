@@ -38,6 +38,7 @@ cargo run -p monad-quic -- ...
   - binary currently exits early until the real wallet backend exists
 - `monad-relay`
   - reusable library code plus binary entrypoint
+  - YAML config loading with env-var / `.env` substitution (`config.rs`)
   - TCP+QUIC listener, `SpilmanMintCache`, `discover_spilman_mint_cache` (`listener.rs`)
   - `RelaySession<T>`, billing, control stream handler, version negotiation (`session.rs`)
   - explicit steady-state session reducer (`session_fsm.rs`)
@@ -214,6 +215,7 @@ The test suite currently covers:
 - Noise session ID (handshake hash) matches on both sides
 - Spilman channel implementation (delta-based) is currently being integrated and tested
 - relay advertises multiple mint/unit pricing options
+- relay loads its trusted mint policy from a per-relay YAML config entry and advertises only configured mints/units
 - default integration-test relays advertise a synthetic test mint/keyset offer so connector-driven intermediate hops can provision mock channels without a real wallet backend
 - control detach releases linked channel ownership and tears down active/future streams
 - relay restart preserves accepted Spilman channel state in SQLite; the client re-links the same channel and delta accounting resumes from the persisted balance (`TestSigningWallet` produces real BIP-340 Cashu signatures for the full `SpilmanRelayPayments` validation path)

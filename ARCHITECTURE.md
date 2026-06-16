@@ -64,10 +64,11 @@ Responsibilities:
   - `POST /control`
   - `CONNECT host:port`
 - proxy bytes between H2 streams and external TCP targets
-- discover trusted mint keysets at startup (`SpilmanMintCache`), caching keyset info JSON
+- discover trusted mint keysets at startup (`SpilmanMintCache`), caching keyset info JSON; the trusted mint/units list comes from the relay's YAML config
 - advertise receiver pubkey and trusted mints/keysets in `SessionStatus`
   (per-(mint, unit) rate configuration is planned; today every advertisement
   carries the session's global default rates)
+- load relay identity, wallet DB path, listen address, transport key, and mint policy from a per-relay entry in the shared YAML config file
 - enforce per-session billing with pause/resume on the control stream
   using validated `ChannelLink` / `ChannelPayment` messages
 - drive steady-state control/session transitions through an explicit relay-side

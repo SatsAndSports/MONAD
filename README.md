@@ -37,22 +37,37 @@ Not implemented yet:
 
 ## Relay Wallet
 
-`monad-relay` now uses a named relay-wallet identity inside a shared SQLite relay-wallet database.
+`monad-relay` now uses a named relay-wallet identity inside a shared SQLite relay-wallet database.  Relay configuration lives in a single YAML file; one file can describe many relays, and each relay process selects its relay with `--relay <name>`.
 
-Single-relay example:
+Example `relay.yaml`:
 
-```bash
-monad-relay run \
-  --listen 0.0.0.0:9050 \
-  --quic \
-  --quic-cert-seed <ed25519-seed-hex> \
-  --transport-key <secp256k1-transport-key-hex> \
-  --wallet-db-path monad-relay.db \
-  --wallet-name relay-a \
-  --receiver-secret-hex <cashu-receiver-key-hex>
+```yaml
+relays:
+  - name: relay-a
+    wallet_db_path: /var/lib/monad/relay.db
+    receiver_secret_hex: "${MONAD_RELAY_A_RECEIVER_KEY}"
+    quic_cert_seed: "${MONAD_RELAY_A_QUIC_SEED}"
+    transport_key: "${MONAD_RELAY_A_TRANSPORT_KEY}"
+    listen: 0.0.0.0:9050
+    quic: true
+    trusted_mints:
+      - url: https://dev.mint.camelus.app
+        units: [sat]
+    default_in_bytes_per_millisat: 1
+    default_out_bytes_per_millisat: 1
 ```
 
-On later restarts of the same relay wallet identity, omit `--receiver-secret-hex`; the relay will load the existing receiver key for `--wallet-name` from the shared wallet DB.
+Environment variables are substituted from the process environment or from a `.env` file in the same directory as the config.  Defaults are supported: `${VAR:-default}`.
+
+Run the relay:
+
+```bash
+monad-relay run --config relay.yaml --relay relay-a
+```
+
+On first start, `receiver_secret_hex` is required so the relay can register its identity in the wallet database.  On later restarts of the same relay wallet identity, omit `receiver_secret_hex`; the relay will load the existing receiver key for `relay-a` from the shared wallet DB.
+
+Two relays can share the same `wallet_db_path` safely because each relay uses a distinct receiver key, so their channel rows are disjoint.  The config loader rejects any two relays that share the same `receiver_secret_hex`.
 
 ## Workspace
 
@@ -202,31 +217,50 @@ This prints:
 
 ### 2. Start one or more relays
 
+Create a `relay.yaml` file.  A single file can hold many relays; each relay process selects one with `--relay <name>`.
+
+```yaml
+relays:
+  - name: hop1
+    wallet_db_path: /var/lib/monad/relay.db
+    receiver_secret_hex: "${HOP1_RECEIVER_KEY}"
+    quic_cert_seed: "${HOP1_ED25519_SEED}"
+    transport_key: "${HOP1_SECP_KEY}"
+    listen: 127.0.0.1:9051
+    quic: false
+    trusted_mints:
+      - url: https://dev.mint.camelus.app
+        units: [sat]
+
+  - name: hop2
+    wallet_db_path: /var/lib/monad/relay.db
+    receiver_secret_hex: "${HOP2_RECEIVER_KEY}"
+    quic_cert_seed: "${HOP2_ED25519_SEED}"
+    transport_key: "${HOP2_SECP_KEY}"
+    listen: 127.0.0.1:9052
+    quic: true
+    trusted_mints:
+      - url: https://dev.mint.camelus.app
+        units: [sat]
+```
+
 Single hop (TCP only):
 
 ```bash
-RUST_LOG=info cargo run -p monad-relay -- run \
-  --listen 127.0.0.1:9050 \
-  --quic-cert-seed <SERVER_ED25519_SEED> \
-  --transport-key <SERVER_SECP256K1_KEY>
+RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop1
 ```
 
-With QUIC enabled (add `--quic`):
+With QUIC enabled (`quic: true` in the config):
 
 ```bash
-RUST_LOG=info cargo run -p monad-relay -- run \
-  --listen 127.0.0.1:9050 \
-  --quic-cert-seed <SERVER_ED25519_SEED> \
-  --transport-key <SERVER_SECP256K1_KEY> \
-  --quic
+RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop2
 ```
 
-Multi-hop example:
+Multi-hop example (run each in its own terminal / process):
 
 ```bash
-RUST_LOG=info cargo run -p monad-relay -- run --listen 127.0.0.1:9051 --quic-cert-seed <HOP1_ED25519> --transport-key <HOP1_SECP>
-RUST_LOG=info cargo run -p monad-relay -- run --listen 127.0.0.1:9052 --quic-cert-seed <HOP2_ED25519> --transport-key <HOP2_SECP> --quic
-RUST_LOG=info cargo run -p monad-relay -- run --listen 127.0.0.1:9053 --quic-cert-seed <HOP3_ED25519> --transport-key <HOP3_SECP> --quic
+RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop1
+RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop2
 ```
 
 ### 3. Start the client
