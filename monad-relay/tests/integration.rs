@@ -40,8 +40,11 @@ use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
 use cdk_spilman::configurable_host::SqliteStorage;
+use cdk_spilman::ChannelState;
 use cdk_spilman_test_mint::TestMintHelper;
-use cdk_spilman_test_mint::{build_router, build_test_mint, TestMintConfig};
+use cdk_spilman_test_mint::{
+    build_router, build_test_mint, InMemoryMintNetworking, TestMintConfig,
+};
 use common::signing_wallet::TestSigningWallet;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
 use monad_relay::listener::{
@@ -432,7 +435,8 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
 
 /// Spin up a MONAD relay with durable `SpilmanRelayPayments` and a graceful
 /// shutdown signal. Returns the bound address, transport pubkey, join handle,
-/// and a oneshot sender that can be used to trigger shutdown.
+/// a oneshot sender that can be used to trigger shutdown, and the concrete
+/// payments implementation so tests can call close_channel directly.
 async fn start_persistent_relay(
     bind_addr: SocketAddr,
     transport_key: &SecpTransportKeypair,
@@ -445,6 +449,7 @@ async fn start_persistent_relay(
     Secp256k1Pubkey,
     tokio::task::JoinHandle<io::Result<()>>,
     tokio::sync::oneshot::Sender<()>,
+    Arc<SpilmanRelayPayments>,
 )> {
     let identity = QuicCertIdentity::generate().unwrap();
     let pubkey = transport_key.pubkey();
@@ -469,11 +474,12 @@ async fn start_persistent_relay(
         SqliteStorage::open(storage_path)
             .map_err(|e| io::Error::other(format!("failed to open spilman storage: {e}")))?,
     );
-    let payments: Arc<dyn RelayPayments> = Arc::new(SpilmanRelayPayments::new(
+    let payments = Arc::new(SpilmanRelayPayments::new(
         config.payment_receiver_secret.clone(),
         mint_cache.clone(),
         storage,
     ));
+    let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
     let mint_cache = Arc::new(mint_cache);
     let session_registry = Arc::new(SessionRegistry::new());
 
@@ -482,7 +488,7 @@ async fn start_persistent_relay(
         listener,
         Some(quic_endpoint),
         config,
-        payments,
+        payments_for_spawn,
         mint_cache,
         session_registry,
         async {
@@ -490,7 +496,7 @@ async fn start_persistent_relay(
         },
     ));
 
-    Ok((addr, pubkey, handle, shutdown_tx))
+    Ok((addr, pubkey, handle, shutdown_tx, payments))
 }
 
 async fn bind_ipv6_listener() -> Option<TcpListener> {
@@ -2918,7 +2924,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
 
     // Phase A: first relay session, driven by the payment driver.
-    let (server_addr, pubkey, handle, shutdown_tx) = start_persistent_relay(
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_persistent_relay(
         "127.0.0.1:0".parse().unwrap(),
         &transport_key,
         payment_receiver_secret.clone(),
@@ -2987,7 +2993,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     // Phase C: restart the relay with the same SQLite file and identity. Use
     // a fresh port; graceful shutdown may leave the old socket in TIME_WAIT
     // briefly, and persistence does not depend on the endpoint address.
-    let (server_addr2, pubkey2, handle2, shutdown_tx2) = start_persistent_relay(
+    let (server_addr2, pubkey2, handle2, shutdown_tx2, _payments2) = start_persistent_relay(
         "127.0.0.1:0".parse().unwrap(),
         &transport_key,
         payment_receiver_secret,
@@ -3092,6 +3098,199 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
 
     let _ = shutdown_tx2.send(());
     handle2.await.unwrap().unwrap();
+}
+
+/// End-to-end test that the relay can unilaterally close a funded Spilman
+/// channel and that further payments on that channel are rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_channel_close_blocks_further_payments_with_real_signatures() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+
+    let mut trusted_mint_units = BTreeMap::new();
+    trusted_mint_units.insert(mint_url.clone(), BTreeSet::from(["sat".to_string()]));
+
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage_path = temp_db.path().to_str().unwrap().to_string();
+
+    let transport_key = SecpTransportKeypair::generate();
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
+
+    let (server_addr, pubkey, handle, shutdown_tx, payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret,
+        &storage_path,
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let status0 = control_handshake_status(&mut control_send, &mut control_recv).await;
+
+    let offer = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_hex,
+        status0
+            .advertisements
+            .iter()
+            .find(|a| a.unit == "sat")
+            .expect("relay should advertise sat keyset"),
+    );
+
+    // Link the pre-created channel to this session.
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+    let _link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+
+    // Fund the session by paying part of the channel capacity.
+    let capacity_raw = wallet.get_channel(&channel_id).unwrap().capacity_msats / 1000;
+    let funded_balance_raw = capacity_raw / 2;
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, &offer, 0, funded_balance_raw)
+        .unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+    let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    assert!(
+        !funded_status.paused,
+        "session should be unpaused after payment"
+    );
+    assert_eq!(
+        funded_status.total_paid_millisats,
+        funded_balance_raw * 1000
+    );
+
+    // Use the session to verify it is functional.
+    let mut tunnel = conn.open_tunnel(&upper_addr.to_string()).await.unwrap();
+    tunnel.write_all(b"before close").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"BEFORE CLOSE");
+
+    // Close the channel through the relay, using the in-memory mint networking.
+    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let close_success = payments
+        .close_channel(&channel_id, &mint_networking)
+        .expect("relay should close the channel");
+    assert!(!close_success.already_closed);
+    assert_eq!(close_success.receiver_sum, funded_balance_raw);
+    assert_eq!(
+        close_success.receiver_sum + close_success.sender_sum,
+        close_success.total_value
+    );
+    assert_eq!(close_success.total_value, capacity_raw);
+
+    assert_eq!(
+        payments.channel_state(&channel_id),
+        Some(ChannelState::Closed),
+        "channel should be Closed after unilateral close"
+    );
+
+    // A further payment on the same linked channel must be rejected because
+    // the channel is closed.
+    let payment_json = wallet
+        .build_channel_payment(
+            &channel_id,
+            &offer,
+            funded_balance_raw,
+            funded_balance_raw + 1,
+        )
+        .unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+
+    let (code, message) = match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, message } => (code, message),
+        other => panic!("expected ChannelClosed error, got {other:?}"),
+    };
+    assert_eq!(code, ServerErrorCode::ChannelClosed);
+    assert!(
+        message.contains("channel closed"),
+        "unexpected error: {message}"
+    );
+
+    // A subsequent ChannelLink for the same closed channel must also be
+    // rejected, even though the wallet still produces a valid signed link
+    // request (balance 0).
+    let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+
+    let (code, message) = match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, message } => (code, message),
+        other => panic!("expected ChannelClosed error on re-link, got {other:?}"),
+    };
+    assert_eq!(code, ServerErrorCode::ChannelClosed);
+    assert!(
+        message.contains("channel closed"),
+        "unexpected re-link error: {message}"
+    );
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
 }
 
 #[tokio::test]

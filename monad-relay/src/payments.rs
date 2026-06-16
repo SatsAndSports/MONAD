@@ -5,7 +5,8 @@ use cdk_spilman::{
     compute_channel_secret_from_hex,
     configurable_host::{ClosedDataView, SpilmanStorage},
     sign_with_tweaked_key_util, BridgeError, ChannelFunding, ChannelPolicy, ChannelState,
-    ClosingData, Payment, PaymentProof, SpilmanBridge, SpilmanHost,
+    CloseError, CloseSuccess, ClosingData, Payment, PaymentProof, SpilmanBridge, SpilmanHost,
+    SpilmanNetworking,
 };
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
 use std::fmt;
@@ -29,6 +30,8 @@ pub trait RelayPayments: Send + Sync + 'static {
     fn linked_channel_status(&self, channel_id: &str) -> Option<LinkedChannelStatus>;
 
     fn release_channel_ownership(&self, session_id: [u8; 32], channel_id: &str);
+
+    fn channel_state(&self, channel_id: &str) -> Option<ChannelState>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +215,14 @@ impl SpilmanRelayPayments {
             store,
         }
     }
+
+    pub fn close_channel<N: SpilmanNetworking>(
+        &self,
+        channel_id: &str,
+        net: &N,
+    ) -> Result<CloseSuccess, CloseError> {
+        self.bridge.execute_unilateral_close(channel_id, net)
+    }
 }
 
 impl RelayPayments for SpilmanRelayPayments {
@@ -306,6 +317,10 @@ impl RelayPayments for SpilmanRelayPayments {
 
     fn release_channel_ownership(&self, session_id: [u8; 32], channel_id: &str) {
         let _ = self.store.release_channel_owner(channel_id, session_id);
+    }
+
+    fn channel_state(&self, channel_id: &str) -> Option<ChannelState> {
+        self.store.channel_state(channel_id)
     }
 }
 
@@ -545,6 +560,7 @@ pub mod testing {
     use super::{
         ChannelPaymentError, ChannelUnit, LinkError, LinkOutcome, PaymentOutcome, RelayPayments,
     };
+    use cdk_spilman::{ChannelState, CloseError, CloseSuccess, SpilmanNetworking};
     use monad_common::protocol::LinkedChannelStatus;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -594,6 +610,46 @@ pub mod testing {
                 }
                 Err(_) => false,
             }
+        }
+
+        pub fn close_channel<N: SpilmanNetworking>(
+            &self,
+            channel_id: &str,
+            _net: &N,
+        ) -> Result<CloseSuccess, CloseError> {
+            let mut inner = self.inner.lock().map_err(|_| CloseError::StorageFailed {
+                reason: "mutex poisoned".to_string(),
+                status: 500,
+            })?;
+            let record =
+                inner
+                    .channels
+                    .get_mut(channel_id)
+                    .ok_or_else(|| CloseError::ValidationFailed {
+                        reason: "unknown channel".to_string(),
+                        status: 400,
+                        expected_balance: None,
+                        actual_balance: None,
+                    })?;
+            if record.closed {
+                return Ok(CloseSuccess {
+                    channel_id: channel_id.to_string(),
+                    total_value: record.capacity_raw,
+                    receiver_sum: record.latest_balance,
+                    sender_sum: record.capacity_raw.saturating_sub(record.latest_balance),
+                    sender_proofs: "[]".to_string(),
+                    already_closed: true,
+                });
+            }
+            record.closed = true;
+            Ok(CloseSuccess {
+                channel_id: channel_id.to_string(),
+                total_value: record.capacity_raw,
+                receiver_sum: record.latest_balance,
+                sender_sum: record.capacity_raw.saturating_sub(record.latest_balance),
+                sender_proofs: "[]".to_string(),
+                already_closed: false,
+            })
         }
     }
 
@@ -797,6 +853,16 @@ pub mod testing {
                     }
                 }
             }
+        }
+
+        fn channel_state(&self, channel_id: &str) -> Option<ChannelState> {
+            let inner = self.inner.lock().ok()?;
+            let record = inner.channels.get(channel_id)?;
+            Some(if record.closed {
+                ChannelState::Closed
+            } else {
+                ChannelState::Open
+            })
         }
     }
 

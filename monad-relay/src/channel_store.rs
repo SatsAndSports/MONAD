@@ -168,6 +168,10 @@ impl ChannelStore {
         self.storage.mark_closed(channel_id, data)
     }
 
+    pub(crate) fn channel_state(&self, channel_id: &str) -> Option<ChannelState> {
+        Some(self.storage.get_state(channel_id))
+    }
+
     pub(crate) fn linked_channel_status(&self, channel_id: &str) -> Option<LinkedChannelStatus> {
         let channel = self.get_channel(channel_id).ok()??;
         Some(LinkedChannelStatus {
