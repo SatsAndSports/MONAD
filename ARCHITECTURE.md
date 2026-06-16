@@ -543,6 +543,11 @@ This lets one MONAD process host multiple relays with different receiver keys
 while still sharing one persistent relay-wallet DB. Transport identity remains a
 separate concern from the Cashu receiver identity used for Spilman channels.
 
+The relay binary now also exposes wallet-admin commands over that same durable
+state (`monad-relay wallet ...`) so operators can list identities, inspect
+stored channels, and close a channel by `channel_id` using metadata stored in
+SQLite.
+
 #### 6. Session Teardown on Control Detach
 
 If the control stream detaches, the relay treats the session as fully ended.

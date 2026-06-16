@@ -5,6 +5,7 @@ use monad_common::secp_identity::SecpTransportKeypair;
 use monad_relay::config::MonadConfig;
 use monad_relay::listener;
 use monad_relay::listener::discover_spilman_mint_cache;
+use monad_relay::wallet_cli::{run_wallet_command, WalletArgs};
 use monad_relay::wallet_manager::RelayWalletManager;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -33,6 +34,9 @@ enum Command {
         #[arg(long)]
         relay: Option<String>,
     },
+
+    /// Inspect and administer the shared relay-wallet database
+    Wallet(WalletArgs),
 }
 
 #[tokio::main]
@@ -48,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Keygen => keygen(),
         Command::Run { config, relay } => run(config, relay).await,
+        Command::Wallet(args) => run_wallet_command(args).await,
     }
 }
 

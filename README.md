@@ -65,6 +65,17 @@ Run the relay:
 monad-relay run --config relay.yaml --relay relay-a
 ```
 
+Inspect the shared relay-wallet DB:
+
+```bash
+monad-relay wallet --config relay.yaml --relay relay-a list
+monad-relay wallet --config relay.yaml --relay relay-a show
+monad-relay wallet --config relay.yaml --relay relay-a channels
+monad-relay wallet --wallet-db-path /var/lib/monad/relay.db close --channel-id <channel-id>
+```
+
+Add `--json` to any wallet command for machine-readable output.
+
 On first start, `receiver_secret_hex` is required so the relay can register its identity in the wallet database.  On later restarts of the same relay wallet identity, omit `receiver_secret_hex`; the relay will load the existing receiver key for `relay-a` from the shared wallet DB.
 
 Two relays can share the same `wallet_db_path` safely because each relay uses a distinct receiver key, so their channel rows are disjoint.  The config loader rejects any two relays that share the same `receiver_secret_hex`.

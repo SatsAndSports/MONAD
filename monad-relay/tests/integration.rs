@@ -39,7 +39,8 @@ use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
-use cdk_spilman::ChannelState;
+use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
+use cdk_spilman::{ChannelState, ClosingData};
 use cdk_spilman_test_mint::{
     build_router, build_test_mint, InMemoryMintNetworking, TestMintConfig, TestMintHelper,
 };
@@ -3994,6 +3995,309 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
 
     let _ = shutdown_tx.send(());
     handle.await.unwrap().unwrap();
+}
+
+/// End-to-end test that the relay-wallet manager can close a funded channel
+/// by channel id, discovering the owning relay identity and mint from the
+/// stored metadata.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_close_channel_by_id() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage_path = temp_db.path().to_str().unwrap().to_string();
+
+    let transport_key = SecpTransportKeypair::generate();
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
+
+    let wallet_manager = Arc::new(RelayWalletManager::open(&storage_path).unwrap());
+    wallet_manager
+        .register_identity("test-wallet-relay", payment_receiver_secret.clone())
+        .unwrap();
+
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret,
+        "test-wallet-relay",
+        wallet_manager.clone(),
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let status0 = control_handshake_status(&mut control_send, &mut control_recv).await;
+
+    let offer = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_hex,
+        status0
+            .advertisements
+            .iter()
+            .find(|a| a.unit == "sat")
+            .expect("relay should advertise sat keyset"),
+    );
+
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+    let _link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+
+    let capacity_raw = wallet.get_channel(&channel_id).unwrap().capacity_msats / 1000;
+    let funded_balance_raw = capacity_raw / 2;
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, &offer, 0, funded_balance_raw)
+        .unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+    let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    assert!(!funded_status.paused);
+
+    // Close the channel through the wallet manager by channel id using the
+    // same reqwest-based networking path as the CLI.
+    let net = wallet_manager
+        .reqwest_networking_for_channel(&channel_id)
+        .expect("wallet manager should build reqwest networking for channel");
+    let close_success = wallet_manager
+        .close_channel(&channel_id, &net)
+        .await
+        .expect("wallet manager should close the channel");
+    assert!(!close_success.already_closed);
+    assert_eq!(close_success.receiver_sum, funded_balance_raw);
+    assert_eq!(close_success.total_value, capacity_raw);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
+}
+
+/// End-to-end test that a channel already persisted in `Closing` can be
+/// completed to `Closed` through the wallet-manager close path, and that a
+/// second close reports `already_closed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_close_channel_from_closing_state() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage_path = temp_db.path().to_str().unwrap().to_string();
+
+    let transport_key = SecpTransportKeypair::generate();
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
+
+    let wallet_manager = Arc::new(RelayWalletManager::open(&storage_path).unwrap());
+    wallet_manager
+        .register_identity("test-wallet-relay", payment_receiver_secret.clone())
+        .unwrap();
+
+    let (server_addr, pubkey, handle, shutdown_tx, payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret,
+        "test-wallet-relay",
+        wallet_manager.clone(),
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let status0 = control_handshake_status(&mut control_send, &mut control_recv).await;
+
+    let offer = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_hex,
+        status0
+            .advertisements
+            .iter()
+            .find(|a| a.unit == "sat")
+            .expect("relay should advertise sat keyset"),
+    );
+
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+    let _ = expect_session_status_struct(read_control_message(&mut control_recv).await);
+
+    let capacity_raw = wallet.get_channel(&channel_id).unwrap().capacity_msats / 1000;
+    let funded_balance_raw = capacity_raw / 2;
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, &offer, 0, funded_balance_raw)
+        .unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+    let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    assert!(!funded_status.paused);
+
+    // Force the channel into durable Closing state without finishing the close.
+    let storage = SqliteStorage::open(&storage_path).unwrap();
+    let latest_payment = storage
+        .get_balance(&channel_id)
+        .expect("storage should contain latest payment proof");
+    storage
+        .mark_closing(
+            &channel_id,
+            ClosingData {
+                expiry_timestamp: 0,
+                balance: latest_payment.balance,
+                signature: latest_payment.signature.clone(),
+            },
+        )
+        .expect("storage should persist Closing state");
+    assert_eq!(storage.get_state(&channel_id), ChannelState::Closing);
+
+    let net = wallet_manager
+        .reqwest_networking_for_channel(&channel_id)
+        .expect("wallet manager should build reqwest networking for channel");
+
+    let close_success = wallet_manager
+        .close_channel(&channel_id, &net)
+        .await
+        .expect("wallet manager should complete close from Closing state");
+    assert!(!close_success.already_closed);
+    assert_eq!(close_success.receiver_sum, funded_balance_raw);
+    assert_eq!(close_success.total_value, capacity_raw);
+    assert_eq!(
+        payments.channel_state(&channel_id),
+        Some(ChannelState::Closed)
+    );
+    assert!(payments.closed_data(&channel_id).is_some());
+
+    let second_close = wallet_manager
+        .close_channel(&channel_id, &net)
+        .await
+        .expect("second close on already-closed channel should succeed");
+    assert!(second_close.already_closed);
+    assert_eq!(second_close.receiver_sum, funded_balance_raw);
+    assert_eq!(second_close.total_value, capacity_raw);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
 }
 
 #[tokio::test]

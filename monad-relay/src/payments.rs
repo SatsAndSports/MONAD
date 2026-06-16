@@ -5,8 +5,8 @@ use cdk_spilman::{
     compute_channel_secret_from_hex,
     configurable_host::{ClosedDataView, SpilmanStorage},
     sign_with_tweaked_key_util, BridgeError, ChannelFunding, ChannelPolicy, ChannelState,
-    CloseError, CloseSuccess, ClosingData, Payment, PaymentProof, SpilmanBridge, SpilmanHost,
-    SpilmanNetworking,
+    CloseError, CloseSuccess, ClosingData, Payment, PaymentProof, SpilmanAsyncNetworking,
+    SpilmanBridge, SpilmanHost, SpilmanNetworking,
 };
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
 use std::fmt;
@@ -229,6 +229,60 @@ impl SpilmanRelayPayments {
         net: &N,
     ) -> Result<CloseSuccess, CloseError> {
         self.bridge.execute_unilateral_close(channel_id, net)
+    }
+
+    /// Async variant of [`Self::close_channel`].
+    pub async fn close_channel_async<N: SpilmanAsyncNetworking>(
+        &self,
+        channel_id: &str,
+        net: &N,
+    ) -> Result<CloseSuccess, CloseError> {
+        self.bridge
+            .execute_unilateral_close_async(channel_id, net)
+            .await
+    }
+
+    /// Close a channel regardless of whether it is currently Open or Closing.
+    /// Already-closed channels return a synthetic [`CloseSuccess`] with
+    /// `already_closed: true`.
+    pub async fn close_channel_any_state_async<N: SpilmanAsyncNetworking>(
+        &self,
+        channel_id: &str,
+        net: &N,
+    ) -> Result<CloseSuccess, CloseError> {
+        match self.store.channel_state(channel_id) {
+            Some(ChannelState::Closed) => {
+                let data = self.store.closed_data(channel_id).ok_or_else(|| {
+                    CloseError::ValidationFailed {
+                        reason: format!(
+                            "channel {channel_id} is closed but closed data is missing"
+                        ),
+                        status: 500,
+                        expected_balance: None,
+                        actual_balance: None,
+                    }
+                })?;
+                let total_value = data.receiver_sum + data.sender_sum;
+                Ok(CloseSuccess {
+                    channel_id: channel_id.to_string(),
+                    total_value,
+                    receiver_sum: data.receiver_sum,
+                    sender_sum: data.sender_sum,
+                    sender_proofs: data.sender_proofs_json,
+                    already_closed: true,
+                })
+            }
+            Some(ChannelState::Closing) => {
+                self.bridge
+                    .execute_close_for_closing_channel_async(channel_id, net)
+                    .await
+            }
+            _ => {
+                self.bridge
+                    .execute_unilateral_close_async(channel_id, net)
+                    .await
+            }
+        }
     }
 
     /// Test/observability accessor for the stored closed-channel data.
