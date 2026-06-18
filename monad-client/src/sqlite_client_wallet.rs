@@ -9,8 +9,8 @@ use crate::wallet::{
     WalletChannelState, WalletError,
 };
 use cdk_spilman::{
-    ClientChannelInfo, ConfigurableClientHost, OpenChannelError, ReqwestClientNetworking,
-    SpilmanClientBridge, SqliteClientStorage,
+    ClientChannelInfo, ConfigurableClientHost, OpenChannelError, OpenChannelResult,
+    ReqwestClientNetworking, SpilmanClientBridge, SqliteClientStorage,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -30,6 +30,21 @@ const CREATE_CHANNELS_SQL: &str = r#"
         attached_session_id TEXT,
         state TEXT NOT NULL,
         reservation_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )
+"#;
+
+const CREATE_OPENING_RECOVERIES_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS monad_client_channel_opening_recoveries (
+        channel_id TEXT PRIMARY KEY,
+        reservation_id TEXT NOT NULL,
+        receiver_pubkey TEXT NOT NULL,
+        mint_url TEXT NOT NULL,
+        unit TEXT NOT NULL,
+        input_budget_msats INTEGER NOT NULL,
+        error_stage TEXT NOT NULL,
+        error_message TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )
@@ -84,7 +99,9 @@ impl SqliteClientWallet {
             .busy_timeout(Duration::from_secs(5))
             .map_err(|e| WalletError::Backend(format!("set channel db busy timeout: {e}")))?;
         channel_db
-            .execute_batch(CREATE_CHANNELS_SQL)
+            .execute_batch(&format!(
+                "{CREATE_CHANNELS_SQL};{CREATE_OPENING_RECOVERIES_SQL};"
+            ))
             .map_err(|e| WalletError::Backend(format!("create channel metadata schema: {e}")))?;
 
         Ok(Self {
@@ -100,10 +117,175 @@ impl SqliteClientWallet {
         &self.loose_wallet
     }
 
+    /// Recover channel openings whose funding swap may have reached the mint.
+    ///
+    /// Ambiguous failures leave loose proofs reserved and an upstream
+    /// `OpeningFromSwap` row behind. This method uses upstream NUT-09 restore to
+    /// recover those openings, then marks the loose-proof reservation spent and
+    /// stores normal MONAD channel metadata.
+    pub fn recover_pending_openings(&self) -> Result<Vec<String>, WalletError> {
+        let recoveries = self.list_opening_recoveries()?;
+        let mut recovered = Vec::new();
+
+        for recovery in recoveries {
+            let result = {
+                let bridge = self
+                    .bridge
+                    .lock()
+                    .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+                bridge.recover_open_channel_from_swap(&recovery.channel_id)
+            };
+
+            match result {
+                Ok(open_result) => {
+                    self.loose_wallet
+                        .mark_reservation_spent(&recovery.reservation_id, &open_result.channel_id)
+                        .map_err(loose_proof_error)?;
+                    self.store_open_channel_metadata(&open_result, &recovery.reservation_id)?;
+                    self.delete_opening_recovery(&recovery.channel_id)?;
+                    recovered.push(open_result.channel_id);
+                }
+                Err(error) if !error.input_may_be_spent => {
+                    let _ = self
+                        .loose_wallet
+                        .release_reservation(&recovery.reservation_id);
+                    self.delete_opening_recovery(&recovery.channel_id)?;
+                }
+                Err(error) => {
+                    return Err(open_channel_error(
+                        error,
+                        &recovery.unit,
+                        recovery.input_budget_msats,
+                    ));
+                }
+            }
+        }
+
+        Ok(recovered)
+    }
+
     fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, WalletError> {
         self.channel_db
             .lock()
             .map_err(|_| WalletError::Backend("channel db mutex poisoned".to_string()))
+    }
+
+    fn store_open_channel_metadata(
+        &self,
+        open_result: &OpenChannelResult,
+        reservation_id: &str,
+    ) -> Result<(), WalletError> {
+        // Store the actual upstream capacity, not the input budget.
+        let capacity_msats = raw_to_msats(&open_result.unit, open_result.capacity)
+            .map_err(|e| WalletError::Backend(format!("convert capacity to msats: {e}")))?;
+        let now = Self::now_seconds()?;
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO monad_client_channels
+             (channel_id, receiver_pubkey, mint_url, unit, keyset_id,
+              capacity_msats, attached_session_id, state, reservation_id,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?9)",
+            params![
+                open_result.channel_id,
+                open_result.receiver_pubkey_hex,
+                open_result.mint_url,
+                open_result.unit,
+                open_result.keyset_id,
+                to_i64(capacity_msats)?,
+                channel_state_str(WalletChannelState::Open),
+                reservation_id,
+                to_i64(now)?,
+            ],
+        )
+        .map_err(|e| WalletError::Backend(format!("insert channel metadata: {e}")))?;
+        Ok(())
+    }
+
+    fn store_opening_recovery(
+        &self,
+        channel_id: &str,
+        reservation_id: &str,
+        offer: &RelayPaymentOffer,
+        input_budget_msats: u64,
+        error: &OpenChannelError,
+    ) -> Result<(), WalletError> {
+        let now = Self::now_seconds()?;
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO monad_client_channel_opening_recoveries
+             (channel_id, reservation_id, receiver_pubkey, mint_url, unit,
+              input_budget_msats, error_stage, error_message, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT(channel_id) DO UPDATE SET
+                reservation_id = excluded.reservation_id,
+                receiver_pubkey = excluded.receiver_pubkey,
+                mint_url = excluded.mint_url,
+                unit = excluded.unit,
+                input_budget_msats = excluded.input_budget_msats,
+                error_stage = excluded.error_stage,
+                error_message = excluded.error_message,
+                updated_at = excluded.updated_at",
+            params![
+                channel_id,
+                reservation_id,
+                offer.receiver_pubkey,
+                offer.mint_url,
+                offer.unit,
+                to_i64(input_budget_msats)?,
+                format!("{:?}", error.stage),
+                error.message,
+                to_i64(now)?,
+            ],
+        )
+        .map_err(|e| WalletError::Backend(format!("store opening recovery: {e}")))?;
+        Ok(())
+    }
+
+    fn list_opening_recoveries(&self) -> Result<Vec<OpeningRecovery>, WalletError> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT channel_id, reservation_id, unit, input_budget_msats
+                 FROM monad_client_channel_opening_recoveries
+                 ORDER BY created_at ASC",
+            )
+            .map_err(|e| WalletError::Backend(format!("prepare opening recoveries: {e}")))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| WalletError::Backend(format!("query opening recoveries: {e}")))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| WalletError::Backend(format!("read opening recovery row: {e}")))?
+        {
+            out.push(OpeningRecovery {
+                channel_id: row.get(0).map_err(|e| {
+                    WalletError::Backend(format!("decode recovery channel_id: {e}"))
+                })?,
+                reservation_id: row.get(1).map_err(|e| {
+                    WalletError::Backend(format!("decode recovery reservation_id: {e}"))
+                })?,
+                unit: row
+                    .get(2)
+                    .map_err(|e| WalletError::Backend(format!("decode recovery unit: {e}")))?,
+                input_budget_msats: from_i64(row.get(3).map_err(|e| {
+                    WalletError::Backend(format!("decode recovery input budget: {e}"))
+                })?)
+                .map_err(|e| WalletError::Backend(format!("decode recovery input budget: {e}")))?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn delete_opening_recovery(&self, channel_id: &str) -> Result<(), WalletError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM monad_client_channel_opening_recoveries WHERE channel_id = ?1",
+            params![channel_id],
+        )
+        .map_err(|e| WalletError::Backend(format!("delete opening recovery: {e}")))?;
+        Ok(())
     }
 
     fn now_seconds() -> Result<u64, WalletError> {
@@ -268,17 +450,15 @@ impl MonadWallet for SqliteClientWallet {
                 .bridge
                 .lock()
                 .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
-            bridge
-                .open_channel_from_proofs_auto(
-                    &offer.mint_url,
-                    &offer.unit,
-                    &input_proofs_json,
-                    &offer.receiver_pubkey,
-                    &self.sender_pubkey_hex,
-                    expiry_timestamp,
-                    0,
-                )
-                .map_err(|e| open_channel_error(e, &offer.unit, input_budget_msats))
+            bridge.open_channel_from_proofs_auto(
+                &offer.mint_url,
+                &offer.unit,
+                &input_proofs_json,
+                &offer.receiver_pubkey,
+                &self.sender_pubkey_hex,
+                expiry_timestamp,
+                0,
+            )
         };
 
         match result {
@@ -286,50 +466,26 @@ impl MonadWallet for SqliteClientWallet {
                 self.loose_wallet
                     .mark_reservation_spent(&reservation.reservation_id, &open_result.channel_id)
                     .map_err(loose_proof_error)?;
-
-                // Store the actual upstream capacity, not the input budget.
-                let capacity_msats = raw_to_msats(&offer.unit, open_result.capacity)
-                    .map_err(|e| WalletError::Backend(format!("convert capacity to msats: {e}")))?;
-                let now = Self::now_seconds()?;
-                let conn = self.conn()?;
-                conn.execute(
-                    "INSERT INTO monad_client_channels
-                     (channel_id, receiver_pubkey, mint_url, unit, keyset_id,
-                      capacity_msats, attached_session_id, state, reservation_id,
-                      created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?9)",
-                    params![
-                        open_result.channel_id,
-                        open_result.receiver_pubkey_hex,
-                        open_result.mint_url,
-                        open_result.unit,
-                        open_result.keyset_id,
-                        to_i64(capacity_msats)?,
-                        channel_state_str(WalletChannelState::Open),
-                        reservation.reservation_id,
-                        to_i64(now)?,
-                    ],
-                )
-                .map_err(|e| WalletError::Backend(format!("insert channel metadata: {e}")))?;
-
+                self.store_open_channel_metadata(&open_result, &reservation.reservation_id)?;
                 Ok(open_result.channel_id)
             }
-            Err(e) => {
-                // If the input proofs were definitely not spent, release the reservation
-                // immediately. Otherwise keep it reserved so a future recovery attempt
-                // can decide whether the swap succeeded.
-                if let WalletError::Backend(ref msg) = e {
-                    if !msg.contains("input may be spent") {
-                        let _ = self
-                            .loose_wallet
-                            .release_reservation(&reservation.reservation_id);
+            Err(error) => {
+                if error.input_may_be_spent {
+                    if let Some(channel_id) = error.channel_id.as_deref() {
+                        self.store_opening_recovery(
+                            channel_id,
+                            &reservation.reservation_id,
+                            offer,
+                            input_budget_msats,
+                            &error,
+                        )?;
                     }
                 } else {
                     let _ = self
                         .loose_wallet
                         .release_reservation(&reservation.reservation_id);
                 }
-                Err(e)
+                Err(open_channel_error(error, &offer.unit, input_budget_msats))
             }
         }
     }
@@ -453,6 +609,14 @@ fn upstream_info(
     channel_id: &str,
 ) -> Option<ClientChannelInfo> {
     bridge.lock().ok()?.get_channel_info(channel_id)
+}
+
+#[derive(Debug, Clone)]
+struct OpeningRecovery {
+    channel_id: String,
+    reservation_id: String,
+    unit: String,
+    input_budget_msats: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -612,10 +776,13 @@ fn sql_decode_error(message: impl Into<String>) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loose_proof_wallet::NewLooseProof;
+    use crate::loose_proof_wallet::{LooseProofState, NewLooseProof};
     use cdk_spilman::{
-        construct_proofs, create_plain_blinded_messages, ConfigurableClientHost, Payment,
-        ReqwestClientNetworking, SpilmanClientBridge,
+        channel_parameters_get_channel_id, compute_channel_from_proofs,
+        compute_channel_secret_from_hex, construct_proofs, create_funding_swap,
+        create_plain_blinded_messages, ClientChannelOpeningFromSwap, ClientStorage,
+        ConfigurableClientHost, OpenChannelError, OpenChannelFailureStage, Payment,
+        ReqwestClientNetworking, SpilmanClientBridge, SqliteClientStorage,
     };
     use cdk_spilman_test_mint::{serve_mint_with_shutdown, TestMintConfig};
     use rand::RngCore;
@@ -878,6 +1045,194 @@ mod tests {
         assert_eq!(payment.balance, next_balance_raw);
         assert!(payment.params.is_none());
         assert!(payment.funding_proofs.is_none());
+
+        let _ = shutdown_tx.send(());
+        mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovers_persisted_ambiguous_opening() {
+        let port = free_loopback_port();
+        let mint_url = format!("http://127.0.0.1:{port}");
+        let config = TestMintConfig::for_port(port);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let mint_task = tokio::spawn(async move {
+            serve_mint_with_shutdown(config, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+
+        let client = reqwest::Client::new();
+        wait_for_mint(&client, &mint_url).await;
+
+        let unit = "sat";
+        let keyset_id = active_keyset_id(&client, &mint_url, unit).await;
+        let helper_bridge = SpilmanClientBridge::new(
+            ConfigurableClientHost::new_in_memory(),
+            ReqwestClientNetworking::new(),
+        );
+        let keyset_info_json = helper_bridge
+            .fetch_keyset_info(&mint_url, &keyset_id)
+            .unwrap();
+
+        let amount_raw = 16u64;
+        let quote_response = request_mint_quote(&client, &mint_url, amount_raw, unit).await;
+        let quote_id = quote_response["quote"].as_str().unwrap().to_string();
+        wait_for_quote_paid(&client, &mint_url, &quote_id).await;
+
+        let premint_json = create_plain_blinded_messages(amount_raw, &keyset_info_json).unwrap();
+        let premint: serde_json::Value = serde_json::from_str(&premint_json).unwrap();
+        let secrets_with_blinding_json = premint["secrets_with_blinding"].to_string();
+        let batch_id = format!("batch-{quote_id}");
+        let mint_response: serde_json::Value = client
+            .post(format!("{mint_url}/v1/mint/bolt11"))
+            .json(&serde_json::json!({
+                "quote": quote_id,
+                "outputs": premint["blinded_messages"],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let signatures_json = mint_response["signatures"].to_string();
+        let proofs_json = construct_proofs(
+            &signatures_json,
+            &secrets_with_blinding_json,
+            &keyset_info_json,
+        )
+        .unwrap();
+        let loose_proofs =
+            loose_proofs_from_json(&mint_url, unit, &quote_id, &batch_id, &proofs_json);
+
+        let temp = tempfile::tempdir().unwrap();
+        let loose_db = temp.path().join("loose.sqlite");
+        let channel_db = temp.path().join("channels.sqlite");
+        let loose_wallet = LooseProofWallet::open(&loose_db, "alice").unwrap();
+        loose_wallet.import_proofs(&loose_proofs).unwrap();
+
+        let sender_secret = sender_secret_hex();
+        let wallet = SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret).unwrap();
+        let receiver_pubkey =
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
+        let offer = offer(&mint_url, &receiver_pubkey, &keyset_id);
+        let input_budget_msats = amount_raw * 1000;
+        let input_budget_raw = msats_to_raw_units(unit, input_budget_msats).unwrap();
+        let reservation = wallet
+            .loose_wallet()
+            .reserve_proofs(
+                &mint_url,
+                unit,
+                std::slice::from_ref(&keyset_id),
+                input_budget_raw,
+            )
+            .unwrap();
+        let input_proofs_json = proofs_json_from_reservation(&reservation).unwrap();
+
+        let channel_secret_hex =
+            compute_channel_secret_from_hex(&sender_secret, &receiver_pubkey).unwrap();
+        let expiry_timestamp = SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS;
+        let compute_result = compute_channel_from_proofs(
+            &mint_url,
+            unit,
+            &input_proofs_json,
+            &receiver_pubkey,
+            &wallet.sender_pubkey_hex,
+            &channel_secret_hex,
+            expiry_timestamp,
+            &keyset_info_json,
+            0,
+        )
+        .unwrap();
+        let compute_json: serde_json::Value = serde_json::from_str(&compute_result).unwrap();
+        let params_json = compute_json["params_json"].as_str().unwrap().to_string();
+        let swap_input_proofs_json = compute_json["proofs_json"].as_str().unwrap().to_string();
+        let capacity = compute_json["capacity"].as_u64().unwrap();
+        let funding_token_amount = compute_json["funding_token_amount"].as_u64().unwrap();
+
+        let channel_id =
+            channel_parameters_get_channel_id(&params_json, &channel_secret_hex, &keyset_info_json)
+                .unwrap();
+        let mut storage =
+            SqliteClientStorage::open(channel_db.to_str().unwrap()).expect("open client storage");
+        storage
+            .save_opening_from_swap(
+                &channel_id,
+                ClientChannelOpeningFromSwap {
+                    params_json: params_json.clone(),
+                    channel_secret_hex: channel_secret_hex.clone(),
+                    keyset_info_json: keyset_info_json.clone(),
+                    sender_pubkey_hex: wallet.sender_pubkey_hex.clone(),
+                    receiver_pubkey_hex: receiver_pubkey.clone(),
+                    capacity,
+                    funding_token_amount,
+                    mint_url: mint_url.clone(),
+                    unit: unit.to_string(),
+                    input_token: input_proofs_json.clone(),
+                    created_at: SqliteClientWallet::now_seconds().unwrap(),
+                },
+            )
+            .unwrap();
+
+        let swap_result = create_funding_swap(
+            &params_json,
+            &channel_secret_hex,
+            &keyset_info_json,
+            &swap_input_proofs_json,
+        )
+        .unwrap();
+        let swap_json: serde_json::Value = serde_json::from_str(&swap_result).unwrap();
+        let swap_request_json = swap_json["swap_request_json"].as_str().unwrap();
+        client
+            .post(format!("{mint_url}/v1/swap"))
+            .header("Content-Type", "application/json")
+            .body(swap_request_json.to_string())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let simulated_error = OpenChannelError {
+            stage: OpenChannelFailureStage::RestoreVerification,
+            channel_id: Some(channel_id.clone()),
+            input_may_be_spent: true,
+            message: "simulated crash after swap".to_string(),
+        };
+        wallet
+            .store_opening_recovery(
+                &channel_id,
+                &reservation.reservation_id,
+                &offer,
+                input_budget_msats,
+                &simulated_error,
+            )
+            .unwrap();
+        drop(storage);
+        drop(wallet);
+
+        let loose_wallet = LooseProofWallet::open(&loose_db, "alice").unwrap();
+        let wallet = SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret).unwrap();
+        let recovered = wallet.recover_pending_openings().unwrap();
+        assert_eq!(recovered, vec![channel_id.clone()]);
+
+        let channel = wallet.get_channel(&channel_id).unwrap();
+        assert_eq!(channel.state, WalletChannelState::Open);
+        assert!(channel.capacity_msats > 0);
+        assert!(channel.capacity_msats <= input_budget_msats);
+
+        let reserved = wallet
+            .loose_wallet()
+            .proofs_for_reservation(&reservation.reservation_id)
+            .unwrap();
+        assert!(!reserved.is_empty());
+        assert!(reserved
+            .iter()
+            .all(|proof| proof.state == LooseProofState::Spent));
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
