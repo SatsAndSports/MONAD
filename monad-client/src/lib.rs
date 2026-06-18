@@ -1,5 +1,6 @@
 pub mod connector;
 pub mod loose_proof_wallet;
+pub mod proof_selection;
 pub mod route;
 pub mod session_driver;
 pub mod socks;
