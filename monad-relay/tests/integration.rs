@@ -40,9 +40,10 @@ use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
 use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
-use cdk_spilman::{ChannelState, ClosingData};
+use cdk_spilman::{ChannelState, ClosingData, ConfigurableClientHost, SpilmanClientBridge};
 use cdk_spilman_test_mint::{
-    build_router, build_test_mint, InMemoryMintNetworking, TestMintConfig, TestMintHelper,
+    build_router, build_test_mint, rotate_sat_keyset, InMemoryMintNetworking, TestMintConfig,
+    TestMintHelper,
 };
 use common::signing_wallet::TestSigningWallet;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
@@ -3696,6 +3697,113 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
     conn2.shutdown().await;
     let _ = shutdown_tx2.send(());
     handle2.await.unwrap().unwrap();
+}
+
+/// A relay must reject ChannelLink when the funding token itself uses a
+/// mint-active keyset outside the relay's trusted keyset cache. This test starts
+/// with relay-accepted keyset A, rotates the mint to active keyset B, then links
+/// a B-funded channel while the relay still accepts only A.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_channel_link_rejects_unaccepted_funding_keyset() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint = mint_helper.mint();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let accepted_keyset_id = mint_helper.keyset_id().to_string();
+    let accepted_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+
+    let rejected_keyset_id = rotate_sat_keyset(&mint, 400).await.unwrap().to_string();
+    assert_ne!(accepted_keyset_id, rejected_keyset_id);
+    let client_bridge = SpilmanClientBridge::new(
+        ConfigurableClientHost::new_in_memory(),
+        InMemoryMintNetworking::new(mint.clone()),
+    );
+    let rejected_keyset_info_json = client_bridge
+        .fetch_keyset_info(&mint_url, &rejected_keyset_id)
+        .expect("fetch rejected keyset info");
+
+    let accepted_mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![accepted_keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(accepted_keyset_id.clone(), accepted_keyset_info_json)]),
+        )]),
+    };
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage_path = temp_db.path().to_str().unwrap().to_string();
+
+    let transport_key = SecpTransportKeypair::generate();
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
+
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret,
+        &storage_path,
+        accepted_mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint,
+            receiver_pubkey_hex,
+            mint_url,
+            rejected_keyset_id.clone(),
+            rejected_keyset_info_json,
+        )
+        .await,
+    );
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+    assert_eq!(
+        wallet.get_channel(&channel_id).unwrap().keyset_id,
+        rejected_keyset_id
+    );
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let status0 = control_handshake_status(&mut control_send, &mut control_recv).await;
+    let advertised_sat = status0
+        .advertisements
+        .iter()
+        .find(|ad| ad.unit == "sat")
+        .expect("relay should advertise accepted sat keyset");
+    assert_eq!(advertised_sat.keyset_ids, vec![accepted_keyset_id]);
+    assert!(!advertised_sat.keyset_ids.contains(&rejected_keyset_id));
+
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+    let payment_json = wallet.build_raw_link_request(&channel_id).unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink { payment_json },
+        false,
+    )
+    .await;
+
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::LinkMintOrKeysetUnacceptable);
+            assert!(message.contains("mint or keyset not acceptable"));
+        }
+        other => panic!("expected LinkMintOrKeysetUnacceptable error, got {other:?}"),
+    }
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
 }
 
 /// A relay can be started from a YAML config file and advertises exactly the

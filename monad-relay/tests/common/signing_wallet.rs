@@ -123,6 +123,37 @@ impl TestSigningWallet {
         Ok(open_result.channel_id.clone())
     }
 
+    /// Build a funding-bearing link payment without checking a relay offer.
+    ///
+    /// This is intentionally test-only escape hatch for negative relay tests
+    /// that must send malformed or policy-invalid links which a normal client
+    /// wallet would refuse to construct.
+    pub fn build_raw_link_request(&self, channel_id: &str) -> Result<String, WalletError> {
+        let channels = self
+            .channels
+            .lock()
+            .map_err(|_| WalletError::Backend("channels mutex poisoned".to_string()))?;
+        let metadata = channels.get(channel_id).ok_or(WalletError::NotFound)?;
+        if metadata.state != WalletChannelState::Open {
+            return Err(WalletError::NotOpen);
+        }
+        if metadata.attached_session_id.is_none() {
+            return Err(WalletError::Backend(
+                "channel must be attached before linking".to_string(),
+            ));
+        }
+
+        let bridge = self
+            .bridge
+            .lock()
+            .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+        let payment = bridge
+            .create_payment_with_funding(channel_id, 0)
+            .map_err(|e| WalletError::Backend(format!("failed to create link payment: {e}")))?;
+        serde_json::to_string(&payment)
+            .map_err(|e| WalletError::Backend(format!("failed to serialize payment: {e}")))
+    }
+
     fn record_opened_channel(&self, open_result: &OpenChannelResult) -> Result<(), String> {
         let unit = "sat";
         let capacity_msats = raw_units_to_msats(unit, open_result.capacity)
