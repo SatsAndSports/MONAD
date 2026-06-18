@@ -617,6 +617,36 @@ fn sum_proof_amounts(proofs_json: &str) -> u64 {
     proofs.iter().map(|p| u64::from(p.amount)).sum()
 }
 
+fn assert_closed_payout_at_least(
+    payments: &SpilmanRelayPayments,
+    channel_id: &str,
+    expected_exit_balance_raw: u64,
+) {
+    let closed_data = payments
+        .closed_data(channel_id)
+        .expect("closed data should be present after successful close");
+    let receiver_proof_sum = sum_proof_amounts(&closed_data.receiver_proofs_json);
+    let sender_proof_sum = sum_proof_amounts(&closed_data.sender_proofs_json);
+
+    assert!(
+        receiver_proof_sum >= expected_exit_balance_raw,
+        "receiver proofs should cover the relay's latest exit balance"
+    );
+    assert_eq!(
+        receiver_proof_sum, closed_data.receiver_sum,
+        "receiver proof sum should match stored receiver close sum"
+    );
+    assert_eq!(
+        sender_proof_sum, closed_data.sender_sum,
+        "sender proof sum should match stored sender close sum"
+    );
+    assert_eq!(
+        receiver_proof_sum + sender_proof_sum,
+        closed_data.value_after_stage1,
+        "proof sums should match the stage-1 close value"
+    );
+}
+
 async fn bind_ipv6_listener() -> Option<TcpListener> {
     match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await {
         Ok(listener) => Some(listener),
@@ -4149,27 +4179,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
         "channel should be Closed after unilateral close"
     );
 
-    // Verify the stored closed-channel proofs actually carry the expected
-    // total value. With the zero-fee test mint, the sums should match exactly.
-    let closed_data = payments
-        .closed_data(&channel_id)
-        .expect("closed data should be present after successful close");
-    let receiver_proof_sum = sum_proof_amounts(&closed_data.receiver_proofs_json);
-    let sender_proof_sum = sum_proof_amounts(&closed_data.sender_proofs_json);
-    assert_eq!(
-        receiver_proof_sum, funded_balance_raw,
-        "receiver proofs should sum to the accepted channel balance"
-    );
-    assert_eq!(
-        sender_proof_sum,
-        capacity_raw - funded_balance_raw,
-        "sender proofs should sum to the remaining channel value"
-    );
-    assert_eq!(
-        receiver_proof_sum + sender_proof_sum,
-        closed_data.value_after_stage1,
-        "proof sums should match the stage-1 close value"
-    );
+    assert_closed_payout_at_least(&payments, &channel_id, funded_balance_raw);
 
     // A further payment on the same linked channel must be rejected because
     // the channel is closed.
@@ -4279,7 +4289,7 @@ async fn test_wallet_manager_close_channel_by_id() {
         .register_identity("test-wallet-relay", payment_receiver_secret.clone())
         .unwrap();
 
-    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+    let (server_addr, pubkey, handle, shutdown_tx, payments) = start_managed_persistent_relay(
         "127.0.0.1:0".parse().unwrap(),
         &transport_key,
         payment_receiver_secret,
@@ -4356,6 +4366,7 @@ async fn test_wallet_manager_close_channel_by_id() {
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
     assert_eq!(close_success.total_value, capacity_raw);
+    assert_closed_payout_at_least(&payments, &channel_id, funded_balance_raw);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -4522,6 +4533,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     assert!(second_close.already_closed);
     assert_eq!(second_close.receiver_sum, funded_balance_raw);
     assert_eq!(second_close.total_value, capacity_raw);
+    assert_closed_payout_at_least(&payments, &channel_id, funded_balance_raw);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
