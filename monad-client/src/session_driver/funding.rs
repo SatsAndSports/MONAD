@@ -17,7 +17,7 @@ use super::state::{
     terminate_session, ControlOpInFlight, DriverState, FundingBlockedReason, SessionDriverConfig,
 };
 
-const DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS: u64 = 100_000_000;
+const DEFAULT_PROVISIONED_CHANNEL_INPUT_BUDGET_MSATS: u64 = 100_000_000;
 
 pub(super) async fn send_control_message(
     h2_send: &mut h2::SendStream<Bytes>,
@@ -236,7 +236,7 @@ pub(super) async fn maybe_ensure_linked_channel(
                 );
                 let channel_id = match config
                     .wallet
-                    .provision_channel(&offer, DEFAULT_PROVISIONED_CHANNEL_CAPACITY_MSATS)
+                    .provision_channel(&offer, DEFAULT_PROVISIONED_CHANNEL_INPUT_BUDGET_MSATS)
                 {
                     Ok(channel_id) => channel_id,
                     Err(error) => {

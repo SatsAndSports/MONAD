@@ -112,10 +112,17 @@ pub trait MonadWallet: Send + Sync + 'static {
 
     fn mark_channel_unusable(&self, channel_id: &str) -> Result<(), WalletError>;
 
+    /// Provision a new channel by spending loose proofs from this wallet.
+    ///
+    /// `input_budget_msats` is the amount of loose proof value the caller is
+    /// willing to commit as input to the channel opening. The actual usable
+    /// channel capacity may be lower because Cashu input/output fees are applied
+    /// by upstream during funding. The returned channel stores the actual
+    /// upstream-reported capacity.
     fn provision_channel(
         &self,
         offer: &RelayPaymentOffer,
-        capacity_msats: u64,
+        input_budget_msats: u64,
     ) -> Result<String, WalletError>;
 
     fn build_link_request(
@@ -460,7 +467,7 @@ impl MonadWallet for MockWallet {
     fn provision_channel(
         &self,
         offer: &RelayPaymentOffer,
-        capacity_msats: u64,
+        input_budget_msats: u64,
     ) -> Result<String, WalletError> {
         let mut inner = self
             .inner
@@ -485,7 +492,7 @@ impl MonadWallet for MockWallet {
             unit: offer.unit.clone(),
             keyset_id,
             attached_session_id: None,
-            capacity_msats,
+            capacity_msats: input_budget_msats,
             current_signed_balance_msats: 0,
         };
         let (capacity_raw, signed_balance_raw, signed_balance_msats) =
@@ -649,12 +656,12 @@ fn raw_amounts_for_channel(
     Ok((capacity_raw, signed_balance_raw, signed_balance_msats))
 }
 
-fn msats_to_raw_units(unit: &str, amount_msats: u64) -> Result<u64, WalletError> {
+pub(crate) fn msats_to_raw_units(unit: &str, amount_msats: u64) -> Result<u64, WalletError> {
     common_msats_to_raw_units(unit, amount_msats)
         .map_err(|e| WalletError::OfferMismatch(e.to_string()))
 }
 
-fn raw_to_msats(unit: &str, amount_raw: u64) -> Result<u64, WalletError> {
+pub(crate) fn raw_to_msats(unit: &str, amount_raw: u64) -> Result<u64, WalletError> {
     common_raw_units_to_msats(unit, amount_raw).map_err(|e| match e.kind() {
         io::ErrorKind::InvalidInput => WalletError::OfferMismatch(e.to_string()),
         _ => WalletError::Backend(e.to_string()),
