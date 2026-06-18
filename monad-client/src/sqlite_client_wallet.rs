@@ -3,16 +3,19 @@
 //! Bridges `LooseProofWallet` (bearer-proof custody) with upstream
 //! `cdk-spilman` Spilman channel operations, implementing `MonadWallet`.
 
-use crate::loose_proof_wallet::{LooseProofWallet, LooseProofWalletError};
+use crate::loose_proof_wallet::{LooseProofWallet, LooseProofWalletError, ProofReservation};
+use crate::proof_selection::{select_mixed_fee_inputs_for_post_swap_target, ProofCandidate};
 use crate::wallet::{
     msats_to_raw_units, raw_to_msats, MonadWallet, RelayPaymentOffer, WalletChannel,
     WalletChannelState, WalletError,
 };
 use cdk_spilman::{
-    ClientChannelInfo, ConfigurableClientHost, OpenChannelError, OpenChannelResult,
-    ReqwestClientNetworking, SpilmanClientBridge, SqliteClientStorage,
+    compute_funding_token_amount, ClientChannelInfo, ConfigurableClientHost, OpenChannelError,
+    OpenChannelResult, ReqwestClientNetworking, SpilmanClientBridge, SpilmanClientNetworking,
+    SqliteClientStorage,
 };
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -115,6 +118,94 @@ impl SqliteClientWallet {
     /// Access the underlying loose-proof wallet.
     pub fn loose_wallet(&self) -> &LooseProofWallet {
         &self.loose_wallet
+    }
+
+    /// Provision a channel with an exact requested capacity.
+    ///
+    /// This path selects loose proofs by their mixed input fees, reserves those
+    /// exact proofs, and asks upstream to build a channel with exactly
+    /// `target_capacity_msats`. If selected proofs provide slightly more funding
+    /// than required, upstream keeps the full funding amount while setting the
+    /// smaller requested channel capacity.
+    pub fn provision_channel_with_target_capacity(
+        &self,
+        offer: &RelayPaymentOffer,
+        target_capacity_msats: u64,
+    ) -> Result<String, WalletError> {
+        if offer.accepted_keyset_ids.is_empty() {
+            return Err(WalletError::OfferMismatch(
+                "offer has no accepted keysets".to_string(),
+            ));
+        }
+
+        let target_capacity_raw = msats_to_raw_units(&offer.unit, target_capacity_msats)?;
+        if target_capacity_raw == 0 {
+            return Err(WalletError::OfferMismatch(
+                "target capacity must be greater than zero".to_string(),
+            ));
+        }
+        let output_keyset_id = first_output_keyset_id(offer)?;
+
+        let output_keyset_info_json = {
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            bridge
+                .fetch_keyset_info(&offer.mint_url, &output_keyset_id)
+                .map_err(|e| WalletError::Backend(format!("fetch output keyset info: {e}")))?
+        };
+        let required_post_swap_raw =
+            compute_funding_token_amount(target_capacity_raw, &output_keyset_info_json, 0)
+                .map_err(|e| {
+                    WalletError::Backend(format!("compute required funding amount: {e}"))
+                })?;
+
+        let available_proofs = self
+            .loose_wallet
+            .list_available_proofs(&offer.mint_url, &offer.unit, &[])
+            .map_err(loose_proof_error)?;
+        let keysets_json = ReqwestClientNetworking::new()
+            .call_mint_keysets(&offer.mint_url)
+            .map_err(|e| WalletError::Backend(format!("fetch mint keysets: {e}")))?;
+        let input_fee_by_keyset = input_fee_ppk_by_keyset_from_keysets_json(&keysets_json)?;
+
+        let candidates = available_proofs
+            .iter()
+            .map(|proof| {
+                let input_fee_ppk = input_fee_by_keyset
+                    .get(&proof.keyset_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        WalletError::Backend(format!(
+                            "missing input fee for keyset {}",
+                            proof.keyset_id
+                        ))
+                    })?;
+                Ok(ProofCandidate {
+                    proof_id: proof.proof_id.clone(),
+                    amount_raw: proof.amount_raw,
+                    input_fee_ppk,
+                })
+            })
+            .collect::<Result<Vec<_>, WalletError>>()?;
+        let selection =
+            select_mixed_fee_inputs_for_post_swap_target(candidates, required_post_swap_raw)
+                .map_err(|e| WalletError::Backend(format!("select loose proofs: {e}")))?;
+
+        let reservation = self
+            .loose_wallet
+            .reserve_selected_proofs(&offer.mint_url, &offer.unit, &selection.proof_ids)
+            .map_err(loose_proof_error)?;
+        let selected_input_msats = raw_to_msats(&offer.unit, reservation.total_amount_raw)?;
+
+        self.open_reserved_channel(
+            offer,
+            &output_keyset_id,
+            reservation,
+            Some(target_capacity_raw),
+            selected_input_msats,
+        )
     }
 
     /// Recover channel openings whose funding swap may have reached the mint.
@@ -294,6 +385,76 @@ impl SqliteClientWallet {
             .map(|d| d.as_secs())
             .map_err(|e| WalletError::Backend(format!("system time before unix epoch: {e}")))
     }
+
+    fn open_reserved_channel(
+        &self,
+        offer: &RelayPaymentOffer,
+        output_keyset_id: &str,
+        reservation: ProofReservation,
+        requested_capacity_raw: Option<u64>,
+        recovery_input_budget_msats: u64,
+    ) -> Result<String, WalletError> {
+        let input_proofs_json = match proofs_json_from_reservation(&reservation) {
+            Ok(json) => json,
+            Err(e) => {
+                let _ = self
+                    .loose_wallet
+                    .release_reservation(&reservation.reservation_id);
+                return Err(e);
+            }
+        };
+
+        let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
+        let result = {
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            bridge.open_channel_from_proofs_with_keyset_id(
+                &offer.mint_url,
+                &offer.unit,
+                &input_proofs_json,
+                &offer.receiver_pubkey,
+                &self.sender_pubkey_hex,
+                expiry_timestamp,
+                output_keyset_id,
+                0,
+                requested_capacity_raw,
+            )
+        };
+
+        match result {
+            Ok(open_result) => {
+                self.loose_wallet
+                    .mark_reservation_spent(&reservation.reservation_id, &open_result.channel_id)
+                    .map_err(loose_proof_error)?;
+                self.store_open_channel_metadata(&open_result, &reservation.reservation_id)?;
+                Ok(open_result.channel_id)
+            }
+            Err(error) => {
+                if error.input_may_be_spent {
+                    if let Some(channel_id) = error.channel_id.as_deref() {
+                        self.store_opening_recovery(
+                            channel_id,
+                            &reservation.reservation_id,
+                            offer,
+                            recovery_input_budget_msats,
+                            &error,
+                        )?;
+                    }
+                } else {
+                    let _ = self
+                        .loose_wallet
+                        .release_reservation(&reservation.reservation_id);
+                }
+                Err(open_channel_error(
+                    error,
+                    &offer.unit,
+                    recovery_input_budget_msats,
+                ))
+            }
+        }
+    }
 }
 
 impl MonadWallet for SqliteClientWallet {
@@ -424,72 +585,18 @@ impl MonadWallet for SqliteClientWallet {
         }
 
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
-        let output_keyset_id = offer
-            .accepted_keyset_ids
-            .first()
-            .ok_or_else(|| WalletError::OfferMismatch("offer has no accepted keysets".to_string()))?
-            .clone();
+        let output_keyset_id = first_output_keyset_id(offer)?;
         let reservation = self
             .loose_wallet
             .reserve_proofs_any_keyset(&offer.mint_url, &offer.unit, input_budget_raw)
             .map_err(loose_proof_error)?;
-
-        let input_proofs_json = match proofs_json_from_reservation(&reservation) {
-            Ok(json) => json,
-            Err(e) => {
-                let _ = self
-                    .loose_wallet
-                    .release_reservation(&reservation.reservation_id);
-                return Err(e);
-            }
-        };
-
-        let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
-        let result = {
-            let bridge = self
-                .bridge
-                .lock()
-                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
-            bridge.open_channel_from_proofs_with_keyset_id(
-                &offer.mint_url,
-                &offer.unit,
-                &input_proofs_json,
-                &offer.receiver_pubkey,
-                &self.sender_pubkey_hex,
-                expiry_timestamp,
-                &output_keyset_id,
-                0,
-                None,
-            )
-        };
-
-        match result {
-            Ok(open_result) => {
-                self.loose_wallet
-                    .mark_reservation_spent(&reservation.reservation_id, &open_result.channel_id)
-                    .map_err(loose_proof_error)?;
-                self.store_open_channel_metadata(&open_result, &reservation.reservation_id)?;
-                Ok(open_result.channel_id)
-            }
-            Err(error) => {
-                if error.input_may_be_spent {
-                    if let Some(channel_id) = error.channel_id.as_deref() {
-                        self.store_opening_recovery(
-                            channel_id,
-                            &reservation.reservation_id,
-                            offer,
-                            input_budget_msats,
-                            &error,
-                        )?;
-                    }
-                } else {
-                    let _ = self
-                        .loose_wallet
-                        .release_reservation(&reservation.reservation_id);
-                }
-                Err(open_channel_error(error, &offer.unit, input_budget_msats))
-            }
-        }
+        self.open_reserved_channel(
+            offer,
+            &output_keyset_id,
+            reservation,
+            None,
+            input_budget_msats,
+        )
     }
 
     fn build_link_request(
@@ -687,6 +794,38 @@ fn proofs_json_from_reservation(
 
 fn loose_proof_error(error: LooseProofWalletError) -> WalletError {
     WalletError::Backend(format!("loose proof wallet: {error}"))
+}
+
+fn first_output_keyset_id(offer: &RelayPaymentOffer) -> Result<String, WalletError> {
+    offer
+        .accepted_keyset_ids
+        .first()
+        .cloned()
+        .ok_or_else(|| WalletError::OfferMismatch("offer has no accepted keysets".to_string()))
+}
+
+fn input_fee_ppk_by_keyset_from_keysets_json(
+    keysets_json: &str,
+) -> Result<HashMap<String, u64>, WalletError> {
+    let value: serde_json::Value = serde_json::from_str(keysets_json)
+        .map_err(|e| WalletError::Backend(format!("parse mint keysets: {e}")))?;
+    let keysets = value["keysets"]
+        .as_array()
+        .ok_or_else(|| WalletError::Backend("mint keysets response missing keysets".to_string()))?;
+    let mut out = HashMap::new();
+    for keyset in keysets {
+        let id = keyset["id"]
+            .as_str()
+            .ok_or_else(|| WalletError::Backend("mint keyset missing id".to_string()))?;
+        let input_fee_ppk = keyset["input_fee_ppk"]
+            .as_u64()
+            .or_else(|| keyset["inputFeePpk"].as_u64())
+            .ok_or_else(|| {
+                WalletError::Backend(format!("mint keyset {id} missing input fee ppk"))
+            })?;
+        out.insert(id.to_string(), input_fee_ppk);
+    }
+    Ok(out)
 }
 
 fn open_channel_error(
@@ -1126,6 +1265,199 @@ mod tests {
         assert_eq!(link_payment.channel_id, channel_id);
         assert!(link_payment.params.is_some());
         assert!(link_payment.funding_proofs.is_some());
+
+        let _ = shutdown_tx.send(());
+        mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provisions_exact_target_capacity_from_spare_input_value() {
+        let mint_helper = TestMintHelper::new().await.unwrap();
+        let mint = mint_helper.mint();
+        let input_keyset_id = mint_helper.keyset_id().to_string();
+        let amount_raw = 128u64;
+        let input_proofs = mint_helper.mint_proofs(amount_raw).await.unwrap();
+        let extra_input_proofs = mint_helper.mint_proofs(1).await.unwrap();
+
+        let output_keyset_id = rotate_sat_keyset(&mint, 400).await.unwrap().to_string();
+        assert_ne!(input_keyset_id, output_keyset_id);
+
+        let port = free_loopback_port();
+        let mint_url = format!("http://127.0.0.1:{port}");
+        let config = TestMintConfig::for_port(port);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let mint_task = tokio::spawn(async move {
+            serve_existing_mint_with_shutdown(mint, config, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        let client = reqwest::Client::new();
+        wait_for_mint(&client, &mint_url).await;
+
+        let mut all_input_proofs: Vec<serde_json::Value> =
+            serde_json::from_str(&serde_json::to_string(&input_proofs).unwrap()).unwrap();
+        let extra_input_proofs: Vec<serde_json::Value> =
+            serde_json::from_str(&serde_json::to_string(&extra_input_proofs).unwrap()).unwrap();
+        all_input_proofs.extend(extra_input_proofs);
+        let input_proofs_json = serde_json::to_string(&all_input_proofs).unwrap();
+        let loose_proofs = loose_proofs_from_json(
+            &mint_url,
+            "sat",
+            "target-capacity-quote",
+            "target-capacity-batch",
+            &input_proofs_json,
+        );
+        assert!(loose_proofs
+            .iter()
+            .all(|proof| proof.keyset_id == input_keyset_id));
+
+        let temp = tempfile::tempdir().unwrap();
+        let loose_db = temp.path().join("loose.sqlite");
+        let channel_db = temp.path().join("channels.sqlite");
+        let loose_wallet = LooseProofWallet::open(&loose_db, "alice").unwrap();
+        loose_wallet.import_proofs(&loose_proofs).unwrap();
+        let wallet =
+            SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret_hex()).unwrap();
+
+        let receiver_pubkey =
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
+        let offer = offer(&mint_url, &receiver_pubkey, &output_keyset_id);
+        assert!(!offer.accepted_keyset_ids.contains(&input_keyset_id));
+
+        let target_capacity_raw = 32u64;
+        let target_capacity_msats = target_capacity_raw * 1000;
+        let channel_id = wallet
+            .provision_channel_with_target_capacity(&offer, target_capacity_msats)
+            .expect("provision exact target capacity channel");
+
+        let channel = wallet.get_channel(&channel_id).unwrap();
+        assert_eq!(channel.receiver_pubkey, receiver_pubkey);
+        assert_eq!(channel.mint_url, mint_url);
+        assert_eq!(channel.unit, "sat");
+        assert_eq!(channel.keyset_id, output_keyset_id);
+        assert_eq!(channel.capacity_msats, target_capacity_msats);
+
+        let reservation_id: String = wallet
+            .channel_db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT reservation_id FROM monad_client_channels WHERE channel_id = ?1",
+                rusqlite::params![channel_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let reserved_proofs = wallet
+            .loose_wallet()
+            .proofs_for_reservation(&reservation_id)
+            .unwrap();
+        let reserved_total = reserved_proofs
+            .iter()
+            .map(|proof| proof.amount_raw)
+            .sum::<u64>();
+        assert!(reserved_total > target_capacity_raw);
+        assert!(reserved_proofs
+            .iter()
+            .all(|proof| proof.state == LooseProofState::Spent));
+        let remaining_available = wallet
+            .loose_wallet()
+            .available_balance_raw(&mint_url, "sat", std::slice::from_ref(&input_keyset_id))
+            .unwrap();
+        assert!(remaining_available > 0);
+
+        let _ = shutdown_tx.send(());
+        mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn target_capacity_insufficient_funds_leaves_state_unchanged() {
+        let port = free_loopback_port();
+        let mint_url = format!("http://127.0.0.1:{port}");
+        let config = TestMintConfig::for_port(port);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let mint_task = tokio::spawn(async move {
+            serve_mint_with_shutdown(config, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+
+        let client = reqwest::Client::new();
+        wait_for_mint(&client, &mint_url).await;
+
+        let unit = "sat";
+        let keyset_id = active_keyset_id(&client, &mint_url, unit).await;
+        let bridge = SpilmanClientBridge::new(
+            ConfigurableClientHost::new_in_memory(),
+            ReqwestClientNetworking::new(),
+        );
+        let keyset_info_json = bridge.fetch_keyset_info(&mint_url, &keyset_id).unwrap();
+
+        let amount_raw = 1u64;
+        let quote_response = request_mint_quote(&client, &mint_url, amount_raw, unit).await;
+        let quote_id = quote_response["quote"].as_str().unwrap().to_string();
+        wait_for_quote_paid(&client, &mint_url, &quote_id).await;
+
+        let premint_json = create_plain_blinded_messages(amount_raw, &keyset_info_json).unwrap();
+        let premint: serde_json::Value = serde_json::from_str(&premint_json).unwrap();
+        let secrets_with_blinding_json = premint["secrets_with_blinding"].to_string();
+        let batch_id = format!("batch-{quote_id}");
+        let mint_response: serde_json::Value = client
+            .post(format!("{mint_url}/v1/mint/bolt11"))
+            .json(&serde_json::json!({
+                "quote": quote_id,
+                "outputs": premint["blinded_messages"],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let proofs_json = construct_proofs(
+            &mint_response["signatures"].to_string(),
+            &secrets_with_blinding_json,
+            &keyset_info_json,
+        )
+        .unwrap();
+        let loose_proofs =
+            loose_proofs_from_json(&mint_url, unit, &quote_id, &batch_id, &proofs_json);
+
+        let temp = tempfile::tempdir().unwrap();
+        let loose_db = temp.path().join("loose.sqlite");
+        let channel_db = temp.path().join("channels.sqlite");
+        let loose_wallet = LooseProofWallet::open(&loose_db, "alice").unwrap();
+        loose_wallet.import_proofs(&loose_proofs).unwrap();
+        let wallet =
+            SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret_hex()).unwrap();
+
+        let receiver_pubkey =
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
+        let offer = offer(&mint_url, &receiver_pubkey, &keyset_id);
+        let err = wallet
+            .provision_channel_with_target_capacity(&offer, 1_000_000)
+            .unwrap_err();
+        assert!(matches!(err, WalletError::Backend(_)));
+
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .available_balance_raw(&mint_url, unit, std::slice::from_ref(&keyset_id))
+                .unwrap(),
+            amount_raw
+        );
+        let channel_count: u64 = wallet
+            .channel_db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM monad_client_channels", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(channel_count, 0);
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();

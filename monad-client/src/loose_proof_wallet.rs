@@ -7,6 +7,7 @@
 use rand::RngCore;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
+use std::collections::HashSet;
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -669,6 +670,152 @@ impl LooseProofWallet {
         amount_raw: u64,
     ) -> Result<ProofReservation> {
         self.reserve_proofs(mint_url, unit, &[], amount_raw)
+    }
+
+    pub fn reserve_selected_proofs(
+        &self,
+        mint_url: &str,
+        unit: &str,
+        proof_ids: &[String],
+    ) -> Result<ProofReservation> {
+        validate_nonempty("mint_url", mint_url)?;
+        validate_nonempty("unit", unit)?;
+        if proof_ids.is_empty() {
+            return Err(LooseProofWalletError::InvalidInput(
+                "selected proof ids must not be empty".to_string(),
+            ));
+        }
+        if proof_ids.len() + 5 > 999 {
+            return Err(LooseProofWalletError::InvalidInput(format!(
+                "too many selected proof ids ({})",
+                proof_ids.len()
+            )));
+        }
+
+        let mut unique = HashSet::with_capacity(proof_ids.len());
+        for proof_id in proof_ids {
+            validate_nonempty("proof_id", proof_id)?;
+            if !unique.insert(proof_id) {
+                return Err(LooseProofWalletError::InvalidInput(format!(
+                    "duplicate selected proof id '{proof_id}'"
+                )));
+            }
+        }
+
+        let reservation_id = new_reservation_id();
+        let now = now_seconds()?;
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| {
+                LooseProofWalletError::Backend(format!("start proof reservation transaction: {e}"))
+            })?;
+
+        let placeholders = std::iter::repeat_n("?", proof_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT proof_id, wallet_name, mint_url, unit, keyset_id, amount_raw, proof_json, state,
+                    source_quote_id, source_batch_id, reserved_by, spent_channel_id, created_at, updated_at
+             FROM monad_client_loose_proofs
+             WHERE wallet_name = ? AND mint_url = ? AND unit = ? AND state = ? AND proof_id IN ({placeholders})
+             ORDER BY amount_raw ASC, proof_id ASC"
+        );
+        let mut values = vec![
+            Value::Text(self.wallet_name.clone()),
+            Value::Text(mint_url.to_string()),
+            Value::Text(unit.to_string()),
+            Value::Text(LooseProofState::Available.as_str().to_string()),
+        ];
+        values.extend(
+            proof_ids
+                .iter()
+                .map(|proof_id| Value::Text(proof_id.clone())),
+        );
+
+        let mut stmt = tx.prepare(&sql).map_err(|e| {
+            LooseProofWalletError::Backend(format!("prepare selected proof query: {e}"))
+        })?;
+        let mut rows = stmt.query(params_from_iter(values)).map_err(|e| {
+            LooseProofWalletError::Backend(format!("query selected loose proofs: {e}"))
+        })?;
+        let mut selected = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| {
+            LooseProofWalletError::Backend(format!("read selected loose proof row: {e}"))
+        })? {
+            selected.push(row_to_loose_proof(row).map_err(|e| {
+                LooseProofWalletError::Backend(format!("decode selected loose proof row: {e}"))
+            })?);
+        }
+        drop(rows);
+        drop(stmt);
+
+        if selected.len() != proof_ids.len() {
+            let available = selected.iter().try_fold(0u64, |total, proof| {
+                total.checked_add(proof.amount_raw).ok_or_else(|| {
+                    LooseProofWalletError::Backend(
+                        "selected proof available total overflow".to_string(),
+                    )
+                })
+            })?;
+            return Err(LooseProofWalletError::InsufficientBalance {
+                requested: proof_ids.len() as u64,
+                available,
+            });
+        }
+
+        let total_amount_raw = selected.iter().try_fold(0u64, |total, proof| {
+            total.checked_add(proof.amount_raw).ok_or_else(|| {
+                LooseProofWalletError::Backend("selected proof total overflow".to_string())
+            })
+        })?;
+
+        let expected = selected.len();
+        let update_placeholders = std::iter::repeat_n("?", expected)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let update_sql = format!(
+            "UPDATE monad_client_loose_proofs
+             SET state = ?, reserved_by = ?, updated_at = ?
+             WHERE wallet_name = ? AND mint_url = ? AND unit = ? AND state = ? AND proof_id IN ({update_placeholders})"
+        );
+        let mut update_values = vec![
+            Value::Text(LooseProofState::Reserved.as_str().to_string()),
+            Value::Text(reservation_id.clone()),
+            Value::Integer(to_i64(now)?),
+            Value::Text(self.wallet_name.clone()),
+            Value::Text(mint_url.to_string()),
+            Value::Text(unit.to_string()),
+            Value::Text(LooseProofState::Available.as_str().to_string()),
+        ];
+        update_values.extend(
+            proof_ids
+                .iter()
+                .map(|proof_id| Value::Text(proof_id.clone())),
+        );
+        let updated = tx
+            .execute(&update_sql, params_from_iter(update_values))
+            .map_err(|e| {
+                LooseProofWalletError::Backend(format!("reserve selected loose proofs: {e}"))
+            })?;
+        if updated != expected {
+            return Err(LooseProofWalletError::ReservationConflict { expected, updated });
+        }
+        tx.commit().map_err(|e| {
+            LooseProofWalletError::Backend(format!("commit selected proof reservation: {e}"))
+        })?;
+
+        for proof in &mut selected {
+            proof.state = LooseProofState::Reserved;
+            proof.reserved_by = Some(reservation_id.clone());
+            proof.updated_at = now;
+        }
+
+        Ok(ProofReservation {
+            reservation_id,
+            proofs: selected,
+            total_amount_raw,
+        })
     }
 
     pub fn release_reservation(&self, reservation_id: &str) -> Result<usize> {
@@ -1510,6 +1657,141 @@ mod tests {
         assert!(proofs
             .iter()
             .all(|proof| proof.state == LooseProofState::Available));
+    }
+
+    #[test]
+    fn reserve_selected_proofs_reserves_exact_ids() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[
+                proof("proof-small", 1, "keyset-a"),
+                proof("proof-medium", 2, "keyset-a"),
+                proof("proof-large", 4, "keyset-a"),
+            ])
+            .unwrap();
+
+        let reservation = wallet
+            .reserve_selected_proofs(
+                MINT,
+                "sat",
+                &["proof-large".to_string(), "proof-small".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(reservation.total_amount_raw, 5);
+        let mut reserved_ids = reservation
+            .proofs
+            .iter()
+            .map(|proof| proof.proof_id.as_str())
+            .collect::<Vec<_>>();
+        reserved_ids.sort_unstable();
+        assert_eq!(reserved_ids, vec!["proof-large", "proof-small"]);
+        assert!(reservation
+            .proofs
+            .iter()
+            .all(|proof| proof.state == LooseProofState::Reserved));
+
+        let available = wallet
+            .list_available_proofs(MINT, "sat", &["keyset-a".to_string()])
+            .unwrap();
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].proof_id, "proof-medium");
+    }
+
+    #[test]
+    fn reserve_selected_proofs_rejects_duplicate_ids() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 1, "keyset-a")])
+            .unwrap();
+
+        let err = wallet
+            .reserve_selected_proofs(MINT, "sat", &["proof-a".to_string(), "proof-a".to_string()])
+            .unwrap_err();
+
+        assert!(matches!(err, LooseProofWalletError::InvalidInput(_)));
+        assert_eq!(wallet.available_balance_raw(MINT, "sat", &[]).unwrap(), 1);
+    }
+
+    #[test]
+    fn reserve_selected_proofs_rejects_wrong_mint_unit_without_partial_reservation() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[
+                proof("proof-a", 1, "keyset-a"),
+                NewLooseProof {
+                    mint_url: "https://other-mint".to_string(),
+                    ..proof("proof-b", 2, "keyset-a")
+                },
+            ])
+            .unwrap();
+
+        let err = wallet
+            .reserve_selected_proofs(MINT, "sat", &["proof-a".to_string(), "proof-b".to_string()])
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            LooseProofWalletError::InsufficientBalance { .. }
+        ));
+        let proofs = wallet.list_available_proofs(MINT, "sat", &[]).unwrap();
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].proof_id, "proof-a");
+        assert_eq!(proofs[0].state, LooseProofState::Available);
+    }
+
+    #[test]
+    fn reserve_selected_proofs_rejects_unavailable_without_partial_reservation() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[
+                proof("proof-a", 1, "keyset-a"),
+                proof("proof-b", 2, "keyset-a"),
+            ])
+            .unwrap();
+        let first = wallet
+            .reserve_selected_proofs(MINT, "sat", &["proof-a".to_string()])
+            .unwrap();
+        wallet
+            .mark_reservation_spent(&first.reservation_id, "chan-a")
+            .unwrap();
+
+        let err = wallet
+            .reserve_selected_proofs(MINT, "sat", &["proof-a".to_string(), "proof-b".to_string()])
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            LooseProofWalletError::InsufficientBalance { .. }
+        ));
+        let available = wallet.list_available_proofs(MINT, "sat", &[]).unwrap();
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].proof_id, "proof-b");
+        assert_eq!(available[0].state, LooseProofState::Available);
+    }
+
+    #[test]
+    fn separate_wallet_handles_do_not_double_reserve_selected_proofs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet.sqlite");
+        let wallet_a = LooseProofWallet::open(&path, "alice").unwrap();
+        let wallet_b = LooseProofWallet::open(&path, "alice").unwrap();
+        wallet_a
+            .import_proofs(&[proof("proof-a", 1, "keyset-a")])
+            .unwrap();
+
+        wallet_a
+            .reserve_selected_proofs(MINT, "sat", &["proof-a".to_string()])
+            .unwrap();
+        let err = wallet_b
+            .reserve_selected_proofs(MINT, "sat", &["proof-a".to_string()])
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            LooseProofWalletError::InsufficientBalance { .. }
+        ));
+        assert_eq!(wallet_b.available_balance_raw(MINT, "sat", &[]).unwrap(), 0);
     }
 
     #[test]
