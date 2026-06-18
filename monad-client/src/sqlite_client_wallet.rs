@@ -778,7 +778,7 @@ mod tests {
     use super::*;
     use crate::loose_proof_wallet::{LooseProofState, NewLooseProof};
     use cdk_spilman::{
-        channel_parameters_get_channel_id, compute_channel_from_proofs,
+        channel_parameters_get_channel_id, compute_channel_from_proofs_with_input_keysets,
         compute_channel_secret_from_hex, construct_proofs, create_funding_swap,
         create_plain_blinded_messages, ClientChannelOpeningFromSwap, ClientStorage,
         ConfigurableClientHost, OpenChannelError, OpenChannelFailureStage, Payment,
@@ -1136,10 +1136,20 @@ mod tests {
         let channel_secret_hex =
             compute_channel_secret_from_hex(&sender_secret, &receiver_pubkey).unwrap();
         let expiry_timestamp = SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS;
-        let compute_result = compute_channel_from_proofs(
+        let keyset_info: serde_json::Value = serde_json::from_str(&keyset_info_json).unwrap();
+        let input_fee_ppk = keyset_info["inputFeePpk"].as_u64().unwrap();
+        let input_keysets_json = serde_json::to_string(&vec![serde_json::json!({
+            "id": keyset_id,
+            "unit": unit,
+            "active": true,
+            "input_fee_ppk": input_fee_ppk,
+        })])
+        .unwrap();
+        let compute_result = compute_channel_from_proofs_with_input_keysets(
             &mint_url,
             unit,
             &input_proofs_json,
+            &input_keysets_json,
             &receiver_pubkey,
             &wallet.sender_pubkey_hex,
             &channel_secret_hex,
@@ -1187,15 +1197,18 @@ mod tests {
         .unwrap();
         let swap_json: serde_json::Value = serde_json::from_str(&swap_result).unwrap();
         let swap_request_json = swap_json["swap_request_json"].as_str().unwrap();
-        client
+        let swap_response = client
             .post(format!("{mint_url}/v1/swap"))
             .header("Content-Type", "application/json")
             .body(swap_request_json.to_string())
             .send()
             .await
-            .unwrap()
-            .error_for_status()
             .unwrap();
+        if !swap_response.status().is_success() {
+            let status = swap_response.status();
+            let body = swap_response.text().await.unwrap_or_default();
+            panic!("swap failed with {status}: {body}");
+        }
 
         let simulated_error = OpenChannelError {
             stage: OpenChannelFailureStage::RestoreVerification,
