@@ -662,6 +662,15 @@ impl LooseProofWallet {
         })
     }
 
+    pub fn reserve_proofs_any_keyset(
+        &self,
+        mint_url: &str,
+        unit: &str,
+        amount_raw: u64,
+    ) -> Result<ProofReservation> {
+        self.reserve_proofs(mint_url, unit, &[], amount_raw)
+    }
+
     pub fn release_reservation(&self, reservation_id: &str) -> Result<usize> {
         let now = now_seconds()?;
         let conn = self.conn()?;

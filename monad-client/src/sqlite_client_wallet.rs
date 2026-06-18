@@ -424,14 +424,14 @@ impl MonadWallet for SqliteClientWallet {
         }
 
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
+        let output_keyset_id = offer
+            .accepted_keyset_ids
+            .first()
+            .ok_or_else(|| WalletError::OfferMismatch("offer has no accepted keysets".to_string()))?
+            .clone();
         let reservation = self
             .loose_wallet
-            .reserve_proofs(
-                &offer.mint_url,
-                &offer.unit,
-                &offer.accepted_keyset_ids,
-                input_budget_raw,
-            )
+            .reserve_proofs_any_keyset(&offer.mint_url, &offer.unit, input_budget_raw)
             .map_err(loose_proof_error)?;
 
         let input_proofs_json = match proofs_json_from_reservation(&reservation) {
@@ -450,13 +450,14 @@ impl MonadWallet for SqliteClientWallet {
                 .bridge
                 .lock()
                 .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
-            bridge.open_channel_from_proofs_auto(
+            bridge.open_channel_from_proofs_with_keyset_id(
                 &offer.mint_url,
                 &offer.unit,
                 &input_proofs_json,
                 &offer.receiver_pubkey,
                 &self.sender_pubkey_hex,
                 expiry_timestamp,
+                &output_keyset_id,
                 0,
             )
         };
@@ -784,7 +785,10 @@ mod tests {
         ConfigurableClientHost, OpenChannelError, OpenChannelFailureStage, Payment,
         ReqwestClientNetworking, SpilmanClientBridge, SqliteClientStorage,
     };
-    use cdk_spilman_test_mint::{serve_mint_with_shutdown, TestMintConfig};
+    use cdk_spilman_test_mint::{
+        rotate_sat_keyset, serve_existing_mint_with_shutdown, serve_mint_with_shutdown,
+        TestMintConfig, TestMintHelper,
+    };
     use rand::RngCore;
     use tokio::sync::oneshot;
 
@@ -1045,6 +1049,82 @@ mod tests {
         assert_eq!(payment.balance, next_balance_raw);
         assert!(payment.params.is_none());
         assert!(payment.funding_proofs.is_none());
+
+        let _ = shutdown_tx.send(());
+        mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provisions_from_non_relay_accepted_input_keyset() {
+        let mint_helper = TestMintHelper::new().await.unwrap();
+        let mint = mint_helper.mint();
+        let input_keyset_id = mint_helper.keyset_id().to_string();
+        let amount_raw = 16u64;
+        let input_proofs = mint_helper.mint_proofs(amount_raw).await.unwrap();
+
+        let output_keyset_id = rotate_sat_keyset(&mint, 400).await.unwrap().to_string();
+        assert_ne!(input_keyset_id, output_keyset_id);
+
+        let port = free_loopback_port();
+        let mint_url = format!("http://127.0.0.1:{port}");
+        let config = TestMintConfig::for_port(port);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let mint_task = tokio::spawn(async move {
+            serve_existing_mint_with_shutdown(mint, config, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        let client = reqwest::Client::new();
+        wait_for_mint(&client, &mint_url).await;
+
+        let input_proofs_json = serde_json::to_string(&input_proofs).unwrap();
+        let loose_proofs = loose_proofs_from_json(
+            &mint_url,
+            "sat",
+            "pre-rotation-quote",
+            "pre-rotation-batch",
+            &input_proofs_json,
+        );
+        assert!(loose_proofs
+            .iter()
+            .all(|proof| proof.keyset_id == input_keyset_id));
+
+        let temp = tempfile::tempdir().unwrap();
+        let loose_db = temp.path().join("loose.sqlite");
+        let channel_db = temp.path().join("channels.sqlite");
+        let loose_wallet = LooseProofWallet::open(&loose_db, "alice").unwrap();
+        loose_wallet.import_proofs(&loose_proofs).unwrap();
+        let wallet =
+            SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret_hex()).unwrap();
+
+        let receiver_pubkey =
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
+        let offer = offer(&mint_url, &receiver_pubkey, &output_keyset_id);
+        assert!(!offer.accepted_keyset_ids.contains(&input_keyset_id));
+
+        let channel_id = wallet
+            .provision_channel(&offer, amount_raw * 1000)
+            .expect("provision channel from non-accepted input keyset proofs");
+        let channel = wallet.get_channel(&channel_id).unwrap();
+        assert_eq!(channel.keyset_id, output_keyset_id);
+        assert_eq!(channel.receiver_pubkey, receiver_pubkey);
+        assert_eq!(channel.state, WalletChannelState::Open);
+
+        let available_input = wallet
+            .loose_wallet()
+            .available_balance_raw(&mint_url, "sat", std::slice::from_ref(&input_keyset_id))
+            .unwrap();
+        assert_eq!(available_input, 0);
+
+        wallet
+            .attach_channel_to_session(&channel_id, [9u8; 32])
+            .unwrap();
+        let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+        let link_payment: Payment = serde_json::from_str(&link_json).unwrap();
+        assert_eq!(link_payment.channel_id, channel_id);
+        assert!(link_payment.params.is_some());
+        assert!(link_payment.funding_proofs.is_some());
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
