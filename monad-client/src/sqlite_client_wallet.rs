@@ -459,6 +459,7 @@ impl MonadWallet for SqliteClientWallet {
                 expiry_timestamp,
                 &output_keyset_id,
                 0,
+                None,
             )
         };
 
@@ -1236,6 +1237,7 @@ mod tests {
             expiry_timestamp,
             &keyset_info_json,
             0,
+            None,
         )
         .unwrap();
         let compute_json: serde_json::Value = serde_json::from_str(&compute_result).unwrap();
