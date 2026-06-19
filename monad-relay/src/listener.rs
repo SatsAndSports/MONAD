@@ -5,6 +5,7 @@ use crate::quic_pool::QuicPool;
 use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
 use crate::session_registry::SessionRegistry;
 use crate::wallet_manager::{cache_relay_keysets, RelayWalletManager};
+use cashu::nuts::Id;
 use cdk_spilman::configurable_host::SpilmanStorage;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
@@ -24,9 +25,10 @@ use monad_quic::stream::{QuicStream, STREAM_KIND_SECP_NOISE, STREAM_KIND_TWEAKED
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io;
+use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, RwLock,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -37,7 +39,7 @@ struct QuicSessionRuntime {
     quic_pool: Option<QuicPool>,
     config: Arc<ServerConfig>,
     transport_key: SecpTransportKeypair,
-    discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
+    discovered_spilman_mint_cache: SharedSpilmanMintCache,
     payments: Arc<dyn RelayPayments>,
     session_registry: Arc<SessionRegistry>,
 }
@@ -88,7 +90,8 @@ async fn run_quic_noise_session(
             session_registry: runtime.session_registry,
             transport_key: runtime.transport_key,
             receiver_pubkey_hex: runtime.config.receiver_pubkey_hex.clone(),
-            spilman_mint_cache: runtime.discovered_spilman_mint_cache.as_ref().clone(),
+            spilman_mint_cache: runtime.discovered_spilman_mint_cache,
+            trusted_mint_units: runtime.config.trusted_mint_units.clone(),
             cashu_spilman_protocol_version: bootstrap_accept.cashu_spilman_protocol_version,
             in_bytes_per_millisat: runtime.config.in_bytes_per_millisat,
             out_bytes_per_millisat: runtime.config.out_bytes_per_millisat,
@@ -107,20 +110,80 @@ async fn run_quic_noise_session(
     }
 }
 
-/// Hardcoded trusted mint policy for now: mint URL -> allowed units.
+/// Configured trusted mint policy: mint URL -> allowed units.
 pub type TrustedMintUnits = BTreeMap<String, BTreeSet<String>>;
 
-/// Relay-side cached view of trusted mints.
+/// Cached details for a single mint keyset.
+#[derive(Debug, Clone)]
+pub struct CachedKeyset {
+    pub unit: String,
+    pub active: bool,
+    pub info_json: String,
+}
+
+/// Relay-side cached view of known mint keysets.
+///
+/// This is a mirror of the mint's current keyset response: it stores every
+/// unit and every keyset the mint reports, active or inactive. Trusted-unit
+/// and active filtering happens on demand at read sites.
 #[derive(Debug, Clone, Default)]
 pub struct SpilmanMintCache {
-    /// Mint URL -> unit -> relay-accepted advertised keyset IDs.
-    ///
-    /// This includes active and inactive keysets for trusted mint/unit pairs so
-    /// old channels can continue to re-link, pay, and close. It is built during
-    /// relay startup/configured discovery and reused for normal sessions.
+    /// Mint URL -> unit -> all known keyset IDs (active and inactive).
     pub advertised: MintUnitKeysets,
-    /// Mint URL -> keyset ID -> keyset info JSON for all advertised keysets.
-    pub keyset_info_json_by_mint: BTreeMap<String, BTreeMap<String, String>>,
+    /// Mint URL -> keyset ID -> cached keyset details.
+    pub keysets: BTreeMap<String, BTreeMap<String, CachedKeyset>>,
+}
+
+impl SpilmanMintCache {
+    /// All known keyset ID strings for one `(mint, unit)`.
+    pub fn keyset_ids(&self, mint: &str, unit: &str) -> Vec<String> {
+        self.advertised
+            .get(mint)
+            .and_then(|units| units.get(unit))
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// Active keyset IDs for one `(mint, unit)`.
+    pub fn active_keyset_ids(&self, mint: &str, unit: &str) -> Vec<Id> {
+        self.keysets
+            .get(mint)
+            .into_iter()
+            .flatten()
+            .filter(|(_, ks)| ks.unit == unit && ks.active)
+            .map(|(id, _)| Id::from_str(id))
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// Keyset info JSON lookup.
+    pub fn keyset_info_json(&self, mint: &str, keyset_id: &Id) -> Option<String> {
+        self.keysets
+            .get(mint)
+            .and_then(|by_id| by_id.get(&keyset_id.to_string()))
+            .map(|ks| ks.info_json.clone())
+    }
+
+    /// True if the keyset is known and belongs to a trusted unit for that mint.
+    pub fn is_acceptable(
+        &self,
+        mint: &str,
+        keyset_id: &Id,
+        trusted_units: &BTreeSet<String>,
+    ) -> bool {
+        self.keysets
+            .get(mint)
+            .and_then(|by_id| by_id.get(&keyset_id.to_string()))
+            .is_some_and(|ks| trusted_units.contains(&ks.unit))
+    }
+}
+
+pub type SharedSpilmanMintCache = Arc<RwLock<SpilmanMintCache>>;
+
+pub fn shared_spilman_mint_cache(cache: SpilmanMintCache) -> SharedSpilmanMintCache {
+    Arc::new(RwLock::new(cache))
 }
 
 /// Relay configuration.
@@ -131,7 +194,7 @@ pub struct ServerConfig {
     pub transport_key: Option<SecpTransportKeypair>,
     /// Receiver secp256k1 pubkey advertised in SessionStatus.
     pub receiver_pubkey_hex: String,
-    /// Hardcoded trusted mint policy.
+    /// Configured trusted mint policy.
     pub trusted_mint_units: TrustedMintUnits,
     /// Default inbound bytes per millisat for sessions on this relay.
     pub in_bytes_per_millisat: u64,
@@ -164,25 +227,27 @@ impl ServerConfig {
     }
 }
 
-/// Discover all trusted keyset IDs (active and inactive) and cache their keyset info JSON.
+/// Discover all keyset IDs (active and inactive) for configured mints and cache
+/// their keyset info JSON.
 pub async fn discover_spilman_mint_cache(
     trusted_mint_units: &TrustedMintUnits,
 ) -> io::Result<SpilmanMintCache> {
     discover_spilman_mint_cache_with_storage(trusted_mint_units, None).await
 }
 
-/// Discover trusted mint keysets and optionally persist the fetched keysets.
+/// Discover mint keysets and optionally persist the fetched keysets.
 ///
 /// This is intended for relay startup/configured mint discovery, not per-session
 /// refreshes. Normal sessions use the in-memory [`SpilmanMintCache`] created at
-/// startup.
+/// startup. All units returned by the mint are cached; trusted-unit filtering
+/// happens on demand at read sites.
 pub async fn discover_spilman_mint_cache_with_storage(
     trusted_mint_units: &TrustedMintUnits,
     storage: Option<&dyn SpilmanStorage>,
 ) -> io::Result<SpilmanMintCache> {
     let mut cache = SpilmanMintCache::default();
 
-    for (mint_url, trusted_units) in trusted_mint_units {
+    for mint_url in trusted_mint_units.keys() {
         let keysets = fetch_all_keysets_from_mint(mint_url)
             .await
             .map_err(|e| io::Error::other(format!("discover keysets from {mint_url}: {e}")))?;
@@ -192,23 +257,23 @@ pub async fn discover_spilman_mint_cache_with_storage(
         }
 
         let mut by_unit = BTreeMap::<String, Vec<String>>::new();
-        let mut by_id = BTreeMap::<String, String>::new();
+        let mut by_id = BTreeMap::<String, CachedKeyset>::new();
         for keyset in keysets {
             let unit = keyset.unit.to_string();
-            if !trusted_units.contains(&unit) {
-                continue;
-            }
-
             let id = keyset.id.to_string();
             by_unit.entry(unit.clone()).or_default().push(id.clone());
             by_id.insert(
                 id,
-                build_keyset_info_json(
-                    &keyset.id,
-                    &keyset.unit,
-                    &keyset.keys,
-                    keyset.input_fee_ppk,
-                ),
+                CachedKeyset {
+                    unit,
+                    active: keyset.active,
+                    info_json: build_keyset_info_json(
+                        &keyset.id,
+                        &keyset.unit,
+                        &keyset.keys,
+                        keyset.input_fee_ppk,
+                    ),
+                },
             );
         }
 
@@ -217,11 +282,9 @@ pub async fn discover_spilman_mint_cache_with_storage(
             ids.dedup();
         }
 
-        info!(mint = %mint_url, units = ?by_unit.keys().collect::<Vec<_>>(), "discovered trusted mint keysets");
+        info!(mint = %mint_url, units = ?by_unit.keys().collect::<Vec<_>>(), "discovered mint keysets");
         cache.advertised.insert(mint_url.clone(), by_unit);
-        cache
-            .keyset_info_json_by_mint
-            .insert(mint_url.clone(), by_id);
+        cache.keysets.insert(mint_url.clone(), by_id);
     }
 
     Ok(cache)
@@ -242,13 +305,10 @@ pub async fn run(
     config: Arc<ServerConfig>,
 ) -> io::Result<()> {
     let wallet_manager = Arc::new(RelayWalletManager::open(&config.spilman_storage_path)?);
-    let discovered_spilman_mint_cache = Arc::new(
-        discover_spilman_mint_cache_with_storage(
-            &config.trusted_mint_units,
-            Some(wallet_manager.spilman_storage()),
-        )
-        .await?,
-    );
+    let discovered_spilman_mint_cache = wallet_manager
+        .refresh_trusted_mint_cache(&config.trusted_mint_units)
+        .await
+        .map_err(io::Error::other)?;
     run_with_wallet_manager(
         listener,
         quic_endpoint,
@@ -264,13 +324,10 @@ pub async fn run_with_wallet_manager(
     quic_endpoint: Option<quinn::Endpoint>,
     config: Arc<ServerConfig>,
     wallet_manager: Arc<RelayWalletManager>,
-    discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
+    discovered_spilman_mint_cache: SharedSpilmanMintCache,
 ) -> io::Result<()> {
     let receiver_pubkey_hex = wallet_manager.receiver_pubkey_hex(&config.relay_wallet_name)?;
-    let payments = wallet_manager.payments_for(
-        &config.relay_wallet_name,
-        discovered_spilman_mint_cache.as_ref().clone(),
-    )?;
+    let payments = wallet_manager.payments_for(&config.relay_wallet_name)?;
     let config = Arc::new(ServerConfig {
         identity: QuicCertIdentity::from_seed(*config.identity.seed())
             .map_err(|e| io::Error::other(format!("clone relay identity: {e}")))?,
@@ -298,7 +355,7 @@ pub async fn run_with_payments(
     quic_endpoint: Option<quinn::Endpoint>,
     config: Arc<ServerConfig>,
     payments: Arc<dyn RelayPayments>,
-    discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
+    discovered_spilman_mint_cache: SharedSpilmanMintCache,
 ) -> io::Result<()> {
     run_with_payments_and_registry(
         listener,
@@ -316,7 +373,7 @@ pub async fn run_with_payments_and_registry(
     quic_endpoint: Option<quinn::Endpoint>,
     config: Arc<ServerConfig>,
     payments: Arc<dyn RelayPayments>,
-    discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
+    discovered_spilman_mint_cache: SharedSpilmanMintCache,
     session_registry: Arc<SessionRegistry>,
 ) -> io::Result<()> {
     run_with_payments_and_registry_and_shutdown(
@@ -338,7 +395,7 @@ pub async fn run_with_payments_and_registry_and_shutdown<S>(
     quic_endpoint: Option<quinn::Endpoint>,
     config: Arc<ServerConfig>,
     payments: Arc<dyn RelayPayments>,
-    discovered_spilman_mint_cache: Arc<SpilmanMintCache>,
+    discovered_spilman_mint_cache: SharedSpilmanMintCache,
     session_registry: Arc<SessionRegistry>,
     shutdown: S,
 ) -> io::Result<()>
@@ -411,7 +468,8 @@ where
                             session_registry,
                             transport_key: transport_key.clone(),
                             receiver_pubkey_hex: config.receiver_pubkey_hex.clone(),
-                            spilman_mint_cache: discovered_spilman_mint_cache.as_ref().clone(),
+                            spilman_mint_cache: discovered_spilman_mint_cache,
+                            trusted_mint_units: config.trusted_mint_units.clone(),
                             cashu_spilman_protocol_version: bootstrap_accept
                                 .cashu_spilman_protocol_version,
                             in_bytes_per_millisat: config.in_bytes_per_millisat,

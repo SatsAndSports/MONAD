@@ -9,9 +9,11 @@ use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 use monad_quic::client::ClientAuthMode;
 use monad_quic::pool::QuicPool;
-use monad_relay::listener::{run_with_payments, ServerConfig, SpilmanMintCache};
+use monad_relay::listener::{
+    run_with_payments, shared_spilman_mint_cache, CachedKeyset, ServerConfig, SpilmanMintCache,
+};
 use monad_relay::payments::testing::InMemoryRelayPayments;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::io;
 use std::io::Write;
@@ -426,10 +428,31 @@ fn synthetic_test_mint_cache() -> SpilmanMintCache {
             vec![SYNTHETIC_TEST_KEYSET_ID.to_string()],
         )]),
     );
+    let mut keysets = BTreeMap::new();
+    keysets.insert(
+        SYNTHETIC_TEST_MINT_URL.to_string(),
+        BTreeMap::from([(
+            SYNTHETIC_TEST_KEYSET_ID.to_string(),
+            CachedKeyset {
+                unit: SYNTHETIC_TEST_MINT_UNIT.to_string(),
+                active: true,
+                info_json:
+                    r#"{"keysetId":"00testkeyset0000","unit":"msat","keys":{},"inputFeePpk":0}"#
+                        .to_string(),
+            },
+        )]),
+    );
     SpilmanMintCache {
         advertised,
-        keyset_info_json_by_mint: BTreeMap::new(),
+        keysets,
     }
+}
+
+fn synthetic_trusted_mint_units() -> BTreeMap<String, BTreeSet<String>> {
+    BTreeMap::from([(
+        SYNTHETIC_TEST_MINT_URL.to_string(),
+        BTreeSet::from([SYNTHETIC_TEST_MINT_UNIT.to_string()]),
+    )])
 }
 
 async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
@@ -448,7 +471,7 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
         identity,
         transport_key: Some(transport_key),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
-        trusted_mint_units: BTreeMap::new(),
+        trusted_mint_units: synthetic_trusted_mint_units(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
@@ -461,7 +484,7 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
             .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
-    let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
+    let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
 
     tokio::spawn(run_with_payments(
         listener,

@@ -1,5 +1,7 @@
 use crate::channel_store::ChannelStore;
-use crate::listener::{discover_spilman_mint_cache, SpilmanMintCache};
+use crate::listener::{
+    shared_spilman_mint_cache, SharedSpilmanMintCache, SpilmanMintCache, TrustedMintUnits,
+};
 use crate::payments::{RelayPayments, SpilmanRelayPayments};
 use cashu::nuts::{BlindedMessage, Proof, SecretKey, SwapRequest};
 use cdk_spilman::configurable_host::{
@@ -14,11 +16,11 @@ use cdk_spilman::{
     SpilmanAsyncNetworking,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 const CREATE_IDENTITIES_TABLE_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS monad_relay_wallet_identities (
@@ -145,6 +147,31 @@ impl DrainSwapNetworking for ReqwestNetworking {
                 .await
                 .map_err(|e| format!("Failed to read restore response: {e}"))
         })
+    }
+}
+
+struct RelayWalletCloseNetworking<'a, N> {
+    inner: &'a N,
+    wallet_manager: &'a RelayWalletManager,
+}
+
+#[async_trait::async_trait]
+impl<N: SpilmanAsyncNetworking + Sync> SpilmanAsyncNetworking
+    for RelayWalletCloseNetworking<'_, N>
+{
+    async fn call_mint_swap(
+        &self,
+        mint_url: &str,
+        swap_request_json: &str,
+    ) -> Result<String, String> {
+        self.inner.call_mint_swap(mint_url, swap_request_json).await
+    }
+
+    async fn refresh_all_keysets(&self, mint: &str) -> Result<(), String> {
+        self.wallet_manager
+            .refresh_keysets_into_shared_cache(mint)
+            .await?;
+        self.inner.refresh_all_keysets(mint).await
     }
 }
 
@@ -278,6 +305,8 @@ pub struct RelayWalletManager {
     storage: Arc<dyn SpilmanStorage>,
     metadata: Arc<ChannelMetadataStore>,
     identities: Arc<Mutex<HashMap<String, SecretKey>>>,
+    keyset_cache: SharedSpilmanMintCache,
+    trusted_mint_units: Arc<RwLock<TrustedMintUnits>>,
 }
 
 impl std::fmt::Debug for RelayWalletManager {
@@ -303,11 +332,15 @@ impl RelayWalletManager {
         );
         let metadata = Arc::new(ChannelMetadataStore::new(db_path.clone())?);
         let identities = Arc::new(Mutex::new(load_identities(&db_path)?));
+        let keyset_cache = shared_spilman_mint_cache(SpilmanMintCache::default());
+        let trusted_mint_units = Arc::new(RwLock::new(TrustedMintUnits::default()));
 
         Ok(Self {
             storage,
             metadata,
             identities,
+            keyset_cache,
+            trusted_mint_units,
         })
     }
 
@@ -364,18 +397,51 @@ impl RelayWalletManager {
         self.storage.as_ref()
     }
 
-    pub fn payments_for(
-        &self,
-        relay_name: &str,
-        mint_cache: SpilmanMintCache,
-    ) -> io::Result<Arc<dyn RelayPayments>> {
-        Ok(self.spilman_payments_for(relay_name, mint_cache)? as Arc<dyn RelayPayments>)
+    pub fn keyset_cache(&self) -> SharedSpilmanMintCache {
+        self.keyset_cache.clone()
     }
 
-    pub fn spilman_payments_for(
+    pub fn keyset_cache_snapshot(&self) -> SpilmanMintCache {
+        self.keyset_cache
+            .read()
+            .expect("relay wallet keyset cache lock poisoned")
+            .clone()
+    }
+
+    pub fn set_trusted_mint_units(&self, trusted_mint_units: TrustedMintUnits) {
+        *self
+            .trusted_mint_units
+            .write()
+            .expect("relay wallet trusted mint units lock poisoned") = trusted_mint_units;
+    }
+
+    pub fn trusted_mint_units(&self) -> TrustedMintUnits {
+        self.trusted_mint_units
+            .read()
+            .expect("relay wallet trusted mint units lock poisoned")
+            .clone()
+    }
+
+    /// Replace the manager's in-memory keyset cache with the supplied snapshot.
+    ///
+    /// Intended for test helpers and explicit admin bootstrap that already have
+    /// a trusted mint cache snapshot and need the wallet manager's own cache
+    /// (used by close/drain paths) to stay consistent with the relay session
+    /// cache.
+    pub fn install_keyset_cache(&self, cache: SpilmanMintCache) {
+        *self
+            .keyset_cache
+            .write()
+            .expect("relay wallet keyset cache lock poisoned") = cache;
+    }
+
+    pub fn payments_for(&self, relay_name: &str) -> io::Result<Arc<dyn RelayPayments>> {
+        Ok(self.spilman_payments_for_live(relay_name)? as Arc<dyn RelayPayments>)
+    }
+
+    pub fn spilman_payments_for_live(
         &self,
         relay_name: &str,
-        mint_cache: SpilmanMintCache,
     ) -> io::Result<Arc<SpilmanRelayPayments>> {
         let receiver_secret = self.receiver_secret(relay_name)?;
         let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
@@ -387,7 +453,30 @@ impl RelayWalletManager {
         );
         Ok(Arc::new(SpilmanRelayPayments::from_store(
             receiver_secret,
+            self.keyset_cache.clone(),
+            self.trusted_mint_units(),
+            store,
+        )))
+    }
+
+    pub fn spilman_payments_for(
+        &self,
+        relay_name: &str,
+        mint_cache: SpilmanMintCache,
+        trusted_mint_units: TrustedMintUnits,
+    ) -> io::Result<Arc<SpilmanRelayPayments>> {
+        let receiver_secret = self.receiver_secret(relay_name)?;
+        let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+        let store = ChannelStore::with_relay_metadata(
+            self.storage.clone(),
+            self.metadata.clone(),
+            relay_name.to_string(),
+            receiver_pubkey_hex,
+        );
+        Ok(Arc::new(SpilmanRelayPayments::from_store_with_snapshot(
+            receiver_secret,
             mint_cache,
+            trusted_mint_units,
             store,
         )))
     }
@@ -459,14 +548,18 @@ impl RelayWalletManager {
     /// identity owns it.  If the channel is already `Closed`, returns a
     /// synthetic success.  If it is `Closing`, completes the close.  Otherwise
     /// initiates and executes a unilateral close against the channel's mint.
-    pub async fn close_channel<N: SpilmanAsyncNetworking>(
+    pub async fn close_channel<N: SpilmanAsyncNetworking + Sync>(
         &self,
         channel_id: &str,
         net: &N,
     ) -> Result<CloseSuccess, CloseError> {
         let payments = self.payments_for_channel(channel_id).await?;
+        let net = RelayWalletCloseNetworking {
+            inner: net,
+            wallet_manager: self,
+        };
         payments
-            .close_channel_any_state_async(channel_id, net)
+            .close_channel_any_state_async(channel_id, &net)
             .await
     }
 
@@ -643,11 +736,10 @@ impl RelayWalletManager {
             .map_err(|e| format!("decode drains: {e}"))
     }
 
-    /// Fetch all keysets from a mint and persist them in the relay wallet cache.
+    /// Fetch all keysets from a mint and persist them in SQLite.
     ///
-    /// This is intended for infrequent wallet/admin operations such as drains.
-    /// Normal sessions use the relay's in-memory advertised mint cache and do
-    /// not refresh keysets per session.
+    /// Use [`Self::refresh_keysets_into_shared_cache`] when the caller also
+    /// needs existing live payment/session objects to observe the new keysets.
     pub async fn refresh_keysets_from_mint(
         &self,
         mint_url: &str,
@@ -655,6 +747,45 @@ impl RelayWalletManager {
         let keysets = fetch_all_keysets_from_mint(mint_url).await?;
         cache_relay_keysets(self.storage.as_ref(), mint_url, &keysets)?;
         Ok(keysets)
+    }
+
+    /// Refresh one mint into SQLite and merge the result into the shared memory
+    /// cache used by live relay payment objects.
+    ///
+    /// Channel close uses this from the upstream keyset-error retry hook: the
+    /// first close attempt is cache-first, then a retry refreshes this mint and
+    /// re-prepares the swap against the updated shared cache.
+    pub async fn refresh_keysets_into_shared_cache(&self, mint_url: &str) -> Result<(), String> {
+        let keysets = self.refresh_keysets_from_mint(mint_url).await?;
+        let mut cache = self
+            .keyset_cache
+            .write()
+            .expect("relay wallet keyset cache lock poisoned");
+        merge_keysets_into_cache(&mut cache, mint_url, &keysets);
+        Ok(())
+    }
+
+    /// Rebuild the shared keyset cache from the currently configured trusted
+    /// mint URLs, storing every keyset those mints report.
+    ///
+    /// The trusted unit map is saved separately and filters advertisements and
+    /// incoming channel acceptance at read time.
+    pub async fn refresh_trusted_mint_cache(
+        &self,
+        trusted_mint_units: &TrustedMintUnits,
+    ) -> Result<SharedSpilmanMintCache, String> {
+        let mut refreshed = SpilmanMintCache::default();
+        for mint_url in trusted_mint_units.keys() {
+            let keysets = fetch_all_keysets_from_mint(mint_url).await?;
+            cache_relay_keysets(self.storage.as_ref(), mint_url, &keysets)?;
+            merge_keysets_into_cache(&mut refreshed, mint_url, &keysets);
+        }
+        *self
+            .keyset_cache
+            .write()
+            .expect("relay wallet keyset cache lock poisoned") = refreshed;
+        self.set_trusted_mint_units(trusted_mint_units.clone());
+        Ok(self.keyset_cache.clone())
     }
 
     fn closed_drain_candidates(
@@ -952,24 +1083,6 @@ impl RelayWalletManager {
         &self,
         channel_id: &str,
     ) -> Result<Arc<SpilmanRelayPayments>, CloseError> {
-        let (_receiver_secret, mint_url, unit) =
-            self.channel_owner_and_mint(channel_id)
-                .map_err(|e| CloseError::StorageFailed {
-                    reason: e,
-                    status: 500,
-                })?;
-
-        let mut trusted_mint_units = std::collections::BTreeMap::new();
-        let mut units = BTreeSet::new();
-        units.insert(unit);
-        trusted_mint_units.insert(mint_url, units);
-        let mint_cache = discover_spilman_mint_cache(&trusted_mint_units)
-            .await
-            .map_err(|e| CloseError::StorageFailed {
-                reason: format!("discover keysets: {e}"),
-                status: 500,
-            })?;
-
         let relay_name = self
             .metadata
             .relay_name_for_channel(channel_id)
@@ -984,7 +1097,7 @@ impl RelayWalletManager {
                 actual_balance: None,
             })?;
 
-        self.spilman_payments_for(&relay_name, mint_cache)
+        self.spilman_payments_for_live(&relay_name)
             .map_err(|e| CloseError::StorageFailed {
                 reason: format!("build payments for relay '{relay_name}': {e}"),
                 status: 500,
@@ -1039,7 +1152,8 @@ impl RelayWalletManager {
         mint_url: &str,
         unit: &str,
     ) -> Result<DrainKeysets, String> {
-        let keysets = self.refresh_keysets_from_mint(mint_url).await?;
+        let keysets = fetch_all_keysets_from_mint(mint_url).await?;
+        cache_relay_keysets(self.storage.as_ref(), mint_url, &keysets)?;
         drain_keysets_from_fetched(mint_url, unit, keysets)
     }
 }
@@ -1079,6 +1193,55 @@ fn drain_keysets_from_fetched(
         output_keyset_info_json,
         input_fee_ppk_by_keyset,
     })
+}
+
+pub(crate) fn merge_keysets_into_cache(
+    cache: &mut SpilmanMintCache,
+    mint_url: &str,
+    keysets: &[MintKeysetWithKeys],
+) {
+    use crate::listener::CachedKeyset;
+
+    let mut by_unit = BTreeMap::<String, Vec<String>>::new();
+    let mut by_id = BTreeMap::<String, CachedKeyset>::new();
+    for keyset in keysets {
+        let unit = keyset.unit.to_string();
+        let id = keyset.id.to_string();
+        by_unit.entry(unit.clone()).or_default().push(id.clone());
+        by_id.insert(
+            id,
+            CachedKeyset {
+                unit,
+                active: keyset.active,
+                info_json: build_keyset_info_json(
+                    &keyset.id,
+                    &keyset.unit,
+                    &keyset.keys,
+                    keyset.input_fee_ppk,
+                ),
+            },
+        );
+    }
+    for ids in by_unit.values_mut() {
+        ids.sort();
+        ids.dedup();
+    }
+
+    // Merge into existing per-mint entries rather than replacing them, so
+    // fetching one mint does not drop previously cached units for the same mint.
+    let unit_entry = cache.advertised.entry(mint_url.to_string()).or_default();
+    for (unit, ids) in by_unit {
+        let existing = unit_entry.entry(unit).or_default();
+        existing.extend(ids);
+        existing.sort();
+        existing.dedup();
+    }
+
+    cache
+        .keysets
+        .entry(mint_url.to_string())
+        .or_default()
+        .extend(by_id);
 }
 
 pub(crate) fn cache_relay_keysets(
@@ -1206,6 +1369,105 @@ fn u64_from_i64(value: i64) -> rusqlite::Result<u64> {
             )),
         )
     })
+}
+
+#[cfg(test)]
+mod close_networking_tests {
+    use super::*;
+    use cdk_spilman_test_mint::{build_router, rotate_sat_keyset, TestMintHelper};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    struct RefreshSpy {
+        refreshes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SpilmanAsyncNetworking for RefreshSpy {
+        async fn call_mint_swap(
+            &self,
+            _mint_url: &str,
+            _swap_request_json: &str,
+        ) -> Result<String, String> {
+            Err("unused".to_string())
+        }
+
+        async fn refresh_all_keysets(&self, _mint: &str) -> Result<(), String> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn close_networking_refresh_updates_manager_cache_and_delegates() {
+        let mint_helper = TestMintHelper::new().await.unwrap();
+        let mint = mint_helper.mint();
+        let old_keyset_id = mint_helper.keyset_id().to_string();
+        let new_keyset_id = rotate_sat_keyset(&mint, 123).await.unwrap().to_string();
+        assert_ne!(old_keyset_id, new_keyset_id);
+
+        let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mint_addr = mint_listener.local_addr().unwrap();
+        let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+        let mint_router = build_router(mint).await.unwrap();
+        let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(mint_listener, mint_router)
+                .with_graceful_shutdown(async {
+                    let _ = mint_shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
+        let inner = RefreshSpy {
+            refreshes: AtomicUsize::new(0),
+        };
+        let wrapper = RelayWalletCloseNetworking {
+            inner: &inner,
+            wallet_manager: &manager,
+        };
+
+        wrapper.refresh_all_keysets(&mint_url).await.unwrap();
+        assert_eq!(inner.refreshes.load(Ordering::SeqCst), 1);
+
+        let old_id = old_keyset_id.parse().unwrap();
+        let new_id = new_keyset_id.parse().unwrap();
+        let old_cached = manager
+            .spilman_storage()
+            .get_keyset(&mint_url, &old_id)
+            .expect("old keyset cached");
+        let new_cached = manager
+            .spilman_storage()
+            .get_keyset(&mint_url, &new_id)
+            .expect("new keyset cached");
+        assert!(!old_cached.active);
+        assert!(new_cached.active);
+
+        // Upstream close retry re-prepares the close with the same payments
+        // object, so the wrapper must update the shared cache it reads from.
+        let snapshot = manager.keyset_cache_snapshot();
+        let cached_keysets = snapshot
+            .keysets
+            .get(&mint_url)
+            .expect("mint keysets cached in shared cache");
+        assert!(
+            !cached_keysets
+                .get(&old_keyset_id)
+                .expect("old keyset in shared cache")
+                .active
+        );
+        assert!(
+            cached_keysets
+                .get(&new_keyset_id)
+                .expect("new keyset in shared cache")
+                .active
+        );
+
+        let _ = mint_shutdown_tx.send(());
+    }
 }
 
 pub(crate) fn build_reqwest_networking(

@@ -1,5 +1,7 @@
 use crate::channel_store::ChannelStore;
-use crate::listener::SpilmanMintCache;
+use crate::listener::{
+    shared_spilman_mint_cache, SharedSpilmanMintCache, SpilmanMintCache, TrustedMintUnits,
+};
 use cashu::nuts::{CurrencyUnit, Id, PublicKey, SecretKey};
 use cdk_spilman::{
     compute_channel_secret_from_hex,
@@ -9,8 +11,8 @@ use cdk_spilman::{
     SpilmanBridge, SpilmanHost, SpilmanNetworking,
 };
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
+use std::collections::BTreeSet;
 use std::fmt;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -188,7 +190,8 @@ enum PaymentContext {
 #[derive(Debug, Clone)]
 struct MonadHost {
     receiver_secret: SecretKey,
-    mint_cache: SpilmanMintCache,
+    mint_cache: SharedSpilmanMintCache,
+    trusted_mint_units: TrustedMintUnits,
     store: ChannelStore,
 }
 
@@ -202,25 +205,47 @@ impl SpilmanRelayPayments {
     pub fn new(
         receiver_secret: SecretKey,
         mint_cache: SpilmanMintCache,
+        trusted_mint_units: TrustedMintUnits,
         storage: Arc<dyn SpilmanStorage>,
     ) -> Self {
-        Self::from_store(receiver_secret, mint_cache, ChannelStore::new(storage))
+        Self::from_store(
+            receiver_secret,
+            shared_spilman_mint_cache(mint_cache),
+            trusted_mint_units,
+            ChannelStore::new(storage),
+        )
     }
 
     pub(crate) fn from_store(
         receiver_secret: SecretKey,
-        mint_cache: SpilmanMintCache,
+        mint_cache: SharedSpilmanMintCache,
+        trusted_mint_units: TrustedMintUnits,
         store: ChannelStore,
     ) -> Self {
         let host = MonadHost {
             receiver_secret,
             mint_cache,
+            trusted_mint_units,
             store: store.clone(),
         };
         Self {
             bridge: SpilmanBridge::new(host),
             store,
         }
+    }
+
+    pub(crate) fn from_store_with_snapshot(
+        receiver_secret: SecretKey,
+        mint_cache: SpilmanMintCache,
+        trusted_mint_units: TrustedMintUnits,
+        store: ChannelStore,
+    ) -> Self {
+        Self::from_store(
+            receiver_secret,
+            shared_spilman_mint_cache(mint_cache),
+            trusted_mint_units,
+            store,
+        )
     }
 
     pub fn close_channel<N: SpilmanNetworking>(
@@ -396,10 +421,15 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     }
 
     fn mint_and_keyset_is_acceptable(&self, mint: &str, keyset_id: &Id) -> bool {
-        self.mint_cache
-            .keyset_info_json_by_mint
+        let trusted_units = self
+            .trusted_mint_units
             .get(mint)
-            .is_some_and(|by_id| by_id.contains_key(&keyset_id.to_string()))
+            .cloned()
+            .unwrap_or_else(BTreeSet::new);
+        self.mint_cache
+            .read()
+            .expect("spilman mint cache lock poisoned")
+            .is_acceptable(mint, keyset_id, &trusted_units)
     }
 
     fn get_funding(&self, channel_id: &str) -> Option<ChannelFunding> {
@@ -491,27 +521,20 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     }
 
     fn get_active_keyset_ids(&self, mint: &str, unit: &CurrencyUnit) -> Vec<Id> {
-        // The upstream hook is named "active", but MONAD advertises/accepts
-        // all trusted known keysets for a mint/unit, including inactive keysets,
-        // so existing channels funded by old keysets remain usable. Code that
-        // creates a new mint swap must independently refresh mint state and
-        // select an active output keyset.
+        // Upstream calls this hook to choose an output keyset for swaps.
+        // Output keyset choice only needs the mint's current active keyset for
+        // the channel unit; relay advertisement/acceptance policy is separate.
         self.mint_cache
-            .advertised
-            .get(mint)
-            .and_then(|units| units.get(&unit.to_string()))
-            .into_iter()
-            .flatten()
-            .filter_map(|id| Id::from_str(id).ok())
-            .collect()
+            .read()
+            .expect("spilman mint cache lock poisoned")
+            .active_keyset_ids(mint, &unit.to_string())
     }
 
     fn get_keyset_info(&self, mint: &str, keyset_id: &Id) -> Option<String> {
         self.mint_cache
-            .keyset_info_json_by_mint
-            .get(mint)
-            .and_then(|by_id| by_id.get(&keyset_id.to_string()))
-            .cloned()
+            .read()
+            .expect("spilman mint cache lock poisoned")
+            .keyset_info_json(mint, keyset_id)
     }
 
     fn mark_channel_closed(

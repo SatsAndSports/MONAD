@@ -13,7 +13,7 @@ It provides:
 ## Status
 
 Implemented today:
-- `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, discovers trusted mint keysets at startup, and persists relay-side Spilman channel state in SQLite
+- `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, keeps a shared in-memory cache of configured mint keysets, and persists relay-side Spilman channel state in SQLite
 - `monad-client`: provides the reusable selector / wallet / session-driver client library pieces for relay session funding and multi-hop connection setup
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
@@ -163,6 +163,8 @@ Current coverage includes:
 - relay advertises multiple mint/unit pricing options
 - control detach releases linked channels and tears down active / future streams
 - changing a relay's current trusted mint policy stops new advertisement/acceptance for that mint without invalidating previously stored channels
+
+Relay keyset handling is deliberately simple: each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy only when advertising options or accepting incoming channel funding/payments. Channel close starts from the shared cache; if the mint rejects a close swap with a keyset error, the close retry path refreshes that mint into SQLite and the shared cache before re-preparing the swap.
 
 ## Payment Code Map
 

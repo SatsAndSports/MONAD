@@ -64,7 +64,7 @@ Responsibilities:
   - `POST /control`
   - `CONNECT host:port`
 - proxy bytes between H2 streams and external TCP targets
-- discover trusted mint keysets at startup (`SpilmanMintCache`), caching keyset info JSON; the trusted mint/units list comes from the relay's YAML config
+- populate a shared relay-wallet `SpilmanMintCache` from configured mint URLs, caching all keysets returned by those mints; trusted mint/unit policy comes from the relay's YAML config and is applied at advertisement/acceptance read sites
 - advertise receiver pubkey and trusted mints/keysets in `SessionStatus`
   (per-(mint, unit) rate configuration is planned; today every advertisement
   carries the session's global default rates)
@@ -493,6 +493,8 @@ MONAD integrates Cashu Spilman payment channels for per-session prepaid relay ac
 #### 1. Server Advertisement
 The relay is configured with a map of `Mint -> Unit -> Rates`. In the `SessionStatus` message, it advertises these options to the client as a list of `KeysetAdvertisement` objects. Each option includes the `in_bytes_per_millisat` and `out_bytes_per_millisat` specific to that mint/unit choice.
 
+The relay wallet manager owns a shared in-memory `SpilmanMintCache`. The cache stores all keysets returned by configured mints, active and inactive, for all units the mint reports. Trusted mint/unit policy filters what is advertised and what incoming channel funding/payment keysets are accepted; it does not mean the cache only stores trusted units. Channel close uses the same shared cache and relies on the Spilman close retry path to refresh that mint into SQLite and memory if the mint rejects the first close swap because of stale keyset state.
+
 #### 2. Channel Linking
 The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs. If the bootstrap did not negotiate a supported Cashu Spilman channel protocol version, the relay rejects linking immediately.
 - **One Session Per Channel**: The relay maintains a global registry of `ChannelId -> SessionId`.
@@ -537,7 +539,7 @@ That manager owns:
 
 - the shared SQLite relay-wallet database
 - the registry of `relay_wallet_name -> Cashu receiver key`
-- one cached `SpilmanRelayPayments` instance per relay wallet name
+- the shared in-memory mint keyset cache used by sessions and wallet close paths
 
 This lets one MONAD process host multiple relays with different receiver keys
 while still sharing one persistent relay-wallet DB. Transport identity remains a

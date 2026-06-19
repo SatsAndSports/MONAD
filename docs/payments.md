@@ -57,6 +57,26 @@ The client is authoritative for local intent and local authorization:
 The client does not treat its local estimate as accepted relay state. It uses
 that estimate only to decide when and how much to pay.
 
+## Relay Keyset Model
+
+The relay wallet manager owns one shared in-memory `SpilmanMintCache` plus the
+SQLite-backed relay wallet database.
+
+The in-memory cache stores all keysets returned by configured mints: all units,
+active and inactive. The relay's trusted mint/unit policy is applied when reading
+from that cache, not when storing it.
+
+Consequences:
+
+- `SessionStatus` advertises only configured trusted mint/unit options.
+- `ChannelLink` / `ChannelPayment` accept only known keysets that belong to a trusted unit for that mint.
+- old inactive keysets can remain usable for existing channels as long as the keyset metadata is known.
+- channel close starts from the shared cache and refreshes that mint into SQLite and memory only if the mint rejects the close swap with a keyset error.
+
+Drain swap preparation is the current exception: drains proactively fetch current
+mint keysets before building the drain swap because drains are rare wallet-admin
+operations and need current input fee / active output keyset metadata.
+
 ## Funding Lifecycle
 
 For one relay session, the client funding flow is:

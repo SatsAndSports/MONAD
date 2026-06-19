@@ -51,7 +51,8 @@ use monad_quic::client::{build_client_config_for_auth, connect_with_auth, Client
 use monad_relay::config::RelayConfig;
 use monad_relay::listener::{
     discover_spilman_mint_cache, discover_spilman_mint_cache_with_storage, run_with_payments,
-    run_with_payments_and_registry_and_shutdown, ServerConfig, SpilmanMintCache,
+    run_with_payments_and_registry_and_shutdown, shared_spilman_mint_cache, CachedKeyset,
+    ServerConfig, SpilmanMintCache,
 };
 use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
 use monad_relay::quic_pool::QuicPool;
@@ -196,17 +197,49 @@ async fn bind_tcp_and_quic_on_same_port(
 }
 
 fn synthetic_test_mint_cache() -> SpilmanMintCache {
-    let mut advertised = BTreeMap::new();
-    advertised.insert(
+    mint_cache_with_keyset(
+        SYNTHETIC_TEST_MINT_URL,
+        SYNTHETIC_TEST_MINT_UNIT,
+        SYNTHETIC_TEST_KEYSET_ID,
+        r#"{"keysetId":"00testkeyset0000","unit":"msat","keys":{},"inputFeePpk":0}"#,
+        true,
+    )
+}
+
+fn synthetic_trusted_mint_units() -> BTreeMap<String, BTreeSet<String>> {
+    BTreeMap::from([(
         SYNTHETIC_TEST_MINT_URL.to_string(),
-        BTreeMap::from([(
-            SYNTHETIC_TEST_MINT_UNIT.to_string(),
-            vec![SYNTHETIC_TEST_KEYSET_ID.to_string()],
-        )]),
-    );
+        BTreeSet::from([SYNTHETIC_TEST_MINT_UNIT.to_string()]),
+    )])
+}
+
+fn mint_cache_with_keyset(
+    mint_url: impl Into<String>,
+    unit: impl Into<String>,
+    keyset_id: impl Into<String>,
+    keyset_info_json: impl Into<String>,
+    active: bool,
+) -> SpilmanMintCache {
+    let mint_url = mint_url.into();
+    let unit = unit.into();
+    let keyset_id = keyset_id.into();
+    let info_json = keyset_info_json.into();
     SpilmanMintCache {
-        advertised,
-        keyset_info_json_by_mint: BTreeMap::new(),
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(unit.clone(), vec![keyset_id.clone()])]),
+        )]),
+        keysets: BTreeMap::from([(
+            mint_url,
+            BTreeMap::from([(
+                keyset_id,
+                CachedKeyset {
+                    unit,
+                    active,
+                    info_json,
+                },
+            )]),
+        )]),
     }
 }
 
@@ -233,7 +266,7 @@ async fn start_monad_relay_with_transport_key_and_capabilities(
         identity,
         transport_key: Some(transport_key),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
-        trusted_mint_units: BTreeMap::new(),
+        trusted_mint_units: synthetic_trusted_mint_units(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
         bootstrap_capabilities: Some(bootstrap_capabilities),
@@ -246,7 +279,8 @@ async fn start_monad_relay_with_transport_key_and_capabilities(
             .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
-    let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
+
+    let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
 
     tokio::spawn(run_with_payments(
         listener,
@@ -289,7 +323,7 @@ async fn start_monad_relay_with_test_payments() -> (
         identity,
         transport_key: Some(transport_key),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
-        trusted_mint_units: BTreeMap::new(),
+        trusted_mint_units: synthetic_trusted_mint_units(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
@@ -302,7 +336,7 @@ async fn start_monad_relay_with_test_payments() -> (
             .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
-    let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
+    let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
 
     tokio::spawn(run_with_payments(
         listener,
@@ -352,7 +386,7 @@ async fn start_monad_relay_with_spilman(
             .to_string(),
     });
 
-    let discovered_spilman_mint_cache = Arc::new(
+    let discovered_spilman_mint_cache = shared_spilman_mint_cache(
         discover_spilman_mint_cache(&config.trusted_mint_units)
             .await
             .unwrap(),
@@ -416,7 +450,7 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
         identity,
         transport_key: Some(transport_key),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
-        trusted_mint_units: BTreeMap::new(),
+        trusted_mint_units: synthetic_trusted_mint_units(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
         bootstrap_capabilities: None,
@@ -429,7 +463,7 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
             .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
-    let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
+    let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
 
     tokio::spawn(run_with_payments(
         listener,
@@ -494,6 +528,12 @@ async fn start_managed_persistent_relay(
 )> {
     wallet_manager.register_identity(wallet_name, payment_receiver_secret.clone())?;
 
+    // Install the supplied cache snapshot into the wallet manager so that
+    // manager-driven close/drain paths use the same trusted keyset view as the
+    // relay sessions they serve.
+    wallet_manager.install_keyset_cache(mint_cache);
+    wallet_manager.set_trusted_mint_units(trusted_mint_units.clone());
+
     let identity = QuicCertIdentity::generate().unwrap();
     let pubkey = transport_key.pubkey();
     let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
@@ -514,9 +554,9 @@ async fn start_managed_persistent_relay(
         spilman_storage_path: String::new(),
     });
 
-    let payments = wallet_manager.spilman_payments_for(wallet_name, mint_cache.clone())?;
+    let payments = wallet_manager.spilman_payments_for_live(wallet_name)?;
     let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
-    let mint_cache = Arc::new(mint_cache);
+    let mint_cache = wallet_manager.keyset_cache();
     let session_registry = Arc::new(SessionRegistry::new());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -570,6 +610,7 @@ async fn start_relay_from_config(
 
     let receiver_pubkey_hex = wallet_manager.receiver_pubkey_hex(&relay_config.name)?;
     let trusted_mint_units = relay_config.trusted_mint_units();
+    wallet_manager.set_trusted_mint_units(trusted_mint_units.clone());
 
     let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
     let quic_server_config =
@@ -593,9 +634,13 @@ async fn start_relay_from_config(
         spilman_storage_path: relay_config.wallet_db_path.clone(),
     });
 
-    let payments = wallet_manager.spilman_payments_for(&relay_config.name, mint_cache.clone())?;
+    let payments = wallet_manager.spilman_payments_for(
+        &relay_config.name,
+        mint_cache.clone(),
+        relay_config.trusted_mint_units(),
+    )?;
     let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
-    let mint_cache = Arc::new(mint_cache);
+    let mint_cache = shared_spilman_mint_cache(mint_cache);
     let session_registry = Arc::new(SessionRegistry::new());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -790,16 +835,10 @@ impl DrainTestContext {
 
         let keyset_id = mint_helper.keyset_id().to_string();
         let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-        let mint_cache = SpilmanMintCache {
-            advertised: BTreeMap::from([(
-                mint_url.clone(),
-                BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-            )]),
-            keyset_info_json_by_mint: BTreeMap::from([(
-                mint_url.clone(),
-                BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-            )]),
-        };
+        let mint_cache =
+            mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+        let trusted_mint_units =
+            BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
         let temp_db = tempfile::NamedTempFile::new().unwrap();
         let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
         let receiver_secret = cashu::nuts::SecretKey::generate();
@@ -808,7 +847,7 @@ impl DrainTestContext {
             .register_identity(relay_name, receiver_secret)
             .unwrap();
         let payments = wallet_manager
-            .spilman_payments_for(relay_name, mint_cache)
+            .spilman_payments_for(relay_name, mint_cache, trusted_mint_units)
             .unwrap();
         let wallet = TestSigningWallet::new(
             mint_helper.mint(),
@@ -3359,16 +3398,7 @@ async fn test_two_relays_share_one_wallet_manager_db() {
     let mint_url = "https://test-mint.invalid".to_string();
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
     let trusted_mint_units =
         BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
 
@@ -3551,16 +3581,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     let mint_url = "https://test-mint.invalid".to_string();
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
     let trusted_mint_units =
         BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
 
@@ -3762,16 +3783,8 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
     let mint_url = "https://test-mint.invalid".to_string();
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let allowed_mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let allowed_mint_cache =
+        mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
     let allowed_trusted_mint_units =
         BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
 
@@ -3968,16 +3981,13 @@ async fn test_channel_link_rejects_unaccepted_funding_keyset() {
         .fetch_keyset_info(&mint_url, &rejected_keyset_id)
         .expect("fetch rejected keyset info");
 
-    let accepted_mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![accepted_keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(accepted_keyset_id.clone(), accepted_keyset_info_json)]),
-        )]),
-    };
+    let accepted_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &accepted_keyset_id,
+        accepted_keyset_info_json,
+        true,
+    );
     let trusted_mint_units =
         BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
 
@@ -4064,16 +4074,7 @@ async fn test_relay_starts_from_yaml_config_and_advertises_configured_mints() {
     let mint_url = "https://test-mint.invalid".to_string();
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
 
     let temp_dir = tempfile::tempdir().unwrap();
     let config_path = temp_dir.path().join("relay.yaml");
@@ -4145,16 +4146,7 @@ async fn test_yaml_config_allows_distinct_per_relay_pricing() {
     let mint_url = "https://test-mint.invalid".to_string();
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
 
     let temp_dir = tempfile::tempdir().unwrap();
     let config_path = temp_dir.path().join("relay.yaml");
@@ -4276,16 +4268,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     let mint_url = "https://test-mint.invalid".to_string();
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
     let trusted_mint_units =
         BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
 
@@ -4481,16 +4464,7 @@ async fn test_wallet_manager_close_channel_by_id() {
     });
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
     let trusted_mint_units =
         BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
 
@@ -4619,16 +4593,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     });
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
     let trusted_mint_units =
         BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
 
@@ -4781,16 +4746,9 @@ async fn test_wallet_manager_drain_swap_combines_multiple_closed_channels() {
 
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
     let temp_db = tempfile::NamedTempFile::new().unwrap();
     let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
     let receiver_secret = cashu::nuts::SecretKey::generate();
@@ -4799,7 +4757,7 @@ async fn test_wallet_manager_drain_swap_combines_multiple_closed_channels() {
         .register_identity("drain-relay", receiver_secret)
         .unwrap();
     let payments = wallet_manager
-        .spilman_payments_for("drain-relay", mint_cache)
+        .spilman_payments_for("drain-relay", mint_cache, trusted_mint_units)
         .unwrap();
     let wallet = TestSigningWallet::new(
         mint_helper.mint(),
@@ -4870,16 +4828,9 @@ async fn test_wallet_manager_drain_swap_recovers_after_ambiguous_submission() {
 
     let keyset_id = mint_helper.keyset_id().to_string();
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
-    let mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
-        )]),
-    };
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
     let temp_db = tempfile::NamedTempFile::new().unwrap();
     let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
     let receiver_secret = cashu::nuts::SecretKey::generate();
@@ -4888,7 +4839,7 @@ async fn test_wallet_manager_drain_swap_recovers_after_ambiguous_submission() {
         .register_identity("drain-recovery-relay", receiver_secret)
         .unwrap();
     let payments = wallet_manager
-        .spilman_payments_for("drain-recovery-relay", mint_cache)
+        .spilman_payments_for("drain-recovery-relay", mint_cache, trusted_mint_units)
         .unwrap();
     let wallet = TestSigningWallet::new(
         mint_helper.mint(),
@@ -5221,6 +5172,8 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
 
     let old_keyset_id = mint_helper.keyset_id().to_string();
     let old_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
     let receiver_secret = cashu::nuts::SecretKey::generate();
     let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
     let temp_db = tempfile::NamedTempFile::new().unwrap();
@@ -5229,18 +5182,19 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
         .register_identity("mixed-keyset-drain-relay", receiver_secret)
         .unwrap();
 
-    let old_mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![old_keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(old_keyset_id.clone(), old_keyset_info_json.clone())]),
-        )]),
-    };
+    let old_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &old_keyset_id,
+        &old_keyset_info_json,
+        true,
+    );
     let old_payments = wallet_manager
-        .spilman_payments_for("mixed-keyset-drain-relay", old_mint_cache)
+        .spilman_payments_for(
+            "mixed-keyset-drain-relay",
+            old_mint_cache,
+            trusted_mint_units.clone(),
+        )
         .unwrap();
     let old_wallet = TestSigningWallet::new(
         mint.clone(),
@@ -5277,18 +5231,19 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
     let new_keyset_info_json = client_bridge
         .fetch_keyset_info(&mint_url, &new_keyset_id)
         .expect("fetch rotated keyset info");
-    let new_mint_cache = SpilmanMintCache {
-        advertised: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([("sat".to_string(), vec![new_keyset_id.clone()])]),
-        )]),
-        keyset_info_json_by_mint: BTreeMap::from([(
-            mint_url.clone(),
-            BTreeMap::from([(new_keyset_id.clone(), new_keyset_info_json.clone())]),
-        )]),
-    };
+    let new_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &new_keyset_id,
+        &new_keyset_info_json,
+        true,
+    );
     let new_payments = wallet_manager
-        .spilman_payments_for("mixed-keyset-drain-relay", new_mint_cache)
+        .spilman_payments_for(
+            "mixed-keyset-drain-relay",
+            new_mint_cache,
+            trusted_mint_units,
+        )
         .unwrap();
     let new_wallet = TestSigningWallet::new(
         mint.clone(),
@@ -5418,6 +5373,109 @@ async fn test_relay_startup_discovery_persists_keysets_to_sqlite_cache() {
     assert!(new_cached.active);
 
     let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_status_reflects_manager_keyset_refresh_mid_session() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint = mint_helper.mint();
+    let old_keyset_id = mint_helper.keyset_id().to_string();
+
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint.clone()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    wallet_manager
+        .register_identity("live-cache-relay", receiver_secret)
+        .unwrap();
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let shared_cache = wallet_manager
+        .refresh_trusted_mint_cache(&trusted_mint_units)
+        .await
+        .unwrap();
+
+    let identity = QuicCertIdentity::generate().unwrap();
+    let transport_key = SecpTransportKeypair::generate();
+    let transport_pubkey = transport_key.pubkey();
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let (listener, quic_endpoint, server_addr) =
+        bind_tcp_and_quic_on_same_port("127.0.0.1:0".parse().unwrap(), quic_server_config)
+            .await
+            .unwrap();
+    let config = Arc::new(ServerConfig {
+        identity,
+        transport_key: Some(transport_key),
+        receiver_pubkey_hex,
+        trusted_mint_units: trusted_mint_units.clone(),
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
+        relay_wallet_name: "live-cache-relay".to_string(),
+        spilman_storage_path: temp_db.path().to_str().unwrap().to_string(),
+    });
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let payments = wallet_manager.payments_for("live-cache-relay").unwrap();
+    let handle = tokio::spawn(run_with_payments_and_registry_and_shutdown(
+        listener,
+        Some(quic_endpoint),
+        config,
+        payments,
+        shared_cache,
+        Arc::new(SessionRegistry::new()),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let conn = connect_client_quic_secp(server_addr, &transport_pubkey).await;
+    let mut control = ControlSessionHarness::open(&conn).await;
+    let initial = control.handshake().await;
+    let initial_sat = initial
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("initial sat advertisement");
+    assert!(initial_sat.keyset_ids.contains(&old_keyset_id));
+
+    let new_keyset_id = rotate_sat_keyset(&mint, 250).await.unwrap().to_string();
+    assert_ne!(old_keyset_id, new_keyset_id);
+    wallet_manager
+        .refresh_trusted_mint_cache(&trusted_mint_units)
+        .await
+        .unwrap();
+
+    let refreshed = control.get_status().await;
+    let refreshed_sat = refreshed
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("refreshed sat advertisement");
+    assert!(refreshed_sat.keyset_ids.contains(&old_keyset_id));
+    assert!(refreshed_sat.keyset_ids.contains(&new_keyset_id));
+
+    control.close().await;
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    let _ = mint_shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
 }
 
 #[tokio::test]

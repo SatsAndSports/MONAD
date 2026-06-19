@@ -9,10 +9,13 @@ use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::{RelayConnection, SessionPricing, SessionSpilmanInfo};
 use monad_quic::client::ClientAuthMode;
 use monad_quic::pool::QuicPool;
-use monad_relay::listener::{run_with_payments_and_registry, ServerConfig, SpilmanMintCache};
+use monad_relay::listener::{
+    run_with_payments_and_registry, shared_spilman_mint_cache, CachedKeyset, ServerConfig,
+    SpilmanMintCache,
+};
 use monad_relay::payments::testing::InMemoryRelayPayments;
 use monad_relay::session_registry::SessionRegistry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -549,7 +552,7 @@ async fn spawn_relay_task(
         identity: QuicCertIdentity::from_seed(*identity.seed())?,
         transport_key: Some(transport_key.clone()),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
-        trusted_mint_units: BTreeMap::new(),
+        trusted_mint_units: synthetic_trusted_mint_units(),
         in_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
         out_bytes_per_millisat: DEFAULT_BYTES_PER_MILLISAT,
         bootstrap_capabilities: None,
@@ -560,7 +563,7 @@ async fn spawn_relay_task(
             .to_string(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
-    let synthetic_mint_cache = Arc::new(synthetic_test_mint_cache());
+    let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
     let session_registry = Arc::new(SessionRegistry::new());
 
     Ok((
@@ -586,10 +589,31 @@ fn synthetic_test_mint_cache() -> SpilmanMintCache {
             vec![SYNTHETIC_TEST_KEYSET_ID.to_string()],
         )]),
     );
+    let mut keysets = BTreeMap::new();
+    keysets.insert(
+        SYNTHETIC_TEST_MINT_URL.to_string(),
+        BTreeMap::from([(
+            SYNTHETIC_TEST_KEYSET_ID.to_string(),
+            CachedKeyset {
+                unit: SYNTHETIC_TEST_MINT_UNIT.to_string(),
+                active: true,
+                info_json:
+                    r#"{"keysetId":"00testkeyset0000","unit":"msat","keys":{},"inputFeePpk":0}"#
+                        .to_string(),
+            },
+        )]),
+    );
     SpilmanMintCache {
         advertised,
-        keyset_info_json_by_mint: BTreeMap::new(),
+        keysets,
     }
+}
+
+fn synthetic_trusted_mint_units() -> BTreeMap<String, BTreeSet<String>> {
+    BTreeMap::from([(
+        SYNTHETIC_TEST_MINT_URL.to_string(),
+        BTreeSet::from([SYNTHETIC_TEST_MINT_UNIT.to_string()]),
+    )])
 }
 
 async fn bind_tcp_and_quic_on_same_port(

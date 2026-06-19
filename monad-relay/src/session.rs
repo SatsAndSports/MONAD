@@ -5,7 +5,7 @@
 //! `POST /control` stream is used to fund and observe the whole session.
 
 use crate::control_driver::ControlDriver;
-use crate::listener::SpilmanMintCache;
+use crate::listener::{SharedSpilmanMintCache, TrustedMintUnits};
 use crate::payments::RelayPayments;
 use crate::proxy;
 use crate::quic_pool::QuicPool;
@@ -136,7 +136,8 @@ pub(crate) struct SessionState {
     session_registry: Arc<SessionRegistry>,
     transport_key: SecpTransportKeypair,
     receiver_pubkey_hex: String,
-    spilman_mint_cache: SpilmanMintCache,
+    spilman_mint_cache: SharedSpilmanMintCache,
+    trusted_mint_units: TrustedMintUnits,
     cashu_spilman_protocol_version: Option<String>,
 }
 
@@ -174,6 +175,7 @@ impl SessionState {
             transport_key: config.transport_key.clone(),
             receiver_pubkey_hex: config.receiver_pubkey_hex.clone(),
             spilman_mint_cache: config.spilman_mint_cache.clone(),
+            trusted_mint_units: config.trusted_mint_units.clone(),
             cashu_spilman_protocol_version: config.cashu_spilman_protocol_version.clone(),
         }
     }
@@ -242,12 +244,21 @@ impl SessionState {
         let (open_connects, total_connects) = self.counters.snapshot();
 
         let mut advertisements = Vec::new();
-        for (mint_url, unit_map) in &self.spilman_mint_cache.advertised {
-            for (unit, keyset_ids) in unit_map {
+        let mint_cache = self
+            .spilman_mint_cache
+            .read()
+            .expect("spilman mint cache lock poisoned")
+            .clone();
+        for (mint_url, trusted_units) in &self.trusted_mint_units {
+            for unit in trusted_units {
+                let keyset_ids = mint_cache.keyset_ids(mint_url, unit);
+                if keyset_ids.is_empty() {
+                    continue;
+                }
                 advertisements.push(KeysetAdvertisement {
                     mint_url: mint_url.clone(),
                     unit: unit.clone(),
-                    keyset_ids: keyset_ids.clone(),
+                    keyset_ids,
                     // Use session defaults for now until we have per-advertisement config.
                     in_bytes_per_millisat: billing.pricing.in_bytes_per_millisat,
                     out_bytes_per_millisat: billing.pricing.out_bytes_per_millisat,
@@ -361,7 +372,8 @@ pub struct RelaySessionConfig {
     pub session_registry: Arc<SessionRegistry>,
     pub transport_key: SecpTransportKeypair,
     pub receiver_pubkey_hex: String,
-    pub spilman_mint_cache: SpilmanMintCache,
+    pub spilman_mint_cache: SharedSpilmanMintCache,
+    pub trusted_mint_units: TrustedMintUnits,
     pub cashu_spilman_protocol_version: Option<String>,
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
