@@ -16,6 +16,9 @@ use cdk_spilman::{
     ReqwestClientNetworking, SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking,
     SqliteClientStorage,
 };
+use monad_common::keyset_retry::{
+    with_active_keyset_retry, KeysetRetryError, KeysetRetryPhase, SelectedOutputKeyset,
+};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
@@ -69,10 +72,11 @@ pub struct SqliteClientWallet {
     channel_db: Mutex<Connection>,
 }
 
-struct TargetCapacityAttempt {
-    output_keyset_info_json: String,
+#[derive(Debug, Clone)]
+struct ClientOpenAttempt {
+    output_keyset: SelectedOutputKeyset,
     reservation: ProofReservation,
-    requested_capacity_raw: u64,
+    requested_capacity_raw: Option<u64>,
     selected_input_msats: u64,
 }
 
@@ -154,43 +158,33 @@ impl SqliteClientWallet {
                 "target capacity must be greater than zero".to_string(),
             ));
         }
-        let attempt = self.prepare_target_capacity_attempt(offer, target_capacity_raw)?;
-        match self.submit_reserved_channel(
-            offer,
-            &attempt.output_keyset_info_json,
-            &attempt.reservation,
-            Some(attempt.requested_capacity_raw),
-        ) {
-            Ok(open_result) => self.finish_open_channel(open_result, &attempt.reservation),
-            Err(error) if should_retry_open_after_keyset_rejection(&error, false) => {
-                let _ = self
-                    .loose_wallet
-                    .release_reservation(&attempt.reservation.reservation_id);
-                let retry_attempt =
-                    self.prepare_target_capacity_attempt(offer, target_capacity_raw)?;
-                match self.submit_reserved_channel(
-                    offer,
-                    &retry_attempt.output_keyset_info_json,
-                    &retry_attempt.reservation,
-                    Some(retry_attempt.requested_capacity_raw),
-                ) {
-                    Ok(open_result) => {
-                        self.finish_open_channel(open_result, &retry_attempt.reservation)
-                    }
-                    Err(error) => self.handle_open_error(
-                        error,
-                        &retry_attempt.reservation,
-                        offer,
-                        retry_attempt.selected_input_msats,
-                    ),
-                }
-            }
-            Err(error) => self.handle_open_error(
+        let result = with_active_keyset_retry(
+            |phase| self.select_output_keyset_for_attempt(offer, phase),
+            |output_keyset, _phase| {
+                self.prepare_target_capacity_attempt(offer, target_capacity_raw, output_keyset)
+            },
+            |attempt| self.submit_open_attempt(offer, attempt),
+            |error| should_retry_open_after_keyset_rejection(error, false),
+            || self.refresh_client_keysets(offer),
+            |attempt, _error| {
+                self.loose_wallet
+                    .release_reservation(&attempt.reservation.reservation_id)
+                    .map(|_| ())
+                    .map_err(loose_proof_error)
+            },
+        );
+        match result {
+            Ok(success) => self.finish_open_channel(success.value, &success.attempt.reservation),
+            Err(KeysetRetryError::Submit { attempt, error, .. }) => self.handle_open_error(
                 error,
                 &attempt.reservation,
                 offer,
                 attempt.selected_input_msats,
             ),
+            Err(error) => Err(WalletError::Backend(format!(
+                "prepare channel open retry: {}",
+                describe_keyset_retry_prepare_error(error)
+            ))),
         }
     }
 
@@ -372,6 +366,19 @@ impl SqliteClientWallet {
             .map_err(|e| WalletError::Backend(format!("system time before unix epoch: {e}")))
     }
 
+    fn submit_open_attempt(
+        &self,
+        offer: &RelayPaymentOffer,
+        attempt: &ClientOpenAttempt,
+    ) -> Result<OpenChannelResult, OpenChannelError> {
+        self.submit_reserved_channel(
+            offer,
+            &attempt.output_keyset.info_json,
+            &attempt.reservation,
+            attempt.requested_capacity_raw,
+        )
+    }
+
     fn submit_reserved_channel(
         &self,
         offer: &RelayPaymentOffer,
@@ -459,40 +466,55 @@ impl SqliteClientWallet {
         ))
     }
 
-    fn refresh_keysets_and_prepare_output_keyset_info(
-        &self,
-        offer: &RelayPaymentOffer,
-    ) -> Result<String, WalletError> {
+    fn refresh_client_keysets(&self, offer: &RelayPaymentOffer) -> Result<(), WalletError> {
         let bridge = self
             .bridge
             .lock()
             .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
         bridge
             .refresh_keysets_response(&offer.mint_url)
-            .map_err(|e| WalletError::Backend(format!("refresh mint keysets: {e}")))?;
+            .map(|_| ())
+            .map_err(|e| WalletError::Backend(format!("refresh mint keysets: {e}")))
+    }
+
+    fn select_output_keyset_for_attempt(
+        &self,
+        offer: &RelayPaymentOffer,
+        phase: KeysetRetryPhase,
+    ) -> Result<SelectedOutputKeyset, WalletError> {
+        let selected = self.select_output_keyset_from_cache(offer);
+        if selected.is_ok() || phase == KeysetRetryPhase::Retry {
+            return selected;
+        }
+
+        self.refresh_client_keysets(offer)?;
+        self.select_output_keyset_from_cache(offer)
+    }
+
+    fn select_output_keyset_from_cache(
+        &self,
+        offer: &RelayPaymentOffer,
+    ) -> Result<SelectedOutputKeyset, WalletError> {
+        let bridge = self
+            .bridge
+            .lock()
+            .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
         let output_keyset_id = active_output_keyset_id_from_cache(&bridge, offer)?;
-        cached_keyset_info_json(&bridge, &offer.mint_url, &output_keyset_id)
+        let info_json = cached_keyset_info_json(&bridge, &offer.mint_url, &output_keyset_id)?;
+        Ok(SelectedOutputKeyset {
+            id: output_keyset_id,
+            info_json,
+        })
     }
 
     fn prepare_target_capacity_attempt(
         &self,
         offer: &RelayPaymentOffer,
         target_capacity_raw: u64,
-    ) -> Result<TargetCapacityAttempt, WalletError> {
-        let output_keyset_info_json = {
-            let bridge = self
-                .bridge
-                .lock()
-                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
-            bridge
-                .refresh_keysets_response(&offer.mint_url)
-                .map_err(|e| WalletError::Backend(format!("refresh mint keysets: {e}")))?;
-            let output_keyset_id = active_output_keyset_id_from_cache(&bridge, offer)?;
-            cached_keyset_info_json(&bridge, &offer.mint_url, &output_keyset_id)?
-        };
-
+        output_keyset: SelectedOutputKeyset,
+    ) -> Result<ClientOpenAttempt, WalletError> {
         let required_post_swap_raw =
-            compute_funding_token_amount(target_capacity_raw, &output_keyset_info_json, 0)
+            compute_funding_token_amount(target_capacity_raw, &output_keyset.info_json, 0)
                 .map_err(|e| {
                     WalletError::Backend(format!("compute required funding amount: {e}"))
                 })?;
@@ -553,10 +575,10 @@ impl SqliteClientWallet {
             .map_err(loose_proof_error)?;
         let selected_input_msats = raw_to_msats(&offer.unit, reservation.total_amount_raw)?;
 
-        Ok(TargetCapacityAttempt {
-            output_keyset_info_json,
+        Ok(ClientOpenAttempt {
+            output_keyset,
             reservation,
-            requested_capacity_raw: target_capacity_raw,
+            requested_capacity_raw: Some(target_capacity_raw),
             selected_input_msats,
         })
     }
@@ -690,29 +712,49 @@ impl MonadWallet for SqliteClientWallet {
         }
 
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
-        let output_keyset_info_json = self.refresh_keysets_and_prepare_output_keyset_info(offer)?;
-        let reservation = self
-            .loose_wallet
-            .reserve_proofs_any_keyset(&offer.mint_url, &offer.unit, input_budget_raw)
-            .map_err(loose_proof_error)?;
-        match self.submit_reserved_channel(offer, &output_keyset_info_json, &reservation, None) {
-            Ok(open_result) => self.finish_open_channel(open_result, &reservation),
-            Err(error) if should_retry_open_after_keyset_rejection(&error, false) => {
-                let retry_output_keyset_info_json =
-                    self.refresh_keysets_and_prepare_output_keyset_info(offer)?;
-                match self.submit_reserved_channel(
-                    offer,
-                    &retry_output_keyset_info_json,
-                    &reservation,
-                    None,
-                ) {
-                    Ok(open_result) => self.finish_open_channel(open_result, &reservation),
-                    Err(error) => {
-                        self.handle_open_error(error, &reservation, offer, input_budget_msats)
+        let mut reservation: Option<ProofReservation> = None;
+        let result = with_active_keyset_retry(
+            |phase| self.select_output_keyset_for_attempt(offer, phase),
+            |output_keyset, _phase| {
+                let reservation = match reservation.as_ref() {
+                    Some(reservation) => reservation.clone(),
+                    None => {
+                        let new_reservation = self
+                            .loose_wallet
+                            .reserve_proofs_any_keyset(
+                                &offer.mint_url,
+                                &offer.unit,
+                                input_budget_raw,
+                            )
+                            .map_err(loose_proof_error)?;
+                        reservation = Some(new_reservation.clone());
+                        new_reservation
                     }
-                }
-            }
-            Err(error) => self.handle_open_error(error, &reservation, offer, input_budget_msats),
+                };
+                Ok(ClientOpenAttempt {
+                    output_keyset,
+                    reservation,
+                    requested_capacity_raw: None,
+                    selected_input_msats: input_budget_msats,
+                })
+            },
+            |attempt| self.submit_open_attempt(offer, attempt),
+            |error| should_retry_open_after_keyset_rejection(error, false),
+            || self.refresh_client_keysets(offer),
+            |_attempt, _error| Ok(()),
+        );
+        match result {
+            Ok(success) => self.finish_open_channel(success.value, &success.attempt.reservation),
+            Err(KeysetRetryError::Submit { attempt, error, .. }) => self.handle_open_error(
+                error,
+                &attempt.reservation,
+                offer,
+                attempt.selected_input_msats,
+            ),
+            Err(error) => Err(WalletError::Backend(format!(
+                "prepare channel open retry: {}",
+                describe_keyset_retry_prepare_error(error)
+            ))),
         }
     }
 
@@ -976,6 +1018,18 @@ fn open_channel_error(
             "channel open failed (input was not spent): {} (requested input budget {} msats in unit {})",
             error.message, requested_input_budget_msats, unit
         ))
+    }
+}
+
+fn describe_keyset_retry_prepare_error(
+    error: KeysetRetryError<ClientOpenAttempt, WalletError, OpenChannelError>,
+) -> String {
+    match error {
+        KeysetRetryError::Select { error, .. }
+        | KeysetRetryError::Prepare { error, .. }
+        | KeysetRetryError::Refresh { error }
+        | KeysetRetryError::Cleanup { error } => error.to_string(),
+        KeysetRetryError::Submit { .. } => "unexpected submit error".to_string(),
     }
 }
 
