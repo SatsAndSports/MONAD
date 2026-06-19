@@ -4,7 +4,8 @@ use crate::payments::RelayPayments;
 use crate::quic_pool::QuicPool;
 use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
 use crate::session_registry::SessionRegistry;
-use crate::wallet_manager::RelayWalletManager;
+use crate::wallet_manager::{cache_relay_keysets, RelayWalletManager};
+use cdk_spilman::configurable_host::SpilmanStorage;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
 use monad_common::bootstrap::{
@@ -112,9 +113,13 @@ pub type TrustedMintUnits = BTreeMap<String, BTreeSet<String>>;
 /// Relay-side cached view of trusted mints.
 #[derive(Debug, Clone, Default)]
 pub struct SpilmanMintCache {
-    /// Mint URL -> unit -> advertised keyset IDs.
+    /// Mint URL -> unit -> relay-accepted advertised keyset IDs.
+    ///
+    /// This includes active and inactive keysets for trusted mint/unit pairs so
+    /// old channels can continue to re-link, pay, and close. It is built during
+    /// relay startup/configured discovery and reused for normal sessions.
     pub advertised: MintUnitKeysets,
-    /// Mint URL -> keyset ID -> keyset info JSON.
+    /// Mint URL -> keyset ID -> keyset info JSON for all advertised keysets.
     pub keyset_info_json_by_mint: BTreeMap<String, BTreeMap<String, String>>,
 }
 
@@ -159,9 +164,21 @@ impl ServerConfig {
     }
 }
 
-/// Discover all keyset IDs (active and inactive) and cache their keyset info JSON.
+/// Discover all trusted keyset IDs (active and inactive) and cache their keyset info JSON.
 pub async fn discover_spilman_mint_cache(
     trusted_mint_units: &TrustedMintUnits,
+) -> io::Result<SpilmanMintCache> {
+    discover_spilman_mint_cache_with_storage(trusted_mint_units, None).await
+}
+
+/// Discover trusted mint keysets and optionally persist the fetched keysets.
+///
+/// This is intended for relay startup/configured mint discovery, not per-session
+/// refreshes. Normal sessions use the in-memory [`SpilmanMintCache`] created at
+/// startup.
+pub async fn discover_spilman_mint_cache_with_storage(
+    trusted_mint_units: &TrustedMintUnits,
+    storage: Option<&dyn SpilmanStorage>,
 ) -> io::Result<SpilmanMintCache> {
     let mut cache = SpilmanMintCache::default();
 
@@ -169,6 +186,10 @@ pub async fn discover_spilman_mint_cache(
         let keysets = fetch_all_keysets_from_mint(mint_url)
             .await
             .map_err(|e| io::Error::other(format!("discover keysets from {mint_url}: {e}")))?;
+        if let Some(storage) = storage {
+            cache_relay_keysets(storage, mint_url, &keysets)
+                .map_err(|e| io::Error::other(format!("cache keysets from {mint_url}: {e}")))?;
+        }
 
         let mut by_unit = BTreeMap::<String, Vec<String>>::new();
         let mut by_id = BTreeMap::<String, String>::new();
@@ -221,8 +242,13 @@ pub async fn run(
     config: Arc<ServerConfig>,
 ) -> io::Result<()> {
     let wallet_manager = Arc::new(RelayWalletManager::open(&config.spilman_storage_path)?);
-    let discovered_spilman_mint_cache =
-        Arc::new(discover_spilman_mint_cache(&config.trusted_mint_units).await?);
+    let discovered_spilman_mint_cache = Arc::new(
+        discover_spilman_mint_cache_with_storage(
+            &config.trusted_mint_units,
+            Some(wallet_manager.spilman_storage()),
+        )
+        .await?,
+    );
     run_with_wallet_manager(
         listener,
         quic_endpoint,

@@ -3,11 +3,11 @@ use crate::listener::{discover_spilman_mint_cache, SpilmanMintCache};
 use crate::payments::{RelayPayments, SpilmanRelayPayments};
 use cashu::nuts::{BlindedMessage, Proof, SecretKey, SwapRequest};
 use cdk_spilman::configurable_host::{
-    ConfigurableHost, ConfigurableHostConfig, SpilmanStorage, SqliteStorage, StorageConfig,
-    UnitPricingConfig,
+    ConfigurableHost, ConfigurableHostConfig, KeysetCacheEntry, SpilmanStorage, SqliteStorage,
+    StorageConfig, UnitPricingConfig,
 };
 use cdk_spilman::configurable_networking::{
-    build_keyset_info_json, fetch_all_keysets_from_mint, ReqwestNetworking,
+    build_keyset_info_json, fetch_all_keysets_from_mint, MintKeysetWithKeys, ReqwestNetworking,
 };
 use cdk_spilman::{
     complete_funding_swap, create_plain_blinded_messages, ChannelState, CloseError, CloseSuccess,
@@ -360,6 +360,10 @@ impl RelayWalletManager {
         Ok(self.receiver_secret(relay_name)?.public_key().to_hex())
     }
 
+    pub fn spilman_storage(&self) -> &dyn SpilmanStorage {
+        self.storage.as_ref()
+    }
+
     pub fn payments_for(
         &self,
         relay_name: &str,
@@ -479,7 +483,9 @@ impl RelayWalletManager {
             return Err("no closed channels available to drain".to_string());
         }
 
-        let drain_keysets = fetch_fresh_drain_keysets_from_mint(mint_url, unit).await?;
+        let drain_keysets = self
+            .fetch_fresh_drain_keysets_from_mint(mint_url, unit)
+            .await?;
         let output_keyset_id = drain_keysets.output_keyset_id.clone();
         let mut all_input_proofs = Vec::new();
         let mut input_amount_raw = 0u64;
@@ -635,6 +641,20 @@ impl RelayWalletManager {
             .map_err(|e| format!("query drains: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("decode drains: {e}"))
+    }
+
+    /// Fetch all keysets from a mint and persist them in the relay wallet cache.
+    ///
+    /// This is intended for infrequent wallet/admin operations such as drains.
+    /// Normal sessions use the relay's in-memory advertised mint cache and do
+    /// not refresh keysets per session.
+    pub async fn refresh_keysets_from_mint(
+        &self,
+        mint_url: &str,
+    ) -> Result<Vec<MintKeysetWithKeys>, String> {
+        let keysets = fetch_all_keysets_from_mint(mint_url).await?;
+        cache_relay_keysets(self.storage.as_ref(), mint_url, &keysets)?;
+        Ok(keysets)
     }
 
     fn closed_drain_candidates(
@@ -1008,16 +1028,27 @@ struct StoredDrain {
     output_proofs_json: Option<String>,
 }
 
-/// Fetch mint keyset state directly for a drain.
+/// Fetch mint keyset state for a drain and persist it through the relay cache.
 ///
-/// Drains are rare and should use current mint state, so this intentionally
-/// bypasses the relay's cached keyset tables. The selected output keyset info is
-/// persisted on the drain row, but this helper does not update SQLite caches.
-async fn fetch_fresh_drain_keysets_from_mint(
+/// Drains are rare and should use current mint state. This refreshes from the
+/// mint, updates the SQLite-backed keyset cache, then uses the fresh returned
+/// data to choose an active output keyset and input fee metadata.
+impl RelayWalletManager {
+    async fn fetch_fresh_drain_keysets_from_mint(
+        &self,
+        mint_url: &str,
+        unit: &str,
+    ) -> Result<DrainKeysets, String> {
+        let keysets = self.refresh_keysets_from_mint(mint_url).await?;
+        drain_keysets_from_fetched(mint_url, unit, keysets)
+    }
+}
+
+fn drain_keysets_from_fetched(
     mint_url: &str,
     unit: &str,
+    keysets: Vec<MintKeysetWithKeys>,
 ) -> Result<DrainKeysets, String> {
-    let keysets = fetch_all_keysets_from_mint(mint_url).await?;
     let mut input_fee_ppk_by_keyset = BTreeMap::new();
     let mut active_output_keysets = Vec::new();
     for keyset in keysets {
@@ -1048,6 +1079,30 @@ async fn fetch_fresh_drain_keysets_from_mint(
         output_keyset_info_json,
         input_fee_ppk_by_keyset,
     })
+}
+
+pub(crate) fn cache_relay_keysets(
+    storage: &dyn SpilmanStorage,
+    mint_url: &str,
+    keysets: &[MintKeysetWithKeys],
+) -> Result<(), String> {
+    for keyset in keysets {
+        storage.set_keyset(
+            mint_url,
+            keyset.id,
+            KeysetCacheEntry {
+                info_json: build_keyset_info_json(
+                    &keyset.id,
+                    &keyset.unit,
+                    &keyset.keys,
+                    keyset.input_fee_ppk,
+                ),
+                active: keyset.active,
+                unit: keyset.unit.clone(),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn prepare_plain_drain_swap(

@@ -491,6 +491,11 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     }
 
     fn get_active_keyset_ids(&self, mint: &str, unit: &CurrencyUnit) -> Vec<Id> {
+        // The upstream hook is named "active", but MONAD advertises/accepts
+        // all trusted known keysets for a mint/unit, including inactive keysets,
+        // so existing channels funded by old keysets remain usable. Code that
+        // creates a new mint swap must independently refresh mint state and
+        // select an active output keyset.
         self.mint_cache
             .advertised
             .get(mint)

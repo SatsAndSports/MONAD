@@ -6,10 +6,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Mint URL -> unit -> advertised keyset IDs.
+/// Mint URL -> unit -> relay-accepted keyset IDs.
+///
+/// These IDs may include inactive mint keysets so existing channels funded by
+/// old keysets can still be re-linked, paid, and closed. A party creating a new
+/// mint swap must query/refresh mint state and choose an active output keyset.
 pub type MintUnitKeysets = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
-/// Advertisement for a specific mint/unit/keyset pricing option.
+/// Advertisement for a specific mint/unit pricing option.
+///
+/// `keyset_ids` are the relay-known keysets accepted by policy for this
+/// mint/unit; they are not necessarily all active output keysets at the mint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeysetAdvertisement {
     pub mint_url: String,

@@ -50,8 +50,8 @@ use common::signing_wallet::TestSigningWallet;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
 use monad_relay::config::RelayConfig;
 use monad_relay::listener::{
-    discover_spilman_mint_cache, run_with_payments, run_with_payments_and_registry_and_shutdown,
-    ServerConfig, SpilmanMintCache,
+    discover_spilman_mint_cache, discover_spilman_mint_cache_with_storage, run_with_payments,
+    run_with_payments_and_registry_and_shutdown, ServerConfig, SpilmanMintCache,
 };
 use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
 use monad_relay::quic_pool::QuicPool;
@@ -3945,10 +3945,11 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
     handle2.await.unwrap().unwrap();
 }
 
-/// A relay must reject ChannelLink when the funding token itself uses a
-/// mint-active keyset outside the relay's trusted keyset cache. This test starts
-/// with relay-accepted keyset A, rotates the mint to active keyset B, then links
-/// a B-funded channel while the relay still accepts only A.
+/// A relay must reject ChannelLink when the funding token itself uses a keyset
+/// outside the relay's accepted/known trusted set, regardless of whether that
+/// keyset is currently active at the mint. This test starts with relay-accepted
+/// keyset A, rotates the mint to active keyset B, then links a B-funded channel
+/// while the relay still accepts only A.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_channel_link_rejects_unaccepted_funding_keyset() {
     let mint_helper = TestMintHelper::new().await.unwrap();
@@ -5355,6 +5356,66 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
     assert!(output_proofs
         .iter()
         .all(|proof| proof.keyset_id.to_string() == new_keyset_id));
+
+    let storage = SqliteStorage::open(temp_db.path().to_str().unwrap()).unwrap();
+    let old_cached = storage
+        .get_keyset(&mint_url, &old_keyset_id.parse().unwrap())
+        .expect("old keyset should be cached by drain refresh");
+    let new_cached = storage
+        .get_keyset(&mint_url, &new_keyset_id.parse().unwrap())
+        .expect("new keyset should be cached by drain refresh");
+    assert!(!old_cached.active);
+    assert!(new_cached.active);
+
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_relay_startup_discovery_persists_keysets_to_sqlite_cache() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint = mint_helper.mint();
+    let old_keyset_id = mint_helper.keyset_id().to_string();
+    let new_keyset_id = rotate_sat_keyset(&mint, 250).await.unwrap().to_string();
+    assert_ne!(old_keyset_id, new_keyset_id);
+
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage = SqliteStorage::open(temp_db.path().to_str().unwrap()).unwrap();
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let cache = discover_spilman_mint_cache_with_storage(
+        &trusted_mint_units,
+        Some(&storage as &dyn SpilmanStorage),
+    )
+    .await
+    .unwrap();
+
+    assert!(cache
+        .advertised
+        .get(&mint_url)
+        .and_then(|units| units.get("sat"))
+        .is_some_and(|ids| ids.contains(&old_keyset_id) && ids.contains(&new_keyset_id)));
+    let old_cached = storage
+        .get_keyset(&mint_url, &old_keyset_id.parse().unwrap())
+        .expect("startup discovery should cache old keyset");
+    let new_cached = storage
+        .get_keyset(&mint_url, &new_keyset_id.parse().unwrap())
+        .expect("startup discovery should cache new keyset");
+    assert!(!old_cached.active);
+    assert!(new_cached.active);
 
     let _ = mint_shutdown_tx.send(());
 }

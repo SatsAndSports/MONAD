@@ -4,7 +4,7 @@ use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::SecpTransportKeypair;
 use monad_relay::config::MonadConfig;
 use monad_relay::listener;
-use monad_relay::listener::discover_spilman_mint_cache;
+use monad_relay::listener::discover_spilman_mint_cache_with_storage;
 use monad_relay::wallet_cli::{run_wallet_command, WalletArgs};
 use monad_relay::wallet_manager::RelayWalletManager;
 use std::sync::Arc;
@@ -134,8 +134,13 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
     };
 
     let trusted_mint_units = relay.trusted_mint_units();
-    let discovered_spilman_mint_cache =
-        Arc::new(discover_spilman_mint_cache(&trusted_mint_units).await?);
+    let discovered_spilman_mint_cache = Arc::new(
+        discover_spilman_mint_cache_with_storage(
+            &trusted_mint_units,
+            Some(wallet_manager.spilman_storage()),
+        )
+        .await?,
+    );
 
     let server_config = Arc::new(listener::ServerConfig {
         identity,
