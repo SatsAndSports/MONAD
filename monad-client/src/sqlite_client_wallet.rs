@@ -9,16 +9,21 @@ use crate::wallet::{
     msats_to_raw_units, raw_to_msats, MonadWallet, RelayPaymentOffer, WalletChannel,
     WalletChannelState, WalletError,
 };
+use cashu::nuts::{CurrencyUnit, Id};
 use cdk_spilman::{
-    compute_funding_token_amount, ClientChannelInfo, ConfigurableClientHost, OpenChannelError,
-    OpenChannelFailureStage, OpenChannelResult, ReqwestClientNetworking, SpilmanClientBridge,
-    SpilmanClientNetworking, SqliteClientStorage,
+    compute_funding_token_amount, parse_keyset_info_from_json, ClientChannelInfo,
+    ConfigurableClientHost, OpenChannelError, OpenChannelFailureStage, OpenChannelResult,
+    ReqwestClientNetworking, SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking,
+    SqliteClientStorage,
 };
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+type ClientBridge =
+    SpilmanClientBridge<ConfigurableClientHost<SqliteClientStorage>, ReqwestClientNetworking>;
 
 const CHANNEL_EXPIRY_SECONDS: u64 = 24 * 3600;
 
@@ -59,9 +64,7 @@ const CREATE_OPENING_RECOVERIES_SQL: &str = r#"
 /// metadata and payment signing via `cdk-spilman`.
 pub struct SqliteClientWallet {
     loose_wallet: LooseProofWallet,
-    bridge: Mutex<
-        SpilmanClientBridge<ConfigurableClientHost<SqliteClientStorage>, ReqwestClientNetworking>,
-    >,
+    bridge: Mutex<ClientBridge>,
     sender_pubkey_hex: String,
     channel_db: Mutex<Connection>,
 }
@@ -447,25 +450,39 @@ impl SqliteClientWallet {
         ))
     }
 
+    fn refresh_keysets_and_select_output_keyset(
+        &self,
+        offer: &RelayPaymentOffer,
+    ) -> Result<String, WalletError> {
+        let bridge = self
+            .bridge
+            .lock()
+            .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+        bridge
+            .refresh_keysets_response(&offer.mint_url)
+            .map_err(|e| WalletError::Backend(format!("refresh mint keysets: {e}")))?;
+        active_output_keyset_id_from_cache(&bridge, offer)
+    }
+
     fn prepare_target_capacity_attempt(
         &self,
         offer: &RelayPaymentOffer,
         target_capacity_raw: u64,
     ) -> Result<TargetCapacityAttempt, WalletError> {
-        let keysets_json = ReqwestClientNetworking::new()
-            .call_mint_keysets(&offer.mint_url)
-            .map_err(|e| WalletError::Backend(format!("fetch mint keysets: {e}")))?;
-        let output_keyset_id = active_output_keyset_id_from_keysets_json(offer, &keysets_json)?;
-
-        let output_keyset_info_json = {
+        let (output_keyset_id, output_keyset_info_json) = {
             let bridge = self
                 .bridge
                 .lock()
                 .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
             bridge
-                .fetch_keyset_info(&offer.mint_url, &output_keyset_id)
-                .map_err(|e| WalletError::Backend(format!("fetch output keyset info: {e}")))?
+                .refresh_keysets_response(&offer.mint_url)
+                .map_err(|e| WalletError::Backend(format!("refresh mint keysets: {e}")))?;
+            let output_keyset_id = active_output_keyset_id_from_cache(&bridge, offer)?;
+            let output_keyset_info_json =
+                cached_keyset_info_json(&bridge, &offer.mint_url, &output_keyset_id)?;
+            (output_keyset_id, output_keyset_info_json)
         };
+
         let required_post_swap_raw =
             compute_funding_token_amount(target_capacity_raw, &output_keyset_info_json, 0)
                 .map_err(|e| {
@@ -476,7 +493,28 @@ impl SqliteClientWallet {
             .loose_wallet
             .list_available_proofs(&offer.mint_url, &offer.unit, &[])
             .map_err(loose_proof_error)?;
-        let input_fee_by_keyset = input_fee_ppk_by_keyset_from_keysets_json(&keysets_json)?;
+        let input_fee_by_keyset = {
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            let mut out = HashMap::new();
+            for proof in &available_proofs {
+                if out.contains_key(&proof.keyset_id) {
+                    continue;
+                }
+                let keyset_info_json =
+                    cached_keyset_info_json(&bridge, &offer.mint_url, &proof.keyset_id)?;
+                let keyset_info = parse_keyset_info_from_json(&keyset_info_json).map_err(|e| {
+                    WalletError::Backend(format!(
+                        "parse cached keyset info for {}: {e}",
+                        proof.keyset_id
+                    ))
+                })?;
+                out.insert(proof.keyset_id.clone(), keyset_info.input_fee_ppk);
+            }
+            out
+        };
 
         let candidates = available_proofs
             .iter()
@@ -644,10 +682,7 @@ impl MonadWallet for SqliteClientWallet {
         }
 
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
-        let keysets_json = ReqwestClientNetworking::new()
-            .call_mint_keysets(&offer.mint_url)
-            .map_err(|e| WalletError::Backend(format!("fetch mint keysets: {e}")))?;
-        let output_keyset_id = active_output_keyset_id_from_keysets_json(offer, &keysets_json)?;
+        let output_keyset_id = self.refresh_keysets_and_select_output_keyset(offer)?;
         let reservation = self
             .loose_wallet
             .reserve_proofs_any_keyset(&offer.mint_url, &offer.unit, input_budget_raw)
@@ -655,11 +690,8 @@ impl MonadWallet for SqliteClientWallet {
         match self.submit_reserved_channel(offer, &output_keyset_id, &reservation, None) {
             Ok(open_result) => self.finish_open_channel(open_result, &reservation),
             Err(error) if should_retry_open_after_keyset_rejection(&error, false) => {
-                let keysets_json = ReqwestClientNetworking::new()
-                    .call_mint_keysets(&offer.mint_url)
-                    .map_err(|e| WalletError::Backend(format!("fetch mint keysets: {e}")))?;
                 let retry_output_keyset_id =
-                    active_output_keyset_id_from_keysets_json(offer, &keysets_json)?;
+                    self.refresh_keysets_and_select_output_keyset(offer)?;
                 match self.submit_reserved_channel(
                     offer,
                     &retry_output_keyset_id,
@@ -873,22 +905,19 @@ fn loose_proof_error(error: LooseProofWalletError) -> WalletError {
     WalletError::Backend(format!("loose proof wallet: {error}"))
 }
 
-fn active_output_keyset_id_from_keysets_json(
+fn active_output_keyset_id_from_cache<H, N>(
+    bridge: &SpilmanClientBridge<H, N>,
     offer: &RelayPaymentOffer,
-    keysets_json: &str,
-) -> Result<String, WalletError> {
-    let value: serde_json::Value = serde_json::from_str(keysets_json)
-        .map_err(|e| WalletError::Backend(format!("parse mint keysets: {e}")))?;
-    let keysets = value["keysets"]
-        .as_array()
-        .ok_or_else(|| WalletError::Backend("mint keysets response missing keysets".to_string()))?;
+) -> Result<String, WalletError>
+where
+    H: SpilmanClientHost,
+    N: SpilmanClientNetworking,
+{
+    let unit = parse_currency_unit(&offer.unit)?;
+    let active_ids = bridge.cached_active_keyset_ids(&offer.mint_url, &unit);
 
     for accepted_id in &offer.accepted_keyset_ids {
-        if keysets.iter().any(|keyset| {
-            keyset["id"].as_str() == Some(accepted_id.as_str())
-                && keyset["unit"].as_str() == Some(offer.unit.as_str())
-                && keyset["active"].as_bool().unwrap_or(false)
-        }) {
+        if active_ids.iter().any(|id| id.to_string() == *accepted_id) {
             return Ok(accepted_id.clone());
         }
     }
@@ -898,28 +927,30 @@ fn active_output_keyset_id_from_keysets_json(
     ))
 }
 
-fn input_fee_ppk_by_keyset_from_keysets_json(
-    keysets_json: &str,
-) -> Result<HashMap<String, u64>, WalletError> {
-    let value: serde_json::Value = serde_json::from_str(keysets_json)
-        .map_err(|e| WalletError::Backend(format!("parse mint keysets: {e}")))?;
-    let keysets = value["keysets"]
-        .as_array()
-        .ok_or_else(|| WalletError::Backend("mint keysets response missing keysets".to_string()))?;
-    let mut out = HashMap::new();
-    for keyset in keysets {
-        let id = keyset["id"]
-            .as_str()
-            .ok_or_else(|| WalletError::Backend("mint keyset missing id".to_string()))?;
-        let input_fee_ppk = keyset["input_fee_ppk"]
-            .as_u64()
-            .or_else(|| keyset["inputFeePpk"].as_u64())
-            .ok_or_else(|| {
-                WalletError::Backend(format!("mint keyset {id} missing input fee ppk"))
-            })?;
-        out.insert(id.to_string(), input_fee_ppk);
-    }
-    Ok(out)
+fn cached_keyset_info_json<H, N>(
+    bridge: &SpilmanClientBridge<H, N>,
+    mint_url: &str,
+    keyset_id: &str,
+) -> Result<String, WalletError>
+where
+    H: SpilmanClientHost,
+    N: SpilmanClientNetworking,
+{
+    let keyset_id = parse_keyset_id(keyset_id)?;
+    bridge
+        .cached_keyset_info(mint_url, &keyset_id)
+        .ok_or_else(|| WalletError::Backend(format!("cached keyset {keyset_id} not found")))
+}
+
+fn parse_keyset_id(keyset_id: &str) -> Result<Id, WalletError> {
+    keyset_id
+        .parse()
+        .map_err(|e| WalletError::Backend(format!("invalid keyset id {keyset_id}: {e}")))
+}
+
+fn parse_currency_unit(unit: &str) -> Result<CurrencyUnit, WalletError> {
+    unit.parse()
+        .map_err(|e| WalletError::Backend(format!("invalid currency unit {unit}: {e}")))
 }
 
 fn open_channel_error(
@@ -1022,9 +1053,10 @@ mod tests {
     use cdk_spilman::{
         channel_parameters_get_channel_id, compute_channel_from_proofs_with_input_keysets,
         compute_channel_secret_from_hex, construct_proofs, create_funding_swap,
-        create_plain_blinded_messages, ClientChannelOpeningFromSwap, ClientStorage,
-        ConfigurableClientHost, OpenChannelError, OpenChannelFailureStage, Payment,
-        ReqwestClientNetworking, SpilmanClientBridge, SqliteClientStorage,
+        create_plain_blinded_messages, ClientChannelOpeningFromSwap, ClientKeysetCacheEntry,
+        ClientStorage, ConfigurableClientHost, MemoryClientStorage, OpenChannelError,
+        OpenChannelFailureStage, Payment, ReqwestClientNetworking, SpilmanClientBridge,
+        SpilmanClientHost, SqliteClientStorage,
     };
     use cdk_spilman_test_mint::{
         rotate_sat_keyset, serve_existing_mint_with_shutdown, serve_mint_with_shutdown,
@@ -1032,6 +1064,26 @@ mod tests {
     };
     use rand::RngCore;
     use tokio::sync::oneshot;
+
+    struct NoopClientNetworking;
+
+    impl SpilmanClientNetworking for NoopClientNetworking {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+
+        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+    }
 
     fn free_loopback_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")
@@ -1168,6 +1220,37 @@ mod tests {
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         }
+    }
+
+    fn test_keyset_id(secret_hex: &str) -> Id {
+        use cashu::nuts::{Keys, SecretKey};
+        use cashu::Amount;
+        use std::collections::BTreeMap;
+
+        let pubkey = SecretKey::from_hex(secret_hex).unwrap().public_key();
+        let mut keys = BTreeMap::new();
+        keys.insert(Amount::from(1), pubkey);
+        Id::v1_from_keys(&Keys::new(keys))
+    }
+
+    fn bridge_with_cached_keysets(
+        entries: Vec<(Id, CurrencyUnit, bool)>,
+    ) -> SpilmanClientBridge<ConfigurableClientHost<MemoryClientStorage>, NoopClientNetworking>
+    {
+        let host = ConfigurableClientHost::new_in_memory();
+        for (id, unit, active) in entries {
+            host.set_keyset(
+                "http://mint",
+                id,
+                ClientKeysetCacheEntry {
+                    info_json: "{}".to_string(),
+                    active,
+                    unit,
+                },
+            )
+            .unwrap();
+        }
+        SpilmanClientBridge::new(host, NoopClientNetworking)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1769,45 +1852,47 @@ mod tests {
 
     #[test]
     fn active_output_keyset_selection_skips_inactive_accepted_keysets() {
+        let old =
+            test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
+        let new =
+            test_keyset_id("0202020202020202020202020202020202020202020202020202020202020202");
         let offer = RelayPaymentOffer {
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),
-            accepted_keyset_ids: vec!["old".to_string(), "new".to_string()],
+            accepted_keyset_ids: vec![old.to_string(), new.to_string()],
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         };
-        let keysets_json = serde_json::json!({
-            "keysets": [
-                {"id": "old", "unit": "sat", "active": false, "input_fee_ppk": 0},
-                {"id": "new", "unit": "sat", "active": true, "input_fee_ppk": 0}
-            ]
-        })
-        .to_string();
+        let bridge = bridge_with_cached_keysets(vec![
+            (old, CurrencyUnit::Sat, false),
+            (new, CurrencyUnit::Sat, true),
+        ]);
 
-        let selected = active_output_keyset_id_from_keysets_json(&offer, &keysets_json).unwrap();
-        assert_eq!(selected, "new");
+        let selected = active_output_keyset_id_from_cache(&bridge, &offer).unwrap();
+        assert_eq!(selected, new.to_string());
     }
 
     #[test]
     fn active_output_keyset_selection_rejects_without_active_accepted_keyset() {
+        let old =
+            test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
+        let other_unit =
+            test_keyset_id("0202020202020202020202020202020202020202020202020202020202020202");
         let offer = RelayPaymentOffer {
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),
-            accepted_keyset_ids: vec!["old".to_string(), "other-unit".to_string()],
+            accepted_keyset_ids: vec![old.to_string(), other_unit.to_string()],
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         };
-        let keysets_json = serde_json::json!({
-            "keysets": [
-                {"id": "old", "unit": "sat", "active": false, "input_fee_ppk": 0},
-                {"id": "other-unit", "unit": "usd", "active": true, "input_fee_ppk": 0}
-            ]
-        })
-        .to_string();
+        let bridge = bridge_with_cached_keysets(vec![
+            (old, CurrencyUnit::Sat, false),
+            (other_unit, CurrencyUnit::Msat, true),
+        ]);
 
-        let error = active_output_keyset_id_from_keysets_json(&offer, &keysets_json).unwrap_err();
+        let error = active_output_keyset_id_from_cache(&bridge, &offer).unwrap_err();
         assert!(matches!(error, WalletError::OfferMismatch(_)));
     }
 
