@@ -118,6 +118,7 @@ pub type TrustedMintUnits = BTreeMap<String, BTreeSet<String>>;
 pub struct CachedKeyset {
     pub unit: String,
     pub active: bool,
+    pub input_fee_ppk: u64,
     pub info_json: String,
 }
 
@@ -267,6 +268,7 @@ pub async fn discover_spilman_mint_cache_with_storage(
                 CachedKeyset {
                     unit,
                     active: keyset.active,
+                    input_fee_ppk: keyset.input_fee_ppk,
                     info_json: build_keyset_info_json(
                         &keyset.id,
                         &keyset.unit,

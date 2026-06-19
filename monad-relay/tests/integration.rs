@@ -63,7 +63,10 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
@@ -236,11 +239,19 @@ fn mint_cache_with_keyset(
                 CachedKeyset {
                     unit,
                     active,
+                    input_fee_ppk: keyset_info_input_fee_ppk(&info_json),
                     info_json,
                 },
             )]),
         )]),
     }
+}
+
+fn keyset_info_input_fee_ppk(info_json: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(info_json)
+        .ok()
+        .and_then(|value| value.get("inputFeePpk").and_then(|fee| fee.as_u64()))
+        .unwrap_or(0)
 }
 
 /// Spin up a MONAD relay and return `(relay_addr, secp256k1 pubkey)`.
@@ -786,6 +797,105 @@ impl DrainSwapNetworking for DropAfterSwap<'_> {
     }
 }
 
+struct CountingDrainNet<'a> {
+    inner: &'a ReqwestNetworking,
+    swaps: Arc<AtomicUsize>,
+    output_keysets_by_call: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl DrainSwapNetworking for CountingDrainNet<'_> {
+    fn call_mint_swap<'a>(
+        &'a self,
+        mint_url: &'a str,
+        swap_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        self.swaps.fetch_add(1, Ordering::SeqCst);
+        self.output_keysets_by_call
+            .lock()
+            .unwrap()
+            .push(output_keyset_ids_from_swap_request(swap_request_json));
+        self.inner.call_mint_swap(mint_url, swap_request_json)
+    }
+
+    fn call_mint_restore<'a>(
+        &'a self,
+        mint_url: &'a str,
+        restore_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        self.inner.call_mint_restore(mint_url, restore_request_json)
+    }
+}
+
+fn output_keyset_ids_from_swap_request(swap_request_json: &str) -> Vec<String> {
+    let value: serde_json::Value = serde_json::from_str(swap_request_json).unwrap();
+    value
+        .get("outputs")
+        .and_then(|outputs| outputs.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|output| {
+            output
+                .get("id")
+                .or_else(|| output.get("keyset_id"))
+                .or_else(|| output.get("keysetId"))
+                .and_then(|id| id.as_str())
+                .map(ToString::to_string)
+        })
+        .collect()
+}
+
+struct KeysetThenRejectSwap {
+    swaps: AtomicUsize,
+}
+
+impl DrainSwapNetworking for KeysetThenRejectSwap {
+    fn call_mint_swap<'a>(
+        &'a self,
+        _mint_url: &'a str,
+        _swap_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        let attempt = self.swaps.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if attempt == 0 {
+                Err(r#"{"code":12001,"detail":"keyset is not known"}"#.to_string())
+            } else {
+                Err(r#"{"code":11001,"detail":"proofs already spent"}"#.to_string())
+            }
+        })
+    }
+
+    fn call_mint_restore<'a>(
+        &'a self,
+        _mint_url: &'a str,
+        _restore_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { Err("restore should not be called".to_string()) })
+    }
+}
+
+struct AlwaysKeysetRejectSwap {
+    swaps: AtomicUsize,
+}
+
+impl DrainSwapNetworking for AlwaysKeysetRejectSwap {
+    fn call_mint_swap<'a>(
+        &'a self,
+        _mint_url: &'a str,
+        _swap_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        self.swaps.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(r#"{"code":12001,"detail":"keyset is not known"}"#.to_string()) })
+    }
+
+    fn call_mint_restore<'a>(
+        &'a self,
+        _mint_url: &'a str,
+        _restore_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { Err("restore should not be called".to_string()) })
+    }
+}
+
 struct RejectSwap;
 
 impl DrainSwapNetworking for RejectSwap {
@@ -846,6 +956,7 @@ impl DrainTestContext {
         wallet_manager
             .register_identity(relay_name, receiver_secret)
             .unwrap();
+        wallet_manager.install_keyset_cache(mint_cache.clone());
         let payments = wallet_manager
             .spilman_payments_for(relay_name, mint_cache, trusted_mint_units)
             .unwrap();
@@ -4756,6 +4867,7 @@ async fn test_wallet_manager_drain_swap_combines_multiple_closed_channels() {
     wallet_manager
         .register_identity("drain-relay", receiver_secret)
         .unwrap();
+    wallet_manager.install_keyset_cache(mint_cache.clone());
     let payments = wallet_manager
         .spilman_payments_for("drain-relay", mint_cache, trusted_mint_units)
         .unwrap();
@@ -4838,6 +4950,7 @@ async fn test_wallet_manager_drain_swap_recovers_after_ambiguous_submission() {
     wallet_manager
         .register_identity("drain-recovery-relay", receiver_secret)
         .unwrap();
+    wallet_manager.install_keyset_cache(mint_cache.clone());
     let payments = wallet_manager
         .spilman_payments_for("drain-recovery-relay", mint_cache, trusted_mint_units)
         .unwrap();
@@ -5108,6 +5221,201 @@ async fn test_wallet_manager_drain_explicit_mint_rejection_marks_failed_and_rele
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_keyset_rejection_refreshes_reprepares_and_retries_same_drain() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint = mint_helper.mint();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint.clone()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let old_keyset_id = mint_helper.keyset_id().to_string();
+    let old_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let old_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &old_keyset_id,
+        &old_keyset_info_json,
+        true,
+    );
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    wallet_manager
+        .register_identity("drain-keyset-retry-relay", receiver_secret)
+        .unwrap();
+    wallet_manager.install_keyset_cache(old_mint_cache.clone());
+    let payments = wallet_manager
+        .spilman_payments_for(
+            "drain-keyset-retry-relay",
+            old_mint_cache,
+            trusted_mint_units,
+        )
+        .unwrap();
+    let wallet = TestSigningWallet::new(
+        mint.clone(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        old_keyset_id.clone(),
+        old_keyset_info_json,
+    )
+    .await;
+    let offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex,
+        mint_url: mint_url.clone(),
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![old_keyset_id.clone()],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let channel_id =
+        create_paid_closed_channel(&wallet_manager, &payments, &wallet, &offer, [21u8; 32], 300)
+            .await;
+
+    let new_keyset_id = rotate_sat_keyset(&mint, 500).await.unwrap().to_string();
+    assert_ne!(old_keyset_id, new_keyset_id);
+    let net = wallet_manager
+        .reqwest_networking_for_channel(&channel_id)
+        .unwrap();
+    let swaps = Arc::new(AtomicUsize::new(0));
+    let output_keysets_by_call = Arc::new(Mutex::new(Vec::new()));
+    let counting = CountingDrainNet {
+        inner: &net,
+        swaps: swaps.clone(),
+        output_keysets_by_call: output_keysets_by_call.clone(),
+    };
+    let drain = wallet_manager
+        .drain_closed_channels_to_swap(
+            "drain-keyset-retry-relay",
+            &mint_url,
+            "sat",
+            &counting,
+            None,
+        )
+        .await
+        .expect("stale drain output keyset should refresh and retry");
+    assert_eq!(swaps.load(Ordering::SeqCst), 2);
+    let output_keysets_by_call = output_keysets_by_call.lock().unwrap().clone();
+    assert_eq!(output_keysets_by_call.len(), 2);
+    assert!(output_keysets_by_call[0].contains(&old_keyset_id));
+    assert!(output_keysets_by_call[1].contains(&new_keyset_id));
+    assert_eq!(wallet_manager.list_drains().unwrap().len(), 1);
+    assert_eq!(wallet_manager.list_drains().unwrap()[0].state, "Completed");
+    assert_eq!(drain.channel_ids, vec![channel_id]);
+    let output_proofs: Vec<cashu::nuts::Proof> =
+        serde_json::from_str(&drain.output_proofs_json).unwrap();
+    assert!(output_proofs
+        .iter()
+        .all(|proof| proof.keyset_id.to_string() == new_keyset_id));
+
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_keyset_rejection_then_second_rejection_marks_failed_and_releases(
+) {
+    let ctx = DrainTestContext::new("drain-keyset-retry-failed-relay").await;
+    let channel_id = ctx.create_closed_channel([22u8; 32], 275).await;
+    let scripted = KeysetThenRejectSwap {
+        swaps: AtomicUsize::new(0),
+    };
+    let err = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap(
+            "drain-keyset-retry-failed-relay",
+            &ctx.mint_url,
+            "sat",
+            &scripted,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("failed"));
+    assert_eq!(scripted.swaps.load(Ordering::SeqCst), 2);
+    let drains = ctx.wallet_manager.list_drains().unwrap();
+    assert_eq!(drains.len(), 1);
+    assert_eq!(drains[0].state, "Failed");
+
+    let net = ctx.net_for(&channel_id);
+    let retry = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap(
+            "drain-keyset-retry-failed-relay",
+            &ctx.mint_url,
+            "sat",
+            &net,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.channel_ids, vec![channel_id]);
+    let states = ctx
+        .wallet_manager
+        .list_drains()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.state)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        states,
+        BTreeSet::from(["Completed".to_string(), "Failed".to_string()])
+    );
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_two_keyset_rejections_retry_once_then_fail_and_release() {
+    let ctx = DrainTestContext::new("drain-keyset-retry-once-relay").await;
+    let channel_id = ctx.create_closed_channel([23u8; 32], 275).await;
+    let scripted = AlwaysKeysetRejectSwap {
+        swaps: AtomicUsize::new(0),
+    };
+    let err = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap(
+            "drain-keyset-retry-once-relay",
+            &ctx.mint_url,
+            "sat",
+            &scripted,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("failed"));
+    assert_eq!(scripted.swaps.load(Ordering::SeqCst), 2);
+    let drains = ctx.wallet_manager.list_drains().unwrap();
+    assert_eq!(drains.len(), 1);
+    assert_eq!(drains[0].state, "Failed");
+
+    let net = ctx.net_for(&channel_id);
+    let retry = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap(
+            "drain-keyset-retry-once-relay",
+            &ctx.mint_url,
+            "sat",
+            &net,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.channel_ids, vec![channel_id]);
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wallet_manager_drain_preparation_failure_does_not_reserve_channels() {
     let ctx = DrainTestContext::new("drain-invalid-relay").await;
     let channel_id = ctx.create_closed_channel([18u8; 32], 325).await;
@@ -5242,7 +5550,7 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
         .spilman_payments_for(
             "mixed-keyset-drain-relay",
             new_mint_cache,
-            trusted_mint_units,
+            trusted_mint_units.clone(),
         )
         .unwrap();
     let new_wallet = TestSigningWallet::new(
@@ -5287,6 +5595,10 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
     )
     .await;
     let expected_output = expected_input - expected_fee;
+    wallet_manager
+        .refresh_trusted_mint_cache(&trusted_mint_units)
+        .await
+        .expect("seed shared drain cache with rotated keysets");
 
     let net = wallet_manager
         .reqwest_networking_for_channel(&old_channel)
@@ -5315,12 +5627,206 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
     let storage = SqliteStorage::open(temp_db.path().to_str().unwrap()).unwrap();
     let old_cached = storage
         .get_keyset(&mint_url, &old_keyset_id.parse().unwrap())
-        .expect("old keyset should be cached by drain refresh");
+        .expect("old keyset should be cached");
     let new_cached = storage
         .get_keyset(&mint_url, &new_keyset_id.parse().unwrap())
-        .expect("new keyset should be cached by drain refresh");
+        .expect("new keyset should be cached");
     assert!(!old_cached.active);
     assert!(new_cached.active);
+
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_and_retries() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint = mint_helper.mint();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint.clone()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let old_keyset_id = mint_helper.keyset_id().to_string();
+    let old_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
+    wallet_manager
+        .register_identity("mixed-keyset-stale-drain-relay", receiver_secret)
+        .unwrap();
+
+    let old_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &old_keyset_id,
+        &old_keyset_info_json,
+        true,
+    );
+    let old_payments = wallet_manager
+        .spilman_payments_for(
+            "mixed-keyset-stale-drain-relay",
+            old_mint_cache.clone(),
+            trusted_mint_units.clone(),
+        )
+        .unwrap();
+    let old_wallet = TestSigningWallet::new(
+        mint.clone(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        old_keyset_id.clone(),
+        old_keyset_info_json.clone(),
+    )
+    .await;
+    let old_offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex.clone(),
+        mint_url: mint_url.clone(),
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![old_keyset_id.clone()],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let old_channel = create_paid_closed_channel(
+        &wallet_manager,
+        &old_payments,
+        &old_wallet,
+        &old_offer,
+        [24u8; 32],
+        300,
+    )
+    .await;
+
+    let new_keyset_id = rotate_sat_keyset(&mint, 600).await.unwrap().to_string();
+    let client_bridge = SpilmanClientBridge::new(
+        ConfigurableClientHost::new_in_memory(),
+        InMemoryMintNetworking::new(mint.clone()),
+    );
+    let new_keyset_info_json = client_bridge
+        .fetch_keyset_info(&mint_url, &new_keyset_id)
+        .expect("fetch rotated keyset info");
+    let new_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &new_keyset_id,
+        &new_keyset_info_json,
+        true,
+    );
+    let new_payments = wallet_manager
+        .spilman_payments_for(
+            "mixed-keyset-stale-drain-relay",
+            new_mint_cache,
+            trusted_mint_units,
+        )
+        .unwrap();
+    let new_wallet = TestSigningWallet::new(
+        mint.clone(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        new_keyset_id.clone(),
+        new_keyset_info_json.clone(),
+    )
+    .await;
+    let new_offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex,
+        mint_url: mint_url.clone(),
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![new_keyset_id.clone()],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let new_channel = create_paid_closed_channel(
+        &wallet_manager,
+        &new_payments,
+        &new_wallet,
+        &new_offer,
+        [25u8; 32],
+        200,
+    )
+    .await;
+
+    let old_closed = old_payments
+        .closed_data(&old_channel)
+        .expect("old channel closed data");
+    let new_closed = new_payments
+        .closed_data(&new_channel)
+        .expect("new channel closed data");
+    let expected_input = old_closed.receiver_sum + new_closed.receiver_sum;
+    let expected_fee = mixed_input_fee_for_proofs(
+        &mint_url,
+        &[
+            &old_closed.receiver_proofs_json,
+            &new_closed.receiver_proofs_json,
+        ],
+    )
+    .await;
+    let expected_output = expected_input - expected_fee;
+
+    let mut stale_cache = old_mint_cache;
+    stale_cache
+        .advertised
+        .get_mut(&mint_url)
+        .unwrap()
+        .get_mut("sat")
+        .unwrap()
+        .push(new_keyset_id.clone());
+    stale_cache.keysets.get_mut(&mint_url).unwrap().insert(
+        new_keyset_id.clone(),
+        CachedKeyset {
+            unit: "sat".to_string(),
+            active: false,
+            input_fee_ppk: keyset_info_input_fee_ppk(&new_keyset_info_json),
+            info_json: new_keyset_info_json,
+        },
+    );
+    wallet_manager.install_keyset_cache(stale_cache);
+
+    let net = wallet_manager
+        .reqwest_networking_for_channel(&old_channel)
+        .unwrap();
+    let swaps = Arc::new(AtomicUsize::new(0));
+    let output_keysets_by_call = Arc::new(Mutex::new(Vec::new()));
+    let counting = CountingDrainNet {
+        inner: &net,
+        swaps: swaps.clone(),
+        output_keysets_by_call: output_keysets_by_call.clone(),
+    };
+    let drain = wallet_manager
+        .drain_closed_channels_to_swap(
+            "mixed-keyset-stale-drain-relay",
+            &mint_url,
+            "sat",
+            &counting,
+            None,
+        )
+        .await
+        .expect("mixed stale-cache drain should refresh and retry");
+    assert_eq!(swaps.load(Ordering::SeqCst), 2);
+    let output_keysets_by_call = output_keysets_by_call.lock().unwrap().clone();
+    assert_eq!(output_keysets_by_call.len(), 2);
+    assert!(output_keysets_by_call[0].contains(&old_keyset_id));
+    assert!(output_keysets_by_call[1].contains(&new_keyset_id));
+    assert_eq!(drain.input_amount_raw, expected_input);
+    assert_eq!(drain.output_amount_raw, expected_output);
+    assert_eq!(
+        BTreeSet::from_iter(drain.channel_ids.iter().cloned()),
+        BTreeSet::from([old_channel, new_channel])
+    );
+    let output_proofs: Vec<cashu::nuts::Proof> =
+        serde_json::from_str(&drain.output_proofs_json).unwrap();
+    assert!(output_proofs
+        .iter()
+        .all(|proof| proof.keyset_id.to_string() == new_keyset_id));
 
     let _ = mint_shutdown_tx.send(());
 }

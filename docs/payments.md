@@ -71,11 +71,10 @@ Consequences:
 - `SessionStatus` advertises only configured trusted mint/unit options.
 - `ChannelLink` / `ChannelPayment` accept only known keysets that belong to a trusted unit for that mint.
 - old inactive keysets can remain usable for existing channels as long as the keyset metadata is known.
-- channel close starts from the shared cache and refreshes that mint into SQLite and memory only if the mint rejects the close swap with a keyset error.
+- channel close and relay drain swaps start from the shared cache and refresh that mint into SQLite and memory only if the mint rejects the swap with a keyset error.
 
-Drain swap preparation is the current exception: drains proactively fetch current
-mint keysets before building the drain swap because drains are rare wallet-admin
-operations and need current input fee / active output keyset metadata.
+This cache-first, single-refresh retry shape is intended to become the common
+pattern for all mint swaps that can fail because of stale keyset state.
 
 ## Funding Lifecycle
 

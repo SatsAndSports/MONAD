@@ -164,7 +164,7 @@ Current coverage includes:
 - control detach releases linked channels and tears down active / future streams
 - changing a relay's current trusted mint policy stops new advertisement/acceptance for that mint without invalidating previously stored channels
 
-Relay keyset handling is deliberately simple: each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy only when advertising options or accepting incoming channel funding/payments. Channel close starts from the shared cache; if the mint rejects a close swap with a keyset error, the close retry path refreshes that mint into SQLite and the shared cache before re-preparing the swap.
+Relay keyset handling is deliberately simple: each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy only when advertising options or accepting incoming channel funding/payments. Channel close and relay drain swaps start from the shared cache; if the mint rejects a swap with a keyset error, the retry path refreshes that mint into SQLite and the shared cache before re-preparing the swap.
 
 ## Payment Code Map
 

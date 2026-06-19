@@ -576,30 +576,12 @@ impl RelayWalletManager {
             return Err("no closed channels available to drain".to_string());
         }
 
-        let drain_keysets = self
-            .fetch_fresh_drain_keysets_from_mint(mint_url, unit)
-            .await?;
-        let output_keyset_id = drain_keysets.output_keyset_id.clone();
         let mut all_input_proofs = Vec::new();
         let mut input_amount_raw = 0u64;
-        let mut input_fee_ppk_sum = 0u64;
         for candidate in &candidates {
             let proofs: Vec<Proof> = serde_json::from_str(&candidate.receiver_proofs_json)
                 .map_err(|e| format!("parse receiver proofs for {}: {e}", candidate.channel_id))?;
             for proof in proofs {
-                let proof_keyset_id = proof.keyset_id.to_string();
-                let input_fee_ppk = drain_keysets
-                    .input_fee_ppk_by_keyset
-                    .get(&proof_keyset_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "missing input fee metadata for receiver proof keyset {}",
-                            proof.keyset_id
-                        )
-                    })?;
-                input_fee_ppk_sum = input_fee_ppk_sum
-                    .checked_add(*input_fee_ppk)
-                    .ok_or_else(|| "drain input fee overflow".to_string())?;
                 input_amount_raw = input_amount_raw
                     .checked_add(u64::from(proof.amount))
                     .ok_or_else(|| "drain input amount overflow".to_string())?;
@@ -610,18 +592,11 @@ impl RelayWalletManager {
             return Err("closed channels have no receiver proofs to drain".to_string());
         }
 
-        let input_fee_raw = input_fee_ppk_sum.div_ceil(1000);
-        let output_amount_raw = input_amount_raw
-            .checked_sub(input_fee_raw)
-            .ok_or_else(|| "drain input fees exceed input amount".to_string())?;
-        if output_amount_raw == 0 {
-            return Err("drain output amount is zero after fees".to_string());
-        }
-
-        let prepared = prepare_plain_drain_swap(
-            all_input_proofs,
-            output_amount_raw,
-            &drain_keysets.output_keyset_info_json,
+        let attempt = self.prepare_drain_attempt_from_cache(
+            mint_url,
+            unit,
+            &all_input_proofs,
+            input_amount_raw,
         )?;
         let drain_id = new_drain_id();
         self.insert_prepared_drain(
@@ -630,36 +605,35 @@ impl RelayWalletManager {
             mint_url,
             unit,
             input_amount_raw,
-            output_amount_raw,
-            &prepared,
-            &output_keyset_id,
-            &drain_keysets.output_keyset_info_json,
+            attempt.output_amount_raw,
+            &attempt.prepared,
+            &attempt.drain_keysets.output_keyset_id,
+            &attempt.drain_keysets.output_keyset_info_json,
             &candidates,
             now_seconds(),
         )?;
 
         self.mark_drain_submitted(&drain_id, now_seconds())?;
-        let swap_response = match net
-            .call_mint_swap(mint_url, &prepared.swap_request_json)
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                if is_explicit_drain_mint_rejection(&e) {
-                    self.mark_drain_failed_and_release(&drain_id, &e, now_seconds())?;
-                    return Err(format!("drain swap failed for {drain_id}: {e}"));
-                }
-                let _ = self.record_drain_error(&drain_id, &e);
-                return Err(format!(
-                    "drain swap submitted for {drain_id}, but response was not completed: {e}"
-                ));
-            }
-        };
+        let outcome = self
+            .submit_drain_with_keyset_retry(
+                net,
+                attempt,
+                DrainSubmitRequest {
+                    mint_url,
+                    unit,
+                    drain_id: &drain_id,
+                    all_input_proofs: &all_input_proofs,
+                    input_amount_raw,
+                },
+            )
+            .await?;
+        let _did_retry = outcome.did_retry;
+        let attempt = outcome.attempt;
 
         let output_proofs_json = complete_plain_drain_swap(
-            &swap_response,
-            &prepared.output_secrets_json,
-            &drain_keysets.output_keyset_info_json,
+            &outcome.swap_response,
+            &attempt.prepared.output_secrets_json,
+            &attempt.drain_keysets.output_keyset_info_json,
         )?;
         self.mark_drain_completed(&drain_id, &output_proofs_json, now_seconds())?;
 
@@ -669,7 +643,7 @@ impl RelayWalletManager {
             mint_url: mint_url.to_string(),
             unit: unit.to_string(),
             input_amount_raw,
-            output_amount_raw,
+            output_amount_raw: attempt.output_amount_raw,
             output_proofs_json,
             channel_ids: candidates.into_iter().map(|c| c.channel_id).collect(),
             recovered: false,
@@ -923,6 +897,43 @@ impl RelayWalletManager {
         Ok(())
     }
 
+    fn update_prepared_drain_attempt(
+        &self,
+        drain_id: &str,
+        output_amount_raw: u64,
+        prepared: &PreparedDrainSwap,
+        output_keyset_id: &str,
+        output_keyset_info_json: &str,
+        submitted_at: u64,
+    ) -> Result<(), String> {
+        let conn = Connection::open(&self.metadata.db_path)
+            .map_err(|e| format!("open relay wallet db: {e}"))?;
+        conn.execute(
+            "UPDATE monad_relay_drains
+             SET output_amount_raw = ?2,
+                 swap_request_json = ?3,
+                 restore_request_json = ?4,
+                 output_secrets_json = ?5,
+                 output_keyset_id = ?6,
+                 output_keyset_info_json = ?7,
+                 submitted_at = ?8,
+                 error = NULL
+             WHERE drain_id = ?1 AND state = 'Submitted'",
+            params![
+                drain_id,
+                i64_from_u64(output_amount_raw)?,
+                prepared.swap_request_json,
+                prepared.restore_request_json,
+                prepared.output_secrets_json,
+                output_keyset_id,
+                output_keyset_info_json,
+                i64_from_u64(submitted_at)?,
+            ],
+        )
+        .map_err(|e| format!("update drain retry attempt: {e}"))?;
+        Ok(())
+    }
+
     fn record_drain_error(&self, drain_id: &str, error: &str) -> Result<(), String> {
         let conn = Connection::open(&self.metadata.db_path)
             .map_err(|e| format!("open relay wallet db: {e}"))?;
@@ -1048,6 +1059,169 @@ impl RelayWalletManager {
         })
     }
 
+    fn prepare_drain_attempt_from_cache(
+        &self,
+        mint_url: &str,
+        unit: &str,
+        all_input_proofs: &[Proof],
+        input_amount_raw: u64,
+    ) -> Result<PreparedDrainAttempt, String> {
+        let drain_keysets = self.drain_keysets_from_shared_cache(mint_url, unit)?;
+        let mut input_fee_ppk_sum = 0u64;
+        for proof in all_input_proofs {
+            let proof_keyset_id = proof.keyset_id.to_string();
+            let input_fee_ppk = drain_keysets
+                .input_fee_ppk_by_keyset
+                .get(&proof_keyset_id)
+                .ok_or_else(|| {
+                    format!(
+                        "missing input fee metadata for receiver proof keyset {}",
+                        proof.keyset_id
+                    )
+                })?;
+            input_fee_ppk_sum = input_fee_ppk_sum
+                .checked_add(*input_fee_ppk)
+                .ok_or_else(|| "drain input fee overflow".to_string())?;
+        }
+        let input_fee_raw = input_fee_ppk_sum.div_ceil(1000);
+        let output_amount_raw = input_amount_raw
+            .checked_sub(input_fee_raw)
+            .ok_or_else(|| "drain input fees exceed input amount".to_string())?;
+        if output_amount_raw == 0 {
+            return Err("drain output amount is zero after fees".to_string());
+        }
+        let prepared = prepare_plain_drain_swap(
+            all_input_proofs.to_vec(),
+            output_amount_raw,
+            &drain_keysets.output_keyset_info_json,
+        )?;
+        Ok(PreparedDrainAttempt {
+            drain_keysets,
+            prepared,
+            output_amount_raw,
+        })
+    }
+
+    fn drain_keysets_from_shared_cache(
+        &self,
+        mint_url: &str,
+        unit: &str,
+    ) -> Result<DrainKeysets, String> {
+        let cache = self
+            .keyset_cache
+            .read()
+            .expect("relay wallet keyset cache lock poisoned");
+        let by_id = cache
+            .keysets
+            .get(mint_url)
+            .ok_or_else(|| format!("mint {mint_url} has no cached keysets"))?;
+        let mut input_fee_ppk_by_keyset = BTreeMap::new();
+        let mut active_output_keysets = Vec::new();
+        for (keyset_id, keyset) in by_id {
+            if keyset.unit != unit {
+                continue;
+            }
+            input_fee_ppk_by_keyset.insert(keyset_id.clone(), keyset.input_fee_ppk);
+            if keyset.active {
+                active_output_keysets.push((keyset_id.clone(), keyset.info_json.clone()));
+            }
+        }
+        active_output_keysets.sort_by(|a, b| a.0.cmp(&b.0));
+        let (output_keyset_id, output_keyset_info_json) = active_output_keysets
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("mint {mint_url} has no active keyset for unit {unit}"))?;
+        Ok(DrainKeysets {
+            output_keyset_id,
+            output_keyset_info_json,
+            input_fee_ppk_by_keyset,
+        })
+    }
+
+    async fn submit_drain_attempt<N: DrainSwapNetworking>(
+        &self,
+        net: &N,
+        mint_url: &str,
+        drain_id: &str,
+        attempt: &PreparedDrainAttempt,
+    ) -> Result<String, String> {
+        match net
+            .call_mint_swap(mint_url, &attempt.prepared.swap_request_json)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                if is_explicit_drain_mint_rejection(&e) {
+                    return Err(e);
+                }
+                let _ = self.record_drain_error(drain_id, &e);
+                Err(format!(
+                    "drain swap submitted for {drain_id}, but response was not completed: {e}"
+                ))
+            }
+        }
+    }
+
+    async fn submit_drain_with_keyset_retry<N: DrainSwapNetworking>(
+        &self,
+        net: &N,
+        mut attempt: PreparedDrainAttempt,
+        request: DrainSubmitRequest<'_>,
+    ) -> Result<DrainSubmitOutcome, String> {
+        match self
+            .submit_drain_attempt(net, request.mint_url, request.drain_id, &attempt)
+            .await
+        {
+            Ok(swap_response) => Ok(DrainSubmitOutcome {
+                attempt,
+                swap_response,
+                did_retry: false,
+            }),
+            Err(e) if is_retryable_drain_keyset_rejection(&e) => {
+                self.refresh_keysets_into_shared_cache(request.mint_url)
+                    .await?;
+                attempt = self.prepare_drain_attempt_from_cache(
+                    request.mint_url,
+                    request.unit,
+                    request.all_input_proofs,
+                    request.input_amount_raw,
+                )?;
+                self.update_prepared_drain_attempt(
+                    request.drain_id,
+                    attempt.output_amount_raw,
+                    &attempt.prepared,
+                    &attempt.drain_keysets.output_keyset_id,
+                    &attempt.drain_keysets.output_keyset_info_json,
+                    now_seconds(),
+                )?;
+                match self
+                    .submit_drain_attempt(net, request.mint_url, request.drain_id, &attempt)
+                    .await
+                {
+                    Ok(swap_response) => Ok(DrainSubmitOutcome {
+                        attempt,
+                        swap_response,
+                        did_retry: true,
+                    }),
+                    Err(e) => self.fail_or_return_submitted_drain_error(request.drain_id, e),
+                }
+            }
+            Err(e) => self.fail_or_return_submitted_drain_error(request.drain_id, e),
+        }
+    }
+
+    fn fail_or_return_submitted_drain_error<T>(
+        &self,
+        drain_id: &str,
+        error: String,
+    ) -> Result<T, String> {
+        if is_explicit_drain_mint_rejection(&error) {
+            self.mark_drain_failed_and_release(drain_id, &error, now_seconds())?;
+            return Err(format!("drain swap failed for {drain_id}: {error}"));
+        }
+        Err(error)
+    }
+
     fn channel_owner_and_mint(
         &self,
         channel_id: &str,
@@ -1127,6 +1301,28 @@ struct PreparedDrainSwap {
 }
 
 #[derive(Debug, Clone)]
+struct PreparedDrainAttempt {
+    drain_keysets: DrainKeysets,
+    prepared: PreparedDrainSwap,
+    output_amount_raw: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DrainSubmitOutcome {
+    attempt: PreparedDrainAttempt,
+    swap_response: String,
+    did_retry: bool,
+}
+
+struct DrainSubmitRequest<'a> {
+    mint_url: &'a str,
+    unit: &'a str,
+    drain_id: &'a str,
+    all_input_proofs: &'a [Proof],
+    input_amount_raw: u64,
+}
+
+#[derive(Debug, Clone)]
 struct StoredDrain {
     drain_id: String,
     relay_name: String,
@@ -1139,60 +1335,6 @@ struct StoredDrain {
     output_secrets_json: String,
     output_keyset_info_json: String,
     output_proofs_json: Option<String>,
-}
-
-/// Fetch mint keyset state for a drain and persist it through the relay cache.
-///
-/// Drains are rare and should use current mint state. This refreshes from the
-/// mint, updates the SQLite-backed keyset cache, then uses the fresh returned
-/// data to choose an active output keyset and input fee metadata.
-impl RelayWalletManager {
-    async fn fetch_fresh_drain_keysets_from_mint(
-        &self,
-        mint_url: &str,
-        unit: &str,
-    ) -> Result<DrainKeysets, String> {
-        let keysets = fetch_all_keysets_from_mint(mint_url).await?;
-        cache_relay_keysets(self.storage.as_ref(), mint_url, &keysets)?;
-        drain_keysets_from_fetched(mint_url, unit, keysets)
-    }
-}
-
-fn drain_keysets_from_fetched(
-    mint_url: &str,
-    unit: &str,
-    keysets: Vec<MintKeysetWithKeys>,
-) -> Result<DrainKeysets, String> {
-    let mut input_fee_ppk_by_keyset = BTreeMap::new();
-    let mut active_output_keysets = Vec::new();
-    for keyset in keysets {
-        if keyset.unit.to_string() != unit {
-            continue;
-        }
-        let keyset_id = keyset.id.to_string();
-        input_fee_ppk_by_keyset.insert(keyset_id.clone(), keyset.input_fee_ppk);
-        if keyset.active {
-            active_output_keysets.push((
-                keyset_id,
-                build_keyset_info_json(
-                    &keyset.id,
-                    &keyset.unit,
-                    &keyset.keys,
-                    keyset.input_fee_ppk,
-                ),
-            ));
-        }
-    }
-    active_output_keysets.sort_by(|a, b| a.0.cmp(&b.0));
-    let (output_keyset_id, output_keyset_info_json) = active_output_keysets
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("mint {mint_url} has no active keyset for unit {unit}"))?;
-    Ok(DrainKeysets {
-        output_keyset_id,
-        output_keyset_info_json,
-        input_fee_ppk_by_keyset,
-    })
 }
 
 pub(crate) fn merge_keysets_into_cache(
@@ -1213,6 +1355,7 @@ pub(crate) fn merge_keysets_into_cache(
             CachedKeyset {
                 unit,
                 active: keyset.active,
+                input_fee_ppk: keyset.input_fee_ppk,
                 info_json: build_keyset_info_json(
                     &keyset.id,
                     &keyset.unit,
@@ -1341,6 +1484,16 @@ fn is_explicit_drain_mint_rejection(error: &str) -> bool {
         && (value.get("code").is_some()
             || value.get("detail").is_some()
             || value.get("error").is_some())
+}
+
+fn is_retryable_drain_keyset_rejection(error: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(error) else {
+        return false;
+    };
+    matches!(
+        value.get("code").and_then(|code| code.as_u64()),
+        Some(12000..=12999) | Some(99999)
+    )
 }
 
 fn new_drain_id() -> String {

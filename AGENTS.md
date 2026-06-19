@@ -77,7 +77,7 @@ cargo run -p monad-quic -- ...
 - `SessionStatus.linked_channel` carries the relay-authoritative linked channel id, latest accepted raw balance, raw capacity, and unit.
 - control-stream detach fully ends the session: linked ownership is released, active streams are torn down, and new streams are no longer accepted.
 - Session ID is the Noise handshake hash (32 bytes, identical on both sides)
-- Relay keyset handling: the relay wallet manager owns one shared in-memory `SpilmanMintCache` plus SQLite persistence. The memory cache stores all keysets returned by configured mints (all units, active and inactive); trusted mint/unit policy filters advertisements and incoming channel acceptance at read time. Channel close is cache-first and refreshes that mint into SQLite + the shared cache only if the close-swap retry path sees a mint keyset error.
+- Relay keyset handling: the relay wallet manager owns one shared in-memory `SpilmanMintCache` plus SQLite persistence. The memory cache stores all keysets returned by configured mints (all units, active and inactive); trusted mint/unit policy filters advertisements and incoming channel acceptance at read time. Channel close and relay drain swaps are cache-first and refresh that mint into SQLite + the shared cache only if a swap retry path sees a mint keyset error.
 
 ### Current Client Runtime State
 

@@ -436,6 +436,7 @@ fn synthetic_test_mint_cache() -> SpilmanMintCache {
             CachedKeyset {
                 unit: SYNTHETIC_TEST_MINT_UNIT.to_string(),
                 active: true,
+                input_fee_ppk: 0,
                 info_json:
                     r#"{"keysetId":"00testkeyset0000","unit":"msat","keys":{},"inputFeePpk":0}"#
                         .to_string(),
