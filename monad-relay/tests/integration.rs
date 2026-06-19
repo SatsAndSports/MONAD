@@ -5416,6 +5416,101 @@ async fn test_wallet_manager_drain_two_keyset_rejections_retry_once_then_fail_an
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_retry_refresh_failure_marks_failed_and_releases() {
+    let ctx = DrainTestContext::new("drain-refresh-failed-relay").await;
+    let channel_id = ctx.create_closed_channel([26u8; 32], 275).await;
+    let db_path = ctx._temp_db.path().to_str().unwrap().to_string();
+    let bad_mint_url = "http://127.0.0.1:1";
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let original_funding_json: String = conn
+        .query_row(
+            "SELECT funding_json FROM spilman_channels WHERE channel_id = ?1",
+            rusqlite::params![channel_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut funding_value: serde_json::Value =
+        serde_json::from_str(&original_funding_json).unwrap();
+    let mut params_value: serde_json::Value = serde_json::from_str(
+        funding_value["params_json"]
+            .as_str()
+            .expect("funding params json"),
+    )
+    .unwrap();
+    params_value["mint"] = serde_json::Value::String(bad_mint_url.to_string());
+    funding_value["params_json"] = serde_json::Value::String(params_value.to_string());
+    conn.execute(
+        "UPDATE spilman_channels SET funding_json = ?2 WHERE channel_id = ?1",
+        rusqlite::params![channel_id, funding_value.to_string()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let stale_cache = ctx.wallet_manager.keyset_cache_snapshot();
+    let old_keyset_id = ctx.offer.accepted_keyset_ids[0].clone();
+    let old_keyset = stale_cache
+        .keysets
+        .get(&ctx.mint_url)
+        .and_then(|by_id| by_id.get(&old_keyset_id))
+        .expect("old keyset cached")
+        .clone();
+    let retry_manager = RelayWalletManager::open(&db_path).unwrap();
+    retry_manager.install_keyset_cache(SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            bad_mint_url.to_string(),
+            BTreeMap::from([("sat".to_string(), vec![old_keyset_id.clone()])]),
+        )]),
+        keysets: BTreeMap::from([(
+            bad_mint_url.to_string(),
+            BTreeMap::from([(old_keyset_id, old_keyset)]),
+        )]),
+    });
+
+    let scripted = AlwaysKeysetRejectSwap {
+        swaps: AtomicUsize::new(0),
+    };
+    let err = retry_manager
+        .drain_closed_channels_to_swap(
+            "drain-refresh-failed-relay",
+            bad_mint_url,
+            "sat",
+            &scripted,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("refresh keysets after keyset rejection"));
+    assert_eq!(scripted.swaps.load(Ordering::SeqCst), 1);
+    let drains = retry_manager.list_drains().unwrap();
+    assert_eq!(drains.len(), 1);
+    assert_eq!(drains[0].state, "Failed");
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE spilman_channels SET funding_json = ?2 WHERE channel_id = ?1",
+        rusqlite::params![channel_id, original_funding_json],
+    )
+    .unwrap();
+    drop(conn);
+
+    let net = ctx.net_for(&channel_id);
+    let retry = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap(
+            "drain-refresh-failed-relay",
+            &ctx.mint_url,
+            "sat",
+            &net,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.channel_ids, vec![channel_id]);
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wallet_manager_drain_preparation_failure_does_not_reserve_channels() {
     let ctx = DrainTestContext::new("drain-invalid-relay").await;
     let channel_id = ctx.create_closed_channel([18u8; 32], 325).await;

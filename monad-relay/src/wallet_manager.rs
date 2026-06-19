@@ -627,6 +627,8 @@ impl RelayWalletManager {
                 },
             )
             .await?;
+        // The helper reports whether the retry branch was used; integration
+        // tests assert that path via submitted swap contents and call counts.
         let _did_retry = outcome.did_retry;
         let attempt = outcome.attempt;
 
@@ -1178,22 +1180,42 @@ impl RelayWalletManager {
                 did_retry: false,
             }),
             Err(e) if is_retryable_drain_keyset_rejection(&e) => {
-                self.refresh_keysets_into_shared_cache(request.mint_url)
-                    .await?;
-                attempt = self.prepare_drain_attempt_from_cache(
+                if let Err(err) = self
+                    .refresh_keysets_into_shared_cache(request.mint_url)
+                    .await
+                {
+                    return self.fail_drain_after_retry_setup_error(
+                        request.drain_id,
+                        format!("refresh keysets after keyset rejection: {err}"),
+                    );
+                }
+                attempt = match self.prepare_drain_attempt_from_cache(
                     request.mint_url,
                     request.unit,
                     request.all_input_proofs,
                     request.input_amount_raw,
-                )?;
-                self.update_prepared_drain_attempt(
+                ) {
+                    Ok(attempt) => attempt,
+                    Err(err) => {
+                        return self.fail_drain_after_retry_setup_error(
+                            request.drain_id,
+                            format!("prepare retry drain after keyset refresh: {err}"),
+                        );
+                    }
+                };
+                if let Err(err) = self.update_prepared_drain_attempt(
                     request.drain_id,
                     attempt.output_amount_raw,
                     &attempt.prepared,
                     &attempt.drain_keysets.output_keyset_id,
                     &attempt.drain_keysets.output_keyset_info_json,
                     now_seconds(),
-                )?;
+                ) {
+                    return self.fail_drain_after_retry_setup_error(
+                        request.drain_id,
+                        format!("update retry drain attempt: {err}"),
+                    );
+                }
                 match self
                     .submit_drain_attempt(net, request.mint_url, request.drain_id, &attempt)
                     .await
@@ -1208,6 +1230,15 @@ impl RelayWalletManager {
             }
             Err(e) => self.fail_or_return_submitted_drain_error(request.drain_id, e),
         }
+    }
+
+    fn fail_drain_after_retry_setup_error<T>(
+        &self,
+        drain_id: &str,
+        error: String,
+    ) -> Result<T, String> {
+        self.mark_drain_failed_and_release(drain_id, &error, now_seconds())?;
+        Err(format!("drain swap failed for {drain_id}: {error}"))
     }
 
     fn fail_or_return_submitted_drain_error<T>(
