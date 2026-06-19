@@ -11,13 +11,11 @@ use crate::wallet::{
 };
 use cashu::nuts::{CurrencyUnit, Id};
 use cdk_spilman::{
-    compute_funding_token_amount, parse_keyset_info_from_json, ClientChannelInfo,
-    ConfigurableClientHost, OpenChannelError, OpenChannelFailureStage, OpenChannelResult,
-    ReqwestClientNetworking, SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking,
+    compute_funding_token_amount, parse_keyset_info_from_json, with_active_keyset_retry,
+    ClientChannelInfo, ConfigurableClientHost, KeysetRetryError, KeysetRetryPhase,
+    OpenChannelError, OpenChannelFailureStage, OpenChannelResult, ReqwestClientNetworking,
+    SelectedOutputKeyset, SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking,
     SqliteClientStorage,
-};
-use monad_common::keyset_retry::{
-    with_active_keyset_retry, KeysetRetryError, KeysetRetryPhase, SelectedOutputKeyset,
 };
 use rusqlite::{params, Connection};
 use std::collections::HashMap;

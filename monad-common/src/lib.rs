@@ -3,7 +3,6 @@ pub mod blinded_hop;
 pub mod bootstrap;
 pub mod control_codec;
 pub mod h2stream;
-pub mod keyset_retry;
 pub mod noise_secp256k1;
 pub mod payment_units;
 pub mod protocol;

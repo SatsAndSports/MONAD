@@ -13,10 +13,8 @@ use cdk_spilman::configurable_networking::{
 };
 use cdk_spilman::{
     complete_funding_swap, create_plain_blinded_messages, is_retryable_keyset_mint_error,
-    ChannelState, CloseError, CloseSuccess, SpilmanAsyncNetworking,
-};
-use monad_common::keyset_retry::{
-    with_active_keyset_retry_async, KeysetRetryError, KeysetRetryPhase,
+    with_active_keyset_retry_async, ChannelState, CloseError, CloseSuccess, KeysetRetryError,
+    KeysetRetryPhase, SpilmanAsyncNetworking,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{BTreeMap, HashMap};
