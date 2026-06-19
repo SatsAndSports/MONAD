@@ -40,6 +40,7 @@ use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
 use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
+use cdk_spilman::configurable_networking::ReqwestNetworking;
 use cdk_spilman::{ChannelState, ClosingData, ConfigurableClientHost, SpilmanClientBridge};
 use cdk_spilman_test_mint::{
     build_router, build_test_mint, rotate_sat_keyset, InMemoryMintNetworking, TestMintConfig,
@@ -55,10 +56,12 @@ use monad_relay::listener::{
 use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
 use monad_relay::quic_pool::QuicPool;
 use monad_relay::session_registry::SessionRegistry;
-use monad_relay::wallet_manager::RelayWalletManager;
+use monad_relay::wallet_manager::{DrainSwapNetworking, RelayWalletManager};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -645,6 +648,189 @@ fn assert_closed_payout_at_least(
         closed_data.value_after_stage1,
         "proof sums should match the stage-1 close value"
     );
+}
+
+async fn create_paid_closed_channel(
+    wallet_manager: &RelayWalletManager,
+    payments: &SpilmanRelayPayments,
+    wallet: &TestSigningWallet,
+    offer: &RelayPaymentOffer,
+    session_id: [u8; 32],
+    funded_balance_raw: u64,
+) -> String {
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+    wallet
+        .attach_channel_to_session(&channel_id, session_id)
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, offer).unwrap();
+    payments.link_channel(session_id, &link_json).unwrap();
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, offer, 0, funded_balance_raw)
+        .unwrap();
+    payments
+        .apply_channel_payment(&channel_id, &payment_json)
+        .unwrap();
+
+    let net = wallet_manager
+        .reqwest_networking_for_channel(&channel_id)
+        .expect("wallet manager should build close networking");
+    let close_success = payments
+        .close_channel_async(&channel_id, &net)
+        .await
+        .expect("relay should close test channel");
+    assert_eq!(close_success.receiver_sum, funded_balance_raw);
+    assert_closed_payout_at_least(payments, &channel_id, funded_balance_raw);
+    channel_id
+}
+
+struct DropAfterSwap<'a> {
+    inner: &'a ReqwestNetworking,
+}
+
+impl DrainSwapNetworking for DropAfterSwap<'_> {
+    fn call_mint_swap<'a>(
+        &'a self,
+        mint_url: &'a str,
+        swap_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self
+                .inner
+                .call_mint_swap(mint_url, swap_request_json)
+                .await?;
+            Err("simulated transport drop after accepted swap".to_string())
+        })
+    }
+
+    fn call_mint_restore<'a>(
+        &'a self,
+        mint_url: &'a str,
+        restore_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        self.inner.call_mint_restore(mint_url, restore_request_json)
+    }
+}
+
+struct RejectSwap;
+
+impl DrainSwapNetworking for RejectSwap {
+    fn call_mint_swap<'a>(
+        &'a self,
+        _mint_url: &'a str,
+        _swap_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { Err(r#"{"code":11001,"detail":"proofs already spent"}"#.to_string()) })
+    }
+
+    fn call_mint_restore<'a>(
+        &'a self,
+        _mint_url: &'a str,
+        _restore_request_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { Err("restore should not be called".to_string()) })
+    }
+}
+
+struct DrainTestContext {
+    mint_url: String,
+    wallet_manager: RelayWalletManager,
+    payments: Arc<SpilmanRelayPayments>,
+    wallet: TestSigningWallet,
+    offer: RelayPaymentOffer,
+    _temp_db: tempfile::NamedTempFile,
+    mint_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl DrainTestContext {
+    async fn new(relay_name: &str) -> Self {
+        let mint_helper = TestMintHelper::new().await.unwrap();
+        let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mint_addr = mint_listener.local_addr().unwrap();
+        let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+        let mint_router = build_router(mint_helper.mint()).await.unwrap();
+        let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(mint_listener, mint_router)
+                .with_graceful_shutdown(async {
+                    let _ = mint_shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let keyset_id = mint_helper.keyset_id().to_string();
+        let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+        let mint_cache = SpilmanMintCache {
+            advertised: BTreeMap::from([(
+                mint_url.clone(),
+                BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+            )]),
+            keyset_info_json_by_mint: BTreeMap::from([(
+                mint_url.clone(),
+                BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+            )]),
+        };
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
+        let receiver_secret = cashu::nuts::SecretKey::generate();
+        let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+        wallet_manager
+            .register_identity(relay_name, receiver_secret)
+            .unwrap();
+        let payments = wallet_manager
+            .spilman_payments_for(relay_name, mint_cache)
+            .unwrap();
+        let wallet = TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json,
+        )
+        .await;
+        let offer = RelayPaymentOffer {
+            receiver_pubkey: receiver_pubkey_hex,
+            mint_url: mint_url.clone(),
+            unit: "sat".to_string(),
+            accepted_keyset_ids: vec![keyset_id],
+            in_bytes_per_millisat: 1,
+            out_bytes_per_millisat: 1,
+        };
+
+        Self {
+            mint_url,
+            wallet_manager,
+            payments,
+            wallet,
+            offer,
+            _temp_db: temp_db,
+            mint_shutdown_tx: Some(mint_shutdown_tx),
+        }
+    }
+
+    async fn create_closed_channel(&self, session_id: [u8; 32], funded_balance_raw: u64) -> String {
+        create_paid_closed_channel(
+            &self.wallet_manager,
+            &self.payments,
+            &self.wallet,
+            &self.offer,
+            session_id,
+            funded_balance_raw,
+        )
+        .await
+    }
+
+    fn net_for(&self, channel_id: &str) -> ReqwestNetworking {
+        self.wallet_manager
+            .reqwest_networking_for_channel(channel_id)
+            .unwrap()
+    }
+
+    fn shutdown(mut self) {
+        if let Some(tx) = self.mint_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 async fn bind_ipv6_listener() -> Option<TcpListener> {
@@ -4543,6 +4729,445 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     let _ = shutdown_tx.send(());
     handle.await.unwrap().unwrap();
     let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_swap_combines_multiple_closed_channels() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    wallet_manager
+        .register_identity("drain-relay", receiver_secret)
+        .unwrap();
+    let payments = wallet_manager
+        .spilman_payments_for("drain-relay", mint_cache)
+        .unwrap();
+    let wallet = TestSigningWallet::new(
+        mint_helper.mint(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        keyset_id.clone(),
+        keyset_info_json,
+    )
+    .await;
+    let offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex,
+        mint_url: mint_url.clone(),
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![keyset_id],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+
+    let ch1 =
+        create_paid_closed_channel(&wallet_manager, &payments, &wallet, &offer, [1u8; 32], 300)
+            .await;
+    let ch2 =
+        create_paid_closed_channel(&wallet_manager, &payments, &wallet, &offer, [2u8; 32], 200)
+            .await;
+
+    let net = wallet_manager.reqwest_networking_for_channel(&ch1).unwrap();
+    let drain = wallet_manager
+        .drain_closed_channels_to_swap("drain-relay", &mint_url, "sat", &net, None)
+        .await
+        .expect("drain should swap closed receiver proofs");
+    assert_eq!(drain.input_amount_raw, 500);
+    assert_eq!(drain.output_amount_raw, 500);
+    assert_eq!(sum_proof_amounts(&drain.output_proofs_json), 500);
+    assert_eq!(
+        BTreeSet::from_iter(drain.channel_ids.iter().cloned()),
+        BTreeSet::from([ch1, ch2])
+    );
+    assert!(!drain.recovered);
+
+    let drains = wallet_manager.list_drains().unwrap();
+    assert_eq!(drains.len(), 1);
+    assert_eq!(drains[0].state, "Completed");
+    let no_more = wallet_manager
+        .drain_closed_channels_to_swap("drain-relay", &mint_url, "sat", &net, None)
+        .await
+        .unwrap_err();
+    assert!(no_more.contains("no closed channels"));
+
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_swap_recovers_after_ambiguous_submission() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(keyset_id.clone(), keyset_info_json.clone())]),
+        )]),
+    };
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    wallet_manager
+        .register_identity("drain-recovery-relay", receiver_secret)
+        .unwrap();
+    let payments = wallet_manager
+        .spilman_payments_for("drain-recovery-relay", mint_cache)
+        .unwrap();
+    let wallet = TestSigningWallet::new(
+        mint_helper.mint(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        keyset_id.clone(),
+        keyset_info_json,
+    )
+    .await;
+    let offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex,
+        mint_url: mint_url.clone(),
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![keyset_id],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+
+    let channel_id =
+        create_paid_closed_channel(&wallet_manager, &payments, &wallet, &offer, [3u8; 32], 400)
+            .await;
+
+    let net = wallet_manager
+        .reqwest_networking_for_channel(&channel_id)
+        .unwrap();
+    let dropped = DropAfterSwap { inner: &net };
+    let err = wallet_manager
+        .drain_closed_channels_to_swap("drain-recovery-relay", &mint_url, "sat", &dropped, None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("submitted"));
+
+    let drains = wallet_manager.list_drains().unwrap();
+    assert_eq!(drains.len(), 1);
+    assert_eq!(drains[0].state, "Submitted");
+    let drain_id = drains[0].drain_id.clone();
+
+    let reserved = wallet_manager
+        .drain_closed_channels_to_swap("drain-recovery-relay", &mint_url, "sat", &net, None)
+        .await
+        .unwrap_err();
+    assert!(reserved.contains("no closed channels"));
+
+    let recovered = wallet_manager
+        .recover_submitted_drain(&drain_id, &net)
+        .await
+        .expect("submitted drain should recover via restore");
+    assert!(recovered.recovered);
+    assert_eq!(recovered.input_amount_raw, 400);
+    assert_eq!(recovered.output_amount_raw, 400);
+    assert_eq!(sum_proof_amounts(&recovered.output_proofs_json), 400);
+    assert_eq!(recovered.channel_ids, vec![channel_id]);
+    assert_eq!(wallet_manager.list_drains().unwrap()[0].state, "Completed");
+
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_swap_limit_selects_subset() {
+    let ctx = DrainTestContext::new("drain-limit-relay").await;
+    let ch1 = ctx.create_closed_channel([10u8; 32], 100).await;
+    let ch2 = ctx.create_closed_channel([11u8; 32], 200).await;
+    let ch3 = ctx.create_closed_channel([12u8; 32], 300).await;
+    let net = ctx.net_for(&ch1);
+
+    let first = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-limit-relay", &ctx.mint_url, "sat", &net, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(first.channel_ids.len(), 2);
+
+    let second = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-limit-relay", &ctx.mint_url, "sat", &net, None)
+        .await
+        .unwrap();
+    assert_eq!(second.channel_ids.len(), 1);
+    assert_eq!(first.input_amount_raw + second.input_amount_raw, 600);
+    let drained = first
+        .channel_ids
+        .into_iter()
+        .chain(second.channel_ids)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(drained, BTreeSet::from([ch1, ch2, ch3]));
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_swap_filters_by_mint_and_unit() {
+    let ctx = DrainTestContext::new("drain-filter-relay").await;
+    let channel_id = ctx.create_closed_channel([13u8; 32], 250).await;
+    let net = ctx.net_for(&channel_id);
+
+    let wrong_mint = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap(
+            "drain-filter-relay",
+            "http://127.0.0.1:1",
+            "sat",
+            &net,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(wrong_mint.contains("no closed channels"));
+    let wrong_unit = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-filter-relay", &ctx.mint_url, "msat", &net, None)
+        .await
+        .unwrap_err();
+    assert!(wrong_unit.contains("no closed channels"));
+    assert!(ctx.wallet_manager.list_drains().unwrap().is_empty());
+
+    let drain = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-filter-relay", &ctx.mint_url, "sat", &net, None)
+        .await
+        .unwrap();
+    assert_eq!(drain.channel_ids, vec![channel_id]);
+    assert_eq!(drain.input_amount_raw, 250);
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_swap_ignores_non_closed_channels() {
+    let ctx = DrainTestContext::new("drain-open-relay").await;
+    let channel_id = ctx.wallet.pre_create_channel(1000).await.unwrap();
+    ctx.wallet
+        .attach_channel_to_session(&channel_id, [14u8; 32])
+        .unwrap();
+    let link_json = ctx
+        .wallet
+        .build_link_request(&channel_id, &ctx.offer)
+        .unwrap();
+    ctx.payments.link_channel([14u8; 32], &link_json).unwrap();
+    let payment_json = ctx
+        .wallet
+        .build_channel_payment(&channel_id, &ctx.offer, 0, 100)
+        .unwrap();
+    ctx.payments
+        .apply_channel_payment(&channel_id, &payment_json)
+        .unwrap();
+
+    let net = ctx.net_for(&channel_id);
+    let err = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-open-relay", &ctx.mint_url, "sat", &net, None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("no closed channels"));
+    assert!(ctx.wallet_manager.list_drains().unwrap().is_empty());
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_recover_completed_drain_is_idempotent() {
+    let ctx = DrainTestContext::new("drain-idempotent-relay").await;
+    let channel_id = ctx.create_closed_channel([15u8; 32], 350).await;
+    let net = ctx.net_for(&channel_id);
+    let drain = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-idempotent-relay", &ctx.mint_url, "sat", &net, None)
+        .await
+        .unwrap();
+
+    let recovered = ctx
+        .wallet_manager
+        .recover_submitted_drain(&drain.drain_id, &net)
+        .await
+        .unwrap();
+    assert!(!recovered.recovered);
+    assert_eq!(recovered.output_proofs_json, drain.output_proofs_json);
+    assert_eq!(recovered.channel_ids, drain.channel_ids);
+    assert_eq!(
+        ctx.wallet_manager.list_drains().unwrap()[0].state,
+        "Completed"
+    );
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_recover_missing_drain_errors() {
+    let ctx = DrainTestContext::new("drain-missing-relay").await;
+    let err = ctx
+        .wallet_manager
+        .recover_submitted_drain("missing-drain", &RejectSwap)
+        .await
+        .unwrap_err();
+    assert!(err.contains("not found"));
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_recovery_survives_manager_reopen() {
+    let ctx = DrainTestContext::new("drain-reopen-relay").await;
+    let channel_id = ctx.create_closed_channel([16u8; 32], 450).await;
+    let db_path = ctx._temp_db.path().to_str().unwrap().to_string();
+    let net = ctx.net_for(&channel_id);
+    let dropped = DropAfterSwap { inner: &net };
+    let err = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-reopen-relay", &ctx.mint_url, "sat", &dropped, None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("submitted"));
+    let drain_id = ctx.wallet_manager.list_drains().unwrap()[0]
+        .drain_id
+        .clone();
+
+    let reopened = RelayWalletManager::open(&db_path).unwrap();
+    let reopened_net = reopened
+        .reqwest_networking_for_channel(&channel_id)
+        .unwrap();
+    let recovered = reopened
+        .recover_submitted_drain(&drain_id, &reopened_net)
+        .await
+        .unwrap();
+    assert!(recovered.recovered);
+    assert_eq!(recovered.input_amount_raw, 450);
+    assert_eq!(sum_proof_amounts(&recovered.output_proofs_json), 450);
+    assert_eq!(reopened.list_drains().unwrap()[0].state, "Completed");
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_explicit_mint_rejection_marks_failed_and_releases_channels() {
+    let ctx = DrainTestContext::new("drain-failed-relay").await;
+    let channel_id = ctx.create_closed_channel([17u8; 32], 275).await;
+    let err = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap(
+            "drain-failed-relay",
+            &ctx.mint_url,
+            "sat",
+            &RejectSwap,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("failed"));
+    let drains = ctx.wallet_manager.list_drains().unwrap();
+    assert_eq!(drains.len(), 1);
+    assert_eq!(drains[0].state, "Failed");
+
+    let net = ctx.net_for(&channel_id);
+    let retry = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-failed-relay", &ctx.mint_url, "sat", &net, None)
+        .await
+        .unwrap();
+    assert_eq!(retry.channel_ids, vec![channel_id]);
+    assert_eq!(retry.input_amount_raw, 275);
+    let states = ctx
+        .wallet_manager
+        .list_drains()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.state)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        states,
+        BTreeSet::from(["Completed".to_string(), "Failed".to_string()])
+    );
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_preparation_failure_does_not_reserve_channels() {
+    let ctx = DrainTestContext::new("drain-invalid-relay").await;
+    let channel_id = ctx.create_closed_channel([18u8; 32], 325).await;
+    let db_path = ctx._temp_db.path().to_str().unwrap();
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let original_closed_json: String = conn
+        .query_row(
+            "SELECT closed_json FROM spilman_channels WHERE channel_id = ?1",
+            rusqlite::params![channel_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut closed_value: serde_json::Value = serde_json::from_str(&original_closed_json).unwrap();
+    closed_value["receiver_proofs_json"] = serde_json::Value::String("[]".to_string());
+    conn.execute(
+        "UPDATE spilman_channels SET closed_json = ?2 WHERE channel_id = ?1",
+        rusqlite::params![channel_id, closed_value.to_string()],
+    )
+    .unwrap();
+
+    let net = ctx.net_for(&channel_id);
+    let err = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-invalid-relay", &ctx.mint_url, "sat", &net, None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("no receiver proofs"));
+    assert!(ctx.wallet_manager.list_drains().unwrap().is_empty());
+
+    conn.execute(
+        "UPDATE spilman_channels SET closed_json = ?2 WHERE channel_id = ?1",
+        rusqlite::params![channel_id, original_closed_json],
+    )
+    .unwrap();
+    let drain = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-invalid-relay", &ctx.mint_url, "sat", &net, None)
+        .await
+        .unwrap();
+    assert_eq!(drain.channel_ids, vec![channel_id]);
+    assert_eq!(drain.input_amount_raw, 325);
+    ctx.shutdown();
 }
 
 #[tokio::test]
