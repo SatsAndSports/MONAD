@@ -12,8 +12,8 @@ use cdk_spilman::configurable_networking::{
     build_keyset_info_json, fetch_all_keysets_from_mint, MintKeysetWithKeys, ReqwestNetworking,
 };
 use cdk_spilman::{
-    complete_funding_swap, create_plain_blinded_messages, ChannelState, CloseError, CloseSuccess,
-    SpilmanAsyncNetworking,
+    complete_funding_swap, create_plain_blinded_messages, is_retryable_keyset_mint_error,
+    ChannelState, CloseError, CloseSuccess, SpilmanAsyncNetworking,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{BTreeMap, HashMap};
@@ -1179,7 +1179,7 @@ impl RelayWalletManager {
                 swap_response,
                 did_retry: false,
             }),
-            Err(e) if is_retryable_drain_keyset_rejection(&e) => {
+            Err(e) if is_retryable_keyset_mint_error(&e) => {
                 if let Err(err) = self
                     .refresh_keysets_into_shared_cache(request.mint_url)
                     .await
@@ -1515,16 +1515,6 @@ fn is_explicit_drain_mint_rejection(error: &str) -> bool {
         && (value.get("code").is_some()
             || value.get("detail").is_some()
             || value.get("error").is_some())
-}
-
-fn is_retryable_drain_keyset_rejection(error: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(error) else {
-        return false;
-    };
-    matches!(
-        value.get("code").and_then(|code| code.as_u64()),
-        Some(12000..=12999) | Some(99999)
-    )
 }
 
 fn new_drain_id() -> String {
