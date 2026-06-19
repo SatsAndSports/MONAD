@@ -154,34 +154,43 @@ impl SqliteClientWallet {
                 "target capacity must be greater than zero".to_string(),
             ));
         }
-        let mut retried = false;
-        loop {
-            let attempt = self.prepare_target_capacity_attempt(offer, target_capacity_raw)?;
-            match self.submit_reserved_channel(
-                offer,
-                &attempt.output_keyset_info_json,
-                &attempt.reservation,
-                Some(attempt.requested_capacity_raw),
-            ) {
-                Ok(open_result) => {
-                    return self.finish_open_channel(open_result, &attempt.reservation);
-                }
-                Err(error) if should_retry_open_after_keyset_rejection(&error, retried) => {
-                    retried = true;
-                    let _ = self
-                        .loose_wallet
-                        .release_reservation(&attempt.reservation.reservation_id);
-                    continue;
-                }
-                Err(error) => {
-                    return self.handle_open_error(
+        let attempt = self.prepare_target_capacity_attempt(offer, target_capacity_raw)?;
+        match self.submit_reserved_channel(
+            offer,
+            &attempt.output_keyset_info_json,
+            &attempt.reservation,
+            Some(attempt.requested_capacity_raw),
+        ) {
+            Ok(open_result) => self.finish_open_channel(open_result, &attempt.reservation),
+            Err(error) if should_retry_open_after_keyset_rejection(&error, false) => {
+                let _ = self
+                    .loose_wallet
+                    .release_reservation(&attempt.reservation.reservation_id);
+                let retry_attempt =
+                    self.prepare_target_capacity_attempt(offer, target_capacity_raw)?;
+                match self.submit_reserved_channel(
+                    offer,
+                    &retry_attempt.output_keyset_info_json,
+                    &retry_attempt.reservation,
+                    Some(retry_attempt.requested_capacity_raw),
+                ) {
+                    Ok(open_result) => {
+                        self.finish_open_channel(open_result, &retry_attempt.reservation)
+                    }
+                    Err(error) => self.handle_open_error(
                         error,
-                        &attempt.reservation,
+                        &retry_attempt.reservation,
                         offer,
-                        attempt.selected_input_msats,
-                    );
+                        retry_attempt.selected_input_msats,
+                    ),
                 }
             }
+            Err(error) => self.handle_open_error(
+                error,
+                &attempt.reservation,
+                offer,
+                attempt.selected_input_msats,
+            ),
         }
     }
 
