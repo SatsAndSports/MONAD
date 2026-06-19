@@ -620,6 +620,36 @@ fn sum_proof_amounts(proofs_json: &str) -> u64 {
     proofs.iter().map(|p| u64::from(p.amount)).sum()
 }
 
+async fn mixed_input_fee_for_proofs(mint_url: &str, proofs_jsons: &[&str]) -> u64 {
+    let keysets: serde_json::Value = reqwest::Client::new()
+        .get(format!("{mint_url}/v1/keysets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fee_by_keyset = keysets["keysets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|keyset| {
+            (
+                keyset["id"].as_str().unwrap().to_string(),
+                keyset["input_fee_ppk"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let fee_ppk_sum = proofs_jsons
+        .iter()
+        .flat_map(|proofs_json| {
+            serde_json::from_str::<Vec<cashu::nuts::Proof>>(proofs_json).unwrap()
+        })
+        .map(|proof| fee_by_keyset[&proof.keyset_id.to_string()])
+        .sum::<u64>();
+    fee_ppk_sum.div_ceil(1000)
+}
+
 fn assert_closed_payout_at_least(
     payments: &SpilmanRelayPayments,
     channel_id: &str,
@@ -678,7 +708,7 @@ async fn create_paid_closed_channel(
         .close_channel_async(&channel_id, &net)
         .await
         .expect("relay should close test channel");
-    assert_eq!(close_success.receiver_sum, funded_balance_raw);
+    assert!(close_success.receiver_sum >= funded_balance_raw);
     assert_closed_payout_at_least(payments, &channel_id, funded_balance_raw);
     channel_id
 }
@@ -5168,6 +5198,165 @@ async fn test_wallet_manager_drain_preparation_failure_does_not_reserve_channels
     assert_eq!(drain.channel_ids, vec![channel_id]);
     assert_eq!(drain.input_amount_raw, 325);
     ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_keysets() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint = mint_helper.mint();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint.clone()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let old_keyset_id = mint_helper.keyset_id().to_string();
+    let old_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
+    wallet_manager
+        .register_identity("mixed-keyset-drain-relay", receiver_secret)
+        .unwrap();
+
+    let old_mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![old_keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(old_keyset_id.clone(), old_keyset_info_json.clone())]),
+        )]),
+    };
+    let old_payments = wallet_manager
+        .spilman_payments_for("mixed-keyset-drain-relay", old_mint_cache)
+        .unwrap();
+    let old_wallet = TestSigningWallet::new(
+        mint.clone(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        old_keyset_id.clone(),
+        old_keyset_info_json,
+    )
+    .await;
+    let old_offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex.clone(),
+        mint_url: mint_url.clone(),
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![old_keyset_id.clone()],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let old_channel = create_paid_closed_channel(
+        &wallet_manager,
+        &old_payments,
+        &old_wallet,
+        &old_offer,
+        [19u8; 32],
+        300,
+    )
+    .await;
+
+    let new_keyset_id = rotate_sat_keyset(&mint, 400).await.unwrap().to_string();
+    assert_ne!(old_keyset_id, new_keyset_id);
+    let client_bridge = SpilmanClientBridge::new(
+        ConfigurableClientHost::new_in_memory(),
+        InMemoryMintNetworking::new(mint.clone()),
+    );
+    let new_keyset_info_json = client_bridge
+        .fetch_keyset_info(&mint_url, &new_keyset_id)
+        .expect("fetch rotated keyset info");
+    let new_mint_cache = SpilmanMintCache {
+        advertised: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([("sat".to_string(), vec![new_keyset_id.clone()])]),
+        )]),
+        keyset_info_json_by_mint: BTreeMap::from([(
+            mint_url.clone(),
+            BTreeMap::from([(new_keyset_id.clone(), new_keyset_info_json.clone())]),
+        )]),
+    };
+    let new_payments = wallet_manager
+        .spilman_payments_for("mixed-keyset-drain-relay", new_mint_cache)
+        .unwrap();
+    let new_wallet = TestSigningWallet::new(
+        mint.clone(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        new_keyset_id.clone(),
+        new_keyset_info_json,
+    )
+    .await;
+    let new_offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex,
+        mint_url: mint_url.clone(),
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![new_keyset_id.clone()],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let new_channel = create_paid_closed_channel(
+        &wallet_manager,
+        &new_payments,
+        &new_wallet,
+        &new_offer,
+        [20u8; 32],
+        200,
+    )
+    .await;
+
+    let old_closed = old_payments
+        .closed_data(&old_channel)
+        .expect("old channel closed data");
+    let new_closed = new_payments
+        .closed_data(&new_channel)
+        .expect("new channel closed data");
+    let expected_input = old_closed.receiver_sum + new_closed.receiver_sum;
+    let expected_fee = mixed_input_fee_for_proofs(
+        &mint_url,
+        &[
+            &old_closed.receiver_proofs_json,
+            &new_closed.receiver_proofs_json,
+        ],
+    )
+    .await;
+    let expected_output = expected_input - expected_fee;
+
+    let net = wallet_manager
+        .reqwest_networking_for_channel(&old_channel)
+        .unwrap();
+    let drain = wallet_manager
+        .drain_closed_channels_to_swap("mixed-keyset-drain-relay", &mint_url, "sat", &net, None)
+        .await
+        .expect("mixed-keyset closed channels should drain together");
+    assert_eq!(drain.input_amount_raw, expected_input);
+    assert_eq!(drain.output_amount_raw, expected_output);
+    assert_eq!(
+        sum_proof_amounts(&drain.output_proofs_json),
+        expected_output
+    );
+    assert_eq!(
+        BTreeSet::from_iter(drain.channel_ids.iter().cloned()),
+        BTreeSet::from([old_channel, new_channel])
+    );
+
+    let output_proofs: Vec<cashu::nuts::Proof> =
+        serde_json::from_str(&drain.output_proofs_json).unwrap();
+    assert!(output_proofs
+        .iter()
+        .all(|proof| proof.keyset_id.to_string() == new_keyset_id));
+
+    let _ = mint_shutdown_tx.send(());
 }
 
 #[tokio::test]

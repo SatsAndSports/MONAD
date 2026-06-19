@@ -6,13 +6,15 @@ use cdk_spilman::configurable_host::{
     ConfigurableHost, ConfigurableHostConfig, SpilmanStorage, SqliteStorage, StorageConfig,
     UnitPricingConfig,
 };
-use cdk_spilman::configurable_networking::ReqwestNetworking;
+use cdk_spilman::configurable_networking::{
+    build_keyset_info_json, fetch_all_keysets_from_mint, ReqwestNetworking,
+};
 use cdk_spilman::{
-    complete_funding_swap, create_plain_blinded_messages, parse_keyset_info_from_json,
-    ChannelState, CloseError, CloseSuccess, SpilmanAsyncNetworking,
+    complete_funding_swap, create_plain_blinded_messages, ChannelState, CloseError, CloseSuccess,
+    SpilmanAsyncNetworking,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -477,24 +479,28 @@ impl RelayWalletManager {
             return Err("no closed channels available to drain".to_string());
         }
 
-        let first_keyset_info_json = candidates[0].output_keyset_info_json.clone();
-        let keyset_info = parse_keyset_info_from_json(&first_keyset_info_json)?;
-        let output_keyset_id = keyset_info.keyset_id.to_string();
+        let drain_keysets = fetch_fresh_drain_keysets_from_mint(mint_url, unit).await?;
+        let output_keyset_id = drain_keysets.output_keyset_id.clone();
         let mut all_input_proofs = Vec::new();
         let mut input_amount_raw = 0u64;
+        let mut input_fee_ppk_sum = 0u64;
         for candidate in &candidates {
-            if candidate.output_keyset_info_json != first_keyset_info_json {
-                return Err("drain candidates use different output keysets".to_string());
-            }
             let proofs: Vec<Proof> = serde_json::from_str(&candidate.receiver_proofs_json)
                 .map_err(|e| format!("parse receiver proofs for {}: {e}", candidate.channel_id))?;
             for proof in proofs {
-                if proof.keyset_id.to_string() != output_keyset_id {
-                    return Err(format!(
-                        "receiver proof for channel {} uses keyset {}, expected {}",
-                        candidate.channel_id, proof.keyset_id, output_keyset_id
-                    ));
-                }
+                let proof_keyset_id = proof.keyset_id.to_string();
+                let input_fee_ppk = drain_keysets
+                    .input_fee_ppk_by_keyset
+                    .get(&proof_keyset_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "missing input fee metadata for receiver proof keyset {}",
+                            proof.keyset_id
+                        )
+                    })?;
+                input_fee_ppk_sum = input_fee_ppk_sum
+                    .checked_add(*input_fee_ppk)
+                    .ok_or_else(|| "drain input fee overflow".to_string())?;
                 input_amount_raw = input_amount_raw
                     .checked_add(u64::from(proof.amount))
                     .ok_or_else(|| "drain input amount overflow".to_string())?;
@@ -505,8 +511,7 @@ impl RelayWalletManager {
             return Err("closed channels have no receiver proofs to drain".to_string());
         }
 
-        let input_fee_raw =
-            (keyset_info.input_fee_ppk * all_input_proofs.len() as u64).div_ceil(1000);
+        let input_fee_raw = input_fee_ppk_sum.div_ceil(1000);
         let output_amount_raw = input_amount_raw
             .checked_sub(input_fee_raw)
             .ok_or_else(|| "drain input fees exceed input amount".to_string())?;
@@ -514,8 +519,11 @@ impl RelayWalletManager {
             return Err("drain output amount is zero after fees".to_string());
         }
 
-        let prepared =
-            prepare_plain_drain_swap(all_input_proofs, output_amount_raw, &first_keyset_info_json)?;
+        let prepared = prepare_plain_drain_swap(
+            all_input_proofs,
+            output_amount_raw,
+            &drain_keysets.output_keyset_info_json,
+        )?;
         let drain_id = new_drain_id();
         self.insert_prepared_drain(
             &drain_id,
@@ -526,7 +534,7 @@ impl RelayWalletManager {
             output_amount_raw,
             &prepared,
             &output_keyset_id,
-            &first_keyset_info_json,
+            &drain_keysets.output_keyset_info_json,
             &candidates,
             now_seconds(),
         )?;
@@ -552,7 +560,7 @@ impl RelayWalletManager {
         let output_proofs_json = complete_plain_drain_swap(
             &swap_response,
             &prepared.output_secrets_json,
-            &first_keyset_info_json,
+            &drain_keysets.output_keyset_info_json,
         )?;
         self.mark_drain_completed(&drain_id, &output_proofs_json, now_seconds())?;
 
@@ -679,7 +687,6 @@ impl RelayWalletManager {
                 channel_id,
                 receiver_sum_raw: closed.receiver_sum,
                 receiver_proofs_json: closed.receiver_proofs_json,
-                output_keyset_info_json: funding.keyset_info_json,
             });
         }
         Ok(out)
@@ -970,7 +977,13 @@ struct DrainCandidate {
     channel_id: String,
     receiver_sum_raw: u64,
     receiver_proofs_json: String,
+}
+
+#[derive(Debug, Clone)]
+struct DrainKeysets {
+    output_keyset_id: String,
     output_keyset_info_json: String,
+    input_fee_ppk_by_keyset: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -993,6 +1006,48 @@ struct StoredDrain {
     output_secrets_json: String,
     output_keyset_info_json: String,
     output_proofs_json: Option<String>,
+}
+
+/// Fetch mint keyset state directly for a drain.
+///
+/// Drains are rare and should use current mint state, so this intentionally
+/// bypasses the relay's cached keyset tables. The selected output keyset info is
+/// persisted on the drain row, but this helper does not update SQLite caches.
+async fn fetch_fresh_drain_keysets_from_mint(
+    mint_url: &str,
+    unit: &str,
+) -> Result<DrainKeysets, String> {
+    let keysets = fetch_all_keysets_from_mint(mint_url).await?;
+    let mut input_fee_ppk_by_keyset = BTreeMap::new();
+    let mut active_output_keysets = Vec::new();
+    for keyset in keysets {
+        if keyset.unit.to_string() != unit {
+            continue;
+        }
+        let keyset_id = keyset.id.to_string();
+        input_fee_ppk_by_keyset.insert(keyset_id.clone(), keyset.input_fee_ppk);
+        if keyset.active {
+            active_output_keysets.push((
+                keyset_id,
+                build_keyset_info_json(
+                    &keyset.id,
+                    &keyset.unit,
+                    &keyset.keys,
+                    keyset.input_fee_ppk,
+                ),
+            ));
+        }
+    }
+    active_output_keysets.sort_by(|a, b| a.0.cmp(&b.0));
+    let (output_keyset_id, output_keyset_info_json) = active_output_keysets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("mint {mint_url} has no active keyset for unit {unit}"))?;
+    Ok(DrainKeysets {
+        output_keyset_id,
+        output_keyset_info_json,
+        input_fee_ppk_by_keyset,
+    })
 }
 
 fn prepare_plain_drain_swap(
