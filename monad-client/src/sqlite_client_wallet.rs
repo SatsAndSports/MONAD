@@ -144,7 +144,10 @@ impl SqliteClientWallet {
                 "target capacity must be greater than zero".to_string(),
             ));
         }
-        let output_keyset_id = first_output_keyset_id(offer)?;
+        let keysets_json = ReqwestClientNetworking::new()
+            .call_mint_keysets(&offer.mint_url)
+            .map_err(|e| WalletError::Backend(format!("fetch mint keysets: {e}")))?;
+        let output_keyset_id = active_output_keyset_id_from_keysets_json(offer, &keysets_json)?;
 
         let output_keyset_info_json = {
             let bridge = self
@@ -165,9 +168,6 @@ impl SqliteClientWallet {
             .loose_wallet
             .list_available_proofs(&offer.mint_url, &offer.unit, &[])
             .map_err(loose_proof_error)?;
-        let keysets_json = ReqwestClientNetworking::new()
-            .call_mint_keysets(&offer.mint_url)
-            .map_err(|e| WalletError::Backend(format!("fetch mint keysets: {e}")))?;
         let input_fee_by_keyset = input_fee_ppk_by_keyset_from_keysets_json(&keysets_json)?;
 
         let candidates = available_proofs
@@ -585,7 +585,10 @@ impl MonadWallet for SqliteClientWallet {
         }
 
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
-        let output_keyset_id = first_output_keyset_id(offer)?;
+        let keysets_json = ReqwestClientNetworking::new()
+            .call_mint_keysets(&offer.mint_url)
+            .map_err(|e| WalletError::Backend(format!("fetch mint keysets: {e}")))?;
+        let output_keyset_id = active_output_keyset_id_from_keysets_json(offer, &keysets_json)?;
         let reservation = self
             .loose_wallet
             .reserve_proofs_any_keyset(&offer.mint_url, &offer.unit, input_budget_raw)
@@ -796,12 +799,29 @@ fn loose_proof_error(error: LooseProofWalletError) -> WalletError {
     WalletError::Backend(format!("loose proof wallet: {error}"))
 }
 
-fn first_output_keyset_id(offer: &RelayPaymentOffer) -> Result<String, WalletError> {
-    offer
-        .accepted_keyset_ids
-        .first()
-        .cloned()
-        .ok_or_else(|| WalletError::OfferMismatch("offer has no accepted keysets".to_string()))
+fn active_output_keyset_id_from_keysets_json(
+    offer: &RelayPaymentOffer,
+    keysets_json: &str,
+) -> Result<String, WalletError> {
+    let value: serde_json::Value = serde_json::from_str(keysets_json)
+        .map_err(|e| WalletError::Backend(format!("parse mint keysets: {e}")))?;
+    let keysets = value["keysets"]
+        .as_array()
+        .ok_or_else(|| WalletError::Backend("mint keysets response missing keysets".to_string()))?;
+
+    for accepted_id in &offer.accepted_keyset_ids {
+        if keysets.iter().any(|keyset| {
+            keyset["id"].as_str() == Some(accepted_id.as_str())
+                && keyset["unit"].as_str() == Some(offer.unit.as_str())
+                && keyset["active"].as_bool().unwrap_or(false)
+        }) {
+            return Ok(accepted_id.clone());
+        }
+    }
+
+    Err(WalletError::OfferMismatch(
+        "offer has no active accepted keyset".to_string(),
+    ))
 }
 
 fn input_fee_ppk_by_keyset_from_keysets_json(
@@ -1240,8 +1260,9 @@ mod tests {
 
         let receiver_pubkey =
             "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
-        let offer = offer(&mint_url, &receiver_pubkey, &output_keyset_id);
-        assert!(!offer.accepted_keyset_ids.contains(&input_keyset_id));
+        let mut offer = offer(&mint_url, &receiver_pubkey, &input_keyset_id);
+        offer.accepted_keyset_ids.push(output_keyset_id.clone());
+        assert_eq!(offer.accepted_keyset_ids[0], input_keyset_id);
 
         let channel_id = wallet
             .provision_channel(&offer, amount_raw * 1000)
@@ -1663,5 +1684,49 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn active_output_keyset_selection_skips_inactive_accepted_keysets() {
+        let offer = RelayPaymentOffer {
+            receiver_pubkey: "receiver".to_string(),
+            mint_url: "http://mint".to_string(),
+            unit: "sat".to_string(),
+            accepted_keyset_ids: vec!["old".to_string(), "new".to_string()],
+            in_bytes_per_millisat: 1,
+            out_bytes_per_millisat: 1,
+        };
+        let keysets_json = serde_json::json!({
+            "keysets": [
+                {"id": "old", "unit": "sat", "active": false, "input_fee_ppk": 0},
+                {"id": "new", "unit": "sat", "active": true, "input_fee_ppk": 0}
+            ]
+        })
+        .to_string();
+
+        let selected = active_output_keyset_id_from_keysets_json(&offer, &keysets_json).unwrap();
+        assert_eq!(selected, "new");
+    }
+
+    #[test]
+    fn active_output_keyset_selection_rejects_without_active_accepted_keyset() {
+        let offer = RelayPaymentOffer {
+            receiver_pubkey: "receiver".to_string(),
+            mint_url: "http://mint".to_string(),
+            unit: "sat".to_string(),
+            accepted_keyset_ids: vec!["old".to_string(), "other-unit".to_string()],
+            in_bytes_per_millisat: 1,
+            out_bytes_per_millisat: 1,
+        };
+        let keysets_json = serde_json::json!({
+            "keysets": [
+                {"id": "old", "unit": "sat", "active": false, "input_fee_ppk": 0},
+                {"id": "other-unit", "unit": "usd", "active": true, "input_fee_ppk": 0}
+            ]
+        })
+        .to_string();
+
+        let error = active_output_keyset_id_from_keysets_json(&offer, &keysets_json).unwrap_err();
+        assert!(matches!(error, WalletError::OfferMismatch(_)));
     }
 }
