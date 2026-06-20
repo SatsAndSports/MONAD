@@ -46,7 +46,7 @@ Important types:
 Responsibilities:
 - parse local SOCKS5 requests
 - build a single-hop or multi-hop MONAD chain
-- expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers`) through the library; the binary entrypoint is gated on a real wallet backend
+- expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers`) through the library; the binary entrypoint is gated until wallet config and funding UX are wired in
 - open H2 `CONNECT` streams to final targets
 - run one payment/session driver per relay session
 - keep a shared wallet across relay sessions
@@ -529,6 +529,28 @@ The client driver then computes the next requested cumulative balance from:
 
 and asks the wallet backend to build a payment for that exact next balance.
 - **Eviction Fairness**: If a session is evicted, it **remains Active** as long as it has a positive balance. The user can spend their existing credit, but cannot send further `ChannelPayment` updates until they link a new channel.
+
+### Client Wallet Layer
+
+Client-side channel funding is split between loose-proof custody and Spilman
+channel metadata.
+
+- `LooseProofWallet` stores spendable Cashu proofs, mint quote records, premint
+  batches, proof reservations, and spend/release state in SQLite.
+- `SqliteClientWallet` implements `MonadWallet` by selecting/reserving loose
+  proofs, opening upstream Spilman channels, persisting MONAD channel metadata,
+  building zero-balance link payments, and signing incremental channel payments.
+- `MockWallet` remains available for deterministic tests and harnesses.
+
+Client channel opening is cache-first. Before entering the shared keyset retry
+helper, each opening call site ensures the upstream client keyset cache has at
+least one keyset for the relevant `(mint, unit)`. Selection inside the helper is
+cache-only; refresh happens only after a retryable mint keyset rejection, and the
+retry is skipped if refresh still selects the same output keyset.
+
+The reusable wallet library path exists, but the `monad-client` binary is still
+gated until wallet configuration, mint-funding commands, balance/channel
+inspection, and startup recovery UX are wired into the CLI.
 
 ### Relay Wallet Layer
 
@@ -1220,9 +1242,8 @@ The full QUIC transport chain is implemented and tested:
 
 ## Current Limitations
 
-- Spilman channel implementation follows the delta-based model described above, but is exercised only through the mock wallet path in tests and the localhost test harness.
-- relay does not yet persist Spilman channel state across restarts (registry is in-memory).
-- multi-hop Spilman channel funding is wired but not yet fully tested with the new lifecycle.
+- `monad-client` does not yet expose the SQLite client wallet as a usable CLI runtime.
+- client wallet funding UX is not yet wired: mint quotes, premint submission, proof import, balance/channel inspection, and client close/sweep flows still need commands.
 - no persistent route configuration file yet.
 - QUIC connection pool does not yet handle connection eviction or stale entry cleanup.
 - asymmetric pricing (rates other than 1/1) is not yet tested.

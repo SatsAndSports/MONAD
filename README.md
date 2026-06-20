@@ -14,7 +14,7 @@ It provides:
 
 Implemented today:
 - `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, keeps a shared in-memory cache of configured mint keysets, and persists relay-side Spilman channel state in SQLite
-- `monad-client`: provides the reusable selector / wallet / session-driver client library pieces for relay session funding and multi-hop connection setup
+- `monad-client`: provides reusable route selection, the session payment driver, a SQLite-backed channel wallet, a loose-proof wallet, and multi-hop connection setup
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
 - `monad-test-client`: localhost SOCKS5/manual test harness for mocked relay funding, circuit rebuild testing, and daily-driver browser/SSH experiments
@@ -26,13 +26,13 @@ Implemented today:
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - in-process relay wallet manager: multiple hosted relays can share one SQLite-backed relay wallet database while keeping distinct Cashu receiver keys / wallet names
 - client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments, with periodic local cleartext-counter checks sizing payments against the latest authoritative relay baseline
-- mock wallet runtime path for tests and connector flows: `MockWallet` plus `session_driver` funds relay sessions without a real wallet backend
+- client wallet library path: `SqliteClientWallet` manages Spilman channels, `LooseProofWallet` stores spendable Cashu proofs, and `session_driver` handles per-session linking and payments; `MockWallet` remains for tests and connector harnesses
 - blinded-hop routing over QUIC: `CONNECT blinded.monad.invalid:443`, tweak-prefixed QUIC forwarded sessions, `RouteHop` / `Route` connector support, reverse-tweak key recovery, and deterministic adjusted-tweak derivation for MONAD's x-only secp256k1 identity model
 - integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
 
 Not implemented yet:
-- real `MonadWallet` backend over `cashu_spilman_channels`
-- usable `monad-client` CLI runtime on top of that real wallet backend
+- usable `monad-client` CLI runtime wired to the SQLite client wallet
+- user-facing client wallet commands for mint quotes, proof minting/import, balances, channels, and recovery
 - persistent route configuration file
 
 ## Relay Wallet
@@ -79,6 +79,17 @@ Add `--json` to any wallet command for machine-readable output.
 On first start, `receiver_secret_hex` is required so the relay can register its identity in the wallet database.  On later restarts of the same relay wallet identity, omit `receiver_secret_hex`; the relay will load the existing receiver key for `relay-a` from the shared wallet DB.
 
 Two relays can share the same `wallet_db_path` safely because each relay uses a distinct receiver key, so their channel rows are disjoint.  The config loader rejects any two relays that share the same `receiver_secret_hex`.
+
+## Client Wallet
+
+The reusable client wallet pieces exist in `monad-client` but are not yet exposed as a usable CLI runtime.
+
+- `LooseProofWallet` stores loose Cashu proofs, mint quote state, premint batches, reservations, and spend/release state in SQLite.
+- `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata in SQLite, and implements `MonadWallet` for the session driver.
+- opening recovery is persisted for ambiguous funding-swap failures and can be recovered through upstream restore.
+- output keyset selection is cache-first: the wallet ensures its mint/unit keyset cache is non-empty before entering the keyset retry helper, then selectors read cache only; refresh happens after retryable mint keyset rejection.
+
+Remaining client-wallet work is operator/user experience rather than the core channel-payment library path: mint quote/mint/import commands, startup wiring in `monad-client`, wallet/channel inspection, and close/sweep flows.
 
 ## Workspace
 
@@ -284,9 +295,9 @@ RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop2
 
 ### 3. Start the client
 
-`monad-client` CLI is temporarily unavailable until the real wallet backend is
-implemented. The current runtime exits with an error rather than pretending the
-mock wallet is production-ready.
+`monad-client` CLI is temporarily unavailable until the SQLite client wallet is
+wired into the binary with funding/config UX. The current runtime exits with an
+error rather than pretending the mock wallet is production-ready.
 
 Direct connection:
 

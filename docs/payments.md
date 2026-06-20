@@ -18,6 +18,9 @@ The canonical client funding implementation is in `monad-client`:
 - `monad-client/src/session_driver/funding.rs` - channel acquisition, link, payment, recovery
 - `monad-client/src/session_driver/payment.rs` - payment math and protocol-safety checks
 - `monad-client/src/wallet.rs` - wallet abstraction, selector, mock wallet
+- `monad-client/src/sqlite_client_wallet.rs` - SQLite-backed `MonadWallet` using upstream Spilman channels
+- `monad-client/src/loose_proof_wallet.rs` - loose Cashu proof custody, quote/premint records, reservations, and spend/release state
+- `monad-client/src/proof_selection.rs` - mixed-keyset proof selection for exact post-swap channel capacity
 
 Shared helpers used by multiple crates live in `monad-common`:
 
@@ -73,8 +76,23 @@ Consequences:
 - old inactive keysets can remain usable for existing channels as long as the keyset metadata is known.
 - channel close and relay drain swaps start from the shared cache and refresh that mint into SQLite and memory only if the mint rejects the swap with a keyset error.
 
-This cache-first, single-refresh retry shape is intended to become the common
-pattern for all mint swaps that can fail because of stale keyset state.
+This cache-first, single-refresh retry shape is the shared model for relay close
+and drain swaps.
+
+## Client Keyset Model
+
+The client wallet has the same cache-first shape for channel-opening swaps.
+
+Before the shared keyset retry helper runs, each call site ensures the upstream
+client cache has at least one keyset for the relevant `(mint, unit)`. That cache
+may be stale and may include inactive keysets. Inside the helper, output-keyset
+selection reads cache only. If the mint rejects the first open with a retryable
+keyset error, the helper refreshes that mint, reselects from cache, and retries
+once only if the selected output keyset id changed.
+
+Input proof keysets are independent from the selected output funding keyset:
+input proofs may be old, inactive, or mixed-keyset proofs as long as the mint
+accepts them and fee metadata is known.
 
 ## Funding Lifecycle
 

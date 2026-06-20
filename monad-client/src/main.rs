@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     anyhow::bail!(
-        "real MONAD wallet backend not implemented yet; monad-client CLI is temporarily unavailable"
+        "MONAD client wallet config/funding runtime is not wired yet; monad-client CLI is temporarily unavailable"
     )
 }
 

@@ -34,8 +34,9 @@ cargo run -p monad-quic -- ...
   - multi-hop connector (`connector.rs`)
   - session payment driver (`session_driver.rs`)
   - wallet abstraction and mock wallet (`wallet.rs`)
+  - SQLite-backed channel wallet (`sqlite_client_wallet.rs`), loose proof custody (`loose_proof_wallet.rs`), proof selection (`proof_selection.rs`)
   - tunnel proxying (`tunnel.rs`)
-  - binary currently exits early until the real wallet backend exists
+  - binary currently exits early until wallet config/funding UX is wired in
 - `monad-relay`
   - reusable library code plus binary entrypoint
   - YAML config loading with env-var / `.env` substitution (`config.rs`)
@@ -81,12 +82,13 @@ cargo run -p monad-quic -- ...
 
 ### Current Client Runtime State
 
-- `monad-client` library now has a wallet abstraction plus per-session payment driver.
+- `monad-client` library now has a wallet abstraction, `SqliteClientWallet`, `LooseProofWallet`, and per-session payment driver.
 - client steady-state control/payment behavior now lives in a direct imperative control loop in `session_driver.rs`; the relay stays authoritative for linked channel / accepted balance / pause state, while the client uses its local cleartext counters to size payments against the latest authoritative relay baseline.
 - channel-payment sizing now follows an explicit target/minimum-topup policy in that control loop: the client computes a local estimated remaining balance, clamps the desired refill to at least the configured minimum topup, then caps it at the linked channel's remaining raw capacity.
 - the main client no longer needs frequent `GetSessionStatus` polling for payment sizing; the relay stress harness and `monad-test-client` still poll periodically for load generation, health checks, and observability.
-- `connector.rs` uses `MockWallet` + `session_driver` so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` flow.
-- the `monad-client` binary intentionally exits early until the real wallet backend exists.
+- `SqliteClientWallet` provisions real upstream Spilman channels from loose proofs, stores MONAD channel metadata, persists ambiguous opening recovery, and uses cache-first active output-keyset selection with refresh/retry only after retryable keyset mint errors.
+- `connector.rs` uses `MockWallet` + `session_driver` for default test/harness flows so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` control path.
+- the `monad-client` binary intentionally exits early until wallet config, mint-funding UX, startup recovery, and SOCKS runtime wiring are implemented.
 - relay-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
 
 ### QUIC Transport
@@ -215,10 +217,10 @@ The test suite currently covers:
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
 - Noise session ID (handshake hash) matches on both sides
-- Spilman channel implementation (delta-based) is currently being integrated and tested
+- Spilman channel implementation (delta-based) is exercised through relay validation, client wallet provisioning/recovery tests, and connector/session-driver flows
 - relay advertises multiple mint/unit pricing options
 - relay loads its trusted mint policy from a per-relay YAML config entry and advertises only configured mints/units
-- default integration-test relays advertise a synthetic test mint/keyset offer so connector-driven intermediate hops can provision mock channels without a real wallet backend
+- default integration-test relays advertise a synthetic test mint/keyset offer so connector-driven intermediate hops can provision mock channels through the test wallet path
 - control detach releases linked channel ownership and tears down active/future streams
 - relay restart preserves accepted Spilman channel state in SQLite; the client re-links the same channel and delta accounting resumes from the persisted balance (`TestSigningWallet` produces real BIP-340 Cashu signatures for the full `SpilmanRelayPayments` validation path)
 - relay unilateral channel close moves the stored channel to `Closed`, returns the correct receiver/sender split, and rejects further `ChannelLink` / `ChannelPayment` attempts on that channel
