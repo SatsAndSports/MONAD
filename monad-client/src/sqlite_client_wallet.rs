@@ -12,10 +12,9 @@ use crate::wallet::{
 use cashu::nuts::{CurrencyUnit, Id};
 use cdk_spilman::{
     compute_funding_token_amount, parse_keyset_info_from_json, with_active_keyset_retry,
-    ClientChannelInfo, ConfigurableClientHost, KeysetRetryError, KeysetRetryPhase,
-    OpenChannelError, OpenChannelFailureStage, OpenChannelResult, ReqwestClientNetworking,
-    SelectedOutputKeyset, SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking,
-    SqliteClientStorage,
+    ClientChannelInfo, ConfigurableClientHost, KeysetRetryError, OpenChannelError,
+    OpenChannelFailureStage, OpenChannelResult, ReqwestClientNetworking, SelectedOutputKeyset,
+    SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking, SqliteClientStorage,
 };
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
@@ -157,8 +156,8 @@ impl SqliteClientWallet {
             ));
         }
         let result = with_active_keyset_retry(
-            |phase| self.select_output_keyset_for_attempt(offer, phase),
-            |output_keyset, _phase| {
+            || self.select_output_keyset_for_attempt(offer),
+            |output_keyset| {
                 self.prepare_target_capacity_attempt(offer, target_capacity_raw, output_keyset)
             },
             |attempt| self.submit_open_attempt(offer, attempt),
@@ -178,6 +177,9 @@ impl SqliteClientWallet {
                 &attempt.reservation,
                 offer,
                 attempt.selected_input_msats,
+            ),
+            Err(KeysetRetryError::RetryKeysetUnchanged { attempt, error, .. }) => Err(
+                open_channel_error(error, &offer.unit, attempt.selected_input_msats),
             ),
             Err(error) => Err(WalletError::Backend(format!(
                 "prepare channel open retry: {}",
@@ -478,10 +480,9 @@ impl SqliteClientWallet {
     fn select_output_keyset_for_attempt(
         &self,
         offer: &RelayPaymentOffer,
-        phase: KeysetRetryPhase,
     ) -> Result<SelectedOutputKeyset, WalletError> {
         let selected = self.select_output_keyset_from_cache(offer);
-        if selected.is_ok() || phase == KeysetRetryPhase::Retry {
+        if selected.is_ok() {
             return selected;
         }
 
@@ -712,8 +713,8 @@ impl MonadWallet for SqliteClientWallet {
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
         let mut reservation: Option<ProofReservation> = None;
         let result = with_active_keyset_retry(
-            |phase| self.select_output_keyset_for_attempt(offer, phase),
-            |output_keyset, _phase| {
+            || self.select_output_keyset_for_attempt(offer),
+            |output_keyset| {
                 let reservation = match reservation.as_ref() {
                     Some(reservation) => reservation.clone(),
                     None => {
@@ -749,6 +750,13 @@ impl MonadWallet for SqliteClientWallet {
                 offer,
                 attempt.selected_input_msats,
             ),
+            Err(KeysetRetryError::RetryKeysetUnchanged { attempt, error, .. }) => self
+                .handle_open_error(
+                    error,
+                    &attempt.reservation,
+                    offer,
+                    attempt.selected_input_msats,
+                ),
             Err(error) => Err(WalletError::Backend(format!(
                 "prepare channel open retry: {}",
                 describe_keyset_retry_prepare_error(error)
@@ -1027,7 +1035,9 @@ fn describe_keyset_retry_prepare_error(
         | KeysetRetryError::Prepare { error, .. }
         | KeysetRetryError::Refresh { error }
         | KeysetRetryError::Cleanup { error } => error.to_string(),
-        KeysetRetryError::Submit { .. } => "unexpected submit error".to_string(),
+        KeysetRetryError::Submit { .. } | KeysetRetryError::RetryKeysetUnchanged { .. } => {
+            "unexpected submit error".to_string()
+        }
     }
 }
 

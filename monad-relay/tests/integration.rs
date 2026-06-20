@@ -5324,8 +5324,7 @@ async fn test_wallet_manager_drain_keyset_rejection_refreshes_reprepares_and_ret
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wallet_manager_drain_keyset_rejection_then_second_rejection_marks_failed_and_releases(
-) {
+async fn test_wallet_manager_drain_keyset_rejection_unchanged_keyset_marks_failed_and_releases() {
     let ctx = DrainTestContext::new("drain-keyset-retry-failed-relay").await;
     let channel_id = ctx.create_closed_channel([22u8; 32], 275).await;
     let scripted = KeysetThenRejectSwap {
@@ -5343,7 +5342,8 @@ async fn test_wallet_manager_drain_keyset_rejection_then_second_rejection_marks_
         .await
         .unwrap_err();
     assert!(err.contains("failed"));
-    assert_eq!(scripted.swaps.load(Ordering::SeqCst), 2);
+    assert!(err.contains("retry keyset unchanged after refresh"));
+    assert_eq!(scripted.swaps.load(Ordering::SeqCst), 1);
     let drains = ctx.wallet_manager.list_drains().unwrap();
     assert_eq!(drains.len(), 1);
     assert_eq!(drains[0].state, "Failed");
@@ -5376,7 +5376,7 @@ async fn test_wallet_manager_drain_keyset_rejection_then_second_rejection_marks_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wallet_manager_drain_two_keyset_rejections_retry_once_then_fail_and_release() {
+async fn test_wallet_manager_drain_repeated_keyset_rejection_skips_retry_when_keyset_unchanged() {
     let ctx = DrainTestContext::new("drain-keyset-retry-once-relay").await;
     let channel_id = ctx.create_closed_channel([23u8; 32], 275).await;
     let scripted = AlwaysKeysetRejectSwap {
@@ -5394,7 +5394,8 @@ async fn test_wallet_manager_drain_two_keyset_rejections_retry_once_then_fail_an
         .await
         .unwrap_err();
     assert!(err.contains("failed"));
-    assert_eq!(scripted.swaps.load(Ordering::SeqCst), 2);
+    assert!(err.contains("retry keyset unchanged after refresh"));
+    assert_eq!(scripted.swaps.load(Ordering::SeqCst), 1);
     let drains = ctx.wallet_manager.list_drains().unwrap();
     assert_eq!(drains.len(), 1);
     assert_eq!(drains[0].state, "Failed");

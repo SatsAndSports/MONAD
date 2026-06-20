@@ -13,8 +13,8 @@ use cdk_spilman::configurable_networking::{
 };
 use cdk_spilman::{
     complete_funding_swap, create_plain_blinded_messages, is_retryable_keyset_mint_error,
-    with_active_keyset_retry_async, ChannelState, CloseError, CloseSuccess, KeysetRetryError,
-    KeysetRetryPhase, SpilmanAsyncNetworking,
+    with_active_keyset_retry_async, ActiveKeysetSelection, ChannelState, CloseError, CloseSuccess,
+    KeysetRetryError, SelectedOutputKeyset, SpilmanAsyncNetworking,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{BTreeMap, HashMap};
@@ -1113,6 +1113,10 @@ impl RelayWalletManager {
             .next()
             .ok_or_else(|| format!("mint {mint_url} has no active keyset for unit {unit}"))?;
         Ok(DrainKeysets {
+            output_keyset: SelectedOutputKeyset {
+                id: output_keyset_id.clone(),
+                info_json: output_keyset_info_json.clone(),
+            },
             output_keyset_id,
             output_keyset_info_json,
             input_fee_ppk_by_keyset,
@@ -1148,44 +1152,40 @@ impl RelayWalletManager {
         net: &N,
         request: DrainSubmitRequest<'_>,
     ) -> Result<DrainSubmitOutcome, String> {
+        let prepared_once = std::cell::Cell::new(false);
         let result = with_active_keyset_retry_async(
-            |phase| {
-                let _phase = phase;
-                self.drain_keysets_from_shared_cache(request.mint_url, request.unit)
-            },
-            |drain_keysets, phase| {
+            || self.drain_keysets_from_shared_cache(request.mint_url, request.unit),
+            |drain_keysets| {
                 let attempt = self.prepare_drain_attempt_with_keysets(
                     drain_keysets,
                     request.all_input_proofs,
                     request.input_amount_raw,
                 )?;
-                match phase {
-                    KeysetRetryPhase::First => {
-                        self.insert_prepared_drain(
-                            request.drain_id,
-                            request.relay_name,
-                            request.mint_url,
-                            request.unit,
-                            request.input_amount_raw,
-                            attempt.output_amount_raw,
-                            &attempt.prepared,
-                            &attempt.drain_keysets.output_keyset_id,
-                            &attempt.drain_keysets.output_keyset_info_json,
-                            request.candidates,
-                            now_seconds(),
-                        )?;
-                        self.mark_drain_submitted(request.drain_id, now_seconds())?;
-                    }
-                    KeysetRetryPhase::Retry => {
-                        self.update_prepared_drain_attempt(
-                            request.drain_id,
-                            attempt.output_amount_raw,
-                            &attempt.prepared,
-                            &attempt.drain_keysets.output_keyset_id,
-                            &attempt.drain_keysets.output_keyset_info_json,
-                            now_seconds(),
-                        )?;
-                    }
+                if prepared_once.get() {
+                    self.update_prepared_drain_attempt(
+                        request.drain_id,
+                        attempt.output_amount_raw,
+                        &attempt.prepared,
+                        &attempt.drain_keysets.output_keyset_id,
+                        &attempt.drain_keysets.output_keyset_info_json,
+                        now_seconds(),
+                    )?;
+                } else {
+                    self.insert_prepared_drain(
+                        request.drain_id,
+                        request.relay_name,
+                        request.mint_url,
+                        request.unit,
+                        request.input_amount_raw,
+                        attempt.output_amount_raw,
+                        &attempt.prepared,
+                        &attempt.drain_keysets.output_keyset_id,
+                        &attempt.drain_keysets.output_keyset_info_json,
+                        request.candidates,
+                        now_seconds(),
+                    )?;
+                    self.mark_drain_submitted(request.drain_id, now_seconds())?;
+                    prepared_once.set(true);
                 }
                 Ok(attempt)
             },
@@ -1211,6 +1211,12 @@ impl RelayWalletManager {
             Err(KeysetRetryError::Submit { error, .. }) => {
                 self.fail_or_return_submitted_drain_error(request.drain_id, error)
             }
+            Err(KeysetRetryError::RetryKeysetUnchanged {
+                error, keyset_id, ..
+            }) => self.fail_drain_after_retry_setup_error(
+                request.drain_id,
+                format!("retry keyset unchanged after refresh ({keyset_id}): {error}"),
+            ),
             Err(error) => self.handle_drain_retry_setup_error(request.drain_id, error),
         }
     }
@@ -1221,29 +1227,27 @@ impl RelayWalletManager {
         error: KeysetRetryError<PreparedDrainAttempt, String, String>,
     ) -> Result<T, String> {
         match error {
-            KeysetRetryError::Select {
-                phase: KeysetRetryPhase::First,
-                error,
+            KeysetRetryError::Select { error } | KeysetRetryError::Prepare { error } => {
+                if self.load_drain(drain_id).is_ok() {
+                    self.fail_drain_after_retry_setup_error(
+                        drain_id,
+                        format!("prepare retry drain after keyset refresh: {error}"),
+                    )
+                } else {
+                    Err(format!("prepare drain swap: {error}"))
+                }
             }
-            | KeysetRetryError::Prepare {
-                phase: KeysetRetryPhase::First,
-                error,
-            } => Err(format!("prepare drain swap: {error}")),
             KeysetRetryError::Refresh { error } => self.fail_drain_after_retry_setup_error(
                 drain_id,
                 format!("refresh keysets after keyset rejection: {error}"),
             ),
-            KeysetRetryError::Select { error, .. } | KeysetRetryError::Prepare { error, .. } => {
-                self.fail_drain_after_retry_setup_error(
-                    drain_id,
-                    format!("prepare retry drain after keyset refresh: {error}"),
-                )
-            }
             KeysetRetryError::Cleanup { error } => self.fail_drain_after_retry_setup_error(
                 drain_id,
                 format!("cleanup before retry drain after keyset rejection: {error}"),
             ),
-            KeysetRetryError::Submit { .. } => Err("unexpected drain submit error".to_string()),
+            KeysetRetryError::Submit { .. } | KeysetRetryError::RetryKeysetUnchanged { .. } => {
+                Err("unexpected drain submit error".to_string())
+            }
         }
     }
 
@@ -1334,9 +1338,16 @@ struct DrainCandidate {
 
 #[derive(Debug, Clone)]
 struct DrainKeysets {
+    output_keyset: SelectedOutputKeyset,
     output_keyset_id: String,
     output_keyset_info_json: String,
     input_fee_ppk_by_keyset: BTreeMap<String, u64>,
+}
+
+impl ActiveKeysetSelection for DrainKeysets {
+    fn selected_output_keyset(&self) -> &SelectedOutputKeyset {
+        &self.output_keyset
+    }
 }
 
 #[derive(Debug, Clone)]
