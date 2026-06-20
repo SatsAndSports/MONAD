@@ -155,14 +155,38 @@ impl SqliteClientWallet {
                 "target capacity must be greater than zero".to_string(),
             ));
         }
+        // Target-capacity provisioning computes the exact post-swap channel
+        // capacity we want, selects loose proofs that can fund it after input
+        // fees, and then asks the mint to swap those proofs into channel funding
+        // outputs.  The output keyset info comes from the client's local mint
+        // keyset cache.  That cache can be stale if the mint has rotated active
+        // keysets, so a mint can reject the first swap with a keyset error even
+        // though the selected input proofs are otherwise valid.  The helper
+        // centralizes the safe retry policy: build/submit once, refresh cached
+        // keysets on a safe keyset rejection, reselect the active output keyset,
+        // skip retry if refresh still selects the same id, otherwise reprepare
+        // and submit one changed-keyset retry.
         let result = with_active_keyset_retry(
+            // Select an active relay-accepted output keyset from the client
+            // cache.  If the cache is cold, this selector warms it once before
+            // returning an error to the caller.
             || self.select_output_keyset_for_attempt(offer),
+            // Prepare reserves a fresh set of loose proofs sized for the target
+            // capacity and the selected output keyset's fee/amount structure.
             |output_keyset| {
                 self.prepare_target_capacity_attempt(offer, target_capacity_raw, output_keyset)
             },
+            // Submit the upstream channel-open swap using that reservation.
             |attempt| self.submit_open_attempt(offer, attempt),
+            // Retry only safe keyset rejections; errors where inputs may be
+            // spent are never retried automatically.
             |error| should_retry_open_after_keyset_rejection(error, false),
+            // Refresh the client's keyset cache for the mint before retry
+            // selection.
             || self.refresh_client_keysets(offer),
+            // Target-capacity proof choice depends on the selected output
+            // keyset.  Release the first reservation before reselecting/retrying
+            // so the retry can choose a fresh proof set.
             |attempt, _error| {
                 self.loose_wallet
                     .release_reservation(&attempt.reservation.reservation_id)
@@ -712,8 +736,20 @@ impl MonadWallet for SqliteClientWallet {
 
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
         let mut reservation: Option<ProofReservation> = None;
+        // Plain provisioning uses an input budget rather than an exact target
+        // capacity.  We reserve an arbitrary set of available proofs once, then
+        // let upstream compute the resulting channel capacity.  If the mint
+        // rejects the first open because our cached output keyset is stale, the
+        // input reservation can be reused: only the output keyset selection and
+        // swap construction need to change.  The helper handles the stale-cache
+        // workflow and skips retry when refresh still selects the same keyset.
         let result = with_active_keyset_retry(
+            // Select active relay-accepted output keyset from cache, warming the
+            // cache on first-use if needed.
             || self.select_output_keyset_for_attempt(offer),
+            // Prepare lazily creates the proof reservation on the first attempt;
+            // on retry, it reuses the same reserved proofs with the refreshed
+            // output keyset.
             |output_keyset| {
                 let reservation = match reservation.as_ref() {
                     Some(reservation) => reservation.clone(),
@@ -737,9 +773,15 @@ impl MonadWallet for SqliteClientWallet {
                     selected_input_msats: input_budget_msats,
                 })
             },
+            // Submit the upstream open-channel swap for this reservation.
             |attempt| self.submit_open_attempt(offer, attempt),
+            // Retry only safe keyset rejections.
             |error| should_retry_open_after_keyset_rejection(error, false),
+            // Refresh keyset cache before reselecting the output keyset.
             || self.refresh_client_keysets(offer),
+            // No cleanup here: the same reservation is reused across a changed
+            // keyset retry, and final error handling releases it if no open
+            // succeeds.
             |_attempt, _error| Ok(()),
         );
         match result {

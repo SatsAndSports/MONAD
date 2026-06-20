@@ -1153,8 +1153,30 @@ impl RelayWalletManager {
         request: DrainSubmitRequest<'_>,
     ) -> Result<DrainSubmitOutcome, String> {
         let prepared_once = std::cell::Cell::new(false);
+        // Draining closed channels is another mint swap: receiver proofs from
+        // already-closed channels are spent into fresh relay-owned output proofs.
+        // The relay wallet manager keeps a shared in-memory cache containing all
+        // keysets returned by each trusted mint (all units, active and inactive),
+        // because drain preparation needs two kinds of keyset metadata:
+        //
+        // 1. the active output keyset info used to build the new drain outputs;
+        // 2. input-fee metadata for every keyset represented by the closed
+        //    receiver proofs being drained.
+        //
+        // If the cached active output keyset is stale, the mint may reject the
+        // drain swap before consuming inputs.  The retry helper owns the common
+        // recovery policy: submit once from cache, refresh the shared cache on a
+        // retryable keyset rejection, reselect keysets, skip the retry if the
+        // active output keyset id is unchanged, otherwise reprepare the same
+        // drain row and submit one changed-keyset retry.
         let result = with_active_keyset_retry_async(
+            // Select from the shared runtime cache.  The selection carries both
+            // the active output keyset and the input-fee map needed by prepare.
             || self.drain_keysets_from_shared_cache(request.mint_url, request.unit),
+            // First preparation inserts the durable drain row and reserves the
+            // source closed channels in SQLite.  Retry preparation updates that
+            // same row with a rebuilt swap for the newly selected output keyset;
+            // channel reservations are not duplicated.
             |drain_keysets| {
                 let attempt = self.prepare_drain_attempt_with_keysets(
                     drain_keysets,
@@ -1189,15 +1211,23 @@ impl RelayWalletManager {
                 }
                 Ok(attempt)
             },
+            // Submit the currently prepared drain swap to the mint.
             |attempt| async move {
                 self.submit_drain_attempt(net, request.mint_url, request.drain_id, &attempt)
                     .await
             },
+            // Only retry explicit keyset-class mint rejections.  Ambiguous
+            // submission failures stay in Submitted for restore/recovery.
             |error| is_retryable_keyset_mint_error(error),
+            // Refresh this mint into SQLite plus the manager's shared runtime
+            // cache before the helper reselects output/input keyset metadata.
             || async {
                 self.refresh_keysets_into_shared_cache(request.mint_url)
                     .await
             },
+            // Cleanup is a no-op here.  Drain reservations are durable DB state:
+            // they are either completed, restored later, or released by the
+            // final failure handler after the helper returns.
             |_attempt, _error| Ok(()),
         )
         .await;
