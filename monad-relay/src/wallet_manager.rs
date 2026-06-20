@@ -1123,6 +1123,23 @@ impl RelayWalletManager {
         })
     }
 
+    async fn ensure_drain_keysets_cached(&self, mint_url: &str, unit: &str) -> Result<(), String> {
+        let has_cached_keysets = {
+            let cache = self
+                .keyset_cache
+                .read()
+                .expect("relay wallet keyset cache lock poisoned");
+            cache
+                .keysets
+                .get(mint_url)
+                .is_some_and(|by_id| by_id.values().any(|keyset| keyset.unit == unit))
+        };
+        if !has_cached_keysets {
+            self.refresh_keysets_into_shared_cache(mint_url).await?;
+        }
+        Ok(())
+    }
+
     async fn submit_drain_attempt<N: DrainSwapNetworking>(
         &self,
         net: &N,
@@ -1153,6 +1170,8 @@ impl RelayWalletManager {
         request: DrainSubmitRequest<'_>,
     ) -> Result<DrainSubmitOutcome, String> {
         let prepared_once = std::cell::Cell::new(false);
+        self.ensure_drain_keysets_cached(request.mint_url, request.unit)
+            .await?;
         // Draining closed channels is another mint swap: receiver proofs from
         // already-closed channels are spent into fresh relay-owned output proofs.
         // The relay wallet manager keeps a shared in-memory cache containing all
@@ -1163,8 +1182,10 @@ impl RelayWalletManager {
         // 2. input-fee metadata for every keyset represented by the closed
         //    receiver proofs being drained.
         //
-        // If the cached active output keyset is stale, the mint may reject the
-        // drain swap before consuming inputs.  The retry helper owns the common
+        // Before entering the retry helper, ensure the shared cache has at least
+        // one keyset for this mint/unit; helper selection is cache-only.  If the
+        // cached active output keyset is stale, the mint may reject the drain
+        // swap before consuming inputs.  The retry helper owns the common
         // recovery policy: submit once from cache, refresh the shared cache on a
         // retryable keyset rejection, reselect keysets, skip the retry if the
         // active output keyset id is unchanged, otherwise reprepare the same

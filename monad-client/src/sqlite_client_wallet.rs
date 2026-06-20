@@ -155,22 +155,23 @@ impl SqliteClientWallet {
                 "target capacity must be greater than zero".to_string(),
             ));
         }
+        self.ensure_offer_keysets_cached(offer)?;
         // Target-capacity provisioning computes the exact post-swap channel
         // capacity we want, selects loose proofs that can fund it after input
         // fees, and then asks the mint to swap those proofs into channel funding
         // outputs.  The output keyset info comes from the client's local mint
-        // keyset cache.  That cache can be stale if the mint has rotated active
-        // keysets, so a mint can reject the first swap with a keyset error even
-        // though the selected input proofs are otherwise valid.  The helper
-        // centralizes the safe retry policy: build/submit once, refresh cached
-        // keysets on a safe keyset rejection, reselect the active output keyset,
-        // skip retry if refresh still selects the same id, otherwise reprepare
-        // and submit one changed-keyset retry.
+        // keyset cache.  We ensure the cache has at least one keyset for this
+        // mint/unit before the retry helper runs; inside the helper selection is
+        // cache-only.  If that cached active keyset is stale, a mint can reject
+        // the first swap with a keyset error even though the selected inputs are
+        // otherwise valid.  The helper centralizes the safe retry policy:
+        // build/submit once, refresh cached keysets on a safe keyset rejection,
+        // reselect the active output keyset, skip retry if refresh still selects
+        // the same id, otherwise reprepare and submit one changed-keyset retry.
         let result = with_active_keyset_retry(
             // Select an active relay-accepted output keyset from the client
-            // cache.  If the cache is cold, this selector warms it once before
-            // returning an error to the caller.
-            || self.select_output_keyset_for_attempt(offer),
+            // cache.
+            || self.select_output_keyset_from_cache(offer),
             // Prepare reserves a fresh set of loose proofs sized for the target
             // capacity and the selected output keyset's fee/amount structure.
             |output_keyset| {
@@ -501,17 +502,21 @@ impl SqliteClientWallet {
             .map_err(|e| WalletError::Backend(format!("refresh mint keysets: {e}")))
     }
 
-    fn select_output_keyset_for_attempt(
-        &self,
-        offer: &RelayPaymentOffer,
-    ) -> Result<SelectedOutputKeyset, WalletError> {
-        let selected = self.select_output_keyset_from_cache(offer);
-        if selected.is_ok() {
-            return selected;
+    fn ensure_offer_keysets_cached(&self, offer: &RelayPaymentOffer) -> Result<(), WalletError> {
+        let unit = parse_currency_unit(&offer.unit)?;
+        let has_cached_keysets = {
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            !bridge
+                .cached_keysets_for_unit(&offer.mint_url, &unit)
+                .is_empty()
+        };
+        if !has_cached_keysets {
+            self.refresh_client_keysets(offer)?;
         }
-
-        self.refresh_client_keysets(offer)?;
-        self.select_output_keyset_from_cache(offer)
+        Ok(())
     }
 
     fn select_output_keyset_from_cache(
@@ -734,6 +739,7 @@ impl MonadWallet for SqliteClientWallet {
             ));
         }
 
+        self.ensure_offer_keysets_cached(offer)?;
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
         let mut reservation: Option<ProofReservation> = None;
         // Plain provisioning uses an input budget rather than an exact target
@@ -745,8 +751,8 @@ impl MonadWallet for SqliteClientWallet {
         // workflow and skips retry when refresh still selects the same keyset.
         let result = with_active_keyset_retry(
             // Select active relay-accepted output keyset from cache, warming the
-            // cache on first-use if needed.
-            || self.select_output_keyset_for_attempt(offer),
+            // cache before entering the helper if needed.
+            || self.select_output_keyset_from_cache(offer),
             // Prepare lazily creates the proof reservation on the first attempt;
             // on retry, it reuses the same reserved proofs with the refreshed
             // output keyset.

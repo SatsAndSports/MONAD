@@ -530,6 +530,16 @@ impl SpilmanHost<PaymentContext> for MonadHost {
             .active_keyset_ids(mint, &unit.to_string())
     }
 
+    fn has_keysets_for_unit(&self, mint: &str, unit: &CurrencyUnit) -> bool {
+        let unit = unit.to_string();
+        self.mint_cache
+            .read()
+            .expect("spilman mint cache lock poisoned")
+            .keysets
+            .get(mint)
+            .is_some_and(|by_id| by_id.values().any(|keyset| keyset.unit == unit))
+    }
+
     fn get_keyset_info(&self, mint: &str, keyset_id: &Id) -> Option<String> {
         self.mint_cache
             .read()
