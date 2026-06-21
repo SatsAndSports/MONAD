@@ -26,3 +26,4 @@ cdk-spilman = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_ch
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 cdk-spilman-test-mint = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman-test-mint", default-features = false, features = ["http"] }
+async-trait = "0.1"

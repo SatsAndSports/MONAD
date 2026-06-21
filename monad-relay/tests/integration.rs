@@ -18,8 +18,10 @@ use bytes::Bytes;
 use h2::client;
 use http::{Method, Request};
 use monad_client::connector;
+use monad_client::loose_proof_wallet::{LooseProofWallet, NewLooseProof};
 use monad_client::route::{Route, RouteHop};
 use monad_client::session_driver::{start_session_payment_driver, PaymentPolicy};
+use monad_client::sqlite_client_wallet::{ChannelFundRecoveryResult, SqliteClientWallet};
 use monad_client::tunnel;
 use monad_client::wallet::{
     MockWallet, MonadWallet, RelayPaymentOffer, WalletChannel, WalletChannelState,
@@ -42,8 +44,8 @@ use monad_common::session::RelayConnection;
 use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
 use cdk_spilman::configurable_networking::ReqwestNetworking;
 use cdk_spilman::{
-    ChannelState, ClosingData, ConfigurableClientHost, EstablishedChannel, MintConnection,
-    SpilmanClientBridge,
+    ChannelState, ClientStorage, ClosingData, ConfigurableClientHost, EstablishedChannel,
+    FundingSpendKind, MintConnection, SpilmanClientBridge, SqliteClientStorage,
 };
 use cdk_spilman_test_mint::{
     build_router, build_test_mint, rotate_sat_keyset, InMemoryMintNetworking, TestMintConfig,
@@ -677,6 +679,28 @@ fn sum_proof_amounts(proofs_json: &str) -> u64 {
     let proofs: Vec<cashu::nuts::Proof> =
         serde_json::from_str(proofs_json).unwrap_or_else(|_| Vec::new());
     proofs.iter().map(|p| u64::from(p.amount)).sum()
+}
+
+fn loose_proofs_from_cashu_proofs(
+    mint_url: &str,
+    unit: &str,
+    source: &str,
+    proofs: &[cashu::nuts::Proof],
+) -> Vec<NewLooseProof> {
+    proofs
+        .iter()
+        .enumerate()
+        .map(|(idx, proof)| NewLooseProof {
+            proof_id: format!("{}:{}:{}", proof.keyset_id, proof.secret, idx),
+            mint_url: mint_url.to_string(),
+            unit: unit.to_string(),
+            keyset_id: proof.keyset_id.to_string(),
+            amount_raw: u64::from(proof.amount),
+            proof_json: serde_json::to_string(proof).unwrap(),
+            source_quote_id: Some(source.to_string()),
+            source_batch_id: Some(source.to_string()),
+        })
+        .collect()
 }
 
 struct DirectMintConnection {
@@ -4917,6 +4941,158 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
 
     let _ = shutdown_tx.send(());
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sqlite_client_recovery_falls_back_to_relay_close_restore() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage_path = temp_db.path().to_str().unwrap().to_string();
+    let transport_key = SecpTransportKeypair::generate();
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
+    let (server_addr, pubkey, handle, shutdown_tx, payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret,
+        &storage_path,
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let input_amount_raw = 128u64;
+    let input_proofs = mint_helper.mint_proofs(input_amount_raw).await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let loose_db = temp.path().join("loose.sqlite");
+    let channel_db = temp.path().join("channels.sqlite");
+    let loose_wallet = LooseProofWallet::open(&loose_db, "alice").unwrap();
+    loose_wallet
+        .import_proofs(&loose_proofs_from_cashu_proofs(
+            &mint_url,
+            "sat",
+            "relay-close-fallback",
+            &input_proofs,
+        ))
+        .unwrap();
+    let sender_secret = hex::encode([11u8; 32]);
+    let wallet = SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret).unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let status0 = control_handshake_status(&mut control_send, &mut control_recv).await;
+    let offer = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_hex,
+        status0
+            .advertisements
+            .iter()
+            .find(|a| a.unit == "sat")
+            .expect("relay should advertise sat keyset"),
+    );
+
+    let channel_id = wallet
+        .provision_channel(&offer, input_amount_raw * 1000)
+        .expect("client wallet should provision channel");
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+    let _link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+
+    let capacity_raw = wallet.get_channel(&channel_id).unwrap().capacity_msats / 1000;
+    let funded_balance_raw = capacity_raw / 2;
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, &offer, 0, funded_balance_raw)
+        .unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+    let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    assert!(!funded_status.paused);
+
+    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let close_success = payments
+        .close_channel(&channel_id, &mint_networking)
+        .expect("relay should close the channel");
+    assert!(!close_success.already_closed);
+    assert_eq!(close_success.receiver_sum, funded_balance_raw);
+
+    let mint_connection = DirectMintConnection {
+        mint: mint_helper.mint(),
+    };
+    let client_funding = SqliteClientStorage::open(channel_db.to_str().unwrap())
+        .unwrap()
+        .get_funding(&channel_id)
+        .unwrap();
+    let established = EstablishedChannel::from_client_channel_funding(&client_funding).unwrap();
+    let funding_state = established
+        .check_funding_token_state(&mint_connection)
+        .await
+        .unwrap();
+    assert_eq!(funding_state.state, cashu::nuts::State::Spent);
+    assert_eq!(
+        EstablishedChannel::classify_funding_spend_witness(&funding_state),
+        FundingSpendKind::RelayClose
+    );
+
+    let recovered = wallet
+        .recover_channel_funds(&channel_id, &mint_connection)
+        .await
+        .expect("client wallet should recover relay-close sender outputs");
+    let ChannelFundRecoveryResult::RelayCloseRecovered {
+        recovered_amount_raw,
+        recovered_proof_count,
+        ..
+    } = recovered
+    else {
+        panic!("expected relay-close recovery, got {recovered:?}");
+    };
+    assert_eq!(recovered_amount_raw, close_success.sender_sum);
+    assert!(recovered_proof_count > 0);
+    assert_eq!(
+        wallet.get_channel(&channel_id).unwrap().state,
+        WalletChannelState::Closed
+    );
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
 }
 
 /// End-to-end test that the relay-wallet manager can close a funded channel
