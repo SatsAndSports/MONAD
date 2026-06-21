@@ -2,6 +2,7 @@ use bytes::Bytes;
 use monad_common::control_codec::send_json_line;
 use monad_common::protocol::{ClientMessage, ServerErrorCode};
 use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use crate::wallet::{select_channel, RelayPaymentOffer, WalletChannel, WalletError};
@@ -34,6 +35,10 @@ fn choose_channel_and_offer(
     let Some(snapshot) = state.relay_snapshot.as_ref() else {
         return Ok(None);
     };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let channels = wallet
         .list_channels()?
         .into_iter()
@@ -46,7 +51,7 @@ fn choose_channel_and_offer(
     for advertisement in &snapshot.advertisements {
         let offer =
             RelayPaymentOffer::from_advertisement(snapshot.receiver_pubkey.clone(), advertisement);
-        if let Some(channel) = select_channel(&channels, &offer, session_id) {
+        if let Some(channel) = select_channel(&channels, &offer, session_id, now) {
             return Ok(Some((channel, offer)));
         }
     }

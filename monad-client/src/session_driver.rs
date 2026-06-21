@@ -135,6 +135,7 @@ mod tests {
             attached_session_id: None,
             capacity_msats: 10,
             current_signed_balance_msats: 7,
+            expiry_timestamp: u64::MAX,
         };
         let sat_channel = crate::wallet::WalletChannel {
             channel_id: "chan-sat".to_string(),
@@ -146,6 +147,7 @@ mod tests {
             attached_session_id: None,
             capacity_msats: 2_000,
             current_signed_balance_msats: 1_001,
+            expiry_timestamp: u64::MAX,
         };
 
         assert_eq!(channel_signed_balance_raw(&msat_channel).unwrap(), 7);
@@ -172,6 +174,7 @@ mod tests {
                 attached_session_id: None,
                 capacity_msats: 100,
                 current_signed_balance_msats: 7,
+                expiry_timestamp: u64::MAX,
             })
             .unwrap();
         let state = DriverState {
@@ -618,6 +621,7 @@ mod tests {
                 attached_session_id: None,
                 capacity_msats: 100,
                 current_signed_balance_msats: 100,
+                expiry_timestamp: u64::MAX,
             })
             .unwrap();
 

@@ -54,6 +54,13 @@ pub struct WalletChannel {
     pub attached_session_id: Option<[u8; 32]>,
     pub capacity_msats: u64,
     pub current_signed_balance_msats: u64,
+    pub expiry_timestamp: u64,
+}
+
+impl WalletChannel {
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expiry_timestamp <= now
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,12 +151,13 @@ pub fn select_channel(
     channels: &[WalletChannel],
     offer: &RelayPaymentOffer,
     session_id: [u8; 32],
+    now: u64,
 ) -> Option<WalletChannel> {
     let mut same_session = Vec::new();
     let mut unattached = Vec::new();
 
     for channel in channels {
-        if channel.state != WalletChannelState::Open {
+        if channel.state != WalletChannelState::Open || channel.is_expired(now) {
             continue;
         }
         if channel.receiver_pubkey != offer.receiver_pubkey
@@ -494,6 +502,7 @@ impl MonadWallet for MockWallet {
             attached_session_id: None,
             capacity_msats: input_budget_msats,
             current_signed_balance_msats: 0,
+            expiry_timestamp: u64::MAX,
         };
         let (capacity_raw, signed_balance_raw, signed_balance_msats) =
             raw_amounts_for_channel(&channel, channel.current_signed_balance_msats)?;
@@ -698,6 +707,7 @@ mod tests {
             attached_session_id: None,
             capacity_msats: 10_000,
             current_signed_balance_msats: 0,
+            expiry_timestamp: u64::MAX,
         }
     }
 
@@ -713,6 +723,7 @@ mod tests {
             ],
             &offer("msat"),
             session(1),
+            0,
         )
         .unwrap();
 
@@ -728,6 +739,7 @@ mod tests {
             }],
             &offer("msat"),
             session(1),
+            0,
         )
         .unwrap();
 
@@ -749,6 +761,22 @@ mod tests {
             ],
             &offer("msat"),
             session(1),
+            0,
+        );
+
+        assert!(chosen.is_none());
+    }
+
+    #[test]
+    fn selector_excludes_expired_channel() {
+        let chosen = select_channel(
+            &[WalletChannel {
+                expiry_timestamp: 100,
+                ..channel("expired")
+            }],
+            &offer("msat"),
+            session(1),
+            100,
         );
 
         assert!(chosen.is_none());

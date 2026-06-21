@@ -1763,6 +1763,7 @@ fn mock_wallet_channel(
         attached_session_id: None,
         capacity_msats: 20_000_000,
         current_signed_balance_msats: 0,
+        expiry_timestamp: u64::MAX,
     }
 }
 

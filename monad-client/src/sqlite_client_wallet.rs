@@ -41,6 +41,7 @@ const CREATE_CHANNELS_SQL: &str = r#"
         attached_session_id TEXT,
         state TEXT NOT NULL,
         reservation_id TEXT,
+        expiry_timestamp INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )
@@ -87,6 +88,7 @@ struct ClientOpenAttempt {
     reservation: ProofReservation,
     requested_capacity_raw: Option<u64>,
     selected_input_msats: u64,
+    expiry_timestamp: u64,
 }
 
 impl SqliteClientWallet {
@@ -251,6 +253,7 @@ impl SqliteClientWallet {
             ));
         }
         self.ensure_offer_keysets_cached(offer)?;
+        let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
         // Target-capacity provisioning computes the exact post-swap channel
         // capacity we want, selects loose proofs that can fund it after input
         // fees, and then asks the mint to swap those proofs into channel funding
@@ -270,7 +273,12 @@ impl SqliteClientWallet {
             // Prepare reserves a fresh set of loose proofs sized for the target
             // capacity and the selected output keyset's fee/amount structure.
             |output_keyset| {
-                self.prepare_target_capacity_attempt(offer, target_capacity_raw, output_keyset)
+                self.prepare_target_capacity_attempt(
+                    offer,
+                    target_capacity_raw,
+                    output_keyset,
+                    expiry_timestamp,
+                )
             },
             // Submit the upstream channel-open swap using that reservation.
             |attempt| self.submit_open_attempt(offer, attempt),
@@ -291,7 +299,11 @@ impl SqliteClientWallet {
             },
         );
         match result {
-            Ok(success) => self.finish_open_channel(success.value, &success.attempt.reservation),
+            Ok(success) => self.finish_open_channel(
+                success.value,
+                &success.attempt.reservation,
+                success.attempt.expiry_timestamp,
+            ),
             Err(KeysetRetryError::Submit { attempt, error, .. }) => self.handle_open_error(
                 error,
                 &attempt.reservation,
@@ -332,7 +344,25 @@ impl SqliteClientWallet {
                     self.loose_wallet
                         .mark_reservation_spent(&recovery.reservation_id, &open_result.channel_id)
                         .map_err(loose_proof_error)?;
-                    self.store_open_channel_metadata(&open_result, &recovery.reservation_id)?;
+                    let expiry_timestamp = {
+                        let bridge = self.bridge.lock().map_err(|_| {
+                            WalletError::Backend("bridge mutex poisoned".to_string())
+                        })?;
+                        let funding = bridge
+                            .get_channel_funding(&open_result.channel_id)
+                            .ok_or_else(|| {
+                                WalletError::Backend(format!(
+                                    "recovered channel {} has no funding data",
+                                    open_result.channel_id
+                                ))
+                            })?;
+                        expiry_from_params_json(&funding.params_json)?
+                    };
+                    self.store_open_channel_metadata(
+                        &open_result,
+                        &recovery.reservation_id,
+                        expiry_timestamp,
+                    )?;
                     self.delete_opening_recovery(&recovery.channel_id)?;
                     recovered.push(open_result.channel_id);
                 }
@@ -382,6 +412,7 @@ impl SqliteClientWallet {
         &self,
         open_result: &OpenChannelResult,
         reservation_id: &str,
+        expiry_timestamp: u64,
     ) -> Result<(), WalletError> {
         // Store the actual upstream capacity, not the input budget.
         let capacity_msats = raw_to_msats(&open_result.unit, open_result.capacity)
@@ -392,8 +423,8 @@ impl SqliteClientWallet {
             "INSERT INTO monad_client_channels
              (channel_id, receiver_pubkey, mint_url, unit, keyset_id,
               capacity_msats, attached_session_id, state, reservation_id,
-              created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?9)",
+              expiry_timestamp, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?10)",
             params![
                 open_result.channel_id,
                 open_result.receiver_pubkey_hex,
@@ -403,6 +434,7 @@ impl SqliteClientWallet {
                 to_i64(capacity_msats)?,
                 channel_state_str(WalletChannelState::Open),
                 reservation_id,
+                to_i64(expiry_timestamp)?,
                 to_i64(now)?,
             ],
         )
@@ -513,6 +545,7 @@ impl SqliteClientWallet {
             &attempt.output_keyset.info_json,
             &attempt.reservation,
             attempt.requested_capacity_raw,
+            attempt.expiry_timestamp,
         )
     }
 
@@ -522,6 +555,7 @@ impl SqliteClientWallet {
         output_keyset_info_json: &str,
         reservation: &ProofReservation,
         requested_capacity_raw: Option<u64>,
+        expiry_timestamp: u64,
     ) -> Result<OpenChannelResult, OpenChannelError> {
         let input_proofs_json = match proofs_json_from_reservation(reservation) {
             Ok(json) => json,
@@ -535,12 +569,6 @@ impl SqliteClientWallet {
             }
         };
 
-        let expiry_timestamp = Self::now_seconds().map_err(|e| OpenChannelError {
-            stage: OpenChannelFailureStage::BeforeOpeningSaved,
-            channel_id: None,
-            input_may_be_spent: false,
-            message: e.to_string(),
-        })? + CHANNEL_EXPIRY_SECONDS;
         {
             let bridge = self.bridge.lock().map_err(|_| OpenChannelError {
                 stage: OpenChannelFailureStage::BeforeOpeningSaved,
@@ -566,11 +594,16 @@ impl SqliteClientWallet {
         &self,
         open_result: OpenChannelResult,
         reservation: &ProofReservation,
+        expiry_timestamp: u64,
     ) -> Result<String, WalletError> {
         self.loose_wallet
             .mark_reservation_spent(&reservation.reservation_id, &open_result.channel_id)
             .map_err(loose_proof_error)?;
-        self.store_open_channel_metadata(&open_result, &reservation.reservation_id)?;
+        self.store_open_channel_metadata(
+            &open_result,
+            &reservation.reservation_id,
+            expiry_timestamp,
+        )?;
         Ok(open_result.channel_id)
     }
 
@@ -652,6 +685,7 @@ impl SqliteClientWallet {
         offer: &RelayPaymentOffer,
         target_capacity_raw: u64,
         output_keyset: SelectedOutputKeyset,
+        expiry_timestamp: u64,
     ) -> Result<ClientOpenAttempt, WalletError> {
         let required_post_swap_raw =
             compute_funding_token_amount(target_capacity_raw, &output_keyset.info_json, 0)
@@ -720,6 +754,7 @@ impl SqliteClientWallet {
             reservation,
             requested_capacity_raw: Some(target_capacity_raw),
             selected_input_msats,
+            expiry_timestamp,
         })
     }
 }
@@ -730,7 +765,7 @@ impl MonadWallet for SqliteClientWallet {
         let mut stmt = conn
             .prepare(
                 "SELECT channel_id, receiver_pubkey, mint_url, unit, keyset_id,
-                        capacity_msats, attached_session_id, state
+                        capacity_msats, attached_session_id, state, expiry_timestamp
                  FROM monad_client_channels
                  ORDER BY created_at ASC",
             )
@@ -753,7 +788,7 @@ impl MonadWallet for SqliteClientWallet {
         let meta = conn
             .query_row(
                 "SELECT channel_id, receiver_pubkey, mint_url, unit, keyset_id,
-                        capacity_msats, attached_session_id, state
+                        capacity_msats, attached_session_id, state, expiry_timestamp
                  FROM monad_client_channels
                  WHERE channel_id = ?1",
                 params![channel_id],
@@ -853,6 +888,7 @@ impl MonadWallet for SqliteClientWallet {
 
         self.ensure_offer_keysets_cached(offer)?;
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
+        let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
         let mut reservation: Option<ProofReservation> = None;
         // Plain provisioning uses an input budget rather than an exact target
         // capacity.  We reserve an arbitrary set of available proofs once, then
@@ -889,6 +925,7 @@ impl MonadWallet for SqliteClientWallet {
                     reservation,
                     requested_capacity_raw: None,
                     selected_input_msats: input_budget_msats,
+                    expiry_timestamp,
                 })
             },
             // Submit the upstream open-channel swap for this reservation.
@@ -903,7 +940,11 @@ impl MonadWallet for SqliteClientWallet {
             |_attempt, _error| Ok(()),
         );
         match result {
-            Ok(success) => self.finish_open_channel(success.value, &success.attempt.reservation),
+            Ok(success) => self.finish_open_channel(
+                success.value,
+                &success.attempt.reservation,
+                success.attempt.expiry_timestamp,
+            ),
             Err(KeysetRetryError::Submit { attempt, error, .. }) => self.handle_open_error(
                 error,
                 &attempt.reservation,
@@ -1032,6 +1073,7 @@ impl SqliteClientWallet {
                 .and_then(|hex| hex_to_session_id(hex).ok()),
             capacity_msats: meta.capacity_msats,
             current_signed_balance_msats,
+            expiry_timestamp: meta.expiry_timestamp,
         })
     }
 }
@@ -1063,6 +1105,7 @@ struct ChannelMeta {
     capacity_msats: u64,
     attached_session_id_hex: Option<String>,
     state: WalletChannelState,
+    expiry_timestamp: u64,
 }
 
 fn row_to_channel_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelMeta> {
@@ -1075,6 +1118,7 @@ fn row_to_channel_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelMeta>
         capacity_msats: from_i64(row.get(5)?)?,
         attached_session_id_hex: row.get(6)?,
         state: parse_channel_state(&row.get::<_, String>(7)?)?,
+        expiry_timestamp: from_i64(row.get(8)?)?,
     })
 }
 
@@ -1101,6 +1145,17 @@ fn hex_to_session_id(hex: &str) -> Result<[u8; 32], WalletError> {
     bytes
         .try_into()
         .map_err(|_| WalletError::Backend("session id is not 32 bytes".to_string()))
+}
+
+fn expiry_from_params_json(params_json: &str) -> Result<u64, WalletError> {
+    let value: serde_json::Value = serde_json::from_str(params_json)
+        .map_err(|e| WalletError::Backend(format!("parse channel params json: {e}")))?;
+    value
+        .get("expiry_timestamp")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            WalletError::Backend("channel params json missing expiry_timestamp".to_string())
+        })
 }
 
 fn proofs_json_from_reservation(
@@ -1581,9 +1636,11 @@ mod tests {
 
         let input_budget_msats = amount_raw * 1000;
         let offer = offer(&mint_url, &receiver_pubkey, &keyset_id);
+        let before_open = SqliteClientWallet::now_seconds().unwrap();
         let channel_id = wallet
             .provision_channel(&offer, input_budget_msats)
             .expect("provision channel from loose proofs");
+        let after_open = SqliteClientWallet::now_seconds().unwrap();
 
         let channel = wallet.get_channel(&channel_id).unwrap();
         assert_eq!(channel.receiver_pubkey, receiver_pubkey);
@@ -1595,6 +1652,27 @@ mod tests {
         // positive and not exceed the loose-proof input budget we committed.
         assert!(channel.capacity_msats > 0);
         assert!(channel.capacity_msats <= input_budget_msats);
+
+        // The channel expiry timestamp is stored in local metadata.
+        let stored_expiry: i64 = wallet
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT expiry_timestamp FROM monad_client_channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_expiry = u64::try_from(stored_expiry).unwrap();
+        assert_eq!(channel.expiry_timestamp, stored_expiry);
+        assert!(
+            stored_expiry >= before_open + CHANNEL_EXPIRY_SECONDS,
+            "stored expiry should be no earlier than before_open + CHANNEL_EXPIRY_SECONDS"
+        );
+        assert!(
+            stored_expiry <= after_open + CHANNEL_EXPIRY_SECONDS,
+            "stored expiry should be no later than after_open + CHANNEL_EXPIRY_SECONDS"
+        );
 
         // Loose proofs used for the channel should be spent.
         let available = wallet

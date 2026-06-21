@@ -210,6 +210,7 @@ impl TestSigningWallet {
             attached_session_id: metadata.attached_session_id,
             capacity_msats: metadata.capacity_msats,
             current_signed_balance_msats: metadata.current_signed_balance_msats,
+            expiry_timestamp: Self::expiry_timestamp(),
         }
     }
 
