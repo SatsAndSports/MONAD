@@ -3,18 +3,21 @@
 //! Bridges `LooseProofWallet` (bearer-proof custody) with upstream
 //! `cdk-spilman` Spilman channel operations, implementing `MonadWallet`.
 
-use crate::loose_proof_wallet::{LooseProofWallet, LooseProofWalletError, ProofReservation};
+use crate::loose_proof_wallet::{
+    LooseProofWallet, LooseProofWalletError, NewLooseProof, ProofReservation,
+};
 use crate::proof_selection::{select_mixed_fee_inputs_for_post_swap_target, ProofCandidate};
 use crate::wallet::{
     msats_to_raw_units, raw_to_msats, MonadWallet, RelayPaymentOffer, WalletChannel,
     WalletChannelState, WalletError,
 };
-use cashu::nuts::{CurrencyUnit, Id};
+use cashu::nuts::{CurrencyUnit, Id, Proof, SecretKey, State};
 use cdk_spilman::{
     compute_funding_token_amount, parse_keyset_info_from_json, with_active_keyset_retry,
-    ClientChannelInfo, ConfigurableClientHost, KeysetRetryError, OpenChannelError,
-    OpenChannelFailureStage, OpenChannelResult, ReqwestClientNetworking, SelectedOutputKeyset,
-    SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking, SqliteClientStorage,
+    ClientChannelFunding, ClientChannelInfo, ConfigurableClientHost, EstablishedChannel,
+    KeysetRetryError, MintConnection, OpenChannelError, OpenChannelFailureStage, OpenChannelResult,
+    ReqwestClientNetworking, SelectedOutputKeyset, SpilmanClientBridge, SpilmanClientHost,
+    SpilmanClientNetworking, SqliteClientStorage,
 };
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
@@ -65,8 +68,17 @@ const CREATE_OPENING_RECOVERIES_SQL: &str = r#"
 pub struct SqliteClientWallet {
     loose_wallet: LooseProofWallet,
     bridge: Mutex<ClientBridge>,
+    sender_secret: SecretKey,
     sender_pubkey_hex: String,
     channel_db: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayClosedSweepResult {
+    pub channel_id: String,
+    pub funding_state: State,
+    pub restored_proof_count: usize,
+    pub restored_amount_raw: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -97,13 +109,14 @@ impl SqliteClientWallet {
             WalletError::Backend("channel database path is not valid UTF-8".to_string())
         })?;
 
+        let sender_secret = SecretKey::from_hex(sender_secret_hex)
+            .map_err(|e| WalletError::Backend(format!("parse sender secret: {e}")))?;
         let mut host = ConfigurableClientHost::<SqliteClientStorage>::open_sqlite(path_str)
             .map_err(|e| {
                 WalletError::Backend(format!("open upstream sqlite client storage: {e}"))
             })?;
-        let sender_pubkey_hex = host
-            .add_key_from_hex(sender_secret_hex)
-            .map_err(|e| WalletError::Backend(format!("add sender key: {e}")))?;
+        let sender_pubkey_hex = sender_secret.public_key().to_hex();
+        host.add_key(sender_secret.clone());
 
         let bridge = SpilmanClientBridge::new(host, ReqwestClientNetworking::new());
 
@@ -121,6 +134,7 @@ impl SqliteClientWallet {
         Ok(Self {
             loose_wallet,
             bridge: Mutex::new(bridge),
+            sender_secret,
             sender_pubkey_hex,
             channel_db: Mutex::new(channel_db),
         })
@@ -129,6 +143,87 @@ impl SqliteClientWallet {
     /// Access the underlying loose-proof wallet.
     pub fn loose_wallet(&self) -> &LooseProofWallet {
         &self.loose_wallet
+    }
+
+    /// Sweep sender proofs after a relay-side unilateral close.
+    ///
+    /// If the funding token is still unspent, this returns without changing
+    /// local state. Once the mint reports it spent, the wallet restores the
+    /// deterministic sender proofs, imports them into loose-proof custody, and
+    /// marks the channel closed locally. Re-running the method is safe because
+    /// loose-proof import ignores already-known proof IDs.
+    pub async fn sweep_relay_closed_channel<M>(
+        &self,
+        channel_id: &str,
+        mint_connection: &M,
+    ) -> Result<RelayClosedSweepResult, WalletError>
+    where
+        M: MintConnection + ?Sized,
+    {
+        let funding = {
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            bridge.get_channel_funding(channel_id)
+        }
+        .ok_or(WalletError::NotFound)?;
+
+        let established = EstablishedChannel::from_client_channel_funding(&funding)
+            .map_err(|e| WalletError::Backend(format!("reconstruct channel funding: {e}")))?;
+        let funding_state = established
+            .check_funding_token_state(mint_connection)
+            .await
+            .map_err(|e| WalletError::Backend(format!("check funding token state: {e}")))?
+            .state;
+
+        if funding_state != State::Spent {
+            return Ok(RelayClosedSweepResult {
+                channel_id: channel_id.to_string(),
+                funding_state,
+                restored_proof_count: 0,
+                restored_amount_raw: 0,
+            });
+        }
+
+        let restored = EstablishedChannel::restore_sender_proofs_from_client_funding(
+            &funding,
+            self.sender_secret.clone(),
+            mint_connection,
+        )
+        .await
+        .map_err(|e| WalletError::Backend(format!("restore sender proofs: {e}")))?;
+        let restored_amount_raw = restored.iter().try_fold(0u64, |total, proof| {
+            total
+                .checked_add(u64::from(proof.amount))
+                .ok_or_else(|| WalletError::Backend("restored proof total overflow".to_string()))
+        })?;
+        let restored_proof_count = restored.len();
+        let loose_proofs = restored
+            .iter()
+            .map(|proof| proof_to_new_loose_proof(proof, &funding))
+            .collect::<Result<Vec<_>, WalletError>>()?;
+        self.loose_wallet
+            .import_proofs(&loose_proofs)
+            .map_err(loose_proof_error)?;
+
+        {
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            bridge
+                .close_channel(channel_id)
+                .map_err(|e| WalletError::Backend(format!("mark upstream channel closed: {e}")))?;
+        }
+        self.mark_channel_metadata_closed(channel_id)?;
+
+        Ok(RelayClosedSweepResult {
+            channel_id: channel_id.to_string(),
+            funding_state,
+            restored_proof_count,
+            restored_amount_raw,
+        })
     }
 
     /// Provision a channel with an exact requested capacity.
@@ -264,6 +359,23 @@ impl SqliteClientWallet {
         self.channel_db
             .lock()
             .map_err(|_| WalletError::Backend("channel db mutex poisoned".to_string()))
+    }
+
+    fn mark_channel_metadata_closed(&self, channel_id: &str) -> Result<(), WalletError> {
+        let now = Self::now_seconds()?;
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE monad_client_channels
+             SET state = ?2, attached_session_id = NULL, updated_at = ?3
+             WHERE channel_id = ?1",
+            params![
+                channel_id,
+                channel_state_str(WalletChannelState::Closed),
+                to_i64(now)?
+            ],
+        )
+        .map_err(|e| WalletError::Backend(format!("mark channel closed: {e}")))?;
+        Ok(())
     }
 
     fn store_open_channel_metadata(
@@ -1003,6 +1115,30 @@ fn proofs_json_from_reservation(
         values.map_err(|e| WalletError::Backend(format!("parse reserved proof json: {e}")))?;
     serde_json::to_string(&values)
         .map_err(|e| WalletError::Backend(format!("serialize reserved proofs: {e}")))
+}
+
+fn proof_to_new_loose_proof(
+    proof: &Proof,
+    funding: &ClientChannelFunding,
+) -> Result<NewLooseProof, WalletError> {
+    let proof_id = proof
+        .y()
+        .map_err(|e| WalletError::Backend(format!("compute restored proof id: {e}")))?
+        .to_hex();
+    let proof_json = serde_json::to_string(proof)
+        .map_err(|e| WalletError::Backend(format!("serialize restored proof: {e}")))?;
+    let keyset_info = parse_keyset_info_from_json(&funding.keyset_info_json)
+        .map_err(|e| WalletError::Backend(format!("parse funding keyset info: {e}")))?;
+    Ok(NewLooseProof {
+        proof_id,
+        mint_url: funding.mint_url.clone(),
+        unit: keyset_info.unit.to_string(),
+        keyset_id: proof.keyset_id.to_string(),
+        amount_raw: u64::from(proof.amount),
+        proof_json,
+        source_quote_id: None,
+        source_batch_id: None,
+    })
 }
 
 fn loose_proof_error(error: LooseProofWalletError) -> WalletError {

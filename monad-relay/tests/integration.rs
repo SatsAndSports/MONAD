@@ -41,7 +41,10 @@ use monad_common::session::RelayConnection;
 
 use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
 use cdk_spilman::configurable_networking::ReqwestNetworking;
-use cdk_spilman::{ChannelState, ClosingData, ConfigurableClientHost, SpilmanClientBridge};
+use cdk_spilman::{
+    ChannelState, ClosingData, ConfigurableClientHost, EstablishedChannel, MintConnection,
+    SpilmanClientBridge,
+};
 use cdk_spilman_test_mint::{
     build_router, build_test_mint, rotate_sat_keyset, InMemoryMintNetworking, TestMintConfig,
     TestMintHelper,
@@ -674,6 +677,136 @@ fn sum_proof_amounts(proofs_json: &str) -> u64 {
     let proofs: Vec<cashu::nuts::Proof> =
         serde_json::from_str(proofs_json).unwrap_or_else(|_| Vec::new());
     proofs.iter().map(|p| u64::from(p.amount)).sum()
+}
+
+struct DirectMintConnection {
+    mint: Arc<cdk::mint::Mint>,
+}
+
+#[async_trait::async_trait]
+impl MintConnection for DirectMintConnection {
+    async fn process_swap(
+        &self,
+        request: cashu::nuts::SwapRequest,
+    ) -> anyhow::Result<cashu::nuts::SwapResponse> {
+        self.mint
+            .process_swap_request(request)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    async fn post_restore(
+        &self,
+        request: cashu::nuts::RestoreRequest,
+    ) -> anyhow::Result<cashu::nuts::RestoreResponse> {
+        self.mint
+            .restore(request)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    async fn check_state(
+        &self,
+        ys: Vec<cashu::nuts::PublicKey>,
+    ) -> anyhow::Result<cashu::nuts::CheckStateResponse> {
+        self.mint
+            .check_state(&cashu::nuts::CheckStateRequest { ys })
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+}
+
+fn parse_proofs_json(proofs_json: &str) -> Vec<cashu::nuts::Proof> {
+    serde_json::from_str(proofs_json).expect("proof JSON should decode")
+}
+
+fn canonical_proof_values_without_witness(proofs: &[cashu::nuts::Proof]) -> Vec<serde_json::Value> {
+    let mut values = proofs
+        .iter()
+        .map(|proof| {
+            let mut value = serde_json::to_value(proof).expect("proof should serialize");
+            if let Some(object) = value.as_object_mut() {
+                object.remove("witness");
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|a, b| {
+        let a_key = format!(
+            "{}:{}:{}",
+            a.get("amount").and_then(|v| v.as_u64()).unwrap_or(0),
+            a.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+            a.get("secret").and_then(|v| v.as_str()).unwrap_or_default()
+        );
+        let b_key = format!(
+            "{}:{}:{}",
+            b.get("amount").and_then(|v| v.as_u64()).unwrap_or(0),
+            b.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+            b.get("secret").and_then(|v| v.as_str()).unwrap_or_default()
+        );
+        a_key.cmp(&b_key)
+    });
+    values
+}
+
+fn assert_proofs_have_p2pk_e(proofs: &[cashu::nuts::Proof], label: &str) {
+    assert!(!proofs.is_empty(), "{label} should not be empty");
+    for (index, proof) in proofs.iter().enumerate() {
+        assert!(
+            proof.p2pk_e.is_some(),
+            "{label}[{index}] should include p2pk_e"
+        );
+    }
+}
+
+fn assert_same_p2pk_e(restored: &[cashu::nuts::Proof], relay: &[cashu::nuts::Proof]) {
+    assert_eq!(
+        restored.len(),
+        relay.len(),
+        "restored and relay sender proof counts should match"
+    );
+    let restored_p2pk_e = restored
+        .iter()
+        .map(|proof| proof.p2pk_e.map(|key| key.to_hex()))
+        .collect::<Vec<_>>();
+    let relay_p2pk_e = relay
+        .iter()
+        .map(|proof| proof.p2pk_e.map(|key| key.to_hex()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        restored_p2pk_e, relay_p2pk_e,
+        "restored sender proofs should use the same p2pk_e keys as relay sender proofs"
+    );
+}
+
+fn assert_proofs_have_no_witness_signatures(proofs: &[cashu::nuts::Proof], label: &str) {
+    for (index, proof) in proofs.iter().enumerate() {
+        let Some(cashu::nuts::Witness::P2PKWitness(witness)) = &proof.witness else {
+            continue;
+        };
+        assert!(
+            witness.signatures.is_empty(),
+            "{label}[{index}] should not include witness signatures"
+        );
+    }
+}
+
+fn assert_proofs_have_witness_signatures(proofs: &[cashu::nuts::Proof], label: &str) {
+    assert!(!proofs.is_empty(), "{label} should not be empty");
+    for (index, proof) in proofs.iter().enumerate() {
+        let signatures = match &proof.witness {
+            Some(cashu::nuts::Witness::P2PKWitness(witness)) => &witness.signatures,
+            other => panic!("{label}[{index}] should include a P2PK witness, got {other:?}"),
+        };
+        assert!(
+            !signatures.is_empty(),
+            "{label}[{index}] should include witness signatures"
+        );
+        assert!(
+            signatures.iter().all(|signature| !signature.is_empty()),
+            "{label}[{index}] should not include empty witness signatures"
+        );
+    }
 }
 
 async fn mixed_input_fee_for_proofs(mint_url: &str, proofs_jsons: &[&str]) -> u64 {
@@ -4540,6 +4673,147 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     assert!(
         message.contains("channel closed"),
         "unexpected re-link error: {message}"
+    );
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_client_observes_relay_close_and_restores_sender_proofs() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let storage_path = temp_db.path().to_str().unwrap().to_string();
+
+    let transport_key = SecpTransportKeypair::generate();
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
+
+    let (server_addr, pubkey, handle, shutdown_tx, payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret,
+        &storage_path,
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex.clone(),
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json.clone(),
+        )
+        .await,
+    );
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let status0 = control_handshake_status(&mut control_send, &mut control_recv).await;
+    let offer = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_hex,
+        status0
+            .advertisements
+            .iter()
+            .find(|a| a.unit == "sat")
+            .expect("relay should advertise sat keyset"),
+    );
+
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+    let _link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+
+    let capacity_raw = wallet.get_channel(&channel_id).unwrap().capacity_msats / 1000;
+    let funded_balance_raw = capacity_raw / 2;
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, &offer, 0, funded_balance_raw)
+        .unwrap();
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+    let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    assert!(!funded_status.paused);
+
+    let funding = wallet.client_channel_funding(&channel_id).unwrap();
+    let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
+    let mint_connection = DirectMintConnection {
+        mint: mint_helper.mint(),
+    };
+
+    let before = established
+        .check_funding_token_state(&mint_connection)
+        .await
+        .unwrap();
+    assert_eq!(before.state, cashu::nuts::State::Unspent);
+
+    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let close_success = payments
+        .close_channel(&channel_id, &mint_networking)
+        .expect("relay should close the channel");
+    assert!(!close_success.already_closed);
+    assert_eq!(close_success.receiver_sum, funded_balance_raw);
+
+    let after = established
+        .check_funding_token_state(&mint_connection)
+        .await
+        .unwrap();
+    assert_eq!(after.state, cashu::nuts::State::Spent);
+
+    let restored_sender_proofs = EstablishedChannel::restore_sender_proofs_from_client_funding(
+        &funding,
+        wallet.sender_secret(),
+        &mint_connection,
+    )
+    .await
+    .unwrap();
+    let relay_sender_proofs = parse_proofs_json(&close_success.sender_proofs);
+
+    assert_proofs_have_p2pk_e(&restored_sender_proofs, "restored sender proofs");
+    assert_proofs_have_p2pk_e(&relay_sender_proofs, "relay sender proofs");
+    assert_same_p2pk_e(&restored_sender_proofs, &relay_sender_proofs);
+    assert_proofs_have_witness_signatures(&restored_sender_proofs, "restored sender proofs");
+    assert_proofs_have_no_witness_signatures(&relay_sender_proofs, "relay sender proofs");
+
+    assert_eq!(
+        restored_sender_proofs
+            .iter()
+            .map(|p| u64::from(p.amount))
+            .sum::<u64>(),
+        close_success.sender_sum
+    );
+    assert_eq!(
+        canonical_proof_values_without_witness(&restored_sender_proofs),
+        canonical_proof_values_without_witness(&relay_sender_proofs)
     );
 
     let _ = control_send.send_data(Bytes::new(), true);

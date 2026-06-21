@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use cashu::nuts::SecretKey;
 use cdk::mint::Mint;
 use cdk_spilman::{
-    build_cashu_b_token, ConfigurableClientHost, MemoryClientStorage, OpenChannelResult,
-    SpilmanClientBridge,
+    build_cashu_b_token, ClientChannelFunding, ConfigurableClientHost, MemoryClientStorage,
+    OpenChannelResult, SpilmanClientBridge,
 };
 use cdk_spilman_test_mint::InMemoryMintNetworking;
 use monad_client::wallet::{
@@ -152,6 +152,17 @@ impl TestSigningWallet {
             .map_err(|e| WalletError::Backend(format!("failed to create link payment: {e}")))?;
         serde_json::to_string(&payment)
             .map_err(|e| WalletError::Backend(format!("failed to serialize payment: {e}")))
+    }
+
+    pub fn client_channel_funding(&self, channel_id: &str) -> Result<ClientChannelFunding, String> {
+        let bridge = self.bridge.lock().map_err(|_| "bridge mutex poisoned")?;
+        bridge
+            .get_channel_funding(channel_id)
+            .ok_or_else(|| format!("channel funding not found for {channel_id}"))
+    }
+
+    pub fn sender_secret(&self) -> SecretKey {
+        self._sender_secret.clone()
     }
 
     fn record_opened_channel(&self, open_result: &OpenChannelResult) -> Result<(), String> {
