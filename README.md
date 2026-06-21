@@ -85,7 +85,7 @@ Two relays can share the same `wallet_db_path` safely because each relay uses a 
 The reusable client wallet pieces exist in `monad-client` but are not yet exposed as a usable CLI runtime.
 
 - `LooseProofWallet` stores loose Cashu proofs, mint quote state, premint batches, reservations, and spend/release state in SQLite.
-- `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata in SQLite, and implements `MonadWallet` for the session driver.
+- `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata including expiry timestamps in SQLite, and implements `MonadWallet` for the session driver.
 - opening recovery is persisted for ambiguous funding-swap failures and can be recovered through upstream restore.
 - output keyset selection is cache-first: the wallet ensures its mint/unit keyset cache is non-empty before entering the keyset retry helper, then selectors read cache only; refresh happens after retryable mint keyset rejection.
 

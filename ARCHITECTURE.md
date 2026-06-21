@@ -291,7 +291,7 @@ Control messages are JSON objects, newline-delimited, exchanged over the H2 cont
 ### Message Types
 
 Client to server (`ClientMessage`):
-- `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0 and funding proofs
+- `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0, funding proofs, and an expiry at least one hour in the future
 - `ChannelPayment { payment_json }` — increment session balance; requires a Spilman `Payment` signature for a higher balance than previously seen for this channel
 - `GetSessionStatus` — request a fresh session status snapshot
 
@@ -356,6 +356,8 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 ### Client Auto-Funding
 
 The client opens a control stream immediately after connecting. Once it receives the initial `SessionStatus`, the per-session payment driver runs one serialized direct control loop. That loop chooses or provisions a local channel, sends `ChannelLink`, and later sends `ChannelPayment` updates. Intermediate hops in multi-hop chains use the same session-driver model.
+
+The client stores each channel's expiry timestamp in local channel metadata and excludes already-expired channels from selection. If a relay rejects a link because the channel expiry is too soon, the driver marks that channel globally unusable locally and selects or provisions another channel.
 
 The relay remains authoritative for:
 

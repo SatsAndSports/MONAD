@@ -2348,6 +2348,99 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
     let _ = mint_shutdown.send(());
 }
 
+/// End-to-end test that the session payment driver marks a real Spilman channel
+/// unusable and reselects when the relay rejects its ChannelLink because the
+/// channel expiry is too soon for relay policy.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_payment_driver_marks_expiry_too_soon_channel_and_reselects() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_pubkey_hex,
+            mint_url.clone(),
+            keyset_id.clone(),
+            keyset_info_json,
+        )
+        .await,
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (expired_channel_id, fallback_channel_id) = loop {
+        let expired = wallet
+            .pre_create_channel_with_expiry(1000, now + 60)
+            .await
+            .unwrap();
+        let fallback = wallet.pre_create_channel(1000).await.unwrap();
+        if expired < fallback {
+            break (expired, fallback);
+        }
+        wallet.forget_channel_metadata(&expired).unwrap();
+        wallet.forget_channel_metadata(&fallback).unwrap();
+    };
+
+    let storage = tempfile::NamedTempFile::new().unwrap();
+    let transport_key = SecpTransportKeypair::generate();
+    let (server_addr, pubkey, relay_handle, shutdown_tx, _payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        receiver_secret,
+        storage.path().to_str().unwrap(),
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (driver_handle, ready_rx) = start_session_payment_driver(
+        &conn,
+        wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "integration hop",
+        PaymentPolicy {
+            target_topup_buffer_msats: 1000,
+            minimum_topup_msats: 1000,
+        },
+    )
+    .await
+    .unwrap();
+
+    timeout(Duration::from_secs(3), ready_rx)
+        .await
+        .expect("driver should ready after expiry-too-soon reselection")
+        .expect("driver ready signal");
+
+    assert_eq!(
+        wallet.get_channel(&expired_channel_id).unwrap().state,
+        WalletChannelState::Closing,
+        "expiry-too-soon channel should be marked globally unusable"
+    );
+    let fallback = wallet.get_channel(&fallback_channel_id).unwrap();
+    assert_eq!(fallback.state, WalletChannelState::Open);
+    assert!(
+        fallback.current_signed_balance_msats > 0,
+        "fallback channel should be linked and paid after relay rejects expired channel"
+    );
+
+    driver_handle.abort();
+    let _ = driver_handle.await;
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    let _ = relay_handle.await;
+}
+
 /// End-to-end test that the session payment driver marks a channel unusable
 /// and reselects to another channel when the relay rejects a payment with
 /// `ChannelClosed`.

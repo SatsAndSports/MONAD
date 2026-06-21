@@ -494,7 +494,7 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     fn get_channel_policy(&self, unit: &str) -> Option<ChannelPolicy> {
         match unit {
             "sat" | "msat" => Some(ChannelPolicy {
-                min_expiry_in_seconds: 0,
+                min_expiry_in_seconds: 3600,
                 min_capacity: 1,
                 max_amount_per_output: None,
             }),

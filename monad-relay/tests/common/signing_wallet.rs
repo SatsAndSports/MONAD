@@ -34,6 +34,7 @@ struct ChannelMetadata {
     capacity_raw: u64,
     current_signed_balance_msats: u64,
     current_signed_balance_raw: u64,
+    expiry_timestamp: u64,
     state: WalletChannelState,
     attached_session_id: Option<[u8; 32]>,
 }
@@ -94,6 +95,16 @@ impl TestSigningWallet {
     ///
     /// Must be called from within a Tokio runtime context.
     pub async fn pre_create_channel(&self, capacity_sats: u64) -> Result<String, String> {
+        self.pre_create_channel_with_expiry(capacity_sats, Self::expiry_timestamp())
+            .await
+    }
+
+    /// Mint proofs and open a real Spilman channel with a custom expiry.
+    pub async fn pre_create_channel_with_expiry(
+        &self,
+        capacity_sats: u64,
+        expiry_timestamp: u64,
+    ) -> Result<String, String> {
         let proofs = cdk_spilman_test_mint::mint_test_proofs(&self.mint, capacity_sats)
             .await
             .map_err(|e| format!("failed to mint test proofs: {e}"))?;
@@ -112,14 +123,14 @@ impl TestSigningWallet {
                     &token,
                     &self.receiver_pubkey_hex,
                     &self.sender_pubkey_hex,
-                    Self::expiry_timestamp(),
+                    expiry_timestamp,
                     &self.keyset_info_json,
                     capacity_sats,
                 )
                 .map_err(|e| format!("failed to open channel: {e}"))?
         };
 
-        self.record_opened_channel(&open_result)?;
+        self.record_opened_channel(&open_result, expiry_timestamp)?;
         Ok(open_result.channel_id.clone())
     }
 
@@ -165,7 +176,20 @@ impl TestSigningWallet {
         self._sender_secret.clone()
     }
 
-    fn record_opened_channel(&self, open_result: &OpenChannelResult) -> Result<(), String> {
+    pub fn forget_channel_metadata(&self, channel_id: &str) -> Result<(), String> {
+        let mut channels = self
+            .channels
+            .lock()
+            .map_err(|_| "channels mutex poisoned")?;
+        channels.remove(channel_id);
+        Ok(())
+    }
+
+    fn record_opened_channel(
+        &self,
+        open_result: &OpenChannelResult,
+        expiry_timestamp: u64,
+    ) -> Result<(), String> {
         let unit = "sat";
         let capacity_msats = raw_units_to_msats(unit, open_result.capacity)
             .map_err(|e| format!("failed to convert capacity to msats: {e}"))?;
@@ -180,6 +204,7 @@ impl TestSigningWallet {
             capacity_raw: open_result.capacity,
             current_signed_balance_msats: 0,
             current_signed_balance_raw: 0,
+            expiry_timestamp,
             state: WalletChannelState::Open,
             attached_session_id: None,
         };
@@ -195,8 +220,8 @@ impl TestSigningWallet {
     fn expiry_timestamp() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() + 3600)
-            .unwrap_or(3600)
+            .map(|d| d.as_secs() + 7200)
+            .unwrap_or(7200)
     }
 
     fn channel_to_wallet_channel(metadata: &ChannelMetadata) -> WalletChannel {
@@ -210,7 +235,7 @@ impl TestSigningWallet {
             attached_session_id: metadata.attached_session_id,
             capacity_msats: metadata.capacity_msats,
             current_signed_balance_msats: metadata.current_signed_balance_msats,
-            expiry_timestamp: Self::expiry_timestamp(),
+            expiry_timestamp: metadata.expiry_timestamp,
         }
     }
 
@@ -308,7 +333,7 @@ impl MonadWallet for TestSigningWallet {
             .lock()
             .map_err(|_| WalletError::Backend("channels mutex poisoned".to_string()))?;
         let metadata = channels.get_mut(channel_id).ok_or(WalletError::NotFound)?;
-        metadata.state = WalletChannelState::Closed;
+        metadata.state = WalletChannelState::Closing;
         Ok(())
     }
 
