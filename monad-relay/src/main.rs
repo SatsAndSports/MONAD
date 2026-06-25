@@ -1,8 +1,8 @@
 use cashu::nuts::SecretKey;
 use clap::{Parser, Subcommand};
+use monad_common::config::MonadConfig;
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::SecpTransportKeypair;
-use monad_relay::config::MonadConfig;
 use monad_relay::listener;
 use monad_relay::wallet_cli::{run_wallet_command, WalletArgs};
 use monad_relay::wallet_manager::RelayWalletManager;
@@ -84,10 +84,10 @@ fn keygen() -> anyhow::Result<()> {
     println!("# --- QUIC certificate (derived from the Ed25519 key) ---");
     println!("{}", quic_km.cert_pem);
     println!("# Run the relay with a config file such as:");
-    println!("#   monad-relay run --config relay.yaml --relay <name>");
+    println!("#   monad-relay run --config monad.yaml --relay <name>");
     println!("#");
-    println!("# MONAD clients use the secp transport key:");
-    println!("#   secp256k1:{transport_pubkey}");
+    println!("# MONAD clients use the secp transport public key:");
+    println!("#   {transport_pubkey}");
     Ok(())
 }
 
@@ -100,17 +100,10 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
     let transport_key = parse_transport_key(&relay.transport_key)
         .map_err(|e| anyhow::anyhow!("bad transport key for relay '{}': {e}", relay.name))?;
 
-    let quic_config = if relay.quic {
-        let quic_km = monad_quic::keygen::generate_from_seed(identity.seed())?;
-        Some(monad_quic::server::build_server_config(
-            &quic_km.cert_pem,
-            &quic_km.key_pem,
-        )?)
-    } else {
-        None
-    };
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed())?;
+    let quic_config = monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem)?;
 
-    let wallet_manager = Arc::new(RelayWalletManager::open(&relay.wallet_db_path)?);
+    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path)?);
 
     let receiver_pubkey_hex = match &relay.receiver_secret_hex {
         Some(secret_hex) => {
@@ -127,7 +120,7 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
                 anyhow::anyhow!(
                     "relay '{}' has no receiver_secret_hex and is not registered in '{}': {e}",
                     relay.name,
-                    relay.wallet_db_path
+                    config.wallets.relay.db_path
                 )
             })?,
     };
@@ -143,28 +136,23 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
         transport_key: Some(transport_key),
         receiver_pubkey_hex,
         trusted_mint_units,
-        in_bytes_per_millisat: relay.in_bytes_per_millisat,
-        out_bytes_per_millisat: relay.out_bytes_per_millisat,
+        in_bytes_per_millisat: relay.pricing.in_bytes_per_millisat,
+        out_bytes_per_millisat: relay.pricing.out_bytes_per_millisat,
         bootstrap_capabilities: None,
         relay_wallet_name: relay.name.clone(),
-        spilman_storage_path: relay.wallet_db_path.clone(),
+        spilman_storage_path: config.wallets.relay.db_path.clone(),
     });
 
     let tcp_listener = TcpListener::bind(&relay.listen).await?;
 
-    let quic_endpoint = if let Some(quinn_config) = quic_config {
-        let local_addr = tcp_listener.local_addr()?;
-        let endpoint = quinn::Endpoint::server(quinn_config, local_addr)?;
-        info!("QUIC listener enabled on {local_addr}");
-        Some(endpoint)
-    } else {
-        None
-    };
+    let local_addr = tcp_listener.local_addr()?;
+    let quic_endpoint = quinn::Endpoint::server(quic_config, local_addr)?;
+    info!("QUIC listener enabled on {local_addr}");
 
     info!(relay = %relay.name, "relay starting");
     listener::run_with_wallet_manager(
         tcp_listener,
-        quic_endpoint,
+        Some(quic_endpoint),
         server_config,
         wallet_manager,
         discovered_spilman_mint_cache,

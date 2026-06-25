@@ -1,6 +1,7 @@
 pub mod blinded_connect;
 pub mod blinded_hop;
 pub mod bootstrap;
+pub mod config;
 pub mod control_codec;
 pub mod h2stream;
 pub mod noise_secp256k1;

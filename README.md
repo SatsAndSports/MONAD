@@ -39,22 +39,41 @@ Not implemented yet:
 
 `monad-relay` now uses a named relay-wallet identity inside a shared SQLite relay-wallet database.  Relay configuration lives in a single YAML file; one file can describe many relays, and each relay process selects its relay with `--relay <name>`.
 
-Example `relay.yaml`:
+Example `monad.yaml`:
 
 ```yaml
+wallets:
+  relay:
+    db_path: /var/lib/monad/relay.db
+  client:
+    loose_db_path: /var/lib/monad/client-loose.db
+    channel_db_path: /var/lib/monad/client-channels.db
+    wallet_name: default
+    sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
+    channel_input_budget_msats: 1000000
+
+management:
+  listen: 127.0.0.1:9090
+
 relays:
   - name: relay-a
-    wallet_db_path: /var/lib/monad/relay.db
     receiver_secret_hex: "${MONAD_RELAY_A_RECEIVER_KEY}"
     quic_cert_seed: "${MONAD_RELAY_A_QUIC_SEED}"
     transport_key: "${MONAD_RELAY_A_TRANSPORT_KEY}"
-    listen: 0.0.0.0:9050
-    quic: true
+    listen: 127.10.0.11:9050
     trusted_mints:
       - url: https://dev.mint.camelus.app
         units: [sat]
-    in_bytes_per_millisat: 1
-    out_bytes_per_millisat: 1
+    pricing:
+      in_bytes_per_millisat: 1
+      out_bytes_per_millisat: 1
+
+clients:
+  - name: local
+    socks: 127.10.0.1:1080
+    route:
+      - addr: 127.10.0.11:9050
+        pubkey: "${MONAD_RELAY_A_TRANSPORT_PUBKEY}"
 ```
 
 Environment variables are substituted from the process environment or from a `.env` file in the same directory as the config.  Defaults are supported: `${VAR:-default}`.
@@ -62,37 +81,39 @@ Environment variables are substituted from the process environment or from a `.e
 Run the relay:
 
 ```bash
-monad-relay run --config relay.yaml --relay relay-a
+monad-relay run --config monad.yaml --relay relay-a
 ```
 
 Inspect the shared relay-wallet DB:
 
 ```bash
-monad-relay wallet --config relay.yaml --relay relay-a list
-monad-relay wallet --config relay.yaml --relay relay-a show
-monad-relay wallet --config relay.yaml --relay relay-a channels
+monad-relay wallet --config monad.yaml --relay relay-a list
+monad-relay wallet --config monad.yaml --relay relay-a show
+monad-relay wallet --config monad.yaml --relay relay-a channels
 monad-relay wallet --wallet-db-path /var/lib/monad/relay.db close --channel-id <channel-id>
-monad-relay wallet --config relay.yaml --relay relay-a drains
-monad-relay wallet --config relay.yaml --relay relay-a drain --mint-url https://dev.mint.camelus.app --unit sat
-monad-relay wallet --config relay.yaml --relay relay-a recover-drain --drain-id <drain-id>
+monad-relay wallet --config monad.yaml --relay relay-a drains
+monad-relay wallet --config monad.yaml --relay relay-a drain --mint-url https://dev.mint.camelus.app --unit sat
+monad-relay wallet --config monad.yaml --relay relay-a recover-drain --drain-id <drain-id>
 ```
 
 Add `--json` to any wallet command for machine-readable output.
 
 On first start, `receiver_secret_hex` is required so the relay can register its identity in the wallet database.  On later restarts of the same relay wallet identity, omit `receiver_secret_hex`; the relay will load the existing receiver key for `relay-a` from the shared wallet DB.
 
-Two relays can share the same `wallet_db_path` safely because each relay uses a distinct receiver key, so their channel rows are disjoint.  The config loader rejects any two relays that share the same `receiver_secret_hex`.
+All configured relays share `wallets.relay.db_path` safely because each relay uses a distinct receiver key, so their channel rows are disjoint.  The config loader rejects any two relays that share the same `receiver_secret_hex`.
 
 ## Client Wallet
 
 The reusable client wallet pieces exist in `monad-client`. The binary exposes
-wallet admin/funding/recovery commands, but the SOCKS runtime is still gated
-until config and full funding UX are wired in.
+wallet admin/funding/recovery commands and can run a configured QUIC SOCKS
+client with `monad-client run --config monad.yaml --client <name>`.
 
 - `LooseProofWallet` stores loose Cashu proofs, mint quote state, premint batches, reservations, and spend/release state in SQLite.
 - `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata including expiry timestamps in SQLite, and implements `MonadWallet` for the session driver.
 - opening recovery is persisted for ambiguous funding-swap failures and can be recovered through upstream restore.
 - output keyset selection is cache-first: the wallet ensures its mint/unit keyset cache is non-empty before entering the keyset retry helper, then selectors read cache only; refresh happens after retryable mint keyset rejection.
+
+`wallets.client.channel_input_budget_msats` controls the loose-proof input budget for each newly provisioned channel. It is not a guaranteed channel capacity; fees and deterministic channel outputs can make the resulting capacity lower. The default is `1000000` msats.
 
 Current admin/recovery commands use explicit DB paths and sender key material:
 
@@ -289,64 +310,86 @@ This prints:
 
 ### 2. Start one or more relays
 
-Create a `relay.yaml` file.  A single file can hold many relays; each relay process selects one with `--relay <name>`.
+Create a `monad.yaml` file.  A single file can hold the shared wallets, many relays, and one or more client route definitions. Each relay process selects one relay with `--relay <name>`.
 
 ```yaml
+wallets:
+  relay:
+    db_path: /var/lib/monad/relay.db
+  client:
+    loose_db_path: /var/lib/monad/client-loose.db
+    channel_db_path: /var/lib/monad/client-channels.db
+    wallet_name: default
+    sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
+    channel_input_budget_msats: 1000000
+
 relays:
   - name: hop1
-    wallet_db_path: /var/lib/monad/relay.db
     receiver_secret_hex: "${HOP1_RECEIVER_KEY}"
     quic_cert_seed: "${HOP1_ED25519_SEED}"
     transport_key: "${HOP1_SECP_KEY}"
-    listen: 127.0.0.1:9051
-    quic: false
-    in_bytes_per_millisat: 1
-    out_bytes_per_millisat: 1
+    listen: 127.10.0.11:9051
+    pricing:
+      in_bytes_per_millisat: 1
+      out_bytes_per_millisat: 1
     trusted_mints:
       - url: https://dev.mint.camelus.app
         units: [sat]
 
   - name: hop2
-    wallet_db_path: /var/lib/monad/relay.db
     receiver_secret_hex: "${HOP2_RECEIVER_KEY}"
     quic_cert_seed: "${HOP2_ED25519_SEED}"
     transport_key: "${HOP2_SECP_KEY}"
-    listen: 127.0.0.1:9052
-    quic: true
-    in_bytes_per_millisat: 1
-    out_bytes_per_millisat: 1
+    listen: 127.10.0.12:9052
+    pricing:
+      in_bytes_per_millisat: 1
+      out_bytes_per_millisat: 1
     trusted_mints:
       - url: https://dev.mint.camelus.app
         units: [sat]
+
+clients:
+  - name: local
+    socks: 127.10.0.1:1080
+    route:
+      - addr: 127.10.0.11:9051
+        pubkey: "${HOP1_SECP_PUBKEY}"
+      - addr: 127.10.0.12:9052
+        pubkey: "${HOP2_SECP_PUBKEY}"
 ```
 
 The pricing fields are required for every relay entry and must be greater than zero.
 
-Single hop (TCP only):
+Single relay:
 
 ```bash
-RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop1
+RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop1
 ```
 
-With QUIC enabled (`quic: true` in the config):
+Second relay:
 
 ```bash
-RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop2
+RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop2
 ```
 
 Multi-hop example (run each in its own terminal / process):
 
 ```bash
-RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop1
-RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop2
+RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop1
+RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop2
 ```
 
 ### 3. Start the client
 
 `monad-client wallet ...` exposes explicit-flag wallet inspection and recovery
-commands. The SOCKS runtime is still unavailable until the SQLite client wallet
-is wired into the binary with funding/config UX; the tunnel runtime exits with an
-error rather than pretending the mock wallet is production-ready.
+commands. `monad-client run --config monad.yaml --client local` starts the
+configured QUIC route and binds the configured SOCKS5 listener.
+
+Configured client:
+
+```bash
+RUST_LOG=info cargo run -p monad-client -- run --config monad.yaml --client local
+```
 
 Direct connection:
 

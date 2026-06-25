@@ -292,7 +292,7 @@ pub async fn discover_spilman_mint_cache_with_storage(
     Ok(cache)
 }
 
-/// Run the relay: listen for TCP and optionally QUIC connections, perform secp
+/// Run the relay: listen for TCP and QUIC connections, perform secp
 /// Noise handshake, and handle H2 sessions.
 ///
 /// Both TCP and QUIC connections are fed into the same H2 session handler.

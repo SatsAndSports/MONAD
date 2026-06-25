@@ -7,8 +7,10 @@ use cdk_spilman::MintConnection;
 use clap::{Parser, Subcommand};
 use monad_client::loose_proof_wallet::{LooseProofSummary, LooseProofWallet, NewLooseProof};
 use monad_client::route::{Route, RouteHop};
+use monad_client::runtime::run_configured_client_until_shutdown;
 use monad_client::sqlite_client_wallet::{ChannelFundRecoveryResult, SqliteClientWallet};
 use monad_client::wallet::{MonadWallet, WalletChannel, WalletChannelState};
+use monad_common::config::MonadConfig;
 use monad_common::secp_identity::Secp256k1Pubkey;
 use std::fs;
 use std::io::Write;
@@ -46,8 +48,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run a configured SOCKS client from shared MONAD YAML.
+    Run(RunArgs),
+
     /// Local client wallet administration and recovery commands.
     Wallet(WalletArgs),
+}
+
+#[derive(Parser)]
+struct RunArgs {
+    /// Shared MONAD YAML config path.
+    #[arg(long)]
+    config: String,
+
+    /// Client name to run. If omitted, the only configured client is selected.
+    #[arg(long)]
+    client: Option<String>,
 }
 
 #[derive(Parser)]
@@ -206,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(command) = cli.command {
         match command {
+            Command::Run(args) => return run_configured_client(args).await,
             Command::Wallet(args) => return run_wallet_command(args).await,
         }
     }
@@ -246,8 +263,18 @@ async fn main() -> anyhow::Result<()> {
     );
 
     anyhow::bail!(
-        "MONAD client wallet config/funding runtime is not wired yet; monad-client CLI is temporarily unavailable"
+        "manual --hop runtime is not wired to the production wallet; use `monad-client run --config <monad.yaml> --client <name>`"
     )
+}
+
+async fn run_configured_client(args: RunArgs) -> anyhow::Result<()> {
+    let config = MonadConfig::load(&args.config)?;
+    run_configured_client_until_shutdown(config, args.client.as_deref(), async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!("failed to listen for Ctrl+C: {err}");
+        }
+    })
+    .await
 }
 
 async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {

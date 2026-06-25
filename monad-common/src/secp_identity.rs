@@ -15,6 +15,8 @@ pub enum SecpIdentityError {
     InvalidSecretKey,
     #[error("invalid schnorr signature bytes")]
     InvalidSignature,
+    #[error("invalid secp256k1 config public key: {0}")]
+    InvalidConfigPubkey(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,6 +35,27 @@ impl Secp256k1Pubkey {
             .try_into()
             .map_err(|_| SecpIdentityError::InvalidPublicKey)?;
         Self::from_bytes(arr)
+    }
+
+    pub fn parse_config_pubkey(input: &str) -> Result<Self, SecpIdentityError> {
+        let trimmed = input.trim();
+        if trimmed.starts_with("npub") {
+            let (hrp, bytes) = bech32::decode(trimmed)
+                .map_err(|e| SecpIdentityError::InvalidConfigPubkey(e.to_string()))?;
+            if hrp.to_string() != "npub" {
+                return Err(SecpIdentityError::InvalidConfigPubkey(
+                    "npub public key must use npub HRP".to_string(),
+                ));
+            }
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                SecpIdentityError::InvalidConfigPubkey(
+                    "npub public key payload must be exactly 32 bytes".to_string(),
+                )
+            })?;
+            return Self::from_bytes(arr);
+        }
+
+        Self::from_hex(trimmed)
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -165,6 +188,41 @@ mod tests {
         let decoded = Secp256k1Pubkey::from_hex(&hex).unwrap();
 
         assert_eq!(decoded, keypair.pubkey());
+    }
+
+    #[test]
+    fn test_parse_config_pubkey_accepts_raw_hex() {
+        let keypair = SecpTransportKeypair::generate();
+        let decoded = Secp256k1Pubkey::parse_config_pubkey(&keypair.pubkey().to_hex()).unwrap();
+
+        assert_eq!(decoded, keypair.pubkey());
+    }
+
+    #[test]
+    fn test_parse_config_pubkey_accepts_npub() {
+        let keypair = SecpTransportKeypair::generate();
+        let hrp = bech32::Hrp::parse("npub").unwrap();
+        let npub = bech32::encode::<bech32::Bech32>(hrp, keypair.pubkey().as_bytes()).unwrap();
+        let decoded = Secp256k1Pubkey::parse_config_pubkey(&npub).unwrap();
+
+        assert_eq!(decoded, keypair.pubkey());
+    }
+
+    #[test]
+    fn test_parse_config_pubkey_rejects_wrong_bech32_hrp() {
+        let keypair = SecpTransportKeypair::generate();
+        let hrp = bech32::Hrp::parse("nsec").unwrap();
+        let nsec = bech32::encode::<bech32::Bech32>(hrp, keypair.pubkey().as_bytes()).unwrap();
+
+        assert!(Secp256k1Pubkey::parse_config_pubkey(&nsec).is_err());
+    }
+
+    #[test]
+    fn test_parse_config_pubkey_rejects_short_npub_payload() {
+        let hrp = bech32::Hrp::parse("npub").unwrap();
+        let npub = bech32::encode::<bech32::Bech32>(hrp, &[1u8; 31]).unwrap();
+
+        assert!(Secp256k1Pubkey::parse_config_pubkey(&npub).is_err());
     }
 
     #[test]

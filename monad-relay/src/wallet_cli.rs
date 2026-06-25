@@ -4,9 +4,9 @@
 //! channels, and closing channels.  Output is human-readable by default and
 //! JSON with `--json`.
 
-use crate::config::MonadConfig;
 use crate::wallet_manager::{ChannelSummary, DrainSummary, DrainSwapResult, RelayWalletManager};
 use clap::{Parser, Subcommand};
+use monad_common::config::MonadConfig;
 use std::io::Write;
 
 #[derive(Parser)]
@@ -214,8 +214,10 @@ fn resolve_wallet_db_path(args: &WalletArgs) -> anyhow::Result<String> {
         (Some(path), _) => Ok(path.clone()),
         (None, Some(config_path)) => {
             let config = MonadConfig::load(config_path)?;
-            let relay = config.select_relay(args.relay.as_deref())?;
-            Ok(relay.wallet_db_path.clone())
+            if args.relay.is_some() {
+                let _ = config.select_relay(args.relay.as_deref())?;
+            }
+            Ok(config.wallets.relay.db_path)
         }
         (None, None) => Err(anyhow::anyhow!(
             "either --wallet-db-path or --config is required"

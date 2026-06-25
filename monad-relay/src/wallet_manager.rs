@@ -395,6 +395,10 @@ impl RelayWalletManager {
         Ok(self.receiver_secret(relay_name)?.public_key().to_hex())
     }
 
+    pub fn db_path(&self) -> &str {
+        &self.metadata.db_path
+    }
+
     pub fn spilman_storage(&self) -> &dyn SpilmanStorage {
         self.storage.as_ref()
     }

@@ -20,6 +20,7 @@ use http::{Method, Request};
 use monad_client::connector;
 use monad_client::loose_proof_wallet::{LooseProofWallet, NewLooseProof};
 use monad_client::route::{Route, RouteHop};
+use monad_client::runtime::run_configured_client_until_shutdown;
 use monad_client::session_driver::{start_session_payment_driver, PaymentPolicy};
 use monad_client::sqlite_client_wallet::{ChannelFundRecoveryResult, SqliteClientWallet};
 use monad_client::tunnel;
@@ -643,11 +644,11 @@ async fn start_relay_from_config(
         transport_key: Some(transport_key),
         receiver_pubkey_hex,
         trusted_mint_units,
-        in_bytes_per_millisat: relay_config.in_bytes_per_millisat,
-        out_bytes_per_millisat: relay_config.out_bytes_per_millisat,
+        in_bytes_per_millisat: relay_config.pricing.in_bytes_per_millisat,
+        out_bytes_per_millisat: relay_config.pricing.out_bytes_per_millisat,
         bootstrap_capabilities: None,
         relay_wallet_name: relay_config.name.clone(),
-        spilman_storage_path: relay_config.wallet_db_path.clone(),
+        spilman_storage_path: wallet_manager.db_path().to_string(),
     });
 
     let payments = wallet_manager.spilman_payments_for(
@@ -2436,6 +2437,7 @@ async fn test_session_payment_driver_marks_expiry_too_soon_channel_and_reselects
         PaymentPolicy {
             target_topup_buffer_msats: 1000,
             minimum_topup_msats: 1000,
+            ..PaymentPolicy::default()
         },
     )
     .await
@@ -2504,6 +2506,7 @@ async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
         PaymentPolicy {
             target_topup_buffer_msats: 1000,
             minimum_topup_msats: 1000,
+            ..PaymentPolicy::default()
         },
     )
     .await
@@ -3986,6 +3989,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
         monad_client::session_driver::PaymentPolicy {
             target_topup_buffer_msats: 1000,
             minimum_topup_msats: 1000,
+            ..monad_client::session_driver::PaymentPolicy::default()
         },
     )
     .await
@@ -4451,19 +4455,21 @@ async fn test_relay_starts_from_yaml_config_and_advertises_configured_mints() {
 
     let yaml = format!(
         r#"
+wallets:
+  relay:
+    db_path: {}
 relays:
   - name: yaml-relay
-    wallet_db_path: {}
     receiver_secret_hex: {}
     quic_cert_seed: {}
     transport_key: {}
     listen: 127.0.0.1:0
-    quic: true
     trusted_mints:
       - url: {}
         units: [sat]
-    in_bytes_per_millisat: 1
-    out_bytes_per_millisat: 1
+    pricing:
+      in_bytes_per_millisat: 1
+      out_bytes_per_millisat: 1
 "#,
         db_path.to_str().unwrap(),
         receiver_secret_hex,
@@ -4476,7 +4482,7 @@ relays:
     let config = MonadConfig::load(&config_path).unwrap();
     let relay = config.select_relay(None).unwrap();
 
-    let wallet_manager = Arc::new(RelayWalletManager::open(&relay.wallet_db_path).unwrap());
+    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
     let (server_addr, pubkey, handle, shutdown_tx, _payments) =
         start_relay_from_config(relay, wallet_manager, mint_cache)
             .await
@@ -4512,8 +4518,7 @@ async fn test_yaml_config_allows_distinct_per_relay_pricing() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let config_path = temp_dir.path().join("relay.yaml");
-    let db_path_a = temp_dir.path().join("relay-a.db");
-    let db_path_b = temp_dir.path().join("relay-b.db");
+    let db_path = temp_dir.path().join("relay.db");
     let listen_a = TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap()
@@ -4534,39 +4539,39 @@ async fn test_yaml_config_allows_distinct_per_relay_pricing() {
 
     let yaml = format!(
         r#"
+wallets:
+  relay:
+    db_path: {}
 relays:
   - name: relay-a
-    wallet_db_path: {}
     receiver_secret_hex: {}
     quic_cert_seed: {}
     transport_key: {}
     listen: {}
-    quic: true
-    in_bytes_per_millisat: 11
-    out_bytes_per_millisat: 22
+    pricing:
+      in_bytes_per_millisat: 11
+      out_bytes_per_millisat: 22
     trusted_mints:
       - url: {}
         units: [sat]
   - name: relay-b
-    wallet_db_path: {}
     receiver_secret_hex: {}
     quic_cert_seed: {}
     transport_key: {}
     listen: {}
-    quic: true
-    in_bytes_per_millisat: 33
-    out_bytes_per_millisat: 44
+    pricing:
+      in_bytes_per_millisat: 33
+      out_bytes_per_millisat: 44
     trusted_mints:
       - url: {}
         units: [sat]
 "#,
-        db_path_a.to_str().unwrap(),
+        db_path.to_str().unwrap(),
         receiver_secret_a.to_secret_hex(),
         hex::encode(quic_cert_a.seed()),
         hex::encode(transport_key_a.normalized_secret_bytes()),
         listen_a,
         mint_url,
-        db_path_b.to_str().unwrap(),
         receiver_secret_b.to_secret_hex(),
         hex::encode(quic_cert_b.seed()),
         hex::encode(transport_key_b.normalized_secret_bytes()),
@@ -4579,12 +4584,14 @@ relays:
     let relay_a = config.select_relay(Some("relay-a")).unwrap();
     let relay_b = config.select_relay(Some("relay-b")).unwrap();
 
-    let wallet_manager_a = Arc::new(RelayWalletManager::open(&relay_a.wallet_db_path).unwrap());
+    let wallet_manager_a =
+        Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
     let (server_addr_a, pubkey_a, handle_a, shutdown_tx_a, _payments_a) =
         start_relay_from_config(relay_a, wallet_manager_a, mint_cache.clone())
             .await
             .unwrap();
-    let wallet_manager_b = Arc::new(RelayWalletManager::open(&relay_b.wallet_db_path).unwrap());
+    let wallet_manager_b =
+        Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
     let (server_addr_b, pubkey_b, handle_b, shutdown_tx_b, _payments_b) =
         start_relay_from_config(relay_b, wallet_manager_b, mint_cache)
             .await
@@ -4616,6 +4623,407 @@ relays:
     let _ = shutdown_tx_b.send(());
     handle_a.await.unwrap().unwrap();
     handle_b.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shared_yaml_config_drives_client_socks_over_quic() {
+    use monad_relay::config::MonadConfig;
+    use std::fs;
+
+    let upper_listener = TcpListener::bind("127.10.1.10:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.10.1.20:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.10.1.20:{}", mint_addr.port());
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let relay_db_path = temp_dir.path().join("relay.db");
+    let loose_db_path = temp_dir.path().join("client-loose.db");
+    let channel_db_path = temp_dir.path().join("client-channel.db");
+    let config_path = temp_dir.path().join("monad.yaml");
+
+    let input_proofs = mint_helper.mint_proofs(2_000).await.unwrap();
+    let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
+    loose_wallet
+        .import_proofs(&loose_proofs_from_cashu_proofs(
+            &mint_url,
+            "sat",
+            "configured-client-e2e",
+            &input_proofs,
+        ))
+        .unwrap();
+
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+
+    let relay_listen = TcpListener::bind("127.10.1.30:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let socks_listen = TcpListener::bind("127.10.1.40:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let transport_key = SecpTransportKeypair::generate();
+    let quic_cert = QuicCertIdentity::generate().unwrap();
+    let sender_secret_hex = hex::encode([19u8; 32]);
+
+    let yaml = format!(
+        r#"
+wallets:
+  relay:
+    db_path: {}
+  client:
+    loose_db_path: {}
+    channel_db_path: {}
+    wallet_name: alice
+    sender_secret_hex: "{}"
+    channel_input_budget_msats: 1000000
+relays:
+  - name: yaml-relay
+    receiver_secret_hex: {}
+    quic_cert_seed: {}
+    transport_key: {}
+    listen: {}
+    trusted_mints:
+      - url: {}
+        units: [sat]
+    pricing:
+      in_bytes_per_millisat: 1
+      out_bytes_per_millisat: 1
+clients:
+  - name: local
+    socks: {}
+    route:
+      - addr: {}
+        pubkey: "{}"
+"#,
+        relay_db_path.display(),
+        loose_db_path.display(),
+        channel_db_path.display(),
+        sender_secret_hex,
+        receiver_secret.to_secret_hex(),
+        hex::encode(quic_cert.seed()),
+        hex::encode(transport_key.normalized_secret_bytes()),
+        relay_listen,
+        mint_url,
+        socks_listen,
+        relay_listen,
+        transport_key.pubkey().to_hex(),
+    );
+    fs::write(&config_path, yaml).unwrap();
+
+    let config = MonadConfig::load(&config_path).unwrap();
+    let relay = config.select_relay(Some("yaml-relay")).unwrap();
+    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let (_server_addr, _pubkey, relay_handle, relay_shutdown_tx, _payments) =
+        start_relay_from_config(relay, wallet_manager, mint_cache)
+            .await
+            .unwrap();
+
+    let (client_shutdown_tx, client_shutdown_rx) = tokio::sync::oneshot::channel();
+    let client_task = tokio::spawn(run_configured_client_until_shutdown(
+        config,
+        Some("local"),
+        async move {
+            let _ = client_shutdown_rx.await;
+        },
+    ));
+
+    let mut stream = None;
+    for _ in 0..100 {
+        match TcpStream::connect(socks_listen).await {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(_) if !client_task.is_finished() => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => {
+                let client_result = client_task.await;
+                panic!(
+                    "client SOCKS listener did not start: {err}; client task result: {client_result:?}"
+                );
+            }
+        }
+    }
+    let mut stream = stream.expect("client SOCKS listener should become reachable");
+
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method_reply = [0u8; 2];
+    stream.read_exact(&mut method_reply).await.unwrap();
+    assert_eq!(method_reply, [0x05, 0x00]);
+
+    let target_ip = match upper_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets(),
+        std::net::IpAddr::V6(_) => panic!("test target must be IPv4"),
+    };
+    let mut request = vec![0x05, 0x01, 0x00, 0x01];
+    request.extend_from_slice(&target_ip);
+    request.extend_from_slice(&upper_addr.port().to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+
+    let mut socks_reply = [0u8; 10];
+    stream.read_exact(&mut socks_reply).await.unwrap();
+    assert_eq!(socks_reply, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+
+    stream.write_all(b"configured client path").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    stream.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"CONFIGURED CLIENT PATH");
+
+    let _ = client_shutdown_tx.send(());
+    timeout(Duration::from_secs(5), client_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let _ = relay_shutdown_tx.send(());
+    relay_handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shared_yaml_config_drives_two_hop_client_socks_over_quic() {
+    use monad_relay::config::MonadConfig;
+    use std::fs;
+
+    let upper_listener = TcpListener::bind("127.10.2.10:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.10.2.20:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.10.2.20:{}", mint_addr.port());
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let relay_db_path = temp_dir.path().join("relay.db");
+    let loose_db_path = temp_dir.path().join("client-loose.db");
+    let channel_db_path = temp_dir.path().join("client-channel.db");
+    let config_path = temp_dir.path().join("monad.yaml");
+
+    let mut input_proofs = Vec::new();
+    for _ in 0..2 {
+        input_proofs.extend(mint_helper.mint_proofs(1_024).await.unwrap());
+    }
+    let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
+    loose_wallet
+        .import_proofs(&loose_proofs_from_cashu_proofs(
+            &mint_url,
+            "sat",
+            "configured-two-hop-client-e2e",
+            &input_proofs,
+        ))
+        .unwrap();
+
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+
+    let relay_1_listen = TcpListener::bind("127.10.2.30:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let relay_2_listen = TcpListener::bind("127.10.2.31:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let socks_listen = TcpListener::bind("127.10.2.40:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let receiver_secret_1 = cashu::nuts::SecretKey::generate();
+    let receiver_secret_2 = cashu::nuts::SecretKey::generate();
+    let transport_key_1 = SecpTransportKeypair::generate();
+    let transport_key_2 = SecpTransportKeypair::generate();
+    let quic_cert_1 = QuicCertIdentity::generate().unwrap();
+    let quic_cert_2 = QuicCertIdentity::generate().unwrap();
+    let sender_secret_hex = hex::encode([23u8; 32]);
+
+    let yaml = format!(
+        r#"
+wallets:
+  relay:
+    db_path: {}
+  client:
+    loose_db_path: {}
+    channel_db_path: {}
+    wallet_name: alice
+    sender_secret_hex: "{}"
+    channel_input_budget_msats: 1000000
+relays:
+  - name: hop1
+    receiver_secret_hex: {}
+    quic_cert_seed: {}
+    transport_key: {}
+    listen: {}
+    trusted_mints:
+      - url: {}
+        units: [sat]
+    pricing:
+      in_bytes_per_millisat: 1
+      out_bytes_per_millisat: 1
+  - name: hop2
+    receiver_secret_hex: {}
+    quic_cert_seed: {}
+    transport_key: {}
+    listen: {}
+    trusted_mints:
+      - url: {}
+        units: [sat]
+    pricing:
+      in_bytes_per_millisat: 1
+      out_bytes_per_millisat: 1
+clients:
+  - name: local
+    socks: {}
+    route:
+      - addr: {}
+        pubkey: "{}"
+      - addr: {}
+        pubkey: "{}"
+"#,
+        relay_db_path.display(),
+        loose_db_path.display(),
+        channel_db_path.display(),
+        sender_secret_hex,
+        receiver_secret_1.to_secret_hex(),
+        hex::encode(quic_cert_1.seed()),
+        hex::encode(transport_key_1.normalized_secret_bytes()),
+        relay_1_listen,
+        mint_url,
+        receiver_secret_2.to_secret_hex(),
+        hex::encode(quic_cert_2.seed()),
+        hex::encode(transport_key_2.normalized_secret_bytes()),
+        relay_2_listen,
+        mint_url,
+        socks_listen,
+        relay_1_listen,
+        transport_key_1.pubkey().to_hex(),
+        relay_2_listen,
+        transport_key_2.pubkey().to_hex(),
+    );
+    fs::write(&config_path, yaml).unwrap();
+
+    let config = MonadConfig::load(&config_path).unwrap();
+    let wallet_manager_1 =
+        Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let wallet_manager_2 =
+        Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let (_relay_1_addr, _relay_1_pubkey, relay_1_handle, relay_1_shutdown_tx, _payments_1) =
+        start_relay_from_config(
+            config.select_relay(Some("hop1")).unwrap(),
+            wallet_manager_1,
+            mint_cache.clone(),
+        )
+        .await
+        .unwrap();
+    let (_relay_2_addr, _relay_2_pubkey, relay_2_handle, relay_2_shutdown_tx, _payments_2) =
+        start_relay_from_config(
+            config.select_relay(Some("hop2")).unwrap(),
+            wallet_manager_2,
+            mint_cache,
+        )
+        .await
+        .unwrap();
+
+    let (client_shutdown_tx, client_shutdown_rx) = tokio::sync::oneshot::channel();
+    let client_task = tokio::spawn(run_configured_client_until_shutdown(
+        config,
+        Some("local"),
+        async move {
+            let _ = client_shutdown_rx.await;
+        },
+    ));
+
+    let mut stream = None;
+    for _ in 0..160 {
+        match TcpStream::connect(socks_listen).await {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(_) if !client_task.is_finished() => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => {
+                let client_result = client_task.await;
+                panic!(
+                    "two-hop client SOCKS listener did not start: {err}; client task result: {client_result:?}"
+                );
+            }
+        }
+    }
+    let mut stream = stream.expect("two-hop client SOCKS listener should become reachable");
+
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method_reply = [0u8; 2];
+    stream.read_exact(&mut method_reply).await.unwrap();
+    assert_eq!(method_reply, [0x05, 0x00]);
+
+    let target_ip = match upper_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets(),
+        std::net::IpAddr::V6(_) => panic!("test target must be IPv4"),
+    };
+    let mut request = vec![0x05, 0x01, 0x00, 0x01];
+    request.extend_from_slice(&target_ip);
+    request.extend_from_slice(&upper_addr.port().to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+
+    let mut socks_reply = [0u8; 10];
+    stream.read_exact(&mut socks_reply).await.unwrap();
+    assert_eq!(socks_reply, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+
+    stream.write_all(b"configured two hop path").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    stream.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"CONFIGURED TWO HOP PATH");
+
+    let _ = client_shutdown_tx.send(());
+    timeout(Duration::from_secs(5), client_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let _ = relay_1_shutdown_tx.send(());
+    let _ = relay_2_shutdown_tx.send(());
+    relay_1_handle.await.unwrap().unwrap();
+    relay_2_handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
 }
 
 /// End-to-end test that the relay can unilaterally close a funded Spilman
