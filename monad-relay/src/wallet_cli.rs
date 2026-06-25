@@ -5,7 +5,7 @@
 //! JSON with `--json`.
 
 use crate::config::MonadConfig;
-use crate::wallet_manager::{ChannelSummary, RelayWalletManager};
+use crate::wallet_manager::{ChannelSummary, DrainSummary, DrainSwapResult, RelayWalletManager};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 
@@ -57,6 +57,35 @@ pub enum WalletCommand {
         /// Channel ID to close.
         #[arg(long)]
         channel_id: String,
+    },
+
+    /// List relay drain attempts.
+    Drains,
+
+    /// Drain closed relay-owned channel receiver proofs through a mint swap.
+    Drain {
+        /// Relay identity name. Required when using `--wallet-db-path`.
+        #[arg(long)]
+        wallet_name: Option<String>,
+
+        /// Mint URL to drain closed channels from.
+        #[arg(long)]
+        mint_url: String,
+
+        /// Cashu unit to drain.
+        #[arg(long)]
+        unit: String,
+
+        /// Maximum number of closed channels to include.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
+    /// Recover a previously submitted drain attempt.
+    RecoverDrain {
+        /// Drain ID to recover.
+        #[arg(long)]
+        drain_id: String,
     },
 }
 
@@ -127,6 +156,54 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                 println!("  sender_sum: {}", result.sender_sum);
             }
         }
+        WalletCommand::Drains => {
+            let drains = manager.list_drains().map_err(|e| anyhow::anyhow!(e))?;
+            if args.json {
+                print_json(&drains)?;
+            } else {
+                print_drains(&drains);
+            }
+        }
+        WalletCommand::Drain {
+            wallet_name: ref name_opt,
+            ref mint_url,
+            ref unit,
+            limit,
+        } => {
+            let name = resolve_wallet_name(&args, name_opt.clone())?;
+            let net = manager
+                .reqwest_networking_for_relay(&name, mint_url, unit)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let result = manager
+                .drain_closed_channels_to_swap(&name, mint_url, unit, &net, limit)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if args.json {
+                print_json(&result)?;
+            } else {
+                print_drain_result(&result);
+            }
+        }
+        WalletCommand::RecoverDrain { drain_id } => {
+            let drain = manager
+                .list_drains()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .into_iter()
+                .find(|drain| drain.drain_id == drain_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown drain '{drain_id}'"))?;
+            let net = manager
+                .reqwest_networking_for_relay(&drain.relay_name, &drain.mint_url, &drain.unit)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let result = manager
+                .recover_submitted_drain(&drain_id, &net)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if args.json {
+                print_json(&result)?;
+            } else {
+                print_drain_result(&result);
+            }
+        }
     }
 
     Ok(())
@@ -182,6 +259,43 @@ fn print_channels(channels: &[ChannelSummary]) {
             c.balance_raw
         );
     }
+}
+
+fn print_drains(drains: &[DrainSummary]) {
+    if drains.is_empty() {
+        println!("No drains.");
+        return;
+    }
+    println!(
+        "{:<44} {:<10} {:<16} {:<32} {:<6} {:>10} {:>10}",
+        "DRAIN ID", "STATE", "RELAY", "MINT", "UNIT", "INPUT", "OUTPUT"
+    );
+    for d in drains {
+        println!(
+            "{:<44} {:<10} {:<16} {:<32} {:<6} {:>10} {:>10}",
+            d.drain_id,
+            d.state,
+            truncate(&d.relay_name, 16),
+            truncate(&d.mint_url, 32),
+            d.unit,
+            d.input_amount_raw,
+            d.output_amount_raw
+        );
+    }
+}
+
+fn print_drain_result(result: &DrainSwapResult) {
+    if result.recovered {
+        println!("recovered drain {}", result.drain_id);
+    } else {
+        println!("completed drain {}", result.drain_id);
+    }
+    println!("  relay: {}", result.relay_name);
+    println!("  mint: {}", result.mint_url);
+    println!("  unit: {}", result.unit);
+    println!("  input_amount_raw: {}", result.input_amount_raw);
+    println!("  output_amount_raw: {}", result.output_amount_raw);
+    println!("  channels: {}", result.channel_ids.join(","));
 }
 
 fn truncate(s: &str, max_len: usize) -> String {

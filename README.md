@@ -32,7 +32,7 @@ Implemented today:
 
 Not implemented yet:
 - usable `monad-client` CLI runtime wired to the SQLite client wallet
-- user-facing client wallet commands for mint quotes, proof minting/import, balances, channels, and recovery
+- user-facing client wallet commands for mint quotes, proof minting, and richer balances
 - persistent route configuration file
 
 ## Relay Wallet
@@ -72,6 +72,9 @@ monad-relay wallet --config relay.yaml --relay relay-a list
 monad-relay wallet --config relay.yaml --relay relay-a show
 monad-relay wallet --config relay.yaml --relay relay-a channels
 monad-relay wallet --wallet-db-path /var/lib/monad/relay.db close --channel-id <channel-id>
+monad-relay wallet --config relay.yaml --relay relay-a drains
+monad-relay wallet --config relay.yaml --relay relay-a drain --mint-url https://dev.mint.camelus.app --unit sat
+monad-relay wallet --config relay.yaml --relay relay-a recover-drain --drain-id <drain-id>
 ```
 
 Add `--json` to any wallet command for machine-readable output.
@@ -82,14 +85,59 @@ Two relays can share the same `wallet_db_path` safely because each relay uses a 
 
 ## Client Wallet
 
-The reusable client wallet pieces exist in `monad-client` but are not yet exposed as a usable CLI runtime.
+The reusable client wallet pieces exist in `monad-client`. The binary exposes
+wallet admin/funding/recovery commands, but the SOCKS runtime is still gated
+until config and full funding UX are wired in.
 
 - `LooseProofWallet` stores loose Cashu proofs, mint quote state, premint batches, reservations, and spend/release state in SQLite.
 - `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata including expiry timestamps in SQLite, and implements `MonadWallet` for the session driver.
 - opening recovery is persisted for ambiguous funding-swap failures and can be recovered through upstream restore.
 - output keyset selection is cache-first: the wallet ensures its mint/unit keyset cache is non-empty before entering the keyset retry helper, then selectors read cache only; refresh happens after retryable mint keyset rejection.
 
-Remaining client-wallet work is operator/user experience rather than the core channel-payment library path: mint quote/mint/import commands, startup wiring in `monad-client`, wallet/channel inspection, and close/sweep flows.
+Current admin/recovery commands use explicit DB paths and sender key material:
+
+```bash
+monad-client wallet \
+  --loose-db ~/.monad/client-loose.sqlite \
+  --channel-db ~/.monad/client-channels.sqlite \
+  --sender-secret-hex <hex> \
+  --wallet-name default \
+  channels
+
+monad-client wallet \
+  --loose-db ~/.monad/client-loose.sqlite \
+  --channel-db ~/.monad/client-channels.sqlite \
+  --sender-secret-hex <hex> \
+  proofs
+
+monad-client wallet \
+  --loose-db ~/.monad/client-loose.sqlite \
+  --channel-db ~/.monad/client-channels.sqlite \
+  --sender-secret-hex <hex> \
+  import-token --token <cashu-token>
+
+monad-client wallet \
+  --loose-db ~/.monad/client-loose.sqlite \
+  --channel-db ~/.monad/client-channels.sqlite \
+  --sender-secret-hex <hex> \
+  import-token --token-file ./token.txt
+
+monad-client wallet \
+  --loose-db ~/.monad/client-loose.sqlite \
+  --channel-db ~/.monad/client-channels.sqlite \
+  --sender-secret-hex <hex> \
+  recover-channel --channel-id <channel-id>
+
+monad-client wallet \
+  --loose-db ~/.monad/client-loose.sqlite \
+  --channel-db ~/.monad/client-channels.sqlite \
+  --sender-secret-hex <hex> \
+  recover-openings
+```
+
+Add `--json` to wallet commands for machine-readable output.
+
+Remaining client-wallet work is operator/user experience rather than the core channel-payment library path: mint quote/mint commands, startup wiring for SOCKS operation in `monad-client`, richer proof balance inspection, and close/sweep flows.
 
 ## Workspace
 
@@ -295,8 +343,9 @@ RUST_LOG=info cargo run -p monad-relay -- run --config relay.yaml --relay hop2
 
 ### 3. Start the client
 
-`monad-client` CLI is temporarily unavailable until the SQLite client wallet is
-wired into the binary with funding/config UX. The current runtime exits with an
+`monad-client wallet ...` exposes explicit-flag wallet inspection and recovery
+commands. The SOCKS runtime is still unavailable until the SQLite client wallet
+is wired into the binary with funding/config UX; the tunnel runtime exits with an
 error rather than pretending the mock wallet is production-ready.
 
 Direct connection:

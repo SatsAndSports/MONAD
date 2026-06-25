@@ -249,6 +249,15 @@ pub struct LooseProofRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LooseProofSummary {
+    pub mint_url: String,
+    pub unit: String,
+    pub keyset_id: String,
+    pub proof_count: u64,
+    pub amount_raw: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewLooseProof {
     pub proof_id: String,
     pub mint_url: String,
@@ -571,6 +580,37 @@ impl LooseProofWallet {
                     )
                 })
             })
+    }
+
+    pub fn list_available_proof_summaries(&self) -> Result<Vec<LooseProofSummary>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT mint_url, unit, keyset_id, COUNT(*), SUM(amount_raw)
+                 FROM monad_client_loose_proofs
+                 WHERE wallet_name = ?1 AND state = ?2
+                 GROUP BY mint_url, unit, keyset_id
+                 ORDER BY mint_url, unit, keyset_id",
+            )
+            .map_err(|e| {
+                LooseProofWalletError::Backend(format!("prepare proof summary query: {e}"))
+            })?;
+        let rows = stmt
+            .query_map(
+                params![self.wallet_name, LooseProofState::Available.as_str()],
+                |row| {
+                    Ok(LooseProofSummary {
+                        mint_url: row.get(0)?,
+                        unit: row.get(1)?,
+                        keyset_id: row.get(2)?,
+                        proof_count: from_i64(row.get::<_, i64>(3)?)?,
+                        amount_raw: from_i64(row.get::<_, i64>(4)?)?,
+                    })
+                },
+            )
+            .map_err(|e| LooseProofWalletError::Backend(format!("query proof summaries: {e}")))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| LooseProofWalletError::Backend(format!("decode proof summaries: {e}")))
     }
 
     pub fn reserve_proofs(
@@ -1460,6 +1500,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(balance, 3);
+
+        let summaries = wallet.list_available_proof_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].mint_url, MINT);
+        assert_eq!(summaries[0].unit, "sat");
+        assert_eq!(summaries[0].keyset_id, "keyset-a");
+        assert_eq!(summaries[0].proof_count, 1);
+        assert_eq!(summaries[0].amount_raw, 1);
+        assert_eq!(summaries[1].keyset_id, "keyset-b");
+        assert_eq!(summaries[1].proof_count, 1);
+        assert_eq!(summaries[1].amount_raw, 2);
     }
 
     #[test]

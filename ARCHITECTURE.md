@@ -550,9 +550,10 @@ least one keyset for the relevant `(mint, unit)`. Selection inside the helper is
 cache-only; refresh happens only after a retryable mint keyset rejection, and the
 retry is skipped if refresh still selects the same output keyset.
 
-The reusable wallet library path exists, but the `monad-client` binary is still
-gated until wallet configuration, mint-funding commands, balance/channel
-inspection, and startup recovery UX are wired into the CLI.
+The reusable wallet library path exists, and `monad-client wallet ...` exposes
+explicit-flag token import, proof/channel inspection, and recovery commands. The
+normal SOCKS runtime remains gated until wallet configuration, mint quote/mint
+commands, and startup recovery policy are wired in.
 
 ### Relay Wallet Layer
 
@@ -571,8 +572,8 @@ separate concern from the Cashu receiver identity used for Spilman channels.
 
 The relay binary now also exposes wallet-admin commands over that same durable
 state (`monad-relay wallet ...`) so operators can list identities, inspect
-stored channels, and close a channel by `channel_id` using metadata stored in
-SQLite.
+stored channels, close a channel by `channel_id`, drain closed-channel receiver
+proofs, and recover submitted drain attempts using metadata stored in SQLite.
 
 #### 6. Session Teardown on Control Detach
 
@@ -1244,8 +1245,8 @@ The full QUIC transport chain is implemented and tested:
 
 ## Current Limitations
 
-- `monad-client` does not yet expose the SQLite client wallet as a usable CLI runtime.
-- client wallet funding UX is not yet wired: mint quotes, premint submission, proof import, balance/channel inspection, and client close/sweep flows still need commands.
+- `monad-client wallet ...` exposes explicit-flag token import, available-proof listing, channel inspection, and recovery commands, but the SOCKS runtime is not yet wired to persisted wallet configuration.
+- client wallet funding UX is not yet fully wired: mint quotes, premint submission, richer proof balance inspection, and client close/sweep flows still need commands.
 - no persistent route configuration file yet.
 - QUIC connection pool does not yet handle connection eviction or stale entry cleanup.
 - asymmetric pricing (rates other than 1/1) is not yet tested.

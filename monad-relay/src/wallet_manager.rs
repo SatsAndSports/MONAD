@@ -17,6 +17,7 @@ use cdk_spilman::{
     KeysetRetryError, SelectedOutputKeyset, SpilmanAsyncNetworking,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io;
@@ -77,7 +78,7 @@ const CREATE_DRAIN_TABLES_SQL: &str = r#"
     );
 "#;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DrainSwapResult {
     pub drain_id: String,
     pub relay_name: String,
@@ -90,7 +91,7 @@ pub struct DrainSwapResult {
     pub recovered: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DrainSummary {
     pub drain_id: String,
     pub relay_name: String,
@@ -543,6 +544,24 @@ impl RelayWalletManager {
     ) -> Result<ReqwestNetworking, String> {
         let (receiver_secret, mint_url, unit) = self.channel_owner_and_mint(channel_id)?;
         build_reqwest_networking(&receiver_secret, &mint_url, &unit)
+    }
+
+    /// Build a [`ReqwestNetworking`] instance for a relay identity and mint/unit.
+    /// Used by wallet drain CLI commands.
+    pub fn reqwest_networking_for_relay(
+        &self,
+        relay_name: &str,
+        mint_url: &str,
+        unit: &str,
+    ) -> Result<ReqwestNetworking, String> {
+        let identities = self
+            .identities
+            .lock()
+            .map_err(|_| "relay wallet identity mutex poisoned".to_string())?;
+        let receiver_secret = identities
+            .get(relay_name)
+            .ok_or_else(|| format!("unknown relay identity '{relay_name}'"))?;
+        build_reqwest_networking(receiver_secret, mint_url, unit)
     }
 
     /// Close any channel stored in this wallet DB, regardless of which relay
