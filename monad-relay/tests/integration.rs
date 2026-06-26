@@ -4655,7 +4655,10 @@ async fn test_shared_yaml_config_drives_client_socks_over_quic() {
     let channel_db_path = temp_dir.path().join("client-channel.db");
     let config_path = temp_dir.path().join("monad.yaml");
 
-    let input_proofs = mint_helper.mint_proofs(2_000).await.unwrap();
+    // Mint more than the per-channel budget so the client must receive and
+    // reuse plain change proofs from the funding swap.
+    let total_input_raw = 2_000u64;
+    let input_proofs = mint_helper.mint_proofs(total_input_raw).await.unwrap();
     let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
     loose_wallet
         .import_proofs(&loose_proofs_from_cashu_proofs(
@@ -4797,6 +4800,34 @@ clients:
         .unwrap()
         .unwrap()
         .unwrap();
+
+    // Verify the client opened one channel and kept the surplus as loose change.
+    let remaining_change = loose_wallet
+        .available_balance_raw(&mint_url, "sat", std::slice::from_ref(&keyset_id))
+        .unwrap();
+    assert!(
+        remaining_change <= total_input_raw,
+        "remaining loose change should not exceed original input"
+    );
+    assert!(
+        remaining_change > 0,
+        "one-hop client should have returned change from a 2000-sat input with a 1000-sat budget"
+    );
+
+    let client_wallet =
+        SqliteClientWallet::open(loose_wallet, &channel_db_path, &sender_secret_hex).unwrap();
+    let open_channels: Vec<_> = client_wallet
+        .list_channels()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.state == WalletChannelState::Open)
+        .collect();
+    assert_eq!(
+        open_channels.len(),
+        1,
+        "one-hop client should open one channel"
+    );
+
     let _ = relay_shutdown_tx.send(());
     relay_handle.await.unwrap().unwrap();
     let _ = mint_shutdown_tx.send(());
@@ -4832,10 +4863,10 @@ async fn test_shared_yaml_config_drives_two_hop_client_socks_over_quic() {
     let channel_db_path = temp_dir.path().join("client-channel.db");
     let config_path = temp_dir.path().join("monad.yaml");
 
-    let mut input_proofs = Vec::new();
-    for _ in 0..2 {
-        input_proofs.extend(mint_helper.mint_proofs(1_024).await.unwrap());
-    }
+    // One 2048-sat proof is enough for two 1000-sat channel budgets because
+    // the first open returns plain change that funds the second hop.
+    let total_input_raw = 2_048u64;
+    let input_proofs = mint_helper.mint_proofs(total_input_raw).await.unwrap();
     let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
     loose_wallet
         .import_proofs(&loose_proofs_from_cashu_proofs(
@@ -5019,6 +5050,31 @@ clients:
         .unwrap()
         .unwrap()
         .unwrap();
+
+    // Verify both hops opened real channels from a single minted input by
+    // checking the client's durable channel metadata and loose-wallet balance.
+    let remaining_change = loose_wallet
+        .available_balance_raw(&mint_url, "sat", std::slice::from_ref(&keyset_id))
+        .unwrap();
+    assert!(
+        remaining_change <= total_input_raw,
+        "remaining loose change should not exceed original input"
+    );
+
+    let client_wallet =
+        SqliteClientWallet::open(loose_wallet, &channel_db_path, &sender_secret_hex).unwrap();
+    let open_channels: Vec<_> = client_wallet
+        .list_channels()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.state == WalletChannelState::Open)
+        .collect();
+    assert_eq!(
+        open_channels.len(),
+        2,
+        "two-hop client should open two channels from one minted input"
+    );
+
     let _ = relay_1_shutdown_tx.send(());
     let _ = relay_2_shutdown_tx.send(());
     relay_1_handle.await.unwrap().unwrap();
