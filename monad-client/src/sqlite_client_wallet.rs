@@ -127,6 +127,7 @@ struct ClientOpenAttempt {
     output_keyset: SelectedOutputKeyset,
     reservation: ProofReservation,
     requested_capacity_raw: Option<u64>,
+    desired_funding_token_amount_raw: Option<u64>,
     selected_input_msats: u64,
     expiry_timestamp: u64,
 }
@@ -521,6 +522,9 @@ impl SqliteClientWallet {
 
             match result {
                 Ok(open_result) => {
+                    self.loose_wallet
+                        .import_proofs(&change_proofs_to_loose_proofs(&open_result)?)
+                        .map_err(loose_proof_error)?;
                     self.loose_wallet
                         .mark_reservation_spent(&recovery.reservation_id, &open_result.channel_id)
                         .map_err(loose_proof_error)?;
@@ -966,6 +970,7 @@ impl SqliteClientWallet {
             &attempt.output_keyset.info_json,
             &attempt.reservation,
             attempt.requested_capacity_raw,
+            attempt.desired_funding_token_amount_raw,
             attempt.expiry_timestamp,
         )
     }
@@ -976,6 +981,7 @@ impl SqliteClientWallet {
         output_keyset_info_json: &str,
         reservation: &ProofReservation,
         requested_capacity_raw: Option<u64>,
+        desired_funding_token_amount_raw: Option<u64>,
         expiry_timestamp: u64,
     ) -> Result<OpenChannelResult, OpenChannelError> {
         let input_proofs_json = match proofs_json_from_reservation(reservation) {
@@ -997,7 +1003,7 @@ impl SqliteClientWallet {
                 input_may_be_spent: false,
                 message: "bridge mutex poisoned".to_string(),
             })?;
-            bridge.open_channel_from_proofs(
+            bridge.open_channel_from_proofs_with_funding_amount(
                 &offer.mint_url,
                 &offer.unit,
                 &input_proofs_json,
@@ -1007,6 +1013,7 @@ impl SqliteClientWallet {
                 output_keyset_info_json,
                 0,
                 requested_capacity_raw,
+                desired_funding_token_amount_raw,
             )
         }
     }
@@ -1017,6 +1024,9 @@ impl SqliteClientWallet {
         reservation: &ProofReservation,
         expiry_timestamp: u64,
     ) -> Result<String, WalletError> {
+        self.loose_wallet
+            .import_proofs(&change_proofs_to_loose_proofs(&open_result)?)
+            .map_err(loose_proof_error)?;
         self.loose_wallet
             .mark_reservation_spent(&reservation.reservation_id, &open_result.channel_id)
             .map_err(loose_proof_error)?;
@@ -1174,6 +1184,7 @@ impl SqliteClientWallet {
             output_keyset,
             reservation,
             requested_capacity_raw: Some(target_capacity_raw),
+            desired_funding_token_amount_raw: Some(required_post_swap_raw),
             selected_input_msats,
             expiry_timestamp,
         })
@@ -1345,6 +1356,7 @@ impl MonadWallet for SqliteClientWallet {
                     output_keyset,
                     reservation,
                     requested_capacity_raw: None,
+                    desired_funding_token_amount_raw: Some(input_budget_raw),
                     selected_input_msats: input_budget_msats,
                     expiry_timestamp,
                 })
@@ -1617,6 +1629,34 @@ fn proof_to_new_loose_proof(
     })
 }
 
+fn change_proofs_to_loose_proofs(
+    open_result: &OpenChannelResult,
+) -> Result<Vec<NewLooseProof>, WalletError> {
+    let proofs: Vec<Proof> = serde_json::from_str(&open_result.change_proofs_json)
+        .map_err(|e| WalletError::Backend(format!("parse channel-open change proofs: {e}")))?;
+    proofs
+        .iter()
+        .map(|proof| {
+            let proof_id = proof
+                .y()
+                .map_err(|e| WalletError::Backend(format!("compute change proof id: {e}")))?
+                .to_hex();
+            let proof_json = serde_json::to_string(proof)
+                .map_err(|e| WalletError::Backend(format!("serialize change proof: {e}")))?;
+            Ok(NewLooseProof {
+                proof_id,
+                mint_url: open_result.mint_url.clone(),
+                unit: open_result.unit.clone(),
+                keyset_id: proof.keyset_id.to_string(),
+                amount_raw: u64::from(proof.amount),
+                proof_json,
+                source_quote_id: None,
+                source_batch_id: None,
+            })
+        })
+        .collect()
+}
+
 fn loose_proof_error(error: LooseProofWalletError) -> WalletError {
     WalletError::Backend(format!("loose proof wallet: {error}"))
 }
@@ -1780,9 +1820,11 @@ fn sql_decode_error(message: impl Into<String>) -> rusqlite::Error {
 mod tests {
     use super::*;
     use crate::loose_proof_wallet::{LooseProofState, NewLooseProof};
+    use crate::proof_selection::input_fee_raw_from_ppk_sum;
     use cdk_spilman::{
-        channel_parameters_get_channel_id, compute_channel_from_proofs_with_input_keysets,
-        compute_channel_secret_from_hex, construct_proofs, create_funding_swap,
+        channel_parameters_get_channel_id,
+        compute_channel_from_proofs_with_input_keysets_and_funding_amount,
+        compute_channel_secret_from_hex, construct_proofs, create_funding_swap_with_plain_change,
         create_plain_blinded_messages, ClientChannelOpeningFromSwap, ClientKeysetCacheEntry,
         ClientStorage, ConfigurableClientHost, FundingSpendKind, MemoryClientStorage,
         OpenChannelError, OpenChannelFailureStage, Payment, ReqwestClientNetworking,
@@ -2117,6 +2159,7 @@ mod tests {
                 &offer,
                 &keyset_info_json,
                 &reservation,
+                None,
                 None,
                 expiry_timestamp,
             )
@@ -2876,13 +2919,15 @@ mod tests {
         );
         let keyset_info_json = bridge.fetch_keyset_info(&mint_url, &keyset_id).unwrap();
 
-        let amount_raw = 16u64;
-        let quote_response = request_mint_quote(&client, &mint_url, amount_raw, unit).await;
+        let minted_amount_raw = 1024u64;
+        let input_budget_raw = 1000u64;
+        let quote_response = request_mint_quote(&client, &mint_url, minted_amount_raw, unit).await;
         let quote_id = quote_response["quote"].as_str().unwrap().to_string();
 
         wait_for_quote_paid(&client, &mint_url, &quote_id).await;
 
-        let premint_json = create_plain_blinded_messages(amount_raw, &keyset_info_json).unwrap();
+        let premint_json =
+            create_plain_blinded_messages(minted_amount_raw, &keyset_info_json).unwrap();
         let premint: serde_json::Value = serde_json::from_str(&premint_json).unwrap();
         let secrets_with_blinding_json = premint["secrets_with_blinding"].to_string();
         let batch_id = format!("batch-{quote_id}");
@@ -2910,6 +2955,13 @@ mod tests {
         .unwrap();
         let loose_proofs =
             loose_proofs_from_json(&mint_url, unit, &quote_id, &batch_id, &proofs_json);
+        let keyset_info: serde_json::Value = serde_json::from_str(&keyset_info_json).unwrap();
+        let input_fee_ppk = keyset_info["input_fee_ppk"]
+            .as_u64()
+            .or_else(|| keyset_info["inputFeePpk"].as_u64())
+            .unwrap_or(0);
+        let input_fee_raw = input_fee_raw_from_ppk_sum(input_fee_ppk * loose_proofs.len() as u64);
+        let expected_change_raw = minted_amount_raw - input_fee_raw - input_budget_raw;
 
         let temp = tempfile::tempdir().unwrap();
         let loose_db = temp.path().join("loose.sqlite");
@@ -2924,7 +2976,7 @@ mod tests {
         let receiver_pubkey =
             "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
 
-        let input_budget_msats = amount_raw * 1000;
+        let input_budget_msats = input_budget_raw * 1000;
         let offer = offer(&mint_url, &receiver_pubkey, &keyset_id);
         let before_open = SqliteClientWallet::now_seconds().unwrap();
         let channel_id = wallet
@@ -2964,12 +3016,12 @@ mod tests {
             "stored expiry should be no later than after_open + CHANNEL_EXPIRY_SECONDS"
         );
 
-        // Loose proofs used for the channel should be spent.
+        // Surplus reserved input should come back as plain loose change.
         let available = wallet
             .loose_wallet()
             .available_balance_raw(&mint_url, unit, std::slice::from_ref(&keyset_id))
             .unwrap();
-        assert_eq!(available, 0);
+        assert_eq!(available, expected_change_raw);
 
         // Attach, build link request, then build a channel payment.
         let session_id = [7u8; 32];
@@ -3296,7 +3348,8 @@ mod tests {
             .fetch_keyset_info(&mint_url, &keyset_id)
             .unwrap();
 
-        let amount_raw = 16u64;
+        let amount_raw = 1024u64;
+        let desired_funding_raw = 1000u64;
         let quote_response = request_mint_quote(&client, &mint_url, amount_raw, unit).await;
         let quote_id = quote_response["quote"].as_str().unwrap().to_string();
         wait_for_quote_paid(&client, &mint_url, &quote_id).await;
@@ -3340,7 +3393,7 @@ mod tests {
         let receiver_pubkey =
             "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
         let offer = offer(&mint_url, &receiver_pubkey, &keyset_id);
-        let input_budget_msats = amount_raw * 1000;
+        let input_budget_msats = desired_funding_raw * 1000;
         let input_budget_raw = msats_to_raw_units(unit, input_budget_msats).unwrap();
         let reservation = wallet
             .loose_wallet()
@@ -3365,7 +3418,11 @@ mod tests {
             "input_fee_ppk": input_fee_ppk,
         })])
         .unwrap();
-        let compute_result = compute_channel_from_proofs_with_input_keysets(
+        let input_fee_raw =
+            input_fee_raw_from_ppk_sum(input_fee_ppk * reservation.proofs.len() as u64);
+        let expected_change_raw = amount_raw - input_fee_raw - desired_funding_raw;
+
+        let compute_result = compute_channel_from_proofs_with_input_keysets_and_funding_amount(
             &mint_url,
             unit,
             &input_proofs_json,
@@ -3377,19 +3434,38 @@ mod tests {
             &keyset_info_json,
             0,
             None,
+            Some(desired_funding_raw),
         )
         .unwrap();
         let compute_json: serde_json::Value = serde_json::from_str(&compute_result).unwrap();
+        assert_eq!(
+            compute_json["change_amount_raw"].as_u64(),
+            Some(expected_change_raw)
+        );
         let params_json = compute_json["params_json"].as_str().unwrap().to_string();
         let swap_input_proofs_json = compute_json["proofs_json"].as_str().unwrap().to_string();
         let capacity = compute_json["capacity"].as_u64().unwrap();
         let funding_token_amount = compute_json["funding_token_amount"].as_u64().unwrap();
+        let change_amount_raw = compute_json["change_amount_raw"].as_u64().unwrap();
 
         let channel_id =
             channel_parameters_get_channel_id(&params_json, &channel_secret_hex, &keyset_info_json)
                 .unwrap();
         let mut storage =
             SqliteClientStorage::open(channel_db.to_str().unwrap()).expect("open client storage");
+        let swap_result = create_funding_swap_with_plain_change(
+            &params_json,
+            &channel_secret_hex,
+            &keyset_info_json,
+            &swap_input_proofs_json,
+            change_amount_raw,
+        )
+        .unwrap();
+        let swap_json: serde_json::Value = serde_json::from_str(&swap_result).unwrap();
+        let change_secrets_json = swap_json["change_secrets_json"]
+            .as_str()
+            .unwrap()
+            .to_string();
         storage
             .save_opening_from_swap(
                 &channel_id,
@@ -3404,19 +3480,12 @@ mod tests {
                     mint_url: mint_url.clone(),
                     unit: unit.to_string(),
                     input_token: input_proofs_json.clone(),
+                    change_secrets_json,
+                    change_amount_raw,
                     created_at: SqliteClientWallet::now_seconds().unwrap(),
                 },
             )
             .unwrap();
-
-        let swap_result = create_funding_swap(
-            &params_json,
-            &channel_secret_hex,
-            &keyset_info_json,
-            &swap_input_proofs_json,
-        )
-        .unwrap();
-        let swap_json: serde_json::Value = serde_json::from_str(&swap_result).unwrap();
         let swap_request_json = swap_json["swap_request_json"].as_str().unwrap();
         let swap_response = client
             .post(format!("{mint_url}/v1/swap"))
@@ -3467,6 +3536,13 @@ mod tests {
         assert!(reserved
             .iter()
             .all(|proof| proof.state == LooseProofState::Spent));
+
+        let available_change = wallet
+            .loose_wallet()
+            .available_balance_raw(&mint_url, unit, std::slice::from_ref(&keyset_id))
+            .unwrap();
+        assert_eq!(available_change, expected_change_raw);
+        assert!(wallet.recover_pending_openings().unwrap().is_empty());
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();

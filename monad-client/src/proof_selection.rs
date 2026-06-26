@@ -106,7 +106,7 @@ impl ProofTotals {
     }
 
     fn input_fee_raw(self) -> u64 {
-        input_fee_raw(self.fee_ppk_sum)
+        input_fee_raw_from_ppk_sum(self.fee_ppk_sum)
     }
 
     fn post_swap_value(self) -> u64 {
@@ -209,7 +209,7 @@ fn compute_suffix_totals(
 ///
 /// Cashu NUT-02 defines the total input fee as
 /// `ceil(sum(input_fee_ppk) / 1000)`.
-fn input_fee_raw(fee_ppk_sum: u64) -> u64 {
+pub(crate) fn input_fee_raw_from_ppk_sum(fee_ppk_sum: u64) -> u64 {
     fee_ppk_sum.div_ceil(1000)
 }
 
