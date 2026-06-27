@@ -1,5 +1,5 @@
 use crate::config_runtime::route_from_client_config;
-use crate::connector::{connect_route_with_runtime, ConnectorRuntime};
+use crate::connector::{connect_route_connection_with_runtime, ConnectorRuntime};
 use crate::loose_proof_wallet::LooseProofWallet;
 use crate::session_driver::PaymentPolicy;
 use crate::sqlite_client_wallet::SqliteClientWallet;
@@ -107,7 +107,7 @@ where
 
         match tokio::time::timeout(
             Duration::from_millis(ROUTE_CONNECT_TIMEOUT_MS),
-            connect_route_with_runtime(route, &runtime),
+            connect_route_connection_with_runtime(route, &runtime),
         )
         .await
         {
@@ -117,12 +117,19 @@ where
             Ok(Err(err)) => {
                 warn!("failed to connect route: {err}");
             }
-            Ok(Ok(conn)) => {
+            Ok(Ok(route_conn)) => {
                 attempt = 0;
                 backoff_ms = INITIAL_RECONNECT_BACKOFF_MS;
+                let hop_count = route_conn.hops().len();
+                let funded_hop_count = route_conn.hops().iter().filter(|hop| hop.funded).count();
+                let conn = route_conn.into_final_connection();
                 let conn = Arc::new(conn);
                 let _ = conn_tx.send(Some(conn.clone()));
-                info!("route connected; SOCKS active");
+                info!(
+                    hops = hop_count,
+                    funded_hops = funded_hop_count,
+                    "route connected; SOCKS active"
+                );
 
                 let failure_fut = conn.wait_for_failure();
                 tokio::pin!(failure_fut);
@@ -134,8 +141,14 @@ where
                         conn.close().await;
                         return Ok(());
                     }
-                    _ = &mut failure_fut => {
-                        warn!("route failed; rebuilding");
+                    failed_hop_idx = &mut failure_fut => {
+                        match failed_hop_idx {
+                            Some(hop_idx) => warn!(
+                                hop = hop_idx + 1,
+                                "route failed at funded hop; rebuilding full route"
+                            ),
+                            None => warn!("route failure watcher unavailable; rebuilding full route"),
+                        }
                         let _ = conn_tx.send(None);
                         conn.close().await;
                     }

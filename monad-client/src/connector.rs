@@ -55,6 +55,38 @@ impl ConnectorRuntime {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RouteHopConnection {
+    pub hop_idx: usize,
+    pub label: String,
+    pub session_id: [u8; 32],
+    pub funded: bool,
+}
+
+pub struct RouteConnection {
+    final_conn: RelayConnection,
+    prefix_conns: Vec<RelayConnection>,
+    hops: Vec<RouteHopConnection>,
+}
+
+impl RouteConnection {
+    pub fn final_connection(&self) -> &RelayConnection {
+        &self.final_conn
+    }
+
+    pub fn into_final_connection(self) -> RelayConnection {
+        let mut final_conn = self.final_conn;
+        for mut prefix_conn in self.prefix_conns {
+            final_conn.absorb_handles_from(&mut prefix_conn);
+        }
+        final_conn
+    }
+
+    pub fn hops(&self) -> &[RouteHopConnection] {
+        &self.hops
+    }
+}
+
 pub async fn connect(
     relay_addr: &str,
     relay_pubkey: Secp256k1Pubkey,
@@ -65,12 +97,16 @@ pub async fn connect(
         use_quic: false,
     }])?;
     let runtime = ConnectorRuntime::with_mock_wallet()?;
-    connect_route_internal(&route, runtime, false).await
+    connect_route_internal(&route, runtime, false)
+        .await
+        .map(RouteConnection::into_final_connection)
 }
 
 pub async fn connect_route(route: &Route) -> io::Result<RelayConnection> {
     let runtime = ConnectorRuntime::with_mock_wallet()?;
-    connect_route_internal(route, runtime, false).await
+    connect_route_internal(route, runtime, false)
+        .await
+        .map(RouteConnection::into_final_connection)
 }
 
 pub async fn connect_route_with_wallet(
@@ -78,13 +114,24 @@ pub async fn connect_route_with_wallet(
     wallet: Option<Arc<dyn MonadWallet>>,
 ) -> io::Result<RelayConnection> {
     let runtime = ConnectorRuntime::new(wallet)?;
-    connect_route_internal(route, runtime, true).await
+    connect_route_internal(route, runtime, true)
+        .await
+        .map(RouteConnection::into_final_connection)
 }
 
 pub async fn connect_route_with_runtime(
     route: &Route,
     runtime: &ConnectorRuntime,
 ) -> io::Result<RelayConnection> {
+    connect_route_connection_with_runtime(route, runtime)
+        .await
+        .map(RouteConnection::into_final_connection)
+}
+
+pub async fn connect_route_connection_with_runtime(
+    route: &Route,
+    runtime: &ConnectorRuntime,
+) -> io::Result<RouteConnection> {
     connect_route_internal(route, runtime.clone(), true).await
 }
 
@@ -92,7 +139,7 @@ async fn connect_route_internal(
     route: &Route,
     runtime: ConnectorRuntime,
     fund_last_hop: bool,
-) -> io::Result<RelayConnection> {
+) -> io::Result<RouteConnection> {
     let first = route.hops().first().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "at least one hop is required")
     })?;
@@ -123,12 +170,18 @@ async fn connect_route_internal(
         info!("TCP connected to {addr}");
         chain_from_stream(tcp_stream, route.clone(), 0, runtime, fund_last_hop).await?
     };
-    Ok(funded.conn)
+    Ok(RouteConnection {
+        final_conn: funded.conn,
+        prefix_conns: funded.prefix_conns,
+        hops: funded.hops,
+    })
 }
 
 pub struct FundedConnection {
     pub conn: RelayConnection,
+    pub prefix_conns: Vec<RelayConnection>,
     pub failure_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    pub hops: Vec<RouteHopConnection>,
 }
 
 async fn optionally_fund_session(
@@ -140,7 +193,9 @@ async fn optionally_fund_session(
     let Some(wallet) = wallet else {
         return Ok(FundedConnection {
             conn,
+            prefix_conns: Vec::new(),
             failure_rx: None,
+            hops: Vec::new(),
         });
     };
 
@@ -159,7 +214,9 @@ async fn optionally_fund_session(
     conn.add_task(control_task);
     Ok(FundedConnection {
         conn,
+        prefix_conns: Vec::new(),
         failure_rx: Some(failure_rx),
+        hops: Vec::new(),
     })
 }
 
@@ -306,9 +363,16 @@ where
         )
         .await?;
         let mut conn = funded.conn;
+        let funded_hop = funded.failure_rx.is_some();
         if let Some(failure_rx) = funded.failure_rx {
-            conn.add_failure_watcher(failure_rx);
+            conn.add_failure_watcher(hop_idx, failure_rx);
         }
+        let mut hops = vec![RouteHopConnection {
+            hop_idx,
+            label: hop_label,
+            session_id: *conn.session_id(),
+            funded: funded_hop,
+        }];
 
         if hop_idx < route.hops().len() - 1 {
             let next_hop = &route.hops()[hop_idx + 1];
@@ -331,13 +395,19 @@ where
                 fund_last_hop,
             )
             .await?;
-            next_funded.conn.absorb_handles_from(&mut conn);
+            let mut prefix_conns = vec![conn];
+            prefix_conns.append(&mut next_funded.prefix_conns);
+            next_funded.prefix_conns = prefix_conns;
+            hops.append(&mut next_funded.hops);
+            next_funded.hops = hops;
             Ok(next_funded)
         } else {
             info!("tunnel route established ({} hops)", route.hops().len());
             Ok(FundedConnection {
                 conn,
+                prefix_conns: Vec::new(),
                 failure_rx: None,
+                hops,
             })
         }
     })

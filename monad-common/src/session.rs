@@ -128,8 +128,8 @@ pub struct RelayConnection {
     cleartext_byte_counters: CleartextByteCounters,
     /// Watch receivers that flip to true when a funded hop's session driver
     /// terminates. The runtime uses these to detect when the route needs
-    /// rebuilding.
-    failure_watchers: Mutex<Vec<watch::Receiver<bool>>>,
+    /// rebuilding and to identify the failed hop.
+    failure_watchers: Mutex<Vec<(usize, watch::Receiver<bool>)>>,
 }
 
 impl RelayConnection {
@@ -305,24 +305,24 @@ impl RelayConnection {
     /// Register a watch receiver that signals when a funded hop's session
     /// driver has terminated. The runtime can await any of these to detect
     /// route failure.
-    pub fn add_failure_watcher(&mut self, rx: watch::Receiver<bool>) {
-        self.failure_watchers.lock().unwrap().push(rx);
+    pub fn add_failure_watcher(&mut self, hop_idx: usize, rx: watch::Receiver<bool>) {
+        self.failure_watchers.lock().unwrap().push((hop_idx, rx));
     }
 
     /// Wait until at least one registered failure watcher signals true.
-    /// Returns immediately if there are no watchers.
-    pub async fn wait_for_failure(&self) {
+    /// Returns immediately with `None` if there are no watchers.
+    pub async fn wait_for_failure(&self) -> Option<usize> {
         let watchers: Vec<_> = {
             let guards = self.failure_watchers.lock().unwrap();
             guards.iter().cloned().collect()
         };
         if watchers.is_empty() {
-            return;
+            return None;
         }
 
         let (tx, rx) = oneshot::channel();
         let tx = Arc::new(Mutex::new(Some(tx)));
-        for mut watcher in watchers {
+        for (hop_idx, mut watcher) in watchers {
             let tx = tx.clone();
             tokio::spawn(async move {
                 loop {
@@ -331,14 +331,14 @@ impl RelayConnection {
                     }
                     if *watcher.borrow() {
                         if let Some(tx) = tx.lock().unwrap().take() {
-                            let _ = tx.send(());
+                            let _ = tx.send(hop_idx);
                         }
                         return;
                     }
                 }
             });
         }
-        let _ = rx.await;
+        rx.await.ok()
     }
 
     /// Move all background driver/task handles from another relay connection
