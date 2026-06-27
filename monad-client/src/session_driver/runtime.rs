@@ -1,10 +1,10 @@
 use bytes::Bytes;
-use monad_common::control_codec::try_decode_json_line;
-use monad_common::protocol::ServerMessage;
+use monad_common::control_codec::{send_json_line, try_decode_json_line};
+use monad_common::protocol::{ClientMessage, ServerMessage};
 use monad_common::session::SessionPricing;
 use std::io;
 use tokio::sync::oneshot;
-use tokio::time::{self, Duration, MissedTickBehavior};
+use tokio::time::{self, Duration, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
 use super::funding::{apply_channel_evicted, apply_server_error};
@@ -17,6 +17,50 @@ use super::state::{
     apply_session_status, publish_pricing, publish_spilman_info, signal_ready, state_summary,
     DriverState, RelaySnapshot, SessionDriverConfig,
 };
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const HEARTBEAT_TICK: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Default)]
+struct ControlHeartbeat {
+    last_server_message_at: Option<Instant>,
+    heartbeat_sent_at: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeartbeatAction {
+    None,
+    SendStatusRequest,
+    TimedOut,
+}
+
+impl ControlHeartbeat {
+    fn observe_server_message(&mut self, now: Instant) {
+        self.last_server_message_at = Some(now);
+        self.heartbeat_sent_at = None;
+    }
+
+    fn on_tick(&mut self, now: Instant) -> HeartbeatAction {
+        if let Some(sent_at) = self.heartbeat_sent_at {
+            if now.duration_since(sent_at) >= HEARTBEAT_TIMEOUT {
+                return HeartbeatAction::TimedOut;
+            }
+            return HeartbeatAction::None;
+        }
+
+        let Some(last_seen) = self.last_server_message_at else {
+            return HeartbeatAction::None;
+        };
+
+        if now.duration_since(last_seen) >= HEARTBEAT_INTERVAL {
+            self.heartbeat_sent_at = Some(now);
+            return HeartbeatAction::SendStatusRequest;
+        }
+
+        HeartbeatAction::None
+    }
+}
 
 pub(super) async fn run_session_driver(
     mut h2_send: h2::SendStream<Bytes>,
@@ -38,6 +82,9 @@ pub(super) async fn run_session_driver(
 
     let mut payment_tick = time::interval(Duration::from_millis(250));
     payment_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut heartbeat_tick = time::interval(HEARTBEAT_TICK);
+    heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut heartbeat = ControlHeartbeat::default();
 
     loop {
         tokio::select! {
@@ -54,6 +101,7 @@ pub(super) async fn run_session_driver(
                     let Some(message) = try_decode_json_line::<ServerMessage>(&mut buf)? else {
                         break;
                     };
+                    heartbeat.observe_server_message(Instant::now());
 
                     let resolved_payment = match message {
                         ServerMessage::SessionStatus {
@@ -151,9 +199,103 @@ pub(super) async fn run_session_driver(
                 }
                 run_funding_cycle(&config, &mut state, &mut h2_send, false).await?;
             }
+            _ = heartbeat_tick.tick() => {
+                match heartbeat.on_tick(Instant::now()) {
+                    HeartbeatAction::None => {}
+                    HeartbeatAction::SendStatusRequest => {
+                        send_json_line(&mut h2_send, &ClientMessage::GetSessionStatus).await?;
+                    }
+                    HeartbeatAction::TimedOut => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "{} control heartbeat timed out after {}ms",
+                                config.hop_label,
+                                HEARTBEAT_TIMEOUT.as_millis()
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
 
     handle_control_detached(&config, &mut state).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_waits_for_initial_server_message() {
+        let mut heartbeat = ControlHeartbeat::default();
+        assert_eq!(
+            heartbeat.on_tick(Instant::now() + HEARTBEAT_INTERVAL),
+            HeartbeatAction::None
+        );
+    }
+
+    #[test]
+    fn heartbeat_sends_status_request_after_idle_interval() {
+        let now = Instant::now();
+        let mut heartbeat = ControlHeartbeat::default();
+        heartbeat.observe_server_message(now);
+
+        assert_eq!(
+            heartbeat.on_tick(now + HEARTBEAT_INTERVAL - Duration::from_millis(1)),
+            HeartbeatAction::None
+        );
+        assert_eq!(
+            heartbeat.on_tick(now + HEARTBEAT_INTERVAL),
+            HeartbeatAction::SendStatusRequest
+        );
+        assert_eq!(
+            heartbeat.on_tick(now + HEARTBEAT_INTERVAL + Duration::from_secs(1)),
+            HeartbeatAction::None
+        );
+    }
+
+    #[test]
+    fn heartbeat_times_out_when_status_request_is_unanswered() {
+        let now = Instant::now();
+        let mut heartbeat = ControlHeartbeat::default();
+        heartbeat.observe_server_message(now);
+        assert_eq!(
+            heartbeat.on_tick(now + HEARTBEAT_INTERVAL),
+            HeartbeatAction::SendStatusRequest
+        );
+        assert_eq!(
+            heartbeat
+                .on_tick(now + HEARTBEAT_INTERVAL + HEARTBEAT_TIMEOUT - Duration::from_millis(1)),
+            HeartbeatAction::None
+        );
+        assert_eq!(
+            heartbeat.on_tick(now + HEARTBEAT_INTERVAL + HEARTBEAT_TIMEOUT),
+            HeartbeatAction::TimedOut
+        );
+    }
+
+    #[test]
+    fn heartbeat_any_server_message_clears_outstanding_request() {
+        let now = Instant::now();
+        let mut heartbeat = ControlHeartbeat::default();
+        heartbeat.observe_server_message(now);
+        assert_eq!(
+            heartbeat.on_tick(now + HEARTBEAT_INTERVAL),
+            HeartbeatAction::SendStatusRequest
+        );
+
+        let response_at = now + HEARTBEAT_INTERVAL + Duration::from_secs(1);
+        heartbeat.observe_server_message(response_at);
+        assert_eq!(
+            heartbeat.on_tick(response_at + HEARTBEAT_INTERVAL - Duration::from_millis(1)),
+            HeartbeatAction::None
+        );
+        assert_eq!(
+            heartbeat.on_tick(response_at + HEARTBEAT_INTERVAL),
+            HeartbeatAction::SendStatusRequest
+        );
+    }
 }
