@@ -117,6 +117,10 @@ pub trait MonadWallet: Send + Sync + 'static {
         session_id: [u8; 32],
     ) -> Result<(), WalletError>;
 
+    /// Force-detach a channel from whatever session it is attached to, if any.
+    /// Used during reconnect when the previous session is gone.
+    fn force_detach_channel(&self, channel_id: &str) -> Result<(), WalletError>;
+
     fn mark_channel_unusable(&self, channel_id: &str) -> Result<(), WalletError>;
 
     /// Provision a new channel by spending loose proofs from this wallet.
@@ -455,6 +459,19 @@ impl MonadWallet for MockWallet {
         if stored.channel.attached_session_id == Some(session_id) {
             stored.channel.attached_session_id = None;
         }
+        Ok(())
+    }
+
+    fn force_detach_channel(&self, channel_id: &str) -> Result<(), WalletError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| WalletError::Backend("wallet mutex poisoned".to_string()))?;
+        let stored = inner
+            .channels
+            .get_mut(channel_id)
+            .ok_or(WalletError::NotFound)?;
+        stored.channel.attached_session_id = None;
         Ok(())
     }
 

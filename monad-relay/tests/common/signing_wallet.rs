@@ -159,7 +159,7 @@ impl TestSigningWallet {
             .lock()
             .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
         let payment = bridge
-            .create_payment_with_funding(channel_id, 0)
+            .sign_channel_registration(channel_id)
             .map_err(|e| WalletError::Backend(format!("failed to create link payment: {e}")))?;
         serde_json::to_string(&payment)
             .map_err(|e| WalletError::Backend(format!("failed to serialize payment: {e}")))
@@ -327,6 +327,16 @@ impl MonadWallet for TestSigningWallet {
         Ok(())
     }
 
+    fn force_detach_channel(&self, channel_id: &str) -> Result<(), WalletError> {
+        let mut channels = self
+            .channels
+            .lock()
+            .map_err(|_| WalletError::Backend("channels mutex poisoned".to_string()))?;
+        let metadata = channels.get_mut(channel_id).ok_or(WalletError::NotFound)?;
+        metadata.attached_session_id = None;
+        Ok(())
+    }
+
     fn mark_channel_unusable(&self, channel_id: &str) -> Result<(), WalletError> {
         let mut channels = self
             .channels
@@ -372,7 +382,7 @@ impl MonadWallet for TestSigningWallet {
             .lock()
             .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
         let payment = bridge
-            .create_payment_with_funding(channel_id, 0)
+            .sign_channel_registration(channel_id)
             .map_err(|e| WalletError::Backend(format!("failed to create link payment: {e}")))?;
         serde_json::to_string(&payment)
             .map_err(|e| WalletError::Backend(format!("failed to serialize payment: {e}")))
@@ -421,7 +431,7 @@ impl MonadWallet for TestSigningWallet {
             .lock()
             .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
         let payment = bridge
-            .create_payment(channel_id, next_balance_raw)
+            .sign_and_record_payment(channel_id, next_balance_raw)
             .map_err(|e| WalletError::Backend(format!("failed to create payment: {e}")))?;
 
         metadata.current_signed_balance_raw = next_balance_raw;

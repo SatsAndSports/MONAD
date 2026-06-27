@@ -1286,6 +1286,19 @@ impl MonadWallet for SqliteClientWallet {
         Ok(())
     }
 
+    fn force_detach_channel(&self, channel_id: &str) -> Result<(), WalletError> {
+        let now = Self::now_seconds()?;
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE monad_client_channels
+             SET attached_session_id = NULL, updated_at = ?2
+             WHERE channel_id = ?1",
+            params![channel_id, to_i64(now)?],
+        )
+        .map_err(|e| WalletError::Backend(format!("force detach channel: {e}")))?;
+        Ok(())
+    }
+
     fn mark_channel_unusable(&self, channel_id: &str) -> Result<(), WalletError> {
         let now = Self::now_seconds()?;
         let conn = self.conn()?;
@@ -1420,10 +1433,9 @@ impl MonadWallet for SqliteClientWallet {
                 .lock()
                 .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
             bridge
-                .create_payment_with_funding(channel_id, 0)
-                .map_err(|e| map_create_payment_error(&channel, e, 0))
+                .sign_channel_registration(channel_id)
+                .map_err(|e| map_create_payment_error(&channel, e, 0))?
         };
-        let payment = payment?;
         serde_json::to_string(&payment)
             .map_err(|e| WalletError::Backend(format!("serialize link payment: {e}")))
     }
@@ -1452,7 +1464,7 @@ impl MonadWallet for SqliteClientWallet {
                 .lock()
                 .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
             bridge
-                .create_payment(channel_id, next_balance_raw)
+                .sign_and_record_payment(channel_id, next_balance_raw)
                 .map_err(|e| map_create_payment_error(&channel, e, next_balance_raw))
         };
         let payment = payment?;

@@ -171,6 +171,19 @@ async fn run_gated_reply_server(
     let _ = stream.write_all(response).await;
 }
 
+async fn bind_tcp_listener_with_reuseaddr(bind_addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(bind_addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&bind_addr.into())?;
+    socket.listen(128)?;
+    TcpListener::from_std(socket.into())
+}
+
 async fn bind_tcp_and_quic_on_same_port(
     bind_addr: SocketAddr,
     quic_server_config: quinn::ServerConfig,
@@ -178,7 +191,7 @@ async fn bind_tcp_and_quic_on_same_port(
     let mut last_addr_in_use: Option<io::Error> = None;
 
     for _ in 0..MAX_SHARED_BIND_RETRIES {
-        let listener = match TcpListener::bind(bind_addr).await {
+        let listener = match bind_tcp_listener_with_reuseaddr(bind_addr).await {
             Ok(listener) => listener,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
                 last_addr_in_use = Some(err);
@@ -639,6 +652,37 @@ async fn start_relay_from_config(
     let (listener, quic_endpoint, addr) =
         bind_tcp_and_quic_on_same_port(bind_addr, quic_server_config).await?;
 
+    start_relay_from_bound_listener_internal(
+        listener,
+        Some(quic_endpoint),
+        relay_config,
+        wallet_manager,
+        mint_cache,
+        receiver_pubkey_hex,
+        trusted_mint_units,
+        transport_key,
+        identity,
+    )
+    .await
+    .map(|(handle, shutdown_tx, payments)| (addr, pubkey, handle, shutdown_tx, payments))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_relay_from_bound_listener_internal(
+    listener: TcpListener,
+    quic_endpoint: Option<quinn::Endpoint>,
+    relay_config: &RelayConfig,
+    wallet_manager: Arc<RelayWalletManager>,
+    mint_cache: SpilmanMintCache,
+    receiver_pubkey_hex: String,
+    trusted_mint_units: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    transport_key: SecpTransportKeypair,
+    identity: monad_common::quic_cert_identity::QuicCertIdentity,
+) -> io::Result<(
+    tokio::task::JoinHandle<io::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+    Arc<SpilmanRelayPayments>,
+)> {
     let config = Arc::new(ServerConfig {
         identity,
         transport_key: Some(transport_key),
@@ -663,7 +707,7 @@ async fn start_relay_from_config(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(run_with_payments_and_registry_and_shutdown(
         listener,
-        Some(quic_endpoint),
+        quic_endpoint,
         config,
         payments_for_spawn,
         mint_cache,
@@ -673,7 +717,7 @@ async fn start_relay_from_config(
         },
     ));
 
-    Ok((addr, pubkey, handle, shutdown_tx, payments))
+    Ok((handle, shutdown_tx, payments))
 }
 
 fn sum_proof_amounts(proofs_json: &str) -> u64 {
@@ -2139,7 +2183,7 @@ async fn test_session_payment_driver_links_unpauses_and_allows_data_flow() {
         .unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_handle, ready_rx) = start_session_payment_driver(
+    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
@@ -2194,7 +2238,7 @@ async fn test_session_payment_driver_proactively_pays_from_local_counters() {
         .unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_handle, ready_rx) = start_session_payment_driver(
+    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
@@ -2266,7 +2310,7 @@ async fn test_session_payment_driver_timer_does_not_duplicate_payment_builds() {
         .unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_handle, ready_rx) = start_session_payment_driver(
+    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
@@ -2346,7 +2390,7 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
     wallet.force_next_link_wrong_receiver("a-bad").unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_handle, ready_rx) = start_session_payment_driver(
+    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
@@ -2430,7 +2474,7 @@ async fn test_session_payment_driver_marks_expiry_too_soon_channel_and_reselects
     .unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_handle, ready_rx) = start_session_payment_driver(
+    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
@@ -2499,7 +2543,7 @@ async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
         .unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_handle, ready_rx) = start_session_payment_driver(
+    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
@@ -2649,7 +2693,7 @@ async fn test_session_payment_driver_detaches_evicted_channel() {
     }
 
     let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_a, ready_a) = start_session_payment_driver(
+    let (driver_a, ready_a, _failure_a) = start_session_payment_driver(
         &conn_a,
         wallet_a.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "driver a",
@@ -2673,7 +2717,7 @@ async fn test_session_payment_driver_detaches_evicted_channel() {
         .unwrap();
 
     let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_b, ready_b) = start_session_payment_driver(
+    let (driver_b, ready_b, _failure_b) = start_session_payment_driver(
         &conn_b,
         wallet_b.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "driver b",
@@ -3982,7 +4026,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     let channel_id = wallet.pre_create_channel(1000).await.unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_handle, ready_rx) = start_session_payment_driver(
+    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "real-crypto hop",
@@ -4750,31 +4794,6 @@ clients:
         },
     ));
 
-    let mut stream = None;
-    for _ in 0..100 {
-        match TcpStream::connect(socks_listen).await {
-            Ok(connected) => {
-                stream = Some(connected);
-                break;
-            }
-            Err(_) if !client_task.is_finished() => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(err) => {
-                let client_result = client_task.await;
-                panic!(
-                    "client SOCKS listener did not start: {err}; client task result: {client_result:?}"
-                );
-            }
-        }
-    }
-    let mut stream = stream.expect("client SOCKS listener should become reachable");
-
-    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method_reply = [0u8; 2];
-    stream.read_exact(&mut method_reply).await.unwrap();
-    assert_eq!(method_reply, [0x05, 0x00]);
-
     let target_ip = match upper_addr.ip() {
         std::net::IpAddr::V4(ip) => ip.octets(),
         std::net::IpAddr::V6(_) => panic!("test target must be IPv4"),
@@ -4782,11 +4801,43 @@ clients:
     let mut request = vec![0x05, 0x01, 0x00, 0x01];
     request.extend_from_slice(&target_ip);
     request.extend_from_slice(&upper_addr.port().to_be_bytes());
-    stream.write_all(&request).await.unwrap();
 
-    let mut socks_reply = [0u8; 10];
-    stream.read_exact(&mut socks_reply).await.unwrap();
-    assert_eq!(socks_reply, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+    // Wait until the route is connected and SOCKS accepts CONNECT requests.
+    let mut stream = None;
+    for _ in 0..100 {
+        match tokio::time::timeout(Duration::from_millis(200), async {
+            let mut s = TcpStream::connect(socks_listen).await.ok()?;
+            s.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.ok()?;
+            if reply != [0x05, 0x00] {
+                return None;
+            }
+            s.write_all(&request).await.ok()?;
+            let mut socks_reply = [0u8; 10];
+            s.read_exact(&mut socks_reply).await.ok()?;
+            if socks_reply == [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0] {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .await
+        {
+            Ok(Some(connected)) => {
+                stream = Some(connected);
+                break;
+            }
+            _ if !client_task.is_finished() => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            _ => {
+                let client_result = client_task.await;
+                panic!("client route never became ready: {client_result:?}");
+            }
+        }
+    }
+    let mut stream = stream.expect("client route should become ready");
 
     stream.write_all(b"configured client path").await.unwrap();
     stream.shutdown().await.unwrap();
@@ -4828,6 +4879,306 @@ clients:
         "one-hop client should open one channel"
     );
 
+    let _ = relay_shutdown_tx.send(());
+    relay_handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_configured_client_reconnects_after_relay_restart() {
+    use monad_relay::config::MonadConfig;
+    use std::fs;
+
+    let upper_listener = TcpListener::bind("127.10.3.10:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.10.3.20:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.10.3.20:{}", mint_addr.port());
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let relay_db_path = temp_dir.path().join("relay.db");
+    let loose_db_path = temp_dir.path().join("client-loose.db");
+    let channel_db_path = temp_dir.path().join("client-channel.db");
+    let config_path = temp_dir.path().join("monad.yaml");
+
+    let mut input_proofs = mint_helper.mint_proofs(10_000).await.unwrap();
+    input_proofs.extend(mint_helper.mint_proofs(10_000).await.unwrap());
+    let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
+    loose_wallet
+        .import_proofs(&loose_proofs_from_cashu_proofs(
+            &mint_url,
+            "sat",
+            "reconnect-client-e2e",
+            &input_proofs,
+        ))
+        .unwrap();
+
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+
+    // Use a fixed loopback address so the restarted relay re-binds to the
+    // same endpoint and the client's route stays valid.
+    let relay_listen = SocketAddr::from(([127, 10, 3, 30], 0));
+    let relay_listener = TcpListener::bind(relay_listen).await.unwrap();
+    let relay_listen = relay_listener.local_addr().unwrap();
+    let socks_listen = TcpListener::bind("127.10.3.40:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let transport_key = SecpTransportKeypair::generate();
+    let quic_cert = QuicCertIdentity::generate().unwrap();
+    let sender_secret_hex = hex::encode([29u8; 32]);
+
+    let yaml = format!(
+        r#"
+wallets:
+  relay:
+    db_path: {}
+  client:
+    loose_db_path: {}
+    channel_db_path: {}
+    wallet_name: alice
+    sender_secret_hex: "{}"
+    channel_input_budget_msats: 20000000
+relays:
+  - name: yaml-relay
+    receiver_secret_hex: {}
+    quic_cert_seed: {}
+    transport_key: {}
+    listen: {}
+    trusted_mints:
+      - url: {}
+        units: [sat]
+    pricing:
+      in_bytes_per_millisat: 1000000
+      out_bytes_per_millisat: 1000000
+clients:
+  - name: local
+    socks: {}
+    route:
+      - addr: {}
+        pubkey: "{}"
+"#,
+        relay_db_path.display(),
+        loose_db_path.display(),
+        channel_db_path.display(),
+        sender_secret_hex,
+        receiver_secret.to_secret_hex(),
+        hex::encode(quic_cert.seed()),
+        hex::encode(transport_key.normalized_secret_bytes()),
+        relay_listen,
+        mint_url,
+        socks_listen,
+        relay_listen,
+        transport_key.pubkey().to_hex(),
+    );
+    fs::write(&config_path, yaml).unwrap();
+
+    // Drop the port-reservation listener so the relay can bind the address.
+    drop(relay_listener);
+
+    let config = MonadConfig::load(&config_path).unwrap();
+    let relay = config.select_relay(Some("yaml-relay")).unwrap();
+    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let (server_addr, _pubkey, relay_handle, relay_shutdown_tx, _payments) =
+        start_relay_from_config(relay, wallet_manager, mint_cache.clone())
+            .await
+            .unwrap();
+    assert_eq!(server_addr, relay_listen);
+
+    let (client_shutdown_tx, client_shutdown_rx) = tokio::sync::oneshot::channel();
+    let client_task = tokio::spawn(run_configured_client_until_shutdown(
+        config.clone(),
+        Some("local"),
+        async move {
+            let _ = client_shutdown_rx.await;
+        },
+    ));
+
+    // Helper to send a SOCKS request and read the echoed response.
+    async fn socks_roundtrip(
+        socks_listen: SocketAddr,
+        upper_addr: SocketAddr,
+    ) -> io::Result<Vec<u8>> {
+        let mut stream = TcpStream::connect(socks_listen).await?;
+        stream.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut method_reply = [0u8; 2];
+        stream.read_exact(&mut method_reply).await?;
+        if method_reply != [0x05, 0x00] {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "SOCKS route is not ready",
+            ));
+        }
+
+        let target_ip = match upper_addr.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            std::net::IpAddr::V6(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "test target must be IPv4",
+                ))
+            }
+        };
+        let mut request = vec![0x05, 0x01, 0x00, 0x01];
+        request.extend_from_slice(&target_ip);
+        request.extend_from_slice(&upper_addr.port().to_be_bytes());
+        stream.write_all(&request).await?;
+
+        let mut socks_reply = [0u8; 10];
+        stream.read_exact(&mut socks_reply).await?;
+        if socks_reply != [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0] {
+            return Err(io::Error::other(format!(
+                "unexpected SOCKS reply: {socks_reply:?}"
+            )));
+        }
+
+        stream.write_all(b"reconnect test").await?;
+        stream.shutdown().await?;
+        let mut result = Vec::new();
+        stream.read_to_end(&mut result).await?;
+        Ok(result)
+    }
+
+    // Wait until the route is connected and SOCKS accepts the no-auth method.
+    let mut ready = false;
+    for _ in 0..50 {
+        match tokio::time::timeout(Duration::from_millis(200), async {
+            let mut s = TcpStream::connect(socks_listen).await.ok()?;
+            s.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.ok()?;
+            Some(reply == [0x05, 0x00])
+        })
+        .await
+        {
+            Ok(Some(true)) => {
+                ready = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    assert!(ready, "client route never became ready");
+
+    // First request through the initial route.
+    let mut first_result = None;
+    for _ in 0..80 {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            socks_roundtrip(socks_listen, upper_addr),
+        )
+        .await
+        {
+            Ok(Ok(result)) if result == b"RECONNECT TEST" => {
+                first_result = Some(result);
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    assert_eq!(first_result.as_deref(), Some(&b"RECONNECT TEST"[..]));
+
+    let initial_wallet = SqliteClientWallet::open(
+        LooseProofWallet::open(&loose_db_path, "alice").unwrap(),
+        &channel_db_path,
+        &sender_secret_hex,
+    )
+    .unwrap();
+    let initial_channels = initial_wallet.list_channels().unwrap();
+    let initial_open_channels: Vec<_> = initial_channels
+        .iter()
+        .filter(|channel| channel.state == WalletChannelState::Open)
+        .collect();
+    assert_eq!(
+        initial_open_channels.len(),
+        1,
+        "initial route should use one open channel"
+    );
+    let reused_channel_id = initial_open_channels[0].channel_id.clone();
+    let initial_signed_balance_msats = initial_open_channels[0].current_signed_balance_msats;
+    assert!(
+        initial_signed_balance_msats < initial_open_channels[0].capacity_msats,
+        "test channel must remain non-exhausted before reconnect"
+    );
+
+    // Kill the relay. The client should detect the failure and enter reconnect.
+    let _ = relay_shutdown_tx.send(());
+    relay_handle.await.unwrap().unwrap();
+
+    // Wait briefly for the client to notice and start reconnecting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Restart the relay on the same TCP+QUIC address with the same DB.
+    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let relay = config.select_relay(Some("yaml-relay")).unwrap();
+    let (_server_addr, _pubkey, relay_handle, relay_shutdown_tx, _payments) =
+        start_relay_from_config(relay, wallet_manager, mint_cache)
+            .await
+            .unwrap();
+
+    // Poll until the client reconnects and SOCKS works again.
+    let mut reconnected = false;
+    for _ in 0..80 {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            socks_roundtrip(socks_listen, upper_addr),
+        )
+        .await
+        {
+            Ok(Ok(result)) if result == b"RECONNECT TEST" => {
+                reconnected = true;
+                break;
+            }
+            _ => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    assert!(reconnected, "client should reconnect after relay restart");
+
+    let reconnected_wallet = SqliteClientWallet::open(
+        LooseProofWallet::open(&loose_db_path, "alice").unwrap(),
+        &channel_db_path,
+        &sender_secret_hex,
+    )
+    .unwrap();
+    let reconnected_channels = reconnected_wallet.list_channels().unwrap();
+    assert_eq!(
+        reconnected_channels.len(),
+        1,
+        "reconnect should reuse the non-exhausted channel instead of opening a new one"
+    );
+    let reconnected_channel = &reconnected_channels[0];
+    assert_eq!(reconnected_channel.channel_id, reused_channel_id);
+    assert_eq!(reconnected_channel.state, WalletChannelState::Open);
+    assert!(
+        reconnected_channel.current_signed_balance_msats >= initial_signed_balance_msats,
+        "relinked channel should preserve the local signed balance baseline"
+    );
+
+    let _ = client_shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), client_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let _ = relay_shutdown_tx.send(());
     relay_handle.await.unwrap().unwrap();
     let _ = mint_shutdown_tx.send(());
@@ -5000,31 +5351,6 @@ clients:
         },
     ));
 
-    let mut stream = None;
-    for _ in 0..160 {
-        match TcpStream::connect(socks_listen).await {
-            Ok(connected) => {
-                stream = Some(connected);
-                break;
-            }
-            Err(_) if !client_task.is_finished() => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(err) => {
-                let client_result = client_task.await;
-                panic!(
-                    "two-hop client SOCKS listener did not start: {err}; client task result: {client_result:?}"
-                );
-            }
-        }
-    }
-    let mut stream = stream.expect("two-hop client SOCKS listener should become reachable");
-
-    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method_reply = [0u8; 2];
-    stream.read_exact(&mut method_reply).await.unwrap();
-    assert_eq!(method_reply, [0x05, 0x00]);
-
     let target_ip = match upper_addr.ip() {
         std::net::IpAddr::V4(ip) => ip.octets(),
         std::net::IpAddr::V6(_) => panic!("test target must be IPv4"),
@@ -5032,11 +5358,42 @@ clients:
     let mut request = vec![0x05, 0x01, 0x00, 0x01];
     request.extend_from_slice(&target_ip);
     request.extend_from_slice(&upper_addr.port().to_be_bytes());
-    stream.write_all(&request).await.unwrap();
 
-    let mut socks_reply = [0u8; 10];
-    stream.read_exact(&mut socks_reply).await.unwrap();
-    assert_eq!(socks_reply, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+    let mut stream = None;
+    for _ in 0..160 {
+        match tokio::time::timeout(Duration::from_millis(200), async {
+            let mut s = TcpStream::connect(socks_listen).await.ok()?;
+            s.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.ok()?;
+            if reply != [0x05, 0x00] {
+                return None;
+            }
+            s.write_all(&request).await.ok()?;
+            let mut socks_reply = [0u8; 10];
+            s.read_exact(&mut socks_reply).await.ok()?;
+            if socks_reply == [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0] {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .await
+        {
+            Ok(Some(connected)) => {
+                stream = Some(connected);
+                break;
+            }
+            _ if !client_task.is_finished() => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            _ => {
+                let client_result = client_task.await;
+                panic!("two-hop client route never became ready: {client_result:?}");
+            }
+        }
+    }
+    let mut stream = stream.expect("two-hop client route should become ready");
 
     stream.write_all(b"configured two hop path").await.unwrap();
     stream.shutdown().await.unwrap();
@@ -5063,16 +5420,19 @@ clients:
 
     let client_wallet =
         SqliteClientWallet::open(loose_wallet, &channel_db_path, &sender_secret_hex).unwrap();
-    let open_channels: Vec<_> = client_wallet
-        .list_channels()
-        .unwrap()
-        .into_iter()
+    let channels = client_wallet.list_channels().unwrap();
+    let open_channels = channels
+        .iter()
         .filter(|c| c.state == WalletChannelState::Open)
-        .collect();
+        .count();
     assert_eq!(
-        open_channels.len(),
+        channels.len(),
         2,
         "two-hop client should open two channels from one minted input"
+    );
+    assert_eq!(
+        open_channels, 1,
+        "only the active second-hop channel should remain open"
     );
 
     let _ = relay_1_shutdown_tx.send(());

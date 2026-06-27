@@ -48,6 +48,11 @@ impl ConnectorRuntime {
     pub fn with_mock_wallet() -> io::Result<Self> {
         Self::new(Some(Arc::new(MockWallet::new())))
     }
+
+    pub fn reset_first_hop_quic_pool(&mut self) -> io::Result<()> {
+        self.first_hop_quic_pool = Arc::new(QuicPool::new()?);
+        Ok(())
+    }
 }
 
 pub async fn connect(
@@ -104,20 +109,26 @@ async fn connect_route_internal(
         ));
     };
 
-    if *use_quic {
+    let funded = if *use_quic {
         info!("connecting to first hop via QUIC: {addr}");
         let quic_stream = runtime
             .first_hop_quic_pool
             .open_stream(addr, ClientAuthMode::Secp256k1(*pubkey))
             .await?;
         info!("QUIC connected to {addr}");
-        chain_from_stream(quic_stream, route.clone(), 0, runtime, fund_last_hop).await
+        chain_from_stream(quic_stream, route.clone(), 0, runtime, fund_last_hop).await?
     } else {
         info!("connecting to first hop: {addr}");
         let tcp_stream = TcpStream::connect(addr).await?;
         info!("TCP connected to {addr}");
-        chain_from_stream(tcp_stream, route.clone(), 0, runtime, fund_last_hop).await
-    }
+        chain_from_stream(tcp_stream, route.clone(), 0, runtime, fund_last_hop).await?
+    };
+    Ok(funded.conn)
+}
+
+pub struct FundedConnection {
+    pub conn: RelayConnection,
+    pub failure_rx: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 async fn optionally_fund_session(
@@ -125,13 +136,16 @@ async fn optionally_fund_session(
     wallet: Option<Arc<dyn MonadWallet>>,
     hop_label: &str,
     payment_policy: PaymentPolicy,
-) -> io::Result<RelayConnection> {
+) -> io::Result<FundedConnection> {
     let Some(wallet) = wallet else {
-        return Ok(conn);
+        return Ok(FundedConnection {
+            conn,
+            failure_rx: None,
+        });
     };
 
     info!("{hop_label}: opening funded control session");
-    let (control_task, ready_rx) =
+    let (control_task, ready_rx, failure_rx) =
         session_driver::start_session_payment_driver(&conn, wallet, hop_label, payment_policy)
             .await?;
     info!("{hop_label}: waiting for funded session readiness");
@@ -143,7 +157,10 @@ async fn optionally_fund_session(
     })?;
     info!("{hop_label}: session funded and usable");
     conn.add_task(control_task);
-    Ok(conn)
+    Ok(FundedConnection {
+        conn,
+        failure_rx: Some(failure_rx),
+    })
 }
 
 fn hop_display_label(hop: &RouteHop) -> String {
@@ -218,7 +235,7 @@ fn chain_from_stream<S>(
     hop_idx: usize,
     runtime: ConnectorRuntime,
     fund_last_hop: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<RelayConnection>> + Send>>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<FundedConnection>> + Send>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -277,7 +294,7 @@ where
         );
         let should_fund =
             runtime.wallet.is_some() && (hop_idx < route.hops().len() - 1 || fund_last_hop);
-        conn = optionally_fund_session(
+        let funded = optionally_fund_session(
             conn,
             if should_fund {
                 runtime.wallet.clone()
@@ -288,6 +305,10 @@ where
             runtime.payment_policy,
         )
         .await?;
+        let mut conn = funded.conn;
+        if let Some(failure_rx) = funded.failure_rx {
+            conn.add_failure_watcher(failure_rx);
+        }
 
         if hop_idx < route.hops().len() - 1 {
             let next_hop = &route.hops()[hop_idx + 1];
@@ -302,8 +323,7 @@ where
 
             let h2_connect_stream = open_next_hop_tunnel(&conn, next_hop).await?;
 
-            let mut conn = conn;
-            let mut next_conn = chain_from_stream(
+            let mut next_funded = chain_from_stream(
                 h2_connect_stream,
                 route.clone(),
                 hop_idx + 1,
@@ -311,11 +331,14 @@ where
                 fund_last_hop,
             )
             .await?;
-            next_conn.absorb_handles_from(&mut conn);
-            Ok(next_conn)
+            next_funded.conn.absorb_handles_from(&mut conn);
+            Ok(next_funded)
         } else {
             info!("tunnel route established ({} hops)", route.hops().len());
-            Ok(conn)
+            Ok(FundedConnection {
+                conn,
+                failure_rx: None,
+            })
         }
     })
 }

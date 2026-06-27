@@ -368,6 +368,7 @@ pub(super) async fn maybe_progress_payment(
                 linked_channel.capacity_raw,
                 state_summary(state, &config.conn.cleartext_byte_counters)
             );
+            let _ = config.wallet.mark_channel_unusable(&intended_channel_id);
             abandon_intended_channel(config, state, intended_channel_id, true).await;
             return Ok(());
         }

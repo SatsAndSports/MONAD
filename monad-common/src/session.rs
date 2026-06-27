@@ -10,7 +10,7 @@ use http::{Method, Request, Uri};
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, watch, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
@@ -126,6 +126,10 @@ pub struct RelayConnection {
     /// session driver when estimating current spend between relay status updates
     /// and sizing proactive payments.
     cleartext_byte_counters: CleartextByteCounters,
+    /// Watch receivers that flip to true when a funded hop's session driver
+    /// terminates. The runtime uses these to detect when the route needs
+    /// rebuilding.
+    failure_watchers: Mutex<Vec<watch::Receiver<bool>>>,
 }
 
 impl RelayConnection {
@@ -159,6 +163,7 @@ impl RelayConnection {
             session_spilman_info: Arc::new(RwLock::new(None)),
             cashu_spilman_protocol_version: Arc::new(RwLock::new(None)),
             cleartext_byte_counters: CleartextByteCounters::default(),
+            failure_watchers: Mutex::new(Vec::new()),
         };
 
         Ok((conn, driver_handle))
@@ -297,6 +302,45 @@ impl RelayConnection {
         self.task_handles.lock().unwrap().push(handle);
     }
 
+    /// Register a watch receiver that signals when a funded hop's session
+    /// driver has terminated. The runtime can await any of these to detect
+    /// route failure.
+    pub fn add_failure_watcher(&mut self, rx: watch::Receiver<bool>) {
+        self.failure_watchers.lock().unwrap().push(rx);
+    }
+
+    /// Wait until at least one registered failure watcher signals true.
+    /// Returns immediately if there are no watchers.
+    pub async fn wait_for_failure(&self) {
+        let watchers: Vec<_> = {
+            let guards = self.failure_watchers.lock().unwrap();
+            guards.iter().cloned().collect()
+        };
+        if watchers.is_empty() {
+            return;
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        for mut watcher in watchers {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    if watcher.changed().await.is_err() {
+                        return;
+                    }
+                    if *watcher.borrow() {
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+        let _ = rx.await;
+    }
+
     /// Move all background driver/task handles from another relay connection
     /// into this one. Used when nested hop setup returns only the final hop but
     /// we still need shutdown of earlier hop tasks to stay attached.
@@ -309,6 +353,10 @@ impl RelayConnection {
             .get_mut()
             .unwrap()
             .append(other.task_handles.get_mut().unwrap());
+        self.failure_watchers
+            .get_mut()
+            .unwrap()
+            .append(other.failure_watchers.get_mut().unwrap());
     }
 
     /// Force-close the hop chain by aborting all background tasks attached to it.

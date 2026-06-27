@@ -165,6 +165,14 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
     Ok(SocksTarget { authority })
 }
 
+/// Reject a SOCKS5 CONNECT request because the proxy is temporarily
+/// unavailable (e.g. the upstream route is reconnecting).
+pub async fn reject_socks5_connect_unavailable(stream: &mut TcpStream) -> io::Result<()> {
+    socks5_handshake(stream).await?;
+    // 0x05 = connection refused.
+    send_reply(stream, 0x05, "0.0.0.0", 0).await
+}
+
 /// Send a SOCKS5 reply to the client.
 ///
 /// Reply format: VER (1) | REP (1) | RSV (1) | ATYP (1) | BND.ADDR (4) | BND.PORT (2)
@@ -248,6 +256,41 @@ mod tests {
             let mut reply = [0u8; 2];
             stream.read_exact(&mut reply).await.unwrap();
             assert_eq!(reply, [0x05, 0xFF]);
+        });
+
+        server.await.unwrap();
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_rejection_uses_connect_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            reject_socks5_connect_unavailable(&mut stream)
+                .await
+                .unwrap();
+        });
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+
+            let mut method_select = [0u8; 2];
+            stream.read_exact(&mut method_select).await.unwrap();
+            assert_eq!(method_select, [0x05, 0x00]);
+
+            let mut request = vec![0x05, 0x01, 0x00, 0x01];
+            request.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
+            request.extend_from_slice(&7777u16.to_be_bytes());
+            stream.write_all(&request).await.unwrap();
+
+            let mut reply = [0u8; 10];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[0], 0x05);
+            assert_eq!(reply[1], 0x05);
         });
 
         server.await.unwrap();

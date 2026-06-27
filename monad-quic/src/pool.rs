@@ -83,7 +83,10 @@ impl QuicPool {
                 let mut pool = self.inner.lock().await;
                 match pool.get(&key) {
                     Some(PoolEntry::Ready { conn }) => Action::UseExisting(conn.clone()),
-                    Some(PoolEntry::Pending { rx }) => Action::Wait(rx.clone()),
+                    Some(PoolEntry::Pending { rx }) => Action::Wait {
+                        key: key.clone(),
+                        rx: rx.clone(),
+                    },
                     None => {
                         let (tx, rx) = watch::channel(None);
                         pool.insert(key.clone(), PoolEntry::Pending { rx });
@@ -114,16 +117,18 @@ impl QuicPool {
                         }
                     }
                 }
-                Action::Wait(mut rx) => {
+                Action::Wait { key, mut rx } => {
                     loop {
-                        rx.changed().await.map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::ConnectionReset,
-                                format!(
-                                    "QUIC connection task to {target_addr} dropped without result"
-                                ),
-                            )
-                        })?;
+                        if rx.changed().await.is_err() {
+                            info!(
+                                "QUIC connection task to {target_addr} dropped without result, removing and retrying"
+                            );
+                            let mut pool = self.inner.lock().await;
+                            if matches!(pool.get(&key), Some(PoolEntry::Pending { .. })) {
+                                pool.remove(&key);
+                            }
+                            break;
+                        }
 
                         match rx.borrow().clone() {
                             None => continue,
@@ -209,7 +214,10 @@ impl QuicPool {
 
 enum Action {
     UseExisting(quinn::Connection),
-    Wait(watch::Receiver<ConnResult>),
+    Wait {
+        key: PoolKey,
+        rx: watch::Receiver<ConnResult>,
+    },
     Connect {
         key: PoolKey,
         tx: watch::Sender<ConnResult>,

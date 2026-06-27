@@ -1,7 +1,7 @@
 use monad_common::session::RelayConnection;
 use std::io;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -43,9 +43,10 @@ pub async fn start_session_payment_driver(
     wallet: Arc<dyn MonadWallet>,
     hop_label: &str,
     payment_policy: PaymentPolicy,
-) -> io::Result<(JoinHandle<()>, oneshot::Receiver<()>)> {
+) -> io::Result<(JoinHandle<()>, oneshot::Receiver<()>, watch::Receiver<bool>)> {
     let (control_send, control_recv) = conn.open_control().await?;
     let (ready_tx, ready_rx) = oneshot::channel();
+    let (failed_tx, failed_rx) = watch::channel(false);
     let config = SessionDriverConfig {
         wallet,
         conn: RelayConnectionHandles::from(conn),
@@ -54,12 +55,14 @@ pub async fn start_session_payment_driver(
     };
 
     let handle = tokio::spawn(async move {
-        if let Err(e) = run_session_driver(control_send, control_recv, ready_tx, config).await {
+        let result = run_session_driver(control_send, control_recv, ready_tx, config).await;
+        if let Err(e) = result {
             warn!("session payment driver ended with error: {e}");
         }
+        let _ = failed_tx.send(true);
     });
 
-    Ok((handle, ready_rx))
+    Ok((handle, ready_rx, failed_rx))
 }
 
 #[cfg(test)]

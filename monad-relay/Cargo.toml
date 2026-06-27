@@ -35,3 +35,4 @@ cdk-spilman-test-mint = { path = "../../../Cashu/Channels/spilman_channel/cashu_
 cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.16.0", package = "cdk", default-features = false, features = ["mint"] }
 axum = "0.8.9"
 tempfile = "3"
+socket2 = "0.6"
