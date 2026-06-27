@@ -64,8 +64,8 @@ pub struct RouteHopConnection {
 }
 
 pub struct RouteConnection {
-    final_conn: RelayConnection,
-    prefix_conns: Vec<RelayConnection>,
+    final_conn: Arc<RelayConnection>,
+    prefix_conns: Vec<Arc<RelayConnection>>,
     hops: Vec<RouteHopConnection>,
 }
 
@@ -74,61 +74,49 @@ impl RouteConnection {
         &self.final_conn
     }
 
-    pub fn into_final_connection(self) -> RelayConnection {
-        let mut final_conn = self.final_conn;
-        for mut prefix_conn in self.prefix_conns {
-            final_conn.absorb_handles_from(&mut prefix_conn);
-        }
-        final_conn
+    pub fn final_connection_arc(&self) -> Arc<RelayConnection> {
+        self.final_conn.clone()
     }
 
     pub fn hops(&self) -> &[RouteHopConnection] {
         &self.hops
+    }
+
+    pub async fn close(&self) {
+        self.final_conn.close().await;
+        for prefix_conn in &self.prefix_conns {
+            prefix_conn.close().await;
+        }
     }
 }
 
 pub async fn connect(
     relay_addr: &str,
     relay_pubkey: Secp256k1Pubkey,
-) -> io::Result<RelayConnection> {
+) -> io::Result<RouteConnection> {
     let route = Route::new(vec![RouteHop::Cleartext {
         addr: relay_addr.to_string(),
         pubkey: relay_pubkey,
         use_quic: false,
     }])?;
     let runtime = ConnectorRuntime::with_mock_wallet()?;
-    connect_route_internal(&route, runtime, false)
-        .await
-        .map(RouteConnection::into_final_connection)
+    connect_route_internal(&route, runtime, false).await
 }
 
-pub async fn connect_route(route: &Route) -> io::Result<RelayConnection> {
+pub async fn connect_route(route: &Route) -> io::Result<RouteConnection> {
     let runtime = ConnectorRuntime::with_mock_wallet()?;
-    connect_route_internal(route, runtime, false)
-        .await
-        .map(RouteConnection::into_final_connection)
+    connect_route_internal(route, runtime, false).await
 }
 
 pub async fn connect_route_with_wallet(
     route: &Route,
     wallet: Option<Arc<dyn MonadWallet>>,
-) -> io::Result<RelayConnection> {
+) -> io::Result<RouteConnection> {
     let runtime = ConnectorRuntime::new(wallet)?;
-    connect_route_internal(route, runtime, true)
-        .await
-        .map(RouteConnection::into_final_connection)
+    connect_route_internal(route, runtime, true).await
 }
 
 pub async fn connect_route_with_runtime(
-    route: &Route,
-    runtime: &ConnectorRuntime,
-) -> io::Result<RelayConnection> {
-    connect_route_connection_with_runtime(route, runtime)
-        .await
-        .map(RouteConnection::into_final_connection)
-}
-
-pub async fn connect_route_connection_with_runtime(
     route: &Route,
     runtime: &ConnectorRuntime,
 ) -> io::Result<RouteConnection> {
@@ -171,8 +159,8 @@ async fn connect_route_internal(
         chain_from_stream(tcp_stream, route.clone(), 0, runtime, fund_last_hop).await?
     };
     Ok(RouteConnection {
-        final_conn: funded.conn,
-        prefix_conns: funded.prefix_conns,
+        final_conn: Arc::new(funded.conn),
+        prefix_conns: funded.prefix_conns.into_iter().map(Arc::new).collect(),
         hops: funded.hops,
     })
 }
@@ -185,7 +173,7 @@ pub struct FundedConnection {
 }
 
 async fn optionally_fund_session(
-    mut conn: RelayConnection,
+    conn: RelayConnection,
     wallet: Option<Arc<dyn MonadWallet>>,
     hop_label: &str,
     payment_policy: PaymentPolicy,

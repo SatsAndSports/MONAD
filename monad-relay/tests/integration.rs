@@ -1229,7 +1229,7 @@ async fn bind_ipv6_listener() -> Option<TcpListener> {
 async fn connect_client_quic_secp(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
-) -> RelayConnection {
+) -> std::sync::Arc<RelayConnection> {
     connect_route_hops(vec![cleartext_route_hop(
         server_addr.to_string(),
         *pubkey,
@@ -1241,7 +1241,7 @@ async fn connect_client_quic_secp(
 async fn connect_client_tcp(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
-) -> RelayConnection {
+) -> std::sync::Arc<RelayConnection> {
     connect_route_hops(vec![cleartext_route_hop(
         server_addr.to_string(),
         *pubkey,
@@ -1262,10 +1262,11 @@ fn cleartext_route_hop(
     }
 }
 
-async fn connect_route_hops(hops: Vec<RouteHop>) -> RelayConnection {
+async fn connect_route_hops(hops: Vec<RouteHop>) -> std::sync::Arc<RelayConnection> {
     connector::connect_route(&Route::new(hops).unwrap())
         .await
         .unwrap()
+        .final_connection_arc()
 }
 
 async fn connect_nested_session(
@@ -1346,18 +1347,18 @@ async fn connect_nested_session_blinded(
 async fn connect_client_quic_secp_funded(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
-) -> RelayConnection {
-    let mut conn = connect_client_quic_secp(server_addr, pubkey).await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+) -> std::sync::Arc<RelayConnection> {
+    let conn = connect_client_quic_secp(server_addr, pubkey).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     conn
 }
 
 async fn connect_client_tcp_funded(
     server_addr: std::net::SocketAddr,
     pubkey: &Secp256k1Pubkey,
-) -> RelayConnection {
-    let mut conn = connect_client_tcp(server_addr, pubkey).await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+) -> std::sync::Arc<RelayConnection> {
+    let conn = connect_client_tcp(server_addr, pubkey).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     conn
 }
 
@@ -1610,7 +1611,7 @@ async fn assert_evicted_then_status(
     expect_session_status_struct(read_control_message(recv).await)
 }
 
-async fn fund_session(conn: &mut RelayConnection, milli_sats: u64) {
+async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
     let (h2_send, h2_recv) = open_funded_control(conn, milli_sats).await;
 
     let keepalive = tokio::spawn(async move {
@@ -3018,14 +3019,12 @@ async fn test_control_detach_ends_active_and_future_streams() {
 }
 
 async fn assert_nested_detach_releases_both_channels(
-    parent_conn: RelayConnection,
+    parent_conn: std::sync::Arc<RelayConnection>,
     child_addr: std::net::SocketAddr,
     child_pubkey: Secp256k1Pubkey,
     parent_payments: Arc<InMemoryRelayPayments>,
     child_payments: Arc<InMemoryRelayPayments>,
 ) {
-    let parent_conn = parent_conn;
-
     let (mut parent_send, mut parent_recv) = parent_conn.open_control().await.unwrap();
     let (_in0, _out0, _paid0, rem0, paused0) =
         control_handshake(&mut parent_send, &mut parent_recv).await;
@@ -7746,12 +7745,12 @@ async fn test_nested_tunnel() {
     let (t_addr, t_pubkey) = start_monad_relay().await;
 
     // Client connects through T → S
-    let mut conn = connect_route_hops(vec![
+    let conn = connect_route_hops(vec![
         cleartext_route_hop(t_addr.to_string(), t_pubkey, true),
         cleartext_route_hop(s_addr.to_string(), s_pubkey, true),
     ])
     .await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     // Open a tunnel to the uppercase server (through S, via T)
@@ -7962,12 +7961,12 @@ async fn test_nested_plain_tcp_tunnel() {
     let (s_addr, s_pubkey) = start_monad_relay().await;
     let (t_addr, t_pubkey) = start_monad_relay().await;
 
-    let mut conn = connect_route_hops(vec![
+    let conn = connect_route_hops(vec![
         cleartext_route_hop(t_addr.to_string(), t_pubkey, false),
         cleartext_route_hop(s_addr.to_string(), s_pubkey, false),
     ])
     .await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -7989,13 +7988,13 @@ async fn test_three_hop_tunnel() {
     let (b_addr, b_pubkey) = start_monad_relay().await;
     let (c_addr, c_pubkey) = start_monad_relay().await;
 
-    let mut conn = connect_route_hops(vec![
+    let conn = connect_route_hops(vec![
         cleartext_route_hop(a_addr.to_string(), a_pubkey, true),
         cleartext_route_hop(b_addr.to_string(), b_pubkey, true),
         cleartext_route_hop(c_addr.to_string(), c_pubkey, true),
     ])
     .await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -8062,12 +8061,12 @@ async fn test_mixed_ipv4_ipv6_hops() {
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
-    let mut conn = connect_route_hops(vec![
+    let conn = connect_route_hops(vec![
         cleartext_route_hop(ipv4_hop_addr.to_string(), ipv4_hop_pubkey, true),
         cleartext_route_hop(ipv6_hop_addr.to_string(), ipv6_hop_pubkey, true),
     ])
     .await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -8107,13 +8106,13 @@ async fn test_quic_secp256k1_first_hop_single_hop() {
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_relay().await;
-    let mut conn = connect_route_hops(vec![cleartext_route_hop(
+    let conn = connect_route_hops(vec![cleartext_route_hop(
         server_addr.to_string(),
         pubkey,
         true,
     )])
     .await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic secp first hop").await;
@@ -8132,12 +8131,12 @@ async fn test_two_hop_quic_secp_chain() {
     let (first_addr, first_pubkey) = start_monad_relay().await;
     let (second_addr, second_pubkey) = start_monad_relay().await;
 
-    let mut conn = connect_route_hops(vec![
+    let conn = connect_route_hops(vec![
         cleartext_route_hop(first_addr.to_string(), first_pubkey, true),
         cleartext_route_hop(second_addr.to_string(), second_pubkey, true),
     ])
     .await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"mixed secp second hop").await;
@@ -8347,7 +8346,7 @@ async fn test_nested_quic_tunnel() {
         .await
         .unwrap();
     conn_to_t.add_driver(driver);
-    fund_session(&mut conn_to_t, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn_to_t, TEST_SESSION_PAYMENT).await;
     let mut h2_to_t = conn_to_t.clone_send_request().await;
 
     // Open a CONNECT tunnel to the uppercase server through T
@@ -8380,11 +8379,11 @@ async fn test_nested_blinded_quic_tunnel() {
     )
     .unwrap();
 
-    let mut intro_conn = connect_client_quic_secp(intro_addr, &intro_pubkey).await;
-    fund_session(&mut intro_conn, TEST_SESSION_PAYMENT).await;
+    let intro_conn = connect_client_quic_secp(intro_addr, &intro_pubkey).await;
+    fund_session(&intro_conn, TEST_SESSION_PAYMENT).await;
 
-    let mut hidden_conn = connect_nested_session_blinded(&intro_conn, &descriptor).await;
-    fund_session(&mut hidden_conn, TEST_SESSION_PAYMENT).await;
+    let hidden_conn = connect_nested_session_blinded(&intro_conn, &descriptor).await;
+    fund_session(&hidden_conn, TEST_SESSION_PAYMENT).await;
 
     let mut h2 = hidden_conn.clone_send_request().await;
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"nested blinded hello").await;
@@ -8403,12 +8402,12 @@ async fn test_relay_can_connect_to_itself_via_quic() {
 
     let (relay_addr, relay_pubkey) = start_monad_relay().await;
 
-    let mut outer_conn = connect_client_quic_secp(relay_addr, &relay_pubkey).await;
-    fund_session(&mut outer_conn, TEST_SESSION_PAYMENT).await;
+    let outer_conn = connect_client_quic_secp(relay_addr, &relay_pubkey).await;
+    fund_session(&outer_conn, TEST_SESSION_PAYMENT).await;
 
-    let mut inner_conn =
+    let inner_conn =
         connect_nested_session_quic(&outer_conn, &relay_addr.to_string(), &relay_pubkey).await;
-    fund_session(&mut inner_conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&inner_conn, TEST_SESSION_PAYMENT).await;
 
     let mut h2 = inner_conn.clone_send_request().await;
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"self quic hello").await;
@@ -8427,12 +8426,12 @@ async fn test_relay_can_connect_to_itself_via_tcp() {
 
     let (relay_addr, relay_pubkey) = start_monad_relay().await;
 
-    let mut outer_conn = connect_client_quic_secp(relay_addr, &relay_pubkey).await;
-    fund_session(&mut outer_conn, TEST_SESSION_PAYMENT).await;
+    let outer_conn = connect_client_quic_secp(relay_addr, &relay_pubkey).await;
+    fund_session(&outer_conn, TEST_SESSION_PAYMENT).await;
 
-    let mut inner_conn =
+    let inner_conn =
         connect_nested_session(&outer_conn, &relay_addr.to_string(), &relay_pubkey).await;
-    fund_session(&mut inner_conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&inner_conn, TEST_SESSION_PAYMENT).await;
 
     let mut h2 = inner_conn.clone_send_request().await;
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"self tcp hello").await;
@@ -8461,12 +8460,12 @@ async fn test_connector_quic_hop() {
     let (s_addr, s_pubkey) = start_monad_relay().await;
 
     // Use the client connector with a QUIC hop (single key per hop)
-    let mut conn = connect_route_hops(vec![
+    let conn = connect_route_hops(vec![
         cleartext_route_hop(s_addr.to_string(), s_pubkey, true),
         cleartext_route_hop(format!("127.0.0.1:{}", t_addr.port()), t_pubkey, true),
     ])
     .await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -8502,15 +8501,16 @@ async fn test_connector_blinded_hop() {
         },
     ])
     .unwrap();
-    let mut conn = connector::connect_route(&route).await.unwrap();
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    let route_conn = connector::connect_route(&route).await.unwrap();
+    let conn = route_conn.final_connection_arc();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
 
     let mut h2 = conn.clone_send_request().await;
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"connector blinded hop").await;
     assert_eq!(result, b"CONNECTOR BLINDED HOP");
 
     drop(h2);
-    conn.shutdown().await;
+    route_conn.close().await;
 }
 
 #[tokio::test]
@@ -8695,15 +8695,16 @@ async fn test_connector_two_consecutive_blinded_hops() {
         },
     ])
     .unwrap();
-    let mut conn = connector::connect_route(&route).await.unwrap();
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    let route_conn = connector::connect_route(&route).await.unwrap();
+    let conn = route_conn.final_connection_arc();
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
 
     let mut h2 = conn.clone_send_request().await;
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"two blinded hops").await;
     assert_eq!(result, b"TWO BLINDED HOPS");
 
     drop(h2);
-    conn.shutdown().await;
+    route_conn.close().await;
 }
 
 /// Test: multiple clients simultaneously request QUIC forwarding to the same target.
@@ -8731,12 +8732,12 @@ async fn test_concurrent_quic_pool_access() {
     let mut handles = Vec::new();
     for i in 0..5 {
         handles.push(tokio::spawn(async move {
-            let mut conn = connect_route_hops(vec![
+            let conn = connect_route_hops(vec![
                 cleartext_route_hop(s_addr.to_string(), s_pubkey, true),
                 cleartext_route_hop(format!("127.0.0.1:{t_port}"), t_pubkey, true),
             ])
             .await;
-            fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+            fund_session(&conn, TEST_SESSION_PAYMENT).await;
             let mut h2 = conn.clone_send_request().await;
 
             let payload = format!("concurrent client {i}");
@@ -8764,13 +8765,13 @@ async fn test_quic_first_hop() {
     let (server_addr, pubkey) = start_monad_relay().await;
 
     // Client connects directly via QUIC (use_quic on the first hop)
-    let mut conn = connect_route_hops(vec![cleartext_route_hop(
+    let conn = connect_route_hops(vec![cleartext_route_hop(
         server_addr.to_string(),
         pubkey,
         true,
     )])
     .await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"quic first hop").await;
@@ -8791,12 +8792,12 @@ async fn test_quic_first_hop_then_tcp() {
     let (t_addr, t_pubkey) = start_monad_relay().await;
 
     // Client connects to S via QUIC, then S forwards to T via TCP
-    let mut conn = connect_route_hops(vec![
+    let conn = connect_route_hops(vec![
         cleartext_route_hop(s_addr.to_string(), s_pubkey, true),
         cleartext_route_hop(t_addr.to_string(), t_pubkey, true),
     ])
     .await;
-    fund_session(&mut conn, TEST_SESSION_PAYMENT).await;
+    fund_session(&conn, TEST_SESSION_PAYMENT).await;
     let mut h2 = conn.clone_send_request().await;
 
     let target = format!("127.0.0.1:{}", upper_addr.port());

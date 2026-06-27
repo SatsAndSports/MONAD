@@ -1004,7 +1004,7 @@ async fn start_huge_funding_control(
 }
 
 async fn fund_session_huge(
-    mut conn: RelayConnection,
+    conn: RelayConnection,
     hop_label: &str,
     payment: StressPaymentConfig,
     payment_stats: Arc<PaymentStats>,

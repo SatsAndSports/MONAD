@@ -298,7 +298,7 @@ impl RelayConnection {
     }
 
     /// Append an abortable background task associated with this connection.
-    pub fn add_task(&mut self, handle: JoinHandle<()>) {
+    pub fn add_task(&self, handle: JoinHandle<()>) {
         self.task_handles.lock().unwrap().push(handle);
     }
 
@@ -393,25 +393,9 @@ impl RelayConnection {
         }
     }
 
-    /// Shut down the hop chain cleanly by dropping the shared H2 client handle
-    /// and waiting for all per-hop H2 driver tasks to exit.
-    pub async fn shutdown(self) {
-        drop(self.h2_client);
-
-        for handle in self.task_handles.into_inner().unwrap() {
-            handle.abort();
-            if let Err(e) = handle.await {
-                if !e.is_cancelled() {
-                    tracing::error!("background task panicked: {e}");
-                }
-            }
-        }
-
-        for handle in self.driver_handles.into_inner().unwrap() {
-            if let Err(e) = handle.await {
-                tracing::error!("H2 driver task panicked: {e}");
-            }
-        }
+    /// Shut down the hop chain by aborting background tasks attached to it.
+    pub async fn shutdown(&self) {
+        self.close().await;
     }
 
     /// Internal: open a CONNECT tunnel with arbitrary extra headers.

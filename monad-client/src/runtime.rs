@@ -1,5 +1,5 @@
 use crate::config_runtime::route_from_client_config;
-use crate::connector::{connect_route_connection_with_runtime, ConnectorRuntime};
+use crate::connector::{connect_route_with_runtime, ConnectorRuntime};
 use crate::loose_proof_wallet::LooseProofWallet;
 use crate::session_driver::PaymentPolicy;
 use crate::sqlite_client_wallet::SqliteClientWallet;
@@ -107,7 +107,7 @@ where
 
         match tokio::time::timeout(
             Duration::from_millis(ROUTE_CONNECT_TIMEOUT_MS),
-            connect_route_connection_with_runtime(route, &runtime),
+            connect_route_with_runtime(route, &runtime),
         )
         .await
         {
@@ -122,8 +122,7 @@ where
                 backoff_ms = INITIAL_RECONNECT_BACKOFF_MS;
                 let hop_count = route_conn.hops().len();
                 let funded_hop_count = route_conn.hops().iter().filter(|hop| hop.funded).count();
-                let conn = route_conn.into_final_connection();
-                let conn = Arc::new(conn);
+                let conn = route_conn.final_connection_arc();
                 let _ = conn_tx.send(Some(conn.clone()));
                 info!(
                     hops = hop_count,
@@ -138,7 +137,7 @@ where
                     _ = &mut *shutdown => {
                         info!("shutting down configured client");
                         let _ = conn_tx.send(None);
-                        conn.close().await;
+                        route_conn.close().await;
                         return Ok(());
                     }
                     failed_hop_idx = &mut failure_fut => {
@@ -150,7 +149,7 @@ where
                             None => warn!("route failure watcher unavailable; rebuilding full route"),
                         }
                         let _ = conn_tx.send(None);
-                        conn.close().await;
+                        route_conn.close().await;
                     }
                 }
             }
