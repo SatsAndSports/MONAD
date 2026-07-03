@@ -4866,16 +4866,11 @@ clients:
 
     let client_wallet =
         SqliteClientWallet::open(loose_wallet, &channel_db_path, &sender_secret_hex).unwrap();
-    let open_channels: Vec<_> = client_wallet
-        .list_channels()
-        .unwrap()
-        .into_iter()
-        .filter(|c| c.state == WalletChannelState::Open)
-        .collect();
+    let channels = client_wallet.list_channels().unwrap();
     assert_eq!(
-        open_channels.len(),
+        channels.len(),
         1,
-        "one-hop client should open one channel"
+        "one-hop client should create one durable channel record"
     );
 
     let _ = relay_shutdown_tx.send(());
