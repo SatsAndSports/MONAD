@@ -51,6 +51,8 @@ wallets:
     wallet_name: default
     sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
     channel_input_budget_msats: 1000000
+    target_topup_buffer_msats: 10000000
+    minimum_topup_msats: 0
 
 management:
   listen: 127.0.0.1:9090
@@ -114,6 +116,8 @@ client with `monad-client run --config monad.yaml --client <name>`.
 - output keyset selection is cache-first: the wallet ensures its mint/unit keyset cache is non-empty before entering the keyset retry helper, then selectors read cache only; refresh happens after retryable mint keyset rejection.
 
 `wallets.client.channel_input_budget_msats` controls the loose-proof input budget for each newly provisioned channel. It is not a guaranteed channel capacity; fees and deterministic channel outputs can make the resulting capacity lower. The default is `1000000` msats.
+
+`wallets.client.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `wallets.client.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats.
 
 Current admin/recovery commands use explicit DB paths and sender key material:
 
@@ -322,6 +326,8 @@ wallets:
     wallet_name: default
     sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
     channel_input_budget_msats: 1000000
+    target_topup_buffer_msats: 10000000
+    minimum_topup_msats: 0
 
 relays:
   - name: hop1

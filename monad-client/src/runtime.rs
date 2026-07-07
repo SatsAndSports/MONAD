@@ -1,5 +1,7 @@
 use crate::config_runtime::route_from_client_config;
-use crate::connector::{connect_route_with_runtime, ConnectorRuntime};
+use crate::connector::{
+    connect_route_with_runtime, rebuild_route_from_with_runtime, ConnectorRuntime,
+};
 use crate::loose_proof_wallet::LooseProofWallet;
 use crate::session_driver::PaymentPolicy;
 use crate::sqlite_client_wallet::SqliteClientWallet;
@@ -50,7 +52,8 @@ where
         Some(wallet.clone()),
         PaymentPolicy {
             channel_input_budget_msats: client_wallet.channel_input_budget_msats,
-            ..PaymentPolicy::default()
+            target_topup_buffer_msats: client_wallet.target_topup_buffer_msats,
+            minimum_topup_msats: client_wallet.minimum_topup_msats,
         },
     )?;
     let route = route_from_client_config(client)?;
@@ -120,36 +123,70 @@ where
             Ok(Ok(route_conn)) => {
                 attempt = 0;
                 backoff_ms = INITIAL_RECONNECT_BACKOFF_MS;
-                let hop_count = route_conn.hops().len();
-                let funded_hop_count = route_conn.hops().iter().filter(|hop| hop.funded).count();
-                let conn = route_conn.final_connection_arc();
-                let _ = conn_tx.send(Some(conn.clone()));
-                info!(
-                    hops = hop_count,
-                    funded_hops = funded_hop_count,
-                    "route connected; SOCKS active"
-                );
+                let mut active_route = route_conn;
 
-                let failure_fut = conn.wait_for_failure();
-                tokio::pin!(failure_fut);
-                tokio::select! {
-                    biased;
-                    _ = &mut *shutdown => {
-                        info!("shutting down configured client");
-                        let _ = conn_tx.send(None);
-                        route_conn.close().await;
-                        return Ok(());
-                    }
-                    failed_hop_idx = &mut failure_fut => {
-                        match failed_hop_idx {
-                            Some(hop_idx) => warn!(
-                                hop = hop_idx + 1,
-                                "route failed at funded hop; rebuilding full route"
-                            ),
-                            None => warn!("route failure watcher unavailable; rebuilding full route"),
+                loop {
+                    let hop_count = active_route.hops().len();
+                    let funded_hop_count =
+                        active_route.hops().iter().filter(|hop| hop.funded).count();
+                    let conn = active_route.final_connection_arc();
+                    let _ = conn_tx.send(Some(conn.clone()));
+                    info!(
+                        hops = hop_count,
+                        funded_hops = funded_hop_count,
+                        "route connected; SOCKS active"
+                    );
+
+                    let failure_fut = active_route.wait_for_failure_owned();
+                    tokio::pin!(failure_fut);
+                    let failed_hop_idx = tokio::select! {
+                        biased;
+                        _ = &mut *shutdown => {
+                            info!("shutting down configured client");
+                            let _ = conn_tx.send(None);
+                            active_route.close().await;
+                            return Ok(());
                         }
+                        failed_hop_idx = &mut failure_fut => failed_hop_idx,
+                    };
+
+                    let Some(hop_idx) = failed_hop_idx else {
+                        warn!("route failure watcher unavailable; rebuilding full route");
                         let _ = conn_tx.send(None);
-                        route_conn.close().await;
+                        active_route.close().await;
+                        break;
+                    };
+
+                    warn!(hop = hop_idx + 1, "route failed at funded hop");
+                    let _ = conn_tx.send(None);
+
+                    if hop_idx == 0 {
+                        active_route.close().await;
+                        break;
+                    }
+
+                    let suffix_session_ids = active_route.suffix_session_ids_from(hop_idx);
+                    detach_channels_for_sessions(&wallet, &suffix_session_ids);
+                    match rebuild_route_from_with_runtime(
+                        route,
+                        &runtime,
+                        Some(active_route),
+                        hop_idx,
+                    )
+                    .await
+                    {
+                        Ok(rebuilt_route) => {
+                            info!(hop = hop_idx + 1, "route suffix rebuilt");
+                            active_route = rebuilt_route;
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(
+                                hop = hop_idx + 1,
+                                "route suffix rebuild failed; falling back to full route rebuild: {err}"
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -193,6 +230,34 @@ fn detach_all_channels(wallet: &Arc<dyn MonadWallet>) {
         }
         Err(err) => {
             warn!("failed to list channels for detach: {err}");
+        }
+    }
+}
+
+fn detach_channels_for_sessions(wallet: &Arc<dyn MonadWallet>, session_ids: &[[u8; 32]]) {
+    if session_ids.is_empty() {
+        return;
+    }
+
+    match wallet.list_channels() {
+        Ok(channels) => {
+            for channel in channels {
+                if channel.state == WalletChannelState::Open
+                    && channel
+                        .attached_session_id
+                        .is_some_and(|session_id| session_ids.contains(&session_id))
+                {
+                    if let Err(err) = wallet.force_detach_channel(&channel.channel_id) {
+                        warn!(
+                            channel_id = %channel.channel_id,
+                            "failed to detach suffix channel from previous session: {err}"
+                        );
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            warn!("failed to list channels for suffix detach: {err}");
         }
     }
 }

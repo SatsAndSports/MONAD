@@ -18,8 +18,10 @@ use monad_quic::client::ClientAuthMode;
 use monad_quic::pool::QuicPool;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::task::JoinSet;
 use tracing::info;
 
 #[derive(Clone)]
@@ -70,6 +72,14 @@ pub struct RouteConnection {
 }
 
 impl RouteConnection {
+    fn from_funded(funded: FundedConnection) -> Self {
+        Self {
+            final_conn: Arc::new(funded.conn),
+            prefix_conns: funded.prefix_conns.into_iter().map(Arc::new).collect(),
+            hops: funded.hops,
+        }
+    }
+
     pub fn final_connection(&self) -> &RelayConnection {
         &self.final_conn
     }
@@ -80,6 +90,99 @@ impl RouteConnection {
 
     pub fn hops(&self) -> &[RouteHopConnection] {
         &self.hops
+    }
+
+    pub fn hop_count(&self) -> usize {
+        self.hops.len()
+    }
+
+    pub fn connection_for_hop(&self, hop_idx: usize) -> Option<Arc<RelayConnection>> {
+        if hop_idx >= self.hops.len() {
+            return None;
+        }
+        if hop_idx + 1 == self.hops.len() {
+            Some(self.final_conn.clone())
+        } else {
+            self.prefix_conns.get(hop_idx).cloned()
+        }
+    }
+
+    pub fn prefix_tail_connection(&self, start_hop_idx: usize) -> Option<Arc<RelayConnection>> {
+        start_hop_idx
+            .checked_sub(1)
+            .and_then(|hop_idx| self.connection_for_hop(hop_idx))
+    }
+
+    pub fn suffix_session_ids_from(&self, start_hop_idx: usize) -> Vec<[u8; 32]> {
+        self.hops
+            .iter()
+            .filter(|hop| hop.hop_idx >= start_hop_idx)
+            .map(|hop| hop.session_id)
+            .collect()
+    }
+
+    pub async fn close_suffix_from(&self, start_hop_idx: usize) {
+        for hop_idx in start_hop_idx..self.hops.len() {
+            if let Some(conn) = self.connection_for_hop(hop_idx) {
+                conn.close().await;
+            }
+        }
+    }
+
+    pub async fn wait_for_failure(&self) -> Option<usize> {
+        self.wait_for_failure_owned().await
+    }
+
+    pub fn wait_for_failure_owned(
+        &self,
+    ) -> impl std::future::Future<Output = Option<usize>> + Send + 'static {
+        let conns = self
+            .prefix_conns
+            .iter()
+            .chain(std::iter::once(&self.final_conn))
+            .filter(|conn| conn.has_failure_watchers())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        async move {
+            if conns.is_empty() {
+                return None;
+            }
+
+            const DEBOUNCE: Duration = Duration::from_millis(100);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+            let mut tasks = JoinSet::new();
+            for conn in conns {
+                let tx = tx.clone();
+                tasks.spawn(async move {
+                    if let Some(hop_idx) = conn.wait_for_failure().await {
+                        let _ = tx.send(hop_idx);
+                    }
+                });
+            }
+
+            let mut min_hop = rx.recv().await?;
+
+            let deadline = tokio::time::Instant::now() + DEBOUNCE;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, rx.recv()).await {
+                    Ok(Some(hop_idx)) => {
+                        if hop_idx < min_hop {
+                            min_hop = hop_idx;
+                        }
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+
+            // The remaining watcher tasks are aborted when the JoinSet drops.
+            drop(tasks);
+            Some(min_hop)
+        }
     }
 
     pub async fn close(&self) {
@@ -123,6 +226,122 @@ pub async fn connect_route_with_runtime(
     connect_route_internal(route, runtime.clone(), true).await
 }
 
+pub async fn rebuild_route_from_with_runtime(
+    route: &Route,
+    runtime: &ConnectorRuntime,
+    old_route: Option<RouteConnection>,
+    start_hop_idx: usize,
+) -> io::Result<RouteConnection> {
+    if start_hop_idx == 0 {
+        if let Some(old_route) = old_route {
+            old_route.close().await;
+        }
+        return connect_route_internal(route, runtime.clone(), true).await;
+    }
+
+    if start_hop_idx >= route.hops().len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot rebuild route from hop {} of {}",
+                start_hop_idx + 1,
+                route.hops().len()
+            ),
+        ));
+    }
+
+    let old_route = old_route.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "suffix rebuild requires an existing route",
+        )
+    })?;
+    if old_route.hop_count() != route.hops().len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot rebuild route suffix: old route has {} hops but target route has {}",
+                old_route.hop_count(),
+                route.hops().len()
+            ),
+        ));
+    }
+
+    let prefix_tail = old_route
+        .prefix_tail_connection(start_hop_idx)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("missing preserved prefix for hop {}", start_hop_idx + 1),
+            )
+        })?;
+    let next_hop = route.hops().get(start_hop_idx).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("missing route hop {}", start_hop_idx + 1),
+        )
+    })?;
+
+    let RouteConnection {
+        final_conn: old_final_conn,
+        prefix_conns: old_prefix_conns,
+        hops: old_hops,
+    } = old_route;
+
+    let mut preserved_prefix_conns = Vec::new();
+    let mut old_suffix_conns = Vec::new();
+    for (hop_idx, conn) in old_prefix_conns.into_iter().enumerate() {
+        if hop_idx < start_hop_idx {
+            preserved_prefix_conns.push(conn);
+        } else {
+            old_suffix_conns.push(conn);
+        }
+    }
+    old_suffix_conns.push(old_final_conn);
+    for conn in old_suffix_conns {
+        conn.close().await;
+    }
+
+    let preserved_hops = old_hops.into_iter().take(start_hop_idx).collect::<Vec<_>>();
+    let h2_connect_stream = match open_next_hop_tunnel(&prefix_tail, next_hop).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            for conn in &preserved_prefix_conns {
+                conn.close().await;
+            }
+            return Err(err);
+        }
+    };
+    let mut rebuilt_suffix = match chain_from_stream(
+        h2_connect_stream,
+        route.clone(),
+        start_hop_idx,
+        runtime.clone(),
+        true,
+    )
+    .await
+    {
+        Ok(rebuilt_suffix) => rebuilt_suffix,
+        Err(err) => {
+            for conn in &preserved_prefix_conns {
+                conn.close().await;
+            }
+            return Err(err);
+        }
+    };
+
+    let mut hops = preserved_hops;
+    hops.append(&mut rebuilt_suffix.hops);
+    let mut prefix_conns = preserved_prefix_conns;
+    prefix_conns.extend(rebuilt_suffix.prefix_conns.into_iter().map(Arc::new));
+
+    Ok(RouteConnection {
+        final_conn: Arc::new(rebuilt_suffix.conn),
+        prefix_conns,
+        hops,
+    })
+}
+
 async fn connect_route_internal(
     route: &Route,
     runtime: ConnectorRuntime,
@@ -158,11 +377,7 @@ async fn connect_route_internal(
         info!("TCP connected to {addr}");
         chain_from_stream(tcp_stream, route.clone(), 0, runtime, fund_last_hop).await?
     };
-    Ok(RouteConnection {
-        final_conn: Arc::new(funded.conn),
-        prefix_conns: funded.prefix_conns.into_iter().map(Arc::new).collect(),
-        hops: funded.hops,
-    })
+    Ok(RouteConnection::from_funded(funded))
 }
 
 pub struct FundedConnection {

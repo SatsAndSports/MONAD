@@ -243,6 +243,10 @@ pub struct ClientWalletConfig {
     pub sender_secret_hex: String,
     #[serde(default = "default_channel_input_budget_msats")]
     pub channel_input_budget_msats: u64,
+    #[serde(default = "default_target_topup_buffer_msats")]
+    pub target_topup_buffer_msats: u64,
+    #[serde(default = "default_minimum_topup_msats")]
+    pub minimum_topup_msats: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -309,6 +313,14 @@ fn default_wallet_name() -> String {
 
 fn default_channel_input_budget_msats() -> u64 {
     1_000_000
+}
+
+fn default_target_topup_buffer_msats() -> u64 {
+    10_000_000
+}
+
+fn default_minimum_topup_msats() -> u64 {
+    0
 }
 
 fn validate_hex_secret(label: &str, value: &str) -> anyhow::Result<()> {
@@ -466,6 +478,19 @@ clients:
                 .channel_input_budget_msats,
             1_000_000
         );
+        assert_eq!(
+            config
+                .wallets
+                .client
+                .as_ref()
+                .unwrap()
+                .target_topup_buffer_msats,
+            10_000_000
+        );
+        assert_eq!(
+            config.wallets.client.as_ref().unwrap().minimum_topup_msats,
+            0
+        );
         assert_eq!(config.relays[0].pricing.in_bytes_per_millisat, 10);
         assert_eq!(config.clients[0].route[0].addr, "127.10.0.11:9050");
     }
@@ -479,6 +504,21 @@ clients:
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("channel_input_budget_msats"));
+    }
+
+    #[test]
+    fn parse_non_default_client_payment_policy() {
+        let yaml = minimal_config_yaml().replace(
+            &format!("sender_secret_hex: \"{ZERO_SECRET}\""),
+            &format!(
+                "sender_secret_hex: \"{ZERO_SECRET}\"\n    target_topup_buffer_msats: 500000\n    minimum_topup_msats: 250000"
+            ),
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let client_wallet = config.wallets.client.as_ref().unwrap();
+        assert_eq!(client_wallet.target_topup_buffer_msats, 500_000);
+        assert_eq!(client_wallet.minimum_topup_msats, 250_000);
     }
 
     #[test]

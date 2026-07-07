@@ -309,6 +309,10 @@ impl RelayConnection {
         self.failure_watchers.lock().unwrap().push((hop_idx, rx));
     }
 
+    pub fn has_failure_watchers(&self) -> bool {
+        !self.failure_watchers.lock().unwrap().is_empty()
+    }
+
     /// Wait until at least one registered failure watcher signals true.
     /// Returns immediately with `None` if there are no watchers.
     pub async fn wait_for_failure(&self) -> Option<usize> {
