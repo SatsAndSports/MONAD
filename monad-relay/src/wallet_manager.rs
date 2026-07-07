@@ -16,6 +16,7 @@ use cdk_spilman::{
     with_active_keyset_retry_async, ActiveKeysetSelection, ChannelState, CloseError, CloseSuccess,
     KeysetRetryError, SelectedOutputKeyset, SpilmanAsyncNetworking,
 };
+use monad_common::config::RelayChannelPolicyConfig;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -445,9 +446,28 @@ impl RelayWalletManager {
         Ok(self.spilman_payments_for_live(relay_name)? as Arc<dyn RelayPayments>)
     }
 
+    pub fn payments_for_with_policy(
+        &self,
+        relay_name: &str,
+        channel_policy: RelayChannelPolicyConfig,
+    ) -> io::Result<Arc<dyn RelayPayments>> {
+        Ok(
+            self.spilman_payments_for_live_with_policy(relay_name, channel_policy)?
+                as Arc<dyn RelayPayments>,
+        )
+    }
+
     pub fn spilman_payments_for_live(
         &self,
         relay_name: &str,
+    ) -> io::Result<Arc<SpilmanRelayPayments>> {
+        self.spilman_payments_for_live_with_policy(relay_name, RelayChannelPolicyConfig::default())
+    }
+
+    pub fn spilman_payments_for_live_with_policy(
+        &self,
+        relay_name: &str,
+        channel_policy: RelayChannelPolicyConfig,
     ) -> io::Result<Arc<SpilmanRelayPayments>> {
         let receiver_secret = self.receiver_secret(relay_name)?;
         let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
@@ -461,6 +481,7 @@ impl RelayWalletManager {
             receiver_secret,
             self.keyset_cache.clone(),
             self.trusted_mint_units(),
+            channel_policy,
             store,
         )))
     }
@@ -470,6 +491,21 @@ impl RelayWalletManager {
         relay_name: &str,
         mint_cache: SpilmanMintCache,
         trusted_mint_units: TrustedMintUnits,
+    ) -> io::Result<Arc<SpilmanRelayPayments>> {
+        self.spilman_payments_for_with_policy(
+            relay_name,
+            mint_cache,
+            trusted_mint_units,
+            RelayChannelPolicyConfig::default(),
+        )
+    }
+
+    pub fn spilman_payments_for_with_policy(
+        &self,
+        relay_name: &str,
+        mint_cache: SpilmanMintCache,
+        trusted_mint_units: TrustedMintUnits,
+        channel_policy: RelayChannelPolicyConfig,
     ) -> io::Result<Arc<SpilmanRelayPayments>> {
         let receiver_secret = self.receiver_secret(relay_name)?;
         let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
@@ -483,6 +519,7 @@ impl RelayWalletManager {
             receiver_secret,
             mint_cache,
             trusted_mint_units,
+            channel_policy,
             store,
         )))
     }
@@ -532,6 +569,57 @@ impl RelayWalletManager {
                 state: channel.state,
                 mint_url,
                 unit: channel.unit.as_str().to_string(),
+                capacity_raw: channel.capacity_raw,
+                balance_raw: channel.latest_payment.balance,
+            });
+        }
+        Ok(summaries)
+    }
+
+    pub fn close_to_expiry_channels(
+        &self,
+        relay_name: Option<&str>,
+        now: u64,
+        close_before_expiry_secs: u64,
+    ) -> io::Result<Vec<ExpiringChannelSummary>> {
+        let meta = self.metadata.list_channels(relay_name)?;
+        let store = ChannelStore::new(self.storage.clone());
+        let cutoff = now.saturating_add(close_before_expiry_secs);
+        let mut summaries = Vec::new();
+        for (channel_id, chan_relay_name, receiver_pubkey_hex) in meta {
+            let channel = match store
+                .get_channel(&channel_id)
+                .map_err(|e| io::Error::other(format!("load channel {channel_id}: {e}")))?
+            {
+                Some(c) => c,
+                None => continue,
+            };
+            if channel.state == ChannelState::Closed {
+                continue;
+            }
+            let funding =
+                parse_channel_summary_metadata(&channel_id, &channel.funding.params_json)?;
+            let expiry_timestamp = match channel.state {
+                ChannelState::Open => funding.expiry_timestamp,
+                ChannelState::Closing => channel
+                    .closing_data
+                    .as_ref()
+                    .map(|closing| closing.expiry_timestamp)
+                    .unwrap_or(funding.expiry_timestamp),
+                ChannelState::Closed => continue,
+            };
+            if expiry_timestamp > cutoff {
+                continue;
+            }
+            summaries.push(ExpiringChannelSummary {
+                channel_id,
+                relay_name: chan_relay_name,
+                receiver_pubkey_hex,
+                state: channel.state,
+                mint_url: funding.mint_url,
+                unit: channel.unit.as_str().to_string(),
+                expiry_timestamp,
+                seconds_until_expiry: seconds_until_expiry(now, expiry_timestamp),
                 capacity_raw: channel.capacity_raw,
                 balance_raw: channel.latest_payment.balance,
             });
@@ -1792,6 +1880,53 @@ pub struct ChannelSummary {
     pub balance_raw: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExpiringChannelSummary {
+    pub channel_id: String,
+    pub relay_name: String,
+    pub receiver_pubkey_hex: String,
+    pub state: ChannelState,
+    pub mint_url: String,
+    pub unit: String,
+    pub expiry_timestamp: u64,
+    pub seconds_until_expiry: i64,
+    pub capacity_raw: u64,
+    pub balance_raw: u64,
+}
+
+struct ChannelSummaryMetadata {
+    mint_url: String,
+    expiry_timestamp: u64,
+}
+
+fn parse_channel_summary_metadata(
+    channel_id: &str,
+    params_json: &str,
+) -> io::Result<ChannelSummaryMetadata> {
+    let value: serde_json::Value = serde_json::from_str(params_json)
+        .map_err(|e| io::Error::other(format!("corrupt funding JSON for {channel_id}: {e}")))?;
+    let mint_url = value["mint"].as_str().unwrap_or("unknown").to_string();
+    let expiry_timestamp = value["expiry_timestamp"].as_u64().ok_or_else(|| {
+        io::Error::other(format!(
+            "corrupt funding JSON for {channel_id}: missing expiry_timestamp"
+        ))
+    })?;
+    Ok(ChannelSummaryMetadata {
+        mint_url,
+        expiry_timestamp,
+    })
+}
+
+fn seconds_until_expiry(now: u64, expiry_timestamp: u64) -> i64 {
+    if expiry_timestamp >= now {
+        let remaining = expiry_timestamp - now;
+        remaining.min(i64::MAX as u64) as i64
+    } else {
+        let overdue = now - expiry_timestamp;
+        -(overdue.min(i64::MAX as u64) as i64)
+    }
+}
+
 fn load_identities(db_path: &str) -> io::Result<HashMap<String, SecretKey>> {
     let conn = Connection::open(db_path)
         .map_err(|e| io::Error::other(format!("open relay wallet db: {e}")))?;
@@ -1845,6 +1980,7 @@ fn store_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cdk_spilman::configurable_host::ClosedDataView;
     use cdk_spilman::{ChannelFunding, PaymentProof};
 
     fn temp_db_path() -> String {
@@ -1854,6 +1990,42 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
+    }
+
+    fn save_test_channel(
+        store: &ChannelStore,
+        channel_id: &str,
+        receiver_pubkey_hex: &str,
+        expiry_timestamp: u64,
+        balance: u64,
+    ) {
+        let funding = ChannelFunding {
+            params_json: serde_json::json!({
+                "channel_id": channel_id,
+                "mint": "https://test.mint",
+                "unit": "sat",
+                "capacity": 1000u64,
+                "keyset_id": "00testkeyset0000",
+                "receiver_pubkey": receiver_pubkey_hex,
+                "sender_pubkey": "0000000000000000000000000000000000000000000000000000000000000002",
+                "expiry_timestamp": expiry_timestamp,
+            })
+            .to_string(),
+            funding_proofs_json: "[]".to_string(),
+            channel_secret_hex: "0000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            keyset_info_json: "{}".to_string(),
+        };
+        store
+            .save_funding(
+                channel_id,
+                funding,
+                PaymentProof {
+                    balance,
+                    signature: "sig".to_string(),
+                },
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1921,6 +2093,77 @@ mod tests {
 
         let all_channels = manager.list_channels(None).unwrap();
         assert_eq!(all_channels.len(), 1);
+    }
+
+    #[test]
+    fn close_to_expiry_channels_filters_open_closing_and_closed() {
+        let manager = RelayWalletManager::open(temp_db_path()).unwrap();
+        let secret = SecretKey::generate();
+        let pubkey_hex = secret.public_key().to_hex();
+        manager.register_identity("r1", secret).unwrap();
+        let store = ChannelStore::with_relay_metadata(
+            manager.storage.clone(),
+            manager.metadata.clone(),
+            "r1".to_string(),
+            pubkey_hex.clone(),
+        );
+        let now = 1_000u64;
+        save_test_channel(&store, "open-far", &pubkey_hex, now + 10_000, 10);
+        save_test_channel(&store, "open-near", &pubkey_hex, now + 100, 20);
+        save_test_channel(&store, "closing-far", &pubkey_hex, now + 10_000, 30);
+        save_test_channel(&store, "closing-near", &pubkey_hex, now + 200, 40);
+        save_test_channel(&store, "closed-near", &pubkey_hex, now + 100, 50);
+
+        store
+            .mark_channel_closing(
+                "closing-far",
+                now + 10_000,
+                PaymentProof {
+                    balance: 30,
+                    signature: "sig".to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .mark_channel_closing(
+                "closing-near",
+                now + 200,
+                PaymentProof {
+                    balance: 40,
+                    signature: "sig".to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .mark_channel_closed(
+                "closed-near",
+                ClosedDataView {
+                    expiry_timestamp: now + 100,
+                    closed_amount: 50,
+                    value_after_stage1: 1000,
+                    receiver_sum: 50,
+                    sender_sum: 950,
+                    receiver_proofs_json: "[]".to_string(),
+                    sender_proofs_json: "[]".to_string(),
+                },
+            )
+            .unwrap();
+
+        let expiring = manager
+            .close_to_expiry_channels(Some("r1"), now, 300)
+            .unwrap();
+        let ids = expiring
+            .iter()
+            .map(|channel| channel.channel_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["closing-near", "open-near"]);
+        let closing = expiring
+            .iter()
+            .find(|channel| channel.channel_id == "closing-near")
+            .unwrap();
+        assert_eq!(closing.state, ChannelState::Closing);
+        assert_eq!(closing.seconds_until_expiry, 200);
+        assert_eq!(closing.balance_raw, 40);
     }
 
     #[test]

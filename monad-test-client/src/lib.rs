@@ -561,6 +561,7 @@ async fn spawn_relay_task(
             .join(format!("monad-test-client-relay-{}.db", addr.port()))
             .to_string_lossy()
             .to_string(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());

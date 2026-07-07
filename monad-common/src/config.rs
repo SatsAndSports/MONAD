@@ -5,7 +5,7 @@
 //! interpolated with `${VAR}` or `${VAR:-default}` syntax, and a `.env` file in
 //! the same directory as the config is loaded automatically before substitution.
 
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
@@ -183,6 +183,37 @@ impl MonadConfig {
                     relay.name
                 );
             }
+            if relay.channel_policy.min_expiry_secs == 0 {
+                anyhow::bail!(
+                    "relay '{}' channel_policy.min_expiry must be greater than zero",
+                    relay.name
+                );
+            }
+            if relay.channel_policy.close_before_expiry_secs == 0 {
+                anyhow::bail!(
+                    "relay '{}' channel_policy.close_before_expiry must be greater than zero",
+                    relay.name
+                );
+            }
+            if relay.channel_policy.close_before_expiry_secs < relay.channel_policy.min_expiry_secs
+            {
+                anyhow::bail!(
+                    "relay '{}' channel_policy.close_before_expiry must be greater than or equal to channel_policy.min_expiry",
+                    relay.name
+                );
+            }
+            if relay.channel_policy.min_capacity_msats == 0 {
+                anyhow::bail!(
+                    "relay '{}' channel_policy.min_capacity must be greater than zero",
+                    relay.name
+                );
+            }
+            if relay.channel_policy.max_amount_per_output_msats == Some(0) {
+                anyhow::bail!(
+                    "relay '{}' channel_policy.max_amount_per_output must be greater than zero when set",
+                    relay.name
+                );
+            }
         }
 
         for client in &self.clients {
@@ -265,6 +296,8 @@ pub struct RelayConfig {
     pub listen: String,
     pub trusted_mints: Vec<TrustedMintConfig>,
     pub pricing: PricingConfig,
+    #[serde(default)]
+    pub channel_policy: RelayChannelPolicyConfig,
 }
 
 impl RelayConfig {
@@ -295,6 +328,45 @@ pub struct TrustedMintConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RelayChannelPolicyConfig {
+    #[serde(
+        default = "default_min_channel_expiry_secs",
+        rename = "min_expiry",
+        deserialize_with = "deserialize_duration_secs"
+    )]
+    pub min_expiry_secs: u64,
+    #[serde(
+        default = "default_min_channel_capacity_msats",
+        rename = "min_capacity",
+        deserialize_with = "deserialize_amount_msats"
+    )]
+    pub min_capacity_msats: u64,
+    #[serde(
+        default,
+        rename = "max_amount_per_output",
+        deserialize_with = "deserialize_optional_amount_msats"
+    )]
+    pub max_amount_per_output_msats: Option<u64>,
+    #[serde(
+        default = "default_close_channel_before_expiry_secs",
+        rename = "close_before_expiry",
+        deserialize_with = "deserialize_duration_secs"
+    )]
+    pub close_before_expiry_secs: u64,
+}
+
+impl Default for RelayChannelPolicyConfig {
+    fn default() -> Self {
+        Self {
+            min_expiry_secs: default_min_channel_expiry_secs(),
+            min_capacity_msats: default_min_channel_capacity_msats(),
+            max_amount_per_output_msats: None,
+            close_before_expiry_secs: default_close_channel_before_expiry_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ClientConfig {
     pub name: String,
     pub socks: String,
@@ -321,6 +393,140 @@ fn default_target_topup_buffer_msats() -> u64 {
 
 fn default_minimum_topup_msats() -> u64 {
     0
+}
+
+fn default_min_channel_expiry_secs() -> u64 {
+    3_600
+}
+
+fn default_min_channel_capacity_msats() -> u64 {
+    1
+}
+
+fn default_close_channel_before_expiry_secs() -> u64 {
+    86_400
+}
+
+fn deserialize_duration_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct DurationVisitor;
+
+    impl de::Visitor<'_> for DurationVisitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a duration in seconds or a string like 3600s, 60m, 2h, or 1d")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u64::try_from(value).map_err(|_| E::custom("duration must not be negative"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            parse_duration_secs(value).map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(DurationVisitor)
+}
+
+fn deserialize_amount_msats<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct AmountVisitor;
+
+    impl de::Visitor<'_> for AmountVisitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a millisat amount string like 1500msat or 2sat")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            parse_amount_msats(value).map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_str(AmountVisitor)
+}
+
+fn deserialize_optional_amount_msats<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| parse_amount_msats(&value).map_err(de::Error::custom))
+        .transpose()
+}
+
+fn parse_duration_secs(value: &str) -> Result<u64, String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Err("duration must not be empty".to_string());
+    }
+    let split = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(split);
+    if digits.is_empty() {
+        return Err(format!("duration '{value}' is missing a number"));
+    }
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|e| format!("invalid duration number '{digits}': {e}"))?;
+    let multiplier = match unit.trim() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        other => return Err(format!("unsupported duration unit '{other}'")),
+    };
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("duration '{value}' overflows seconds"))
+}
+
+fn parse_amount_msats(value: &str) -> Result<u64, String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Err("amount must not be empty".to_string());
+    }
+    let split = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .ok_or_else(|| "amount must include a unit suffix, such as msat or sat".to_string())?;
+    let (digits, unit) = value.split_at(split);
+    if digits.is_empty() {
+        return Err(format!("amount '{value}' is missing a number"));
+    }
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|e| format!("invalid amount number '{digits}': {e}"))?;
+    match unit.trim() {
+        "msat" | "msats" | "millisat" | "millisats" => Ok(amount),
+        "sat" | "sats" | "satoshi" | "satoshis" => amount
+            .checked_mul(1_000)
+            .ok_or_else(|| format!("amount '{value}' overflows millisats")),
+        other => Err(format!("unsupported amount unit '{other}'")),
+    }
 }
 
 fn validate_hex_secret(label: &str, value: &str) -> anyhow::Result<()> {
@@ -492,7 +698,110 @@ clients:
             0
         );
         assert_eq!(config.relays[0].pricing.in_bytes_per_millisat, 10);
+        assert_eq!(config.relays[0].channel_policy.min_expiry_secs, 3_600);
+        assert_eq!(config.relays[0].channel_policy.min_capacity_msats, 1);
+        assert_eq!(
+            config.relays[0].channel_policy.max_amount_per_output_msats,
+            None
+        );
+        assert_eq!(
+            config.relays[0].channel_policy.close_before_expiry_secs,
+            86_400
+        );
         assert_eq!(config.clients[0].route[0].addr, "127.10.0.11:9050");
+    }
+
+    #[test]
+    fn parse_relay_channel_policy() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    channel_policy:\n      min_expiry: 3600s\n      min_capacity: 1500msat\n      max_amount_per_output: 2sat\n      close_before_expiry: 2h\n    trusted_mints:",
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let policy = &config.relays[0].channel_policy;
+        assert_eq!(policy.min_expiry_secs, 3_600);
+        assert_eq!(policy.min_capacity_msats, 1_500);
+        assert_eq!(policy.max_amount_per_output_msats, Some(2_000));
+        assert_eq!(policy.close_before_expiry_secs, 7_200);
+    }
+
+    #[test]
+    fn parse_relay_channel_policy_duration_aliases() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    channel_policy:\n      min_expiry: 60m\n      min_capacity: 1sat\n      close_before_expiry: 1d\n    trusted_mints:",
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let policy = &config.relays[0].channel_policy;
+        assert_eq!(policy.min_expiry_secs, 3_600);
+        assert_eq!(policy.min_capacity_msats, 1_000);
+        assert_eq!(policy.close_before_expiry_secs, 86_400);
+    }
+
+    #[test]
+    fn parse_relay_channel_policy_numeric_duration_seconds() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    channel_policy:\n      min_expiry: 3600\n      min_capacity: 1sat\n      close_before_expiry: \"7200\"\n    trusted_mints:",
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let policy = &config.relays[0].channel_policy;
+        assert_eq!(policy.min_expiry_secs, 3_600);
+        assert_eq!(policy.close_before_expiry_secs, 7_200);
+    }
+
+    #[test]
+    fn relay_channel_policy_rejects_bare_amounts() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    channel_policy:\n      min_capacity: 1\n    trusted_mints:",
+        );
+        assert!(serde_yaml::from_str::<MonadConfig>(&yaml).is_err());
+    }
+
+    #[test]
+    fn relay_channel_policy_rejects_invalid_units() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    channel_policy:\n      min_expiry: 1fortnight\n      min_capacity: 1btc\n    trusted_mints:",
+        );
+        assert!(serde_yaml::from_str::<MonadConfig>(&yaml).is_err());
+    }
+
+    #[test]
+    fn relay_channel_policy_rejects_close_window_below_min_expiry() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    channel_policy:\n      min_expiry: 2h\n      min_capacity: 1sat\n      close_before_expiry: 1h\n    trusted_mints:",
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("close_before_expiry"));
+    }
+
+    #[test]
+    fn relay_channel_policy_rejects_zero_amounts() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    channel_policy:\n      min_capacity: 0msat\n    trusted_mints:",
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("min_capacity"));
+    }
+
+    #[test]
+    fn relay_channel_policy_rejects_zero_max_amount() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    channel_policy:\n      max_amount_per_output: 0sat\n    trusted_mints:",
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_amount_per_output"));
     }
 
     #[test]

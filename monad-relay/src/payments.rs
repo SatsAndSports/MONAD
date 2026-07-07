@@ -10,6 +10,7 @@ use cdk_spilman::{
     CloseError, CloseSuccess, ClosingData, Payment, PaymentProof, SpilmanAsyncNetworking,
     SpilmanBridge, SpilmanHost, SpilmanNetworking,
 };
+use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -192,6 +193,7 @@ struct MonadHost {
     receiver_secret: SecretKey,
     mint_cache: SharedSpilmanMintCache,
     trusted_mint_units: TrustedMintUnits,
+    channel_policy: RelayChannelPolicyConfig,
     store: ChannelStore,
 }
 
@@ -212,6 +214,7 @@ impl SpilmanRelayPayments {
             receiver_secret,
             shared_spilman_mint_cache(mint_cache),
             trusted_mint_units,
+            RelayChannelPolicyConfig::default(),
             ChannelStore::new(storage),
         )
     }
@@ -220,12 +223,14 @@ impl SpilmanRelayPayments {
         receiver_secret: SecretKey,
         mint_cache: SharedSpilmanMintCache,
         trusted_mint_units: TrustedMintUnits,
+        channel_policy: RelayChannelPolicyConfig,
         store: ChannelStore,
     ) -> Self {
         let host = MonadHost {
             receiver_secret,
             mint_cache,
             trusted_mint_units,
+            channel_policy,
             store: store.clone(),
         };
         Self {
@@ -238,12 +243,14 @@ impl SpilmanRelayPayments {
         receiver_secret: SecretKey,
         mint_cache: SpilmanMintCache,
         trusted_mint_units: TrustedMintUnits,
+        channel_policy: RelayChannelPolicyConfig,
         store: ChannelStore,
     ) -> Self {
         Self::from_store(
             receiver_secret,
             shared_spilman_mint_cache(mint_cache),
             trusted_mint_units,
+            channel_policy,
             store,
         )
     }
@@ -492,14 +499,7 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     }
 
     fn get_channel_policy(&self, unit: &str) -> Option<ChannelPolicy> {
-        match unit {
-            "sat" | "msat" => Some(ChannelPolicy {
-                min_expiry_in_seconds: 3600,
-                min_capacity: 1,
-                max_amount_per_output: None,
-            }),
-            _ => None,
-        }
+        relay_channel_policy_for_unit(&self.channel_policy, unit)
     }
 
     fn now_seconds(&self) -> u64 {
@@ -607,6 +607,31 @@ impl SpilmanHost<PaymentContext> for MonadHost {
     }
 }
 
+fn relay_channel_policy_for_unit(
+    config: &RelayChannelPolicyConfig,
+    unit: &str,
+) -> Option<ChannelPolicy> {
+    match unit {
+        "sat" | "msat" => Some(ChannelPolicy {
+            min_expiry_in_seconds: config.min_expiry_secs,
+            min_capacity: amount_msats_to_raw_ceil(config.min_capacity_msats, unit)?,
+            max_amount_per_output: match config.max_amount_per_output_msats {
+                Some(amount) => Some(amount_msats_to_raw_ceil(amount, unit)?),
+                None => None,
+            },
+        }),
+        _ => None,
+    }
+}
+
+fn amount_msats_to_raw_ceil(amount_msats: u64, unit: &str) -> Option<u64> {
+    match unit {
+        "msat" => Some(amount_msats),
+        "sat" => Some(amount_msats.div_ceil(1_000)),
+        _ => None,
+    }
+}
+
 fn map_link_bridge_error(err: BridgeError) -> LinkError {
     match err {
         BridgeError::InvalidRequest(s)
@@ -657,6 +682,47 @@ fn map_payment_bridge_error(err: BridgeError) -> ChannelPaymentError {
         | BridgeError::BalanceMismatch { .. } => {
             ChannelPaymentError::InvalidPayment(err.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod channel_policy_tests {
+    use super::relay_channel_policy_for_unit;
+    use monad_common::config::RelayChannelPolicyConfig;
+
+    #[test]
+    fn min_capacity_msats_converts_to_unit_raw_amounts() {
+        let config = RelayChannelPolicyConfig {
+            min_capacity_msats: 1_500,
+            ..RelayChannelPolicyConfig::default()
+        };
+
+        let sat = relay_channel_policy_for_unit(&config, "sat").unwrap();
+        let msat = relay_channel_policy_for_unit(&config, "msat").unwrap();
+        assert_eq!(sat.min_capacity, 2);
+        assert_eq!(msat.min_capacity, 1_500);
+    }
+
+    #[test]
+    fn sat_amounts_convert_to_msat_and_sat_policies() {
+        let config = RelayChannelPolicyConfig {
+            min_capacity_msats: 2_000,
+            max_amount_per_output_msats: Some(1_500),
+            ..RelayChannelPolicyConfig::default()
+        };
+
+        let sat = relay_channel_policy_for_unit(&config, "sat").unwrap();
+        let msat = relay_channel_policy_for_unit(&config, "msat").unwrap();
+        assert_eq!(sat.min_capacity, 2);
+        assert_eq!(msat.min_capacity, 2_000);
+        assert_eq!(sat.max_amount_per_output, Some(2));
+        assert_eq!(msat.max_amount_per_output, Some(1_500));
+    }
+
+    #[test]
+    fn unknown_units_do_not_get_channel_policy() {
+        let config = RelayChannelPolicyConfig::default();
+        assert!(relay_channel_policy_for_unit(&config, "usd").is_none());
     }
 }
 

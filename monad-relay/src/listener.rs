@@ -13,6 +13,7 @@ use monad_common::bootstrap::{
     initial_server_accept_v1, select_cashu_spilman_protocol_version, select_pricing_policy,
     BootstrapCapabilities, BootstrapV1ClientHello, BootstrapV1ServerAccept,
 };
+use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::noise_secp256k1;
 use monad_common::protocol::MintUnitKeysets;
 use monad_common::quic_cert_identity::QuicCertIdentity;
@@ -208,6 +209,8 @@ pub struct ServerConfig {
     pub relay_wallet_name: String,
     /// Path to the SQLite database used for persistent Spilman channel state.
     pub spilman_storage_path: String,
+    /// Relay-side channel acceptance and expiry-maintenance policy.
+    pub channel_policy: RelayChannelPolicyConfig,
 }
 
 impl ServerConfig {
@@ -329,7 +332,8 @@ pub async fn run_with_wallet_manager(
     discovered_spilman_mint_cache: SharedSpilmanMintCache,
 ) -> io::Result<()> {
     let receiver_pubkey_hex = wallet_manager.receiver_pubkey_hex(&config.relay_wallet_name)?;
-    let payments = wallet_manager.payments_for(&config.relay_wallet_name)?;
+    let payments = wallet_manager
+        .payments_for_with_policy(&config.relay_wallet_name, config.channel_policy.clone())?;
     let config = Arc::new(ServerConfig {
         identity: QuicCertIdentity::from_seed(*config.identity.seed())
             .map_err(|e| io::Error::other(format!("clone relay identity: {e}")))?,
@@ -341,6 +345,7 @@ pub async fn run_with_wallet_manager(
         bootstrap_capabilities: config.bootstrap_capabilities.clone(),
         relay_wallet_name: config.relay_wallet_name.clone(),
         spilman_storage_path: config.spilman_storage_path.clone(),
+        channel_policy: config.channel_policy.clone(),
     });
     run_with_payments(
         listener,

@@ -141,6 +141,7 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
         bootstrap_capabilities: None,
         relay_wallet_name: relay.name.clone(),
         spilman_storage_path: config.wallets.relay.db_path.clone(),
+        channel_policy: relay.channel_policy.clone(),
     });
 
     let tcp_listener = TcpListener::bind(&relay.listen).await?;

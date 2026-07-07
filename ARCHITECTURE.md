@@ -319,7 +319,7 @@ Control messages are JSON objects, newline-delimited, exchanged over the H2 cont
 ### Message Types
 
 Client to server (`ClientMessage`):
-- `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0, funding proofs, and an expiry at least one hour in the future
+- `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0, funding proofs, sufficient capacity for the relay's configured channel policy, and an expiry at least `channel_policy.min_expiry` in the future
 - `ChannelPayment { payment_json }` — increment session balance; requires a Spilman `Payment` signature for a higher balance than previously seen for this channel
 - `GetSessionStatus` — request a fresh session status snapshot
 
@@ -385,7 +385,9 @@ The balance can go negative between billing checks (a proxy chunk may push usage
 
 The client opens a control stream immediately after connecting. Once it receives the initial `SessionStatus`, the per-session payment driver runs one serialized direct control loop. That loop chooses or provisions a local channel, sends `ChannelLink`, and later sends `ChannelPayment` updates. Intermediate hops in multi-hop chains use the same session-driver model.
 
-The client stores each channel's expiry timestamp in local channel metadata and excludes already-expired channels from selection. If a relay rejects a link because the channel expiry is too soon, the driver marks that channel globally unusable locally and selects or provisions another channel.
+The client stores each channel's expiry timestamp in local channel metadata and excludes already-expired channels from selection. If a relay rejects a link because the channel expiry is too soon or the capacity does not satisfy the relay's channel policy, the driver marks that channel globally unusable locally and selects or provisions another channel.
+
+Relay channel policy is configured per relay. Duration fields such as `min_expiry` and `close_before_expiry` accept human-readable strings like `3600s`, `60m`, `2h`, or `1d`. Capacity fields require explicit `sat` or `msat` suffixes; MONAD stores them internally as millisats and converts to the channel's raw unit before returning upstream Spilman `ChannelPolicy` values. Close-to-expiry detection currently reports `Open` and `Closing` channels whose expiry timestamp is inside `close_before_expiry`; the automatic close worker is a later step.
 
 The relay remains authoritative for:
 

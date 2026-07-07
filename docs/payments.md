@@ -79,6 +79,19 @@ Consequences:
 This cache-first, single-refresh retry shape is the shared model for relay close
 and drain swaps.
 
+## Relay Channel Policy
+
+Each relay has an optional `channel_policy` block in YAML. `min_expiry` controls
+how much time must remain before the relay accepts a new `ChannelLink`.
+`min_capacity` and `max_amount_per_output` require explicit `sat` or `msat`
+suffixes; the config stores them as millisats and converts them to the linked
+channel's raw unit before passing policy to upstream Spilman validation.
+
+`close_before_expiry` is parsed and validated alongside link policy. It is used
+by relay wallet detection to report `Open` and `Closing` channels that are close
+to expiry. The automatic close-before-expiry worker is intentionally separate
+future work.
+
 ## Client Keyset Model
 
 The client wallet has the same cache-first shape for channel-opening swaps.

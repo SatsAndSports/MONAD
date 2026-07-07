@@ -483,6 +483,7 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
             .to_str()
             .unwrap()
             .to_string(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());

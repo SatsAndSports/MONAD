@@ -307,6 +307,7 @@ async fn start_monad_relay_with_transport_key_and_capabilities(
             .to_str()
             .unwrap()
             .to_string(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
 
@@ -364,6 +365,7 @@ async fn start_monad_relay_with_test_payments() -> (
             .to_str()
             .unwrap()
             .to_string(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
@@ -414,6 +416,7 @@ async fn start_monad_relay_with_spilman(
             .to_str()
             .unwrap()
             .to_string(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
     });
 
     let discovered_spilman_mint_cache = shared_spilman_mint_cache(
@@ -491,6 +494,7 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
             .to_str()
             .unwrap()
             .to_string(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
@@ -582,6 +586,7 @@ async fn start_managed_persistent_relay(
         bootstrap_capabilities: None,
         relay_wallet_name: wallet_name.to_string(),
         spilman_storage_path: String::new(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
     });
 
     let payments = wallet_manager.spilman_payments_for_live(wallet_name)?;
@@ -761,6 +766,7 @@ async fn start_relay_from_bound_listener_internal(
         bootstrap_capabilities: None,
         relay_wallet_name: relay_config.name.clone(),
         spilman_storage_path: wallet_manager.db_path().to_string(),
+        channel_policy: relay_config.channel_policy.clone(),
     });
 
     let payments = wallet_manager.spilman_payments_for(
@@ -7862,6 +7868,7 @@ async fn test_session_status_reflects_manager_keyset_refresh_mid_session() {
         bootstrap_capabilities: None,
         relay_wallet_name: "live-cache-relay".to_string(),
         spilman_storage_path: temp_db.path().to_str().unwrap().to_string(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
     });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let payments = wallet_manager.payments_for("live-cache-relay").unwrap();

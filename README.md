@@ -68,6 +68,11 @@ relays:
     pricing:
       in_bytes_per_millisat: 1
       out_bytes_per_millisat: 1
+    channel_policy:
+      min_expiry: 1h
+      min_capacity: 1msat
+      max_amount_per_output: null
+      close_before_expiry: 24h
 
 clients:
   - name: local
@@ -364,6 +369,14 @@ clients:
 ```
 
 The pricing fields are required for every relay entry and must be greater than zero.
+
+`channel_policy` is optional. `min_expiry` rejects newly linked channels that do
+not have enough time left before expiry. `min_capacity` and
+`max_amount_per_output` use explicit `sat` or `msat` suffixes and are converted
+to the linked channel's raw unit before validation. `close_before_expiry`
+controls when existing `Open` / `Closing` relay channels are considered close to
+expiry for maintenance. Duration fields accept seconds as numbers or strings
+such as `3600s`, `60m`, `2h`, and `1d`.
 
 Single relay:
 
