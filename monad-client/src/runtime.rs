@@ -11,7 +11,7 @@ use monad_common::config::MonadConfig;
 use monad_common::session::RelayConnection;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -20,6 +20,14 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const INITIAL_RECONNECT_BACKOFF_MS: u64 = 250;
 const MAX_RECONNECT_BACKOFF_MS: u64 = 5_000;
 const ROUTE_CONNECT_TIMEOUT_MS: u64 = 5_000;
+
+#[derive(Debug, Default)]
+struct ChannelDetachStats {
+    scanned: usize,
+    matched: usize,
+    detached: usize,
+    failed: usize,
+}
 
 /// Run a configured client until the shutdown signal fires or the route cannot
 /// be rebuilt after the maximum number of reconnect attempts.
@@ -99,14 +107,37 @@ where
 
     loop {
         if attempt > 0 {
-            info!("route reconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS}");
+            info!(
+                attempt,
+                max_attempts = MAX_RECONNECT_ATTEMPTS,
+                hops = route.hops().len(),
+                backoff_ms,
+                "route reconnect attempt"
+            );
             if let Err(err) = runtime.reset_first_hop_quic_pool() {
                 warn!("failed to reset QUIC pool before reconnect: {err}");
+            } else {
+                info!(attempt, "reset first-hop QUIC pool before reconnect");
             }
             // Detach any channels still linked to a previous session so the
             // next session can re-link or provision fresh channels.
-            detach_all_channels(&wallet);
+            let detach_stats = detach_all_channels(&wallet);
+            info!(
+                attempt,
+                scanned = detach_stats.scanned,
+                matched = detach_stats.matched,
+                detached = detach_stats.detached,
+                failed = detach_stats.failed,
+                "detached channels before full route reconnect"
+            );
         }
+
+        info!(
+            attempt,
+            hops = route.hops().len(),
+            timeout_ms = ROUTE_CONNECT_TIMEOUT_MS,
+            "connecting route"
+        );
 
         match tokio::time::timeout(
             Duration::from_millis(ROUTE_CONNECT_TIMEOUT_MS),
@@ -157,18 +188,52 @@ where
                         break;
                     };
 
-                    warn!(hop = hop_idx + 1, "route failed at funded hop");
+                    let failure_path = if hop_idx == 0 {
+                        "full_reconnect"
+                    } else {
+                        "suffix_rebuild"
+                    };
+                    warn!(
+                        hop = hop_idx + 1,
+                        hops = hop_count,
+                        funded_hops = funded_hop_count,
+                        path = failure_path,
+                        "route failed at funded hop"
+                    );
                     let _ = conn_tx.send(None);
 
                     if hop_idx == 0 {
+                        warn!(
+                            hop = hop_idx + 1,
+                            "first-hop failure requires full route reconnect"
+                        );
                         active_route.close().await;
                         break;
                     }
 
                     // Prefix sessions stay active across a suffix rebuild, so
                     // only detach channels linked to sessions that will close.
+                    let preserved_hops = hop_idx;
+                    let suffix_hops = hop_count - hop_idx;
                     let suffix_session_ids = active_route.suffix_session_ids_from(hop_idx);
-                    detach_channels_for_sessions(&wallet, &suffix_session_ids);
+                    info!(
+                        hop = hop_idx + 1,
+                        preserved_hops,
+                        suffix_hops,
+                        suffix_sessions = suffix_session_ids.len(),
+                        "starting route suffix rebuild"
+                    );
+                    let detach_stats = detach_channels_for_sessions(&wallet, &suffix_session_ids);
+                    info!(
+                        hop = hop_idx + 1,
+                        scanned = detach_stats.scanned,
+                        matched = detach_stats.matched,
+                        detached = detach_stats.detached,
+                        failed = detach_stats.failed,
+                        suffix_sessions = suffix_session_ids.len(),
+                        "detached suffix channels before route rebuild"
+                    );
+                    let rebuild_started = Instant::now();
                     match rebuild_route_from_with_runtime(
                         route,
                         &runtime,
@@ -178,13 +243,22 @@ where
                     .await
                     {
                         Ok(rebuilt_route) => {
-                            info!(hop = hop_idx + 1, "route suffix rebuilt");
+                            info!(
+                                hop = hop_idx + 1,
+                                preserved_hops,
+                                rebuilt_hops = suffix_hops,
+                                elapsed_ms = rebuild_started.elapsed().as_millis(),
+                                "route suffix rebuilt"
+                            );
                             active_route = rebuilt_route;
                             continue;
                         }
                         Err(err) => {
                             warn!(
                                 hop = hop_idx + 1,
+                                preserved_hops,
+                                suffix_hops,
+                                elapsed_ms = rebuild_started.elapsed().as_millis(),
                                 "route suffix rebuild failed; falling back to full route rebuild: {err}"
                             );
                             break;
@@ -214,18 +288,24 @@ where
     }
 }
 
-fn detach_all_channels(wallet: &Arc<dyn MonadWallet>) {
+fn detach_all_channels(wallet: &Arc<dyn MonadWallet>) -> ChannelDetachStats {
+    let mut stats = ChannelDetachStats::default();
     match wallet.list_channels() {
         Ok(channels) => {
+            stats.scanned = channels.len();
             for channel in channels {
                 if channel.state == WalletChannelState::Open
                     && channel.attached_session_id.is_some()
                 {
+                    stats.matched += 1;
                     if let Err(err) = wallet.force_detach_channel(&channel.channel_id) {
+                        stats.failed += 1;
                         warn!(
                             channel_id = %channel.channel_id,
                             "failed to detach channel from previous session: {err}"
                         );
+                    } else {
+                        stats.detached += 1;
                     }
                 }
             }
@@ -234,26 +314,36 @@ fn detach_all_channels(wallet: &Arc<dyn MonadWallet>) {
             warn!("failed to list channels for detach: {err}");
         }
     }
+    stats
 }
 
-fn detach_channels_for_sessions(wallet: &Arc<dyn MonadWallet>, session_ids: &[[u8; 32]]) {
+fn detach_channels_for_sessions(
+    wallet: &Arc<dyn MonadWallet>,
+    session_ids: &[[u8; 32]],
+) -> ChannelDetachStats {
     if session_ids.is_empty() {
-        return;
+        return ChannelDetachStats::default();
     }
 
+    let mut stats = ChannelDetachStats::default();
     match wallet.list_channels() {
         Ok(channels) => {
+            stats.scanned = channels.len();
             for channel in channels {
                 if channel.state == WalletChannelState::Open
                     && channel
                         .attached_session_id
                         .is_some_and(|session_id| session_ids.contains(&session_id))
                 {
+                    stats.matched += 1;
                     if let Err(err) = wallet.force_detach_channel(&channel.channel_id) {
+                        stats.failed += 1;
                         warn!(
                             channel_id = %channel.channel_id,
                             "failed to detach suffix channel from previous session: {err}"
                         );
+                    } else {
+                        stats.detached += 1;
                     }
                 }
             }
@@ -262,6 +352,7 @@ fn detach_channels_for_sessions(wallet: &Arc<dyn MonadWallet>, session_ids: &[[u
             warn!("failed to list channels for suffix detach: {err}");
         }
     }
+    stats
 }
 
 pub async fn run_socks_listener(
