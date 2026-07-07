@@ -623,6 +623,9 @@ mod tests {
     use monad_common::blinded_hop::BlindedHopMessage;
     use monad_common::bootstrap::initial_server_capabilities;
     use monad_common::secp_identity::SecpTransportKeypair;
+    use std::time::Duration;
+    use tokio::sync::watch;
+    use tokio::time::{sleep, timeout};
 
     fn sample_pubkey(seed: u8) -> Secp256k1Pubkey {
         SecpTransportKeypair::from_secret_bytes(&[seed; 32])
@@ -640,8 +643,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn capability_check_hard_fails_when_next_hop_requires_missing_flag() {
+    async fn test_relay_connection(session_seed: u8) -> RelayConnection {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            let Ok(mut h2) = h2::server::handshake(server_io).await else {
+                return;
+            };
+            while let Some(result) = h2.accept().await {
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+        let (mut conn, driver) =
+            RelayConnection::from_transport_stream(client_io, [session_seed; 32])
+                .await
+                .unwrap();
+        conn.add_driver(driver);
+        conn.add_task(server_handle);
+        conn
+    }
+
+    async fn test_route_with_connections(conns: Vec<RelayConnection>) -> RouteConnection {
+        let hop_count = conns.len();
+        let mut conns = conns.into_iter().map(Arc::new).collect::<Vec<_>>();
+        let final_conn = conns.pop().expect("test route requires at least one hop");
+        let hops = (0..hop_count)
+            .map(|hop_idx| RouteHopConnection {
+                hop_idx,
+                label: format!("test hop {hop_idx}"),
+                session_id: [hop_idx as u8; 32],
+                funded: true,
+            })
+            .collect();
+        RouteConnection {
+            final_conn,
+            prefix_conns: conns,
+            hops,
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_check_hard_fails_when_next_hop_requires_missing_flag() {
         let route = Route::new(vec![
             RouteHop::Cleartext {
                 addr: "127.0.0.1:9000".to_string(),
@@ -659,5 +702,65 @@ mod tests {
         let err = ensure_next_hop_capabilities(&route, 0, &capabilities).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("cannot forward"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_failure_returns_none_with_no_watchers() {
+        let route = test_route_with_connections(vec![test_relay_connection(1).await]).await;
+
+        let failed_hop = timeout(Duration::from_secs(1), route.wait_for_failure_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(failed_hop, None);
+        route.close().await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_failure_reports_single_failed_hop() {
+        let mut hop0 = test_relay_connection(1).await;
+        let mut hop1 = test_relay_connection(2).await;
+        let (_hop0_tx, hop0_rx) = watch::channel(false);
+        let (hop1_tx, hop1_rx) = watch::channel(false);
+        hop0.add_failure_watcher(0, hop0_rx);
+        hop1.add_failure_watcher(1, hop1_rx);
+        let route = test_route_with_connections(vec![hop0, hop1]).await;
+
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            let _ = hop1_tx.send(true);
+        });
+
+        let failed_hop = timeout(Duration::from_secs(1), route.wait_for_failure_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(failed_hop, Some(1));
+        route.close().await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_failure_debounces_and_reports_lowest_failed_hop() {
+        let mut hop0 = test_relay_connection(1).await;
+        let mut hop1 = test_relay_connection(2).await;
+        let (hop0_tx, hop0_rx) = watch::channel(false);
+        let (hop1_tx, hop1_rx) = watch::channel(false);
+        hop0.add_failure_watcher(0, hop0_rx);
+        hop1.add_failure_watcher(1, hop1_rx);
+        let route = test_route_with_connections(vec![hop0, hop1]).await;
+
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            let _ = hop1_tx.send(true);
+            sleep(Duration::from_millis(10)).await;
+            let _ = hop0_tx.send(true);
+        });
+
+        let failed_hop = timeout(Duration::from_secs(1), route.wait_for_failure_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(failed_hop, Some(0));
+        route.close().await;
     }
 }
