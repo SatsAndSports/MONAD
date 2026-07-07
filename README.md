@@ -31,9 +31,8 @@ Implemented today:
 - integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
 
 Not implemented yet:
-- usable `monad-client` CLI runtime wired to the SQLite client wallet
 - user-facing client wallet commands for mint quotes, proof minting, and richer balances
-- persistent route configuration file
+- automated startup recovery policy for configured clients before SOCKS accepts traffic
 
 ## Relay Wallet
 
@@ -162,7 +161,7 @@ monad-client wallet \
 
 Add `--json` to wallet commands for machine-readable output.
 
-Remaining client-wallet work is operator/user experience rather than the core channel-payment library path: mint quote/mint commands, startup wiring for SOCKS operation in `monad-client`, richer proof balance inspection, and close/sweep flows.
+Remaining client-wallet work is operator/user experience rather than the core channel-payment library path: mint quote/mint commands, startup recovery policy before SOCKS operation, richer proof balance inspection, and close/sweep flows.
 
 ## Workspace
 
@@ -389,7 +388,7 @@ RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop2
 
 `monad-client wallet ...` exposes explicit-flag wallet inspection and recovery
 commands. `monad-client run --config monad.yaml --client local` starts the
-configured QUIC route and binds the configured SOCKS5 listener.
+configured route and binds the configured SOCKS5 listener.
 
 Configured client:
 
@@ -397,37 +396,61 @@ Configured client:
 RUST_LOG=info cargo run -p monad-client -- run --config monad.yaml --client local
 ```
 
-Direct connection:
+Direct connection route:
 
-```bash
-RUST_LOG=info cargo run -p monad-client -- \
-  --hop 127.0.0.1:9050,secp256k1:<SERVER_SECP256K1_PUBKEY> \
-  --socks 127.0.0.1:1080
+```yaml
+clients:
+  - name: local
+    socks: 127.0.0.1:1080
+    route:
+      - addr: 127.0.0.1:9050
+        pubkey: "<SERVER_SECP256K1_PUBKEY>"
 ```
 
-Three-hop chain:
+Three-hop route:
 
-```bash
-RUST_LOG=info cargo run -p monad-client -- \
-  --hop 127.0.0.1:9051,secp256k1:<HOP1_SECP_PUB> \
-  --hop 127.0.0.1:9052,secp256k1:<HOP2_SECP_PUB> \
-  --hop 127.0.0.1:9053,secp256k1:<HOP3_SECP_PUB> \
-  --socks 127.0.0.1:1080
+```yaml
+clients:
+  - name: local
+    socks: 127.0.0.1:1080
+    route:
+      - addr: 127.0.0.1:9051
+        pubkey: "<HOP1_SECP_PUB>"
+      - addr: 127.0.0.1:9052
+        pubkey: "<HOP2_SECP_PUB>"
+      - addr: 127.0.0.1:9053
+        pubkey: "<HOP3_SECP_PUB>"
 ```
 
-The eventual client runtime will listen locally as a SOCKS5 proxy on
-`127.0.0.1:1080` by default.
+The configured client listens locally as a SOCKS5 proxy at the address in
+`clients[].socks`.
 
-QUIC hops:
+Configured routes currently use QUIC for every hop:
 
-```bash
-RUST_LOG=info cargo run -p monad-client -- \
-  --hop 127.0.0.1:9051,secp256k1:<HOP1_SECP_PUB> \
-  --hop quic:127.0.0.1:9052,secp256k1:<HOP2_SECP_PUB> \
-  --socks 127.0.0.1:1080
+```yaml
+clients:
+  - name: local
+    socks: 127.0.0.1:1080
+    route:
+      - addr: 127.0.0.1:9051
+        pubkey: "<HOP1_SECP_PUB>"
+      - addr: 127.0.0.1:9052
+        pubkey: "<HOP2_SECP_PUB>"
 ```
 
-The `quic:` prefix tells the client to instruct the previous hop to connect via QUIC instead of TCP. The `monad-client` binary uses explicit `secp256k1:<pubkey>` transport identities for both QUIC and non-QUIC hops. See `ARCHITECTURE.md` for the full layering model.
+For non-first hops, the previous relay connects via QUIC instead of TCP. The
+configured client uses secp256k1 transport identities for QUIC hop
+authentication. See `ARCHITECTURE.md` for the full layering model.
+
+When a funded hop fails, the configured client temporarily withdraws the active
+route from the SOCKS listener. Existing application streams fail; new SOCKS
+connections wait for the route manager to publish a rebuilt route. A first-hop
+failure triggers a full reconnect. Later-hop failures detach only channels tied
+to the old suffix sessions and try to rebuild from the failed hop, preserving
+the unaffected prefix when possible; suffix rebuild failure falls back to a full
+route reconnect. The client does not run concurrent rebuilds; failures observed
+during an in-flight rebuild are treated as stale and ignored until the rebuilt
+route is active.
 
 QUIC first hop:
 

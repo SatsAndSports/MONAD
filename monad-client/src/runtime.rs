@@ -62,7 +62,7 @@ where
         client = %client.name,
         socks = %client.socks,
         hops = route.hops().len(),
-        "connecting configured QUIC route"
+        "connecting configured route"
     );
 
     let listener = TcpListener::bind(&client.socks).await?;
@@ -165,6 +165,8 @@ where
                         break;
                     }
 
+                    // Prefix sessions stay active across a suffix rebuild, so
+                    // only detach channels linked to sessions that will close.
                     let suffix_session_ids = active_route.suffix_session_ids_from(hop_idx);
                     detach_channels_for_sessions(&wallet, &suffix_session_ids);
                     match rebuild_route_from_with_runtime(

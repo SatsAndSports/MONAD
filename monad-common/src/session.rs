@@ -309,6 +309,7 @@ impl RelayConnection {
         self.failure_watchers.lock().unwrap().push((hop_idx, rx));
     }
 
+    /// Return whether this connection has funded-hop failure watchers.
     pub fn has_failure_watchers(&self) -> bool {
         !self.failure_watchers.lock().unwrap().is_empty()
     }

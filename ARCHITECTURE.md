@@ -46,7 +46,7 @@ Important types:
 Responsibilities:
 - parse local SOCKS5 requests
 - build a single-hop or multi-hop MONAD chain
-- expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers`) through the library; the binary entrypoint is gated until wallet config and funding UX are wired in
+- expose a local SOCKS5 listener for normal tools (`curl`, `ssh`, `scp`, browsers`) through the configured-client binary path
 - open H2 `CONNECT` streams to final targets
 - run one payment/session driver per relay session
 - keep a shared wallet across relay sessions
@@ -253,6 +253,34 @@ The client preserves that hostname and sends it through the hop chain unchanged.
 This means:
 - local machine DNS is avoided
 - only the final hop sees the real hostname
+
+## Configured Client Route Rebuilds
+
+The configured client owns a `RouteConnection`, not just the final hop. That
+handle keeps the final `RelayConnection`, all prefix hop connections, and per-hop
+session metadata together so route failures can be handled at hop granularity.
+
+Each funded hop has a session/payment driver failure watcher. When one or more
+watchers fire, the route manager briefly debounces the signals and treats the
+lowest failed hop index as authoritative. This collapses cascaded failures where
+a broken middle hop also causes downstream sessions to end.
+
+Route rebuilds are serialized. Once a rebuild starts, old-route watchers are
+dropped; additional stale failures from that old route are ignored. The rebuilt
+route installs fresh watchers after it is published.
+
+Failure handling is deliberately scoped:
+
+- hop `0` failure closes the whole route and uses the normal reconnect loop
+- hop `N > 0` failure temporarily withdraws the route from SOCKS, detaches only
+  wallet channels attached to old suffix session IDs, and attempts to rebuild
+  from hop `N`
+- suffix rebuild preserves prefix sessions and channels before the failed hop
+- suffix rebuild failure falls back to a full route reconnect
+
+Active application streams are not migrated across rebuilds. Existing SOCKS
+connections fail while the route is unavailable; new SOCKS connections use the
+next route published by the manager.
 
 ## IPv6 Support
 
@@ -552,8 +580,9 @@ retry is skipped if refresh still selects the same output keyset.
 
 The reusable wallet library path exists, and `monad-client wallet ...` exposes
 explicit-flag token import, proof/channel inspection, and recovery commands. The
-normal SOCKS runtime remains gated until wallet configuration, mint quote/mint
-commands, and startup recovery policy are wired in.
+configured SOCKS runtime uses the persisted loose-proof and channel wallets from
+YAML. Remaining wallet UX work is mostly mint quote/mint commands, richer
+balance inspection, close/sweep flows, and startup recovery policy.
 
 ### Relay Wallet Layer
 
@@ -1245,8 +1274,7 @@ The full QUIC transport chain is implemented and tested:
 
 ## Current Limitations
 
-- `monad-client wallet ...` exposes explicit-flag token import, available-proof listing, channel inspection, and recovery commands, but the SOCKS runtime is not yet wired to persisted wallet configuration.
 - client wallet funding UX is not yet fully wired: mint quotes, premint submission, richer proof balance inspection, and client close/sweep flows still need commands.
-- no persistent route configuration file yet.
+- configured-client startup recovery policy is still explicit/operator-driven rather than automatic before SOCKS starts accepting traffic.
 - QUIC connection pool does not yet handle connection eviction or stale entry cleanup.
 - asymmetric pricing (rates other than 1/1) is not yet tested.

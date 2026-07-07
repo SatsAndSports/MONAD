@@ -65,6 +65,12 @@ pub struct RouteHopConnection {
     pub funded: bool,
 }
 
+const ROUTE_FAILURE_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Owns every established hop in a route, not only the final hop.
+///
+/// Keeping prefix connections alive lets configured clients rebuild a failed
+/// suffix without tearing down unaffected prefix sessions or their channels.
 pub struct RouteConnection {
     final_conn: Arc<RelayConnection>,
     prefix_conns: Vec<Arc<RelayConnection>>,
@@ -149,7 +155,6 @@ impl RouteConnection {
                 return None;
             }
 
-            const DEBOUNCE: Duration = Duration::from_millis(100);
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
             let mut tasks = JoinSet::new();
             for conn in conns {
@@ -163,7 +168,9 @@ impl RouteConnection {
 
             let mut min_hop = rx.recv().await?;
 
-            let deadline = tokio::time::Instant::now() + DEBOUNCE;
+            // A middle-hop failure often cascades into downstream session
+            // failures. Debounce briefly and rebuild from the lowest failed hop.
+            let deadline = tokio::time::Instant::now() + ROUTE_FAILURE_DEBOUNCE;
             loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
@@ -226,12 +233,15 @@ pub async fn connect_route_with_runtime(
     connect_route_internal(route, runtime.clone(), true).await
 }
 
+/// Build a route, optionally preserving the prefix before `start_hop_idx` from
+/// `old_route` and rebuilding only the suffix from that hop onward.
 pub async fn rebuild_route_from_with_runtime(
     route: &Route,
     runtime: &ConnectorRuntime,
     old_route: Option<RouteConnection>,
     start_hop_idx: usize,
 ) -> io::Result<RouteConnection> {
+    // Rebuilding from hop 0 is equivalent to a normal full-route reconnect.
     if start_hop_idx == 0 {
         if let Some(old_route) = old_route {
             old_route.close().await;
@@ -256,6 +266,9 @@ pub async fn rebuild_route_from_with_runtime(
             "suffix rebuild requires an existing route",
         )
     })?;
+
+    // Suffix rebuild only applies when the route shape is unchanged. Route
+    // config changes should use a full reconnect so hop metadata cannot drift.
     if old_route.hop_count() != route.hops().len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

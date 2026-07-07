@@ -36,7 +36,7 @@ cargo run -p monad-quic -- ...
   - wallet abstraction and mock wallet (`wallet.rs`)
   - SQLite-backed channel wallet (`sqlite_client_wallet.rs`), loose proof custody (`loose_proof_wallet.rs`), proof selection (`proof_selection.rs`)
   - tunnel proxying (`tunnel.rs`)
-  - binary currently exits early until wallet config/funding UX is wired in
+  - binary supports `run --config ...` for configured QUIC SOCKS clients backed by persisted wallets; manual `--hop` mode is not wired to the production wallet
 - `monad-relay`
   - reusable library code plus binary entrypoint
   - YAML config loading with env-var / `.env` substitution (`config.rs`)
@@ -88,7 +88,8 @@ cargo run -p monad-quic -- ...
 - the main client no longer needs frequent `GetSessionStatus` polling for payment sizing; the relay stress harness and `monad-test-client` still poll periodically for load generation, health checks, and observability.
 - `SqliteClientWallet` provisions real upstream Spilman channels from loose proofs, stores MONAD channel metadata, persists ambiguous opening recovery, and uses cache-first active output-keyset selection with refresh/retry only after retryable keyset mint errors.
 - `connector.rs` uses `MockWallet` + `session_driver` for default test/harness flows so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` control path.
-- the `monad-client` binary intentionally exits early until wallet config, mint-funding UX, startup recovery, and SOCKS runtime wiring are implemented.
+- the `monad-client` binary can run configured QUIC SOCKS routes from YAML with persisted wallet config; manual `--hop` mode still exits before SOCKS because it is not wired to the production wallet.
+- configured-client route failures are handled at hop granularity: first-hop failure does a full reconnect, later-hop failure tries a suffix rebuild that preserves prefix sessions/channels, and suffix rebuild failure falls back to a full reconnect. Rebuilds are serialized; stale failures from the old route during an in-flight rebuild are ignored.
 - relay-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
 
 ### QUIC Transport
