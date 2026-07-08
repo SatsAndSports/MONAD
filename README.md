@@ -96,6 +96,7 @@ Inspect the shared relay-wallet DB:
 monad-relay wallet --config monad.yaml --relay relay-a list
 monad-relay wallet --config monad.yaml --relay relay-a show
 monad-relay wallet --config monad.yaml --relay relay-a channels
+monad-relay wallet --config monad.yaml --relay relay-a expiring-channels
 monad-relay wallet --wallet-db-path /var/lib/monad/relay.db close --channel-id <channel-id>
 monad-relay wallet --config monad.yaml --relay relay-a drains
 monad-relay wallet --config monad.yaml --relay relay-a drain --mint-url https://dev.mint.camelus.app --unit sat

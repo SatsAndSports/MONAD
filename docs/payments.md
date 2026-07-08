@@ -92,6 +92,9 @@ by relay wallet detection to report `Open` and `Closing` channels that are close
 to expiry. The automatic close-before-expiry worker is intentionally separate
 future work.
 
+Operators can inspect the current close-to-expiry set with
+`monad-relay wallet --config monad.yaml --relay <name> expiring-channels`.
+
 ## Client Keyset Model
 
 The client wallet has the same cache-first shape for channel-opening swaps.

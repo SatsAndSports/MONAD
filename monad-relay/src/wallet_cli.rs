@@ -4,10 +4,13 @@
 //! channels, and closing channels.  Output is human-readable by default and
 //! JSON with `--json`.
 
-use crate::wallet_manager::{ChannelSummary, DrainSummary, DrainSwapResult, RelayWalletManager};
+use crate::wallet_manager::{
+    ChannelSummary, DrainSummary, DrainSwapResult, ExpiringChannelSummary, RelayWalletManager,
+};
 use clap::{Parser, Subcommand};
-use monad_common::config::MonadConfig;
+use monad_common::config::{MonadConfig, RelayChannelPolicyConfig};
 use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 pub struct WalletArgs {
@@ -46,6 +49,13 @@ pub enum WalletCommand {
 
     /// List channels for a relay identity.
     Channels {
+        /// Relay identity name.  Required when using `--wallet-db-path`.
+        #[arg(long)]
+        wallet_name: Option<String>,
+    },
+
+    /// List Open / Closing channels that are close to expiry.
+    ExpiringChannels {
         /// Relay identity name.  Required when using `--wallet-db-path`.
         #[arg(long)]
         wallet_name: Option<String>,
@@ -136,6 +146,22 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                 print_json(&channels)?;
             } else {
                 print_channels(&channels);
+            }
+        }
+        WalletCommand::ExpiringChannels {
+            wallet_name: ref name_opt,
+        } => {
+            let name = resolve_wallet_name(&args, name_opt.clone())?;
+            let close_before_expiry_secs = resolve_close_before_expiry_secs(&args)?;
+            let channels = manager.close_to_expiry_channels(
+                Some(&name),
+                now_seconds(),
+                close_before_expiry_secs,
+            )?;
+            if args.json {
+                print_json(&channels)?;
+            } else {
+                print_expiring_channels(&channels, close_before_expiry_secs);
             }
         }
         WalletCommand::Close { channel_id } => {
@@ -240,6 +266,23 @@ fn resolve_wallet_name(args: &WalletArgs, explicit: Option<String>) -> anyhow::R
     ))
 }
 
+fn resolve_close_before_expiry_secs(args: &WalletArgs) -> anyhow::Result<u64> {
+    if let Some(config_path) = &args.config {
+        let config = MonadConfig::load(config_path)?;
+        let relay = config.select_relay(args.relay.as_deref())?;
+        Ok(relay.channel_policy.close_before_expiry_secs)
+    } else {
+        Ok(RelayChannelPolicyConfig::default().close_before_expiry_secs)
+    }
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 fn print_channels(channels: &[ChannelSummary]) {
     if channels.is_empty() {
         println!("No channels.");
@@ -261,6 +304,49 @@ fn print_channels(channels: &[ChannelSummary]) {
             c.balance_raw
         );
     }
+}
+
+fn print_expiring_channels(channels: &[ExpiringChannelSummary], close_before_expiry_secs: u64) {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    write_expiring_channels(&mut handle, channels, close_before_expiry_secs)
+        .expect("stdout write failed");
+}
+
+fn write_expiring_channels<W: Write>(
+    mut out: W,
+    channels: &[ExpiringChannelSummary],
+    close_before_expiry_secs: u64,
+) -> anyhow::Result<()> {
+    if channels.is_empty() {
+        writeln!(
+            out,
+            "No channels expiring within {close_before_expiry_secs}s."
+        )?;
+        return Ok(());
+    }
+    writeln!(out, "Channels expiring within {close_before_expiry_secs}s:")?;
+    writeln!(
+        out,
+        "{:<44} {:<8} {:<32} {:<6} {:>10} {:>10} {:>12} {:>12}",
+        "CHANNEL ID", "STATE", "MINT", "UNIT", "CAPACITY", "BALANCE", "EXPIRES_AT", "SECONDS_LEFT"
+    )?;
+    for c in channels {
+        let state = format!("{:?}", c.state);
+        writeln!(
+            out,
+            "{:<44} {:<8} {:<32} {:<6} {:>10} {:>10} {:>12} {:>12}",
+            c.channel_id,
+            state,
+            truncate(&c.mint_url, 32),
+            c.unit,
+            c.capacity_raw,
+            c.balance_raw,
+            c.expiry_timestamp,
+            c.seconds_until_expiry
+        )?;
+    }
+    Ok(())
 }
 
 fn print_drains(drains: &[DrainSummary]) {
@@ -314,4 +400,49 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     serde_json::to_writer_pretty(&mut handle, value)?;
     writeln!(handle)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cdk_spilman::ChannelState;
+
+    #[test]
+    fn write_expiring_channels_includes_close_window_and_channel_fields() {
+        let channels = vec![ExpiringChannelSummary {
+            channel_id: "channel-1".to_string(),
+            relay_name: "relay-a".to_string(),
+            receiver_pubkey_hex: "receiver".to_string(),
+            state: ChannelState::Open,
+            mint_url: "https://example.com/very/long/mint/url".to_string(),
+            unit: "sat".to_string(),
+            expiry_timestamp: 1234,
+            seconds_until_expiry: 55,
+            capacity_raw: 100,
+            balance_raw: 42,
+        }];
+        let mut out = Vec::new();
+
+        write_expiring_channels(&mut out, &channels, 60).unwrap();
+
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Channels expiring within 60s"));
+        assert!(out.contains("channel-1"));
+        assert!(out.contains("Open"));
+        assert!(out.contains("sat"));
+        assert!(out.contains("1234"));
+        assert!(out.contains("55"));
+    }
+
+    #[test]
+    fn write_expiring_channels_reports_empty_set() {
+        let mut out = Vec::new();
+
+        write_expiring_channels(&mut out, &[], 3600).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "No channels expiring within 3600s.\n"
+        );
+    }
 }
