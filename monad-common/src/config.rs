@@ -189,16 +189,37 @@ impl MonadConfig {
                     relay.name
                 );
             }
-            if relay.channel_policy.close_before_expiry_secs == 0 {
+            if relay
+                .channel_policy
+                .expiring_channels
+                .close_before_expiry_secs
+                == 0
+            {
                 anyhow::bail!(
-                    "relay '{}' channel_policy.close_before_expiry must be greater than zero",
+                    "relay '{}' channel_policy.expiring_channels.close_before_expiry must be greater than zero",
                     relay.name
                 );
             }
-            if relay.channel_policy.close_before_expiry_secs < relay.channel_policy.min_expiry_secs
+            if relay
+                .channel_policy
+                .expiring_channels
+                .close_before_expiry_secs
+                < relay.channel_policy.min_expiry_secs
             {
                 anyhow::bail!(
-                    "relay '{}' channel_policy.close_before_expiry must be greater than or equal to channel_policy.min_expiry",
+                    "relay '{}' channel_policy.expiring_channels.close_before_expiry must be greater than or equal to channel_policy.min_expiry",
+                    relay.name
+                );
+            }
+            if relay
+                .channel_policy
+                .expiring_channels
+                .auto_close
+                .interval_secs
+                == 0
+            {
+                anyhow::bail!(
+                    "relay '{}' channel_policy.expiring_channels.auto_close.interval must be greater than zero",
                     relay.name
                 );
             }
@@ -347,12 +368,8 @@ pub struct RelayChannelPolicyConfig {
         deserialize_with = "deserialize_optional_amount_msats"
     )]
     pub max_amount_per_output_msats: Option<u64>,
-    #[serde(
-        default = "default_close_channel_before_expiry_secs",
-        rename = "close_before_expiry",
-        deserialize_with = "deserialize_duration_secs"
-    )]
-    pub close_before_expiry_secs: u64,
+    #[serde(default)]
+    pub expiring_channels: RelayExpiringChannelsConfig,
 }
 
 impl Default for RelayChannelPolicyConfig {
@@ -361,7 +378,51 @@ impl Default for RelayChannelPolicyConfig {
             min_expiry_secs: default_min_channel_expiry_secs(),
             min_capacity_msats: default_min_channel_capacity_msats(),
             max_amount_per_output_msats: None,
+            expiring_channels: RelayExpiringChannelsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayExpiringChannelsConfig {
+    #[serde(
+        default = "default_close_channel_before_expiry_secs",
+        rename = "close_before_expiry",
+        deserialize_with = "deserialize_duration_secs"
+    )]
+    pub close_before_expiry_secs: u64,
+
+    #[serde(default)]
+    pub auto_close: RelayExpiringChannelsAutoCloseConfig,
+}
+
+impl Default for RelayExpiringChannelsConfig {
+    fn default() -> Self {
+        Self {
             close_before_expiry_secs: default_close_channel_before_expiry_secs(),
+            auto_close: RelayExpiringChannelsAutoCloseConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayExpiringChannelsAutoCloseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(
+        default = "default_auto_close_interval_secs",
+        rename = "interval",
+        deserialize_with = "deserialize_duration_secs"
+    )]
+    pub interval_secs: u64,
+}
+
+impl Default for RelayExpiringChannelsAutoCloseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_auto_close_interval_secs(),
         }
     }
 }
@@ -405,6 +466,10 @@ fn default_min_channel_capacity_msats() -> u64 {
 
 fn default_close_channel_before_expiry_secs() -> u64 {
     86_400
+}
+
+fn default_auto_close_interval_secs() -> u64 {
+    3_600
 }
 
 fn deserialize_duration_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -705,8 +770,26 @@ clients:
             None
         );
         assert_eq!(
-            config.relays[0].channel_policy.close_before_expiry_secs,
+            config.relays[0]
+                .channel_policy
+                .expiring_channels
+                .close_before_expiry_secs,
             86_400
+        );
+        assert!(
+            !config.relays[0]
+                .channel_policy
+                .expiring_channels
+                .auto_close
+                .enabled
+        );
+        assert_eq!(
+            config.relays[0]
+                .channel_policy
+                .expiring_channels
+                .auto_close
+                .interval_secs,
+            3_600
         );
         assert_eq!(config.clients[0].route[0].addr, "127.10.0.11:9050");
     }
@@ -715,7 +798,7 @@ clients:
     fn parse_relay_channel_policy() {
         let yaml = minimal_config_yaml().replace(
             "    trusted_mints:",
-            "    channel_policy:\n      min_expiry: 3600s\n      min_capacity: 1500msat\n      max_amount_per_output: 2sat\n      close_before_expiry: 2h\n    trusted_mints:",
+            "    channel_policy:\n      min_expiry: 3600s\n      min_capacity: 1500msat\n      max_amount_per_output: 2sat\n      expiring_channels:\n        close_before_expiry: 2h\n        auto_close:\n          enabled: true\n          interval: 30m\n    trusted_mints:",
         );
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         config.validate().unwrap();
@@ -723,34 +806,38 @@ clients:
         assert_eq!(policy.min_expiry_secs, 3_600);
         assert_eq!(policy.min_capacity_msats, 1_500);
         assert_eq!(policy.max_amount_per_output_msats, Some(2_000));
-        assert_eq!(policy.close_before_expiry_secs, 7_200);
+        assert_eq!(policy.expiring_channels.close_before_expiry_secs, 7_200);
+        assert!(policy.expiring_channels.auto_close.enabled);
+        assert_eq!(policy.expiring_channels.auto_close.interval_secs, 1_800);
     }
 
     #[test]
     fn parse_relay_channel_policy_duration_aliases() {
         let yaml = minimal_config_yaml().replace(
             "    trusted_mints:",
-            "    channel_policy:\n      min_expiry: 60m\n      min_capacity: 1sat\n      close_before_expiry: 1d\n    trusted_mints:",
+            "    channel_policy:\n      min_expiry: 60m\n      min_capacity: 1sat\n      expiring_channels:\n        close_before_expiry: 1d\n        auto_close:\n          interval: 1hour\n    trusted_mints:",
         );
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         config.validate().unwrap();
         let policy = &config.relays[0].channel_policy;
         assert_eq!(policy.min_expiry_secs, 3_600);
         assert_eq!(policy.min_capacity_msats, 1_000);
-        assert_eq!(policy.close_before_expiry_secs, 86_400);
+        assert_eq!(policy.expiring_channels.close_before_expiry_secs, 86_400);
+        assert_eq!(policy.expiring_channels.auto_close.interval_secs, 3_600);
     }
 
     #[test]
     fn parse_relay_channel_policy_numeric_duration_seconds() {
         let yaml = minimal_config_yaml().replace(
             "    trusted_mints:",
-            "    channel_policy:\n      min_expiry: 3600\n      min_capacity: 1sat\n      close_before_expiry: \"7200\"\n    trusted_mints:",
+            "    channel_policy:\n      min_expiry: 3600\n      min_capacity: 1sat\n      expiring_channels:\n        close_before_expiry: \"7200\"\n        auto_close:\n          interval: 1800\n    trusted_mints:",
         );
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         config.validate().unwrap();
         let policy = &config.relays[0].channel_policy;
         assert_eq!(policy.min_expiry_secs, 3_600);
-        assert_eq!(policy.close_before_expiry_secs, 7_200);
+        assert_eq!(policy.expiring_channels.close_before_expiry_secs, 7_200);
+        assert_eq!(policy.expiring_channels.auto_close.interval_secs, 1_800);
     }
 
     #[test]
@@ -775,11 +862,22 @@ clients:
     fn relay_channel_policy_rejects_close_window_below_min_expiry() {
         let yaml = minimal_config_yaml().replace(
             "    trusted_mints:",
-            "    channel_policy:\n      min_expiry: 2h\n      min_capacity: 1sat\n      close_before_expiry: 1h\n    trusted_mints:",
+            "    channel_policy:\n      min_expiry: 2h\n      min_capacity: 1sat\n      expiring_channels:\n        close_before_expiry: 1h\n    trusted_mints:",
         );
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("close_before_expiry"));
+    }
+
+    #[test]
+    fn relay_channel_policy_rejects_zero_auto_close_interval() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    channel_policy:\n      expiring_channels:\n        auto_close:\n          enabled: true\n          interval: 0\n    trusted_mints:",
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("auto_close.interval"));
     }
 
     #[test]

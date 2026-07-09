@@ -87,10 +87,11 @@ how much time must remain before the relay accepts a new `ChannelLink`.
 suffixes; the config stores them as millisats and converts them to the linked
 channel's raw unit before passing policy to upstream Spilman validation.
 
+Expiry maintenance settings live under `channel_policy.expiring_channels`.
 `close_before_expiry` is parsed and validated alongside link policy. It is used
 by relay wallet detection to report `Open` and `Closing` channels that are close
-to expiry. The automatic close-before-expiry worker is intentionally separate
-future work.
+to expiry. `auto_close.enabled` is disabled by default; `auto_close.interval`
+configures the opt-in periodic worker planned after the manual sweep path.
 
 Operators can inspect the current close-to-expiry set with
 `monad-relay wallet --config monad.yaml --relay <name> expiring-channels`.

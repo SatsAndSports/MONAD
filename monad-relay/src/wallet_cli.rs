@@ -379,19 +379,30 @@ fn find_expiring_channels_for_command(
         let mut channels = Vec::new();
         let mut max_close_before_expiry_secs = 0u64;
         for relay in &config.relays {
-            max_close_before_expiry_secs =
-                max_close_before_expiry_secs.max(relay.channel_policy.close_before_expiry_secs);
-            channels.extend(manager.find_expiring_channels(
-                Some(&relay.name),
-                now,
-                relay.channel_policy.close_before_expiry_secs,
-            )?);
+            max_close_before_expiry_secs = max_close_before_expiry_secs.max(
+                relay
+                    .channel_policy
+                    .expiring_channels
+                    .close_before_expiry_secs,
+            );
+            channels.extend(
+                manager.find_expiring_channels(
+                    Some(&relay.name),
+                    now,
+                    relay
+                        .channel_policy
+                        .expiring_channels
+                        .close_before_expiry_secs,
+                )?,
+            );
         }
         channels.sort_by_key(|channel| channel.seconds_until_expiry);
         return Ok((channels, max_close_before_expiry_secs));
     }
 
-    let close_before_expiry_secs = RelayChannelPolicyConfig::default().close_before_expiry_secs;
+    let close_before_expiry_secs = RelayChannelPolicyConfig::default()
+        .expiring_channels
+        .close_before_expiry_secs;
     let channels = manager.find_expiring_channels(None, now, close_before_expiry_secs)?;
     Ok((channels, close_before_expiry_secs))
 }
@@ -403,9 +414,14 @@ fn close_before_expiry_secs_for_relay(
     if let Some(config_path) = &args.config {
         let config = MonadConfig::load(config_path)?;
         let relay = config.select_relay(relay_name)?;
-        Ok(relay.channel_policy.close_before_expiry_secs)
+        Ok(relay
+            .channel_policy
+            .expiring_channels
+            .close_before_expiry_secs)
     } else {
-        Ok(RelayChannelPolicyConfig::default().close_before_expiry_secs)
+        Ok(RelayChannelPolicyConfig::default()
+            .expiring_channels
+            .close_before_expiry_secs)
     }
 }
 

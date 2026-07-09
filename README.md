@@ -72,7 +72,11 @@ relays:
       min_expiry: 1h
       min_capacity: 1msat
       max_amount_per_output: null
-      close_before_expiry: 24h
+      expiring_channels:
+        close_before_expiry: 24h
+        auto_close:
+          enabled: false
+          interval: 1h
 
 clients:
   - name: local
@@ -378,14 +382,16 @@ The pricing fields are required for every relay entry and must be greater than z
 `channel_policy` is optional. `min_expiry` rejects newly linked channels that do
 not have enough time left before expiry. `min_capacity` and
 `max_amount_per_output` use explicit `sat` or `msat` suffixes and are converted
-to the linked channel's raw unit before validation. `close_before_expiry`
-controls when existing `Open` / `Closing` relay channels are considered close to
-expiry for maintenance. `close-expiring-channels` closes all currently expiring
+to the linked channel's raw unit before validation.
+`expiring_channels.close_before_expiry` controls when existing `Open` /
+`Closing` relay channels are considered close to expiry for maintenance.
+`expiring_channels.auto_close` is disabled by default and reserves config for the
+periodic close worker. `close-expiring-channels` closes all currently expiring
 channels non-interactively, continues after individual failures, and exits
 non-zero if any close fails. Omit `--relay` / `--wallet-name` on
 `expiring-channels` or `close-expiring-channels` to scan all relay identities;
-human output is a flat list with a `RELAY` column. Duration fields accept
-seconds as numbers or strings such as `3600s`, `60m`, `2h`, and `1d`.
+human output is a flat list with a `RELAY` column. Duration fields accept seconds
+as numbers or strings such as `3600s`, `60m`, `2h`, and `1d`.
 
 Single relay:
 

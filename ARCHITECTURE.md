@@ -387,7 +387,7 @@ The client opens a control stream immediately after connecting. Once it receives
 
 The client stores each channel's expiry timestamp in local channel metadata and excludes already-expired channels from selection. If a relay rejects a link because the channel expiry is too soon or the capacity does not satisfy the relay's channel policy, the driver marks that channel globally unusable locally and selects or provisions another channel.
 
-Relay channel policy is configured per relay. Duration fields such as `min_expiry` and `close_before_expiry` accept human-readable strings like `3600s`, `60m`, `2h`, or `1d`. Capacity fields require explicit `sat` or `msat` suffixes; MONAD stores them internally as millisats and converts to the channel's raw unit before returning upstream Spilman `ChannelPolicy` values. Close-to-expiry detection currently reports `Open` and `Closing` channels whose expiry timestamp is inside `close_before_expiry`; the automatic close worker is a later step.
+Relay channel policy is configured per relay. Duration fields such as `min_expiry` and `expiring_channels.close_before_expiry` accept human-readable strings like `3600s`, `60m`, `2h`, or `1d`. Capacity fields require explicit `sat` or `msat` suffixes; MONAD stores them internally as millisats and converts to the channel's raw unit before returning upstream Spilman `ChannelPolicy` values. Close-to-expiry detection currently reports `Open` and `Closing` channels whose expiry timestamp is inside `expiring_channels.close_before_expiry`; `expiring_channels.auto_close` is opt-in config for the periodic close worker.
 
 The relay remains authoritative for:
 
