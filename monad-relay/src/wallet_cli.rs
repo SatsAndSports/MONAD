@@ -7,6 +7,7 @@
 use crate::wallet_manager::{
     ChannelSummary, DrainSummary, DrainSwapResult, ExpiringChannelSummary, RelayWalletManager,
 };
+use cdk_spilman::{CloseError, CloseSuccess};
 use clap::{Parser, Subcommand};
 use monad_common::config::{MonadConfig, RelayChannelPolicyConfig};
 use std::io::Write;
@@ -59,6 +60,17 @@ pub enum WalletCommand {
         /// Relay identity name.  Required when using `--wallet-db-path`.
         #[arg(long)]
         wallet_name: Option<String>,
+    },
+
+    /// Close Open / Closing channels that are close to expiry.
+    CloseExpiringChannels {
+        /// Relay identity name.  Required when using `--wallet-db-path`.
+        #[arg(long)]
+        wallet_name: Option<String>,
+
+        /// Show channels that would be closed without closing them.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Close a channel.  The owning relay identity is discovered from the
@@ -153,7 +165,7 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
         } => {
             let name = resolve_wallet_name(&args, name_opt.clone())?;
             let close_before_expiry_secs = resolve_close_before_expiry_secs(&args)?;
-            let channels = manager.close_to_expiry_channels(
+            let channels = manager.find_expiring_channels(
                 Some(&name),
                 now_seconds(),
                 close_before_expiry_secs,
@@ -162,6 +174,45 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                 print_json(&channels)?;
             } else {
                 print_expiring_channels(&channels, close_before_expiry_secs);
+            }
+        }
+        WalletCommand::CloseExpiringChannels {
+            wallet_name: ref name_opt,
+            dry_run,
+        } => {
+            let name = resolve_wallet_name(&args, name_opt.clone())?;
+            let close_before_expiry_secs = resolve_close_before_expiry_secs(&args)?;
+            let channels = manager.find_expiring_channels(
+                Some(&name),
+                now_seconds(),
+                close_before_expiry_secs,
+            )?;
+            if dry_run {
+                if args.json {
+                    print_json(&CloseExpiringChannelsResult::dry_run(
+                        close_before_expiry_secs,
+                        channels,
+                    ))?;
+                } else {
+                    println!("Dry run: no channels will be closed.");
+                    print_expiring_channels(&channels, close_before_expiry_secs);
+                }
+                return Ok(());
+            }
+
+            let result =
+                close_expiring_channels(&manager, channels, close_before_expiry_secs, !args.json)
+                    .await;
+            if args.json {
+                print_json(&result)?;
+            } else {
+                print_close_expiring_summary(&result);
+            }
+            if !result.failures.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "failed to close {} expiring channel(s)",
+                    result.failures.len()
+                ));
             }
         }
         WalletCommand::Close { channel_id } => {
@@ -233,6 +284,60 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn close_expiring_channels(
+    manager: &RelayWalletManager,
+    channels: Vec<ExpiringChannelSummary>,
+    close_before_expiry_secs: u64,
+    print_progress: bool,
+) -> CloseExpiringChannelsResult {
+    let mut result = CloseExpiringChannelsResult::new(close_before_expiry_secs, channels.len());
+    if print_progress {
+        if result.candidate_count == 0 {
+            println!(
+                "No channels expiring within {}s.",
+                result.close_before_expiry_secs
+            );
+        } else {
+            println!(
+                "Closing {} channel(s) expiring within {}s:",
+                result.candidate_count, result.close_before_expiry_secs
+            );
+        }
+    }
+    for channel in channels {
+        match manager.reqwest_networking_for_channel(&channel.channel_id) {
+            Ok(net) => match manager.close_channel(&channel.channel_id, &net).await {
+                Ok(close) => {
+                    if print_progress {
+                        print_close_expiring_success(&channel, &close);
+                    }
+                    result
+                        .closed
+                        .push(CloseExpiringChannelSuccess { channel, close });
+                }
+                Err(error) => {
+                    let error = close_error_summary(&error);
+                    if print_progress {
+                        print_close_expiring_failure(&channel, &error);
+                    }
+                    result
+                        .failures
+                        .push(CloseExpiringChannelFailure { error, channel });
+                }
+            },
+            Err(error) => {
+                if print_progress {
+                    print_close_expiring_failure(&channel, &error);
+                }
+                result
+                    .failures
+                    .push(CloseExpiringChannelFailure { channel, error });
+            }
+        }
+    }
+    result
 }
 
 fn resolve_wallet_db_path(args: &WalletArgs) -> anyhow::Result<String> {
@@ -313,6 +418,51 @@ fn print_expiring_channels(channels: &[ExpiringChannelSummary], close_before_exp
         .expect("stdout write failed");
 }
 
+fn print_close_expiring_success(channel: &ExpiringChannelSummary, close: &CloseSuccess) {
+    let status = if close.already_closed {
+        "already closed"
+    } else {
+        "closed"
+    };
+    println!(
+        "  ok    {} {} expires_in={} receiver_sum={} sender_sum={}",
+        channel.channel_id,
+        status,
+        format_duration(channel.seconds_until_expiry),
+        close.receiver_sum,
+        close.sender_sum
+    );
+}
+
+fn print_close_expiring_failure(channel: &ExpiringChannelSummary, error: &str) {
+    println!(
+        "  fail  {} expires_in={} mint={} error={}",
+        channel.channel_id,
+        format_duration(channel.seconds_until_expiry),
+        channel.mint_url,
+        error
+    );
+}
+
+fn print_close_expiring_summary(result: &CloseExpiringChannelsResult) {
+    if result.candidate_count == 0 {
+        return;
+    }
+    println!(
+        "Summary: candidates={} closed={} failed={}",
+        result.candidate_count,
+        result.closed.len(),
+        result.failures.len()
+    );
+    if !result.failures.is_empty() {
+        println!(
+            "WARNING: {} of {} expiring channel(s) failed to close.",
+            result.failures.len(),
+            result.candidate_count
+        );
+    }
+}
+
 fn write_expiring_channels<W: Write>(
     mut out: W,
     channels: &[ExpiringChannelSummary],
@@ -329,7 +479,7 @@ fn write_expiring_channels<W: Write>(
     writeln!(
         out,
         "{:<44} {:<8} {:<32} {:<6} {:>10} {:>10} {:>12} {:>12}",
-        "CHANNEL ID", "STATE", "MINT", "UNIT", "CAPACITY", "BALANCE", "EXPIRES_AT", "SECONDS_LEFT"
+        "CHANNEL ID", "STATE", "MINT", "UNIT", "CAPACITY", "BALANCE", "EXPIRES_AT", "EXPIRES_IN"
     )?;
     for c in channels {
         let state = format!("{:?}", c.state);
@@ -343,7 +493,7 @@ fn write_expiring_channels<W: Write>(
             c.capacity_raw,
             c.balance_raw,
             c.expiry_timestamp,
-            c.seconds_until_expiry
+            format_duration(c.seconds_until_expiry)
         )?;
     }
     Ok(())
@@ -394,6 +544,90 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+fn format_duration(seconds: i64) -> String {
+    let sign = if seconds < 0 { "-" } else { "" };
+    let abs = seconds.unsigned_abs();
+    if abs < 60 {
+        return format!("{sign}{abs}s");
+    }
+    let minutes = abs / 60;
+    let secs = abs % 60;
+    if minutes < 60 {
+        return format!("{sign}{minutes}m{secs:02}s");
+    }
+    let hours = minutes / 60;
+    let mins = minutes % 60;
+    format!("{sign}{hours}h{mins:02}m")
+}
+
+fn close_error_summary(error: &CloseError) -> String {
+    match error {
+        CloseError::ValidationFailed { reason, .. } => format!("validation failed: {reason}"),
+        CloseError::UnknownChannel { .. } => "unknown channel".to_string(),
+        CloseError::AlreadyClosed {
+            closed_balance,
+            requested_balance,
+            ..
+        } => format!(
+            "already closed: closed_balance={closed_balance} requested_balance={requested_balance}"
+        ),
+        CloseError::MintRejected { mint_error, .. } => format!("mint rejected: {mint_error}"),
+        CloseError::MintRejectedAfterRetry {
+            original_error,
+            retry_error,
+            ..
+        } => format!("mint rejected after retry: original={original_error} retry={retry_error}"),
+        CloseError::UnblindFailed { reason, .. } => format!("unblind failed: {reason}"),
+        CloseError::StorageFailed { reason, .. } => format!("storage failed: {reason}"),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CloseExpiringChannelsResult {
+    dry_run: bool,
+    close_before_expiry_secs: u64,
+    candidate_count: usize,
+    candidates: Vec<ExpiringChannelSummary>,
+    closed: Vec<CloseExpiringChannelSuccess>,
+    failures: Vec<CloseExpiringChannelFailure>,
+}
+
+impl CloseExpiringChannelsResult {
+    fn new(close_before_expiry_secs: u64, candidate_count: usize) -> Self {
+        Self {
+            dry_run: false,
+            close_before_expiry_secs,
+            candidate_count,
+            candidates: Vec::new(),
+            closed: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+
+    fn dry_run(close_before_expiry_secs: u64, candidates: Vec<ExpiringChannelSummary>) -> Self {
+        Self {
+            dry_run: true,
+            close_before_expiry_secs,
+            candidate_count: candidates.len(),
+            candidates,
+            closed: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CloseExpiringChannelSuccess {
+    channel: ExpiringChannelSummary,
+    close: CloseSuccess,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CloseExpiringChannelFailure {
+    channel: ExpiringChannelSummary,
+    error: String,
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
@@ -431,7 +665,8 @@ mod tests {
         assert!(out.contains("Open"));
         assert!(out.contains("sat"));
         assert!(out.contains("1234"));
-        assert!(out.contains("55"));
+        assert!(out.contains("EXPIRES_IN"));
+        assert!(out.contains("55s"));
     }
 
     #[test]
@@ -444,5 +679,13 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "No channels expiring within 3600s.\n"
         );
+    }
+
+    #[test]
+    fn format_duration_is_human_readable() {
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(125), "2m05s");
+        assert_eq!(format_duration(7_260), "2h01m");
+        assert_eq!(format_duration(-30), "-30s");
     }
 }

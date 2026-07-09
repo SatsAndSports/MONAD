@@ -576,7 +576,7 @@ impl RelayWalletManager {
         Ok(summaries)
     }
 
-    pub fn close_to_expiry_channels(
+    pub fn find_expiring_channels(
         &self,
         relay_name: Option<&str>,
         now: u64,
@@ -624,6 +624,7 @@ impl RelayWalletManager {
                 balance_raw: channel.latest_payment.balance,
             });
         }
+        summaries.sort_by_key(|summary| summary.seconds_until_expiry);
         Ok(summaries)
     }
 
@@ -2096,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn close_to_expiry_channels_filters_open_closing_and_closed() {
+    fn find_expiring_channels_filters_open_closing_closed_and_orders_by_expiry() {
         let manager = RelayWalletManager::open(temp_db_path()).unwrap();
         let secret = SecretKey::generate();
         let pubkey_hex = secret.public_key().to_hex();
@@ -2150,13 +2151,13 @@ mod tests {
             .unwrap();
 
         let expiring = manager
-            .close_to_expiry_channels(Some("r1"), now, 300)
+            .find_expiring_channels(Some("r1"), now, 300)
             .unwrap();
         let ids = expiring
             .iter()
             .map(|channel| channel.channel_id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["closing-near", "open-near"]);
+        assert_eq!(ids, vec!["open-near", "closing-near"]);
         let closing = expiring
             .iter()
             .find(|channel| channel.channel_id == "closing-near")

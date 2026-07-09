@@ -94,6 +94,10 @@ future work.
 
 Operators can inspect the current close-to-expiry set with
 `monad-relay wallet --config monad.yaml --relay <name> expiring-channels`.
+They can close that set non-interactively with
+`monad-relay wallet --config monad.yaml --relay <name> close-expiring-channels`;
+add `--dry-run` to preview the candidates. The command attempts every candidate,
+prints each result as it completes, and exits non-zero if any close fails.
 
 ## Client Keyset Model
 
