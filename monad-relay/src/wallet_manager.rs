@@ -2168,6 +2168,40 @@ mod tests {
     }
 
     #[test]
+    fn find_expiring_channels_without_relay_scans_all_identities() {
+        let manager = RelayWalletManager::open(temp_db_path()).unwrap();
+        let secret1 = SecretKey::generate();
+        let pubkey1_hex = secret1.public_key().to_hex();
+        let secret2 = SecretKey::generate();
+        let pubkey2_hex = secret2.public_key().to_hex();
+        manager.register_identity("r1", secret1).unwrap();
+        manager.register_identity("r2", secret2).unwrap();
+        let store1 = ChannelStore::with_relay_metadata(
+            manager.storage.clone(),
+            manager.metadata.clone(),
+            "r1".to_string(),
+            pubkey1_hex.clone(),
+        );
+        let store2 = ChannelStore::with_relay_metadata(
+            manager.storage.clone(),
+            manager.metadata.clone(),
+            "r2".to_string(),
+            pubkey2_hex.clone(),
+        );
+        let now = 1_000u64;
+        save_test_channel(&store1, "r1-near", &pubkey1_hex, now + 200, 20);
+        save_test_channel(&store2, "r2-nearer", &pubkey2_hex, now + 100, 30);
+
+        let expiring = manager.find_expiring_channels(None, now, 300).unwrap();
+        let ids = expiring
+            .iter()
+            .map(|channel| (channel.channel_id.as_str(), channel.relay_name.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![("r2-nearer", "r2"), ("r1-near", "r1")]);
+    }
+
+    #[test]
     fn relay_name_for_channel_returns_owner() {
         let db_path = temp_db_path();
         let manager = RelayWalletManager::open(&db_path).unwrap();

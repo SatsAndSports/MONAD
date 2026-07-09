@@ -97,8 +97,10 @@ monad-relay wallet --config monad.yaml --relay relay-a list
 monad-relay wallet --config monad.yaml --relay relay-a show
 monad-relay wallet --config monad.yaml --relay relay-a channels
 monad-relay wallet --config monad.yaml --relay relay-a expiring-channels
+monad-relay wallet --config monad.yaml expiring-channels
 monad-relay wallet --config monad.yaml --relay relay-a close-expiring-channels --dry-run
 monad-relay wallet --config monad.yaml --relay relay-a close-expiring-channels
+monad-relay wallet --config monad.yaml close-expiring-channels --dry-run
 monad-relay wallet --wallet-db-path /var/lib/monad/relay.db close --channel-id <channel-id>
 monad-relay wallet --config monad.yaml --relay relay-a drains
 monad-relay wallet --config monad.yaml --relay relay-a drain --mint-url https://dev.mint.camelus.app --unit sat
@@ -380,8 +382,10 @@ to the linked channel's raw unit before validation. `close_before_expiry`
 controls when existing `Open` / `Closing` relay channels are considered close to
 expiry for maintenance. `close-expiring-channels` closes all currently expiring
 channels non-interactively, continues after individual failures, and exits
-non-zero if any close fails. Duration fields accept seconds as numbers or
-strings such as `3600s`, `60m`, `2h`, and `1d`.
+non-zero if any close fails. Omit `--relay` / `--wallet-name` on
+`expiring-channels` or `close-expiring-channels` to scan all relay identities;
+human output is a flat list with a `RELAY` column. Duration fields accept
+seconds as numbers or strings such as `3600s`, `60m`, `2h`, and `1d`.
 
 Single relay:
 

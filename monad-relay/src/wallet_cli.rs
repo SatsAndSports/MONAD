@@ -57,14 +57,14 @@ pub enum WalletCommand {
 
     /// List Open / Closing channels that are close to expiry.
     ExpiringChannels {
-        /// Relay identity name.  Required when using `--wallet-db-path`.
+        /// Relay identity name.  Omit to scan all relay identities.
         #[arg(long)]
         wallet_name: Option<String>,
     },
 
     /// Close Open / Closing channels that are close to expiry.
     CloseExpiringChannels {
-        /// Relay identity name.  Required when using `--wallet-db-path`.
+        /// Relay identity name.  Omit to scan all relay identities.
         #[arg(long)]
         wallet_name: Option<String>,
 
@@ -163,13 +163,8 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
         WalletCommand::ExpiringChannels {
             wallet_name: ref name_opt,
         } => {
-            let name = resolve_wallet_name(&args, name_opt.clone())?;
-            let close_before_expiry_secs = resolve_close_before_expiry_secs(&args)?;
-            let channels = manager.find_expiring_channels(
-                Some(&name),
-                now_seconds(),
-                close_before_expiry_secs,
-            )?;
+            let (channels, close_before_expiry_secs) =
+                find_expiring_channels_for_command(&args, &manager, name_opt.clone())?;
             if args.json {
                 print_json(&channels)?;
             } else {
@@ -180,13 +175,8 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
             wallet_name: ref name_opt,
             dry_run,
         } => {
-            let name = resolve_wallet_name(&args, name_opt.clone())?;
-            let close_before_expiry_secs = resolve_close_before_expiry_secs(&args)?;
-            let channels = manager.find_expiring_channels(
-                Some(&name),
-                now_seconds(),
-                close_before_expiry_secs,
-            )?;
+            let (channels, close_before_expiry_secs) =
+                find_expiring_channels_for_command(&args, &manager, name_opt.clone())?;
             if dry_run {
                 if args.json {
                     print_json(&CloseExpiringChannelsResult::dry_run(
@@ -371,10 +361,48 @@ fn resolve_wallet_name(args: &WalletArgs, explicit: Option<String>) -> anyhow::R
     ))
 }
 
-fn resolve_close_before_expiry_secs(args: &WalletArgs) -> anyhow::Result<u64> {
+fn find_expiring_channels_for_command(
+    args: &WalletArgs,
+    manager: &RelayWalletManager,
+    explicit: Option<String>,
+) -> anyhow::Result<(Vec<ExpiringChannelSummary>, u64)> {
+    let now = now_seconds();
+    if let Some(name) = explicit.or_else(|| args.relay.clone()) {
+        let close_before_expiry_secs = close_before_expiry_secs_for_relay(args, Some(&name))?;
+        let channels =
+            manager.find_expiring_channels(Some(&name), now, close_before_expiry_secs)?;
+        return Ok((channels, close_before_expiry_secs));
+    }
+
     if let Some(config_path) = &args.config {
         let config = MonadConfig::load(config_path)?;
-        let relay = config.select_relay(args.relay.as_deref())?;
+        let mut channels = Vec::new();
+        let mut max_close_before_expiry_secs = 0u64;
+        for relay in &config.relays {
+            max_close_before_expiry_secs =
+                max_close_before_expiry_secs.max(relay.channel_policy.close_before_expiry_secs);
+            channels.extend(manager.find_expiring_channels(
+                Some(&relay.name),
+                now,
+                relay.channel_policy.close_before_expiry_secs,
+            )?);
+        }
+        channels.sort_by_key(|channel| channel.seconds_until_expiry);
+        return Ok((channels, max_close_before_expiry_secs));
+    }
+
+    let close_before_expiry_secs = RelayChannelPolicyConfig::default().close_before_expiry_secs;
+    let channels = manager.find_expiring_channels(None, now, close_before_expiry_secs)?;
+    Ok((channels, close_before_expiry_secs))
+}
+
+fn close_before_expiry_secs_for_relay(
+    args: &WalletArgs,
+    relay_name: Option<&str>,
+) -> anyhow::Result<u64> {
+    if let Some(config_path) = &args.config {
+        let config = MonadConfig::load(config_path)?;
+        let relay = config.select_relay(relay_name)?;
         Ok(relay.channel_policy.close_before_expiry_secs)
     } else {
         Ok(RelayChannelPolicyConfig::default().close_before_expiry_secs)
@@ -425,8 +453,9 @@ fn print_close_expiring_success(channel: &ExpiringChannelSummary, close: &CloseS
         "closed"
     };
     println!(
-        "  ok    {} {} expires_in={} receiver_sum={} sender_sum={}",
+        "  ok    {} relay={} {} expires_in={} receiver_sum={} sender_sum={}",
         channel.channel_id,
+        channel.relay_name,
         status,
         format_duration(channel.seconds_until_expiry),
         close.receiver_sum,
@@ -436,8 +465,9 @@ fn print_close_expiring_success(channel: &ExpiringChannelSummary, close: &CloseS
 
 fn print_close_expiring_failure(channel: &ExpiringChannelSummary, error: &str) {
     println!(
-        "  fail  {} expires_in={} mint={} error={}",
+        "  fail  {} relay={} expires_in={} mint={} error={}",
         channel.channel_id,
+        channel.relay_name,
         format_duration(channel.seconds_until_expiry),
         channel.mint_url,
         error
@@ -478,15 +508,24 @@ fn write_expiring_channels<W: Write>(
     writeln!(out, "Channels expiring within {close_before_expiry_secs}s:")?;
     writeln!(
         out,
-        "{:<44} {:<8} {:<32} {:<6} {:>10} {:>10} {:>12} {:>12}",
-        "CHANNEL ID", "STATE", "MINT", "UNIT", "CAPACITY", "BALANCE", "EXPIRES_AT", "EXPIRES_IN"
+        "{:<44} {:<16} {:<8} {:<32} {:<6} {:>10} {:>10} {:>12} {:>12}",
+        "CHANNEL ID",
+        "RELAY",
+        "STATE",
+        "MINT",
+        "UNIT",
+        "CAPACITY",
+        "BALANCE",
+        "EXPIRES_AT",
+        "EXPIRES_IN"
     )?;
     for c in channels {
         let state = format!("{:?}", c.state);
         writeln!(
             out,
-            "{:<44} {:<8} {:<32} {:<6} {:>10} {:>10} {:>12} {:>12}",
+            "{:<44} {:<16} {:<8} {:<32} {:<6} {:>10} {:>10} {:>12} {:>12}",
             c.channel_id,
+            truncate(&c.relay_name, 16),
             state,
             truncate(&c.mint_url, 32),
             c.unit,
@@ -662,6 +701,8 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("Channels expiring within 60s"));
         assert!(out.contains("channel-1"));
+        assert!(out.contains("RELAY"));
+        assert!(out.contains("relay-a"));
         assert!(out.contains("Open"));
         assert!(out.contains("sat"));
         assert!(out.contains("1234"));
