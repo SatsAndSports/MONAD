@@ -57,8 +57,8 @@ use monad_quic::client::{build_client_config_for_auth, connect_with_auth, Client
 use monad_relay::config::RelayConfig;
 use monad_relay::listener::{
     discover_spilman_mint_cache, discover_spilman_mint_cache_with_storage, run_with_payments,
-    run_with_payments_and_registry_and_shutdown, shared_spilman_mint_cache, CachedKeyset,
-    ServerConfig, SpilmanMintCache,
+    run_with_payments_and_registry_and_shutdown, run_with_wallet_manager_and_shutdown,
+    shared_spilman_mint_cache, CachedKeyset, ServerConfig, SpilmanMintCache,
 };
 use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
 use monad_relay::quic_pool::QuicPool;
@@ -1043,6 +1043,150 @@ async fn create_paid_closed_channel(
     assert!(close_success.receiver_sum >= funded_balance_raw);
     assert_closed_payout_at_least(payments, &channel_id, funded_balance_raw);
     channel_id
+}
+
+async fn create_paid_open_channel_with_expiry(
+    payments: &SpilmanRelayPayments,
+    wallet: &TestSigningWallet,
+    offer: &RelayPaymentOffer,
+    session_id: [u8; 32],
+    funded_balance_raw: u64,
+    expiry_timestamp: u64,
+) -> String {
+    let channel_id = wallet
+        .pre_create_channel_with_expiry(1000, expiry_timestamp)
+        .await
+        .unwrap();
+    wallet
+        .attach_channel_to_session(&channel_id, session_id)
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, offer).unwrap();
+    payments.link_channel(session_id, &link_json).unwrap();
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, offer, 0, funded_balance_raw)
+        .unwrap();
+    payments
+        .apply_channel_payment(&channel_id, &payment_json)
+        .unwrap();
+    channel_id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_expiring_channel_auto_close_worker_closes_near_expiry_channel() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let relay_name = "auto-close-relay";
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    wallet_manager
+        .register_identity(relay_name, receiver_secret)
+        .unwrap();
+    wallet_manager.install_keyset_cache(mint_cache.clone());
+    wallet_manager.set_trusted_mint_units(trusted_mint_units.clone());
+
+    let payments = wallet_manager
+        .spilman_payments_for(relay_name, mint_cache.clone(), trusted_mint_units.clone())
+        .unwrap();
+    let wallet = TestSigningWallet::new(
+        mint_helper.mint(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        keyset_id.clone(),
+        keyset_info_json,
+    )
+    .await;
+    let offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex.clone(),
+        mint_url: mint_url.clone(),
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![keyset_id],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let funded_balance_raw = 100;
+    let channel_id = create_paid_open_channel_with_expiry(
+        &payments,
+        &wallet,
+        &offer,
+        [31u8; 32],
+        funded_balance_raw,
+        now + 10_000,
+    )
+    .await;
+    assert!(payments.closed_data(&channel_id).is_none());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let identity = QuicCertIdentity::generate().unwrap();
+    let transport_key = SecpTransportKeypair::generate();
+    let mut channel_policy = monad_common::config::RelayChannelPolicyConfig::default();
+    channel_policy.expiring_channels.close_before_expiry_secs = 20_000;
+    channel_policy.expiring_channels.auto_close.enabled = true;
+    channel_policy.expiring_channels.auto_close.interval_secs = 1;
+    let config = Arc::new(ServerConfig {
+        identity,
+        transport_key: Some(transport_key),
+        receiver_pubkey_hex,
+        trusted_mint_units,
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
+        relay_wallet_name: relay_name.to_string(),
+        spilman_storage_path: temp_db.path().to_str().unwrap().to_string(),
+        channel_policy,
+    });
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(run_with_wallet_manager_and_shutdown(
+        listener,
+        None,
+        config,
+        wallet_manager,
+        shared_spilman_mint_cache(mint_cache),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if payments.closed_data(&channel_id).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("auto-close worker should close near-expiry channel");
+    assert_closed_payout_at_least(&payments, &channel_id, funded_balance_raw);
+
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
 }
 
 struct DropAfterSwap<'a> {

@@ -333,6 +333,30 @@ pub async fn run_with_wallet_manager(
     wallet_manager: Arc<RelayWalletManager>,
     discovered_spilman_mint_cache: SharedSpilmanMintCache,
 ) -> io::Result<()> {
+    run_with_wallet_manager_and_shutdown(
+        listener,
+        quic_endpoint,
+        config,
+        wallet_manager,
+        discovered_spilman_mint_cache,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
+    .await
+}
+
+pub async fn run_with_wallet_manager_and_shutdown<S>(
+    listener: TcpListener,
+    quic_endpoint: Option<quinn::Endpoint>,
+    config: Arc<ServerConfig>,
+    wallet_manager: Arc<RelayWalletManager>,
+    discovered_spilman_mint_cache: SharedSpilmanMintCache,
+    shutdown: S,
+) -> io::Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
     let receiver_pubkey_hex = wallet_manager.receiver_pubkey_hex(&config.relay_wallet_name)?;
     let payments = wallet_manager
         .payments_for_with_policy(&config.relay_wallet_name, config.channel_policy.clone())?;
@@ -364,12 +388,14 @@ pub async fn run_with_wallet_manager(
             .interval_secs,
     );
 
-    let result = run_with_payments(
+    let result = run_with_payments_and_registry_and_shutdown(
         listener,
         quic_endpoint,
         config,
         payments,
         discovered_spilman_mint_cache,
+        Arc::new(SessionRegistry::new()),
+        shutdown,
     )
     .await;
 
