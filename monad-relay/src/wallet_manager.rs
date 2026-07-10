@@ -4,12 +4,9 @@ use crate::listener::{
 };
 use crate::payments::{RelayPayments, SpilmanRelayPayments};
 use cashu::nuts::{BlindedMessage, Proof, SecretKey, SwapRequest};
-use cdk_spilman::configurable_host::{
-    ConfigurableHost, ConfigurableHostConfig, KeysetCacheEntry, SpilmanStorage, SqliteStorage,
-    StorageConfig, UnitPricingConfig,
-};
+use cdk_spilman::configurable_host::{KeysetCacheEntry, SpilmanStorage, SqliteStorage};
 use cdk_spilman::configurable_networking::{
-    build_keyset_info_json, fetch_all_keysets_from_mint, MintKeysetWithKeys, ReqwestNetworking,
+    build_keyset_info_json, fetch_all_keysets_from_mint, MintKeysetWithKeys,
 };
 use cdk_spilman::{
     complete_funding_swap, create_plain_blinded_messages, is_retryable_keyset_mint_error,
@@ -117,7 +114,62 @@ pub trait DrainSwapNetworking {
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 }
 
-impl DrainSwapNetworking for ReqwestNetworking {
+#[derive(Debug, Clone)]
+pub struct RelayWalletMintNetworking {
+    client: reqwest::Client,
+}
+
+impl RelayWalletMintNetworking {
+    fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn post_json(&self, url: String, body: String, action: &str) -> Result<String, String> {
+        let resp = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| format!("{action} request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+                return Err(body);
+            }
+            return Err(format!("{action} failed: {status} - {body}"));
+        }
+        resp.text()
+            .await
+            .map_err(|e| format!("Failed to read {action} response: {e}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl SpilmanAsyncNetworking for RelayWalletMintNetworking {
+    async fn call_mint_swap(
+        &self,
+        mint_url: &str,
+        swap_request_json: &str,
+    ) -> Result<String, String> {
+        self.post_json(
+            format!("{mint_url}/v1/swap"),
+            swap_request_json.to_string(),
+            "Swap",
+        )
+        .await
+    }
+
+    async fn refresh_all_keysets(&self, _mint: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl DrainSwapNetworking for RelayWalletMintNetworking {
     fn call_mint_swap<'a>(
         &'a self,
         mint_url: &'a str,
@@ -134,21 +186,12 @@ impl DrainSwapNetworking for ReqwestNetworking {
         restore_request_json: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
-            let resp = reqwest::Client::new()
-                .post(format!("{mint_url}/v1/restore"))
-                .header("Content-Type", "application/json")
-                .body(restore_request_json.to_string())
-                .send()
-                .await
-                .map_err(|e| format!("Restore request failed: {e}"))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(format!("Restore failed: {status} - {body}"));
-            }
-            resp.text()
-                .await
-                .map_err(|e| format!("Failed to read restore response: {e}"))
+            self.post_json(
+                format!("{mint_url}/v1/restore"),
+                restore_request_json.to_string(),
+                "Restore",
+            )
+            .await
         })
     }
 }
@@ -172,9 +215,8 @@ impl<N: SpilmanAsyncNetworking + Sync> SpilmanAsyncNetworking
 
     async fn refresh_all_keysets(&self, mint: &str) -> Result<(), String> {
         self.wallet_manager
-            .refresh_keysets_into_shared_cache(mint)
-            .await?;
-        self.inner.refresh_all_keysets(mint).await
+            .refresh_all_keysets_for_mint_into_shared_cache(mint)
+            .await
     }
 }
 
@@ -628,25 +670,24 @@ impl RelayWalletManager {
         Ok(summaries)
     }
 
-    /// Build a [`ReqwestNetworking`] instance configured for the mint and
-    /// receiver identity associated with a stored channel.  Used by the CLI
-    /// close command.
+    /// Build mint networking for the mint and receiver identity associated
+    /// with a stored channel. Used by the CLI close command.
     pub fn reqwest_networking_for_channel(
         &self,
         channel_id: &str,
-    ) -> Result<ReqwestNetworking, String> {
+    ) -> Result<RelayWalletMintNetworking, String> {
         let (receiver_secret, mint_url, unit) = self.channel_owner_and_mint(channel_id)?;
         build_reqwest_networking(&receiver_secret, &mint_url, &unit)
     }
 
-    /// Build a [`ReqwestNetworking`] instance for a relay identity and mint/unit.
-    /// Used by wallet drain CLI commands.
+    /// Build mint networking for a relay identity and mint/unit. Used by wallet
+    /// drain CLI commands.
     pub fn reqwest_networking_for_relay(
         &self,
         relay_name: &str,
         mint_url: &str,
         unit: &str,
-    ) -> Result<ReqwestNetworking, String> {
+    ) -> Result<RelayWalletMintNetworking, String> {
         let identities = self
             .identities
             .lock()
@@ -842,11 +883,12 @@ impl RelayWalletManager {
             .map_err(|e| format!("decode drains: {e}"))
     }
 
-    /// Fetch all keysets from a mint and persist them in SQLite.
+    /// Fetch all keysets reported by one mint and persist them in SQLite.
     ///
-    /// Use [`Self::refresh_keysets_into_shared_cache`] when the caller also
-    /// needs existing live payment/session objects to observe the new keysets.
-    pub async fn refresh_keysets_from_mint(
+    /// Use [`Self::refresh_all_keysets_for_mint_into_shared_cache`] when the
+    /// caller also needs existing live payment/session objects to observe the
+    /// new keysets.
+    pub async fn refresh_all_keysets_for_mint_into_sqlite(
         &self,
         mint_url: &str,
     ) -> Result<Vec<MintKeysetWithKeys>, String> {
@@ -855,14 +897,19 @@ impl RelayWalletManager {
         Ok(keysets)
     }
 
-    /// Refresh one mint into SQLite and merge the result into the shared memory
-    /// cache used by live relay payment objects.
+    /// Refresh all keysets reported by one mint into SQLite and merge them into
+    /// the shared memory cache used by live relay payment objects.
     ///
     /// Channel close uses this from the upstream keyset-error retry hook: the
     /// first close attempt is cache-first, then a retry refreshes this mint and
     /// re-prepares the swap against the updated shared cache.
-    pub async fn refresh_keysets_into_shared_cache(&self, mint_url: &str) -> Result<(), String> {
-        let keysets = self.refresh_keysets_from_mint(mint_url).await?;
+    pub async fn refresh_all_keysets_for_mint_into_shared_cache(
+        &self,
+        mint_url: &str,
+    ) -> Result<(), String> {
+        let keysets = self
+            .refresh_all_keysets_for_mint_into_sqlite(mint_url)
+            .await?;
         let mut cache = self
             .keyset_cache
             .write()
@@ -1284,7 +1331,8 @@ impl RelayWalletManager {
                 .is_some_and(|by_id| by_id.values().any(|keyset| keyset.unit == unit))
         };
         if !has_cached_keysets {
-            self.refresh_keysets_into_shared_cache(mint_url).await?;
+            self.refresh_all_keysets_for_mint_into_shared_cache(mint_url)
+                .await?;
         }
         Ok(())
     }
@@ -1392,7 +1440,7 @@ impl RelayWalletManager {
             // Refresh this mint into SQLite plus the manager's shared runtime
             // cache before the helper reselects output/input keyset metadata.
             || async {
-                self.refresh_keysets_into_shared_cache(request.mint_url)
+                self.refresh_all_keysets_for_mint_into_shared_cache(request.mint_url)
                     .await
             },
             // Cleanup is a no-op here.  Drain reservations are durable DB state:
@@ -1801,7 +1849,7 @@ mod close_networking_tests {
     }
 
     #[tokio::test]
-    async fn close_networking_refresh_updates_manager_cache_and_delegates() {
+    async fn close_networking_refresh_updates_manager_cache_without_inner_refresh() {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint = mint_helper.mint();
         let old_keyset_id = mint_helper.keyset_id().to_string();
@@ -1833,7 +1881,7 @@ mod close_networking_tests {
         };
 
         wrapper.refresh_all_keysets(&mint_url).await.unwrap();
-        assert_eq!(inner.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.refreshes.load(Ordering::SeqCst), 0);
 
         let old_id = old_keyset_id.parse().unwrap();
         let new_id = new_keyset_id.parse().unwrap();
@@ -1873,31 +1921,11 @@ mod close_networking_tests {
 }
 
 pub(crate) fn build_reqwest_networking(
-    receiver_secret: &SecretKey,
-    mint_url: &str,
-    unit: &str,
-) -> Result<ReqwestNetworking, String> {
-    let mut mints = HashMap::new();
-    mints.insert(mint_url.to_string(), vec![unit.to_string()]);
-    let mut pricing = HashMap::new();
-    pricing.insert(
-        unit.to_string(),
-        UnitPricingConfig {
-            min_capacity: 0,
-            max_amount_per_output: None,
-            variables: HashMap::new(),
-        },
-    );
-    let config = ConfigurableHostConfig {
-        mints,
-        min_expiry_seconds: 3600,
-        pricing_scale: 1,
-        storage: StorageConfig::Memory,
-        pricing,
-    };
-    let host = ConfigurableHost::new(config, &receiver_secret.to_secret_hex())
-        .map_err(|e| format!("create configurable host: {e}"))?;
-    Ok(ReqwestNetworking::new(Arc::new(host)))
+    _receiver_secret: &SecretKey,
+    _mint_url: &str,
+    _unit: &str,
+) -> Result<RelayWalletMintNetworking, String> {
+    Ok(RelayWalletMintNetworking::new())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

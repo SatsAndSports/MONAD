@@ -43,7 +43,6 @@ use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
 
 use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
-use cdk_spilman::configurable_networking::ReqwestNetworking;
 use cdk_spilman::{
     ChannelState, ClientStorage, ClosingData, ConfigurableClientHost, EstablishedChannel,
     FundingSpendKind, MintConnection, SpilmanClientBridge, SqliteClientStorage,
@@ -63,7 +62,9 @@ use monad_relay::listener::{
 use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
 use monad_relay::quic_pool::QuicPool;
 use monad_relay::session_registry::SessionRegistry;
-use monad_relay::wallet_manager::{DrainSwapNetworking, RelayWalletManager};
+use monad_relay::wallet_manager::{
+    DrainSwapNetworking, RelayWalletManager, RelayWalletMintNetworking,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io;
@@ -1190,7 +1191,7 @@ async fn test_expiring_channel_auto_close_worker_closes_near_expiry_channel() {
 }
 
 struct DropAfterSwap<'a> {
-    inner: &'a ReqwestNetworking,
+    inner: &'a RelayWalletMintNetworking,
 }
 
 impl DrainSwapNetworking for DropAfterSwap<'_> {
@@ -1218,7 +1219,7 @@ impl DrainSwapNetworking for DropAfterSwap<'_> {
 }
 
 struct CountingDrainNet<'a> {
-    inner: &'a ReqwestNetworking,
+    inner: &'a RelayWalletMintNetworking,
     swaps: Arc<AtomicUsize>,
     output_keysets_by_call: Arc<Mutex<Vec<Vec<String>>>>,
 }
@@ -1420,7 +1421,7 @@ impl DrainTestContext {
         .await
     }
 
-    fn net_for(&self, channel_id: &str) -> ReqwestNetworking {
+    fn net_for(&self, channel_id: &str) -> RelayWalletMintNetworking {
         self.wallet_manager
             .reqwest_networking_for_channel(channel_id)
             .unwrap()
