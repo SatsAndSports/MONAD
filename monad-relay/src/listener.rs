@@ -4,7 +4,7 @@ use crate::payments::RelayPayments;
 use crate::quic_pool::QuicPool;
 use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
 use crate::session_registry::SessionRegistry;
-use crate::wallet_manager::{cache_relay_keysets, RelayWalletManager};
+use crate::wallet_manager::{cache_relay_keysets, CloseExpiringChannelsResult, RelayWalletManager};
 use cashu::nuts::Id;
 use cdk_spilman::configurable_host::SpilmanStorage;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
@@ -32,7 +32,9 @@ use std::sync::{
     Arc, RwLock,
 };
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -347,14 +349,142 @@ pub async fn run_with_wallet_manager(
         spilman_storage_path: config.spilman_storage_path.clone(),
         channel_policy: config.channel_policy.clone(),
     });
-    run_with_payments(
+    let auto_close_worker = spawn_expiring_channel_auto_close_worker(
+        wallet_manager,
+        config.relay_wallet_name.clone(),
+        config
+            .channel_policy
+            .expiring_channels
+            .close_before_expiry_secs,
+        config.channel_policy.expiring_channels.auto_close.enabled,
+        config
+            .channel_policy
+            .expiring_channels
+            .auto_close
+            .interval_secs,
+    );
+
+    let result = run_with_payments(
         listener,
         quic_endpoint,
         config,
         payments,
         discovered_spilman_mint_cache,
     )
-    .await
+    .await;
+
+    stop_expiring_channel_auto_close_worker(auto_close_worker).await;
+    result
+}
+
+fn spawn_expiring_channel_auto_close_worker(
+    wallet_manager: Arc<RelayWalletManager>,
+    relay_name: String,
+    close_before_expiry_secs: u64,
+    enabled: bool,
+    interval_secs: u64,
+) -> Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)> {
+    if !enabled {
+        return None;
+    }
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run_expiring_channel_auto_close_worker(
+        wallet_manager,
+        relay_name,
+        close_before_expiry_secs,
+        interval_secs,
+        shutdown_rx,
+    ));
+    Some((shutdown_tx, handle))
+}
+
+async fn stop_expiring_channel_auto_close_worker(
+    worker: Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
+) {
+    let Some((shutdown_tx, mut handle)) = worker else {
+        return;
+    };
+    let _ = shutdown_tx.send(true);
+    match tokio::time::timeout(Duration::from_secs(5), &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!(error = %e, "expiring-channel auto-close worker panicked"),
+        Err(_) => {
+            error!("timed out waiting for expiring-channel auto-close worker to stop");
+            handle.abort();
+        }
+    }
+}
+
+async fn run_expiring_channel_auto_close_worker(
+    wallet_manager: Arc<RelayWalletManager>,
+    relay_name: String,
+    close_before_expiry_secs: u64,
+    interval_secs: u64,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    info!(
+        relay = %relay_name,
+        close_before_expiry_secs,
+        interval_secs,
+        "expiring-channel auto-close worker started"
+    );
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        let started = Instant::now();
+        match wallet_manager
+            .close_expiring_channels(Some(&relay_name), now_seconds(), close_before_expiry_secs)
+            .await
+        {
+            Ok(result) => log_expiring_channel_auto_close_result(&result, started.elapsed()),
+            Err(e) => {
+                error!(relay = %relay_name, error = %e, "expiring-channel auto-close sweep failed")
+            }
+        }
+
+        let sleep = tokio::time::sleep(Duration::from_secs(interval_secs));
+        tokio::pin!(sleep);
+        tokio::select! {
+            _ = &mut sleep => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+    info!(relay = %relay_name, "expiring-channel auto-close worker stopped");
+}
+
+fn log_expiring_channel_auto_close_result(result: &CloseExpiringChannelsResult, elapsed: Duration) {
+    for failure in &result.failures {
+        warn!(
+            channel_id = %failure.channel.channel_id,
+            relay = %failure.channel.relay_name,
+            mint = %failure.channel.mint_url,
+            unit = %failure.channel.unit,
+            seconds_until_expiry = failure.channel.seconds_until_expiry,
+            error = %failure.error,
+            "expiring-channel auto-close failed for channel"
+        );
+    }
+    info!(
+        candidates = result.candidate_count,
+        closed = result.closed.len(),
+        failed = result.failures.len(),
+        close_before_expiry_secs = result.close_before_expiry_secs,
+        elapsed_ms = elapsed.as_millis(),
+        "expiring-channel auto-close sweep finished"
+    );
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 pub async fn run_with_payments(

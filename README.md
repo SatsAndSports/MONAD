@@ -385,10 +385,12 @@ not have enough time left before expiry. `min_capacity` and
 to the linked channel's raw unit before validation.
 `expiring_channels.close_before_expiry` controls when existing `Open` /
 `Closing` relay channels are considered close to expiry for maintenance.
-`expiring_channels.auto_close` is disabled by default and reserves config for the
-periodic close worker. `close-expiring-channels` closes all currently expiring
-channels non-interactively, continues after individual failures, and exits
-non-zero if any close fails. Omit `--relay` / `--wallet-name` on
+`expiring_channels.auto_close` is disabled by default; when enabled, the running
+relay closes its own currently expiring channels once at startup and then every
+configured `interval`, continuing after individual failures and logging summary
+stats. `close-expiring-channels` runs the same kind of close sweep manually,
+continues after individual failures, and exits non-zero if any close fails. Omit
+`--relay` / `--wallet-name` on
 `expiring-channels` or `close-expiring-channels` to scan all relay identities;
 human output is a flat list with a `RELAY` column. Duration fields accept seconds
 as numbers or strings such as `3600s`, `60m`, `2h`, and `1d`.

@@ -676,6 +676,43 @@ impl RelayWalletManager {
             .await
     }
 
+    pub async fn close_expiring_channels(
+        &self,
+        relay_name: Option<&str>,
+        now: u64,
+        close_before_expiry_secs: u64,
+    ) -> io::Result<CloseExpiringChannelsResult> {
+        let channels = self.find_expiring_channels(relay_name, now, close_before_expiry_secs)?;
+        Ok(self
+            .close_expiring_channel_candidates(channels, close_before_expiry_secs)
+            .await)
+    }
+
+    pub async fn close_expiring_channel_candidates(
+        &self,
+        channels: Vec<ExpiringChannelSummary>,
+        close_before_expiry_secs: u64,
+    ) -> CloseExpiringChannelsResult {
+        let mut result = CloseExpiringChannelsResult::new(close_before_expiry_secs, channels.len());
+        for channel in channels {
+            match self.reqwest_networking_for_channel(&channel.channel_id) {
+                Ok(net) => match self.close_channel(&channel.channel_id, &net).await {
+                    Ok(close) => result
+                        .closed
+                        .push(CloseExpiringChannelSuccess { channel, close }),
+                    Err(error) => result.failures.push(CloseExpiringChannelFailure {
+                        error: close_error_summary(&error),
+                        channel,
+                    }),
+                },
+                Err(error) => result
+                    .failures
+                    .push(CloseExpiringChannelFailure { channel, error }),
+            }
+        }
+        result
+    }
+
     pub async fn drain_closed_channels_to_swap<N: DrainSwapNetworking>(
         &self,
         relay_name: &str,
@@ -1895,6 +1932,52 @@ pub struct ExpiringChannelSummary {
     pub balance_raw: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CloseExpiringChannelsResult {
+    pub dry_run: bool,
+    pub close_before_expiry_secs: u64,
+    pub candidate_count: usize,
+    pub candidates: Vec<ExpiringChannelSummary>,
+    pub closed: Vec<CloseExpiringChannelSuccess>,
+    pub failures: Vec<CloseExpiringChannelFailure>,
+}
+
+impl CloseExpiringChannelsResult {
+    pub fn new(close_before_expiry_secs: u64, candidate_count: usize) -> Self {
+        Self {
+            dry_run: false,
+            close_before_expiry_secs,
+            candidate_count,
+            candidates: Vec::new(),
+            closed: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+
+    pub fn dry_run(close_before_expiry_secs: u64, candidates: Vec<ExpiringChannelSummary>) -> Self {
+        Self {
+            dry_run: true,
+            close_before_expiry_secs,
+            candidate_count: candidates.len(),
+            candidates,
+            closed: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CloseExpiringChannelSuccess {
+    pub channel: ExpiringChannelSummary,
+    pub close: CloseSuccess,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CloseExpiringChannelFailure {
+    pub channel: ExpiringChannelSummary,
+    pub error: String,
+}
+
 struct ChannelSummaryMetadata {
     mint_url: String,
     expiry_timestamp: u64,
@@ -1925,6 +2008,28 @@ fn seconds_until_expiry(now: u64, expiry_timestamp: u64) -> i64 {
     } else {
         let overdue = now - expiry_timestamp;
         -(overdue.min(i64::MAX as u64) as i64)
+    }
+}
+
+fn close_error_summary(error: &CloseError) -> String {
+    match error {
+        CloseError::ValidationFailed { reason, .. } => format!("validation failed: {reason}"),
+        CloseError::UnknownChannel { .. } => "unknown channel".to_string(),
+        CloseError::AlreadyClosed {
+            closed_balance,
+            requested_balance,
+            ..
+        } => format!(
+            "already closed: closed_balance={closed_balance} requested_balance={requested_balance}"
+        ),
+        CloseError::MintRejected { mint_error, .. } => format!("mint rejected: {mint_error}"),
+        CloseError::MintRejectedAfterRetry {
+            original_error,
+            retry_error,
+            ..
+        } => format!("mint rejected after retry: original={original_error} retry={retry_error}"),
+        CloseError::UnblindFailed { reason, .. } => format!("unblind failed: {reason}"),
+        CloseError::StorageFailed { reason, .. } => format!("storage failed: {reason}"),
     }
 }
 
@@ -2199,6 +2304,33 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec![("r2-nearer", "r2"), ("r1-near", "r1")]);
+    }
+
+    #[tokio::test]
+    async fn close_expiring_channel_candidates_records_failures_and_continues() {
+        let manager = RelayWalletManager::open(temp_db_path()).unwrap();
+        let channels = vec![ExpiringChannelSummary {
+            channel_id: "missing-channel".to_string(),
+            relay_name: "r1".to_string(),
+            receiver_pubkey_hex: "receiver".to_string(),
+            state: ChannelState::Open,
+            mint_url: "https://test.mint".to_string(),
+            unit: "sat".to_string(),
+            expiry_timestamp: 1_000,
+            seconds_until_expiry: 100,
+            capacity_raw: 1_000,
+            balance_raw: 0,
+        }];
+
+        let result = manager
+            .close_expiring_channel_candidates(channels, 300)
+            .await;
+
+        assert_eq!(result.candidate_count, 1);
+        assert!(result.closed.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].channel.channel_id, "missing-channel");
+        assert!(result.failures[0].error.contains("not found"));
     }
 
     #[test]
