@@ -7,8 +7,8 @@ use cdk_spilman::{
     compute_channel_secret_from_hex,
     configurable_host::{ClosedDataView, SpilmanStorage},
     sign_with_tweaked_key_util, BridgeError, ChannelFunding, ChannelPolicy, ChannelState,
-    CloseError, CloseSuccess, ClosingData, Payment, PaymentProof, SpilmanAsyncNetworking,
-    SpilmanBridge, SpilmanHost, SpilmanNetworking,
+    CloseError, CloseSuccess, ClosingData, Payment, PaymentProof, SpilmanAsyncKeysetRefresher,
+    SpilmanAsyncMintClient, SpilmanBridge, SpilmanHost, SpilmanKeysetRefresher, SpilmanMintClient,
 };
 use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
@@ -255,32 +255,38 @@ impl SpilmanRelayPayments {
         )
     }
 
-    pub fn close_channel<N: SpilmanNetworking>(
+    pub fn close_channel<M: SpilmanMintClient, R: SpilmanKeysetRefresher>(
         &self,
         channel_id: &str,
-        net: &N,
-    ) -> Result<CloseSuccess, CloseError> {
-        self.bridge.execute_unilateral_close(channel_id, net)
-    }
-
-    /// Async variant of [`Self::close_channel`].
-    pub async fn close_channel_async<N: SpilmanAsyncNetworking>(
-        &self,
-        channel_id: &str,
-        net: &N,
+        mint_client: &M,
+        keyset_refresher: &R,
     ) -> Result<CloseSuccess, CloseError> {
         self.bridge
-            .execute_unilateral_close_async(channel_id, net)
+            .execute_unilateral_close(channel_id, mint_client, keyset_refresher)
+    }
+
+    pub async fn close_channel_async<M: SpilmanAsyncMintClient, R: SpilmanAsyncKeysetRefresher>(
+        &self,
+        channel_id: &str,
+        mint_client: &M,
+        keyset_refresher: &R,
+    ) -> Result<CloseSuccess, CloseError> {
+        self.bridge
+            .execute_unilateral_close_async(channel_id, mint_client, keyset_refresher)
             .await
     }
 
     /// Close a channel regardless of whether it is currently Open or Closing.
     /// Already-closed channels return a synthetic [`CloseSuccess`] with
     /// `already_closed: true`.
-    pub async fn close_channel_any_state_async<N: SpilmanAsyncNetworking>(
+    pub async fn close_channel_any_state_async<
+        M: SpilmanAsyncMintClient,
+        R: SpilmanAsyncKeysetRefresher,
+    >(
         &self,
         channel_id: &str,
-        net: &N,
+        mint_client: &M,
+        keyset_refresher: &R,
     ) -> Result<CloseSuccess, CloseError> {
         match self.store.channel_state(channel_id) {
             Some(ChannelState::Closed) => {
@@ -306,12 +312,16 @@ impl SpilmanRelayPayments {
             }
             Some(ChannelState::Closing) => {
                 self.bridge
-                    .execute_close_for_closing_channel_async(channel_id, net)
+                    .execute_close_for_closing_channel_async(
+                        channel_id,
+                        mint_client,
+                        keyset_refresher,
+                    )
                     .await
             }
             _ => {
                 self.bridge
-                    .execute_unilateral_close_async(channel_id, net)
+                    .execute_unilateral_close_async(channel_id, mint_client, keyset_refresher)
                     .await
             }
         }
@@ -730,7 +740,7 @@ pub mod testing {
     use super::{
         ChannelPaymentError, ChannelUnit, LinkError, LinkOutcome, PaymentOutcome, RelayPayments,
     };
-    use cdk_spilman::{ChannelState, CloseError, CloseSuccess, SpilmanNetworking};
+    use cdk_spilman::{ChannelState, CloseError, CloseSuccess};
     use monad_common::protocol::LinkedChannelStatus;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -782,11 +792,7 @@ pub mod testing {
             }
         }
 
-        pub fn close_channel<N: SpilmanNetworking>(
-            &self,
-            channel_id: &str,
-            _net: &N,
-        ) -> Result<CloseSuccess, CloseError> {
+        pub fn close_channel(&self, channel_id: &str) -> Result<CloseSuccess, CloseError> {
             let mut inner = self.inner.lock().map_err(|_| CloseError::StorageFailed {
                 reason: "mutex poisoned".to_string(),
                 status: 500,

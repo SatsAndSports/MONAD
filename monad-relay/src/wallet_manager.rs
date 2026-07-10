@@ -11,7 +11,7 @@ use cdk_spilman::configurable_networking::{
 use cdk_spilman::{
     complete_funding_swap, create_plain_blinded_messages, is_retryable_keyset_mint_error,
     with_active_keyset_retry_async, ActiveKeysetSelection, ChannelState, CloseError, CloseSuccess,
-    KeysetRetryError, SelectedOutputKeyset, SpilmanAsyncNetworking,
+    KeysetRetryError, SelectedOutputKeyset, SpilmanAsyncKeysetRefresher, SpilmanAsyncMintClient,
 };
 use monad_common::config::RelayChannelPolicyConfig;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -115,12 +115,12 @@ pub trait DrainSwapNetworking {
 }
 
 #[derive(Debug, Clone)]
-pub struct RelayWalletMintNetworking {
+pub struct RelayWalletMintClient {
     client: reqwest::Client,
 }
 
-impl RelayWalletMintNetworking {
-    fn new() -> Self {
+impl RelayWalletMintClient {
+    pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
         }
@@ -149,8 +149,14 @@ impl RelayWalletMintNetworking {
     }
 }
 
+impl Default for RelayWalletMintClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
-impl SpilmanAsyncNetworking for RelayWalletMintNetworking {
+impl SpilmanAsyncMintClient for RelayWalletMintClient {
     async fn call_mint_swap(
         &self,
         mint_url: &str,
@@ -163,20 +169,16 @@ impl SpilmanAsyncNetworking for RelayWalletMintNetworking {
         )
         .await
     }
-
-    async fn refresh_all_keysets(&self, _mint: &str) -> Result<(), String> {
-        Ok(())
-    }
 }
 
-impl DrainSwapNetworking for RelayWalletMintNetworking {
+impl DrainSwapNetworking for RelayWalletMintClient {
     fn call_mint_swap<'a>(
         &'a self,
         mint_url: &'a str,
         swap_request_json: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
-            SpilmanAsyncNetworking::call_mint_swap(self, mint_url, swap_request_json).await
+            SpilmanAsyncMintClient::call_mint_swap(self, mint_url, swap_request_json).await
         })
     }
 
@@ -193,30 +195,6 @@ impl DrainSwapNetworking for RelayWalletMintNetworking {
             )
             .await
         })
-    }
-}
-
-struct RelayWalletCloseNetworking<'a, N> {
-    inner: &'a N,
-    wallet_manager: &'a RelayWalletManager,
-}
-
-#[async_trait::async_trait]
-impl<N: SpilmanAsyncNetworking + Sync> SpilmanAsyncNetworking
-    for RelayWalletCloseNetworking<'_, N>
-{
-    async fn call_mint_swap(
-        &self,
-        mint_url: &str,
-        swap_request_json: &str,
-    ) -> Result<String, String> {
-        self.inner.call_mint_swap(mint_url, swap_request_json).await
-    }
-
-    async fn refresh_all_keysets(&self, mint: &str) -> Result<(), String> {
-        self.wallet_manager
-            .refresh_all_keysets_for_mint_into_shared_cache(mint)
-            .await
     }
 }
 
@@ -672,22 +650,23 @@ impl RelayWalletManager {
 
     /// Build mint networking for the mint and receiver identity associated
     /// with a stored channel. Used by the CLI close command.
-    pub fn reqwest_networking_for_channel(
+    pub fn mint_client_for_channel(
         &self,
         channel_id: &str,
-    ) -> Result<RelayWalletMintNetworking, String> {
+    ) -> Result<RelayWalletMintClient, String> {
         let (receiver_secret, mint_url, unit) = self.channel_owner_and_mint(channel_id)?;
-        build_reqwest_networking(&receiver_secret, &mint_url, &unit)
+        let _ = (receiver_secret, mint_url, unit);
+        Ok(RelayWalletMintClient::new())
     }
 
     /// Build mint networking for a relay identity and mint/unit. Used by wallet
     /// drain CLI commands.
-    pub fn reqwest_networking_for_relay(
+    pub fn mint_client_for_relay(
         &self,
         relay_name: &str,
         mint_url: &str,
         unit: &str,
-    ) -> Result<RelayWalletMintNetworking, String> {
+    ) -> Result<RelayWalletMintClient, String> {
         let identities = self
             .identities
             .lock()
@@ -695,25 +674,22 @@ impl RelayWalletManager {
         let receiver_secret = identities
             .get(relay_name)
             .ok_or_else(|| format!("unknown relay identity '{relay_name}'"))?;
-        build_reqwest_networking(receiver_secret, mint_url, unit)
+        let _ = (receiver_secret, mint_url, unit);
+        Ok(RelayWalletMintClient::new())
     }
 
     /// Close any channel stored in this wallet DB, regardless of which relay
     /// identity owns it.  If the channel is already `Closed`, returns a
     /// synthetic success.  If it is `Closing`, completes the close.  Otherwise
     /// initiates and executes a unilateral close against the channel's mint.
-    pub async fn close_channel<N: SpilmanAsyncNetworking + Sync>(
+    pub async fn close_channel<N: SpilmanAsyncMintClient + Sync>(
         &self,
         channel_id: &str,
         net: &N,
     ) -> Result<CloseSuccess, CloseError> {
         let payments = self.payments_for_channel(channel_id).await?;
-        let net = RelayWalletCloseNetworking {
-            inner: net,
-            wallet_manager: self,
-        };
         payments
-            .close_channel_any_state_async(channel_id, &net)
+            .close_channel_any_state_async(channel_id, net, self)
             .await
     }
 
@@ -736,7 +712,7 @@ impl RelayWalletManager {
     ) -> CloseExpiringChannelsResult {
         let mut result = CloseExpiringChannelsResult::new(close_before_expiry_secs, channels.len());
         for channel in channels {
-            match self.reqwest_networking_for_channel(&channel.channel_id) {
+            match self.mint_client_for_channel(&channel.channel_id) {
                 Ok(net) => match self.close_channel(&channel.channel_id, &net).await {
                     Ok(close) => result
                         .closed
@@ -1821,35 +1797,22 @@ fn u64_from_i64(value: i64) -> rusqlite::Result<u64> {
     })
 }
 
+#[async_trait::async_trait]
+impl SpilmanAsyncKeysetRefresher for RelayWalletManager {
+    async fn refresh(&self, mint: &str) -> Result<(), String> {
+        self.refresh_all_keysets_for_mint_into_shared_cache(mint)
+            .await
+    }
+}
+
 #[cfg(test)]
-mod close_networking_tests {
+mod keyset_refresher_tests {
     use super::*;
     use cdk_spilman_test_mint::{build_router, rotate_sat_keyset, TestMintHelper};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
-    struct RefreshSpy {
-        refreshes: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl SpilmanAsyncNetworking for RefreshSpy {
-        async fn call_mint_swap(
-            &self,
-            _mint_url: &str,
-            _swap_request_json: &str,
-        ) -> Result<String, String> {
-            Err("unused".to_string())
-        }
-
-        async fn refresh_all_keysets(&self, _mint: &str) -> Result<(), String> {
-            self.refreshes.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
     #[tokio::test]
-    async fn close_networking_refresh_updates_manager_cache_without_inner_refresh() {
+    async fn keyset_refresher_updates_sqlite_and_shared_cache() {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint = mint_helper.mint();
         let old_keyset_id = mint_helper.keyset_id().to_string();
@@ -1872,16 +1835,10 @@ mod close_networking_tests {
 
         let temp_db = tempfile::NamedTempFile::new().unwrap();
         let manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
-        let inner = RefreshSpy {
-            refreshes: AtomicUsize::new(0),
-        };
-        let wrapper = RelayWalletCloseNetworking {
-            inner: &inner,
-            wallet_manager: &manager,
-        };
 
-        wrapper.refresh_all_keysets(&mint_url).await.unwrap();
-        assert_eq!(inner.refreshes.load(Ordering::SeqCst), 0);
+        SpilmanAsyncKeysetRefresher::refresh(&manager, &mint_url)
+            .await
+            .unwrap();
 
         let old_id = old_keyset_id.parse().unwrap();
         let new_id = new_keyset_id.parse().unwrap();
@@ -1897,7 +1854,7 @@ mod close_networking_tests {
         assert!(new_cached.active);
 
         // Upstream close retry re-prepares the close with the same payments
-        // object, so the wrapper must update the shared cache it reads from.
+        // object, so the refresher must update the shared cache it reads from.
         let snapshot = manager.keyset_cache_snapshot();
         let cached_keysets = snapshot
             .keysets
@@ -1918,14 +1875,6 @@ mod close_networking_tests {
 
         let _ = mint_shutdown_tx.send(());
     }
-}
-
-pub(crate) fn build_reqwest_networking(
-    _receiver_secret: &SecretKey,
-    _mint_url: &str,
-    _unit: &str,
-) -> Result<RelayWalletMintNetworking, String> {
-    Ok(RelayWalletMintNetworking::new())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

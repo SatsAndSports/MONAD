@@ -62,9 +62,7 @@ use monad_relay::listener::{
 use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
 use monad_relay::quic_pool::QuicPool;
 use monad_relay::session_registry::SessionRegistry;
-use monad_relay::wallet_manager::{
-    DrainSwapNetworking, RelayWalletManager, RelayWalletMintNetworking,
-};
+use monad_relay::wallet_manager::{DrainSwapNetworking, RelayWalletManager, RelayWalletMintClient};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io;
@@ -1035,10 +1033,10 @@ async fn create_paid_closed_channel(
         .unwrap();
 
     let net = wallet_manager
-        .reqwest_networking_for_channel(&channel_id)
+        .mint_client_for_channel(&channel_id)
         .expect("wallet manager should build close networking");
     let close_success = payments
-        .close_channel_async(&channel_id, &net)
+        .close_channel_async(&channel_id, &net, wallet_manager)
         .await
         .expect("relay should close test channel");
     assert!(close_success.receiver_sum >= funded_balance_raw);
@@ -1191,7 +1189,7 @@ async fn test_expiring_channel_auto_close_worker_closes_near_expiry_channel() {
 }
 
 struct DropAfterSwap<'a> {
-    inner: &'a RelayWalletMintNetworking,
+    inner: &'a RelayWalletMintClient,
 }
 
 impl DrainSwapNetworking for DropAfterSwap<'_> {
@@ -1219,7 +1217,7 @@ impl DrainSwapNetworking for DropAfterSwap<'_> {
 }
 
 struct CountingDrainNet<'a> {
-    inner: &'a RelayWalletMintNetworking,
+    inner: &'a RelayWalletMintClient,
     swaps: Arc<AtomicUsize>,
     output_keysets_by_call: Arc<Mutex<Vec<Vec<String>>>>,
 }
@@ -1421,9 +1419,9 @@ impl DrainTestContext {
         .await
     }
 
-    fn net_for(&self, channel_id: &str) -> RelayWalletMintNetworking {
+    fn net_for(&self, channel_id: &str) -> RelayWalletMintClient {
         self.wallet_manager
-            .reqwest_networking_for_channel(channel_id)
+            .mint_client_for_channel(channel_id)
             .unwrap()
     }
 
@@ -6162,7 +6160,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     // Close the channel through the relay, using the in-memory mint networking.
     let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
     let close_success = payments
-        .close_channel(&channel_id, &mint_networking)
+        .close_channel(&channel_id, &mint_networking, &mint_networking)
         .expect("relay should close the channel");
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
@@ -6333,7 +6331,7 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
 
     let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
     let close_success = payments
-        .close_channel(&channel_id, &mint_networking)
+        .close_channel(&channel_id, &mint_networking, &mint_networking)
         .expect("relay should close the channel");
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
@@ -6481,7 +6479,7 @@ async fn test_sqlite_client_recovery_falls_back_to_relay_close_restore() {
 
     let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
     let close_success = payments
-        .close_channel(&channel_id, &mint_networking)
+        .close_channel(&channel_id, &mint_networking, &mint_networking)
         .expect("relay should close the channel");
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
@@ -6640,7 +6638,7 @@ async fn test_wallet_manager_close_channel_by_id() {
     // Close the channel through the wallet manager by channel id using the
     // same reqwest-based networking path as the CLI.
     let net = wallet_manager
-        .reqwest_networking_for_channel(&channel_id)
+        .mint_client_for_channel(&channel_id)
         .expect("wallet manager should build reqwest networking for channel");
     let close_success = wallet_manager
         .close_channel(&channel_id, &net)
@@ -6784,7 +6782,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     assert_eq!(storage.get_state(&channel_id), ChannelState::Closing);
 
     let net = wallet_manager
-        .reqwest_networking_for_channel(&channel_id)
+        .mint_client_for_channel(&channel_id)
         .expect("wallet manager should build reqwest networking for channel");
 
     let close_success = wallet_manager
@@ -6876,7 +6874,7 @@ async fn test_wallet_manager_drain_swap_combines_multiple_closed_channels() {
         create_paid_closed_channel(&wallet_manager, &payments, &wallet, &offer, [2u8; 32], 200)
             .await;
 
-    let net = wallet_manager.reqwest_networking_for_channel(&ch1).unwrap();
+    let net = wallet_manager.mint_client_for_channel(&ch1).unwrap();
     let drain = wallet_manager
         .drain_closed_channels_to_swap("drain-relay", &mint_url, "sat", &net, None)
         .await
@@ -6956,9 +6954,7 @@ async fn test_wallet_manager_drain_swap_recovers_after_ambiguous_submission() {
         create_paid_closed_channel(&wallet_manager, &payments, &wallet, &offer, [3u8; 32], 400)
             .await;
 
-    let net = wallet_manager
-        .reqwest_networking_for_channel(&channel_id)
-        .unwrap();
+    let net = wallet_manager.mint_client_for_channel(&channel_id).unwrap();
     let dropped = DropAfterSwap { inner: &net };
     let err = wallet_manager
         .drain_closed_channels_to_swap("drain-recovery-relay", &mint_url, "sat", &dropped, None)
@@ -7145,9 +7141,7 @@ async fn test_wallet_manager_drain_recovery_survives_manager_reopen() {
         .clone();
 
     let reopened = RelayWalletManager::open(&db_path).unwrap();
-    let reopened_net = reopened
-        .reqwest_networking_for_channel(&channel_id)
-        .unwrap();
+    let reopened_net = reopened.mint_client_for_channel(&channel_id).unwrap();
     let recovered = reopened
         .recover_submitted_drain(&drain_id, &reopened_net)
         .await
@@ -7267,9 +7261,7 @@ async fn test_wallet_manager_drain_keyset_rejection_refreshes_reprepares_and_ret
 
     let new_keyset_id = rotate_sat_keyset(&mint, 500).await.unwrap().to_string();
     assert_ne!(old_keyset_id, new_keyset_id);
-    let net = wallet_manager
-        .reqwest_networking_for_channel(&channel_id)
-        .unwrap();
+    let net = wallet_manager.mint_client_for_channel(&channel_id).unwrap();
     let swaps = Arc::new(AtomicUsize::new(0));
     let output_keysets_by_call = Arc::new(Mutex::new(Vec::new()));
     let counting = CountingDrainNet {
@@ -7678,7 +7670,7 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
         .expect("seed shared drain cache with rotated keysets");
 
     let net = wallet_manager
-        .reqwest_networking_for_channel(&old_channel)
+        .mint_client_for_channel(&old_channel)
         .unwrap();
     let drain = wallet_manager
         .drain_closed_channels_to_swap("mixed-keyset-drain-relay", &mint_url, "sat", &net, None)
@@ -7869,7 +7861,7 @@ async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_an
     wallet_manager.install_keyset_cache(stale_cache);
 
     let net = wallet_manager
-        .reqwest_networking_for_channel(&old_channel)
+        .mint_client_for_channel(&old_channel)
         .unwrap();
     let swaps = Arc::new(AtomicUsize::new(0));
     let output_keysets_by_call = Arc::new(Mutex::new(Vec::new()));

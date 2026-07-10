@@ -212,7 +212,7 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
         }
         WalletCommand::Close { channel_id } => {
             let net = manager
-                .reqwest_networking_for_channel(&channel_id)
+                .mint_client_for_channel(&channel_id)
                 .map_err(|e| anyhow::anyhow!(e))?;
             let result = manager.close_channel(&channel_id, &net).await?;
             if args.json {
@@ -244,7 +244,7 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
         } => {
             let name = resolve_wallet_name(&args, name_opt.clone())?;
             let net = manager
-                .reqwest_networking_for_relay(&name, mint_url, unit)
+                .mint_client_for_relay(&name, mint_url, unit)
                 .map_err(|e| anyhow::anyhow!(e))?;
             let result = manager
                 .drain_closed_channels_to_swap(&name, mint_url, unit, &net, limit)
@@ -264,7 +264,7 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                 .find(|drain| drain.drain_id == drain_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown drain '{drain_id}'"))?;
             let net = manager
-                .reqwest_networking_for_relay(&drain.relay_name, &drain.mint_url, &drain.unit)
+                .mint_client_for_relay(&drain.relay_name, &drain.mint_url, &drain.unit)
                 .map_err(|e| anyhow::anyhow!(e))?;
             let result = manager
                 .recover_submitted_drain(&drain_id, &net)
