@@ -1165,7 +1165,6 @@ async fn test_expiring_channel_auto_close_worker_closes_near_expiry_channel() {
         None,
         config,
         wallet_manager,
-        shared_spilman_mint_cache(mint_cache),
         async {
             let _ = shutdown_rx.await;
         },

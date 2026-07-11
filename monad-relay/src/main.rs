@@ -126,7 +126,7 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
     };
 
     let trusted_mint_units = relay.trusted_mint_units();
-    let discovered_spilman_mint_cache = wallet_manager
+    wallet_manager
         .refresh_trusted_mint_cache(&trusted_mint_units)
         .await
         .map_err(anyhow::Error::msg)?;
@@ -156,7 +156,6 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
         Some(quic_endpoint),
         server_config,
         wallet_manager,
-        discovered_spilman_mint_cache,
     )
     .await?;
 
