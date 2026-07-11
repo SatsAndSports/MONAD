@@ -175,7 +175,7 @@ Inputs:
 - `PaymentPolicy { target_topup_buffer_msats, minimum_topup_msats }`
 
 Configured clients load `target_topup_buffer_msats` and `minimum_topup_msats`
-from `wallets.client` in YAML, defaulting to `10000000` and `0` msats.
+from `client_wallet` in YAML, defaulting to `10000000` and `0` msats.
 
 The client computes:
 

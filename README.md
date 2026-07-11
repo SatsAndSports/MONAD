@@ -41,17 +41,16 @@ Not implemented yet:
 Example `monad.yaml`:
 
 ```yaml
-wallets:
-  relay:
-    db_path: /var/lib/monad/relay.db
-  client:
-    loose_db_path: /var/lib/monad/client-loose.db
-    channel_db_path: /var/lib/monad/client-channels.db
-    wallet_name: default
-    sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
-    channel_input_budget_msats: 1000000
-    target_topup_buffer_msats: 10000000
-    minimum_topup_msats: 0
+relay_wallet:
+  db_path: /var/lib/monad/relay.db
+
+client_wallet:
+  loose_db_path: /var/lib/monad/client-loose.db
+  channel_db_path: /var/lib/monad/client-channels.db
+  sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
+  channel_input_budget_msats: 1000000
+  target_topup_buffer_msats: 10000000
+  minimum_topup_msats: 0
 
 management:
   listen: 127.0.0.1:9090
@@ -115,7 +114,7 @@ Add `--json` to any wallet command for machine-readable output.
 
 On first start, `receiver_secret_hex` is required so the relay can register its identity in the wallet database.  On later restarts of the same relay wallet identity, omit `receiver_secret_hex`; the relay will load the existing receiver key for `relay-a` from the shared wallet DB.
 
-All configured relays share `wallets.relay.db_path` safely because each relay uses a distinct receiver key, so their channel rows are disjoint.  The config loader rejects any two relays that share the same `receiver_secret_hex`.
+All configured relays share `relay_wallet.db_path` safely because each relay uses a distinct receiver key, so their channel rows are disjoint.  The config loader rejects any two relays that share the same `receiver_secret_hex`.
 
 ## Client Wallet
 
@@ -128,11 +127,22 @@ client with `monad-client run --config monad.yaml --client <name>`.
 - opening recovery is persisted for ambiguous funding-swap failures and can be recovered through upstream restore.
 - output keyset selection is cache-first: the wallet ensures its mint/unit keyset cache is non-empty before entering the keyset retry helper, then selectors read cache only; refresh happens after retryable mint keyset rejection.
 
-`wallets.client.channel_input_budget_msats` controls the loose-proof input budget for each newly provisioned channel. It is not a guaranteed channel capacity; fees and deterministic channel outputs can make the resulting capacity lower. The default is `1000000` msats.
+`client_wallet.channel_input_budget_msats` controls the loose-proof input budget for each newly provisioned channel. It is not a guaranteed channel capacity; fees and deterministic channel outputs can make the resulting capacity lower. The default is `1000000` msats.
 
-`wallets.client.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `wallets.client.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats.
+`client_wallet.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `client_wallet.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats.
 
-Current admin/recovery commands use explicit DB paths and sender key material:
+Admin/recovery commands can use the configured singleton `client_wallet`:
+
+```bash
+monad-client wallet --config monad.yaml channels
+monad-client wallet --config monad.yaml proofs
+monad-client wallet --config monad.yaml import-token --token <cashu-token>
+monad-client wallet --config monad.yaml import-token --token-file ./token.txt
+monad-client wallet --config monad.yaml recover-channel --channel-id <channel-id>
+monad-client wallet --config monad.yaml recover-openings
+```
+
+They can also use explicit DB paths and sender key material for manual or emergency access:
 
 ```bash
 monad-client wallet \
@@ -175,7 +185,7 @@ monad-client wallet \
 
 Add `--json` to wallet commands for machine-readable output.
 
-Remaining client-wallet work is operator/user experience rather than the core channel-payment library path: mint quote/mint commands, startup recovery policy before SOCKS operation, richer proof balance inspection, and close/sweep flows.
+Remaining client-wallet work is operator/user experience rather than the core channel-payment library path: mint quote/mint commands, startup recovery policy before SOCKS operation, richer balance inspection, and close/sweep flows.
 
 ## Workspace
 
@@ -330,17 +340,16 @@ This prints:
 Create a `monad.yaml` file.  A single file can hold the shared wallets, many relays, and one or more client route definitions. Each relay process selects one relay with `--relay <name>`.
 
 ```yaml
-wallets:
-  relay:
-    db_path: /var/lib/monad/relay.db
-  client:
-    loose_db_path: /var/lib/monad/client-loose.db
-    channel_db_path: /var/lib/monad/client-channels.db
-    wallet_name: default
-    sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
-    channel_input_budget_msats: 1000000
-    target_topup_buffer_msats: 10000000
-    minimum_topup_msats: 0
+relay_wallet:
+  db_path: /var/lib/monad/relay.db
+
+client_wallet:
+  loose_db_path: /var/lib/monad/client-loose.db
+  channel_db_path: /var/lib/monad/client-channels.db
+  sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
+  channel_input_budget_msats: 1000000
+  target_topup_buffer_msats: 10000000
+  minimum_topup_msats: 0
 
 relays:
   - name: hop1

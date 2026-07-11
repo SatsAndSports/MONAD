@@ -103,7 +103,11 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
     let quic_km = monad_quic::keygen::generate_from_seed(identity.seed())?;
     let quic_config = monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem)?;
 
-    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path)?);
+    let relay_wallet = config
+        .relay_wallet
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("relay_wallet is required to run a relay"))?;
+    let wallet_manager = Arc::new(RelayWalletManager::open(&relay_wallet.db_path)?);
 
     let receiver_pubkey_hex = match &relay.receiver_secret_hex {
         Some(secret_hex) => {
@@ -120,7 +124,7 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
                 anyhow::anyhow!(
                     "relay '{}' has no receiver_secret_hex and is not registered in '{}': {e}",
                     relay.name,
-                    config.wallets.relay.db_path
+                    relay_wallet.db_path
                 )
             })?,
     };
@@ -140,7 +144,7 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
         out_bytes_per_millisat: relay.pricing.out_bytes_per_millisat,
         bootstrap_capabilities: None,
         relay_wallet_name: relay.name.clone(),
-        spilman_storage_path: config.wallets.relay.db_path.clone(),
+        spilman_storage_path: relay_wallet.db_path.clone(),
         channel_policy: relay.channel_policy.clone(),
     });
 

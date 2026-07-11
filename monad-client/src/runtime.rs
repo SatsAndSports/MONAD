@@ -21,6 +21,7 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const INITIAL_RECONNECT_BACKOFF_MS: u64 = 250;
 const MAX_RECONNECT_BACKOFF_MS: u64 = 5_000;
 const ROUTE_CONNECT_TIMEOUT_MS: u64 = 5_000;
+pub const CONFIGURED_CLIENT_WALLET_NAME: &str = "default";
 
 #[derive(Debug, Default)]
 struct ChannelDetachStats {
@@ -155,13 +156,12 @@ where
 
     let client = config.select_client(client_name)?;
     let client_wallet = config
-        .wallets
-        .client
+        .client_wallet
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("wallets.client is required to run a client"))?;
+        .ok_or_else(|| anyhow::anyhow!("client_wallet is required to run a client"))?;
 
     let loose_wallet =
-        LooseProofWallet::open(&client_wallet.loose_db_path, &client_wallet.wallet_name)?;
+        LooseProofWallet::open(&client_wallet.loose_db_path, CONFIGURED_CLIENT_WALLET_NAME)?;
     let wallet = SqliteClientWallet::open(
         loose_wallet,
         &client_wallet.channel_db_path,

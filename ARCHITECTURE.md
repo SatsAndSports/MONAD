@@ -581,9 +581,10 @@ cache-only; refresh happens only after a retryable mint keyset rejection, and th
 retry is skipped if refresh still selects the same output keyset.
 
 The reusable wallet library path exists, and `monad-client wallet ...` exposes
-explicit-flag token import, proof/channel inspection, and recovery commands. The
-configured SOCKS runtime uses the persisted loose-proof and channel wallets from
-YAML. Remaining wallet UX work is mostly mint quote/mint commands, richer
+token import, proof/channel inspection, and recovery commands using either
+top-level `client_wallet` YAML config or explicit DB/key flags. The configured
+SOCKS runtime uses the persisted loose-proof and channel wallets from that same
+YAML config. Remaining wallet UX work is mostly mint quote/mint commands, richer
 balance inspection, close/sweep flows, and startup recovery policy.
 
 ### Relay Wallet Layer
@@ -1273,7 +1274,7 @@ The full QUIC transport chain is implemented and tested:
 
 ## Current Limitations
 
-- client wallet funding UX is not yet fully wired: mint quotes, premint submission, richer proof balance inspection, and client close/sweep flows still need commands.
+- client wallet funding UX is not yet fully wired: mint quotes, premint submission, richer balance inspection, and client close/sweep flows still need commands.
 - configured-client startup recovery policy is still explicit/operator-driven rather than automatic before SOCKS starts accepting traffic.
 - QUIC connection pool does not yet handle connection eviction or stale entry cleanup.
 - asymmetric pricing (rates other than 1/1) is not yet tested.

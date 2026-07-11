@@ -289,7 +289,10 @@ fn resolve_wallet_db_path(args: &WalletArgs) -> anyhow::Result<String> {
             if args.relay.is_some() {
                 let _ = config.select_relay(args.relay.as_deref())?;
             }
-            Ok(config.wallets.relay.db_path)
+            Ok(config
+                .relay_wallet
+                .ok_or_else(|| anyhow::anyhow!("relay_wallet is required when using --config"))?
+                .db_path)
         }
         (None, None) => Err(anyhow::anyhow!(
             "either --wallet-db-path or --config is required"

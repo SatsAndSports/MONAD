@@ -22,7 +22,7 @@ use monad_client::loose_proof_wallet::{LooseProofWallet, NewLooseProof};
 use monad_client::route::{Route, RouteHop};
 use monad_client::runtime::{
     run_configured_client_until_shutdown, run_configured_client_until_shutdown_with_stats,
-    SharedRouteRuntimeStats,
+    SharedRouteRuntimeStats, CONFIGURED_CLIENT_WALLET_NAME,
 };
 use monad_client::session_driver::{start_session_payment_driver, PaymentPolicy};
 use monad_client::sqlite_client_wallet::{ChannelFundRecoveryResult, SqliteClientWallet};
@@ -4717,9 +4717,8 @@ async fn test_relay_starts_from_yaml_config_and_advertises_configured_mints() {
 
     let yaml = format!(
         r#"
-wallets:
-  relay:
-    db_path: {}
+relay_wallet:
+  db_path: {}
 relays:
   - name: yaml-relay
     receiver_secret_hex: {}
@@ -4744,7 +4743,8 @@ relays:
     let config = MonadConfig::load(&config_path).unwrap();
     let relay = config.select_relay(None).unwrap();
 
-    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let (server_addr, pubkey, handle, shutdown_tx, _payments) =
         start_relay_from_config(relay, wallet_manager, mint_cache)
             .await
@@ -4801,9 +4801,8 @@ async fn test_yaml_config_allows_distinct_per_relay_pricing() {
 
     let yaml = format!(
         r#"
-wallets:
-  relay:
-    db_path: {}
+relay_wallet:
+  db_path: {}
 relays:
   - name: relay-a
     receiver_secret_hex: {}
@@ -4847,13 +4846,13 @@ relays:
     let relay_b = config.select_relay(Some("relay-b")).unwrap();
 
     let wallet_manager_a =
-        Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let (server_addr_a, pubkey_a, handle_a, shutdown_tx_a, _payments_a) =
         start_relay_from_config(relay_a, wallet_manager_a, mint_cache.clone())
             .await
             .unwrap();
     let wallet_manager_b =
-        Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let (server_addr_b, pubkey_b, handle_b, shutdown_tx_b, _payments_b) =
         start_relay_from_config(relay_b, wallet_manager_b, mint_cache)
             .await
@@ -4921,7 +4920,8 @@ async fn test_shared_yaml_config_drives_client_socks_over_quic() {
     // reuse plain change proofs from the funding swap.
     let total_input_raw = 2_000u64;
     let input_proofs = mint_helper.mint_proofs(total_input_raw).await.unwrap();
-    let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
+    let loose_wallet =
+        LooseProofWallet::open(&loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap();
     loose_wallet
         .import_proofs(&loose_proofs_from_cashu_proofs(
             &mint_url,
@@ -4954,16 +4954,14 @@ async fn test_shared_yaml_config_drives_client_socks_over_quic() {
     // channel exhaustion/closure timing.
     let yaml = format!(
         r#"
-wallets:
-  relay:
-    db_path: {}
-  client:
-    loose_db_path: {}
-    channel_db_path: {}
-    wallet_name: alice
-    sender_secret_hex: "{}"
-    channel_input_budget_msats: 1000000
-    target_topup_buffer_msats: 500000
+relay_wallet:
+  db_path: {}
+client_wallet:
+  loose_db_path: {}
+  channel_db_path: {}
+  sender_secret_hex: "{}"
+  channel_input_budget_msats: 1000000
+  target_topup_buffer_msats: 500000
 relays:
   - name: yaml-relay
     receiver_secret_hex: {}
@@ -5000,7 +4998,8 @@ clients:
 
     let config = MonadConfig::load(&config_path).unwrap();
     let relay = config.select_relay(Some("yaml-relay")).unwrap();
-    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let (_server_addr, _pubkey, relay_handle, relay_shutdown_tx, _payments) =
         start_relay_from_config(relay, wallet_manager, mint_cache)
             .await
@@ -5132,7 +5131,8 @@ async fn test_configured_client_reconnects_after_relay_restart() {
 
     let mut input_proofs = mint_helper.mint_proofs(10_000).await.unwrap();
     input_proofs.extend(mint_helper.mint_proofs(10_000).await.unwrap());
-    let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
+    let loose_wallet =
+        LooseProofWallet::open(&loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap();
     loose_wallet
         .import_proofs(&loose_proofs_from_cashu_proofs(
             &mint_url,
@@ -5163,17 +5163,15 @@ async fn test_configured_client_reconnects_after_relay_restart() {
 
     let yaml = format!(
         r#"
-wallets:
-  relay:
-    db_path: {}
-  client:
-    loose_db_path: {}
-    channel_db_path: {}
-    wallet_name: alice
-    sender_secret_hex: "{}"
-    channel_input_budget_msats: 20000000
-    # Low target keeps the reused channel far from capacity during reconnect.
-    target_topup_buffer_msats: 500000
+relay_wallet:
+  db_path: {}
+client_wallet:
+  loose_db_path: {}
+  channel_db_path: {}
+  sender_secret_hex: "{}"
+  channel_input_budget_msats: 20000000
+  # Low target keeps the reused channel far from capacity during reconnect.
+  target_topup_buffer_msats: 500000
 relays:
   - name: yaml-relay
     receiver_secret_hex: {}
@@ -5213,7 +5211,8 @@ clients:
 
     let config = MonadConfig::load(&config_path).unwrap();
     let relay = config.select_relay(Some("yaml-relay")).unwrap();
-    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let (server_addr, _pubkey, relay_handle, relay_shutdown_tx, _payments) =
         start_relay_from_config(relay, wallet_manager, mint_cache.clone())
             .await
@@ -5316,7 +5315,7 @@ clients:
     assert_eq!(first_result.as_deref(), Some(&b"RECONNECT TEST"[..]));
 
     let initial_wallet = SqliteClientWallet::open(
-        LooseProofWallet::open(&loose_db_path, "alice").unwrap(),
+        LooseProofWallet::open(&loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap(),
         &channel_db_path,
         &sender_secret_hex,
     )
@@ -5346,7 +5345,8 @@ clients:
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Restart the relay on the same TCP+QUIC address with the same DB.
-    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let relay = config.select_relay(Some("yaml-relay")).unwrap();
     let (_server_addr, _pubkey, relay_handle, relay_shutdown_tx, _payments) =
         start_relay_from_config(relay, wallet_manager, mint_cache)
@@ -5392,7 +5392,7 @@ clients:
     );
 
     let reconnected_wallet = SqliteClientWallet::open(
-        LooseProofWallet::open(&loose_db_path, "alice").unwrap(),
+        LooseProofWallet::open(&loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap(),
         &channel_db_path,
         &sender_secret_hex,
     )
@@ -5561,7 +5561,8 @@ async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
     for _ in 0..case.proof_batches {
         input_proofs.extend(mint_helper.mint_proofs(10_000).await.unwrap());
     }
-    let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
+    let loose_wallet =
+        LooseProofWallet::open(&loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap();
     loose_wallet
         .import_proofs(&loose_proofs_from_cashu_proofs(
             &mint_url,
@@ -5643,16 +5644,14 @@ async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
 
     let yaml = format!(
         r#"
-wallets:
-  relay:
-    db_path: {}
-  client:
-    loose_db_path: {}
-    channel_db_path: {}
-    wallet_name: alice
-    sender_secret_hex: "{}"
-    # Just above the default 10M target so preserved prefix channels stay reusable.
-    channel_input_budget_msats: 11000000
+relay_wallet:
+  db_path: {}
+client_wallet:
+  loose_db_path: {}
+  channel_db_path: {}
+  sender_secret_hex: "{}"
+  # Just above the default 10M target so preserved prefix channels stay reusable.
+  channel_input_budget_msats: 11000000
 relays:
 {}clients:
   - name: local
@@ -5673,7 +5672,8 @@ relays:
     drop(socks_listener);
 
     let config = MonadConfig::load(&config_path).unwrap();
-    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let mut relay_handles = Vec::new();
     let mut relay_shutdown_txs = Vec::new();
     for relay_name in relay_names.iter().take(case.hop_count) {
@@ -5706,7 +5706,7 @@ relays:
     wait_for_configured_roundtrip(socks_listen, upper_addr, case.payload, case.label).await;
 
     let initial_wallet = SqliteClientWallet::open(
-        LooseProofWallet::open(&loose_db_path, "alice").unwrap(),
+        LooseProofWallet::open(&loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap(),
         &channel_db_path,
         &sender_secret_hex,
     )
@@ -5725,7 +5725,8 @@ relays:
     failed_handle.await.unwrap().unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let wallet_manager = Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let failed_relay_name = relay_names[case.failed_hop_idx];
     let failed_relay_config = config.select_relay(Some(failed_relay_name)).unwrap();
     let (_server, _pubkey, failed_handle, failed_shutdown_tx, _payments) =
@@ -5770,7 +5771,7 @@ relays:
     );
 
     let rebuilt_wallet = SqliteClientWallet::open(
-        LooseProofWallet::open(&loose_db_path, "alice").unwrap(),
+        LooseProofWallet::open(&loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap(),
         &channel_db_path,
         &sender_secret_hex,
     )
@@ -5878,7 +5879,8 @@ async fn test_shared_yaml_config_drives_two_hop_client_socks_over_quic() {
     // the first open returns plain change that funds the second hop.
     let total_input_raw = 2_048u64;
     let input_proofs = mint_helper.mint_proofs(total_input_raw).await.unwrap();
-    let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
+    let loose_wallet =
+        LooseProofWallet::open(&loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap();
     loose_wallet
         .import_proofs(&loose_proofs_from_cashu_proofs(
             &mint_url,
@@ -5917,16 +5919,14 @@ async fn test_shared_yaml_config_drives_two_hop_client_socks_over_quic() {
 
     let yaml = format!(
         r#"
-wallets:
-  relay:
-    db_path: {}
-  client:
-    loose_db_path: {}
-    channel_db_path: {}
-    wallet_name: alice
-    sender_secret_hex: "{}"
-    channel_input_budget_msats: 1000000
-    target_topup_buffer_msats: 500000
+relay_wallet:
+  db_path: {}
+client_wallet:
+  loose_db_path: {}
+  channel_db_path: {}
+  sender_secret_hex: "{}"
+  channel_input_budget_msats: 1000000
+  target_topup_buffer_msats: 500000
 relays:
   - name: hop1
     receiver_secret_hex: {}
@@ -5983,9 +5983,9 @@ clients:
 
     let config = MonadConfig::load(&config_path).unwrap();
     let wallet_manager_1 =
-        Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let wallet_manager_2 =
-        Arc::new(RelayWalletManager::open(&config.wallets.relay.db_path).unwrap());
+        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let (_relay_1_addr, _relay_1_pubkey, relay_1_handle, relay_1_shutdown_tx, _payments_1) =
         start_relay_from_config(
             config.select_relay(Some("hop1")).unwrap(),

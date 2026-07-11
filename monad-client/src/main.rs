@@ -6,7 +6,7 @@ use cashu::nuts::{
 use cdk_spilman::MintConnection;
 use clap::{Parser, Subcommand};
 use monad_client::loose_proof_wallet::{LooseProofSummary, LooseProofWallet, NewLooseProof};
-use monad_client::runtime::run_configured_client_until_shutdown;
+use monad_client::runtime::{run_configured_client_until_shutdown, CONFIGURED_CLIENT_WALLET_NAME};
 use monad_client::sqlite_client_wallet::{ChannelFundRecoveryResult, SqliteClientWallet};
 use monad_client::wallet::{MonadWallet, WalletChannel, WalletChannelState};
 use monad_common::config::MonadConfig;
@@ -42,21 +42,25 @@ struct RunArgs {
 
 #[derive(Parser)]
 struct WalletArgs {
+    /// Shared MONAD YAML config path. Uses the top-level client_wallet entry.
+    #[arg(long)]
+    config: Option<String>,
+
     /// SQLite database containing loose bearer proofs.
     #[arg(long)]
-    loose_db: String,
+    loose_db: Option<String>,
 
     /// SQLite database containing MONAD/upstream channel metadata.
     #[arg(long)]
-    channel_db: String,
+    channel_db: Option<String>,
 
     /// Sender secret hex used for channel refund/payment signing.
     #[arg(long)]
-    sender_secret_hex: String,
+    sender_secret_hex: Option<String>,
 
     /// Logical loose-proof wallet name inside the loose proof database.
-    #[arg(long, default_value = "default")]
-    wallet_name: String,
+    #[arg(long)]
+    wallet_name: Option<String>,
 
     /// Emit JSON instead of human-readable output.
     #[arg(long)]
@@ -64,6 +68,14 @@ struct WalletArgs {
 
     #[command(subcommand)]
     command: WalletCommand,
+}
+
+#[derive(Debug)]
+struct ResolvedWalletArgs {
+    loose_db: String,
+    channel_db: String,
+    sender_secret_hex: String,
+    wallet_name: String,
 }
 
 #[derive(Subcommand)]
@@ -171,8 +183,13 @@ async fn run_configured_client(args: RunArgs) -> anyhow::Result<()> {
 }
 
 async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
-    let loose_wallet = LooseProofWallet::open(&args.loose_db, &args.wallet_name)?;
-    let wallet = SqliteClientWallet::open(loose_wallet, &args.channel_db, &args.sender_secret_hex)?;
+    let resolved = resolve_wallet_args(&args)?;
+    let loose_wallet = LooseProofWallet::open(&resolved.loose_db, &resolved.wallet_name)?;
+    let wallet = SqliteClientWallet::open(
+        loose_wallet,
+        &resolved.channel_db,
+        &resolved.sender_secret_hex,
+    )?;
 
     match args.command {
         WalletCommand::Channels => {
@@ -237,6 +254,48 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_wallet_args(args: &WalletArgs) -> anyhow::Result<ResolvedWalletArgs> {
+    if let Some(config_path) = &args.config {
+        if args.loose_db.is_some()
+            || args.channel_db.is_some()
+            || args.sender_secret_hex.is_some()
+            || args.wallet_name.is_some()
+        {
+            anyhow::bail!(
+                "--config cannot be combined with --loose-db, --channel-db, --sender-secret-hex, or --wallet-name"
+            );
+        }
+        let config = MonadConfig::load(config_path)?;
+        let client_wallet = config
+            .client_wallet
+            .ok_or_else(|| anyhow::anyhow!("client_wallet is required when using --config"))?;
+        return Ok(ResolvedWalletArgs {
+            loose_db: client_wallet.loose_db_path,
+            channel_db: client_wallet.channel_db_path,
+            sender_secret_hex: client_wallet.sender_secret_hex,
+            wallet_name: CONFIGURED_CLIENT_WALLET_NAME.to_string(),
+        });
+    }
+
+    Ok(ResolvedWalletArgs {
+        loose_db: args
+            .loose_db
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--loose-db is required unless --config is used"))?,
+        channel_db: args
+            .channel_db
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--channel-db is required unless --config is used"))?,
+        sender_secret_hex: args.sender_secret_hex.clone().ok_or_else(|| {
+            anyhow::anyhow!("--sender-secret-hex is required unless --config is used")
+        })?,
+        wallet_name: args
+            .wallet_name
+            .clone()
+            .unwrap_or_else(|| CONFIGURED_CLIENT_WALLET_NAME.to_string()),
+    })
 }
 
 struct ImportedTokenSummary {
@@ -534,4 +593,86 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
     serde_json::to_writer_pretty(&mut handle, value)?;
     writeln!(handle)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monad_common::secp_identity::SecpTransportKeypair;
+
+    const ZERO_SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn wallet_args(command: WalletCommand) -> WalletArgs {
+        WalletArgs {
+            config: None,
+            loose_db: None,
+            channel_db: None,
+            sender_secret_hex: None,
+            wallet_name: None,
+            json: false,
+            command,
+        }
+    }
+
+    #[test]
+    fn resolve_wallet_args_uses_client_wallet_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("monad.yaml");
+        let loose_db = dir.path().join("loose.db");
+        let channel_db = dir.path().join("channel.db");
+        let pubkey = SecpTransportKeypair::from_secret_bytes(&[7u8; 32])
+            .unwrap()
+            .pubkey()
+            .to_hex();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+client_wallet:
+  loose_db_path: {}
+  channel_db_path: {}
+  sender_secret_hex: "{ZERO_SECRET}"
+clients:
+  - name: local
+    socks: 127.0.0.1:1080
+    route:
+      - addr: 127.0.0.1:9050
+        pubkey: "{pubkey}"
+"#,
+                loose_db.display(),
+                channel_db.display()
+            ),
+        )
+        .unwrap();
+
+        let mut args = wallet_args(WalletCommand::Channels);
+        args.config = Some(config_path.display().to_string());
+
+        let resolved = resolve_wallet_args(&args).unwrap();
+        assert_eq!(resolved.loose_db, loose_db.display().to_string());
+        assert_eq!(resolved.channel_db, channel_db.display().to_string());
+        assert_eq!(resolved.sender_secret_hex, ZERO_SECRET);
+        assert_eq!(resolved.wallet_name, CONFIGURED_CLIENT_WALLET_NAME);
+    }
+
+    #[test]
+    fn resolve_wallet_args_rejects_mixed_config_and_explicit_args() {
+        let mut args = wallet_args(WalletCommand::Channels);
+        args.config = Some("monad.yaml".to_string());
+        args.loose_db = Some("loose.db".to_string());
+
+        let err = resolve_wallet_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--config cannot be combined"));
+    }
+
+    #[test]
+    fn resolve_wallet_args_explicit_mode_defaults_wallet_name() {
+        let mut args = wallet_args(WalletCommand::Channels);
+        args.loose_db = Some("loose.db".to_string());
+        args.channel_db = Some("channel.db".to_string());
+        args.sender_secret_hex = Some(ZERO_SECRET.to_string());
+
+        let resolved = resolve_wallet_args(&args).unwrap();
+        assert_eq!(resolved.wallet_name, CONFIGURED_CLIENT_WALLET_NAME);
+    }
 }

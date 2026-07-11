@@ -14,11 +14,16 @@ use crate::secp_identity::Secp256k1Pubkey;
 /// Top-level MONAD configuration file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MonadConfig {
-    pub wallets: WalletsConfig,
+    #[serde(default)]
+    pub relay_wallet: Option<RelayWalletConfig>,
+
+    #[serde(default)]
+    pub client_wallet: Option<ClientWalletConfig>,
 
     #[serde(default)]
     pub management: Option<ManagementConfig>,
 
+    #[serde(default)]
     pub relays: Vec<RelayConfig>,
 
     #[serde(default)]
@@ -98,36 +103,36 @@ impl MonadConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.wallets.relay.db_path.trim().is_empty() {
-            anyhow::bail!("wallets.relay.db_path must not be empty");
+        if self.relays.is_empty() && self.clients.is_empty() {
+            anyhow::bail!("config must contain at least one relay or client");
         }
 
-        if !self.clients.is_empty() && self.wallets.client.is_none() {
-            anyhow::bail!("wallets.client is required when clients are configured");
+        if !self.relays.is_empty() && self.relay_wallet.is_none() {
+            anyhow::bail!("relay_wallet is required when relays are configured");
         }
-        if let Some(client_wallet) = &self.wallets.client {
+        if let Some(relay_wallet) = &self.relay_wallet {
+            if relay_wallet.db_path.trim().is_empty() {
+                anyhow::bail!("relay_wallet.db_path must not be empty");
+            }
+        }
+
+        if !self.clients.is_empty() && self.client_wallet.is_none() {
+            anyhow::bail!("client_wallet is required when clients are configured");
+        }
+        if let Some(client_wallet) = &self.client_wallet {
             if client_wallet.loose_db_path.trim().is_empty() {
-                anyhow::bail!("wallets.client.loose_db_path must not be empty");
+                anyhow::bail!("client_wallet.loose_db_path must not be empty");
             }
             if client_wallet.channel_db_path.trim().is_empty() {
-                anyhow::bail!("wallets.client.channel_db_path must not be empty");
-            }
-            if client_wallet.wallet_name.trim().is_empty() {
-                anyhow::bail!("wallets.client.wallet_name must not be empty");
+                anyhow::bail!("client_wallet.channel_db_path must not be empty");
             }
             validate_hex_secret(
-                "wallets.client.sender_secret_hex",
+                "client_wallet.sender_secret_hex",
                 &client_wallet.sender_secret_hex,
             )?;
             if client_wallet.channel_input_budget_msats == 0 {
-                anyhow::bail!(
-                    "wallets.client.channel_input_budget_msats must be greater than zero"
-                );
+                anyhow::bail!("client_wallet.channel_input_budget_msats must be greater than zero");
             }
-        }
-
-        if self.relays.is_empty() {
-            anyhow::bail!("config must contain at least one relay");
         }
 
         let mut relay_names = HashSet::new();
@@ -274,14 +279,6 @@ impl MonadConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct WalletsConfig {
-    pub relay: RelayWalletConfig,
-
-    #[serde(default)]
-    pub client: Option<ClientWalletConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct RelayWalletConfig {
     pub db_path: String,
 }
@@ -290,8 +287,6 @@ pub struct RelayWalletConfig {
 pub struct ClientWalletConfig {
     pub loose_db_path: String,
     pub channel_db_path: String,
-    #[serde(default = "default_wallet_name")]
-    pub wallet_name: String,
     pub sender_secret_hex: String,
     #[serde(default = "default_channel_input_budget_msats")]
     pub channel_input_budget_msats: u64,
@@ -438,10 +433,6 @@ pub struct ClientConfig {
 pub struct ClientRouteHopConfig {
     pub addr: String,
     pub pubkey: String,
-}
-
-fn default_wallet_name() -> String {
-    "default".to_string()
 }
 
 fn default_channel_input_budget_msats() -> u64 {
@@ -676,14 +667,12 @@ mod tests {
         let pubkey = sample_pubkey_hex(7);
         format!(
             r#"
-wallets:
-  relay:
-    db_path: /tmp/relay.db
-  client:
-    loose_db_path: /tmp/client-loose.db
-    channel_db_path: /tmp/client-channel.db
-    wallet_name: default
-    sender_secret_hex: "{ZERO_SECRET}"
+relay_wallet:
+  db_path: /tmp/relay.db
+client_wallet:
+  loose_db_path: /tmp/client-loose.db
+  channel_db_path: /tmp/client-channel.db
+  sender_secret_hex: "{ZERO_SECRET}"
 management:
   listen: 127.0.0.1:9080
 relays:
@@ -739,11 +728,13 @@ clients:
     fn parse_and_validate_minimal_config() {
         let config: MonadConfig = serde_yaml::from_str(&minimal_config_yaml()).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.wallets.relay.db_path, "/tmp/relay.db");
+        assert_eq!(
+            config.relay_wallet.as_ref().unwrap().db_path,
+            "/tmp/relay.db"
+        );
         assert_eq!(
             config
-                .wallets
-                .client
+                .client_wallet
                 .as_ref()
                 .unwrap()
                 .channel_input_budget_msats,
@@ -751,15 +742,14 @@ clients:
         );
         assert_eq!(
             config
-                .wallets
-                .client
+                .client_wallet
                 .as_ref()
                 .unwrap()
                 .target_topup_buffer_msats,
             10_000_000
         );
         assert_eq!(
-            config.wallets.client.as_ref().unwrap().minimum_topup_msats,
+            config.client_wallet.as_ref().unwrap().minimum_topup_msats,
             0
         );
         assert_eq!(config.relays[0].pricing.in_bytes_per_millisat, 10);
@@ -906,7 +896,7 @@ clients:
     fn zero_client_channel_input_budget_is_rejected() {
         let yaml = minimal_config_yaml().replace(
             &format!("sender_secret_hex: \"{ZERO_SECRET}\""),
-            &format!("sender_secret_hex: \"{ZERO_SECRET}\"\n    channel_input_budget_msats: 0"),
+            &format!("sender_secret_hex: \"{ZERO_SECRET}\"\n  channel_input_budget_msats: 0"),
         );
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         let err = config.validate().unwrap_err().to_string();
@@ -918,12 +908,12 @@ clients:
         let yaml = minimal_config_yaml().replace(
             &format!("sender_secret_hex: \"{ZERO_SECRET}\""),
             &format!(
-                "sender_secret_hex: \"{ZERO_SECRET}\"\n    target_topup_buffer_msats: 500000\n    minimum_topup_msats: 250000"
+                "sender_secret_hex: \"{ZERO_SECRET}\"\n  target_topup_buffer_msats: 500000\n  minimum_topup_msats: 250000"
             ),
         );
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         config.validate().unwrap();
-        let client_wallet = config.wallets.client.as_ref().unwrap();
+        let client_wallet = config.client_wallet.as_ref().unwrap();
         assert_eq!(client_wallet.target_topup_buffer_msats, 500_000);
         assert_eq!(client_wallet.minimum_topup_msats, 250_000);
     }
@@ -932,9 +922,8 @@ clients:
     fn duplicate_relay_name_is_rejected() {
         let yaml = format!(
             r#"
-wallets:
-  relay:
-    db_path: /tmp/relay.db
+relay_wallet:
+  db_path: /tmp/relay.db
 relays:
   - name: r1
     quic_cert_seed: "{ZERO_SECRET}"
@@ -958,9 +947,8 @@ relays:
     fn duplicate_listen_is_rejected() {
         let yaml = format!(
             r#"
-wallets:
-  relay:
-    db_path: /tmp/relay.db
+relay_wallet:
+  db_path: /tmp/relay.db
 relays:
   - name: r1
     quic_cert_seed: "{ZERO_SECRET}"
@@ -984,9 +972,8 @@ relays:
     fn duplicate_receiver_secret_is_rejected() {
         let yaml = format!(
             r#"
-wallets:
-  relay:
-    db_path: /tmp/relay.db
+relay_wallet:
+  db_path: /tmp/relay.db
 relays:
   - name: r1
     receiver_secret_hex: "{ZERO_SECRET}"
@@ -1030,18 +1017,64 @@ relays:
     fn client_wallet_required_when_clients_exist() {
         let yaml = minimal_config_yaml().replace(
             &format!(
-                r#"  client:
-    loose_db_path: /tmp/client-loose.db
-    channel_db_path: /tmp/client-channel.db
-    wallet_name: default
-    sender_secret_hex: "{ZERO_SECRET}"
+                r#"client_wallet:
+  loose_db_path: /tmp/client-loose.db
+  channel_db_path: /tmp/client-channel.db
+  sender_secret_hex: "{ZERO_SECRET}"
 "#
             ),
             "",
         );
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("wallets.client is required"));
+        assert!(err.contains("client_wallet is required"));
+    }
+
+    #[test]
+    fn relay_wallet_required_when_relays_exist() {
+        let yaml = minimal_config_yaml().replace(
+            r#"relay_wallet:
+  db_path: /tmp/relay.db
+"#,
+            "",
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("relay_wallet is required"));
+    }
+
+    #[test]
+    fn client_only_config_validates() {
+        let yaml = format!(
+            r#"
+client_wallet:
+  loose_db_path: /tmp/client-loose.db
+  channel_db_path: /tmp/client-channel.db
+  sender_secret_hex: "{ZERO_SECRET}"
+clients:
+  - name: c1
+    socks: 127.0.0.1:1080
+    route:
+      - addr: 127.10.0.11:9050
+        pubkey: "{}"
+"#,
+            sample_pubkey_hex(7)
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        assert!(config.relays.is_empty());
+        assert!(config.relay_wallet.is_none());
+        assert!(config.client_wallet.is_some());
+    }
+
+    #[test]
+    fn relay_only_config_validates() {
+        let clients_block_start = minimal_config_yaml().find("clients:").unwrap();
+        let yaml = minimal_config_yaml()[..clients_block_start].to_string();
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        assert!(config.clients.is_empty());
+        assert!(config.relay_wallet.is_some());
     }
 
     #[test]
@@ -1065,9 +1098,8 @@ relays:
 
         let yaml = format!(
             r#"
-wallets:
-  relay:
-    db_path: {}
+relay_wallet:
+  db_path: {}
 relays:
   - name: file-relay
     receiver_secret_hex: "${{MONAD_CFG_TEST_SECRET:-0000000000000000000000000000000000000000000000000000000000000003}}"
@@ -1087,7 +1119,10 @@ relays:
 
         let config = MonadConfig::load(&config_path).unwrap();
         let relay = &config.relays[0];
-        assert_eq!(config.wallets.relay.db_path, relay_db.display().to_string());
+        assert_eq!(
+            config.relay_wallet.as_ref().unwrap().db_path,
+            relay_db.display().to_string()
+        );
         assert_eq!(relay.name, "file-relay");
         assert_eq!(relay.quic_cert_seed, "0".repeat(63) + "1");
         assert_eq!(relay.transport_key, "0".repeat(63) + "2");
