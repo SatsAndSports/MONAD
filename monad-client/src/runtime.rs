@@ -1,6 +1,7 @@
 use crate::config_runtime::route_from_client_config;
 use crate::connector::{
-    connect_route_with_runtime, rebuild_route_from_with_runtime, ConnectorRuntime,
+    cascaded_route_failure_debounce, connect_route_with_runtime, rebuild_route_from_with_runtime,
+    ConnectorRuntime,
 };
 use crate::loose_proof_wallet::LooseProofWallet;
 use crate::session_driver::PaymentPolicy;
@@ -10,7 +11,7 @@ use crate::{socks, tunnel};
 use monad_common::config::MonadConfig;
 use monad_common::session::RelayConnection;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -29,11 +30,122 @@ struct ChannelDetachStats {
     failed: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouteRuntimeStatsSnapshot {
+    pub route_connect_attempts_total: u64,
+    pub route_failures_total: u64,
+    pub failure_watchers_unavailable_total: u64,
+    pub full_reconnects_total: u64,
+    pub suffix_rebuild_attempts_total: u64,
+    pub suffix_rebuild_successes_total: u64,
+    pub suffix_rebuild_failures_total: u64,
+    pub suffix_rebuild_fallbacks_total: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedRouteRuntimeStats {
+    inner: Arc<Mutex<RouteRuntimeStatsSnapshot>>,
+}
+
+impl SharedRouteRuntimeStats {
+    pub fn snapshot(&self) -> RouteRuntimeStatsSnapshot {
+        *self
+            .inner
+            .lock()
+            .expect("route runtime stats lock poisoned")
+    }
+
+    fn record_route_connect_attempt(&self) -> RouteRuntimeStatsSnapshot {
+        self.update(|stats| stats.route_connect_attempts_total += 1)
+    }
+
+    fn record_failure_watcher_unavailable(&self) -> RouteRuntimeStatsSnapshot {
+        self.update(|stats| {
+            stats.failure_watchers_unavailable_total += 1;
+            stats.full_reconnects_total += 1;
+        })
+    }
+
+    fn record_failed_hop(&self, hop_idx: usize) -> (RouteFailurePath, RouteRuntimeStatsSnapshot) {
+        let path = if hop_idx == 0 {
+            RouteFailurePath::FullReconnect
+        } else {
+            RouteFailurePath::SuffixRebuild
+        };
+        let snapshot = self.update(|stats| {
+            stats.route_failures_total += 1;
+            if path == RouteFailurePath::FullReconnect {
+                stats.full_reconnects_total += 1;
+            }
+        });
+        (path, snapshot)
+    }
+
+    fn record_suffix_rebuild_attempt(&self) -> RouteRuntimeStatsSnapshot {
+        self.update(|stats| stats.suffix_rebuild_attempts_total += 1)
+    }
+
+    fn record_suffix_rebuild_success(&self) -> RouteRuntimeStatsSnapshot {
+        self.update(|stats| stats.suffix_rebuild_successes_total += 1)
+    }
+
+    fn record_suffix_rebuild_failure_with_fallback(&self) -> RouteRuntimeStatsSnapshot {
+        self.update(|stats| {
+            stats.suffix_rebuild_failures_total += 1;
+            stats.suffix_rebuild_fallbacks_total += 1;
+            stats.full_reconnects_total += 1;
+        })
+    }
+
+    fn update(&self, f: impl FnOnce(&mut RouteRuntimeStatsSnapshot)) -> RouteRuntimeStatsSnapshot {
+        let mut stats = self
+            .inner
+            .lock()
+            .expect("route runtime stats lock poisoned");
+        f(&mut stats);
+        *stats
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteFailurePath {
+    FullReconnect,
+    SuffixRebuild,
+}
+
+impl RouteFailurePath {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FullReconnect => "full_reconnect",
+            Self::SuffixRebuild => "suffix_rebuild",
+        }
+    }
+}
+
 /// Run a configured client until the shutdown signal fires or the route cannot
 /// be rebuilt after the maximum number of reconnect attempts.
 pub async fn run_configured_client_until_shutdown<S>(
     config: MonadConfig,
     client_name: Option<&str>,
+    shutdown: S,
+) -> anyhow::Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
+    run_configured_client_until_shutdown_with_stats(
+        config,
+        client_name,
+        SharedRouteRuntimeStats::default(),
+        shutdown,
+    )
+    .await
+}
+
+/// Run a configured client with an observable in-memory stats handle.
+pub async fn run_configured_client_until_shutdown_with_stats<S>(
+    config: MonadConfig,
+    client_name: Option<&str>,
+    stats: SharedRouteRuntimeStats,
     shutdown: S,
 ) -> anyhow::Result<()>
 where
@@ -80,8 +192,15 @@ where
     let (socks_shutdown_tx, socks_shutdown_rx) = watch::channel(false);
     let socks_task = tokio::spawn(run_socks_listener(listener, conn_rx, socks_shutdown_rx));
 
-    let result =
-        connection_manager_loop(&route, runtime, wallet, conn_tx.clone(), &mut shutdown).await;
+    let result = connection_manager_loop(
+        &route,
+        runtime,
+        wallet,
+        conn_tx.clone(),
+        stats,
+        &mut shutdown,
+    )
+    .await;
 
     // Stop accepting SOCKS connections before tearing down tasks.
     let _ = conn_tx.send(None);
@@ -97,6 +216,7 @@ async fn connection_manager_loop<S>(
     mut runtime: ConnectorRuntime,
     wallet: Arc<dyn MonadWallet>,
     conn_tx: watch::Sender<Option<Arc<RelayConnection>>>,
+    stats: SharedRouteRuntimeStats,
     shutdown: &mut S,
 ) -> anyhow::Result<()>
 where
@@ -132,10 +252,13 @@ where
             );
         }
 
+        let snapshot = stats.record_route_connect_attempt();
         info!(
             attempt,
             hops = route.hops().len(),
             timeout_ms = ROUTE_CONNECT_TIMEOUT_MS,
+            route_connect_attempts_total = snapshot.route_connect_attempts_total,
+            full_reconnects_total = snapshot.full_reconnects_total,
             "connecting route"
         );
 
@@ -182,22 +305,30 @@ where
                     };
 
                     let Some(hop_idx) = failed_hop_idx else {
-                        warn!("route failure watcher unavailable; rebuilding full route");
+                        let snapshot = stats.record_failure_watcher_unavailable();
+                        warn!(
+                            failure_watchers_unavailable_total =
+                                snapshot.failure_watchers_unavailable_total,
+                            full_reconnects_total = snapshot.full_reconnects_total,
+                            "route failure watcher unavailable; rebuilding full route"
+                        );
                         let _ = conn_tx.send(None);
                         active_route.close().await;
                         break;
                     };
 
-                    let failure_path = if hop_idx == 0 {
-                        "full_reconnect"
-                    } else {
-                        "suffix_rebuild"
-                    };
+                    let (failure_path, snapshot) = stats.record_failed_hop(hop_idx);
                     warn!(
                         hop = hop_idx + 1,
                         hops = hop_count,
                         funded_hops = funded_hop_count,
-                        path = failure_path,
+                        debounce_ms = cascaded_route_failure_debounce().as_millis(),
+                        path = failure_path.as_str(),
+                        route_failures_total = snapshot.route_failures_total,
+                        full_reconnects_total = snapshot.full_reconnects_total,
+                        suffix_rebuild_attempts_total = snapshot.suffix_rebuild_attempts_total,
+                        suffix_rebuild_successes_total = snapshot.suffix_rebuild_successes_total,
+                        suffix_rebuild_failures_total = snapshot.suffix_rebuild_failures_total,
                         "route failed at funded hop"
                     );
                     let _ = conn_tx.send(None);
@@ -205,6 +336,7 @@ where
                     if hop_idx == 0 {
                         warn!(
                             hop = hop_idx + 1,
+                            full_reconnects_total = snapshot.full_reconnects_total,
                             "first-hop failure requires full route reconnect"
                         );
                         active_route.close().await;
@@ -216,11 +348,13 @@ where
                     let preserved_hops = hop_idx;
                     let suffix_hops = hop_count - hop_idx;
                     let suffix_session_ids = active_route.suffix_session_ids_from(hop_idx);
+                    let snapshot = stats.record_suffix_rebuild_attempt();
                     info!(
                         hop = hop_idx + 1,
                         preserved_hops,
                         suffix_hops,
                         suffix_sessions = suffix_session_ids.len(),
+                        suffix_rebuild_attempts_total = snapshot.suffix_rebuild_attempts_total,
                         "starting route suffix rebuild"
                     );
                     let detach_stats = detach_channels_for_sessions(&wallet, &suffix_session_ids);
@@ -243,22 +377,35 @@ where
                     .await
                     {
                         Ok(rebuilt_route) => {
+                            let snapshot = stats.record_suffix_rebuild_success();
                             info!(
                                 hop = hop_idx + 1,
                                 preserved_hops,
                                 rebuilt_hops = suffix_hops,
                                 elapsed_ms = rebuild_started.elapsed().as_millis(),
+                                suffix_rebuild_attempts_total =
+                                    snapshot.suffix_rebuild_attempts_total,
+                                suffix_rebuild_successes_total =
+                                    snapshot.suffix_rebuild_successes_total,
                                 "route suffix rebuilt"
                             );
                             active_route = rebuilt_route;
                             continue;
                         }
                         Err(err) => {
+                            let snapshot = stats.record_suffix_rebuild_failure_with_fallback();
                             warn!(
                                 hop = hop_idx + 1,
                                 preserved_hops,
                                 suffix_hops,
                                 elapsed_ms = rebuild_started.elapsed().as_millis(),
+                                suffix_rebuild_attempts_total =
+                                    snapshot.suffix_rebuild_attempts_total,
+                                suffix_rebuild_failures_total =
+                                    snapshot.suffix_rebuild_failures_total,
+                                suffix_rebuild_fallbacks_total =
+                                    snapshot.suffix_rebuild_fallbacks_total,
+                                full_reconnects_total = snapshot.full_reconnects_total,
                                 "route suffix rebuild failed; falling back to full route rebuild: {err}"
                             );
                             break;
@@ -400,5 +547,96 @@ pub async fn run_socks_listener(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_runtime_stats_start_at_zero() {
+        assert_eq!(
+            SharedRouteRuntimeStats::default().snapshot(),
+            RouteRuntimeStatsSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn route_runtime_stats_record_connect_attempts() {
+        let stats = SharedRouteRuntimeStats::default();
+
+        stats.record_route_connect_attempt();
+        let snapshot = stats.record_route_connect_attempt();
+
+        assert_eq!(snapshot.route_connect_attempts_total, 2);
+        assert_eq!(snapshot.full_reconnects_total, 0);
+    }
+
+    #[test]
+    fn route_runtime_stats_first_hop_failure_counts_full_reconnect() {
+        let stats = SharedRouteRuntimeStats::default();
+
+        let (path, snapshot) = stats.record_failed_hop(0);
+
+        assert_eq!(path, RouteFailurePath::FullReconnect);
+        assert_eq!(snapshot.route_failures_total, 1);
+        assert_eq!(snapshot.full_reconnects_total, 1);
+        assert_eq!(snapshot.suffix_rebuild_attempts_total, 0);
+    }
+
+    #[test]
+    fn route_runtime_stats_later_hop_failure_selects_suffix_rebuild() {
+        let stats = SharedRouteRuntimeStats::default();
+
+        let (path, snapshot) = stats.record_failed_hop(2);
+
+        assert_eq!(path, RouteFailurePath::SuffixRebuild);
+        assert_eq!(snapshot.route_failures_total, 1);
+        assert_eq!(snapshot.full_reconnects_total, 0);
+        assert_eq!(snapshot.suffix_rebuild_attempts_total, 0);
+    }
+
+    #[test]
+    fn route_runtime_stats_suffix_rebuild_success_flow() {
+        let stats = SharedRouteRuntimeStats::default();
+
+        let (path, _) = stats.record_failed_hop(1);
+        assert_eq!(path, RouteFailurePath::SuffixRebuild);
+        stats.record_suffix_rebuild_attempt();
+        let snapshot = stats.record_suffix_rebuild_success();
+
+        assert_eq!(snapshot.route_failures_total, 1);
+        assert_eq!(snapshot.suffix_rebuild_attempts_total, 1);
+        assert_eq!(snapshot.suffix_rebuild_successes_total, 1);
+        assert_eq!(snapshot.suffix_rebuild_failures_total, 0);
+        assert_eq!(snapshot.full_reconnects_total, 0);
+    }
+
+    #[test]
+    fn route_runtime_stats_suffix_rebuild_failure_counts_fallback() {
+        let stats = SharedRouteRuntimeStats::default();
+
+        stats.record_failed_hop(1);
+        stats.record_suffix_rebuild_attempt();
+        let snapshot = stats.record_suffix_rebuild_failure_with_fallback();
+
+        assert_eq!(snapshot.route_failures_total, 1);
+        assert_eq!(snapshot.suffix_rebuild_attempts_total, 1);
+        assert_eq!(snapshot.suffix_rebuild_successes_total, 0);
+        assert_eq!(snapshot.suffix_rebuild_failures_total, 1);
+        assert_eq!(snapshot.suffix_rebuild_fallbacks_total, 1);
+        assert_eq!(snapshot.full_reconnects_total, 1);
+    }
+
+    #[test]
+    fn route_runtime_stats_failure_watcher_unavailable_counts_full_reconnect() {
+        let stats = SharedRouteRuntimeStats::default();
+
+        let snapshot = stats.record_failure_watcher_unavailable();
+
+        assert_eq!(snapshot.failure_watchers_unavailable_total, 1);
+        assert_eq!(snapshot.full_reconnects_total, 1);
+        assert_eq!(snapshot.route_failures_total, 0);
     }
 }

@@ -65,7 +65,13 @@ pub struct RouteHopConnection {
     pub funded: bool,
 }
 
-const ROUTE_FAILURE_DEBOUNCE: Duration = Duration::from_millis(100);
+const CASCADED_ROUTE_FAILURE_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Short window for collecting downstream failures caused by one upstream hop
+/// dropping, so rebuilds start from the earliest failed hop.
+pub fn cascaded_route_failure_debounce() -> Duration {
+    CASCADED_ROUTE_FAILURE_DEBOUNCE
+}
 
 /// Owns every established hop in a route, not only the final hop.
 ///
@@ -170,7 +176,7 @@ impl RouteConnection {
 
             // A middle-hop failure often cascades into downstream session
             // failures. Debounce briefly and rebuild from the lowest failed hop.
-            let deadline = tokio::time::Instant::now() + ROUTE_FAILURE_DEBOUNCE;
+            let deadline = tokio::time::Instant::now() + CASCADED_ROUTE_FAILURE_DEBOUNCE;
             loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {

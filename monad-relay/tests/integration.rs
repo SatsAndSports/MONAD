@@ -20,7 +20,10 @@ use http::{Method, Request};
 use monad_client::connector;
 use monad_client::loose_proof_wallet::{LooseProofWallet, NewLooseProof};
 use monad_client::route::{Route, RouteHop};
-use monad_client::runtime::run_configured_client_until_shutdown;
+use monad_client::runtime::{
+    run_configured_client_until_shutdown, run_configured_client_until_shutdown_with_stats,
+    SharedRouteRuntimeStats,
+};
 use monad_client::session_driver::{start_session_payment_driver, PaymentPolicy};
 use monad_client::sqlite_client_wallet::{ChannelFundRecoveryResult, SqliteClientWallet};
 use monad_client::tunnel;
@@ -5217,10 +5220,12 @@ clients:
             .unwrap();
     assert_eq!(server_addr, relay_listen);
 
+    let route_stats = SharedRouteRuntimeStats::default();
     let (client_shutdown_tx, client_shutdown_rx) = tokio::sync::oneshot::channel();
-    let client_task = tokio::spawn(run_configured_client_until_shutdown(
+    let client_task = tokio::spawn(run_configured_client_until_shutdown_with_stats(
         config.clone(),
         Some("local"),
+        route_stats.clone(),
         async move {
             let _ = client_shutdown_rx.await;
         },
@@ -5367,6 +5372,24 @@ clients:
         }
     }
     assert!(reconnected, "client should reconnect after relay restart");
+
+    let stats = route_stats.snapshot();
+    assert_eq!(
+        stats.route_failures_total, 1,
+        "single-hop restart should report one route failure"
+    );
+    assert_eq!(
+        stats.full_reconnects_total, 1,
+        "single-hop restart should require a full reconnect"
+    );
+    assert_eq!(
+        stats.suffix_rebuild_attempts_total, 0,
+        "single-hop restart should not attempt suffix rebuild"
+    );
+    assert!(
+        stats.route_connect_attempts_total >= 2,
+        "single-hop restart should include initial connect and reconnect attempt"
+    );
 
     let reconnected_wallet = SqliteClientWallet::open(
         LooseProofWallet::open(&loose_db_path, "alice").unwrap(),
@@ -5663,10 +5686,12 @@ relays:
         relay_shutdown_txs.push(shutdown_tx);
     }
 
+    let route_stats = SharedRouteRuntimeStats::default();
     let (client_shutdown_tx, client_shutdown_rx) = tokio::sync::oneshot::channel();
-    let client_task = tokio::spawn(run_configured_client_until_shutdown(
+    let client_task = tokio::spawn(run_configured_client_until_shutdown_with_stats(
         config.clone(),
         Some("local"),
+        route_stats.clone(),
         async move {
             let _ = client_shutdown_rx.await;
         },
@@ -5711,6 +5736,38 @@ relays:
     relay_shutdown_txs.insert(case.failed_hop_idx, failed_shutdown_tx);
 
     wait_for_configured_roundtrip(socks_listen, upper_addr, case.payload, case.label).await;
+
+    let stats = route_stats.snapshot();
+    assert_eq!(
+        stats.route_failures_total, 1,
+        "{}: exactly one route failure should be observed",
+        case.label
+    );
+    assert_eq!(
+        stats.suffix_rebuild_attempts_total, 1,
+        "{}: failed non-first hop should attempt one suffix rebuild",
+        case.label
+    );
+    assert_eq!(
+        stats.suffix_rebuild_successes_total, 1,
+        "{}: suffix rebuild should succeed",
+        case.label
+    );
+    assert_eq!(
+        stats.suffix_rebuild_failures_total, 0,
+        "{}: suffix rebuild should not fail",
+        case.label
+    );
+    assert_eq!(
+        stats.suffix_rebuild_fallbacks_total, 0,
+        "{}: successful suffix rebuild should not fall back",
+        case.label
+    );
+    assert_eq!(
+        stats.full_reconnects_total, 0,
+        "{}: suffix rebuild should avoid full reconnect",
+        case.label
+    );
 
     let rebuilt_wallet = SqliteClientWallet::open(
         LooseProofWallet::open(&loose_db_path, "alice").unwrap(),
