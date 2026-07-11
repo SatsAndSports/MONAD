@@ -36,7 +36,7 @@ cargo run -p monad-quic -- ...
   - wallet abstraction and mock wallet (`wallet.rs`)
   - SQLite-backed channel wallet (`sqlite_client_wallet.rs`), loose proof custody (`loose_proof_wallet.rs`), proof selection (`proof_selection.rs`)
   - tunnel proxying (`tunnel.rs`)
-  - binary supports `run --config ...` for configured QUIC SOCKS clients backed by persisted wallets; manual `--hop` mode is not wired to the production wallet
+  - binary supports `run --config ...` for configured QUIC SOCKS clients backed by persisted wallets
 - `monad-relay`
   - reusable library code plus binary entrypoint
   - YAML config loading with env-var / `.env` substitution (`config.rs`)
@@ -88,7 +88,7 @@ cargo run -p monad-quic -- ...
 - the main client no longer needs frequent `GetSessionStatus` polling for payment sizing; the relay stress harness and `monad-test-client` still poll periodically for load generation, health checks, and observability.
 - `SqliteClientWallet` provisions real upstream Spilman channels from loose proofs, stores MONAD channel metadata, persists ambiguous opening recovery, and uses cache-first active output-keyset selection with refresh/retry only after retryable keyset mint errors.
 - `connector.rs` uses `MockWallet` + `session_driver` for default test/harness flows so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` control path.
-- the `monad-client` binary can run configured QUIC SOCKS routes from YAML with persisted wallet config; manual `--hop` mode still exits before SOCKS because it is not wired to the production wallet.
+- the `monad-client` binary runs configured QUIC SOCKS routes from YAML with persisted wallet config.
 - configured-client route failures are handled at hop granularity: first-hop failure does a full reconnect, later-hop failure tries a suffix rebuild that preserves prefix sessions/channels, and suffix rebuild failure falls back to a full reconnect. Rebuilds are serialized; stale failures from the old route during an in-flight rebuild are ignored.
 - relay-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
 
@@ -97,8 +97,8 @@ cargo run -p monad-quic -- ...
 - Relay-to-relay transport: QUIC (replaces TCP between hops, does not replace Noise)
 - QUIC authentication: secp256k1 attestation on top of the QUIC/TLS channel
 - QUIC hop signaling: `CONNECT host:port` with `quic-secp256k1-pubkey: <64-hex-char x-only pubkey>` H2 header
-- Client hop syntax: `--hop quic:addr:port,secp256k1:<pubkey>`
-- Client can also use QUIC directly to the first hop with the same `--hop quic:` syntax
+- Configured clients use YAML route hop entries with secp256k1 pubkeys.
+- Client and relay connector paths can use QUIC directly to the first hop and for nested relay-to-relay hops.
 - Noise nesting is preserved — the inner Noise+H2 session runs unchanged inside the QUIC stream
 - Server listens on the same port for both TCP and UDP (QUIC)
 - QUIC connection pool: shared connections reused across client sessions, keyed by `(host, port)` plus auth mode
@@ -214,7 +214,7 @@ The test suite currently covers:
 - QUIC single-hop (Noise+H2 over QUIC stream)
 - QUIC control + data channels over QUIC transport
 - nested QUIC tunnel (TCP relay forwarding via QUIC to next relay)
-- client connector with QUIC hop (`--hop quic:` end-to-end path)
+- client connector with QUIC hop
 - client QUIC first hop (direct QUIC connection from client)
 - QUIC first hop then TCP second hop
 - Noise session ID (handshake hash) matches on both sides

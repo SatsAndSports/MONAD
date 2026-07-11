@@ -1015,12 +1015,7 @@ MONAD transport now uses secp256k1 throughout.
 - **Plain TCP MONAD transport** uses secp Noise.
 - **QUIC MONAD transport** uses secp attestation plus secp Noise.
 
-Clients now store one transport identity form per hop:
-
-```text
-addr:port,secp256k1:<secp_pubkey>
-quic:addr:port,secp256k1:<secp_pubkey>
-```
+Configured clients store one secp256k1 transport identity per YAML route hop.
 
 On the relay side, startup still takes both:
 
@@ -1201,23 +1196,25 @@ A relay that handles CONNECT requests with `quic-secp256k1-pubkey` maintains a c
 
 This is the core scaling benefit: one QUIC handshake to T is amortized across all clients whose routes pass through S to T.
 
-### Client `--hop` Syntax for QUIC Hops
+### Configured Client QUIC Hops
 
-The `--hop` syntax uses 32-byte x-only secp256k1 identities:
-
-```text
---hop addr:port,secp256k1:<pubkey>
---hop quic:addr:port,secp256k1:<pubkey>
-```
-
-The `quic:` prefix on any hop after the first tells the client to include `quic-secp256k1-pubkey` in the CONNECT request to the previous relay. On the first hop, `quic:` tells the client to connect directly via QUIC instead of TCP.
+Configured client routes use 32-byte x-only secp256k1 identities from YAML
+route entries. The configured runtime currently uses QUIC for each hop. For
+non-first hops, the client includes `quic-secp256k1-pubkey` in the CONNECT
+request to the previous relay. On the first hop, the client connects directly
+via QUIC instead of TCP.
 
 Example 2-hop route where the second hop uses QUIC:
 
-```bash
-monad-client \
-  --hop 10.0.0.1:9050,secp256k1:<S_pubkey> \
-  --hop quic:10.0.0.2:9050,secp256k1:<T_pubkey>
+```yaml
+clients:
+  - name: local
+    socks: 127.0.0.1:1080
+    route:
+      - addr: 10.0.0.1:9050
+        pubkey: "<S_pubkey>"
+      - addr: 10.0.0.2:9050
+        pubkey: "<T_pubkey>"
 ```
 
 The client:
@@ -1271,7 +1268,7 @@ The full QUIC transport chain is implemented and tested:
 3. **Dual transport identity plumbing in `monad-relay`** — `monad-relay keygen` emits both an Ed25519 identity set for QUIC certificate generation and a secp256k1 transport key for MONAD transport auth.
 4. **QUIC transport header parsing in `monad-relay`** — detects `quic-secp256k1-pubkey` on CONNECT requests and connects via secp-authenticated QUIC instead of TCP
 5. **QUIC connection pool in `monad-relay`** — maintains shared QUIC connections keyed by `(host, port)`, reuses across client sessions
-6. **`--hop quic:` parsing in `monad-client`** — parses the `quic:` prefix from the hop spec, emits `quic-secp256k1-pubkey`, and uses secp256k1 directly for non-QUIC hops
+6. **configured QUIC route handling in `monad-client`** — uses YAML route hop identities, emits `quic-secp256k1-pubkey` for nested QUIC hops, and uses secp256k1 directly for transport auth
 7. **Integration tests** — cover QUIC single-hop, QUIC with control+data channels, nested QUIC tunnels (manual and via connector), alongside all existing TCP tests
 
 ## Current Limitations

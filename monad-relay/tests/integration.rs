@@ -9109,7 +9109,7 @@ async fn test_relay_can_connect_to_itself_via_tcp() {
 ///
 /// Client → S (TCP) → T (QUIC) → uppercase
 ///
-/// This exercises the full client-side --hop quic: path through the connector library.
+/// This exercises the connector library's QUIC hop path.
 #[tokio::test]
 async fn test_connector_quic_hop() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

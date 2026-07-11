@@ -18,7 +18,7 @@ Implemented today:
 - `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
 - `monad-test-client`: localhost SOCKS5/manual test harness for mocked relay funding, circuit rebuild testing, and daily-driver browser/SSH experiments
-- QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, `--hop quic:` client syntax, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
+- QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, configured client routes, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
 - Noise-payload bootstrap: MONAD uses the Noise `NK` pattern over secp256k1 with ChaCha20-Poly1305 and BLAKE2s; the client sends a bootstrap request in the first Noise handshake payload, the relay replies in the second, and today this strictly negotiates the post-handshake session protocol (`h2`), the Cashu Spilman channel protocol version (`2026-03-20`), and the pricing policy (`session_constant`) before H2 starts
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
 - session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
@@ -248,7 +248,7 @@ Current coverage includes:
 - QUIC single-hop (Noise+H2 over QUIC stream)
 - QUIC control + data channels
 - nested QUIC tunnel (TCP relay forwarding to QUIC relay)
-- client connector with QUIC hop (end-to-end `--hop quic:` path)
+- client connector with QUIC hop
 - connector blinded hop route (`RouteHop::Blinded`)
 - connector two-consecutive-blinded-hop route
 - connector hard-fails when a relay lacks required blinded/nested capability bits
@@ -289,7 +289,7 @@ MONAD transport now uses secp256k1 identities throughout:
 - **TCP MONAD transport** uses secp Noise with 32-byte x-only relay identities
 - **QUIC MONAD transport** uses secp attestation plus secp Noise with the same 32-byte x-only relay identities
 
-The `monad-client` binary emits and accepts only secp256k1 hop identities. The
+Configured clients use secp256k1 hop identities from YAML route entries. The
 relay still keeps an Ed25519 seed internally for QUIC certificate generation,
 but that is no longer a client-facing MONAD transport identity.
 
@@ -307,10 +307,10 @@ verify that signature against the expected secp256k1 public key.
 
 Quick reference:
 
-| Transport | Hop syntax | Identity | Auth mechanism |
+| Transport | Route config | Identity | Auth mechanism |
 |-----------|-----------|----------|----------------|
-| TCP | `addr:port,secp256k1:<pub>` | 32-byte x-only secp256k1 | secp Noise NK |
-| QUIC (secp) | `quic:addr:port,secp256k1:<pub>` | 32-byte x-only secp256k1 | QUIC attestation + secp Noise NK |
+| TCP | `addr` + `pubkey` | 32-byte x-only secp256k1 | secp Noise NK |
+| QUIC (secp) | `addr` + `pubkey` with QUIC route transport | 32-byte x-only secp256k1 | QUIC attestation + secp Noise NK |
 
 ## Quick Start
 
@@ -482,17 +482,11 @@ route reconnect. The client does not run concurrent rebuilds; failures observed
 during an in-flight rebuild are treated as stale and ignored until the rebuilt
 route is active.
 
-QUIC first hop:
+The configured client connects directly to the first hop via QUIC, then runs
+the same Noise+H2 session on top using the secp QUIC path.
 
-```bash
-RUST_LOG=info cargo run -p monad-client -- \
-  --hop quic:127.0.0.1:9051,secp256k1:<HOP1_SECP_PUB> \
-  --socks 127.0.0.1:1080
-```
-
-The client connects directly to the first hop via QUIC, then runs the same Noise+H2 session on top using the secp QUIC path.
-
-Blinded routes are currently exposed through the Rust library route model (`RouteHop::Blinded`) rather than the CLI `--hop` parser.
+Blinded routes are currently exposed through the Rust library route model
+(`RouteHop::Blinded`) rather than the YAML client route format.
 
 ## Example Usage
 
