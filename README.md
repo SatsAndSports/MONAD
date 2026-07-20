@@ -425,8 +425,9 @@ RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop2
 
 ### 3. Start the client
 
-`monad-client wallet ...` exposes explicit-flag wallet inspection and recovery
-commands. `monad-client run --config monad.yaml --client local` starts the
+`monad-client wallet --config monad.yaml ...` exposes configured wallet
+inspection and recovery commands; explicit DB/key flags remain available for
+manual access. `monad-client run --config monad.yaml --client local` starts the
 configured route and binds the configured SOCKS5 listener.
 
 Configured client:
@@ -482,14 +483,15 @@ configured client uses secp256k1 transport identities for QUIC hop
 authentication. See `ARCHITECTURE.md` for the full layering model.
 
 When a funded hop fails, the configured client temporarily withdraws the active
-route from the SOCKS listener. Existing application streams fail; new SOCKS
-connections wait for the route manager to publish a rebuilt route. A first-hop
-failure triggers a full reconnect. Later-hop failures detach only channels tied
-to the old suffix sessions and try to rebuild from the failed hop, preserving
-the unaffected prefix when possible; suffix rebuild failure falls back to a full
-route reconnect. The client does not run concurrent rebuilds; failures observed
-during an in-flight rebuild are treated as stale and ignored until the rebuilt
-route is active.
+route from the SOCKS listener. Existing application streams are not migrated to
+the replacement route; they fail if their old route breaks. New SOCKS requests
+fail while no route is published, then use the replacement route once it is
+connected. A first-hop failure triggers a full reconnect. Later-hop failures
+detach only channels tied to the old suffix sessions and try to rebuild from the
+failed hop, preserving the unaffected prefix when possible; suffix rebuild
+failure falls back to a full route reconnect. The client does not run concurrent
+rebuilds; failures observed during an in-flight rebuild are treated as stale and
+ignored until the rebuilt route is active.
 
 The configured client connects directly to the first hop via QUIC, then runs
 the same Noise+H2 session on top using the secp QUIC path.

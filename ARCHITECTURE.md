@@ -272,15 +272,17 @@ route installs fresh watchers after it is published.
 Failure handling is deliberately scoped:
 
 - hop `0` failure closes the whole route and uses the normal reconnect loop
-- hop `N > 0` failure temporarily withdraws the route from SOCKS, detaches only
-  wallet channels attached to old suffix session IDs, and attempts to rebuild
-  from hop `N`
-- suffix rebuild preserves prefix sessions and channels before the failed hop
+- hop `N > 0` failure temporarily withdraws the route from SOCKS so new local
+  CONNECT requests fail fast while no route is published, detaches only wallet
+  channels attached to old suffix session IDs, and attempts to rebuild from hop
+  `N`
+- suffix rebuild preserves prefix sessions and channels before the failed hop for
+  future streams
 - suffix rebuild failure falls back to a full route reconnect
 
-Active application streams are not migrated across rebuilds. Existing SOCKS
-connections fail while the route is unavailable; new SOCKS connections use the
-next route published by the manager.
+Active application streams are not migrated across rebuilds. A local TCP/SOCKS
+stream stays bound to the route it started on and fails if that route breaks;
+new SOCKS connections use the next route published by the manager.
 
 ## IPv6 Support
 

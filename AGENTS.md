@@ -89,7 +89,7 @@ cargo run -p monad-quic -- ...
 - `SqliteClientWallet` provisions real upstream Spilman channels from loose proofs, stores MONAD channel metadata, persists ambiguous opening recovery, and uses cache-first active output-keyset selection with refresh/retry only after retryable keyset mint errors.
 - `connector.rs` uses `MockWallet` + `session_driver` for default test/harness flows so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` control path.
 - the `monad-client` binary runs configured QUIC SOCKS routes from YAML with persisted wallet config.
-- configured-client route failures are handled at hop granularity: first-hop failure does a full reconnect, later-hop failure tries a suffix rebuild that preserves prefix sessions/channels, and suffix rebuild failure falls back to a full reconnect. Rebuilds are serialized; stale failures from the old route during an in-flight rebuild are ignored.
+- configured-client route failures are handled at hop granularity: first-hop failure does a full reconnect, later-hop failure tries a suffix rebuild that preserves prefix sessions/channels, and suffix rebuild failure falls back to a full reconnect. Rebuilds are serialized; stale failures from the old route during an in-flight rebuild are ignored. Active SOCKS/TCP streams are not migrated across rebuilds; they fail if their original route breaks, and new streams use the next published route.
 - relay-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
 
 ### QUIC Transport
