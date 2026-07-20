@@ -260,12 +260,21 @@ The test suite currently covers:
     - `pause_events` should stay rare
     - `failures=0` and `control_errors=0`
   - high `ulimit -n` expected
+- `make stress-chaos` runs the configured-client chaos restart harness with the real YAML client runtime, persisted client wallet, real Spilman channels, and repeated relay restarts.
+  - knobs: `MONAD_CHAOS_HOPS`, `MONAD_CHAOS_DURATION_SECS`, `MONAD_CHAOS_RESTART_INTERVAL_MS`, `MONAD_CHAOS_CONCURRENT_PROBES`, `MONAD_CHAOS_RECOVERY_DEADLINE_MS`, `MONAD_CHAOS_SEED`
+  - the `chaos summary` line prints the initial `seed=` so a failing run can be reproduced with `MONAD_CHAOS_SEED=<seed>`
+  - expected summary pattern:
+    - `suffix_rebuild_failures_total=0`
+    - `suffix_rebuild_fallbacks_total=0`
+    - `channel_records` should stay at or below `channel_record_bound`
+    - `probes_failed` can be non-zero because active SOCKS/TCP streams are allowed to fail during rebuilds
 
 ### Stress Result Reading
 
 - `stress-transport-extreme` should usually show only large initial prefunding, little or no follow-up payment traffic, and `failures=0` / `control_errors=0`.
 - `stress-payment-buffered` should usually keep one linked channel per session and produce many proactive topups with little or no relink activity.
 - `stress-payment-relink` should usually produce many successful relinks with little or no link failures and only rare pauses.
+- `stress-chaos` should recover after each relay restart, report no suffix rebuild failures/fallbacks, and keep channel record growth bounded by the number of full reconnect generations.
 - small amounts of pause/recovery activity can still be acceptable because chunk-boundary overshoot is allowed, but repeated control errors, repeated `payment_no_new_funds`, or non-zero `channel_link_failures` are warning signs worth investigating.
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.

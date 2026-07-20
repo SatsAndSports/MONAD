@@ -56,7 +56,7 @@ use cdk_spilman_test_mint::{
 };
 use common::signing_wallet::TestSigningWallet;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
-use monad_relay::config::RelayConfig;
+use monad_relay::config::{MonadConfig, RelayConfig};
 use monad_relay::listener::{
     discover_spilman_mint_cache, discover_spilman_mint_cache_with_storage, run_with_payments,
     run_with_payments_and_registry_and_shutdown, run_with_wallet_manager_and_shutdown,
@@ -67,16 +67,19 @@ use monad_relay::quic_pool::QuicPool;
 use monad_relay::session_registry::SessionRegistry;
 use monad_relay::wallet_manager::{DrainSwapNetworking, RelayWalletManager, RelayWalletMintClient};
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, Duration};
 
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
@@ -4695,7 +4698,6 @@ async fn test_channel_link_rejects_unaccepted_funding_keyset() {
 /// mints/units configured for that relay.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_relay_starts_from_yaml_config_and_advertises_configured_mints() {
-    use monad_relay::config::MonadConfig;
     use std::fs;
 
     let mint_helper = TestMintHelper::new().await.unwrap();
@@ -4769,7 +4771,6 @@ relays:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_yaml_config_allows_distinct_per_relay_pricing() {
-    use monad_relay::config::MonadConfig;
     use std::fs;
 
     let mint_helper = TestMintHelper::new().await.unwrap();
@@ -4888,7 +4889,6 @@ relays:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shared_yaml_config_drives_client_socks_over_quic() {
-    use monad_relay::config::MonadConfig;
     use std::fs;
 
     let upper_listener = TcpListener::bind("127.10.1.10:0").await.unwrap();
@@ -5101,7 +5101,6 @@ clients:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_configured_client_reconnects_after_relay_restart() {
-    use monad_relay::config::MonadConfig;
     use std::fs;
 
     let upper_listener = TcpListener::bind("127.10.3.10:0").await.unwrap();
@@ -5513,8 +5512,34 @@ fn assert_suffix_rebuild_channel_invariants(
     );
 }
 
+async fn restart_configured_relay_hop(
+    config: &MonadConfig,
+    relay_names: &[String],
+    relay_handles: &mut Vec<JoinHandle<io::Result<()>>>,
+    relay_shutdown_txs: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+    hop_idx: usize,
+    wallet_manager: Arc<RelayWalletManager>,
+    mint_cache: SpilmanMintCache,
+) {
+    let shutdown_tx = relay_shutdown_txs.remove(hop_idx);
+    let handle = relay_handles.remove(hop_idx);
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+
+    // Give the configured client time to observe the broken session before the
+    // relay comes back on the same address.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let relay_config = config.select_relay(Some(&relay_names[hop_idx])).unwrap();
+    let (_server, _pubkey, handle, shutdown_tx, _payments) =
+        start_relay_from_config(relay_config, wallet_manager, mint_cache)
+            .await
+            .unwrap();
+    relay_handles.insert(hop_idx, handle);
+    relay_shutdown_txs.insert(hop_idx, shutdown_tx);
+}
+
 async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
-    use monad_relay::config::MonadConfig;
     use std::fs;
 
     assert!(
@@ -5845,9 +5870,569 @@ async fn test_configured_client_rebuilds_three_hop_suffix_in_five_hop_route() {
     .await;
 }
 
+struct ConfiguredChaosFixtureConfig {
+    subnet: u8,
+    hop_count: usize,
+    proof_batches: usize,
+    wallet_seed: u8,
+    label: &'static str,
+}
+
+struct ConfiguredChaosFixture {
+    _temp_dir: tempfile::TempDir,
+    config: MonadConfig,
+    relay_names: Vec<String>,
+    upper_addr: SocketAddr,
+    socks_listen: SocketAddr,
+    loose_db_path: PathBuf,
+    channel_db_path: PathBuf,
+    sender_secret_hex: String,
+    wallet_manager: Arc<RelayWalletManager>,
+    mint_cache: SpilmanMintCache,
+    route_stats: SharedRouteRuntimeStats,
+    relay_handles: Vec<JoinHandle<io::Result<()>>>,
+    relay_shutdown_txs: Vec<tokio::sync::oneshot::Sender<()>>,
+    client_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    client_task: Option<JoinHandle<anyhow::Result<()>>>,
+    mint_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl ConfiguredChaosFixture {
+    async fn start(fixture_config: ConfiguredChaosFixtureConfig) -> Self {
+        use std::fs;
+
+        assert!(fixture_config.hop_count > 0, "chaos needs at least one hop");
+        assert!(
+            fixture_config.hop_count <= 5,
+            "chaos fixture has relay names for up to five hops"
+        );
+
+        let subnet = fixture_config.subnet;
+        let upper_listener = TcpListener::bind(SocketAddr::from(([127, 10, subnet, 10], 0)))
+            .await
+            .unwrap();
+        let upper_addr = upper_listener.local_addr().unwrap();
+        tokio::spawn(run_uppercase_server(upper_listener));
+
+        let mint_helper = TestMintHelper::new().await.unwrap();
+        let mint_listener = TcpListener::bind(SocketAddr::from(([127, 10, subnet, 20], 0)))
+            .await
+            .unwrap();
+        let mint_addr = mint_listener.local_addr().unwrap();
+        let mint_url = format!("http://127.10.{subnet}.20:{}", mint_addr.port());
+        let mint_router = build_router(mint_helper.mint()).await.unwrap();
+        let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(mint_listener, mint_router)
+                .with_graceful_shutdown(async {
+                    let _ = mint_shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let relay_db_path = temp_dir.path().join("relay.db");
+        let loose_db_path = temp_dir.path().join("client-loose.db");
+        let channel_db_path = temp_dir.path().join("client-channel.db");
+        let config_path = temp_dir.path().join("monad.yaml");
+
+        let mut input_proofs = Vec::new();
+        for _ in 0..fixture_config.proof_batches {
+            input_proofs.extend(mint_helper.mint_proofs(10_000).await.unwrap());
+        }
+        let loose_wallet =
+            LooseProofWallet::open(&loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap();
+        loose_wallet
+            .import_proofs(&loose_proofs_from_cashu_proofs(
+                &mint_url,
+                "sat",
+                fixture_config.label,
+                &input_proofs,
+            ))
+            .unwrap();
+
+        let keyset_id = mint_helper.keyset_id().to_string();
+        let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+        let mint_cache =
+            mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+
+        let mut relay_listeners = Vec::new();
+        let mut relay_listens = Vec::new();
+        for hop_idx in 0..fixture_config.hop_count {
+            let listener =
+                TcpListener::bind(SocketAddr::from(([127, 10, subnet, 30 + hop_idx as u8], 0)))
+                    .await
+                    .unwrap();
+            relay_listens.push(listener.local_addr().unwrap());
+            relay_listeners.push(listener);
+        }
+        let socks_listener = TcpListener::bind(SocketAddr::from(([127, 10, subnet, 40], 0)))
+            .await
+            .unwrap();
+        let socks_listen = socks_listener.local_addr().unwrap();
+
+        let receiver_secrets = (0..fixture_config.hop_count)
+            .map(|_| cashu::nuts::SecretKey::generate())
+            .collect::<Vec<_>>();
+        let transport_keys = (0..fixture_config.hop_count)
+            .map(|_| SecpTransportKeypair::generate())
+            .collect::<Vec<_>>();
+        let quic_certs = (0..fixture_config.hop_count)
+            .map(|_| QuicCertIdentity::generate().unwrap())
+            .collect::<Vec<_>>();
+        let relay_names = (0..fixture_config.hop_count)
+            .map(|idx| format!("{}-{idx}", fixture_config.label))
+            .collect::<Vec<_>>();
+        let sender_secret_hex = hex::encode([fixture_config.wallet_seed; 32]);
+
+        let mut relays_yaml = String::new();
+        let mut route_yaml = String::new();
+        for idx in 0..fixture_config.hop_count {
+            relays_yaml.push_str(&format!(
+                r#"  - name: {}
+    receiver_secret_hex: {}
+    quic_cert_seed: {}
+    transport_key: {}
+    listen: {}
+    trusted_mints:
+      - url: {}
+        units: [sat]
+    pricing:
+      in_bytes_per_millisat: 1000000
+      out_bytes_per_millisat: 1000000
+"#,
+                relay_names[idx],
+                receiver_secrets[idx].to_secret_hex(),
+                hex::encode(quic_certs[idx].seed()),
+                hex::encode(transport_keys[idx].normalized_secret_bytes()),
+                relay_listens[idx],
+                mint_url,
+            ));
+            route_yaml.push_str(&format!(
+                r#"      - addr: {}
+        pubkey: "{}"
+"#,
+                relay_listens[idx],
+                transport_keys[idx].pubkey().to_hex(),
+            ));
+        }
+
+        let yaml = format!(
+            r#"
+relay_wallet:
+  db_path: {}
+client_wallet:
+  loose_db_path: {}
+  channel_db_path: {}
+  sender_secret_hex: "{}"
+  channel_input_budget_msats: 11000000
+relays:
+{}clients:
+  - name: local
+    socks: {}
+    route:
+{}"#,
+            relay_db_path.display(),
+            loose_db_path.display(),
+            channel_db_path.display(),
+            sender_secret_hex,
+            relays_yaml,
+            socks_listen,
+            route_yaml,
+        );
+        fs::write(&config_path, yaml).unwrap();
+
+        drop(relay_listeners);
+        drop(socks_listener);
+
+        let config = MonadConfig::load(&config_path).unwrap();
+        let wallet_manager = Arc::new(
+            RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap(),
+        );
+        let mut relay_handles = Vec::new();
+        let mut relay_shutdown_txs = Vec::new();
+        for relay_name in &relay_names {
+            let relay_config = config.select_relay(Some(relay_name)).unwrap();
+            let (_server, _pubkey, handle, shutdown_tx, _payments) =
+                start_relay_from_config(relay_config, wallet_manager.clone(), mint_cache.clone())
+                    .await
+                    .unwrap();
+            relay_handles.push(handle);
+            relay_shutdown_txs.push(shutdown_tx);
+        }
+
+        let route_stats = SharedRouteRuntimeStats::default();
+        let (client_shutdown_tx, client_shutdown_rx) = tokio::sync::oneshot::channel();
+        let client_task = tokio::spawn(run_configured_client_until_shutdown_with_stats(
+            config.clone(),
+            Some("local"),
+            route_stats.clone(),
+            async move {
+                let _ = client_shutdown_rx.await;
+            },
+        ));
+
+        assert!(
+            wait_for_configured_socks_ready(socks_listen).await,
+            "{}: client route never became ready",
+            fixture_config.label
+        );
+
+        Self {
+            _temp_dir: temp_dir,
+            config,
+            relay_names,
+            upper_addr,
+            socks_listen,
+            loose_db_path,
+            channel_db_path,
+            sender_secret_hex,
+            wallet_manager,
+            mint_cache,
+            route_stats,
+            relay_handles,
+            relay_shutdown_txs,
+            client_shutdown_tx: Some(client_shutdown_tx),
+            client_task: Some(client_task),
+            mint_shutdown_tx: Some(mint_shutdown_tx),
+        }
+    }
+
+    async fn restart_hop(&mut self, hop_idx: usize) {
+        restart_configured_relay_hop(
+            &self.config,
+            &self.relay_names,
+            &mut self.relay_handles,
+            &mut self.relay_shutdown_txs,
+            hop_idx,
+            self.wallet_manager.clone(),
+            self.mint_cache.clone(),
+        )
+        .await;
+    }
+
+    async fn wait_roundtrip(&self, payload: &[u8], context: &str) -> Vec<u8> {
+        wait_for_configured_roundtrip(self.socks_listen, self.upper_addr, payload, context).await
+    }
+
+    async fn wait_roundtrip_deadline(
+        &self,
+        payload: &[u8],
+        context: &str,
+        deadline: Duration,
+    ) -> Duration {
+        let started = tokio::time::Instant::now();
+        let expected = payload.to_ascii_uppercase();
+        let mut last_error = None;
+        while started.elapsed() < deadline {
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                configured_client_socks_roundtrip(self.socks_listen, self.upper_addr, payload),
+            )
+            .await
+            {
+                Ok(Ok(result)) if result == expected => return started.elapsed(),
+                Ok(Ok(result)) => last_error = Some(format!("unexpected response: {result:?}")),
+                Ok(Err(err)) => last_error = Some(err.to_string()),
+                Err(err) => last_error = Some(format!("timeout: {err}")),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("{context} should recover within {deadline:?}: {last_error:?}");
+    }
+
+    fn channel_records(&self) -> Vec<WalletChannel> {
+        let wallet = SqliteClientWallet::open(
+            LooseProofWallet::open(&self.loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap(),
+            &self.channel_db_path,
+            &self.sender_secret_hex,
+        )
+        .unwrap();
+        wallet.list_channels().unwrap()
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(client_shutdown_tx) = self.client_shutdown_tx.take() {
+            let _ = client_shutdown_tx.send(());
+        }
+        if let Some(client_task) = self.client_task.take() {
+            tokio::time::timeout(Duration::from_secs(5), client_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        for shutdown_tx in self.relay_shutdown_txs.drain(..) {
+            let _ = shutdown_tx.send(());
+        }
+        for handle in self.relay_handles.drain(..) {
+            handle.await.unwrap().unwrap();
+        }
+        if let Some(mint_shutdown_tx) = self.mint_shutdown_tx.take() {
+            let _ = mint_shutdown_tx.send(());
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ChaosProbeStats {
+    total: AtomicU64,
+    ok: AtomicU64,
+    failed: AtomicU64,
+}
+
+impl ChaosProbeStats {
+    fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    fn ok(&self) -> u64 {
+        self.ok.load(Ordering::Relaxed)
+    }
+
+    fn failed(&self) -> u64 {
+        self.failed.load(Ordering::Relaxed)
+    }
+}
+
+fn read_chaos_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn read_chaos_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn next_chaos_u64(seed: &mut u64) -> u64 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    *seed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_configured_client_chaos_restarts_all_hop_positions() {
+    let mut fixture = ConfiguredChaosFixture::start(ConfiguredChaosFixtureConfig {
+        subnet: 12,
+        hop_count: 3,
+        proof_batches: 8,
+        wallet_seed: 47,
+        label: "configured-chaos-restarts",
+    })
+    .await;
+
+    fixture
+        .wait_roundtrip(b"chaos warmup", "chaos warmup")
+        .await;
+
+    let initial_channels = fixture.channel_records();
+    assert_eq!(
+        initial_channels.len(),
+        fixture.relay_names.len(),
+        "chaos: initial route should create one channel per hop"
+    );
+
+    let restart_sequence = [2usize, 1, 0];
+    for (round, hop_idx) in restart_sequence.into_iter().enumerate() {
+        fixture.restart_hop(hop_idx).await;
+        let payload = format!("chaos round {round} hop {hop_idx}");
+        fixture
+            .wait_roundtrip(payload.as_bytes(), "chaos restart recovery")
+            .await;
+    }
+
+    let stats = fixture.route_stats.snapshot();
+    assert_eq!(
+        stats.route_failures_total,
+        restart_sequence.len() as u64,
+        "chaos: every relay restart should produce one route failure"
+    );
+    assert_eq!(
+        stats.suffix_rebuild_attempts_total, 2,
+        "chaos: final and middle hop restarts should use suffix rebuild"
+    );
+    assert_eq!(
+        stats.suffix_rebuild_successes_total, 2,
+        "chaos: every suffix rebuild should succeed"
+    );
+    assert_eq!(
+        stats.suffix_rebuild_failures_total, 0,
+        "chaos: suffix rebuilds should not fail"
+    );
+    assert_eq!(
+        stats.suffix_rebuild_fallbacks_total, 0,
+        "chaos: suffix rebuilds should not fall back to full reconnect"
+    );
+    assert_eq!(
+        stats.full_reconnects_total, 1,
+        "chaos: first-hop restart should require one full reconnect"
+    );
+
+    let final_channels = fixture.channel_records();
+    let max_expected_channels =
+        fixture.relay_names.len() * (stats.full_reconnects_total as usize + 1);
+    assert!(
+        final_channels.len() <= max_expected_channels,
+        "chaos: channel records should stay bounded; got {}, expected at most {}",
+        final_channels.len(),
+        max_expected_channels
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual configured-client chaos stress test"]
+async fn chaos_configured_client_restarts() {
+    let hop_count = read_chaos_usize("MONAD_CHAOS_HOPS", 3);
+    let duration = Duration::from_secs(read_chaos_u64("MONAD_CHAOS_DURATION_SECS", 60));
+    let restart_interval =
+        Duration::from_millis(read_chaos_u64("MONAD_CHAOS_RESTART_INTERVAL_MS", 2_000));
+    let concurrent_probes = read_chaos_usize("MONAD_CHAOS_CONCURRENT_PROBES", 4);
+    let recovery_deadline =
+        Duration::from_millis(read_chaos_u64("MONAD_CHAOS_RECOVERY_DEADLINE_MS", 15_000));
+    let initial_seed = read_chaos_u64("MONAD_CHAOS_SEED", 0x4d4f_4e41_445f_4348);
+    let mut seed = initial_seed;
+
+    let mut fixture = ConfiguredChaosFixture::start(ConfiguredChaosFixtureConfig {
+        subnet: 13,
+        hop_count,
+        proof_batches: hop_count.saturating_mul(4),
+        wallet_seed: 53,
+        label: "configured-chaos-stress",
+    })
+    .await;
+    fixture
+        .wait_roundtrip(b"chaos stress warmup", "chaos stress warmup")
+        .await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let probe_stats = Arc::new(ChaosProbeStats::default());
+    let mut probe_tasks = JoinSet::new();
+    for worker_id in 0..concurrent_probes {
+        let stop = stop.clone();
+        let probe_stats = probe_stats.clone();
+        let socks_listen = fixture.socks_listen;
+        let upper_addr = fixture.upper_addr;
+        probe_tasks.spawn(async move {
+            let mut probe_id = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let payload = format!("chaos probe {worker_id} {probe_id}");
+                probe_stats.total.fetch_add(1, Ordering::Relaxed);
+                let expected = payload.as_bytes().to_ascii_uppercase();
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    configured_client_socks_roundtrip(socks_listen, upper_addr, payload.as_bytes()),
+                )
+                .await
+                {
+                    Ok(Ok(result)) if result == expected => {
+                        probe_stats.ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        probe_stats.failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                probe_id += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+    }
+
+    let started = tokio::time::Instant::now();
+    let mut restarts_by_hop = vec![0u64; hop_count];
+    let mut restarts_total = 0u64;
+    let mut max_recovery = Duration::ZERO;
+    while started.elapsed() < duration {
+        tokio::time::sleep(restart_interval).await;
+        if started.elapsed() >= duration {
+            break;
+        }
+        let hop_idx = (next_chaos_u64(&mut seed) as usize) % hop_count;
+        restarts_by_hop[hop_idx] += 1;
+        restarts_total += 1;
+        fixture.restart_hop(hop_idx).await;
+        let payload = format!("chaos recovery {restarts_total} hop {hop_idx}");
+        let recovery = fixture
+            .wait_roundtrip_deadline(
+                payload.as_bytes(),
+                "chaos stress restart recovery",
+                recovery_deadline,
+            )
+            .await;
+        max_recovery = max_recovery.max(recovery);
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    while let Some(result) = probe_tasks.join_next().await {
+        result.unwrap();
+    }
+
+    fixture
+        .wait_roundtrip_deadline(
+            b"chaos stress final",
+            "chaos stress final",
+            recovery_deadline,
+        )
+        .await;
+    let stats = fixture.route_stats.snapshot();
+    let final_channels = fixture.channel_records();
+    let max_expected_channels = hop_count * (stats.full_reconnects_total as usize + 1);
+
+    println!(
+        "chaos summary seed={} hops={} duration_s={:.3} restart_interval_ms={} concurrent_probes={} restarts_total={} restarts_by_hop={:?} probes_total={} probes_ok={} probes_failed={} max_recovery_ms={} route_failures_total={} full_reconnects_total={} suffix_rebuild_attempts_total={} suffix_rebuild_successes_total={} suffix_rebuild_failures_total={} suffix_rebuild_fallbacks_total={} channel_records={} channel_record_bound={}",
+        initial_seed,
+        hop_count,
+        started.elapsed().as_secs_f64(),
+        restart_interval.as_millis(),
+        concurrent_probes,
+        restarts_total,
+        restarts_by_hop,
+        probe_stats.total(),
+        probe_stats.ok(),
+        probe_stats.failed(),
+        max_recovery.as_millis(),
+        stats.route_failures_total,
+        stats.full_reconnects_total,
+        stats.suffix_rebuild_attempts_total,
+        stats.suffix_rebuild_successes_total,
+        stats.suffix_rebuild_failures_total,
+        stats.suffix_rebuild_fallbacks_total,
+        final_channels.len(),
+        max_expected_channels,
+    );
+
+    assert!(
+        restarts_total > 0,
+        "chaos stress should restart at least one relay"
+    );
+    assert_eq!(
+        stats.suffix_rebuild_failures_total, 0,
+        "chaos stress suffix rebuilds should not fail"
+    );
+    assert_eq!(
+        stats.suffix_rebuild_fallbacks_total, 0,
+        "chaos stress suffix rebuilds should not fall back"
+    );
+    assert!(
+        final_channels.len() <= max_expected_channels,
+        "chaos stress channel records should stay bounded; got {}, expected at most {}",
+        final_channels.len(),
+        max_expected_channels
+    );
+
+    fixture.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shared_yaml_config_drives_two_hop_client_socks_over_quic() {
-    use monad_relay::config::MonadConfig;
     use std::fs;
 
     let upper_listener = TcpListener::bind("127.10.2.10:0").await.unwrap();

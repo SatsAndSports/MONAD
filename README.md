@@ -230,8 +230,9 @@ The `Makefile` also includes named manual stress recipes for:
 - transport-focused stress (`make stress-transport-extreme`)
 - repeated `ChannelPayment` stress on one linked channel (`make stress-payment-buffered`)
 - repeated relink stress with one active channel per session at a time (`make stress-payment-relink`)
+- configured-client chaos restarts (`make stress-chaos`)
 
-These stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
+The throughput/payment stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. `make stress-chaos` runs at a smaller scale and needs no special `ulimit`. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
 
 Current coverage includes:
 - Noise handshake and large-payload transport tests
