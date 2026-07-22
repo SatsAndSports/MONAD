@@ -673,11 +673,19 @@ where
 
                     // Accept bidirectional streams from this QUIC connection.
                     // Each stream is an independent secp Noise+H2 session.
+                    // Stream tasks are tracked in a per-connection JoinSet so
+                    // cancelling this task (shutdown, abrupt kill) also cancels
+                    // its stream sessions: JoinSet aborts on drop. Detached
+                    // stream tasks would leak connections and hold the endpoint
+                    // socket open.
+                    let mut stream_tasks = JoinSet::new();
                     loop {
-                        match conn.accept_bi().await {
-                            Ok((send, recv)) => {
-                                let stream_id = send.id();
-                                info!(%remote, ?stream_id, "accepted QUIC stream");
+                        tokio::select! {
+                            accept_result = conn.accept_bi() => {
+                                match accept_result {
+                                    Ok((send, recv)) => {
+                                        let stream_id = send.id();
+                                        info!(%remote, ?stream_id, "accepted QUIC stream");
 
                                 let config = config.clone();
                                 let transport_key = transport_key.clone();
@@ -687,7 +695,7 @@ where
                                 let session_registry = session_registry.clone();
                                 let authenticated = authenticated.clone();
                                 let conn = conn.clone();
-                                tokio::spawn(async move {
+                                stream_tasks.spawn(async move {
                                     let mut send = send;
                                     let mut recv = recv;
                                     let mut kind = [0u8; 1];
@@ -804,8 +812,15 @@ where
                                 error!(%remote, error = %e, "QUIC accept_bi failed");
                                 break;
                             }
+                                }
+                        }
+                        Some(result) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                            if let Err(e) = result {
+                                error!(%remote, "QUIC stream task panicked: {e}");
+                            }
                         }
                     }
+                }
                 });
 
                 while let Some(result) = sessions.try_join_next() {
