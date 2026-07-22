@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+const MAX_STARTUP_CONNECT_ATTEMPTS: u32 = 5;
 const INITIAL_RECONNECT_BACKOFF_MS: u64 = 250;
 const MAX_RECONNECT_BACKOFF_MS: u64 = 5_000;
 const ROUTE_CONNECT_TIMEOUT_MS: u64 = 5_000;
@@ -224,12 +224,18 @@ where
 {
     let mut attempt = 0u32;
     let mut backoff_ms = INITIAL_RECONNECT_BACKOFF_MS;
+    // Startup connects fail fast after a bounded number of attempts so a
+    // misconfigured route is loud. Once a route has connected at least once,
+    // retry forever with capped backoff: transient correlated failures (e.g.
+    // relay restarts, wallet top-ups) should never permanently kill the SOCKS
+    // listener.
+    let mut route_has_connected = false;
 
     loop {
         if attempt > 0 {
             info!(
                 attempt,
-                max_attempts = MAX_RECONNECT_ATTEMPTS,
+                route_has_connected,
                 hops = route.hops().len(),
                 backoff_ms,
                 "route reconnect attempt"
@@ -277,6 +283,7 @@ where
             Ok(Ok(route_conn)) => {
                 attempt = 0;
                 backoff_ms = INITIAL_RECONNECT_BACKOFF_MS;
+                route_has_connected = true;
                 let mut active_route = route_conn;
 
                 loop {
@@ -416,9 +423,9 @@ where
         }
 
         attempt += 1;
-        if attempt > MAX_RECONNECT_ATTEMPTS {
+        if !route_has_connected && attempt > MAX_STARTUP_CONNECT_ATTEMPTS {
             return Err(anyhow::anyhow!(
-                "route failed and max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded"
+                "route failed before first successful connect: max startup attempts ({MAX_STARTUP_CONNECT_ATTEMPTS}) exceeded"
             ));
         }
 
