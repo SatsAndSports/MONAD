@@ -89,7 +89,7 @@ cargo run -p monad-quic -- ...
 - `SqliteClientWallet` provisions real upstream Spilman channels from loose proofs, stores MONAD channel metadata, persists ambiguous opening recovery, and uses cache-first active output-keyset selection with refresh/retry only after retryable keyset mint errors.
 - `connector.rs` uses `MockWallet` + `session_driver` for default test/harness flows so multi-hop tests exercise the real `ChannelLink` / `ChannelPayment` control path.
 - the `monad-client` binary runs configured QUIC SOCKS routes from YAML with persisted wallet config.
-- configured-client route failures are handled at hop granularity: first-hop failure does a full reconnect, later-hop failure tries a suffix rebuild that preserves prefix sessions/channels, and suffix rebuild failure falls back to a full reconnect. Rebuilds are serialized; stale failures from the old route during an in-flight rebuild are ignored. Active SOCKS/TCP streams are not migrated across rebuilds; they fail if their original route breaks, and new streams use the next published route.
+- configured-client route failures are handled at hop granularity: first-hop failure does a full reconnect, later-hop failure tries a suffix rebuild that preserves prefix sessions/channels, and suffix rebuild failure falls back to a full reconnect. Rebuilds are serialized; stale failures from the old route during an in-flight rebuild are ignored. Active SOCKS/TCP streams are not migrated across rebuilds; they fail if their original route breaks, and new streams use the next published route. Route connects fail fast with bounded attempts before the first successful connect (loud startup misconfiguration), then retry indefinitely with capped backoff once a route has connected (transient failures, including wallet funding exhaustion, must not permanently kill the SOCKS listener).
 - relay-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
 
 ### QUIC Transport
@@ -260,8 +260,9 @@ The test suite currently covers:
     - `pause_events` should stay rare
     - `failures=0` and `control_errors=0`
   - high `ulimit -n` expected
-- `make stress-chaos` runs the configured-client chaos restart harness with the real YAML client runtime, persisted client wallet, real Spilman channels, and repeated relay restarts.
-  - knobs: `MONAD_CHAOS_HOPS`, `MONAD_CHAOS_DURATION_SECS`, `MONAD_CHAOS_RESTART_INTERVAL_MS`, `MONAD_CHAOS_CONCURRENT_PROBES`, `MONAD_CHAOS_RECOVERY_DEADLINE_MS`, `MONAD_CHAOS_SEED`
+- `make stress-chaos-rebuild` runs the configured-client chaos restart harness with the real YAML client runtime, persisted client wallet, real Spilman channels, and repeated relay restarts; `make stress-chaos-rebuild-intense` is the longer 5-hop variant.
+  - knobs: `MONAD_CHAOS_HOPS`, `MONAD_CHAOS_DURATION_SECS`, `MONAD_CHAOS_RESTART_INTERVAL_MS`, `MONAD_CHAOS_CONCURRENT_PROBES`, `MONAD_CHAOS_RECOVERY_DEADLINE_MS`, `MONAD_CHAOS_SEED`, `MONAD_CHAOS_PROOF_BATCHES`
+  - the chaos fixture deliberately uses a small `target_topup_buffer_msats` (100k) with a 1M msat channel budget: a re-linked session funds its buffer from the channel's remaining capacity, so channels pinned near capacity are effectively single-use and drain the purse. Keep chaos channels far from capacity.
   - the `chaos summary` line prints the initial `seed=` so a failing run can be reproduced with `MONAD_CHAOS_SEED=<seed>`
   - expected summary pattern:
     - `suffix_rebuild_failures_total=0`
@@ -274,7 +275,7 @@ The test suite currently covers:
 - `stress-transport-extreme` should usually show only large initial prefunding, little or no follow-up payment traffic, and `failures=0` / `control_errors=0`.
 - `stress-payment-buffered` should usually keep one linked channel per session and produce many proactive topups with little or no relink activity.
 - `stress-payment-relink` should usually produce many successful relinks with little or no link failures and only rare pauses.
-- `stress-chaos` should recover after each relay restart, report no suffix rebuild failures/fallbacks, and keep channel record growth bounded by the number of full reconnect generations.
+- `stress-chaos-rebuild` should recover after each relay restart, report no suffix rebuild failures/fallbacks, and keep channel record growth bounded by the number of full reconnect generations.
 - small amounts of pause/recovery activity can still be acceptable because chunk-boundary overshoot is allowed, but repeated control errors, repeated `payment_no_new_funds`, or non-zero `channel_link_failures` are warning signs worth investigating.
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.

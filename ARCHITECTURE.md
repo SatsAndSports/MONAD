@@ -269,6 +269,14 @@ Route rebuilds are serialized. Once a rebuild starts, old-route watchers are
 dropped; additional stale failures from that old route are ignored. The rebuilt
 route installs fresh watchers after it is published.
 
+Route (re)connect retry policy is split by lifecycle: before the first
+successful connect the client fails fast after a bounded number of attempts so
+startup misconfiguration is loud; once a route has connected, reconnects retry
+indefinitely with capped backoff. Transient correlated failures (relay
+restarts, wallet funding exhaustion) withdraw the route from SOCKS but never
+permanently kill the listener — the client recovers when the route (or an
+operator refilling the wallet) lets it.
+
 Failure handling is deliberately scoped:
 
 - hop `0` failure closes the whole route and uses the normal reconnect loop

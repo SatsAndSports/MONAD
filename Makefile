@@ -84,12 +84,22 @@ stress-payment-relink:
 	cargo test -p monad-relay --test stress -- --ignored stress_three_hop_quic_configurable --nocapture
 
 # Approx wall time on clanker's machine: ~1m30s (60s run + setup/teardown)
-stress-chaos:
+stress-chaos-rebuild:
 	NO_COLOR=1 RUST_LOG=error \
 	MONAD_CHAOS_HOPS=3 \
 	MONAD_CHAOS_DURATION_SECS=60 \
 	MONAD_CHAOS_RESTART_INTERVAL_MS=2000 \
 	MONAD_CHAOS_CONCURRENT_PROBES=4 \
+	cargo test -p monad-relay --test integration -- --ignored chaos_configured_client_restarts --nocapture
+
+# Approx wall time on clanker's machine: ~5m30s (300s run + setup/teardown)
+stress-chaos-rebuild-intense:
+	NO_COLOR=1 RUST_LOG=error \
+	MONAD_CHAOS_HOPS=5 \
+	MONAD_CHAOS_DURATION_SECS=300 \
+	MONAD_CHAOS_RESTART_INTERVAL_MS=1000 \
+	MONAD_CHAOS_CONCURRENT_PROBES=8 \
+	MONAD_CHAOS_RECOVERY_DEADLINE_MS=30000 \
 	cargo test -p monad-relay --test integration -- --ignored chaos_configured_client_restarts --nocapture
 
 lint:

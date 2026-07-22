@@ -230,9 +230,9 @@ The `Makefile` also includes named manual stress recipes for:
 - transport-focused stress (`make stress-transport-extreme`)
 - repeated `ChannelPayment` stress on one linked channel (`make stress-payment-buffered`)
 - repeated relink stress with one active channel per session at a time (`make stress-payment-relink`)
-- configured-client chaos restarts (`make stress-chaos`)
+- configured-client chaos route rebuilds (`make stress-chaos-rebuild`, or the longer 5-hop `make stress-chaos-rebuild-intense`)
 
-The throughput/payment stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. `make stress-chaos` runs at a smaller scale and needs no special `ulimit`. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
+The throughput/payment stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. The chaos rebuild recipes run at a smaller scale and need no special `ulimit`. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
 
 Current coverage includes:
 - Noise handshake and large-payload transport tests
@@ -492,7 +492,10 @@ detach only channels tied to the old suffix sessions and try to rebuild from the
 failed hop, preserving the unaffected prefix when possible; suffix rebuild
 failure falls back to a full route reconnect. The client does not run concurrent
 rebuilds; failures observed during an in-flight rebuild are treated as stale and
-ignored until the rebuilt route is active.
+ignored until the rebuilt route is active. Route (re)connects fail fast after a
+few attempts before the first successful connect, so startup misconfiguration is
+loud; once a route has connected, reconnects retry indefinitely with capped
+backoff, and the client recovers when the route (or a refilled wallet) allows.
 
 The configured client connects directly to the first hop via QUIC, then runs
 the same Noise+H2 session on top using the secp QUIC path.

@@ -75,7 +75,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -5870,11 +5870,26 @@ async fn test_configured_client_rebuilds_three_hop_suffix_in_five_hop_route() {
     .await;
 }
 
+static TRACING_INIT: OnceLock<()> = OnceLock::new();
+
+/// Initialize tracing for tests that spawn client/relay runtimes. Without a
+/// subscriber, the runtimes' info/warn logs are silently dropped, which makes
+/// chaos diagnostics blind. RUST_LOG controls the filter.
+fn init_test_tracing() {
+    let _ = TRACING_INIT.get_or_init(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,quinn=warn,h2=warn".into());
+        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    });
+}
+
 struct ConfiguredChaosFixtureConfig {
     subnet: u8,
     hop_count: usize,
     proof_batches: usize,
     wallet_seed: u8,
+    channel_input_budget_msats: u64,
+    target_topup_buffer_msats: u64,
     label: &'static str,
 }
 
@@ -6026,7 +6041,8 @@ client_wallet:
   loose_db_path: {}
   channel_db_path: {}
   sender_secret_hex: "{}"
-  channel_input_budget_msats: 11000000
+  channel_input_budget_msats: {}
+  target_topup_buffer_msats: {}
 relays:
 {}clients:
   - name: local
@@ -6037,6 +6053,8 @@ relays:
             loose_db_path.display(),
             channel_db_path.display(),
             sender_secret_hex,
+            fixture_config.channel_input_budget_msats,
+            fixture_config.target_topup_buffer_msats,
             relays_yaml,
             socks_listen,
             route_yaml,
@@ -6219,11 +6237,14 @@ fn next_chaos_u64(seed: &mut u64) -> u64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_configured_client_chaos_restarts_all_hop_positions() {
+    init_test_tracing();
     let mut fixture = ConfiguredChaosFixture::start(ConfiguredChaosFixtureConfig {
         subnet: 12,
         hop_count: 3,
         proof_batches: 8,
         wallet_seed: 47,
+        channel_input_budget_msats: 11_000_000,
+        target_topup_buffer_msats: 10_000_000,
         label: "configured-chaos-restarts",
     })
     .await;
@@ -6291,6 +6312,7 @@ async fn test_configured_client_chaos_restarts_all_hop_positions() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "manual configured-client chaos stress test"]
 async fn chaos_configured_client_restarts() {
+    init_test_tracing();
     let hop_count = read_chaos_usize("MONAD_CHAOS_HOPS", 3);
     let duration = Duration::from_secs(read_chaos_u64("MONAD_CHAOS_DURATION_SECS", 60));
     let restart_interval =
@@ -6301,11 +6323,17 @@ async fn chaos_configured_client_restarts() {
     let initial_seed = read_chaos_u64("MONAD_CHAOS_SEED", 0x4d4f_4e41_445f_4348);
     let mut seed = initial_seed;
 
+    // Keep channels far from capacity: a re-linked session funds its buffer
+    // from the channel's remaining capacity, so pinned channels are effectively
+    // single-use and drain the purse. A small target makes channels reusable
+    // across rebuilds and keeps the run sustainable.
     let mut fixture = ConfiguredChaosFixture::start(ConfiguredChaosFixtureConfig {
         subnet: 13,
         hop_count,
-        proof_batches: hop_count.saturating_mul(4),
+        proof_batches: read_chaos_usize("MONAD_CHAOS_PROOF_BATCHES", 40),
         wallet_seed: 53,
+        channel_input_budget_msats: 1_000_000,
+        target_topup_buffer_msats: 100_000,
         label: "configured-chaos-stress",
     })
     .await;
@@ -6358,6 +6386,10 @@ async fn chaos_configured_client_restarts() {
         let hop_idx = (next_chaos_u64(&mut seed) as usize) % hop_count;
         restarts_by_hop[hop_idx] += 1;
         restarts_total += 1;
+        println!(
+            "chaos restart {restarts_total}: restarting hop {hop_idx} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         fixture.restart_hop(hop_idx).await;
         let payload = format!("chaos recovery {restarts_total} hop {hop_idx}");
         let recovery = fixture
@@ -6367,6 +6399,10 @@ async fn chaos_configured_client_restarts() {
                 recovery_deadline,
             )
             .await;
+        println!(
+            "chaos restart {restarts_total}: hop {hop_idx} recovered_ms={recovery_ms}",
+            recovery_ms = recovery.as_millis()
+        );
         max_recovery = max_recovery.max(recovery);
     }
 
