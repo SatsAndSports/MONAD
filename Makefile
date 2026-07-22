@@ -102,6 +102,17 @@ stress-chaos-rebuild-intense:
 	MONAD_CHAOS_RECOVERY_DEADLINE_MS=30000 \
 	cargo test -p monad-relay --test integration -- --ignored chaos_configured_client_restarts --nocapture
 
+# Approx wall time on clanker's machine: ~1m30s (60s run + setup/teardown)
+stress-chaos-rebuild-abrupt:
+	NO_COLOR=1 RUST_LOG=error \
+	MONAD_CHAOS_HOPS=3 \
+	MONAD_CHAOS_DURATION_SECS=60 \
+	MONAD_CHAOS_RESTART_INTERVAL_MS=1000 \
+	MONAD_CHAOS_CONCURRENT_PROBES=4 \
+	MONAD_CHAOS_KILL_MODE=abrupt \
+	MONAD_CHAOS_RECOVERY_DEADLINE_MS=30000 \
+	cargo test -p monad-relay --test integration -- --ignored chaos_configured_client_restarts --nocapture
+
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
 

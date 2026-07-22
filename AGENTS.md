@@ -102,6 +102,8 @@ cargo run -p monad-quic -- ...
 - Noise nesting is preserved — the inner Noise+H2 session runs unchanged inside the QUIC stream
 - Server listens on the same port for both TCP and UDP (QUIC)
 - QUIC connection pool: shared connections reused across client sessions, keyed by `(host, port)` plus auth mode
+- no QUIC keep-alives by design: idle connections die and are re-established on demand; 20s idle timeout on both sides bounds silent peer-death detection at the transport layer, while the client session heartbeat (5s idle / 15s timeout) detects unresponsive sessions at the MONAD level
+- relay QUIC per-stream session tasks are tracked in a per-connection `JoinSet`, so shutdown or abrupt task cancellation cancels the whole connection task tree (detached stream tasks used to leak connections and hold the endpoint socket)
 
 ### Transport Identity Model
 
@@ -260,8 +262,9 @@ The test suite currently covers:
     - `pause_events` should stay rare
     - `failures=0` and `control_errors=0`
   - high `ulimit -n` expected
-- `make stress-chaos-rebuild` runs the configured-client chaos restart harness with the real YAML client runtime, persisted client wallet, real Spilman channels, and repeated relay restarts; `make stress-chaos-rebuild-intense` is the longer 5-hop variant.
-  - knobs: `MONAD_CHAOS_HOPS`, `MONAD_CHAOS_DURATION_SECS`, `MONAD_CHAOS_RESTART_INTERVAL_MS`, `MONAD_CHAOS_CONCURRENT_PROBES`, `MONAD_CHAOS_RECOVERY_DEADLINE_MS`, `MONAD_CHAOS_SEED`, `MONAD_CHAOS_PROOF_BATCHES`
+- `make stress-chaos-rebuild` runs the configured-client chaos restart harness with the real YAML client runtime, persisted client wallet, real Spilman channels, and repeated relay restarts; `make stress-chaos-rebuild-intense` is the longer 5-hop variant; `make stress-chaos-rebuild-abrupt` kills relays ungracefully.
+  - knobs: `MONAD_CHAOS_HOPS`, `MONAD_CHAOS_DURATION_SECS`, `MONAD_CHAOS_RESTART_INTERVAL_MS`, `MONAD_CHAOS_CONCURRENT_PROBES`, `MONAD_CHAOS_RECOVERY_DEADLINE_MS`, `MONAD_CHAOS_SEED`, `MONAD_CHAOS_PROOF_BATCHES`, `MONAD_CHAOS_KILL_MODE` (`graceful` default, `abrupt`, `mixed` alternating)
+  - `abrupt` kills cancel the relay task tree instead of sending the shutdown signal: faster restart cycles (no 5s session drain), and they exercise the ungraceful-loss path — silent QUIC death (no CONNECTION_CLOSE), session teardown via transport collapse, and QUIC pool dead-connection eviction. Expect larger `recovered_ms` than graceful runs; use a >=30s recovery deadline.
   - the chaos fixture deliberately uses a small `target_topup_buffer_msats` (100k) with a 1M msat channel budget: a re-linked session funds its buffer from the channel's remaining capacity, so channels pinned near capacity are effectively single-use and drain the purse. Keep chaos channels far from capacity.
   - the `chaos summary` line prints the initial `seed=` so a failing run can be reproduced with `MONAD_CHAOS_SEED=<seed>`
   - expected summary pattern:

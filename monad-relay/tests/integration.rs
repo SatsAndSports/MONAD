@@ -5512,6 +5512,53 @@ fn assert_suffix_rebuild_channel_invariants(
     );
 }
 
+/// How chaos restarts kill a relay. `graceful` uses the relay's shutdown
+/// signal (clean connection close, up to a 5s session drain). `abrupt` cancels
+/// the relay task tree: session tasks abort via JoinSet drop and TCP sockets
+/// close, but the QUIC endpoint dies silently (no CONNECTION_CLOSE), so QUIC
+/// peers detect loss via QUIC idle timeout / MONAD session heartbeat instead
+/// of a clean close.
+/// `mixed` alternates per restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChaosKillMode {
+    Graceful,
+    Abrupt,
+    Mixed,
+}
+
+impl ChaosKillMode {
+    fn from_env() -> Self {
+        match env::var("MONAD_CHAOS_KILL_MODE")
+            .ok()
+            .as_deref()
+            .unwrap_or("graceful")
+        {
+            "graceful" => Self::Graceful,
+            "abrupt" => Self::Abrupt,
+            "mixed" => Self::Mixed,
+            other => panic!("unsupported MONAD_CHAOS_KILL_MODE={other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::Abrupt => "abrupt",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    /// Resolve whether the given 0-based restart should kill ungracefully.
+    fn is_abrupt_for_restart(self, restart_index: u64) -> bool {
+        match self {
+            Self::Graceful => false,
+            Self::Abrupt => true,
+            Self::Mixed => restart_index % 2 == 1,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn restart_configured_relay_hop(
     config: &MonadConfig,
     relay_names: &[String],
@@ -5520,23 +5567,49 @@ async fn restart_configured_relay_hop(
     hop_idx: usize,
     wallet_manager: Arc<RelayWalletManager>,
     mint_cache: SpilmanMintCache,
+    abrupt: bool,
 ) {
     let shutdown_tx = relay_shutdown_txs.remove(hop_idx);
     let handle = relay_handles.remove(hop_idx);
-    let _ = shutdown_tx.send(());
-    handle.await.unwrap().unwrap();
+    if abrupt {
+        handle.abort();
+        match handle.await {
+            Err(err) if err.is_cancelled() => {}
+            other => {
+                other.unwrap().unwrap();
+            }
+        }
+    } else {
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap().unwrap();
+    }
 
     // Give the configured client time to observe the broken session before the
     // relay comes back on the same address.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // Rebinding after an abrupt kill races QUIC endpoint teardown: the aborted
+    // task's UDP socket may still be closing when we try to bind the same
+    // address. Retry briefly on AddrInUse.
     let relay_config = config.select_relay(Some(&relay_names[hop_idx])).unwrap();
-    let (_server, _pubkey, handle, shutdown_tx, _payments) =
-        start_relay_from_config(relay_config, wallet_manager, mint_cache)
+    let mut last_err = None;
+    for _ in 0..50 {
+        match start_relay_from_config(relay_config, wallet_manager.clone(), mint_cache.clone())
             .await
-            .unwrap();
-    relay_handles.insert(hop_idx, handle);
-    relay_shutdown_txs.insert(hop_idx, shutdown_tx);
+        {
+            Ok((_server, _pubkey, handle, shutdown_tx, _payments)) => {
+                relay_handles.insert(hop_idx, handle);
+                relay_shutdown_txs.insert(hop_idx, shutdown_tx);
+                return;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => panic!("failed to restart relay after {err}"),
+        }
+    }
+    panic!("relay rebind stayed AddrInUse after abort: {last_err:?}");
 }
 
 async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
@@ -6118,6 +6191,10 @@ relays:
     }
 
     async fn restart_hop(&mut self, hop_idx: usize) {
+        self.restart_hop_with_mode(hop_idx, false).await;
+    }
+
+    async fn restart_hop_with_mode(&mut self, hop_idx: usize, abrupt: bool) {
         restart_configured_relay_hop(
             &self.config,
             &self.relay_names,
@@ -6126,6 +6203,7 @@ relays:
             hop_idx,
             self.wallet_manager.clone(),
             self.mint_cache.clone(),
+            abrupt,
         )
         .await;
     }
@@ -6320,6 +6398,7 @@ async fn chaos_configured_client_restarts() {
     let concurrent_probes = read_chaos_usize("MONAD_CHAOS_CONCURRENT_PROBES", 4);
     let recovery_deadline =
         Duration::from_millis(read_chaos_u64("MONAD_CHAOS_RECOVERY_DEADLINE_MS", 15_000));
+    let kill_mode = ChaosKillMode::from_env();
     let initial_seed = read_chaos_u64("MONAD_CHAOS_SEED", 0x4d4f_4e41_445f_4348);
     let mut seed = initial_seed;
 
@@ -6384,13 +6463,15 @@ async fn chaos_configured_client_restarts() {
             break;
         }
         let hop_idx = (next_chaos_u64(&mut seed) as usize) % hop_count;
+        let abrupt = kill_mode.is_abrupt_for_restart(restarts_total);
         restarts_by_hop[hop_idx] += 1;
         restarts_total += 1;
         println!(
-            "chaos restart {restarts_total}: restarting hop {hop_idx} elapsed_ms={}",
+            "chaos restart {restarts_total}: restarting hop {hop_idx} ({}) elapsed_ms={}",
+            if abrupt { "abrupt" } else { "graceful" },
             started.elapsed().as_millis()
         );
-        fixture.restart_hop(hop_idx).await;
+        fixture.restart_hop_with_mode(hop_idx, abrupt).await;
         let payload = format!("chaos recovery {restarts_total} hop {hop_idx}");
         let recovery = fixture
             .wait_roundtrip_deadline(
@@ -6423,8 +6504,9 @@ async fn chaos_configured_client_restarts() {
     let max_expected_channels = hop_count * (stats.full_reconnects_total as usize + 1);
 
     println!(
-        "chaos summary seed={} hops={} duration_s={:.3} restart_interval_ms={} concurrent_probes={} restarts_total={} restarts_by_hop={:?} probes_total={} probes_ok={} probes_failed={} max_recovery_ms={} route_failures_total={} full_reconnects_total={} suffix_rebuild_attempts_total={} suffix_rebuild_successes_total={} suffix_rebuild_failures_total={} suffix_rebuild_fallbacks_total={} channel_records={} channel_record_bound={}",
+        "chaos summary seed={} kill_mode={} hops={} duration_s={:.3} restart_interval_ms={} concurrent_probes={} restarts_total={} restarts_by_hop={:?} probes_total={} probes_ok={} probes_failed={} max_recovery_ms={} route_failures_total={} full_reconnects_total={} suffix_rebuild_attempts_total={} suffix_rebuild_successes_total={} suffix_rebuild_failures_total={} suffix_rebuild_fallbacks_total={} channel_records={} channel_record_bound={}",
         initial_seed,
+        kill_mode.as_str(),
         hop_count,
         started.elapsed().as_secs_f64(),
         restart_interval.as_millis(),
