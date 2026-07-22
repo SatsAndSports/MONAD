@@ -1268,7 +1268,7 @@ This is specific to the echo test pattern (sequential write-all then read-all on
 
 These values are generous for testing. Production tuning will depend on expected relay traffic patterns.
 
-Initiator-side QUIC connections also enable periodic keep-alives so idle client-to-hop and relay-to-relay QUIC links stay up past the default Quinn idle timeout.
+MONAD deliberately uses no QUIC keep-alives: idle connections are meant to die and be re-established on demand (the pool evicts a dead connection on the next failed stream open and reconnects fresh). Both sides set a 20s QUIC idle timeout, which also bounds silent peer-death detection at the transport layer. Above QUIC, the client's session heartbeat (status request after 5s idle, 15s timeout) provides MONAD-level detection of an unresponsive session, so active sessions keep their transport warm without transport-level keep-alives.
 
 ### What Has Been Integrated
 
@@ -1286,5 +1286,5 @@ The full QUIC transport chain is implemented and tested:
 
 - client wallet funding UX is not yet fully wired: mint quotes, premint submission, richer balance inspection, and client close/sweep flows still need commands.
 - configured-client startup recovery policy is still explicit/operator-driven rather than automatic before SOCKS starts accepting traffic.
-- QUIC connection pool does not yet handle connection eviction or stale entry cleanup.
+- QUIC connection pool entries are only evicted lazily (on failed stream open) plus transport idle timeout; there is no proactive stale-entry cleanup.
 - asymmetric pricing (rates other than 1/1) is not yet tested.

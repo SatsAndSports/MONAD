@@ -138,7 +138,11 @@ pub enum ClientAuthMode {
     Secp256k1(Secp256k1Pubkey),
 }
 
-const MONAD_QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+// MONAD uses no QUIC keep-alives: idle connections are meant to die and be
+// re-established on demand. The idle timeout therefore also bounds silent peer
+// death detection at the transport layer. Active MONAD sessions stay warm via
+// the client session heartbeat, so legit traffic is unaffected.
+const MONAD_QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub fn build_client_config_for_auth(auth: ClientAuthMode) -> Result<quinn::ClientConfig> {
     ensure_crypto_provider();

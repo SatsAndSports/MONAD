@@ -6,7 +6,9 @@ use quinn::Endpoint;
 use tracing::{error, info, warn};
 
 static CRYPTO_PROVIDER: Once = Once::new();
-const MONAD_QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+// Keep in sync with the client-side value: no keep-alives, idle connections
+// die, and silent peer death is detected within this bound.
+const MONAD_QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn ensure_crypto_provider() {
     CRYPTO_PROVIDER.call_once(|| {
