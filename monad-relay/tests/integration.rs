@@ -4939,6 +4939,292 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
     let _ = mint_shutdown_tx.send(());
 }
 
+/// A client whose keyset cache is fresher than the relay's must keep working
+/// after mint rotation: the stale relay still advertises only the old keyset,
+/// an existing old-keyset channel can be re-linked and paid (relay acceptance
+/// is "known + trusted unit", deliberately not active-gated), and data flows.
+/// Provisioning a NEW channel from the stale offer must fail cleanly before
+/// any mint call, because the refreshed client knows the old keyset is
+/// inactive and the mint can no longer sign outputs for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rotated_mint_stale_relay_old_channel_ok_new_open_refused() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint = mint_helper.mint();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint.clone()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let old_keyset_id = mint_helper.keyset_id().to_string();
+    let old_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let stale_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &old_keyset_id,
+        &old_keyset_info_json,
+        true,
+    );
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let transport_key = SecpTransportKeypair::generate();
+    let payment_receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = payment_receiver_secret.public_key().to_hex();
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        payment_receiver_secret,
+        "client-ahead-rotation-relay",
+        wallet_manager.clone(),
+        stale_mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    // Real client wallet backed by temp SQLite DBs.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let loose_db_path = temp_dir.path().join("loose.db");
+    let channel_db_path = temp_dir.path().join("channels.db");
+    let sender_secret_hex = hex::encode([42u8; 32]);
+    let loose_wallet = LooseProofWallet::open(&loose_db_path, "alice").unwrap();
+    let wallet = SqliteClientWallet::open(loose_wallet, &channel_db_path, &sender_secret_hex)
+        .expect("open client wallet");
+
+    // Fund the client with old-keyset loose proofs before rotation.
+    let mut old_proofs = mint_helper.mint_proofs(10_000).await.unwrap();
+    old_proofs.extend(mint_helper.mint_proofs(10_000).await.unwrap());
+    assert!(old_proofs
+        .iter()
+        .all(|proof| proof.keyset_id.to_string() == old_keyset_id));
+    wallet
+        .loose_wallet()
+        .import_proofs(&loose_proofs_from_cashu_proofs(
+            &mint_url,
+            "sat",
+            "pre-rotation",
+            &old_proofs,
+        ))
+        .unwrap();
+
+    // Session 1: provision, link, and pay an old-keyset channel.
+    let conn1 = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send1, mut control_recv1) = conn1.open_control().await.unwrap();
+    let status1 = control_handshake_status(&mut control_send1, &mut control_recv1).await;
+    let advertisement1 = status1
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("relay should advertise sat keyset");
+    assert_eq!(advertisement1.keyset_ids, vec![old_keyset_id.clone()]);
+    let offer = RelayPaymentOffer::from_advertisement(receiver_pubkey_hex.clone(), advertisement1);
+
+    let channel_id = wallet.provision_channel(&offer, 10_000_000).unwrap();
+    assert_eq!(
+        wallet.get_channel(&channel_id).unwrap().keyset_id,
+        old_keyset_id
+    );
+    wallet
+        .attach_channel_to_session(&channel_id, *conn1.session_id())
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
+    send_control_message(
+        &mut control_send1,
+        &ClientMessage::ChannelLink {
+            payment_json: link_json,
+        },
+        false,
+    )
+    .await;
+    let link_status = expect_session_status_struct(read_control_message(&mut control_recv1).await);
+    let capacity_raw = link_status
+        .linked_channel
+        .as_ref()
+        .expect("linked channel after first link")
+        .capacity_raw;
+    link_status.assert_linked_channel(&channel_id, 0, capacity_raw, "sat");
+
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, &offer, 0, 100)
+        .unwrap();
+    send_control_message(
+        &mut control_send1,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+    let paid_status = expect_session_status_struct(read_control_message(&mut control_recv1).await);
+    assert!(!paid_status.paused);
+
+    // Rotate the mint: old keyset becomes inactive, new keyset becomes active.
+    let new_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
+    assert_ne!(old_keyset_id, new_keyset_id);
+
+    // Force a client-side keyset refresh out-of-band: the wallet's cache lives
+    // in its channel DB, so a second bridge over the same DB can refresh it.
+    let refresh_bridge = SpilmanClientBridge::new(
+        ConfigurableClientHost::<SqliteClientStorage>::open_sqlite(
+            channel_db_path.to_str().unwrap(),
+        )
+        .unwrap(),
+        cdk_spilman::ReqwestClientNetworking::new(),
+    );
+    refresh_bridge
+        .refresh_keysets_response(&mint_url)
+        .expect("client keyset refresh");
+    let client_active_ids: Vec<String> = refresh_bridge
+        .cached_active_keyset_ids(&mint_url, &cashu::nuts::CurrencyUnit::Sat)
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    assert_eq!(
+        client_active_ids,
+        vec![new_keyset_id.clone()],
+        "refreshed client cache should see only the new keyset as active"
+    );
+
+    // New loose proofs mint on the new active keyset.
+    let new_proofs = mint_helper.mint_proofs(10_000).await.unwrap();
+    assert!(new_proofs
+        .iter()
+        .all(|proof| proof.keyset_id.to_string() == new_keyset_id));
+    wallet
+        .loose_wallet()
+        .import_proofs(&loose_proofs_from_cashu_proofs(
+            &mint_url,
+            "sat",
+            "post-rotation",
+            &new_proofs,
+        ))
+        .unwrap();
+    let holdings = wallet
+        .loose_wallet()
+        .list_available_proofs(&mint_url, "sat", &[])
+        .unwrap();
+    assert!(holdings.iter().any(|p| p.keyset_id == old_keyset_id));
+    assert!(holdings.iter().any(|p| p.keyset_id == new_keyset_id));
+
+    // End session 1 so the relay releases channel ownership.
+    let _ = control_send1.send_data(Bytes::new(), true);
+    drop(control_send1);
+    drop(control_recv1);
+    conn1.shutdown().await;
+
+    // Session 2: the stale relay still advertises only the old keyset.
+    let conn2 = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send2, mut control_recv2) = conn2.open_control().await.unwrap();
+    let status2 = control_handshake_status(&mut control_send2, &mut control_recv2).await;
+    let advertisement2 = status2
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("stale relay should still advertise sat keyset");
+    assert_eq!(
+        advertisement2.keyset_ids,
+        vec![old_keyset_id.clone()],
+        "stale relay must advertise only the old keyset"
+    );
+    let offer2 = RelayPaymentOffer::from_advertisement(receiver_pubkey_hex.clone(), advertisement2);
+
+    // Re-link the existing old-keyset channel; relay-side ownership release
+    // from session 1 may race, so retry on Error for a bounded time.
+    wallet.force_detach_channel(&channel_id).unwrap();
+    wallet
+        .attach_channel_to_session(&channel_id, *conn2.session_id())
+        .unwrap();
+    let link_json = wallet.build_link_request(&channel_id, &offer2).unwrap();
+    let relink_status = {
+        let mut last_error = String::new();
+        let mut status = None;
+        for _ in 0..50 {
+            send_control_message(
+                &mut control_send2,
+                &ClientMessage::ChannelLink {
+                    payment_json: link_json.clone(),
+                },
+                false,
+            )
+            .await;
+            match read_control_message(&mut control_recv2).await {
+                message @ ServerMessage::SessionStatus { .. } => {
+                    status = Some(expect_session_status_struct(message));
+                    break;
+                }
+                ServerMessage::Error { code, message } => {
+                    last_error = format!("{code:?}: {message}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => panic!("unexpected message during re-link: {other:?}"),
+            }
+        }
+        status.unwrap_or_else(|| panic!("re-link never succeeded; last error: {last_error}"))
+    };
+    let relinked = relink_status
+        .linked_channel
+        .as_ref()
+        .expect("linked channel after re-link");
+    assert_eq!(relinked.channel_id, channel_id);
+    assert_eq!(
+        relinked.balance_raw, 100,
+        "re-link should resume from the persisted accepted balance"
+    );
+
+    // Pay again on the re-linked old-keyset channel.
+    let payment_json = wallet
+        .build_channel_payment(&channel_id, &offer2, 100, 200)
+        .unwrap();
+    send_control_message(
+        &mut control_send2,
+        &ClientMessage::ChannelPayment { payment_json },
+        false,
+    )
+    .await;
+    let paid_status2 = expect_session_status_struct(read_control_message(&mut control_recv2).await);
+    assert!(!paid_status2.paused);
+
+    // Data flows through the re-linked session.
+    let mut tunnel = conn2.open_tunnel(&upper_addr.to_string()).await.unwrap();
+    tunnel.write_all(b"client ahead of relay").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    tunnel.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"CLIENT AHEAD OF RELAY");
+
+    // Boundary: provisioning a NEW channel from the stale offer fails cleanly
+    // before any mint call — the refreshed client knows the old keyset is
+    // inactive and cannot be used for new outputs.
+    let err = wallet.provision_channel(&offer2, 10_000_000).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("offer has no active accepted keyset"),
+        "expected no-active-accepted-keyset error, got: {err}"
+    );
+
+    let _ = control_send2.send_data(Bytes::new(), true);
+    drop(control_send2);
+    drop(control_recv2);
+    conn2.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
+}
+
 /// A relay can be started from a YAML config file and advertises exactly the
 /// mints/units configured for that relay.
 #[tokio::test(flavor = "multi_thread")]
