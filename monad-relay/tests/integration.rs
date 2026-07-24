@@ -5008,8 +5008,7 @@ async fn test_rotated_mint_stale_relay_old_channel_ok_new_open_refused() {
         .expect("open client wallet");
 
     // Fund the client with old-keyset loose proofs before rotation.
-    let mut old_proofs = mint_helper.mint_proofs(10_000).await.unwrap();
-    old_proofs.extend(mint_helper.mint_proofs(10_000).await.unwrap());
+    let old_proofs = mint_helper.mint_proofs(20_000).await.unwrap();
     assert!(old_proofs
         .iter()
         .all(|proof| proof.keyset_id.to_string() == old_keyset_id));
