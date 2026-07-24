@@ -32,7 +32,7 @@ Implemented today:
 
 Not implemented yet:
 - user-facing client wallet commands for mint quotes, proof minting, and richer balances
-- automated startup recovery policy for configured clients before SOCKS accepts traffic
+- unattended infinite retry before the first successful configured-client route connect; startup still fails fast on persistent misconfiguration
 
 ## Relay Wallet
 
@@ -185,7 +185,7 @@ monad-client wallet \
 
 Add `--json` to wallet commands for machine-readable output.
 
-Remaining client-wallet work is operator/user experience rather than the core channel-payment library path: mint quote/mint commands, startup recovery policy before SOCKS operation, richer balance inspection, and close/sweep flows.
+Remaining client-wallet work is operator/user experience rather than the core channel-payment library path: mint quote/mint commands, richer balance inspection, and close/sweep flows.
 
 ## Workspace
 
@@ -230,9 +230,9 @@ The `Makefile` also includes named manual stress recipes for:
 - transport-focused stress (`make stress-transport-extreme`)
 - repeated `ChannelPayment` stress on one linked channel (`make stress-payment-buffered`)
 - repeated relink stress with one active channel per session at a time (`make stress-payment-relink`)
-- configured-client chaos route rebuilds (`make stress-chaos-rebuild`, or the longer 5-hop `make stress-chaos-rebuild-intense`)
+- configured-client chaos route rebuilds (`make stress-chaos-rebuild`, the longer 5-hop `make stress-chaos-rebuild-intense`, or abrupt-kill coverage with `make stress-chaos-rebuild-abrupt`)
 
-The throughput/payment stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. The chaos rebuild recipes run at a smaller scale and need no special `ulimit`. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
+The throughput/payment stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. The chaos rebuild recipes run at a smaller scale and need no special `ulimit`. `MONAD_CHAOS_KILL_MODE=graceful|abrupt|mixed` selects whether chaos restarts use clean shutdown, task-tree cancellation, or alternating modes. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
 
 Current coverage includes:
 - Noise handshake and large-payload transport tests
@@ -260,6 +260,8 @@ Current coverage includes:
 - QUIC control + data channels
 - nested QUIC tunnel (TCP relay forwarding to QUIC relay)
 - client connector with QUIC hop
+- configured-client route rebuilds across first, middle, and final hop restarts
+- configured-client abrupt relay loss through the chaos stress harness
 - connector blinded hop route (`RouteHop::Blinded`)
 - connector two-consecutive-blinded-hop route
 - connector hard-fails when a relay lacks required blinded/nested capability bits

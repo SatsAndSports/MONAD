@@ -595,7 +595,7 @@ token import, proof/channel inspection, and recovery commands using either
 top-level `client_wallet` YAML config or explicit DB/key flags. The configured
 SOCKS runtime uses the persisted loose-proof and channel wallets from that same
 YAML config. Remaining wallet UX work is mostly mint quote/mint commands, richer
-balance inspection, close/sweep flows, and startup recovery policy.
+balance inspection, and close/sweep flows.
 
 ### Relay Wallet Layer
 
@@ -1229,7 +1229,7 @@ clients:
 ```
 
 The client:
-1. Connects to S at `10.0.0.1:9050` via TCP+secp Noise
+1. Connects to S at `10.0.0.1:9050` via QUIC with secp256k1 attestation, then runs secp Noise+H2 over that QUIC stream
 2. Sends `CONNECT 10.0.0.2:9050` with `quic-secp256k1-pubkey` to S over H2
 3. S connects to T via QUIC using the requested auth mode
 4. Client runs a nested secp Noise+H2 session to T through the tunnel
@@ -1270,6 +1270,8 @@ These values are generous for testing. Production tuning will depend on expected
 
 MONAD deliberately uses no QUIC keep-alives: idle connections are meant to die and be re-established on demand (the pool evicts a dead connection on the next failed stream open and reconnects fresh). Both sides set a 20s QUIC idle timeout, which also bounds silent peer-death detection at the transport layer. Above QUIC, the client's session heartbeat (status request after 5s idle, 15s timeout) provides MONAD-level detection of an unresponsive session, so active sessions keep their transport warm without transport-level keep-alives.
 
+Relay QUIC stream sessions are tracked under the accepting connection task with a per-connection `JoinSet`. Graceful shutdown waits for active connection tasks, while abrupt task cancellation drops the connection's stream task tree. This keeps stream sessions from outliving their connection and prevents detached stream tasks from holding the QUIC endpoint socket open after an ungraceful relay loss.
+
 ### What Has Been Integrated
 
 The full QUIC transport chain is implemented and tested:
@@ -1285,6 +1287,6 @@ The full QUIC transport chain is implemented and tested:
 ## Current Limitations
 
 - client wallet funding UX is not yet fully wired: mint quotes, premint submission, richer balance inspection, and client close/sweep flows still need commands.
-- configured-client startup recovery policy is still explicit/operator-driven rather than automatic before SOCKS starts accepting traffic.
+- configured-client startup still fails fast before the first successful route connect; after a route has connected once, reconnects retry indefinitely with capped backoff while SOCKS stays alive.
 - QUIC connection pool entries are only evicted lazily (on failed stream open) plus transport idle timeout; there is no proactive stale-entry cleanup.
 - asymmetric pricing (rates other than 1/1) is not yet tested.
