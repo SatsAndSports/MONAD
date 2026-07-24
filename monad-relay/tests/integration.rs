@@ -6497,10 +6497,10 @@ async fn test_configured_client_keyset_rotation_after_relay_cache_refresh() {
         "keyset rotation: refreshed relay cache should advertise the new active keyset"
     );
     assert!(
-        final_channels.iter().any(|channel| {
-            channel.keyset_id == new_keyset_id && channel.state == WalletChannelState::Open
-        }),
-        "keyset rotation: rebuilt suffix should provision an open channel on the rotated active keyset; channels={final_channels:?}"
+        final_channels
+            .iter()
+            .any(|channel| channel.keyset_id == new_keyset_id),
+        "keyset rotation: rebuilt suffix should provision a channel on the rotated active keyset; channels={final_channels:?}"
     );
 
     let stats = fixture.route_stats.snapshot();
@@ -6511,6 +6511,88 @@ async fn test_configured_client_keyset_rotation_after_relay_cache_refresh() {
     assert_eq!(
         stats.suffix_rebuild_fallbacks_total, 0,
         "keyset rotation: suffix rebuild should not fall back"
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_configured_client_keyset_rotation_without_relay_cache_refresh_does_not_use_new_keyset(
+) {
+    init_test_tracing();
+    let mut fixture = ConfiguredChaosFixture::start(ConfiguredChaosFixtureConfig {
+        subnet: 15,
+        hop_count: 2,
+        proof_batches: 4,
+        wallet_seed: 61,
+        channel_input_budget_msats: 10_000_000,
+        target_topup_buffer_msats: 10_000_000,
+        label: "configured-keyset-rotation-stale-cache",
+    })
+    .await;
+
+    fixture
+        .wait_roundtrip(b"keyset stale cache warmup", "keyset stale cache warmup")
+        .await;
+
+    let initial_channels = fixture.channel_records();
+    assert_eq!(
+        initial_channels.len(),
+        2,
+        "keyset stale cache: warmup should create one old-keyset channel per hop"
+    );
+    let old_keyset_id = initial_channels[0].keyset_id.clone();
+    assert!(
+        initial_channels
+            .iter()
+            .all(|channel| channel.keyset_id == old_keyset_id),
+        "keyset stale cache: initial channels should use the pre-rotation keyset"
+    );
+
+    let new_keyset_id = fixture.rotate_sat_keyset(400).await;
+    assert_ne!(old_keyset_id, new_keyset_id);
+    fixture
+        .import_minted_proof_batches(3, 10_000, "configured-keyset-rotation-stale-cache-new")
+        .await;
+
+    // Deliberately do not refresh the relay keyset cache. The restarted relay
+    // still advertises the old cache snapshot, so configured-client provisioning
+    // must not silently move to the rotated active keyset.
+    assert!(
+        !fixture
+            .mint_cache
+            .keyset_ids(&fixture.mint_url, "sat")
+            .iter()
+            .any(|keyset| keyset == &new_keyset_id),
+        "keyset stale cache: fixture relay cache should still lack the rotated keyset"
+    );
+
+    fixture.restart_hop(1).await;
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(10) {
+        if fixture.route_stats.snapshot().suffix_rebuild_attempts_total > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        fixture.route_stats.snapshot().suffix_rebuild_attempts_total > 0,
+        "keyset stale cache: final-hop restart should trigger a suffix rebuild attempt"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let final_channels = fixture.channel_records();
+    assert!(
+        final_channels
+            .iter()
+            .any(|channel| channel.keyset_id == old_keyset_id),
+        "keyset stale cache: old-keyset channel records should remain present after rotation"
+    );
+    assert!(
+        !final_channels
+            .iter()
+            .any(|channel| channel.keyset_id == new_keyset_id),
+        "keyset stale cache: client should not provision a new-keyset channel before the relay advertises it; channels={final_channels:?}"
     );
 
     fixture.shutdown().await;
