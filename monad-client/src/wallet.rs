@@ -161,7 +161,10 @@ pub fn select_channel(
     let mut unattached = Vec::new();
 
     for channel in channels {
-        if channel.state != WalletChannelState::Open || channel.is_expired(now) {
+        if channel.state != WalletChannelState::Open
+            || channel.is_expired(now)
+            || channel.current_signed_balance_msats >= channel.capacity_msats
+        {
             continue;
         }
         if channel.receiver_pubkey != offer.receiver_pubkey
@@ -797,6 +800,30 @@ mod tests {
         );
 
         assert!(chosen.is_none());
+    }
+
+    #[test]
+    fn selector_excludes_exhausted_channel() {
+        let chosen = select_channel(
+            &[
+                WalletChannel {
+                    capacity_msats: 10_000,
+                    current_signed_balance_msats: 10_000,
+                    ..channel("exhausted")
+                },
+                WalletChannel {
+                    capacity_msats: 10_000,
+                    current_signed_balance_msats: 9_999,
+                    ..channel("funded")
+                },
+            ],
+            &offer("msat"),
+            session(1),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(chosen.channel_id, "funded");
     }
 
     #[test]
