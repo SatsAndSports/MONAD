@@ -5970,6 +5970,8 @@ struct ConfiguredChaosFixture {
     _temp_dir: tempfile::TempDir,
     config: MonadConfig,
     relay_names: Vec<String>,
+    mint_helper: TestMintHelper,
+    mint_url: String,
     upper_addr: SocketAddr,
     socks_listen: SocketAddr,
     loose_db_path: PathBuf,
@@ -6174,6 +6176,8 @@ relays:
             _temp_dir: temp_dir,
             config,
             relay_names,
+            mint_helper,
+            mint_url,
             upper_addr,
             socks_listen,
             loose_db_path,
@@ -6206,6 +6210,41 @@ relays:
             abrupt,
         )
         .await;
+    }
+
+    async fn rotate_sat_keyset(&self, input_fee_ppk: u64) -> String {
+        rotate_sat_keyset(&self.mint_helper.mint(), input_fee_ppk)
+            .await
+            .unwrap()
+            .to_string()
+    }
+
+    async fn import_minted_proof_batches(&self, batches: usize, amount_raw: u64, source: &str) {
+        let mut proofs = Vec::new();
+        for _ in 0..batches {
+            proofs.extend(self.mint_helper.mint_proofs(amount_raw).await.unwrap());
+        }
+        let loose_wallet =
+            LooseProofWallet::open(&self.loose_db_path, CONFIGURED_CLIENT_WALLET_NAME).unwrap();
+        loose_wallet
+            .import_proofs(&loose_proofs_from_cashu_proofs(
+                &self.mint_url,
+                "sat",
+                source,
+                &proofs,
+            ))
+            .unwrap();
+    }
+
+    async fn refresh_relay_keyset_cache(&mut self) {
+        let trusted_mint_units = self.config.relays[0].trusted_mint_units();
+        self.mint_cache = discover_spilman_mint_cache(&trusted_mint_units)
+            .await
+            .unwrap();
+        self.wallet_manager
+            .install_keyset_cache(self.mint_cache.clone());
+        self.wallet_manager
+            .set_trusted_mint_units(trusted_mint_units);
     }
 
     async fn wait_roundtrip(&self, payload: &[u8], context: &str) -> Vec<u8> {
@@ -6382,6 +6421,96 @@ async fn test_configured_client_chaos_restarts_all_hop_positions() {
         "chaos: channel records should stay bounded; got {}, expected at most {}",
         final_channels.len(),
         max_expected_channels
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_configured_client_keyset_rotation_after_relay_cache_refresh() {
+    init_test_tracing();
+    let mut fixture = ConfiguredChaosFixture::start(ConfiguredChaosFixtureConfig {
+        subnet: 14,
+        hop_count: 2,
+        proof_batches: 4,
+        wallet_seed: 59,
+        channel_input_budget_msats: 10_000_000,
+        target_topup_buffer_msats: 10_000_000,
+        label: "configured-keyset-rotation",
+    })
+    .await;
+
+    fixture
+        .wait_roundtrip(b"keyset rotation warmup", "keyset rotation warmup")
+        .await;
+
+    let initial_channels = fixture.channel_records();
+    assert_eq!(
+        initial_channels.len(),
+        2,
+        "keyset rotation: warmup should create one old-keyset channel per hop"
+    );
+    let old_keyset_id = initial_channels[0].keyset_id.clone();
+    assert!(
+        initial_channels
+            .iter()
+            .all(|channel| channel.keyset_id == old_keyset_id),
+        "keyset rotation: initial channels should use the pre-rotation keyset"
+    );
+
+    let new_keyset_id = fixture.rotate_sat_keyset(400).await;
+    assert_ne!(old_keyset_id, new_keyset_id);
+    fixture
+        .import_minted_proof_batches(3, 10_000, "configured-keyset-rotation-new")
+        .await;
+    fixture.refresh_relay_keyset_cache().await;
+
+    fixture.restart_hop(1).await;
+    fixture
+        .wait_roundtrip(
+            b"keyset rotation recovered",
+            "keyset rotation final-hop recovery",
+        )
+        .await;
+
+    let final_channels = fixture.channel_records();
+    assert!(
+        final_channels
+            .iter()
+            .any(|channel| channel.keyset_id == old_keyset_id),
+        "keyset rotation: old-keyset channel records should remain present after rotation"
+    );
+    assert!(
+        fixture
+            .mint_cache
+            .keyset_ids(&fixture.mint_url, "sat")
+            .iter()
+            .any(|keyset| keyset == &old_keyset_id),
+        "keyset rotation: refreshed relay cache should keep the inactive old keyset known"
+    );
+    assert!(
+        fixture
+            .mint_cache
+            .keyset_ids(&fixture.mint_url, "sat")
+            .iter()
+            .any(|keyset| keyset == &new_keyset_id),
+        "keyset rotation: refreshed relay cache should advertise the new active keyset"
+    );
+    assert!(
+        final_channels.iter().any(|channel| {
+            channel.keyset_id == new_keyset_id && channel.state == WalletChannelState::Open
+        }),
+        "keyset rotation: rebuilt suffix should provision an open channel on the rotated active keyset; channels={final_channels:?}"
+    );
+
+    let stats = fixture.route_stats.snapshot();
+    assert_eq!(
+        stats.suffix_rebuild_failures_total, 0,
+        "keyset rotation: suffix rebuild should not fail"
+    );
+    assert_eq!(
+        stats.suffix_rebuild_fallbacks_total, 0,
+        "keyset rotation: suffix rebuild should not fall back"
     );
 
     fixture.shutdown().await;
