@@ -332,6 +332,7 @@ Client to server (`ClientMessage`):
 - `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0, funding proofs, sufficient capacity for the relay's configured channel policy, and an expiry at least `channel_policy.min_expiry` in the future
 - `ChannelPayment { payment_json }` — increment session balance; requires a Spilman `Payment` signature for a higher balance than previously seen for this channel
 - `GetSessionStatus` — request a fresh session status snapshot
+- `RefreshKeysets { mint_url, unit }` — request a bounded relay-side refresh of keyset metadata for one configured trusted mint/unit. On success, or when skipped by cooldown, the relay replies with a fresh `SessionStatus`; policy rejection or refresh failure returns `Error`.
 
 Server to client (`ServerMessage`):
 - `SessionStatus { ... }` — primary state synchronization message; sent immediately after control stream establishment and proactively whenever session state (balance, link, pricing) changes. Contains:
@@ -349,6 +350,23 @@ Server to client (`ServerMessage`):
 - `SessionStatus { ... linked_channel: Some(...) ... }` — authoritative relay state after a successful link or payment
 - `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
 - `Error { code, message }` — relay-initiated error or rejection
+
+### Relay Keyset Refresh
+
+Relay keyset refresh is a bounded client hint, not open mint discovery. It exists so a client can ask a relay to re-check a mint after the client suspects the relay's advertised keysets are stale, for example after a Cashu mint rotates to a new active output keyset.
+
+The request is deliberately narrow:
+
+- The client sends `RefreshKeysets { mint_url, unit }` on the control stream.
+- The relay accepts the hint only when `mint_url` is already configured as trusted and `unit` is trusted for that mint.
+- The relay refreshes all keysets for that mint into the shared relay-wallet cache, not only the requested unit, because mint keyset endpoints are mint-scoped.
+- On successful refresh, the relay replies with a fresh `SessionStatus` containing the updated advertisements.
+- If the request is skipped by cooldown, the relay still replies with a fresh `SessionStatus` from the current cache.
+- If policy rejects the request or the mint refresh fails, the relay replies with `Error` and leaves the existing cache intact.
+
+DoS resistance is part of the protocol behavior. The relay validates request sizes and trusted mint/unit policy before any network fetch, uses a per-mint singleflight lock so concurrent sessions cannot stampede one mint, applies per-mint success and failure cooldowns, bounds total concurrent refreshes with a global semaphore, and wraps mint I/O in a timeout. Refresh I/O runs outside session accounting locks, so slow or failing mints do not block data-path accounting or unrelated control state.
+
+Refresh does not invalidate old keysets by itself. The relay cache stores all keysets returned by configured mints, active and inactive, and trusted policy filters advertisements and channel acceptance at read time. Existing channels funded by a still-known old keyset can continue to link and pay after a mint rotation, while newly opened channels should use a currently active keyset once both client and relay have refreshed.
 
 ### Version Negotiation
 

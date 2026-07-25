@@ -21,7 +21,7 @@ Implemented today:
 - QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, configured client routes, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
 - Noise-payload bootstrap: MONAD uses the Noise `NK` pattern over secp256k1 with ChaCha20-Poly1305 and BLAKE2s; the client sends a bootstrap request in the first Noise handshake payload, the relay replies in the second, and today this strictly negotiates the post-handshake session protocol (`h2`), the Cashu Spilman channel protocol version (`2026-03-20`), and the pricing policy (`session_constant`) before H2 starts
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
-- session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
+- session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, `RefreshKeysets`, and `ChannelEvicted`
 - relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - in-process relay wallet manager: multiple hosted relays can share one SQLite-backed relay wallet database while keeping distinct Cashu receiver keys / wallet names
@@ -274,7 +274,13 @@ Current coverage includes:
 - control detach releases linked channels and tears down active / future streams
 - changing a relay's current trusted mint policy stops new advertisement/acceptance for that mint without invalidating previously stored channels
 
-Relay keyset handling is deliberately simple: each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy only when advertising options or accepting incoming channel funding/payments. Channel close and relay drain swaps start from the shared cache; if the mint rejects a swap with a keyset error, the retry path refreshes that mint into SQLite and the shared cache before re-preparing the swap.
+### Relay Keyset Handling
+
+Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy only when advertising options or accepting incoming channel funding/payments.
+
+Clients can send `RefreshKeysets { mint_url, unit }` on the control stream when they suspect a relay's advertised keysets are stale, such as after mint keyset rotation. The relay treats this as a bounded hint: it only refreshes configured trusted mint/unit pairs, applies per-mint cooldown and singleflight protection, limits global refresh concurrency, times out slow mint calls, and responds with a fresh `SessionStatus` on success or cooldown skip. Policy rejection or refresh failure returns `Error` and preserves the existing cache.
+
+Existing old-keyset channels keep working as long as the relay still knows the keyset and the mint/unit remains trusted. New channel opening should move to the currently active keyset once the client and relay have refreshed. Channel close and relay drain swaps also start from the shared cache; if the mint rejects a swap with a keyset error, the retry path refreshes that mint into SQLite and the shared cache before re-preparing the swap.
 
 ## Payment Code Map
 

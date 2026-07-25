@@ -1,5 +1,6 @@
 //! TCP and QUIC listener that accepts connections and performs the Noise NK handshake.
 
+use crate::keyset_refresh::RelayKeysetRefreshCoordinator;
 use crate::payments::RelayPayments;
 use crate::quic_pool::QuicPool;
 use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
@@ -45,6 +46,7 @@ struct QuicSessionRuntime {
     discovered_spilman_mint_cache: SharedSpilmanMintCache,
     payments: Arc<dyn RelayPayments>,
     session_registry: Arc<SessionRegistry>,
+    keyset_refresh: Option<Arc<RelayKeysetRefreshCoordinator>>,
 }
 
 async fn run_quic_noise_session(
@@ -95,6 +97,7 @@ async fn run_quic_noise_session(
             receiver_pubkey_hex: runtime.config.receiver_pubkey_hex.clone(),
             spilman_mint_cache: runtime.discovered_spilman_mint_cache,
             trusted_mint_units: runtime.config.trusted_mint_units.clone(),
+            keyset_refresh: runtime.keyset_refresh,
             cashu_spilman_protocol_version: bootstrap_accept.cashu_spilman_protocol_version,
             in_bytes_per_millisat: runtime.config.in_bytes_per_millisat,
             out_bytes_per_millisat: runtime.config.out_bytes_per_millisat,
@@ -188,6 +191,21 @@ pub type SharedSpilmanMintCache = Arc<RwLock<SpilmanMintCache>>;
 
 pub fn shared_spilman_mint_cache(cache: SpilmanMintCache) -> SharedSpilmanMintCache {
     Arc::new(RwLock::new(cache))
+}
+
+#[derive(Clone)]
+pub struct RelayRuntimeServices {
+    pub session_registry: Arc<SessionRegistry>,
+    pub keyset_refresh: Option<Arc<RelayKeysetRefreshCoordinator>>,
+}
+
+impl RelayRuntimeServices {
+    pub fn new(session_registry: Arc<SessionRegistry>) -> Self {
+        Self {
+            session_registry,
+            keyset_refresh: None,
+        }
+    }
 }
 
 /// Relay configuration.
@@ -342,6 +360,10 @@ where
     S: Future<Output = ()> + Send,
 {
     let discovered_spilman_mint_cache = wallet_manager.keyset_cache();
+    let keyset_refresh = Some(Arc::new(RelayKeysetRefreshCoordinator::new(
+        wallet_manager.clone(),
+        config.trusted_mint_units.clone(),
+    )));
     let receiver_pubkey_hex = wallet_manager.receiver_pubkey_hex(&config.relay_wallet_name)?;
     let payments = wallet_manager
         .payments_for_with_policy(&config.relay_wallet_name, config.channel_policy.clone())?;
@@ -379,7 +401,10 @@ where
         config,
         payments,
         discovered_spilman_mint_cache,
-        Arc::new(SessionRegistry::new()),
+        RelayRuntimeServices {
+            session_registry: Arc::new(SessionRegistry::new()),
+            keyset_refresh,
+        },
         shutdown,
     )
     .await;
@@ -530,7 +555,7 @@ pub async fn run_with_payments_and_registry(
         config,
         payments,
         discovered_spilman_mint_cache,
-        session_registry,
+        RelayRuntimeServices::new(session_registry),
         async {
             let _ = tokio::signal::ctrl_c().await;
         },
@@ -544,7 +569,7 @@ pub async fn run_with_payments_and_registry_and_shutdown<S>(
     config: Arc<ServerConfig>,
     payments: Arc<dyn RelayPayments>,
     discovered_spilman_mint_cache: SharedSpilmanMintCache,
-    session_registry: Arc<SessionRegistry>,
+    services: RelayRuntimeServices,
     shutdown: S,
 ) -> io::Result<()>
 where
@@ -577,7 +602,7 @@ where
                 let quic_pool = quic_pool.clone();
                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
                 let payments = payments.clone();
-                let session_registry = session_registry.clone();
+                let services = services.clone();
 
                 sessions.spawn(async move {
                     let (send_cipher, recv_cipher, session_id, bootstrap_accept) =
@@ -613,11 +638,12 @@ where
                         quic_pool,
                         RelaySessionConfig {
                             payments,
-                            session_registry,
+                            session_registry: services.session_registry,
                             transport_key: transport_key.clone(),
                             receiver_pubkey_hex: config.receiver_pubkey_hex.clone(),
                             spilman_mint_cache: discovered_spilman_mint_cache,
                             trusted_mint_units: config.trusted_mint_units.clone(),
+                            keyset_refresh: services.keyset_refresh,
                             cashu_spilman_protocol_version: bootstrap_accept
                                 .cashu_spilman_protocol_version,
                             in_bytes_per_millisat: config.in_bytes_per_millisat,
@@ -656,7 +682,7 @@ where
                 let quic_pool = quic_pool.clone();
                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
                 let payments = payments.clone();
-                let session_registry = session_registry.clone();
+                let services = services.clone();
 
                 sessions.spawn(async move {
                     // Complete the QUIC connection handshake
@@ -692,7 +718,7 @@ where
                                 let quic_pool = quic_pool.clone();
                                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
                                 let payments = payments.clone();
-                                let session_registry = session_registry.clone();
+                                let services = services.clone();
                                 let authenticated = authenticated.clone();
                                 let conn = conn.clone();
                                 stream_tasks.spawn(async move {
@@ -736,10 +762,11 @@ where
                                                 quic_pool,
                                                 config,
                                                 transport_key,
-                                                discovered_spilman_mint_cache,
-                                                payments,
-                                                session_registry,
-                                            };
+                                                 discovered_spilman_mint_cache,
+                                                 payments,
+                                                 session_registry: services.session_registry,
+                                                 keyset_refresh: services.keyset_refresh,
+                                             };
                                             run_quic_noise_session(
                                                 QuicStream::new(send, recv),
                                                 runtime.transport_key.normalized_secret_bytes(),
@@ -777,10 +804,11 @@ where
                                                 quic_pool,
                                                 config,
                                                 transport_key,
-                                                discovered_spilman_mint_cache,
-                                                payments,
-                                                session_registry,
-                                            };
+                                                 discovered_spilman_mint_cache,
+                                                 payments,
+                                                 session_registry: services.session_registry,
+                                                 keyset_refresh: services.keyset_refresh,
+                                             };
 
                                             run_quic_noise_session(
                                                 QuicStream::new(send, recv),

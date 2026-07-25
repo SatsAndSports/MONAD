@@ -72,6 +72,7 @@ cargo run -p monad-quic -- ...
 - `CONNECT` rejected with 402 while paused
 - Balance can go negative (chunk-boundary overshoot); session repauses
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
+- `RefreshKeysets { mint_url, unit }` asks the relay to refresh keyset metadata for one configured trusted mint/unit; on success or cooldown skip the relay replies with a fresh `SessionStatus`, while policy rejection or refresh failure returns `Error`. Requests are handled through a shared per-mint cooldown/singleflight coordinator with global concurrency and timeout limits.
 - `Error { code, message }` for relay-initiated rejections and notifications
 - `ChannelLink { payment_json }` links a Spilman channel to the session; relay validates and then sends an authoritative `SessionStatus` on success or `Error` on failure. Only one session can own a channel at a time.
 - `ChannelPayment { payment_json }` increments the session balance based on the delta of the channel's max balance seen.

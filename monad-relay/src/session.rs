@@ -5,6 +5,7 @@
 //! `POST /control` stream is used to fund and observe the whole session.
 
 use crate::control_driver::ControlDriver;
+use crate::keyset_refresh::RelayKeysetRefreshCoordinator;
 use crate::listener::{SharedSpilmanMintCache, TrustedMintUnits};
 use crate::payments::RelayPayments;
 use crate::proxy;
@@ -138,6 +139,7 @@ pub(crate) struct SessionState {
     receiver_pubkey_hex: String,
     spilman_mint_cache: SharedSpilmanMintCache,
     trusted_mint_units: TrustedMintUnits,
+    keyset_refresh: Option<Arc<RelayKeysetRefreshCoordinator>>,
     cashu_spilman_protocol_version: Option<String>,
 }
 
@@ -176,6 +178,7 @@ impl SessionState {
             receiver_pubkey_hex: config.receiver_pubkey_hex.clone(),
             spilman_mint_cache: config.spilman_mint_cache.clone(),
             trusted_mint_units: config.trusted_mint_units.clone(),
+            keyset_refresh: config.keyset_refresh.clone(),
             cashu_spilman_protocol_version: config.cashu_spilman_protocol_version.clone(),
         }
     }
@@ -235,6 +238,10 @@ impl SessionState {
 
     pub(crate) fn update_pause_watch(&self, paused: bool) {
         let _ = self.pause_tx.send_replace(paused);
+    }
+
+    pub(crate) fn keyset_refresh_coordinator(&self) -> Option<Arc<RelayKeysetRefreshCoordinator>> {
+        self.keyset_refresh.clone()
     }
 
     // Billing state and status snapshots.
@@ -374,6 +381,7 @@ pub struct RelaySessionConfig {
     pub receiver_pubkey_hex: String,
     pub spilman_mint_cache: SharedSpilmanMintCache,
     pub trusted_mint_units: TrustedMintUnits,
+    pub keyset_refresh: Option<Arc<RelayKeysetRefreshCoordinator>>,
     pub cashu_spilman_protocol_version: Option<String>,
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
@@ -884,6 +892,14 @@ async fn handle_control_stream(
                                     terminate_session = process_session_event(
                                         &state,
                                         SessionEvent::ClientChannelPayment { payment_json },
+                                        &mut h2_send,
+                                    )
+                                    .await?;
+                                }
+                                ClientMessage::RefreshKeysets { mint_url, unit } => {
+                                    terminate_session = process_session_event(
+                                        &state,
+                                        SessionEvent::ClientRefreshKeysets { mint_url, unit },
                                         &mut h2_send,
                                     )
                                     .await?;

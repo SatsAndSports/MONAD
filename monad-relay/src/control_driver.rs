@@ -7,8 +7,10 @@
 use crate::session::{send_control_message, SessionState};
 use crate::session_fsm::{SessionEffect, SessionEvent};
 use bytes::Bytes;
+use monad_common::protocol::{ServerErrorCode, ServerMessage};
 use std::collections::VecDeque;
 use std::io;
+use tracing::{info, warn};
 
 /// Interpreter for the side effects produced by the session reducer.
 pub(crate) struct ControlDriver<'a> {
@@ -49,6 +51,48 @@ impl<'a> ControlDriver<'a> {
                     self.state
                         .apply_channel_payment(&expected_channel_id, &payment_json),
                 ));
+            }
+            SessionEffect::RunKeysetRefresh { mint_url, unit } => {
+                let Some(coordinator) = self.state.keyset_refresh_coordinator() else {
+                    send_control_message(
+                        self.h2_send,
+                        &ServerMessage::Error {
+                            code: ServerErrorCode::KeysetRefreshRejected,
+                            message: "keyset refresh is not available for this relay".to_string(),
+                        },
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                match coordinator.refresh_mint_unit(&mint_url, &unit).await {
+                    Ok(outcome) => {
+                        info!(mint = %mint_url, unit = %unit, ?outcome, "keyset refresh request completed");
+                        let status = self.state.session_status_message().await;
+                        send_control_message(self.h2_send, &status).await?;
+                    }
+                    Err(error) => {
+                        let code = match &error {
+                            crate::keyset_refresh::KeysetRefreshError::RequestTooLarge
+                            | crate::keyset_refresh::KeysetRefreshError::UntrustedMint
+                            | crate::keyset_refresh::KeysetRefreshError::UntrustedUnit => {
+                                ServerErrorCode::KeysetRefreshRejected
+                            }
+                            crate::keyset_refresh::KeysetRefreshError::Timeout
+                            | crate::keyset_refresh::KeysetRefreshError::RefreshFailed(_) => {
+                                ServerErrorCode::KeysetRefreshFailed
+                            }
+                        };
+                        warn!(mint_url_len = mint_url.len(), unit = %unit, %error, "keyset refresh request failed");
+                        send_control_message(
+                            self.h2_send,
+                            &ServerMessage::Error {
+                                code,
+                                message: error.to_string(),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
             SessionEffect::NotifySessionEvicted {
                 target_session_id,

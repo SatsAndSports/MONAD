@@ -1,6 +1,7 @@
 mod channel_store;
 pub mod config;
 mod control_driver;
+pub mod keyset_refresh;
 pub mod listener;
 pub mod payments;
 pub mod proxy;

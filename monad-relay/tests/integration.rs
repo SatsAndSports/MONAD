@@ -57,10 +57,11 @@ use cdk_spilman_test_mint::{
 use common::signing_wallet::TestSigningWallet;
 use monad_quic::client::{build_client_config_for_auth, connect_with_auth, ClientAuthMode};
 use monad_relay::config::{MonadConfig, RelayConfig};
+use monad_relay::keyset_refresh::RelayKeysetRefreshCoordinator;
 use monad_relay::listener::{
     discover_spilman_mint_cache, discover_spilman_mint_cache_with_storage, run_with_payments,
     run_with_payments_and_registry_and_shutdown, run_with_wallet_manager_and_shutdown,
-    shared_spilman_mint_cache, CachedKeyset, ServerConfig, SpilmanMintCache,
+    shared_spilman_mint_cache, CachedKeyset, RelayRuntimeServices, ServerConfig, SpilmanMintCache,
 };
 use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
 use monad_relay::quic_pool::QuicPool;
@@ -81,6 +82,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, Duration};
+
+use axum::middleware::{self, Next};
 
 const TEST_SESSION_PAYMENT: u64 = 10_000_000;
 const TEST_CHANNEL_CAPACITY_UNITS: u64 = u64::MAX / 4096;
@@ -467,6 +470,79 @@ async fn start_http_test_mint() -> (String, String, tokio::sync::oneshot::Sender
     (config.base_url, keyset_id, shutdown_tx)
 }
 
+async fn start_counted_http_test_mint() -> (
+    String,
+    String,
+    Arc<AtomicUsize>,
+    Arc<TestMintHelper>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let mint_helper = Arc::new(TestMintHelper::new().await.unwrap());
+    let mint = mint_helper.mint();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", addr.port());
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_requests = Arc::new(AtomicUsize::new(0));
+    let counter_for_middleware = keyset_requests.clone();
+    let mint_for_shutdown = mint.clone();
+    let router = build_router(mint).await.unwrap().layer(middleware::from_fn(
+        move |request: axum::extract::Request, next: Next| {
+            let counter = counter_for_middleware.clone();
+            async move {
+                if request.uri().path() == "/v1/keysets" {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        mint_for_shutdown.stop().await.unwrap();
+    });
+
+    (
+        mint_url,
+        keyset_id,
+        keyset_requests,
+        mint_helper,
+        shutdown_tx,
+    )
+}
+
+async fn start_failing_keysets_mint() -> (String, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", addr.port());
+    let router = axum::Router::new().route(
+        "/v1/keysets",
+        axum::routing::get(|| async {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "deterministic keyset refresh failure",
+            )
+        }),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    (mint_url, shutdown_tx)
+}
+
 /// Spin up a MONAD relay bound to a specific address and return `(relay_addr, secp256k1 pubkey)`.
 async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp256k1Pubkey)> {
     let identity = QuicCertIdentity::generate().unwrap();
@@ -598,6 +674,10 @@ async fn start_managed_persistent_relay(
     let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
     let mint_cache = wallet_manager.keyset_cache();
     let session_registry = Arc::new(SessionRegistry::new());
+    let keyset_refresh = Some(Arc::new(RelayKeysetRefreshCoordinator::new(
+        wallet_manager,
+        config.trusted_mint_units.clone(),
+    )));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(run_with_payments_and_registry_and_shutdown(
@@ -606,7 +686,10 @@ async fn start_managed_persistent_relay(
         config,
         payments_for_spawn,
         mint_cache,
-        session_registry,
+        RelayRuntimeServices {
+            session_registry,
+            keyset_refresh,
+        },
         async {
             let _ = shutdown_rx.await;
         },
@@ -790,7 +873,7 @@ async fn start_relay_from_bound_listener_internal(
         config,
         payments_for_spawn,
         mint_cache,
-        session_registry,
+        RelayRuntimeServices::new(session_registry),
         async {
             let _ = shutdown_rx.await;
         },
@@ -4929,6 +5012,441 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
     let new_paid_status =
         expect_session_status_struct(read_control_message(&mut control_recv).await);
     assert!(!new_paid_status.paused);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_refresh_keysets_updates_advertisements() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint = mint_helper.mint();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
+    let mint_router = build_router(mint.clone()).await.unwrap();
+    let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let old_keyset_id = mint_helper.keyset_id().to_string();
+    let old_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let stale_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &old_keyset_id,
+        &old_keyset_info_json,
+        true,
+    );
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let transport_key = SecpTransportKeypair::generate();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        receiver_secret,
+        "control-refresh-keysets-relay",
+        wallet_manager,
+        stale_mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let initial = control_handshake_status(&mut control_send, &mut control_recv).await;
+    let initial_sat = initial
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("initial sat advertisement");
+    assert_eq!(initial_sat.keyset_ids, vec![old_keyset_id.clone()]);
+
+    let new_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
+    assert_ne!(old_keyset_id, new_keyset_id);
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::RefreshKeysets {
+            mint_url: mint_url.clone(),
+            unit: "sat".to_string(),
+        },
+        false,
+    )
+    .await;
+    let refreshed = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    let refreshed_sat = refreshed
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("refreshed sat advertisement");
+    assert!(refreshed_sat.keyset_ids.contains(&old_keyset_id));
+    assert!(refreshed_sat.keyset_ids.contains(&new_keyset_id));
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_refresh_keysets_rejects_untrusted_mint_or_unit() {
+    let trusted_mint_url = "https://trusted-refresh-mint.invalid".to_string();
+    let keyset_id = "00trustedrefreshkeyset".to_string();
+    let keyset_info_json = serde_json::json!({
+        "keysetId": keyset_id,
+        "unit": "sat",
+        "keys": {},
+        "inputFeePpk": 0,
+    })
+    .to_string();
+    let mint_cache = mint_cache_with_keyset(
+        &trusted_mint_url,
+        "sat",
+        &keyset_id,
+        &keyset_info_json,
+        true,
+    );
+    let trusted_mint_units = BTreeMap::from([(
+        trusted_mint_url.clone(),
+        BTreeSet::from(["sat".to_string()]),
+    )]);
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let transport_key = SecpTransportKeypair::generate();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        receiver_secret,
+        "control-refresh-reject-relay",
+        wallet_manager,
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let _initial = control_handshake_status(&mut control_send, &mut control_recv).await;
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::RefreshKeysets {
+            mint_url: "https://untrusted-refresh-mint.invalid".to_string(),
+            unit: "sat".to_string(),
+        },
+        false,
+    )
+    .await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::KeysetRefreshRejected);
+            assert!(message.contains("mint is not trusted"));
+        }
+        other => panic!("expected refresh rejection for untrusted mint, got {other:?}"),
+    }
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::RefreshKeysets {
+            mint_url: trusted_mint_url,
+            unit: "usd".to_string(),
+        },
+        false,
+    )
+    .await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::KeysetRefreshRejected);
+            assert!(message.contains("unit is not trusted"));
+        }
+        other => panic!("expected refresh rejection for untrusted unit, got {other:?}"),
+    }
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_refresh_keysets_unavailable_without_refresher() {
+    let trusted_mint_url = "https://trusted-refresh-mint.invalid".to_string();
+    let keyset_id = "00trustedrefreshkeyset".to_string();
+    let keyset_info_json = serde_json::json!({
+        "keysetId": keyset_id,
+        "unit": "sat",
+        "keys": {},
+        "inputFeePpk": 0,
+    })
+    .to_string();
+    let mint_cache = shared_spilman_mint_cache(mint_cache_with_keyset(
+        &trusted_mint_url,
+        "sat",
+        &keyset_id,
+        &keyset_info_json,
+        true,
+    ));
+    let trusted_mint_units = BTreeMap::from([(
+        trusted_mint_url.clone(),
+        BTreeSet::from(["sat".to_string()]),
+    )]);
+    let identity = QuicCertIdentity::generate().unwrap();
+    let transport_key = SecpTransportKeypair::generate();
+    let pubkey = transport_key.pubkey();
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let (listener, quic_endpoint, server_addr) =
+        bind_tcp_and_quic_on_same_port("127.0.0.1:0".parse().unwrap(), quic_server_config)
+            .await
+            .unwrap();
+    let config = Arc::new(ServerConfig {
+        identity,
+        transport_key: Some(transport_key),
+        receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
+        trusted_mint_units,
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
+        relay_wallet_name: "refresh-unavailable-relay".to_string(),
+        spilman_storage_path: String::new(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+    });
+    let payments: Arc<dyn RelayPayments> = Arc::new(InMemoryRelayPayments::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(run_with_payments_and_registry_and_shutdown(
+        listener,
+        Some(quic_endpoint),
+        config,
+        payments,
+        mint_cache,
+        RelayRuntimeServices {
+            session_registry: Arc::new(SessionRegistry::new()),
+            keyset_refresh: None,
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let _initial = control_handshake_status(&mut control_send, &mut control_recv).await;
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::RefreshKeysets {
+            mint_url: trusted_mint_url,
+            unit: "sat".to_string(),
+        },
+        false,
+    )
+    .await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::KeysetRefreshRejected);
+            assert!(message.contains("not available"));
+        }
+        other => panic!("expected refresh unavailable error, got {other:?}"),
+    }
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_refresh_keysets_failure_preserves_cached_advertisements() {
+    let keyset_id = "00trustedrefreshkeyset".to_string();
+    let keyset_info_json = serde_json::json!({
+        "keysetId": keyset_id,
+        "unit": "sat",
+        "keys": {},
+        "inputFeePpk": 0,
+    })
+    .to_string();
+    let (mint_url, mint_shutdown_tx) = start_failing_keysets_mint().await;
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let transport_key = SecpTransportKeypair::generate();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        receiver_secret,
+        "control-refresh-failure-relay",
+        wallet_manager,
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let initial = control_handshake_status(&mut control_send, &mut control_recv).await;
+    let initial_sat = initial
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("initial sat advertisement");
+    assert_eq!(initial_sat.keyset_ids, vec![keyset_id.clone()]);
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::RefreshKeysets {
+            mint_url: mint_url.clone(),
+            unit: "sat".to_string(),
+        },
+        false,
+    )
+    .await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::KeysetRefreshFailed);
+            assert!(message.contains("keyset refresh failed") || message.contains("timed out"));
+        }
+        other => panic!("expected refresh failure error, got {other:?}"),
+    }
+
+    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
+    let status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    let status_sat = status
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("cached sat advertisement after failed refresh");
+    assert_eq!(status_sat.keyset_ids, vec![keyset_id]);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_refresh_keysets_success_cooldown_skips_second_mint_fetch() {
+    let (mint_url, old_keyset_id, keyset_requests, mint_helper, mint_shutdown_tx) =
+        start_counted_http_test_mint().await;
+    let old_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let stale_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &old_keyset_id,
+        &old_keyset_info_json,
+        true,
+    );
+
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let transport_key = SecpTransportKeypair::generate();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        receiver_secret,
+        "control-refresh-cooldown-relay",
+        wallet_manager,
+        stale_mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let initial = control_handshake_status(&mut control_send, &mut control_recv).await;
+    let initial_sat = initial
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("initial sat advertisement");
+    assert_eq!(initial_sat.keyset_ids, vec![old_keyset_id.clone()]);
+    assert_eq!(keyset_requests.load(Ordering::SeqCst), 0);
+
+    let mint = mint_helper.mint();
+    let new_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
+    assert_ne!(old_keyset_id, new_keyset_id);
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::RefreshKeysets {
+            mint_url: mint_url.clone(),
+            unit: "sat".to_string(),
+        },
+        false,
+    )
+    .await;
+    let refreshed = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    let refreshed_sat = refreshed
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("refreshed sat advertisement");
+    assert!(refreshed_sat.keyset_ids.contains(&old_keyset_id));
+    assert!(refreshed_sat.keyset_ids.contains(&new_keyset_id));
+    assert_eq!(keyset_requests.load(Ordering::SeqCst), 1);
+
+    let newest_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
+    assert_ne!(new_keyset_id, newest_keyset_id);
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::RefreshKeysets {
+            mint_url: mint_url.clone(),
+            unit: "sat".to_string(),
+        },
+        false,
+    )
+    .await;
+    let skipped = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    let skipped_sat = skipped
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("cooldown sat advertisement");
+    assert!(skipped_sat.keyset_ids.contains(&old_keyset_id));
+    assert!(skipped_sat.keyset_ids.contains(&new_keyset_id));
+    assert!(!skipped_sat.keyset_ids.contains(&newest_keyset_id));
+    assert_eq!(keyset_requests.load(Ordering::SeqCst), 1);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -9515,7 +10033,7 @@ async fn test_session_status_reflects_manager_keyset_refresh_mid_session() {
         config,
         payments,
         shared_cache,
-        Arc::new(SessionRegistry::new()),
+        RelayRuntimeServices::new(Arc::new(SessionRegistry::new())),
         async {
             let _ = shutdown_rx.await;
         },

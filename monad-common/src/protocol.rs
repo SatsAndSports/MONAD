@@ -51,6 +51,8 @@ pub enum ServerErrorCode {
     PaymentUnknownChannel,
     PaymentInvalid,
     PaymentNoNewFunds,
+    KeysetRefreshRejected,
+    KeysetRefreshFailed,
     InternalError,
 }
 
@@ -69,6 +71,11 @@ pub enum ClientMessage {
     ChannelPayment { payment_json: String },
     /// Request a fresh session status snapshot.
     GetSessionStatus,
+    /// Ask the relay to refresh its trusted keyset cache for one mint/unit.
+    ///
+    /// The relay answers with a fresh `SessionStatus` on success or cooldown
+    /// skip, and with `Error` if policy rejects the request or refresh fails.
+    RefreshKeysets { mint_url: String, unit: String },
 }
 
 /// Messages sent from server to client on the control channel.
