@@ -602,13 +602,12 @@ channel metadata.
   building zero-balance link payments, and signing incremental channel payments.
 - `MockWallet` remains available for deterministic tests and harnesses.
 
-Client channel opening is cache-first. Before entering the shared keyset retry
-helper, each opening call site ensures the upstream client keyset cache has at
-least one keyset for the relevant `(mint, unit)`. Output keyset selection first
-tries the cached active keysets that intersect with the relay offer, then
-refreshes the client cache before deciding the relay advertisement is stale. If
-the mint rejects a selected cached keyset during swap submission, the retry path
-refreshes again and skips retry if refresh still selects the same output keyset.
+Client channel opening is cache-first. Each opening call site selects an active
+client output keyset that intersects with the relay's advertised
+`accepted_keyset_ids`. A cache-only miss refreshes the client mint cache before
+the offer is classified as stale. If the mint rejects a selected cached keyset
+during swap submission, the retry path refreshes again and skips retry if refresh
+still selects the same output keyset.
 
 If that refreshed client cache has no active output keyset that is also present
 in the relay's advertised `accepted_keyset_ids`, `SqliteClientWallet` returns a

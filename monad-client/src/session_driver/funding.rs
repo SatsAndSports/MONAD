@@ -276,11 +276,6 @@ pub(super) async fn maybe_ensure_linked_channel(
                 let Some(advertisement) = snapshot.advertisements.first() else {
                     return Ok(());
                 };
-                info!(
-                    "{} provisioning new channel from first advertisement | {}",
-                    config.hop_label,
-                    state_summary(state, &config.conn.cleartext_byte_counters)
-                );
                 let offer = RelayPaymentOffer::from_advertisement(
                     snapshot.receiver_pubkey.clone(),
                     advertisement,
@@ -289,6 +284,11 @@ pub(super) async fn maybe_ensure_linked_channel(
                 if keyset_refresh_hint_is_suppressed(state, &keyset_refresh_hint) {
                     return Ok(());
                 }
+                info!(
+                    "{} provisioning new channel from first advertisement | {}",
+                    config.hop_label,
+                    state_summary(state, &config.conn.cleartext_byte_counters)
+                );
                 let channel_id = match config
                     .wallet
                     .provision_channel(&offer, config.payment_policy.channel_input_budget_msats)

@@ -125,7 +125,7 @@ client with `monad-client run --config monad.yaml --client <name>`.
 - `LooseProofWallet` stores loose Cashu proofs, mint quote state, premint batches, reservations, and spend/release state in SQLite.
 - `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata including expiry timestamps in SQLite, and implements `MonadWallet` for the session driver.
 - opening recovery is persisted for ambiguous funding-swap failures and can be recovered through upstream restore.
-- output keyset selection is cache-first: the wallet ensures its mint/unit keyset cache is non-empty before entering the keyset retry helper, then selectors read cache only; refresh happens after retryable mint keyset rejection.
+- output keyset handling is cache-first: channel opening selects an active client output keyset that intersects with the relay offer; cache misses refresh the client mint cache before a relay offer is classified as stale, and retryable mint keyset rejections refresh again before one safe retry.
 
 `client_wallet.channel_input_budget_msats` controls the loose-proof input budget for each newly provisioned channel. It is not a guaranteed channel capacity; fees and deterministic channel outputs can make the resulting capacity lower. The default is `1000000` msats.
 

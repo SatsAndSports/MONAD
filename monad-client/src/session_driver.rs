@@ -81,10 +81,12 @@ mod tests {
     };
     use super::PaymentPolicy;
     use crate::wallet::WalletError;
+    use http::{Method, Request};
     use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus, ServerErrorCode};
     use monad_common::proxy::CleartextByteCounters;
     use monad_common::session::SessionPricing;
     use std::io;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::oneshot;
     use tokio::time::Instant;
@@ -708,10 +710,6 @@ mod tests {
     fn maybe_progress_payment_abandons_exhausted_channel() {
         use super::state::{RelayConnectionHandles, SessionDriverConfig};
         use crate::wallet::{MockWallet, WalletChannelState};
-        use http::{Method, Request};
-        use monad_common::proxy::CleartextByteCounters;
-        use monad_common::session::SessionPricing;
-        use std::sync::Arc;
 
         let wallet = MockWallet::new();
         wallet
