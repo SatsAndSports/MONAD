@@ -7847,6 +7847,126 @@ async fn test_configured_client_keyset_rotation_after_relay_cache_refresh() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_configured_client_fresh_relay_stale_client_refreshes_locally_after_rotation() {
+    init_test_tracing();
+    let mut fixture = ConfiguredChaosFixture::start(ConfiguredChaosFixtureConfig {
+        subnet: 18,
+        hop_count: 2,
+        proof_batches: 4,
+        wallet_seed: 73,
+        channel_input_budget_msats: 10_000_000,
+        target_topup_buffer_msats: 10_000_000,
+        label: "configured-keyset-rotation-fresh-relay-stale-client",
+    })
+    .await;
+
+    fixture
+        .wait_roundtrip(
+            b"fresh relay stale client warmup",
+            "fresh relay stale client warmup",
+        )
+        .await;
+
+    let initial_channels = fixture.channel_records();
+    assert_eq!(
+        initial_channels.len(),
+        2,
+        "fresh relay stale client: warmup should create one old-keyset channel per hop"
+    );
+    let old_keyset_id = initial_channels[0].keyset_id.clone();
+    assert!(
+        initial_channels
+            .iter()
+            .all(|channel| channel.keyset_id == old_keyset_id),
+        "fresh relay stale client: initial channels should use the pre-rotation keyset"
+    );
+
+    let new_keyset_id = fixture.rotate_sat_keyset(400).await;
+    assert_ne!(old_keyset_id, new_keyset_id);
+    fixture
+        .import_minted_proof_batches(3, 10_000, "configured-fresh-relay-stale-client-new")
+        .await;
+
+    fixture.refresh_relay_keyset_cache().await;
+    assert!(
+        fixture
+            .mint_cache
+            .keyset_ids(&fixture.mint_url, "sat")
+            .iter()
+            .any(|keyset| keyset == &new_keyset_id),
+        "fresh relay stale client: relay cache should know the rotated keyset before reconnect"
+    );
+
+    let client_bridge = SpilmanClientBridge::new(
+        ConfigurableClientHost::<SqliteClientStorage>::open_sqlite(
+            fixture.channel_db_path.to_str().unwrap(),
+        )
+        .unwrap(),
+        cdk_spilman::ReqwestClientNetworking::new(),
+    );
+    let client_active_before: Vec<String> = client_bridge
+        .cached_active_keyset_ids(&fixture.mint_url, &cashu::nuts::CurrencyUnit::Sat)
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    assert!(
+        client_active_before.iter().any(|keyset| keyset == &old_keyset_id),
+        "fresh relay stale client: client cache should still contain the old active keyset before reconnect"
+    );
+    assert!(
+        !client_active_before
+            .iter()
+            .any(|keyset| keyset == &new_keyset_id),
+        "fresh relay stale client: client cache should not know the rotated active keyset before reconnect"
+    );
+
+    fixture.restart_hop(1).await;
+    fixture
+        .wait_roundtrip(
+            b"fresh relay stale client recovered",
+            "fresh relay stale client recovery",
+        )
+        .await;
+
+    let final_channels = fixture.channel_records();
+    assert!(
+        final_channels
+            .iter()
+            .any(|channel| channel.keyset_id == old_keyset_id),
+        "fresh relay stale client: old-keyset channel records should remain present after rotation"
+    );
+    assert!(
+        final_channels
+            .iter()
+            .any(|channel| channel.keyset_id == new_keyset_id),
+        "fresh relay stale client: stale client should refresh locally and provision on the rotated active keyset; channels={final_channels:?}"
+    );
+    let client_active_after: Vec<String> = client_bridge
+        .cached_active_keyset_ids(&fixture.mint_url, &cashu::nuts::CurrencyUnit::Sat)
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    assert!(
+        client_active_after
+            .iter()
+            .any(|keyset| keyset == &new_keyset_id),
+        "fresh relay stale client: client cache should know the rotated keyset after recovery"
+    );
+
+    let stats = fixture.route_stats.snapshot();
+    assert_eq!(
+        stats.suffix_rebuild_failures_total, 0,
+        "fresh relay stale client: suffix rebuild should not fail"
+    );
+    assert_eq!(
+        stats.suffix_rebuild_fallbacks_total, 0,
+        "fresh relay stale client: suffix rebuild should not fall back"
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_configured_client_keyset_rotation_triggers_relay_refresh_for_stale_offer() {
     init_test_tracing();
     let mut fixture = ConfiguredChaosFixture::start(ConfiguredChaosFixtureConfig {
