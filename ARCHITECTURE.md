@@ -604,9 +604,20 @@ channel metadata.
 
 Client channel opening is cache-first. Before entering the shared keyset retry
 helper, each opening call site ensures the upstream client keyset cache has at
-least one keyset for the relevant `(mint, unit)`. Selection inside the helper is
-cache-only; refresh happens only after a retryable mint keyset rejection, and the
-retry is skipped if refresh still selects the same output keyset.
+least one keyset for the relevant `(mint, unit)`. Output keyset selection first
+tries the cached active keysets that intersect with the relay offer, then
+refreshes the client cache before deciding the relay advertisement is stale. If
+the mint rejects a selected cached keyset during swap submission, the retry path
+refreshes again and skips retry if refresh still selects the same output keyset.
+
+If that refreshed client cache has no active output keyset that is also present
+in the relay's advertised `accepted_keyset_ids`, `SqliteClientWallet` returns a
+dedicated stale-relay-keysets error. The session payment driver treats that as a
+hint that the relay advertisement is stale, sends `RefreshKeysets { mint_url,
+unit }`, waits for the next `SessionStatus`, and then retries normal funding.
+The driver records the advertised keyset set it hinted for and suppresses
+duplicate hints for that same stale set for a short cooldown so refresh failures
+cannot become a client-side control-message loop.
 
 The reusable wallet library path exists, and `monad-client wallet ...` exposes
 token import, proof/channel inspection, and recovery commands using either

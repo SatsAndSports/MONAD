@@ -123,6 +123,7 @@ pub(super) fn exclude_on_wallet_error(error: &WalletError) -> bool {
             | WalletError::InsufficientCapacity { .. }
             | WalletError::ChannelUnusable
             | WalletError::OfferMismatch(_)
+            | WalletError::StaleRelayKeysets { .. }
     )
 }
 

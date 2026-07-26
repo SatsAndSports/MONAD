@@ -67,6 +67,7 @@ pub async fn start_session_payment_driver(
 
 #[cfg(test)]
 mod tests {
+    use super::funding::{keyset_refresh_hint_is_suppressed, KEYSET_REFRESH_HINT_RETRY_COOLDOWN};
     use super::payment::{
         channel_signed_balance_raw, exclude_on_wallet_error, plan_payment_topup,
         raw_amount_to_msats, requested_delta_msats, server_error_rejects_intended_channel,
@@ -74,8 +75,9 @@ mod tests {
         validate_session_status_baseline_against_local_counters, PaymentTopupPlan,
     };
     use super::state::{
-        pre_ready_blocked_error, relay_confirms_intended_channel, DriverState,
-        FundingBlockedReason, RelaySnapshot,
+        apply_session_status, pre_ready_blocked_error, relay_confirms_intended_channel,
+        set_keyset_refresh_in_flight, ControlOpInFlight, DriverState, FundingBlockedReason,
+        KeysetRefreshHint, RelaySnapshot,
     };
     use super::PaymentPolicy;
     use crate::wallet::WalletError;
@@ -83,7 +85,9 @@ mod tests {
     use monad_common::proxy::CleartextByteCounters;
     use monad_common::session::SessionPricing;
     use std::io;
+    use std::time::Duration;
     use tokio::sync::oneshot;
+    use tokio::time::Instant;
 
     fn snapshot(paused: bool) -> RelaySnapshot {
         RelaySnapshot {
@@ -586,9 +590,103 @@ mod tests {
         assert!(exclude_on_wallet_error(&WalletError::OfferMismatch(
             "nope".to_string()
         )));
+        assert!(exclude_on_wallet_error(&WalletError::StaleRelayKeysets {
+            mint_url: "https://mint".to_string(),
+            unit: "msat".to_string(),
+            accepted_keyset_ids: vec!["keyset-a".to_string()],
+        }));
         assert!(!exclude_on_wallet_error(&WalletError::Backend(
             "boom".to_string()
         )));
+    }
+
+    #[test]
+    fn session_status_clears_keyset_refresh_in_flight() {
+        let hint = KeysetRefreshHint {
+            mint_url: "https://mint".to_string(),
+            unit: "msat".to_string(),
+            accepted_keyset_ids: vec!["keyset-a".to_string()],
+        };
+        let mut state = DriverState::default();
+        set_keyset_refresh_in_flight(&mut state, hint.clone());
+
+        let resolved_payment = apply_session_status(&mut state, snapshot(true));
+
+        assert!(!resolved_payment);
+        assert!(state.control_op_in_flight.is_none());
+        assert_eq!(state.last_keyset_refresh_hint, Some(hint));
+        assert!(state.last_keyset_refresh_hint_at.is_some());
+    }
+
+    #[test]
+    fn changed_advertisement_clears_last_keyset_refresh_hint() {
+        let hint = KeysetRefreshHint {
+            mint_url: "https://mint".to_string(),
+            unit: "msat".to_string(),
+            accepted_keyset_ids: vec!["keyset-a".to_string()],
+        };
+        let mut state = DriverState {
+            control_op_in_flight: Some(ControlOpInFlight::RefreshKeysets(hint.clone())),
+            last_keyset_refresh_hint: Some(hint),
+            ..DriverState::default()
+        };
+        let mut updated = snapshot(true);
+        updated.advertisements[0]
+            .keyset_ids
+            .push("keyset-b".to_string());
+
+        let resolved_payment = apply_session_status(&mut state, updated);
+
+        assert!(!resolved_payment);
+        assert!(state.control_op_in_flight.is_none());
+        assert!(state.last_keyset_refresh_hint.is_none());
+        assert!(state.last_keyset_refresh_hint_at.is_none());
+    }
+
+    #[test]
+    fn duplicate_keyset_refresh_hint_is_suppressed_within_cooldown() {
+        let hint = KeysetRefreshHint {
+            mint_url: "https://mint".to_string(),
+            unit: "sat".to_string(),
+            accepted_keyset_ids: vec!["keyset-a".to_string()],
+        };
+        let mut state = DriverState::default();
+        set_keyset_refresh_in_flight(&mut state, hint.clone());
+
+        assert!(keyset_refresh_hint_is_suppressed(&state, &hint));
+    }
+
+    #[test]
+    fn same_keyset_refresh_hint_can_retry_after_cooldown() {
+        let hint = KeysetRefreshHint {
+            mint_url: "https://mint".to_string(),
+            unit: "sat".to_string(),
+            accepted_keyset_ids: vec!["keyset-a".to_string()],
+        };
+        let mut state = DriverState::default();
+        set_keyset_refresh_in_flight(&mut state, hint.clone());
+        state.last_keyset_refresh_hint_at =
+            Some(Instant::now() - KEYSET_REFRESH_HINT_RETRY_COOLDOWN - Duration::from_secs(1));
+
+        assert!(!keyset_refresh_hint_is_suppressed(&state, &hint));
+    }
+
+    #[test]
+    fn changed_keyset_refresh_hint_is_not_suppressed() {
+        let previous = KeysetRefreshHint {
+            mint_url: "https://mint".to_string(),
+            unit: "sat".to_string(),
+            accepted_keyset_ids: vec!["keyset-a".to_string()],
+        };
+        let changed = KeysetRefreshHint {
+            mint_url: "https://mint".to_string(),
+            unit: "sat".to_string(),
+            accepted_keyset_ids: vec!["keyset-b".to_string()],
+        };
+        let mut state = DriverState::default();
+        set_keyset_refresh_in_flight(&mut state, previous);
+
+        assert!(!keyset_refresh_hint_is_suppressed(&state, &changed));
     }
 
     #[test]

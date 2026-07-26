@@ -67,11 +67,21 @@ impl WalletChannel {
 pub enum WalletError {
     NotFound,
     NotOpen,
-    AttachedToDifferentSession { current: [u8; 32] },
-    InsufficientCapacity { requested: u64, capacity: u64 },
+    AttachedToDifferentSession {
+        current: [u8; 32],
+    },
+    InsufficientCapacity {
+        requested: u64,
+        capacity: u64,
+    },
     NoNewFunds,
     ChannelUnusable,
     OfferMismatch(String),
+    StaleRelayKeysets {
+        mint_url: String,
+        unit: String,
+        accepted_keyset_ids: Vec<String>,
+    },
     Backend(String),
 }
 
@@ -93,6 +103,14 @@ impl fmt::Display for WalletError {
             Self::NoNewFunds => write!(f, "no new funds"),
             Self::ChannelUnusable => write!(f, "channel unusable"),
             Self::OfferMismatch(message) => write!(f, "offer mismatch: {message}"),
+            Self::StaleRelayKeysets {
+                mint_url,
+                unit,
+                accepted_keyset_ids,
+            } => write!(
+                f,
+                "stale relay keysets for mint={mint_url} unit={unit} accepted_keysets={accepted_keyset_ids:?}"
+            ),
             Self::Backend(message) => write!(f, "backend error: {message}"),
         }
     }

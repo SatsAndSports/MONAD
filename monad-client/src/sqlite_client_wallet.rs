@@ -132,6 +132,12 @@ struct ClientOpenAttempt {
     expiry_timestamp: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutputKeysetSelection<T> {
+    Selected(T),
+    NoActiveAcceptedKeyset,
+}
+
 #[derive(Debug, Clone)]
 struct ChannelRecoveryRow {
     status: ChannelRecoveryStatus,
@@ -439,18 +445,16 @@ impl SqliteClientWallet {
         // capacity we want, selects loose proofs that can fund it after input
         // fees, and then asks the mint to swap those proofs into channel funding
         // outputs.  The output keyset info comes from the client's local mint
-        // keyset cache.  We ensure the cache has at least one keyset for this
-        // mint/unit before the retry helper runs; inside the helper selection is
-        // cache-only.  If that cached active keyset is stale, a mint can reject
-        // the first swap with a keyset error even though the selected inputs are
-        // otherwise valid.  The helper centralizes the safe retry policy:
-        // build/submit once, refresh cached keysets on a safe keyset rejection,
-        // reselect the active output keyset, skip retry if refresh still selects
-        // the same id, otherwise reprepare and submit one changed-keyset retry.
+        // keyset cache.  Selection first tries the cached active keysets that
+        // intersect with the relay offer, then refreshes the client cache before
+        // deciding the relay offer is stale.  If a selected cached keyset becomes
+        // stale before swap submission, the retry helper centralizes the safe
+        // mint-rejection policy: refresh keysets, reselect, skip retry if refresh
+        // still selects the same id, otherwise reprepare and submit once.
         let result = with_active_keyset_retry(
-            // Select an active relay-accepted output keyset from the client
-            // cache.
-            || self.select_output_keyset_from_cache(offer),
+            // Select an active relay-accepted output keyset, refreshing the
+            // client cache before reporting a stale relay offer.
+            || self.select_output_keyset_refreshing_client_first(offer),
             // Prepare reserves a fresh set of loose proofs sized for the target
             // capacity and the selected output keyset's fee/amount structure.
             |output_keyset| {
@@ -494,6 +498,14 @@ impl SqliteClientWallet {
             Err(KeysetRetryError::RetryKeysetUnchanged { attempt, error, .. }) => Err(
                 open_channel_error(error, &offer.unit, attempt.selected_input_msats),
             ),
+            Err(KeysetRetryError::Select {
+                error: WalletError::StaleRelayKeysets { .. },
+                ..
+            }) => Err(WalletError::StaleRelayKeysets {
+                mint_url: offer.mint_url.clone(),
+                unit: offer.unit.clone(),
+                accepted_keyset_ids: offer.accepted_keyset_ids.clone(),
+            }),
             Err(error) => Err(WalletError::Backend(format!(
                 "prepare channel open retry: {}",
                 describe_keyset_retry_prepare_error(error)
@@ -1095,20 +1107,45 @@ impl SqliteClientWallet {
         Ok(())
     }
 
-    fn select_output_keyset_from_cache(
+    fn select_output_keyset_refreshing_client_first(
         &self,
         offer: &RelayPaymentOffer,
     ) -> Result<SelectedOutputKeyset, WalletError> {
+        match self.select_output_keyset_from_cache(offer)? {
+            OutputKeysetSelection::Selected(output_keyset) => return Ok(output_keyset),
+            OutputKeysetSelection::NoActiveAcceptedKeyset => {}
+        }
+
+        self.refresh_client_keysets(offer)?;
+        match self.select_output_keyset_from_cache(offer)? {
+            OutputKeysetSelection::Selected(output_keyset) => Ok(output_keyset),
+            OutputKeysetSelection::NoActiveAcceptedKeyset => Err(WalletError::StaleRelayKeysets {
+                mint_url: offer.mint_url.clone(),
+                unit: offer.unit.clone(),
+                accepted_keyset_ids: offer.accepted_keyset_ids.clone(),
+            }),
+        }
+    }
+
+    fn select_output_keyset_from_cache(
+        &self,
+        offer: &RelayPaymentOffer,
+    ) -> Result<OutputKeysetSelection<SelectedOutputKeyset>, WalletError> {
         let bridge = self
             .bridge
             .lock()
             .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
-        let output_keyset_id = active_output_keyset_id_from_cache(&bridge, offer)?;
+        let output_keyset_id = match active_output_keyset_id_from_cache(&bridge, offer)? {
+            OutputKeysetSelection::Selected(output_keyset_id) => output_keyset_id,
+            OutputKeysetSelection::NoActiveAcceptedKeyset => {
+                return Ok(OutputKeysetSelection::NoActiveAcceptedKeyset);
+            }
+        };
         let info_json = cached_keyset_info_json(&bridge, &offer.mint_url, &output_keyset_id)?;
-        Ok(SelectedOutputKeyset {
+        Ok(OutputKeysetSelection::Selected(SelectedOutputKeyset {
             id: output_keyset_id,
             info_json,
-        })
+        }))
     }
 
     fn prepare_target_capacity_attempt(
@@ -1340,12 +1377,14 @@ impl MonadWallet for SqliteClientWallet {
         // let upstream compute the resulting channel capacity.  If the mint
         // rejects the first open because our cached output keyset is stale, the
         // input reservation can be reused: only the output keyset selection and
-        // swap construction need to change.  The helper handles the stale-cache
-        // workflow and skips retry when refresh still selects the same keyset.
+        // swap construction need to change. Selection refreshes the client cache
+        // before reporting a stale relay offer; the retry helper handles the
+        // mint-rejection refresh path and skips retry when refresh still selects
+        // the same keyset.
         let result = with_active_keyset_retry(
-            // Select active relay-accepted output keyset from cache, warming the
-            // cache before entering the helper if needed.
-            || self.select_output_keyset_from_cache(offer),
+            // Select an active relay-accepted output keyset, refreshing the
+            // client cache before reporting a stale relay offer.
+            || self.select_output_keyset_refreshing_client_first(offer),
             // Prepare lazily creates the proof reservation on the first attempt;
             // on retry, it reuses the same reserved proofs with the refreshed
             // output keyset.
@@ -1404,6 +1443,14 @@ impl MonadWallet for SqliteClientWallet {
                     offer,
                     attempt.selected_input_msats,
                 ),
+            Err(KeysetRetryError::Select {
+                error: WalletError::StaleRelayKeysets { .. },
+                ..
+            }) => Err(WalletError::StaleRelayKeysets {
+                mint_url: offer.mint_url.clone(),
+                unit: offer.unit.clone(),
+                accepted_keyset_ids: offer.accepted_keyset_ids.clone(),
+            }),
             Err(error) => Err(WalletError::Backend(format!(
                 "prepare channel open retry: {}",
                 describe_keyset_retry_prepare_error(error)
@@ -1676,7 +1723,7 @@ fn loose_proof_error(error: LooseProofWalletError) -> WalletError {
 fn active_output_keyset_id_from_cache<H, N>(
     bridge: &SpilmanClientBridge<H, N>,
     offer: &RelayPaymentOffer,
-) -> Result<String, WalletError>
+) -> Result<OutputKeysetSelection<String>, WalletError>
 where
     H: SpilmanClientHost,
     N: SpilmanClientNetworking,
@@ -1686,13 +1733,11 @@ where
 
     for accepted_id in &offer.accepted_keyset_ids {
         if active_ids.iter().any(|id| id.to_string() == *accepted_id) {
-            return Ok(accepted_id.clone());
+            return Ok(OutputKeysetSelection::Selected(accepted_id.clone()));
         }
     }
 
-    Err(WalletError::OfferMismatch(
-        "offer has no active accepted keyset".to_string(),
-    ))
+    Ok(OutputKeysetSelection::NoActiveAcceptedKeyset)
 }
 
 fn cached_keyset_info_json<H, N>(
@@ -3560,6 +3605,118 @@ mod tests {
         mint_task.await.unwrap().unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_keyset_selection_refreshes_stale_client_when_relay_offer_is_fresh() {
+        let mint_helper = TestMintHelper::new().await.unwrap();
+        let mint = mint_helper.mint();
+        let first_keyset_id = mint_helper.keyset_id().to_string();
+
+        let port = free_loopback_port();
+        let mint_url = format!("http://127.0.0.1:{port}");
+        let config = TestMintConfig::for_port(port);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let mint_for_server = mint.clone();
+        let mint_task = tokio::spawn(async move {
+            serve_existing_mint_with_shutdown(mint_for_server, config, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        let client = reqwest::Client::new();
+        wait_for_mint(&client, &mint_url).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let loose_wallet =
+            LooseProofWallet::open(temp.path().join("loose.sqlite"), "alice").unwrap();
+        let wallet = SqliteClientWallet::open(
+            loose_wallet,
+            temp.path().join("channels.sqlite"),
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        let receiver_pubkey = "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2";
+
+        let first_offer = offer(&mint_url, receiver_pubkey, &first_keyset_id);
+        let selected = wallet
+            .select_output_keyset_refreshing_client_first(&first_offer)
+            .unwrap();
+        assert_eq!(selected.id, first_keyset_id);
+
+        let second_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
+        // The relay offer is already fresh, but this wallet has only cached the
+        // old keyset. Selection must refresh the client cache and pick the
+        // relay-advertised active keyset instead of reporting a stale relay.
+        let second_offer = offer(&mint_url, receiver_pubkey, &second_keyset_id);
+        let selected = wallet
+            .select_output_keyset_refreshing_client_first(&second_offer)
+            .unwrap();
+        assert_eq!(selected.id, second_keyset_id);
+
+        let _ = shutdown_tx.send(());
+        mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_keyset_selection_reports_stale_relay_only_after_client_refresh() {
+        let mint_helper = TestMintHelper::new().await.unwrap();
+        let mint = mint_helper.mint();
+        let first_keyset_id = mint_helper.keyset_id().to_string();
+        let unknown_keyset_id =
+            "010000000000000000000000000000000000000000000000000000000000000000".to_string();
+        assert_ne!(first_keyset_id, unknown_keyset_id);
+
+        let port = free_loopback_port();
+        let mint_url = format!("http://127.0.0.1:{port}");
+        let config = TestMintConfig::for_port(port);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let mint_for_server = mint.clone();
+        let mint_task = tokio::spawn(async move {
+            serve_existing_mint_with_shutdown(mint_for_server, config, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        let client = reqwest::Client::new();
+        wait_for_mint(&client, &mint_url).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let loose_wallet =
+            LooseProofWallet::open(temp.path().join("loose.sqlite"), "alice").unwrap();
+        let wallet = SqliteClientWallet::open(
+            loose_wallet,
+            temp.path().join("channels.sqlite"),
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        let receiver_pubkey = "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2";
+
+        let first_offer = offer(&mint_url, receiver_pubkey, &unknown_keyset_id);
+        let error = wallet
+            .select_output_keyset_refreshing_client_first(&first_offer)
+            .unwrap_err();
+        let cached_keysets = wallet
+            .bridge
+            .lock()
+            .unwrap()
+            .cached_keysets_for_unit(&mint_url, &CurrencyUnit::Sat);
+        assert!(cached_keysets
+            .iter()
+            .any(|(keyset_id, _entry)| keyset_id.to_string() == first_keyset_id));
+        assert!(matches!(
+            error,
+            WalletError::StaleRelayKeysets {
+                mint_url: error_mint_url,
+                unit,
+                accepted_keyset_ids,
+            } if error_mint_url == mint_url
+                && unit == "sat"
+                && accepted_keyset_ids == vec![unknown_keyset_id]
+        ));
+
+        let _ = shutdown_tx.send(());
+        mint_task.await.unwrap().unwrap();
+    }
+
     #[test]
     fn active_output_keyset_selection_skips_inactive_accepted_keysets() {
         let old =
@@ -3580,7 +3737,7 @@ mod tests {
         ]);
 
         let selected = active_output_keyset_id_from_cache(&bridge, &offer).unwrap();
-        assert_eq!(selected, new.to_string());
+        assert_eq!(selected, OutputKeysetSelection::Selected(new.to_string()));
     }
 
     #[test]
@@ -3602,8 +3759,8 @@ mod tests {
             (other_unit, CurrencyUnit::Msat, true),
         ]);
 
-        let error = active_output_keyset_id_from_cache(&bridge, &offer).unwrap_err();
-        assert!(matches!(error, WalletError::OfferMismatch(_)));
+        let selected = active_output_keyset_id_from_cache(&bridge, &offer).unwrap();
+        assert_eq!(selected, OutputKeysetSelection::NoActiveAcceptedKeyset);
     }
 
     #[test]

@@ -234,6 +234,12 @@ The `Makefile` also includes named manual stress recipes for:
 
 The throughput/payment stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. The chaos rebuild recipes run at a smaller scale and need no special `ulimit`. `MONAD_CHAOS_KILL_MODE=graceful|abrupt|mixed` selects whether chaos restarts use clean shutdown, task-tree cancellation, or alternating modes. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
 
+Ignored but important regression tests can be run explicitly when changing route rebuild or keyset-refresh behavior:
+
+```bash
+cargo test -p monad-relay test_configured_client_three_hop_middle_hop_keyset_rotation_triggers_relay_refresh_for_stale_offer --test integration -- --ignored
+```
+
 Current coverage includes:
 - Noise handshake and large-payload transport tests
 - Noise session ID (handshake hash) matches on both sides
@@ -278,7 +284,7 @@ Current coverage includes:
 
 Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy only when advertising options or accepting incoming channel funding/payments.
 
-Clients can send `RefreshKeysets { mint_url, unit }` on the control stream when they suspect a relay's advertised keysets are stale, such as after mint keyset rotation. The relay treats this as a bounded hint: it only refreshes configured trusted mint/unit pairs, applies per-mint cooldown and singleflight protection, limits global refresh concurrency, times out slow mint calls, and responds with a fresh `SessionStatus` on success or cooldown skip. Policy rejection or refresh failure returns `Error` and preserves the existing cache.
+Clients can send `RefreshKeysets { mint_url, unit }` on the control stream when they suspect a relay's advertised keysets are stale, such as after mint keyset rotation. Configured clients do this automatically when their refreshed local mint cache has no active output keyset accepted by the relay's current advertisement. The relay treats this as a bounded hint: it only refreshes configured trusted mint/unit pairs, applies per-mint cooldown and singleflight protection, limits global refresh concurrency, times out slow mint calls, and responds with a fresh `SessionStatus` on success or cooldown skip. Policy rejection or refresh failure returns `Error` and preserves the existing cache.
 
 Existing old-keyset channels keep working as long as the relay still knows the keyset and the mint/unit remains trusted. New channel opening should move to the currently active keyset once the client and relay have refreshed. Channel close and relay drain swaps also start from the shared cache; if the mint rejects a swap with a keyset error, the retry path refreshes that mint into SQLite and the shared cache before re-preparing the swap.
 

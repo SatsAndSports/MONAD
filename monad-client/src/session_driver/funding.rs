@@ -3,9 +3,12 @@ use monad_common::control_codec::send_json_line;
 use monad_common::protocol::{ClientMessage, ServerErrorCode};
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::Duration;
 use tracing::{info, warn};
 
 use crate::wallet::{select_channel, RelayPaymentOffer, WalletChannel, WalletError};
+
+pub(super) const KEYSET_REFRESH_HINT_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 
 use super::payment::{
     compute_estimated_remaining, exclude_on_wallet_error, plan_payment_topup, raw_amount_to_msats,
@@ -14,8 +17,9 @@ use super::payment::{
 use super::state::{
     abandon_intended_channel, clear_control_op, exclude_channel, publish_spilman_info,
     relay_confirms_intended_channel, relay_linked_channel_id, session_is_paused,
-    set_blocked_reason, set_link_in_flight, set_payment_in_flight, state_summary,
-    terminate_session, ControlOpInFlight, DriverState, FundingBlockedReason, SessionDriverConfig,
+    set_blocked_reason, set_keyset_refresh_in_flight, set_link_in_flight, set_payment_in_flight,
+    state_summary, terminate_session, ControlOpInFlight, DriverState, FundingBlockedReason,
+    KeysetRefreshHint, SessionDriverConfig,
 };
 
 pub(super) async fn send_control_message(
@@ -128,6 +132,56 @@ async fn try_link_channel(
     }
 }
 
+async fn maybe_request_keyset_refresh(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    h2_send: &mut h2::SendStream<Bytes>,
+    offer: &RelayPaymentOffer,
+    error: &WalletError,
+) -> io::Result<bool> {
+    let WalletError::StaleRelayKeysets {
+        mint_url,
+        unit,
+        accepted_keyset_ids,
+    } = error
+    else {
+        return Ok(false);
+    };
+    let hint = KeysetRefreshHint::from_offer(offer);
+    if keyset_refresh_hint_is_suppressed(state, &hint) {
+        return Ok(true);
+    }
+
+    info!(
+        "{} requesting relay keyset refresh for mint={} unit={} accepted_keysets={:?} | {}",
+        config.hop_label,
+        mint_url,
+        unit,
+        accepted_keyset_ids,
+        state_summary(state, &config.conn.cleartext_byte_counters)
+    );
+    send_control_message(
+        h2_send,
+        &ClientMessage::RefreshKeysets {
+            mint_url: mint_url.clone(),
+            unit: unit.clone(),
+        },
+    )
+    .await?;
+    set_keyset_refresh_in_flight(state, hint);
+    Ok(true)
+}
+
+pub(super) fn keyset_refresh_hint_is_suppressed(
+    state: &DriverState,
+    hint: &KeysetRefreshHint,
+) -> bool {
+    state.last_keyset_refresh_hint.as_ref() == Some(hint)
+        && state
+            .last_keyset_refresh_hint_at
+            .is_some_and(|at| at.elapsed() < KEYSET_REFRESH_HINT_RETRY_COOLDOWN)
+}
+
 pub(super) async fn maybe_ensure_linked_channel(
     config: &SessionDriverConfig,
     state: &mut DriverState,
@@ -136,13 +190,7 @@ pub(super) async fn maybe_ensure_linked_channel(
     if state.terminated || state.funding_blocked_reason.is_some() || !session_is_paused(state) {
         return Ok(());
     }
-    if matches!(
-        state.control_op_in_flight,
-        Some(ControlOpInFlight::Link { .. })
-    ) || matches!(
-        state.control_op_in_flight,
-        Some(ControlOpInFlight::Payment { .. })
-    ) {
+    if state.control_op_in_flight.is_some() {
         return Ok(());
     }
     if relay_confirms_intended_channel(state) {
@@ -237,12 +285,21 @@ pub(super) async fn maybe_ensure_linked_channel(
                     snapshot.receiver_pubkey.clone(),
                     advertisement,
                 );
+                let keyset_refresh_hint = KeysetRefreshHint::from_offer(&offer);
+                if keyset_refresh_hint_is_suppressed(state, &keyset_refresh_hint) {
+                    return Ok(());
+                }
                 let channel_id = match config
                     .wallet
                     .provision_channel(&offer, config.payment_policy.channel_input_budget_msats)
                 {
                     Ok(channel_id) => channel_id,
                     Err(error) => {
+                        if maybe_request_keyset_refresh(config, state, h2_send, &offer, &error)
+                            .await?
+                        {
+                            return Ok(());
+                        }
                         if matches!(error, WalletError::Backend(_)) {
                             set_blocked_reason(
                                 config,
