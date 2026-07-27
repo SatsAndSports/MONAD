@@ -345,10 +345,41 @@ impl RelayPayments for SpilmanRelayPayments {
             return Err(LinkError::NonZeroLinkBalance);
         }
 
-        let result = self
-            .bridge
-            .fund_channel_via_json(payment_json)
-            .map_err(map_link_bridge_error)?;
+        let capacity_raw = if self
+            .store
+            .get_channel(&payment.channel_id)
+            .map_err(LinkError::Internal)?
+            .is_some()
+        {
+            self.bridge
+                .fund_channel(
+                    &payment.channel_id,
+                    payment.balance,
+                    &payment.signature,
+                    payment.params.as_ref(),
+                    payment.funding_proofs.as_deref(),
+                )
+                .map_err(map_link_bridge_error)?
+                .capacity
+        } else {
+            let validated =
+                self.bridge
+                    .validate_new_channel_funding(
+                        &payment.channel_id,
+                        payment.params.as_ref().ok_or_else(|| {
+                            LinkError::InvalidPayment("missing params".to_string())
+                        })?,
+                        payment.funding_proofs.as_deref().ok_or_else(|| {
+                            LinkError::InvalidPayment("missing funding_proofs".to_string())
+                        })?,
+                        payment.balance,
+                        &payment.signature,
+                    )
+                    .map_err(map_link_bridge_error)?;
+            let capacity = validated.capacity;
+            self.bridge.record_validated_new_channel(&validated);
+            capacity
+        };
 
         let evicted_session = self
             .store
@@ -365,7 +396,7 @@ impl RelayPayments for SpilmanRelayPayments {
 
         Ok(LinkOutcome {
             channel_id: payment.channel_id,
-            capacity_millisats: channel.unit.capacity_millisats(result.capacity)?,
+            capacity_millisats: channel.unit.capacity_millisats(capacity_raw)?,
             evicted_session,
         })
     }
@@ -401,16 +432,27 @@ impl RelayPayments for SpilmanRelayPayments {
 
         let validation = self
             .bridge
-            .validate_payment_via_json(payment_json, &PaymentContext::Payment)
+            .validate_payment(
+                &payment.channel_id,
+                payment.balance,
+                &payment.signature,
+                &PaymentContext::Payment,
+            )
             .map_err(map_payment_bridge_error)?;
 
         if validation.balance <= previous_balance {
             return Err(ChannelPaymentError::NoNewFunds);
         }
 
-        self.bridge
-            .process_payment_via_json(payment_json, &PaymentContext::Payment)
-            .map_err(map_payment_bridge_error)?;
+        self.store
+            .record_payment(
+                &payment.channel_id,
+                PaymentProof {
+                    balance: validation.balance,
+                    signature: validation.sender_signature.clone(),
+                },
+            )
+            .map_err(ChannelPaymentError::Internal)?;
 
         let delta_raw = validation.balance - previous_balance;
         Ok(PaymentOutcome {
