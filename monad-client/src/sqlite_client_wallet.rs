@@ -523,15 +523,10 @@ impl SqliteClientWallet {
     pub fn recover_pending_openings(&self) -> Result<Vec<String>, WalletError> {
         let recoveries = self.list_opening_recoveries()?;
         let mut recovered = Vec::new();
+        let networking = ReqwestClientNetworking::new();
 
         for recovery in recoveries {
-            let result = {
-                let bridge = self
-                    .bridge
-                    .lock()
-                    .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
-                bridge.recover_open_channel_from_swap(&recovery.channel_id)
-            };
+            let result = self.recover_pending_opening(&recovery.channel_id, &networking);
 
             match result {
                 Ok(open_result) => {
@@ -580,6 +575,66 @@ impl SqliteClientWallet {
         }
 
         Ok(recovered)
+    }
+
+    fn recover_pending_opening(
+        &self,
+        channel_id: &str,
+        networking: &ReqwestClientNetworking,
+    ) -> Result<OpenChannelResult, OpenChannelError> {
+        let prepared = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    Some(channel_id.to_string()),
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            bridge.prepare_open_channel_recovery(channel_id)?
+        };
+
+        let funding_restore_response = networking
+            .call_mint_restore(&prepared.mint_url, &prepared.funding_restore_request_json)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::RestoreVerification,
+                    Some(prepared.channel_id.clone()),
+                    e,
+                )
+            })?;
+        let change_restore_response = match prepared.change_restore_request_json.as_ref() {
+            Some(request) => Some(
+                networking
+                    .call_mint_restore(&prepared.mint_url, request)
+                    .map_err(|e| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::RestoreVerification,
+                            Some(prepared.channel_id.clone()),
+                            e,
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+
+        let completed = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::RestoreVerification,
+                    Some(prepared.channel_id.clone()),
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            let completed = bridge.complete_prepared_open_recovery(
+                &prepared,
+                &funding_restore_response,
+                change_restore_response.as_deref(),
+            )?;
+            bridge.mark_completed_open_recovery(&completed)?;
+            completed
+        };
+
+        Ok(completed.result)
     }
 
     fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, WalletError> {
