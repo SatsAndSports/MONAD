@@ -511,12 +511,10 @@ impl RelayPayments for SpilmanRelayPayments {
             .is_some()
         {
             self.bridge
-                .fund_channel(
+                .validate_existing_channel_funding(
                     &payment.channel_id,
                     payment.balance,
                     &payment.signature,
-                    payment.params.as_ref(),
-                    payment.funding_proofs.as_deref(),
                 )
                 .map_err(map_link_bridge_error)?
                 .capacity

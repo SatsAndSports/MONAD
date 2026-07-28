@@ -1632,13 +1632,17 @@ impl MonadWallet for SqliteClientWallet {
                 .bridge
                 .lock()
                 .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            let payment = bridge
+                .sign_payment(channel_id, next_balance_raw)
+                .map_err(|e| map_create_payment_error(&channel, e, next_balance_raw))?;
+            let payment_json = serde_json::to_string(&payment)
+                .map_err(|e| WalletError::Backend(format!("serialize channel payment: {e}")))?;
             bridge
-                .sign_and_record_payment(channel_id, next_balance_raw)
-                .map_err(|e| map_create_payment_error(&channel, e, next_balance_raw))
+                .record_signed_payment(&payment)
+                .map_err(|e| WalletError::Backend(format!("record signed payment: {e}")))?;
+            Ok(payment_json)
         };
-        let payment = payment?;
-        serde_json::to_string(&payment)
-            .map_err(|e| WalletError::Backend(format!("serialize channel payment: {e}")))
+        payment
     }
 }
 

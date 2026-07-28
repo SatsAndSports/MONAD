@@ -431,14 +431,18 @@ impl MonadWallet for TestSigningWallet {
             .lock()
             .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
         let payment = bridge
-            .sign_and_record_payment(channel_id, next_balance_raw)
+            .sign_payment(channel_id, next_balance_raw)
             .map_err(|e| WalletError::Backend(format!("failed to create payment: {e}")))?;
+        let payment_json = serde_json::to_string(&payment)
+            .map_err(|e| WalletError::Backend(format!("failed to serialize payment: {e}")))?;
+        bridge
+            .record_signed_payment(&payment)
+            .map_err(|e| WalletError::Backend(format!("failed to record payment: {e}")))?;
 
         metadata.current_signed_balance_raw = next_balance_raw;
         metadata.current_signed_balance_msats =
             Self::raw_to_msats(&metadata.unit, next_balance_raw)?;
 
-        serde_json::to_string(&payment)
-            .map_err(|e| WalletError::Backend(format!("failed to serialize payment: {e}")))
+        Ok(payment_json)
     }
 }
