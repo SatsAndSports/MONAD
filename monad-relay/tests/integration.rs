@@ -760,23 +760,16 @@ async fn start_relay_from_config(
     .map(|(handle, shutdown_tx, payments)| (addr, pubkey, handle, shutdown_tx, payments))
 }
 
-/// Poll the SOCKS5 listener until it accepts the no-auth handshake method.
-/// This is useful for configured-client tests where the route may need a
-/// moment to come up after start or after a rebuild.
-async fn wait_for_configured_socks_ready(socks_listen: SocketAddr) -> bool {
-    for _ in 0..50 {
-        match tokio::time::timeout(Duration::from_millis(200), async {
-            let mut s = TcpStream::connect(socks_listen).await.ok()?;
-            s.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
-            let mut reply = [0u8; 2];
-            s.read_exact(&mut reply).await.ok()?;
-            Some(reply == [0x05, 0x00])
-        })
-        .await
-        {
-            Ok(Some(true)) => return true,
-            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+async fn wait_for_configured_route_connected(
+    route_stats: &SharedRouteRuntimeStats,
+    baseline: u64,
+) -> bool {
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
+        if route_stats.snapshot().route_connected_total > baseline {
+            return true;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
 }
@@ -816,6 +809,12 @@ async fn configured_client_socks_roundtrip(
     let mut socks_reply = [0u8; 10];
     stream.read_exact(&mut socks_reply).await?;
     if socks_reply != [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0] {
+        if socks_reply[0] == 0x05 && socks_reply[1] == 0x05 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "SOCKS route is not ready",
+            ));
+        }
         return Err(io::Error::other(format!(
             "unexpected SOCKS reply: {socks_reply:?}"
         )));
@@ -6592,6 +6591,12 @@ clients:
         let mut socks_reply = [0u8; 10];
         stream.read_exact(&mut socks_reply).await?;
         if socks_reply != [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0] {
+            if socks_reply[0] == 0x05 && socks_reply[1] == 0x05 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "SOCKS route is not ready",
+                ));
+            }
             return Err(io::Error::other(format!(
                 "unexpected SOCKS reply: {socks_reply:?}"
             )));
@@ -6770,7 +6775,8 @@ async fn wait_for_configured_roundtrip(
 ) -> Vec<u8> {
     let expected = payload.to_ascii_uppercase();
     let mut last_error = None;
-    for _ in 0..80 {
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
         match tokio::time::timeout(
             Duration::from_secs(2),
             configured_client_socks_roundtrip(socks_listen, upper_addr, payload),
@@ -7115,6 +7121,7 @@ relays:
     }
 
     let route_stats = SharedRouteRuntimeStats::default();
+    let route_connected_baseline = route_stats.snapshot().route_connected_total;
     let (client_shutdown_tx, client_shutdown_rx) = tokio::sync::oneshot::channel();
     let client_task = tokio::spawn(run_configured_client_until_shutdown_with_stats(
         config.clone(),
@@ -7126,7 +7133,7 @@ relays:
     ));
 
     assert!(
-        wait_for_configured_socks_ready(socks_listen).await,
+        wait_for_configured_route_connected(&route_stats, route_connected_baseline).await,
         "{}: client route never became ready",
         case.label
     );
@@ -7486,6 +7493,7 @@ relays:
         }
 
         let route_stats = SharedRouteRuntimeStats::default();
+        let route_connected_baseline = route_stats.snapshot().route_connected_total;
         let (client_shutdown_tx, client_shutdown_rx) = tokio::sync::oneshot::channel();
         let client_task = tokio::spawn(run_configured_client_until_shutdown_with_stats(
             config.clone(),
@@ -7497,7 +7505,7 @@ relays:
         ));
 
         assert!(
-            wait_for_configured_socks_ready(socks_listen).await,
+            wait_for_configured_route_connected(&route_stats, route_connected_baseline).await,
             "{}: client route never became ready",
             fixture_config.label
         );

@@ -21,6 +21,7 @@ const MAX_STARTUP_CONNECT_ATTEMPTS: u32 = 5;
 const INITIAL_RECONNECT_BACKOFF_MS: u64 = 250;
 const MAX_RECONNECT_BACKOFF_MS: u64 = 5_000;
 const ROUTE_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const SOCKS_ROUTE_WAIT_TIMEOUT_MS: u64 = 10_000;
 pub const CONFIGURED_CLIENT_WALLET_NAME: &str = "default";
 
 #[derive(Debug, Default)]
@@ -34,6 +35,7 @@ struct ChannelDetachStats {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RouteRuntimeStatsSnapshot {
     pub route_connect_attempts_total: u64,
+    pub route_connected_total: u64,
     pub route_failures_total: u64,
     pub failure_watchers_unavailable_total: u64,
     pub full_reconnects_total: u64,
@@ -58,6 +60,10 @@ impl SharedRouteRuntimeStats {
 
     fn record_route_connect_attempt(&self) -> RouteRuntimeStatsSnapshot {
         self.update(|stats| stats.route_connect_attempts_total += 1)
+    }
+
+    fn record_route_connected(&self) -> RouteRuntimeStatsSnapshot {
+        self.update(|stats| stats.route_connected_total += 1)
     }
 
     fn record_failure_watcher_unavailable(&self) -> RouteRuntimeStatsSnapshot {
@@ -292,9 +298,11 @@ where
                         active_route.hops().iter().filter(|hop| hop.funded).count();
                     let conn = active_route.final_connection_arc();
                     let _ = conn_tx.send(Some(conn.clone()));
+                    let snapshot = stats.record_route_connected();
                     info!(
                         hops = hop_count,
                         funded_hops = funded_hop_count,
+                        route_connected_total = snapshot.route_connected_total,
                         "route connected; SOCKS active"
                     );
 
@@ -511,7 +519,7 @@ fn detach_channels_for_sessions(
 
 pub async fn run_socks_listener(
     listener: TcpListener,
-    mut conn_rx: watch::Receiver<Option<Arc<RelayConnection>>>,
+    conn_rx: watch::Receiver<Option<Arc<RelayConnection>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -520,24 +528,21 @@ pub async fn run_socks_listener(
         tokio::select! {
             accept_result = listener.accept() => {
                 let (mut stream, peer_addr) = accept_result?;
-
-                // If there is no active route (reconnecting), fail the SOCKS request
-                // immediately so the application can retry.
-                let conn = match conn_rx.borrow_and_update().clone() {
-                    Some(conn) => conn,
-                    None => {
-                        tokio::spawn(async move {
-                            let _ = socks::reject_socks5_connect_unavailable(&mut stream).await;
-                            warn!(
-                                "SOCKS client {peer_addr} rejected: route is reconnecting"
-                            );
-                        });
-                        continue;
-                    }
-                };
+                let conn_rx = conn_rx.clone();
+                let shutdown_rx = shutdown_rx.clone();
 
                 tokio::spawn(async move {
                     let result = async {
+                        let conn = match wait_for_active_route(conn_rx, shutdown_rx).await {
+                            Some(conn) => conn,
+                            None => {
+                                socks::reject_socks5_connect_unavailable(&mut stream).await?;
+                                warn!(
+                                    "SOCKS client {peer_addr} rejected: route is reconnecting"
+                                );
+                                return Ok(());
+                            }
+                        };
                         let target = socks::socks5_handshake(&mut stream).await?;
                         tunnel::open_tunnel(&conn, &target.authority, &mut stream).await
                     }
@@ -551,6 +556,38 @@ pub async fn run_socks_listener(
                 if changed.is_err() || *shutdown_rx.borrow() {
                     // Sender dropped or explicit shutdown.
                     return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_active_route(
+    mut conn_rx: watch::Receiver<Option<Arc<RelayConnection>>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Option<Arc<RelayConnection>> {
+    let timeout = tokio::time::sleep(Duration::from_millis(SOCKS_ROUTE_WAIT_TIMEOUT_MS));
+    tokio::pin!(timeout);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            return None;
+        }
+        if let Some(conn) = conn_rx.borrow_and_update().clone() {
+            return Some(conn);
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut timeout => return None,
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return None;
+                }
+            }
+            changed = conn_rx.changed() => {
+                if changed.is_err() {
+                    return None;
                 }
             }
         }
