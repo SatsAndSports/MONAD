@@ -14,10 +14,11 @@ use crate::wallet::{
 use cashu::nuts::{CurrencyUnit, Id, Proof, SecretKey, State};
 use cdk_spilman::{
     compute_funding_token_amount, parse_keyset_info_from_json, with_active_keyset_retry,
-    ClientChannelFunding, ClientChannelInfo, ConfigurableClientHost, EstablishedChannel,
-    FundingSpendKind, KeysetRetryError, MintConnection, OpenChannelError, OpenChannelFailureStage,
-    OpenChannelResult, PreparedSenderRefund, ReqwestClientNetworking, SelectedOutputKeyset,
-    SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking, SqliteClientStorage,
+    ClientChannelFunding, ClientChannelInfo, ClientKeysetCacheEntry, CompletedOpenChannel,
+    ConfigurableClientHost, EstablishedChannel, FundingSpendKind, KeysetRetryError, MintConnection,
+    OpenChannelError, OpenChannelFailureStage, OpenChannelResult, PreparedOpenChannel,
+    PreparedSenderRefund, ReqwestClientNetworking, SelectedOutputKeyset, SpilmanClientBridge,
+    SpilmanClientHost, SpilmanClientNetworking, SqliteClientStorage,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -999,26 +1000,41 @@ impl SqliteClientWallet {
         let input_proofs_json = match proofs_json_from_reservation(reservation) {
             Ok(json) => json,
             Err(e) => {
-                return Err(OpenChannelError {
-                    stage: OpenChannelFailureStage::BeforeOpeningSaved,
-                    channel_id: None,
-                    input_may_be_spent: false,
-                    message: e.to_string(),
-                });
+                return Err(open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    None,
+                    e.to_string(),
+                ));
             }
         };
 
-        {
-            let bridge = self.bridge.lock().map_err(|_| OpenChannelError {
-                stage: OpenChannelFailureStage::BeforeOpeningSaved,
-                channel_id: None,
-                input_may_be_spent: false,
-                message: "bridge mutex poisoned".to_string(),
+        let networking = ReqwestClientNetworking::new();
+        let input_keyset_lookup = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    None,
+                    "bridge mutex poisoned".to_string(),
+                )
             })?;
-            bridge.open_channel_from_proofs_with_funding_amount(
+            proof_input_keysets_from_cache(&bridge, &offer.mint_url, &offer.unit, reservation)?
+        };
+        let input_keysets_json =
+            proof_input_keysets_json(input_keyset_lookup, &offer.mint_url, &networking)?;
+
+        let prepared = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    None,
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            let prepared = bridge.prepare_open_channel_from_proofs_with_input_keysets(
                 &offer.mint_url,
                 &offer.unit,
                 &input_proofs_json,
+                &input_keysets_json,
                 &offer.receiver_pubkey,
                 &self.sender_pubkey_hex,
                 expiry_timestamp,
@@ -1026,8 +1042,114 @@ impl SqliteClientWallet {
                 0,
                 requested_capacity_raw,
                 desired_funding_token_amount_raw,
-            )
+            )?;
+            bridge.mark_prepared_open_saved(&prepared)?;
+            prepared
+        };
+
+        self.submit_prepared_open(prepared, &networking)
+    }
+
+    fn submit_prepared_open(
+        &self,
+        prepared: PreparedOpenChannel,
+        networking: &ReqwestClientNetworking,
+    ) -> Result<OpenChannelResult, OpenChannelError> {
+        let swap_response_json = networking
+            .call_mint_swap(&prepared.mint_url, &prepared.swap_request_json)
+            .map_err(|e| {
+                let message = normalize_mint_error_string(e);
+                if cdk_spilman::extract_nut00_error_code(&message).is_some() {
+                    return self
+                        .mark_prepared_open_rejected(&prepared, message)
+                        .unwrap_or_else(|error| error);
+                }
+                open_channel_stage_error(
+                    OpenChannelFailureStage::SwapSubmitted,
+                    Some(prepared.channel_id.clone()),
+                    message,
+                )
+            })?;
+
+        let completed = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::FundingProofsReceived,
+                    Some(prepared.channel_id.clone()),
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            bridge.complete_prepared_open_channel(&prepared, &swap_response_json)?
+        };
+
+        self.verify_prepared_open_restore(&prepared, &completed, networking)?;
+
+        {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::MarkOpen,
+                    Some(prepared.channel_id.clone()),
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            bridge.mark_completed_open(&completed)?;
         }
+
+        Ok(completed.result)
+    }
+
+    fn mark_prepared_open_rejected(
+        &self,
+        prepared: &PreparedOpenChannel,
+        message: String,
+    ) -> Result<OpenChannelError, OpenChannelError> {
+        let bridge = self.bridge.lock().map_err(|_| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::MarkOpen,
+                Some(prepared.channel_id.clone()),
+                format!("bridge mutex poisoned while marking mint rejection: {message}"),
+            )
+        })?;
+        bridge.mark_prepared_open_rejected(prepared, message)
+    }
+
+    fn verify_prepared_open_restore(
+        &self,
+        prepared: &PreparedOpenChannel,
+        completed: &CompletedOpenChannel,
+        networking: &ReqwestClientNetworking,
+    ) -> Result<(), OpenChannelError> {
+        let restore_request = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::RestoreVerification,
+                    Some(prepared.channel_id.clone()),
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            bridge.funding_restore_request_for_prepared_open(prepared)?
+        };
+
+        let restore_response = networking
+            .call_mint_restore(&prepared.mint_url, &restore_request)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::RestoreVerification,
+                    Some(prepared.channel_id.clone()),
+                    e,
+                )
+            })?;
+
+        let bridge = self.bridge.lock().map_err(|_| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::RestoreVerification,
+                Some(prepared.channel_id.clone()),
+                "bridge mutex poisoned".to_string(),
+            )
+        })?;
+        let restored_proofs_json =
+            bridge.complete_funding_restore_for_prepared_open(prepared, &restore_response)?;
+        bridge.verify_completed_open_matches_restore(completed, &restored_proofs_json)
     }
 
     fn finish_open_channel(
@@ -1764,6 +1886,260 @@ fn parse_keyset_id(keyset_id: &str) -> Result<Id, WalletError> {
 fn parse_currency_unit(unit: &str) -> Result<CurrencyUnit, WalletError> {
     unit.parse()
         .map_err(|e| WalletError::Backend(format!("invalid currency unit {unit}: {e}")))
+}
+
+fn open_channel_stage_error(
+    stage: OpenChannelFailureStage,
+    channel_id: Option<String>,
+    message: String,
+) -> OpenChannelError {
+    let input_may_be_spent = matches!(
+        stage,
+        OpenChannelFailureStage::SwapSubmitted
+            | OpenChannelFailureStage::FundingProofsReceived
+            | OpenChannelFailureStage::RestoreVerification
+            | OpenChannelFailureStage::MarkOpen
+    );
+    OpenChannelError {
+        stage,
+        channel_id,
+        input_may_be_spent,
+        message,
+    }
+}
+
+fn normalize_mint_error_string(raw: String) -> String {
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .map(|value| value.to_string())
+        .unwrap_or(raw)
+}
+
+struct ProofInputKeysetLookup {
+    unit: CurrencyUnit,
+    summaries: Vec<serde_json::Value>,
+    missing: Vec<Id>,
+}
+
+fn proof_input_keysets_from_cache<H, N>(
+    bridge: &SpilmanClientBridge<H, N>,
+    mint_url: &str,
+    unit: &str,
+    reservation: &ProofReservation,
+) -> Result<ProofInputKeysetLookup, OpenChannelError>
+where
+    H: SpilmanClientHost,
+    N: SpilmanClientNetworking,
+{
+    let expected_unit = unit.parse::<CurrencyUnit>().map_err(|e| {
+        open_channel_stage_error(
+            OpenChannelFailureStage::BeforeOpeningSaved,
+            None,
+            format!("invalid input proof unit: {e}"),
+        )
+    })?;
+    if reservation.proofs.is_empty() {
+        return Err(open_channel_stage_error(
+            OpenChannelFailureStage::BeforeOpeningSaved,
+            None,
+            "input proofs are empty".to_string(),
+        ));
+    }
+
+    let cached = bridge.cached_keysets_for_unit(mint_url, &expected_unit);
+    let mut summaries = Vec::new();
+    let mut missing = Vec::new();
+    for proof in &reservation.proofs {
+        if summaries
+            .iter()
+            .any(|summary: &serde_json::Value| summary["id"].as_str() == Some(&proof.keyset_id))
+        {
+            continue;
+        }
+        match cached
+            .iter()
+            .find(|(keyset_id, _)| keyset_id.to_string() == proof.keyset_id)
+        {
+            Some(entry) => summaries.push(keyset_summary_from_cache_entry(
+                entry.0,
+                &entry.1,
+                &expected_unit,
+            )?),
+            None => {
+                let missing_id = parse_keyset_id(&proof.keyset_id).map_err(|e| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::BeforeOpeningSaved,
+                        None,
+                        e.to_string(),
+                    )
+                })?;
+                if !missing.contains(&missing_id) {
+                    missing.push(missing_id);
+                }
+            }
+        }
+    }
+
+    Ok(ProofInputKeysetLookup {
+        unit: expected_unit,
+        summaries,
+        missing,
+    })
+}
+
+fn proof_input_keysets_json(
+    mut lookup: ProofInputKeysetLookup,
+    mint_url: &str,
+    networking: &ReqwestClientNetworking,
+) -> Result<String, OpenChannelError> {
+    if !lookup.missing.is_empty() {
+        lookup.summaries.extend(proof_input_keysets_from_mint(
+            mint_url,
+            &lookup.unit,
+            &lookup.missing,
+            networking,
+        )?);
+    }
+    serde_json::to_string(&lookup.summaries).map_err(|e| {
+        open_channel_stage_error(
+            OpenChannelFailureStage::BeforeOpeningSaved,
+            None,
+            format!("serialize input keysets: {e}"),
+        )
+    })
+}
+
+fn proof_input_keysets_from_mint(
+    mint_url: &str,
+    unit: &CurrencyUnit,
+    missing: &[Id],
+    networking: &ReqwestClientNetworking,
+) -> Result<Vec<serde_json::Value>, OpenChannelError> {
+    let keysets_json = networking.call_mint_keysets(mint_url).map_err(|e| {
+        open_channel_stage_error(OpenChannelFailureStage::BeforeOpeningSaved, None, e)
+    })?;
+    let keysets_resp: serde_json::Value = serde_json::from_str(&keysets_json).map_err(|e| {
+        open_channel_stage_error(
+            OpenChannelFailureStage::BeforeOpeningSaved,
+            None,
+            format!("parse /v1/keysets response: {e}"),
+        )
+    })?;
+    let keysets = keysets_resp
+        .get("keysets")
+        .and_then(|keysets| keysets.as_array())
+        .ok_or_else(|| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::BeforeOpeningSaved,
+                None,
+                "invalid /v1/keysets response: missing keysets array".to_string(),
+            )
+        })?;
+
+    let mut available = Vec::new();
+    for keyset in keysets {
+        if keyset.get("unit").and_then(|value| value.as_str()) != Some(&unit.to_string()) {
+            continue;
+        }
+        let id = keyset
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    None,
+                    "missing id in /v1/keysets entry".to_string(),
+                )
+            })?;
+        let active = keyset
+            .get("active")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let input_fee_ppk = keyset
+            .get("input_fee_ppk")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let mut value = serde_json::json!({
+            "id": id,
+            "unit": unit.to_string(),
+            "active": active,
+            "input_fee_ppk": input_fee_ppk,
+        });
+        if let Some(final_expiry) = keyset.get("final_expiry") {
+            value["final_expiry"] = final_expiry.clone();
+        }
+        available.push(value);
+    }
+
+    let mut out = Vec::new();
+    for missing_id in missing {
+        let Some(keyset) = available.iter().find(|keyset: &&serde_json::Value| {
+            keyset["id"].as_str() == Some(&missing_id.to_string())
+        }) else {
+            return Err(open_channel_stage_error(
+                OpenChannelFailureStage::BeforeOpeningSaved,
+                None,
+                format!("missing input keyset metadata for proof keyset {missing_id}"),
+            ));
+        };
+        out.push(keyset.clone());
+    }
+
+    Ok(out)
+}
+
+fn keyset_summary_from_cache_entry(
+    keyset_id: Id,
+    entry: &ClientKeysetCacheEntry,
+    expected_unit: &CurrencyUnit,
+) -> Result<serde_json::Value, OpenChannelError> {
+    if &entry.unit != expected_unit {
+        return Err(open_channel_stage_error(
+            OpenChannelFailureStage::BeforeOpeningSaved,
+            None,
+            format!(
+                "cached keyset {keyset_id} unit mismatch: expected {expected_unit}, got {}",
+                entry.unit
+            ),
+        ));
+    }
+    let info = parse_keyset_info_from_json(&entry.info_json).map_err(|e| {
+        open_channel_stage_error(
+            OpenChannelFailureStage::BeforeOpeningSaved,
+            None,
+            format!("parse cached keyset info for {keyset_id}: {e}"),
+        )
+    })?;
+    if info.keyset_id != keyset_id {
+        return Err(open_channel_stage_error(
+            OpenChannelFailureStage::BeforeOpeningSaved,
+            None,
+            format!(
+                "cached keyset id mismatch: requested {keyset_id}, cache entry has {}",
+                info.keyset_id
+            ),
+        ));
+    }
+    if &info.unit != expected_unit {
+        return Err(open_channel_stage_error(
+            OpenChannelFailureStage::BeforeOpeningSaved,
+            None,
+            format!(
+                "cached keyset {keyset_id} info unit mismatch: expected {expected_unit}, got {}",
+                info.unit
+            ),
+        ));
+    }
+
+    let mut value = serde_json::json!({
+        "id": keyset_id.to_string(),
+        "unit": expected_unit.to_string(),
+        "active": entry.active,
+        "input_fee_ppk": info.input_fee_ppk,
+    });
+    if let Some(final_expiry) = info.final_expiry {
+        value["final_expiry"] = serde_json::json!(final_expiry);
+    }
+    Ok(value)
 }
 
 fn open_channel_error(
