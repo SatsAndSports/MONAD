@@ -192,6 +192,48 @@ async fn bind_tcp_listener_with_reuseaddr(bind_addr: SocketAddr) -> io::Result<T
     TcpListener::from_std(socket.into())
 }
 
+struct TcpUdpPortReservation {
+    _tcp: TcpListener,
+    _udp: std::net::UdpSocket,
+    addr: SocketAddr,
+}
+
+async fn reserve_tcp_udp_port(ip: [u8; 4]) -> io::Result<TcpUdpPortReservation> {
+    let mut last_addr_in_use: Option<io::Error> = None;
+
+    for _ in 0..MAX_SHARED_BIND_RETRIES {
+        let tcp = match TcpListener::bind(SocketAddr::from((ip, 0))).await {
+            Ok(tcp) => tcp,
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                last_addr_in_use = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let addr = tcp.local_addr()?;
+        match std::net::UdpSocket::bind(addr) {
+            Ok(udp) => {
+                udp.set_nonblocking(true)?;
+                return Ok(TcpUdpPortReservation {
+                    _tcp: tcp,
+                    _udp: udp,
+                    addr,
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                last_addr_in_use = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_addr_in_use.unwrap_or_else(|| {
+        io::Error::other(format!(
+            "failed to reserve shared TCP/UDP test port after {MAX_SHARED_BIND_RETRIES} retries"
+        ))
+    }))
+}
+
 async fn bind_tcp_and_quic_on_same_port(
     bind_addr: SocketAddr,
     quic_server_config: quinn::ServerConfig,
@@ -758,6 +800,34 @@ async fn start_relay_from_config(
     )
     .await
     .map(|(handle, shutdown_tx, payments)| (addr, pubkey, handle, shutdown_tx, payments))
+}
+
+async fn start_relay_from_config_retry_addr_in_use(
+    relay_config: &RelayConfig,
+    wallet_manager: Arc<RelayWalletManager>,
+    mint_cache: SpilmanMintCache,
+) -> io::Result<(
+    SocketAddr,
+    Secp256k1Pubkey,
+    tokio::task::JoinHandle<io::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+    Arc<SpilmanRelayPayments>,
+)> {
+    let mut last_err = None;
+    for _ in 0..50 {
+        match start_relay_from_config(relay_config, wallet_manager.clone(), mint_cache.clone())
+            .await
+        {
+            Ok(started) => return Ok(started),
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| io::Error::other("relay start stayed AddrInUse")))
 }
 
 async fn wait_for_configured_route_connected(
@@ -7010,17 +7080,14 @@ async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
     let keyset_info_json = mint_helper.keyset_info_json().unwrap();
     let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
 
-    let mut relay_listeners = Vec::new();
+    let mut relay_reservations = Vec::new();
     let mut relay_listens = Vec::new();
     for hop_idx in 0..case.hop_count {
-        let listener = TcpListener::bind(SocketAddr::from((
-            [127, 10, case.subnet, 30 + hop_idx as u8],
-            0,
-        )))
-        .await
-        .unwrap();
-        relay_listens.push(listener.local_addr().unwrap());
-        relay_listeners.push(listener);
+        let reservation = reserve_tcp_udp_port([127, 10, case.subnet, 30 + hop_idx as u8])
+            .await
+            .unwrap();
+        relay_listens.push(reservation.addr);
+        relay_reservations.push(reservation);
     }
     let socks_listener = TcpListener::bind(SocketAddr::from(([127, 10, case.subnet, 40], 0)))
         .await
@@ -7102,7 +7169,7 @@ relays:
     );
     fs::write(&config_path, yaml).unwrap();
 
-    drop(relay_listeners);
+    drop(relay_reservations);
     drop(socks_listener);
 
     let config = MonadConfig::load(&config_path).unwrap();
@@ -7113,9 +7180,13 @@ relays:
     for relay_name in relay_names.iter().take(case.hop_count) {
         let relay_config = config.select_relay(Some(relay_name)).unwrap();
         let (_server, _pubkey, handle, shutdown_tx, _payments) =
-            start_relay_from_config(relay_config, wallet_manager.clone(), mint_cache.clone())
-                .await
-                .unwrap();
+            start_relay_from_config_retry_addr_in_use(
+                relay_config,
+                wallet_manager.clone(),
+                mint_cache.clone(),
+            )
+            .await
+            .unwrap();
         relay_handles.push(handle);
         relay_shutdown_txs.push(shutdown_tx);
     }
@@ -7165,7 +7236,7 @@ relays:
     let failed_relay_name = relay_names[case.failed_hop_idx];
     let failed_relay_config = config.select_relay(Some(failed_relay_name)).unwrap();
     let (_server, _pubkey, failed_handle, failed_shutdown_tx, _payments) =
-        start_relay_from_config(failed_relay_config, wallet_manager, mint_cache)
+        start_relay_from_config_retry_addr_in_use(failed_relay_config, wallet_manager, mint_cache)
             .await
             .unwrap();
     relay_handles.insert(case.failed_hop_idx, failed_handle);
@@ -7384,15 +7455,14 @@ impl ConfiguredChaosFixture {
         let mint_cache =
             mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
 
-        let mut relay_listeners = Vec::new();
+        let mut relay_reservations = Vec::new();
         let mut relay_listens = Vec::new();
         for hop_idx in 0..fixture_config.hop_count {
-            let listener =
-                TcpListener::bind(SocketAddr::from(([127, 10, subnet, 30 + hop_idx as u8], 0)))
-                    .await
-                    .unwrap();
-            relay_listens.push(listener.local_addr().unwrap());
-            relay_listeners.push(listener);
+            let reservation = reserve_tcp_udp_port([127, 10, subnet, 30 + hop_idx as u8])
+                .await
+                .unwrap();
+            relay_listens.push(reservation.addr);
+            relay_reservations.push(reservation);
         }
         let socks_listener = TcpListener::bind(SocketAddr::from(([127, 10, subnet, 40], 0)))
             .await
@@ -7473,7 +7543,7 @@ relays:
         );
         fs::write(&config_path, yaml).unwrap();
 
-        drop(relay_listeners);
+        drop(relay_reservations);
         drop(socks_listener);
 
         let config = MonadConfig::load(&config_path).unwrap();
@@ -7485,9 +7555,13 @@ relays:
         for relay_name in &relay_names {
             let relay_config = config.select_relay(Some(relay_name)).unwrap();
             let (_server, _pubkey, handle, shutdown_tx, _payments) =
-                start_relay_from_config(relay_config, wallet_manager.clone(), mint_cache.clone())
-                    .await
-                    .unwrap();
+                start_relay_from_config_retry_addr_in_use(
+                    relay_config,
+                    wallet_manager.clone(),
+                    mint_cache.clone(),
+                )
+                .await
+                .unwrap();
             relay_handles.push(handle);
             relay_shutdown_txs.push(shutdown_tx);
         }
