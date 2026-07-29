@@ -60,6 +60,31 @@ The client is authoritative for local intent and local authorization:
 The client does not treat its local estimate as accepted relay state. It uses
 that estimate only to decide when and how much to pay.
 
+## Spilman Sans-IO Layering
+
+MONAD uses upstream `cdk-spilman` as the protocol core and keeps runtime
+orchestration in MONAD.
+
+`cdk-spilman` owns:
+
+- constructing prepared channel-open, payment, close, and recovery artifacts
+- validating funding, registration, and payment signatures
+- completing and verifying mint swap/restore responses
+- explicit storage transitions such as record funding, record payment, mark open, mark closing, and mark closed
+
+MONAD owns:
+
+- mint HTTP calls and async runtime boundaries
+- keyset refresh and retry policy
+- loose proof reservations and proof import/release sequencing
+- MONAD channel metadata and opening-recovery rows
+- relay session ownership, eviction, pause/resume, and byte-accounting policy
+
+The intended shape is `prepare` / `validate`, then MONAD performs I/O and retry,
+then `complete` / `record` / `mark`. Avoid reintroducing upstream all-in-one
+helpers on the MONAD hot path unless the call site is intentionally a simple
+test or compatibility wrapper.
+
 ## Relay Keyset Model
 
 The relay wallet manager owns one shared in-memory `SpilmanMintCache` plus the

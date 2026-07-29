@@ -269,6 +269,8 @@ impl SpilmanRelayPayments {
             .bridge
             .prepare_unilateral_close_transition(channel_id)
             .map_err(CloseError::from_preparation_error)?;
+        // Mark Closing before mint I/O so a crash can replay close execution
+        // from persisted closing data instead of accepting more payments.
         self.bridge.mark_prepared_close_closing(&transition)?;
         self.execute_close_for_closing_channel(channel_id, mint_client, keyset_refresher)
     }
@@ -283,6 +285,8 @@ impl SpilmanRelayPayments {
             .bridge
             .prepare_unilateral_close_transition(channel_id)
             .map_err(CloseError::from_preparation_error)?;
+        // Mark Closing before mint I/O so a crash can replay close execution
+        // from persisted closing data instead of accepting more payments.
         self.bridge.mark_prepared_close_closing(&transition)?;
         self.execute_close_for_closing_channel_async(channel_id, mint_client, keyset_refresher)
             .await
@@ -510,6 +514,8 @@ impl RelayPayments for SpilmanRelayPayments {
             .map_err(LinkError::Internal)?
             .is_some()
         {
+            // Relink validates the zero-balance registration signature without
+            // mutating the relay-authoritative latest accepted balance.
             self.bridge
                 .validate_existing_channel_funding(
                     &payment.channel_id,
@@ -519,6 +525,8 @@ impl RelayPayments for SpilmanRelayPayments {
                 .map_err(map_link_bridge_error)?
                 .capacity
         } else {
+            // First link validates funding, then explicitly records it so MONAD
+            // controls the persistence boundary around session ownership.
             let validated =
                 self.bridge
                     .validate_new_channel_funding(
@@ -601,6 +609,8 @@ impl RelayPayments for SpilmanRelayPayments {
             return Err(ChannelPaymentError::NoNewFunds);
         }
 
+        // Record only after validation and monotonicity checks; the stored
+        // balance is the relay-authoritative baseline for future payments.
         self.store
             .record_payment(
                 &payment.channel_id,

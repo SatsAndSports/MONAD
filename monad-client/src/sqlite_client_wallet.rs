@@ -582,6 +582,8 @@ impl SqliteClientWallet {
         channel_id: &str,
         networking: &ReqwestClientNetworking,
     ) -> Result<OpenChannelResult, OpenChannelError> {
+        // MONAD owns restore I/O and retry boundaries; upstream owns request
+        // construction, response completion, and the explicit mark-open step.
         let prepared = {
             let bridge = self.bridge.lock().map_err(|_| {
                 open_channel_stage_error(
@@ -1098,6 +1100,8 @@ impl SqliteClientWallet {
                 requested_capacity_raw,
                 desired_funding_token_amount_raw,
             )?;
+            // Persist before mint submission so ambiguous swap outcomes can be
+            // recovered via NUT-09 restore after a crash or network failure.
             bridge.mark_prepared_open_saved(&prepared)?;
             prepared
         };
@@ -1137,6 +1141,8 @@ impl SqliteClientWallet {
             bridge.complete_prepared_open_channel(&prepared, &swap_response_json)?
         };
 
+        // Verify restore deterministically recreates the funding proofs before
+        // moving upstream storage out of OpeningFromSwap.
         self.verify_prepared_open_restore(&prepared, &completed, networking)?;
 
         {
@@ -1692,6 +1698,8 @@ impl MonadWallet for SqliteClientWallet {
                 .map_err(|e| map_create_payment_error(&channel, e, next_balance_raw))?;
             let payment_json = serde_json::to_string(&payment)
                 .map_err(|e| WalletError::Backend(format!("serialize channel payment: {e}")))?;
+            // Serialize before recording so local state cannot advance for a
+            // payment JSON that was never returned to the session driver.
             bridge
                 .record_signed_payment(&payment)
                 .map_err(|e| WalletError::Backend(format!("record signed payment: {e}")))?;
