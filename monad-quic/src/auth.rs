@@ -3,6 +3,7 @@ use monad_common::secp_identity::{
     transport_auth_digest, verify_transport_auth_digest, Secp256k1Pubkey, SecpTransportKeypair,
 };
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
@@ -61,9 +62,15 @@ pub async fn authenticate_connection(
     Ok(())
 }
 
+/// Serve one relay-side attestation stream. Once the signature is ready, the
+/// connection is marked authenticated *before* the response is revealed to the
+/// client: the client opens session streams as soon as it receives the
+/// signature, so committing the flag any later races with those streams being
+/// rejected as unauthenticated.
 pub async fn serve_attestation_stream(
     conn: &quinn::Connection,
     transport_key: &SecpTransportKeypair,
+    authenticated: &AtomicBool,
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> io::Result<()> {
@@ -77,6 +84,7 @@ pub async fn serve_attestation_stream(
     let digest = transport_auth_digest(EXPORTER_LABEL, &challenge, &exporter);
     let signature = transport_key.sign_digest(&digest);
 
+    authenticated.store(true, Ordering::Release);
     send.write_all(&signature)
         .await
         .map_err(|e| io::Error::other(format!("failed to write QUIC auth signature: {e}")))?;

@@ -733,14 +733,13 @@ where
                                         if let Err(e) = serve_attestation_stream(
                                             &conn,
                                             &transport_key,
+                                            &authenticated,
                                             &mut send,
                                             &mut recv,
                                         )
                                         .await
                                         {
                                             error!("QUIC secp256k1 auth failed with {remote} ({stream_id:?}): {e}");
-                                        } else {
-                                            authenticated.store(true, Ordering::Release);
                                         }
                                         return;
                                     }
