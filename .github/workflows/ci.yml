@@ -2,24 +2,45 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
+      - master
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  check:
+  rust:
+    name: Rust fmt, lint, and tests
     runs-on: ubuntu-latest
-
+    timeout-minutes: 90
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.1
-          components: rustfmt, clippy
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
 
-      - name: Run formatting check
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
         run: make fmt-check
 
-      - name: Run tests
+      - name: Lint
+        run: make lint
+
+      - name: Test
         run: make test

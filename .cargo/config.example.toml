@@ -1,0 +1,8 @@
+# Copy this file to `.cargo/config.toml` for local MONAD development against a
+# sibling checkout of `cashu_spilman_channels`. These paths are relative to the
+# `.cargo` directory. Keep the copied file untracked; CI uses the pinned Git
+# dependencies from `Cargo.toml`.
+
+[patch."https://github.com/SatsAndSports/cashu_spilman_channels.git"]
+cdk-spilman = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman" }
+cdk-spilman-test-mint = { path = "../../../Cashu/Channels/spilman_channel/cashu_spilman_channels/crates/cdk-spilman-test-mint" }
