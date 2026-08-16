@@ -1,0 +1,92 @@
+name: Stress
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  payment-buffered:
+    name: Payment buffered stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run stress
+        run: make stress-payment-buffered
+
+  payment-relink:
+    name: Payment relink stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run stress
+        run: make stress-payment-relink
+
+  chaos-rebuild:
+    name: Chaos rebuild stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run stress
+        run: make stress-chaos-rebuild
+
+  chaos-rebuild-abrupt:
+    name: Abrupt chaos rebuild stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run stress
+        run: make stress-chaos-rebuild-abrupt
