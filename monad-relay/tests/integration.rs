@@ -7654,6 +7654,78 @@ async fn test_direct_connector_suffix_rebuild_preserves_prefix_sessions() {
     fixture.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_failed_route_build_detaches_and_reuses_funded_prefix_channel() {
+    let fixture = ConfiguredRouteFixture::start(ConfiguredRouteFixtureConfig {
+        subnet: 22,
+        hop_count: 2,
+        proof_batches: 3,
+        wallet_seed: 59,
+        channel_input_budget_msats: 11_000_000,
+        label: "failed-route-channel-reuse",
+    })
+    .await;
+
+    let client = fixture.config.select_client(Some("local")).unwrap();
+    let client_wallet = fixture.config.client_wallet.as_ref().unwrap();
+    let wallet: Arc<dyn MonadWallet> = Arc::new(fixture.open_client_wallet());
+    let runtime = connector::ConnectorRuntime::with_payment_policy(
+        Some(wallet.clone()),
+        PaymentPolicy {
+            channel_input_budget_msats: client_wallet.channel_input_budget_msats,
+            target_topup_buffer_msats: client_wallet.target_topup_buffer_msats,
+            minimum_topup_msats: client_wallet.minimum_topup_msats,
+        },
+    )
+    .unwrap();
+    let route = route_from_client_config(client).unwrap();
+
+    let mut failed_hops = route.hops().to_vec();
+    let RouteHop::Cleartext { addr, .. } = &mut failed_hops[1] else {
+        panic!("fixture route should use cleartext hops");
+    };
+    *addr = "127.0.0.1:1".to_string();
+    let failed_route = Route::new(failed_hops).unwrap();
+
+    assert!(
+        connector::connect_route_with_runtime(&failed_route, &runtime)
+            .await
+            .is_err(),
+        "the unreachable second hop should fail route construction"
+    );
+
+    let first_channel_id = timeout(Duration::from_secs(5), async {
+        loop {
+            let channels = wallet.list_channels().unwrap();
+            if let [channel] = channels.as_slice() {
+                if channel.attached_session_id.is_none() {
+                    break channel.channel_id.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed route should detach its funded prefix channel");
+
+    let retried_route = connector::connect_route_with_runtime(&route, &runtime)
+        .await
+        .unwrap();
+    let channels = wallet.list_channels().unwrap();
+    assert_eq!(
+        channels.len(),
+        2,
+        "retry should reuse the first-hop channel and provision only the second-hop channel"
+    );
+    assert!(channels.iter().any(|channel| {
+        channel.channel_id == first_channel_id
+            && channel.attached_session_id == Some(retried_route.hops()[0].session_id)
+    }));
+
+    retried_route.close().await;
+    fixture.shutdown().await;
+}
+
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 
 /// Initialize tracing for tests that spawn client/relay runtimes. Without a
