@@ -598,7 +598,11 @@ where
 
         if hop_idx < route.hops().len() - 1 {
             let next_hop = &route.hops()[hop_idx + 1];
-            ensure_next_hop_capabilities(&route, hop_idx, &capabilities)?;
+            if let Err(err) = ensure_next_hop_capabilities(&route, hop_idx, &capabilities) {
+                close_failed_funded_connection(&conn, &runtime);
+                conn.close().await;
+                return Err(err);
+            }
 
             info!(
                 "hop {}/{}: opening CONNECT tunnel to next hop {}",
@@ -607,16 +611,31 @@ where
                 hop_display_label(next_hop)
             );
 
-            let h2_connect_stream = open_next_hop_tunnel(&conn, next_hop).await?;
+            let h2_connect_stream = match open_next_hop_tunnel(&conn, next_hop).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    close_failed_funded_connection(&conn, &runtime);
+                    conn.close().await;
+                    return Err(err);
+                }
+            };
 
-            let mut next_funded = chain_from_stream(
+            let mut next_funded = match chain_from_stream(
                 h2_connect_stream,
                 route.clone(),
                 hop_idx + 1,
                 runtime.clone(),
                 fund_last_hop,
             )
-            .await?;
+            .await
+            {
+                Ok(funded) => funded,
+                Err(err) => {
+                    close_failed_funded_connection(&conn, &runtime);
+                    conn.close().await;
+                    return Err(err);
+                }
+            };
             let mut prefix_conns = vec![conn];
             prefix_conns.append(&mut next_funded.prefix_conns);
             next_funded.prefix_conns = prefix_conns;
@@ -633,6 +652,27 @@ where
             })
         }
     })
+}
+
+fn close_failed_funded_connection(conn: &RelayConnection, runtime: &ConnectorRuntime) {
+    let Some(wallet) = runtime.wallet.as_ref() else {
+        return;
+    };
+    let session_id = *conn.session_id();
+    let Ok(channels) = wallet.list_channels() else {
+        return;
+    };
+    for channel in channels
+        .iter()
+        .filter(|channel| channel.attached_session_id == Some(session_id))
+    {
+        if let Err(err) = wallet.force_detach_channel(&channel.channel_id) {
+            tracing::warn!(
+                "failed to detach channel {} from failed route session: {err}",
+                channel.channel_id
+            );
+        }
+    }
 }
 
 #[cfg(test)]

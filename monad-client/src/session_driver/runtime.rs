@@ -86,8 +86,9 @@ pub(super) async fn run_session_driver(
     heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut heartbeat = ControlHeartbeat::default();
 
-    loop {
-        tokio::select! {
+    let result = async {
+        loop {
+            tokio::select! {
             maybe_chunk = h2_recv.data() => {
                 let Some(chunk) = maybe_chunk else {
                     break;
@@ -206,7 +207,7 @@ pub(super) async fn run_session_driver(
                         send_json_line(&mut h2_send, &ClientMessage::GetSessionStatus).await?;
                     }
                     HeartbeatAction::TimedOut => {
-                        return Err(io::Error::new(
+                    return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
                                 "{} control heartbeat timed out after {}ms",
@@ -217,11 +218,14 @@ pub(super) async fn run_session_driver(
                     }
                 }
             }
+            }
         }
+        Ok(())
     }
+    .await;
 
     handle_control_detached(&config, &mut state).await;
-    Ok(())
+    result
 }
 
 #[cfg(test)]
