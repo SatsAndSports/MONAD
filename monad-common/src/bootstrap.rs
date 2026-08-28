@@ -5,7 +5,7 @@ use std::io;
 
 pub const BOOTSTRAP_VERSION: u8 = 1;
 pub const SESSION_PROTOCOL_H2: &str = "h2";
-pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20: &str = "2026-03-20";
+pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29: &str = "2026-08-29";
 pub const PRICING_POLICY_SESSION_CONSTANT: &str = "session_constant";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,7 +88,7 @@ pub fn server_accept_v1(capabilities: BootstrapCapabilities) -> BootstrapV1Serve
     BootstrapV1ServerAccept {
         session_protocol: SESSION_PROTOCOL_H2.to_string(),
         capabilities,
-        cashu_spilman_protocol_version: Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()),
+        cashu_spilman_protocol_version: Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()),
         pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
     }
 }
@@ -113,11 +113,11 @@ pub fn supported_bootstrap_versions() -> Vec<u8> {
 }
 
 pub fn supported_cashu_spilman_protocol_versions() -> Vec<String> {
-    vec![CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()]
+    vec![CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()]
 }
 
 pub fn is_supported_cashu_spilman_protocol_version(version: &str) -> bool {
-    version == CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20
+    version == CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29
 }
 
 pub fn select_cashu_spilman_protocol_version(client_versions: &[String]) -> Option<String> {
@@ -263,7 +263,7 @@ mod tests {
                 "nested_monad_over_tcp": true,
                 "nested_monad_over_quic": true
             },
-            "cashu_spilman_protocol_version": "2026-03-20",
+            "cashu_spilman_protocol_version": "2026-08-29",
             "pricing_policy": "session_constant"
         });
 
@@ -275,7 +275,7 @@ mod tests {
         assert!(!decoded.capabilities.tweaked_noise_v1);
         assert_eq!(
             decoded.cashu_spilman_protocol_version.as_deref(),
-            Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20)
+            Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
         );
         assert_eq!(
             decoded.pricing_policy.as_deref(),
@@ -295,7 +295,7 @@ mod tests {
                 tweaked_noise_v1: true,
             },
             cashu_spilman_protocol_version: Some(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
             ),
             pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
@@ -313,7 +313,7 @@ mod tests {
                     "1".to_string(),
                     json!({
                         "session_protocols": ["h2"],
-                        "cashu_spilman_protocol_versions": ["2026-03-20"],
+                        "cashu_spilman_protocol_versions": ["2026-08-29"],
                         "pricing_policies": ["session_constant"]
                     }),
                 ),
@@ -328,7 +328,7 @@ mod tests {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec!["future".to_string(), "h2".to_string()],
             cashu_spilman_protocol_versions: vec![
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
             ],
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
@@ -340,7 +340,7 @@ mod tests {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec!["something-else".to_string()],
             cashu_spilman_protocol_versions: vec![
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
             ],
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
@@ -356,7 +356,7 @@ mod tests {
             session_protocol: "future".to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: Some(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
             ),
             pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
@@ -393,14 +393,27 @@ mod tests {
     }
 
     #[test]
+    fn v1_rejects_the_pre_canonical_spilman_protocol_version() {
+        let hello = BootstrapV1ClientHello {
+            session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
+            cashu_spilman_protocol_versions: vec!["2026-03-20".to_string()],
+            pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
+        };
+        assert_eq!(
+            validate_v1_client_hello(&hello),
+            Err("unsupported cashu_spilman_protocol_versions: [\"2026-03-20\"]".to_string())
+        );
+    }
+
+    #[test]
     fn select_cashu_spilman_protocol_version_prefers_first_mutual_client_entry() {
         let selected = select_cashu_spilman_protocol_version(&[
             "future".to_string(),
-            CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+            CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
         ]);
         assert_eq!(
             selected.as_deref(),
-            Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20)
+            Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
         );
     }
 
@@ -437,7 +450,7 @@ mod tests {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
             cashu_spilman_protocol_versions: vec![
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
             ],
             pricing_policies: vec![],
         };
@@ -452,7 +465,7 @@ mod tests {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
             cashu_spilman_protocol_versions: vec![
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
             ],
             pricing_policies: vec!["future".to_string()],
         };
@@ -477,7 +490,7 @@ mod tests {
             session_protocol: SESSION_PROTOCOL_H2.to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: Some(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
             ),
             pricing_policy: None,
         };
@@ -493,7 +506,7 @@ mod tests {
             session_protocol: SESSION_PROTOCOL_H2.to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: Some(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
             ),
             pricing_policy: Some("future".to_string()),
         };

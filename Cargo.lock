@@ -699,18 +699,20 @@ dependencies = [
 [[package]]
 name = "cdk-spilman"
 version = "0.15.1"
-source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=11acf52c5c1cc02371fb306d47c47eb9456efe83#11acf52c5c1cc02371fb306d47c47eb9456efe83"
+source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=10bf2d4d5994a94574102d3c144d06e481dbf97e#10bf2d4d5994a94574102d3c144d06e481dbf97e"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "bitcoin",
  "cashu",
+ "hkdf",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "serde_yml",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -719,7 +721,7 @@ dependencies = [
 [[package]]
 name = "cdk-spilman-test-mint"
 version = "0.15.1"
-source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=11acf52c5c1cc02371fb306d47c47eb9456efe83#11acf52c5c1cc02371fb306d47c47eb9456efe83"
+source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=10bf2d4d5994a94574102d3c144d06e481dbf97e#10bf2d4d5994a94574102d3c144d06e481dbf97e"
 dependencies = [
  "anyhow",
  "axum",

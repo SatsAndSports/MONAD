@@ -36,7 +36,7 @@ use monad_common::blinded_hop::{build_blinded_hop_descriptor, BlindedHopDescript
 use monad_common::bootstrap::{
     decode_server_response, encode_client_hello, initial_server_capabilities,
     BootstrapCapabilities, BootstrapClientHello, BootstrapV1ClientHello, BOOTSTRAP_VERSION,
-    CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20, PRICING_POLICY_SESSION_CONSTANT,
+    CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29, PRICING_POLICY_SESSION_CONSTANT,
 };
 use monad_common::control_codec::{encode_json_line, try_decode_json_line};
 use monad_common::h2stream::wait_for_send_capacity;
@@ -12314,7 +12314,7 @@ async fn test_connector_stores_negotiated_cashu_spilman_protocol_version() {
 
     assert_eq!(
         conn.cashu_spilman_protocol_version().await.as_deref(),
-        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20)
+        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
     );
 
     conn.shutdown().await;
@@ -12348,7 +12348,7 @@ async fn test_bootstrap_rejects_client_without_mutual_pricing_policy() {
             serde_json::to_value(BootstrapV1ClientHello {
                 session_protocols: vec!["h2".to_string()],
                 cashu_spilman_protocol_versions: vec![
-                    CASHU_SPILMAN_PROTOCOL_VERSION_2026_03_20.to_string()
+                    CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
                 ],
                 pricing_policies: vec!["future".to_string()],
             })
