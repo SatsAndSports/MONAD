@@ -2622,6 +2622,110 @@ async fn test_session_payment_driver_links_unpauses_and_allows_data_flow() {
     let _ = mint_shutdown.send(());
 }
 
+async fn assert_session_payment_driver_pays_with_active_keyset_version(
+    mint_helper: TestMintHelper,
+    expected_keyset_prefix: &str,
+) {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    assert!(
+        keyset_id.starts_with(expected_keyset_prefix),
+        "expected active keyset ID {keyset_id} to start with {expected_keyset_prefix}"
+    );
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_secret.public_key().to_hex(),
+            mint_url,
+            keyset_id,
+            keyset_info_json,
+        )
+        .await,
+    );
+    wallet.pre_create_channel(1_000).await.unwrap();
+
+    let storage = tempfile::NamedTempFile::new().unwrap();
+    let transport_key = SecpTransportKeypair::generate();
+    let (server_addr, pubkey, relay_handle, shutdown_tx, _payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        receiver_secret,
+        storage.path().to_str().unwrap(),
+        mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    assert_eq!(
+        conn.cashu_spilman_protocol_version().await.as_deref(),
+        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+    );
+    assert_eq!(
+        conn.cashu_spilman_keyset_versions().await,
+        Some(required_cashu_spilman_keyset_versions())
+    );
+
+    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
+        &conn,
+        wallet as Arc<dyn monad_client::wallet::MonadWallet>,
+        "keyset-version integration hop",
+        PaymentPolicy {
+            target_topup_buffer_msats: 1_000,
+            minimum_topup_msats: 1_000,
+            ..PaymentPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(3), ready_rx)
+        .await
+        .expect("driver should link and pay")
+        .expect("driver ready signal");
+
+    let mut h2 = conn.clone_send_request().await;
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    assert_eq!(
+        tunnel_roundtrip(&mut h2, &target, b"keyset version flow").await,
+        b"KEYSET VERSION FLOW"
+    );
+
+    driver_handle.abort();
+    let _ = driver_handle.await;
+    drop(h2);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    relay_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_payment_driver_pays_with_v1_active_keyset() {
+    assert_session_payment_driver_pays_with_active_keyset_version(
+        TestMintHelper::new_v1().await.unwrap(),
+        "00",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_payment_driver_pays_with_v2_active_keyset() {
+    assert_session_payment_driver_pays_with_active_keyset_version(
+        TestMintHelper::new().await.unwrap(),
+        "01",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn test_session_payment_driver_proactively_pays_from_local_counters() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
