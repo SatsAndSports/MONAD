@@ -621,5 +621,6 @@ This opens 16 bidirectional QUIC streams, sends 64KB of random data on each, rea
 
 ## Further Reading
 
+- `DESIGN.md` for the high-level system design and tradeoffs
 - `ARCHITECTURE.md` for the protocol and layering model
 - `AGENTS.md` for repo-specific development guidance
