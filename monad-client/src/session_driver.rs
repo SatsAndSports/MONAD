@@ -794,6 +794,9 @@ mod tests {
                         cashu_spilman_protocol_version_handle: Arc::new(tokio::sync::RwLock::new(
                             None,
                         )),
+                        cashu_spilman_keyset_versions_handle: Arc::new(tokio::sync::RwLock::new(
+                            None,
+                        )),
                         cleartext_byte_counters: CleartextByteCounters::default(),
                     },
                     hop_label: "test".to_string(),

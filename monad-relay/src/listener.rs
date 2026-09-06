@@ -11,7 +11,7 @@ use cdk_spilman::configurable_host::SpilmanStorage;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
 use monad_common::bootstrap::{
-    initial_server_accept_v1, select_cashu_spilman_protocol_version, select_pricing_policy,
+    initial_server_accept_v1, select_cashu_spilman_protocol_keyset_versions, select_pricing_policy,
     BootstrapCapabilities, BootstrapV1ClientHello, BootstrapV1ServerAccept,
 };
 use monad_common::config::RelayChannelPolicyConfig;
@@ -99,6 +99,7 @@ async fn run_quic_noise_session(
             trusted_mint_units: runtime.config.trusted_mint_units.clone(),
             keyset_refresh: runtime.keyset_refresh,
             cashu_spilman_protocol_version: bootstrap_accept.cashu_spilman_protocol_version,
+            cashu_spilman_keyset_versions: bootstrap_accept.cashu_spilman_keyset_versions,
             in_bytes_per_millisat: runtime.config.in_bytes_per_millisat,
             out_bytes_per_millisat: runtime.config.out_bytes_per_millisat,
         },
@@ -240,12 +241,19 @@ impl ServerConfig {
                 session_protocol: initial_server_accept_v1().session_protocol,
                 capabilities: capabilities.clone(),
                 cashu_spilman_protocol_version: None,
+                cashu_spilman_keyset_versions: None,
                 pricing_policy: None,
             },
             None => initial_server_accept_v1(),
         };
-        accept.cashu_spilman_protocol_version =
-            select_cashu_spilman_protocol_version(&hello.cashu_spilman_protocol_versions);
+        let selected_spilman = select_cashu_spilman_protocol_keyset_versions(
+            &hello.cashu_spilman_protocol_keyset_versions,
+        );
+        accept.cashu_spilman_protocol_version = selected_spilman
+            .as_ref()
+            .map(|(protocol, _)| protocol.clone());
+        accept.cashu_spilman_keyset_versions =
+            selected_spilman.map(|(_, keyset_versions)| keyset_versions);
         accept.pricing_policy = select_pricing_policy(&hello.pricing_policies);
         accept
     }
@@ -646,6 +654,8 @@ where
                             keyset_refresh: services.keyset_refresh,
                             cashu_spilman_protocol_version: bootstrap_accept
                                 .cashu_spilman_protocol_version,
+                            cashu_spilman_keyset_versions: bootstrap_accept
+                                .cashu_spilman_keyset_versions,
                             in_bytes_per_millisat: config.in_bytes_per_millisat,
                             out_bytes_per_millisat: config.out_bytes_per_millisat,
                         },

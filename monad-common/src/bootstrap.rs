@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 pub const BOOTSTRAP_VERSION: u8 = 1;
 pub const SESSION_PROTOCOL_H2: &str = "h2";
 pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29: &str = "2026-08-29";
+pub const CASHU_SPILMAN_KEYSET_VERSION_V1: &str = "v1";
+pub const CASHU_SPILMAN_KEYSET_VERSION_V2: &str = "v2";
 pub const PRICING_POLICY_SESSION_CONSTANT: &str = "session_constant";
+
+pub type CashuSpilmanProtocolKeysetVersions = BTreeMap<String, BTreeSet<String>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapCapabilities {
@@ -25,7 +29,7 @@ pub struct BootstrapCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapV1ClientHello {
     pub session_protocols: Vec<String>,
-    pub cashu_spilman_protocol_versions: Vec<String>,
+    pub cashu_spilman_protocol_keyset_versions: CashuSpilmanProtocolKeysetVersions,
     pub pricing_policies: Vec<String>,
 }
 
@@ -34,6 +38,7 @@ pub struct BootstrapV1ServerAccept {
     pub session_protocol: String,
     pub capabilities: BootstrapCapabilities,
     pub cashu_spilman_protocol_version: Option<String>,
+    pub cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
     pub pricing_policy: Option<String>,
 }
 
@@ -66,7 +71,8 @@ pub fn initial_client_hello() -> BootstrapClientHello {
         version_key(BOOTSTRAP_VERSION),
         serde_json::to_value(BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
-            cashu_spilman_protocol_versions: supported_cashu_spilman_protocol_versions(),
+            cashu_spilman_protocol_keyset_versions:
+                supported_cashu_spilman_protocol_keyset_versions(),
             pricing_policies: supported_pricing_policies(),
         })
         .expect("initial bootstrap v1 hello is serializable"),
@@ -89,6 +95,7 @@ pub fn server_accept_v1(capabilities: BootstrapCapabilities) -> BootstrapV1Serve
         session_protocol: SESSION_PROTOCOL_H2.to_string(),
         capabilities,
         cashu_spilman_protocol_version: Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()),
+        cashu_spilman_keyset_versions: Some(required_cashu_spilman_keyset_versions()),
         pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
     }
 }
@@ -112,19 +119,49 @@ pub fn supported_bootstrap_versions() -> Vec<u8> {
     vec![BOOTSTRAP_VERSION]
 }
 
-pub fn supported_cashu_spilman_protocol_versions() -> Vec<String> {
-    vec![CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()]
+pub fn required_cashu_spilman_keyset_versions() -> BTreeSet<String> {
+    BTreeSet::from([
+        CASHU_SPILMAN_KEYSET_VERSION_V1.to_string(),
+        CASHU_SPILMAN_KEYSET_VERSION_V2.to_string(),
+    ])
+}
+
+pub fn supported_cashu_spilman_protocol_keyset_versions() -> CashuSpilmanProtocolKeysetVersions {
+    BTreeMap::from([(
+        CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+        required_cashu_spilman_keyset_versions(),
+    )])
 }
 
 pub fn is_supported_cashu_spilman_protocol_version(version: &str) -> bool {
-    version == CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29
+    supported_cashu_spilman_protocol_keyset_versions().contains_key(version)
 }
 
-pub fn select_cashu_spilman_protocol_version(client_versions: &[String]) -> Option<String> {
-    client_versions
+pub fn select_cashu_spilman_protocol_keyset_versions(
+    client_versions: &CashuSpilmanProtocolKeysetVersions,
+) -> Option<(String, BTreeSet<String>)> {
+    select_cashu_spilman_protocol_keyset_versions_from_supported(
+        client_versions,
+        &supported_cashu_spilman_protocol_keyset_versions(),
+    )
+}
+
+fn select_cashu_spilman_protocol_keyset_versions_from_supported(
+    client_versions: &CashuSpilmanProtocolKeysetVersions,
+    server_versions: &CashuSpilmanProtocolKeysetVersions,
+) -> Option<(String, BTreeSet<String>)> {
+    server_versions
         .iter()
-        .find(|version| is_supported_cashu_spilman_protocol_version(version))
-        .cloned()
+        .find_map(|(protocol, server_keyset_versions)| {
+            let client_keyset_versions = client_versions.get(protocol)?;
+            let mutual_keyset_versions = client_keyset_versions
+                .intersection(server_keyset_versions)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            mutual_keyset_versions
+                .is_superset(&required_cashu_spilman_keyset_versions())
+                .then(|| (protocol.clone(), mutual_keyset_versions))
+        })
 }
 
 pub fn supported_pricing_policies() -> Vec<String> {
@@ -166,7 +203,11 @@ pub fn validate_v1_client_hello(hello: &BootstrapV1ClientHello) -> Result<(), St
         .iter()
         .any(|protocol| protocol == SESSION_PROTOCOL_H2)
     {
-        if select_cashu_spilman_protocol_version(&hello.cashu_spilman_protocol_versions).is_some() {
+        if select_cashu_spilman_protocol_keyset_versions(
+            &hello.cashu_spilman_protocol_keyset_versions,
+        )
+        .is_some()
+        {
             if select_pricing_policy(&hello.pricing_policies).is_some() {
                 return Ok(());
             }
@@ -176,8 +217,8 @@ pub fn validate_v1_client_hello(hello: &BootstrapV1ClientHello) -> Result<(), St
             ));
         }
         return Err(format!(
-            "unsupported cashu_spilman_protocol_versions: {:?}",
-            hello.cashu_spilman_protocol_versions
+            "unsupported cashu_spilman_protocol_keyset_versions: {:?}",
+            hello.cashu_spilman_protocol_keyset_versions
         ));
     }
     Err(format!(
@@ -201,6 +242,21 @@ pub fn validate_v1_server_accept(accept: &BootstrapV1ServerAccept) -> Result<(),
         return Err(format!(
             "unsupported cashu_spilman_protocol_version: {}",
             version
+        ));
+    }
+    let keyset_versions = accept
+        .cashu_spilman_keyset_versions
+        .as_ref()
+        .ok_or_else(|| "missing cashu_spilman_keyset_versions".to_string())?;
+    let supported_protocol_keyset_versions = supported_cashu_spilman_protocol_keyset_versions();
+    let supported_keyset_versions = supported_protocol_keyset_versions
+        .get(version)
+        .expect("supported protocol has keyset versions");
+    if !keyset_versions.is_superset(&required_cashu_spilman_keyset_versions())
+        || !keyset_versions.is_subset(supported_keyset_versions)
+    {
+        return Err(format!(
+            "unsupported cashu_spilman_keyset_versions for {version}: {keyset_versions:?}"
         ));
     }
     let pricing_policy = accept
@@ -264,6 +320,7 @@ mod tests {
                 "nested_monad_over_quic": true
             },
             "cashu_spilman_protocol_version": "2026-08-29",
+            "cashu_spilman_keyset_versions": ["v1", "v2"],
             "pricing_policy": "session_constant"
         });
 
@@ -297,6 +354,7 @@ mod tests {
             cashu_spilman_protocol_version: Some(
                 CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
             ),
+            cashu_spilman_keyset_versions: Some(required_cashu_spilman_keyset_versions()),
             pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
 
@@ -313,7 +371,9 @@ mod tests {
                     "1".to_string(),
                     json!({
                         "session_protocols": ["h2"],
-                        "cashu_spilman_protocol_versions": ["2026-08-29"],
+                        "cashu_spilman_protocol_keyset_versions": {
+                            "2026-08-29": ["v1", "v2"]
+                        },
                         "pricing_policies": ["session_constant"]
                     }),
                 ),
@@ -327,9 +387,8 @@ mod tests {
     fn v1_accepts_h2_among_other_protocols() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec!["future".to_string(), "h2".to_string()],
-            cashu_spilman_protocol_versions: vec![
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
-            ],
+            cashu_spilman_protocol_keyset_versions:
+                supported_cashu_spilman_protocol_keyset_versions(),
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
         assert_eq!(validate_v1_client_hello(&hello), Ok(()));
@@ -339,9 +398,8 @@ mod tests {
     fn v1_rejects_when_h2_missing() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec!["something-else".to_string()],
-            cashu_spilman_protocol_versions: vec![
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
-            ],
+            cashu_spilman_protocol_keyset_versions:
+                supported_cashu_spilman_protocol_keyset_versions(),
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
         assert_eq!(
@@ -358,6 +416,7 @@ mod tests {
             cashu_spilman_protocol_version: Some(
                 CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
             ),
+            cashu_spilman_keyset_versions: Some(required_cashu_spilman_keyset_versions()),
             pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
         assert_eq!(
@@ -370,12 +429,12 @@ mod tests {
     fn v1_rejects_when_cashu_spilman_version_missing() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
-            cashu_spilman_protocol_versions: vec![],
+            cashu_spilman_protocol_keyset_versions: BTreeMap::new(),
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
         assert_eq!(
             validate_v1_client_hello(&hello),
-            Err("unsupported cashu_spilman_protocol_versions: []".to_string())
+            Err("unsupported cashu_spilman_protocol_keyset_versions: {}".to_string())
         );
     }
 
@@ -383,12 +442,18 @@ mod tests {
     fn v1_rejects_when_cashu_spilman_version_unsupported() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
-            cashu_spilman_protocol_versions: vec!["future".to_string()],
+            cashu_spilman_protocol_keyset_versions: BTreeMap::from([(
+                "future".to_string(),
+                required_cashu_spilman_keyset_versions(),
+            )]),
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
         assert_eq!(
             validate_v1_client_hello(&hello),
-            Err("unsupported cashu_spilman_protocol_versions: [\"future\"]".to_string())
+            Err(
+                "unsupported cashu_spilman_protocol_keyset_versions: {\"future\": {\"v1\", \"v2\"}}"
+                    .to_string()
+            )
         );
     }
 
@@ -396,25 +461,79 @@ mod tests {
     fn v1_rejects_the_pre_canonical_spilman_protocol_version() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
-            cashu_spilman_protocol_versions: vec!["2026-03-20".to_string()],
+            cashu_spilman_protocol_keyset_versions: BTreeMap::from([(
+                "2026-03-20".to_string(),
+                required_cashu_spilman_keyset_versions(),
+            )]),
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
         };
         assert_eq!(
             validate_v1_client_hello(&hello),
-            Err("unsupported cashu_spilman_protocol_versions: [\"2026-03-20\"]".to_string())
+            Err(
+                "unsupported cashu_spilman_protocol_keyset_versions: {\"2026-03-20\": {\"v1\", \"v2\"}}"
+                    .to_string()
+            )
         );
     }
 
     #[test]
-    fn select_cashu_spilman_protocol_version_prefers_first_mutual_client_entry() {
-        let selected = select_cashu_spilman_protocol_version(&[
-            "future".to_string(),
+    fn selects_full_mutual_keyset_version_set() {
+        let client_versions = BTreeMap::from([(
             CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
-        ]);
-        assert_eq!(
-            selected.as_deref(),
-            Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+            BTreeSet::from(["v1".to_string(), "v2".to_string(), "v3".to_string()]),
+        )]);
+        let server_versions = BTreeMap::from([(
+            CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+            BTreeSet::from(["v1".to_string(), "v2".to_string()]),
+        )]);
+        let selected = select_cashu_spilman_protocol_keyset_versions_from_supported(
+            &client_versions,
+            &server_versions,
         );
+        assert_eq!(
+            selected,
+            Some((
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                required_cashu_spilman_keyset_versions(),
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_protocol_when_mutual_keyset_versions_omit_required_v1_or_v2() {
+        let client_versions = BTreeMap::from([(
+            CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+            BTreeSet::from(["v1".to_string(), "v2".to_string(), "v3".to_string()]),
+        )]);
+        let server_versions = BTreeMap::from([(
+            CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+            BTreeSet::from(["v2".to_string(), "v3".to_string()]),
+        )]);
+
+        assert_eq!(
+            select_cashu_spilman_protocol_keyset_versions_from_supported(
+                &client_versions,
+                &server_versions,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn v1_rejects_client_without_both_required_keyset_versions() {
+        let hello = BootstrapV1ClientHello {
+            session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
+            cashu_spilman_protocol_keyset_versions: BTreeMap::from([(
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                BTreeSet::from([CASHU_SPILMAN_KEYSET_VERSION_V1.to_string()]),
+            )]),
+            pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
+        };
+
+        assert!(matches!(
+            validate_v1_client_hello(&hello),
+            Err(message) if message.contains("unsupported cashu_spilman_protocol_keyset_versions")
+        ));
     }
 
     #[test]
@@ -423,6 +542,7 @@ mod tests {
             session_protocol: SESSION_PROTOCOL_H2.to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: None,
+            cashu_spilman_keyset_versions: Some(required_cashu_spilman_keyset_versions()),
             pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
         assert_eq!(
@@ -437,6 +557,7 @@ mod tests {
             session_protocol: SESSION_PROTOCOL_H2.to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: Some("future".to_string()),
+            cashu_spilman_keyset_versions: Some(required_cashu_spilman_keyset_versions()),
             pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
         };
         assert_eq!(
@@ -446,12 +567,30 @@ mod tests {
     }
 
     #[test]
+    fn v1_server_accept_rejects_missing_or_partial_keyset_version_set() {
+        let mut accept = initial_server_accept_v1();
+        accept.cashu_spilman_keyset_versions = None;
+        assert_eq!(
+            validate_v1_server_accept(&accept),
+            Err("missing cashu_spilman_keyset_versions".to_string())
+        );
+
+        accept.cashu_spilman_keyset_versions =
+            Some(BTreeSet::from(
+                [CASHU_SPILMAN_KEYSET_VERSION_V1.to_string()],
+            ));
+        assert!(matches!(
+            validate_v1_server_accept(&accept),
+            Err(message) if message.contains("unsupported cashu_spilman_keyset_versions")
+        ));
+    }
+
+    #[test]
     fn v1_rejects_when_pricing_policy_missing() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
-            cashu_spilman_protocol_versions: vec![
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
-            ],
+            cashu_spilman_protocol_keyset_versions:
+                supported_cashu_spilman_protocol_keyset_versions(),
             pricing_policies: vec![],
         };
         assert_eq!(
@@ -464,9 +603,8 @@ mod tests {
     fn v1_rejects_when_pricing_policy_unsupported() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
-            cashu_spilman_protocol_versions: vec![
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
-            ],
+            cashu_spilman_protocol_keyset_versions:
+                supported_cashu_spilman_protocol_keyset_versions(),
             pricing_policies: vec!["future".to_string()],
         };
         assert_eq!(
@@ -492,6 +630,7 @@ mod tests {
             cashu_spilman_protocol_version: Some(
                 CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
             ),
+            cashu_spilman_keyset_versions: Some(required_cashu_spilman_keyset_versions()),
             pricing_policy: None,
         };
         assert_eq!(
@@ -508,6 +647,7 @@ mod tests {
             cashu_spilman_protocol_version: Some(
                 CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
             ),
+            cashu_spilman_keyset_versions: Some(required_cashu_spilman_keyset_versions()),
             pricing_policy: Some("future".to_string()),
         };
         assert_eq!(

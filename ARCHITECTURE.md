@@ -31,7 +31,7 @@ Important types:
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established secp Noise+H2 session
   - manages H2 client, driver handles, task handles, session pricing, session ID
-  - stores fetched `SessionSpilmanInfo` (mint, keyset, receiver pubkey, negotiated Cashu Spilman protocol version) for the active channel
+  - stores fetched `SessionSpilmanInfo` (mint, keyset, receiver pubkey, negotiated Cashu Spilman protocol and keyset-format versions) for the active channel
 - `SessionPricing` (`session.rs`)
   - local billing metadata with precomputed LCM for integer-only arithmetic
 - `proxy_bidirectional` (`proxy.rs`)
@@ -372,7 +372,7 @@ Refresh does not invalidate old keysets by itself. The relay cache stores all ke
 
 Here, "bootstrap" means the MONAD-specific negotiation carried inside the two Noise handshake payloads before the post-handshake session begins.
 
-MONAD currently uses the Noise `NK` pattern instantiated with secp256k1 DH, ChaCha20-Poly1305 for transport encryption, BLAKE2s for hashing, and the fixed prologue `monad-noise-secp256k1-v1`. The client sends a bootstrap request in the first Noise handshake payload, the relay replies with an accept-or-reject payload in the second, and this bootstrap is intentionally strict rather than open-ended negotiation: the client must offer `h2`, at least one mutually supported Cashu Spilman channel protocol version, and at least one mutually supported pricing policy, and the relay selects exactly one of each or rejects the session before H2 starts. Today the only accepted post-handshake session protocol is `h2` (HTTP/2), the only supported Cashu Spilman channel protocol version is `2026-08-29`, and the only supported pricing policy is `session_constant`.
+MONAD currently uses the Noise `NK` pattern instantiated with secp256k1 DH, ChaCha20-Poly1305 for transport encryption, BLAKE2s for hashing, and the fixed prologue `monad-noise-secp256k1-v1`. The client sends a bootstrap request in the first Noise handshake payload, the relay replies with an accept-or-reject payload in the second, and this bootstrap is intentionally strict rather than open-ended negotiation: the client maps each Cashu Spilman channel protocol version to its supported keyset-format versions, must offer `h2` and a mutually supported pricing policy, and the relay selects one session protocol, one Cashu Spilman protocol, and the full mutual keyset-format set or rejects the session before H2 starts. Today the only accepted post-handshake session protocol is `h2` (HTTP/2), `2026-08-29` requires both keyset-format versions `v1` and `v2`, and the only supported pricing policy is `session_constant`. Concrete mint keyset IDs remain relay advertisements on the post-H2 control stream; these bootstrap keyset-format versions are capability identifiers rather than mint keyset IDs.
 
 The `2026-08-29` version fixes canonical deterministic P2PK secret serialization for commitment outputs. It intentionally rejects `2026-03-20` peers so mixed versions cannot authorize different NUT-11 `SIG_ALL` swaps for the same channel state.
 
@@ -550,7 +550,7 @@ Each Noise NK handshake produces a 32-byte **handshake hash** that is identical 
 - Not transmitted over the wire — derived locally from the shared transcript
 - Will be used for channel_id → session_id binding (enforcing one channel per session)
 
-MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The design enforces channel exclusivity and uses delta-based accounting. Before any `ChannelLink` or `ChannelPayment` traffic can happen, the client and relay must already have negotiated a mutually supported Cashu Spilman channel protocol version during the Noise bootstrap.
+MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The design enforces channel exclusivity and uses delta-based accounting. Before any `ChannelLink` or `ChannelPayment` traffic can happen, the client and relay must already have negotiated a mutually supported Cashu Spilman channel protocol version and required keyset-format versions during the Noise bootstrap.
 
 #### 1. Server Advertisement
 The relay is configured with a map of `Mint -> Unit -> Rates`. In the `SessionStatus` message, it advertises these options to the client as a list of `KeysetAdvertisement` objects. Each option includes the `in_bytes_per_millisat` and `out_bytes_per_millisat` specific to that mint/unit choice.
@@ -558,7 +558,7 @@ The relay is configured with a map of `Mint -> Unit -> Rates`. In the `SessionSt
 The relay wallet manager owns a shared in-memory `SpilmanMintCache`. The cache stores all keysets returned by configured mints, active and inactive, for all units the mint reports. Trusted mint/unit policy filters what is advertised and what incoming channel funding/payment keysets are accepted; it does not mean the cache only stores trusted units. Channel close and relay drain swaps use the same shared cache and rely on a single refresh-and-retry path to refresh that mint into SQLite and memory if the mint rejects the first swap because of stale keyset state.
 
 #### 2. Channel Linking
-The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs. If the bootstrap did not negotiate a supported Cashu Spilman channel protocol version, the relay rejects linking immediately.
+The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs. If the bootstrap did not negotiate a supported Cashu Spilman channel protocol version and keyset-format set, the relay rejects linking immediately.
 - **One Session Per Channel**: The relay maintains a global registry of `ChannelId -> SessionId`.
 - **Exclusivity**: If a channel is already linked to another session, the relay sends `ChannelEvicted` to the old session and links the channel to the new one.
 - **Stateless Session Start**: Every new Noise session starts with a `total_paid_millisats` of 0. Only *new* payments made within the current session count as credit.

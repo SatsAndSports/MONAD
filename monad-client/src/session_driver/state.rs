@@ -42,6 +42,8 @@ pub(super) struct RelayConnectionHandles {
     pub(super) pricing_handle: Arc<tokio::sync::RwLock<Option<SessionPricing>>>,
     pub(super) spilman_info_handle: Arc<tokio::sync::RwLock<Option<SessionSpilmanInfo>>>,
     pub(super) cashu_spilman_protocol_version_handle: Arc<tokio::sync::RwLock<Option<String>>>,
+    pub(super) cashu_spilman_keyset_versions_handle:
+        Arc<tokio::sync::RwLock<Option<BTreeSet<String>>>>,
     pub(super) cleartext_byte_counters: CleartextByteCounters,
 }
 
@@ -52,6 +54,7 @@ impl From<&RelayConnection> for RelayConnectionHandles {
             pricing_handle: conn.session_pricing_handle(),
             spilman_info_handle: conn.session_spilman_info_handle(),
             cashu_spilman_protocol_version_handle: conn.cashu_spilman_protocol_version_handle(),
+            cashu_spilman_keyset_versions_handle: conn.cashu_spilman_keyset_versions_handle(),
             cleartext_byte_counters: conn.cleartext_byte_counters(),
         }
     }
@@ -99,6 +102,7 @@ pub(super) struct DriverState {
     pub(super) relay_snapshot: Option<RelaySnapshot>,
     pub(super) established_pricing: Option<SessionPricing>,
     pub(super) cashu_spilman_protocol_version: Option<String>,
+    pub(super) cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
     pub(super) local_session_paid_msats: u64,
     pub(super) intended_channel_id: Option<String>,
     pub(super) intended_offer: Option<RelayPaymentOffer>,
@@ -173,6 +177,7 @@ pub(super) fn state_summary(state: &DriverState, counters: &CleartextByteCounter
 
 pub(super) fn current_spilman_info(state: &DriverState) -> Option<SessionSpilmanInfo> {
     let cashu_spilman_protocol_version = state.cashu_spilman_protocol_version.clone();
+    let cashu_spilman_keyset_versions = state.cashu_spilman_keyset_versions.clone();
     if let Some(offer) = &state.intended_offer {
         return Some(SessionSpilmanInfo {
             receiver_pubkey: offer.receiver_pubkey.clone(),
@@ -185,6 +190,7 @@ pub(super) fn current_spilman_info(state: &DriverState) -> Option<SessionSpilman
                 .unwrap_or_default(),
             keyset_info_json: String::new(),
             cashu_spilman_protocol_version,
+            cashu_spilman_keyset_versions,
         });
     }
 
@@ -201,6 +207,7 @@ pub(super) fn current_spilman_info(state: &DriverState) -> Option<SessionSpilman
             .unwrap_or_default(),
         keyset_info_json: String::new(),
         cashu_spilman_protocol_version,
+        cashu_spilman_keyset_versions,
     })
 }
 
