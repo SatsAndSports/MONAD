@@ -139,7 +139,10 @@ Payments use Cashu Spilman channels. At a high level, a channel commits Cashu
 value to a relay and lets the client authorize monotonically increasing payment
 claims against that committed value. The client can therefore make frequent,
 small payment updates without opening a new Cashu channel for every amount due.
-The relay validates the update and credits only the newly authorized delta.
+The relay validates the update and credits only the newly authorized delta. Once
+a channel is established, each payment is a small signed authorization sent over
+the control stream; no communication with the mint is needed because the relay
+can validate the signature itself.
 
 There are two primary control messages:
 
