@@ -26,8 +26,11 @@ pub fn resolve_blinded_hop_for_intro(
     descriptor: &BlindedHopDescriptor,
 ) -> Result<ResolvedBlindedHop, BlindedHopError> {
     let plaintext = decrypt_blinded_hop_for_intro(intro_identity, &descriptor.message)?;
-    let next_hop_real_pubkey =
-        untweak_pubkey(descriptor.tweaked_pubkey, &plaintext.next_hop_tweak)?;
+    let next_hop_real_pubkey = untweak_pubkey(
+        descriptor.tweaked_pubkey,
+        &plaintext.next_hop_tweak,
+        plaintext.l_prime_y_is_odd,
+    )?;
     Ok(ResolvedBlindedHop {
         next_hop_addr: plaintext.next_hop_addr,
         next_hop_real_pubkey,

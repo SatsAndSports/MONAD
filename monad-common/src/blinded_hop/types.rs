@@ -1,5 +1,4 @@
 use crate::secp_identity::Secp256k1Pubkey;
-use crate::secp_identity::SecpTransportKeypair;
 use k256::elliptic_curve::ff::Field;
 use k256::Scalar;
 use rand_core::OsRng;
@@ -12,8 +11,6 @@ pub enum BlindedHopError {
     InvalidTweak,
     #[error("invalid secp256k1 public key bytes")]
     InvalidPublicKey,
-    #[error("failed to generate randomness")]
-    Randomness,
     #[error("invalid blinded hop payload: {0}")]
     InvalidPayload(&'static str),
     #[error("invalid blinded hop address utf-8: {0}")]
@@ -32,7 +29,7 @@ pub(crate) struct HopTweak([u8; 32]);
 
 impl HopTweak {
     // Raw random tweak generation stays private so callers go through
-    // identity-aware helpers that enforce an even tweaked pubkey.
+    // public-key-aware helpers that enforce an even tweaked pubkey.
     pub(super) fn generate() -> Result<Self, BlindedHopError> {
         loop {
             let scalar = Scalar::random(&mut OsRng);
@@ -42,7 +39,6 @@ impl HopTweak {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -61,6 +57,7 @@ impl HopTweak {
 pub(crate) struct BlindedHopPlaintext {
     pub next_hop_addr: String,
     pub next_hop_tweak: HopTweak,
+    pub l_prime_y_is_odd: bool,
 }
 
 /// A one-shot sealed blinded-hop message.
@@ -112,19 +109,6 @@ pub enum PathHopMode {
 #[derive(Clone, Copy)]
 pub struct PathHop<'a> {
     pub addr: &'a str,
-    pub identity: &'a SecpTransportKeypair,
+    pub pubkey: Secp256k1Pubkey,
     pub mode: PathHopMode,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct TweakedHopPublic {
-    pub tweaked_pubkey: Secp256k1Pubkey,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TweakedHopIdentity {
-    pub tweak: HopTweak,
-    pub tweaked_pubkey: Secp256k1Pubkey,
-    pub responder_secret_key: [u8; 32],
 }

@@ -32,8 +32,9 @@ pub(super) fn encode_blinded_hop_plaintext(
         ));
     }
 
-    let mut out = Vec::with_capacity(32 + plaintext.next_hop_addr.len());
+    let mut out = Vec::with_capacity(33 + plaintext.next_hop_addr.len());
     out.extend_from_slice(plaintext.next_hop_tweak.as_bytes());
+    out.push(u8::from(plaintext.l_prime_y_is_odd));
     out.extend_from_slice(plaintext.next_hop_addr.as_bytes());
     Ok(out)
 }
@@ -42,7 +43,7 @@ pub(super) fn encode_blinded_hop_plaintext(
 pub(super) fn decode_blinded_hop_plaintext(
     bytes: &[u8],
 ) -> Result<BlindedHopPlaintext, BlindedHopError> {
-    if bytes.len() <= 32 {
+    if bytes.len() <= 33 {
         return Err(BlindedHopError::InvalidPayload(
             "blinded hop payload too short",
         ));
@@ -50,7 +51,16 @@ pub(super) fn decode_blinded_hop_plaintext(
 
     let mut tweak = [0u8; 32];
     tweak.copy_from_slice(&bytes[..32]);
-    let addr_bytes = &bytes[32..];
+    let l_prime_y_is_odd = match bytes[32] {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(BlindedHopError::InvalidPayload(
+                "invalid blinded-hop parity flag",
+            ));
+        }
+    };
+    let addr_bytes = &bytes[33..];
     if addr_bytes.is_empty() {
         return Err(BlindedHopError::InvalidPayload(
             "next hop address must not be empty",
@@ -68,6 +78,7 @@ pub(super) fn decode_blinded_hop_plaintext(
     Ok(BlindedHopPlaintext {
         next_hop_addr,
         next_hop_tweak: HopTweak::from_bytes(tweak),
+        l_prime_y_is_odd,
     })
 }
 

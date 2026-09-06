@@ -749,9 +749,10 @@ established, the existing nested Noise+H2 model takes over unchanged.
 Implemented today:
 
 - blinded-hop blob encryption/decryption `(E, ciphertext)`
-- deterministic adjusted-tweak derivation for MONAD's secp256k1 x-only identity model
+- public-key-only blinded-hop construction with a parity flag for MONAD's
+  secp256k1 x-only identity model
 - reverse-tweak recovery of the original secp256k1 x-only public key from
-  `(tweaked_pubkey, tweak)`
+  `(tweaked_pubkey, tweak, parity_flag)`
 - a mixed client-facing `Path` model with:
   - a required cleartext first hop
   - later hops that may be cleartext or blinded
@@ -785,7 +786,7 @@ In the current implementation:
 - `tweaked_pubkey` is a 32-byte x-only secp256k1 pubkey with implied even Y
 - `E` is a 33-byte compressed secp256k1 point
 - the decrypted plaintext inside `ciphertext` is the compact binary payload
-  `[next_hop_tweak:32][next_hop_addr:utf8...]`
+  `[next_hop_tweak:32][l_prime_y_is_odd:1][next_hop_addr:utf8...]`
 
 The client cannot decrypt `ciphertext`, and it does not know the real long-term
 identity behind `tweaked_pubkey`.
@@ -802,6 +803,7 @@ information needed to establish the next relay-to-relay connection:
 - the real network address of `R2`
 - the tweak scalar that `R2` must apply when serving the next nested Noise
   session
+- whether the pre-normalization tweaked point had odd Y
 
 The client does **not** need to know `R2`'s real address or real public key.
 
@@ -825,14 +827,14 @@ key = HKDF(shared_secret)
 and encrypts the plaintext payload with that symmetric key:
 
 ```text
-plaintext = (next_hop_address, next_hop_tweak)
+plaintext = (next_hop_address, next_hop_tweak, l_prime_y_is_odd)
 ciphertext = Encrypt(key, plaintext)
 ```
 
 The current binary payload layout is:
 
 ```text
-[next_hop_tweak:32][next_hop_addr:utf8...]
+[next_hop_tweak:32][l_prime_y_is_odd:1][next_hop_addr:utf8...]
 ```
 
 The address bytes must be non-empty valid UTF-8 and may not contain NUL bytes.
@@ -861,38 +863,42 @@ private key.
 
 ### Tweak Mechanics
 
-Let the next relay's real private scalar be `s`, real public key be
-`S = s*G`, and tweak scalar be `t`.
+Let the next relay's real private scalar be `s`, real public key be `S = s*G`,
+and tweak scalar be `t`. The path constructor needs only `S`, not `s`.
 
 Then:
 
 ```text
-tweaked_private = s + t
-tweaked_public  = S + t*G
+L' = S + t*G
+L  = even-Y representative of L'
 ```
 
-The client sees only `tweaked_public`, not `S` and not `t`.
+The client sees only the x-only encoding of `L`, not `S` and not `t`. The
+encrypted blob contains `t` and one flag recording whether `L'` had odd Y.
 
 The receiving relay applies the tweak on its private side before serving the
-Noise handshake.
-
-In MONAD's current x-only/even-Y transport identity model, blinded-hop
-construction does **not** use rejection sampling anymore.
-
-- sample a candidate tweak `t`
-- derive the candidate tweaked private scalar `s + t`
-- if `(s + t)G` has even Y, keep it
-- if `(s + t)G` has odd Y, negate the tweaked secret to `-(s + t)` and adjust the transmitted tweak to `t' = -(s + t) - s`
-
-This preserves the same x-only public key while ensuring the hidden relay serves
-the even-Y representative that matches MONAD's 32-byte x-only identity format.
-The hidden relay later reconstructs the correct tweaked secret with the normal
-formula `real_secret + tweak` using that adjusted tweak value.
-
-The original long-lived public key can later be recovered from:
+Noise handshake:
 
 ```text
-real_public = tweaked_public - t*G
+candidate_secret = s + t
+
+if candidate_secret * G has even Y:
+    responder_secret = candidate_secret
+else:
+    responder_secret = -candidate_secret
+```
+
+This lets the target relay derive the private key matching the client-visible
+even-Y `L` without revealing `s` to the path constructor.
+
+The introduction relay needs the encrypted parity flag to recover the original
+long-lived public key for relay-to-relay QUIC authentication:
+
+```text
+if L' had even Y:
+    real_public = L - t*G
+else:
+    real_public = -L - t*G
 ```
 
 Because the client-visible `tweaked_public` is always even-Y, it can stay in
