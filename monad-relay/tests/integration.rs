@@ -12129,7 +12129,7 @@ async fn test_nested_blinded_quic_tunnel() {
     let descriptor = build_blinded_hop_descriptor(
         intro_pubkey.to_compressed_bytes(),
         &hidden_addr.to_string(),
-        &hidden_transport_key,
+        hidden_transport_key.pubkey(),
     )
     .unwrap();
 
@@ -12244,7 +12244,7 @@ async fn test_connector_blinded_hop() {
     let descriptor = build_blinded_hop_descriptor(
         intro_pubkey.to_compressed_bytes(),
         &hidden_addr.to_string(),
-        &hidden_transport_key,
+        hidden_transport_key.pubkey(),
     )
     .unwrap();
 
@@ -12284,7 +12284,7 @@ async fn test_connector_rejects_blinded_hop_when_relay_lacks_capability() {
     let descriptor = build_blinded_hop_descriptor(
         intro_pubkey.to_compressed_bytes(),
         &hidden_addr.to_string(),
-        &hidden_transport_key,
+        hidden_transport_key.pubkey(),
     )
     .unwrap();
 
@@ -12429,13 +12429,13 @@ async fn test_connector_two_consecutive_blinded_hops() {
     let descriptor_ab = build_blinded_hop_descriptor(
         intro_pubkey.to_compressed_bytes(),
         &hidden_b_addr.to_string(),
-        &hidden_b_transport_key,
+        hidden_b_transport_key.pubkey(),
     )
     .unwrap();
     let descriptor_bc = build_blinded_hop_descriptor(
         hidden_b_pubkey.to_compressed_bytes(),
         &hidden_c_addr.to_string(),
-        &hidden_c_transport_key,
+        hidden_c_transport_key.pubkey(),
     )
     .unwrap();
 

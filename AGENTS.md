@@ -109,7 +109,7 @@ cargo run -p monad-quic -- ...
 ### Transport Identity Model
 
 - Long-lived relay identities are 32-byte x-only secp256k1 pubkeys with implied even Y.
-- Blinded-hop tweaked pubkeys are also represented as 32-byte x-only pubkeys and are forced even via rejection sampling.
+- Blinded-hop tweaked pubkeys are also represented as 32-byte x-only pubkeys. The path constructor records the pre-normalization parity in the encrypted hop payload, while the hidden relay normalizes its derived responder secret to the even-Y representative.
 - Ephemeral ECDH pubkeys remain 33-byte compressed points.
 - Noise DH uses full curve points internally even when configured identities are x-only.
 
