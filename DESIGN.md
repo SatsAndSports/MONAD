@@ -40,8 +40,10 @@ multiplexed traffic. After its encrypted transport is established, a session
 uses one HTTP/2 connection with two kinds of stream:
 
 - A single `POST /control` stream manages session status and payments.
-- Any number of HTTP/2 `CONNECT` streams ask the relay to open independent TCP
-  connections to destinations such as web servers or SSH hosts.
+- Any number of HTTP/2 `CONNECT` streams ask the relay to open an onward
+  connection. This is usually a TCP connection to a destination such as a web
+  server or SSH host, but it can also be a QUIC connection to the next MONAD
+  relay in a chain, or a blinded-route instruction rather than a real address.
 
 This lets one session carry many application connections without making a new
 encrypted connection for each one. The control stream is deliberately separate
