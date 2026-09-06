@@ -558,6 +558,8 @@ where
             server_accept.cashu_spilman_protocol_version.clone(),
         )
         .await;
+        conn.set_cashu_spilman_keyset_versions(server_accept.cashu_spilman_keyset_versions.clone())
+            .await;
 
         info!(
             "hop {}/{}: H2 connection established",

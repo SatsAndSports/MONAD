@@ -670,13 +670,21 @@ where
         total_hops,
         relay.addr
     );
-    let (send_cipher, recv_cipher, session_id) =
-        noise_secp256k1::handshake_initiator(&mut stream, &relay.pubkey).await?;
+    let (send_cipher, recv_cipher, session_id, server_accept) =
+        noise_secp256k1::handshake_initiator_with_pubkey_and_server_accept(
+            &mut stream,
+            relay.pubkey.to_compressed_bytes(),
+        )
+        .await?;
     let secp_stream =
         noise_secp256k1::SecpNoiseStream::new(stream, send_cipher, recv_cipher, session_id, label);
     let (mut conn, driver) =
         RelayConnection::from_transport_stream(secp_stream, session_id).await?;
     conn.add_driver(driver);
+    conn.set_cashu_spilman_protocol_version(server_accept.cashu_spilman_protocol_version)
+        .await;
+    conn.set_cashu_spilman_keyset_versions(server_accept.cashu_spilman_keyset_versions)
+        .await;
     let hop_label = format!("hop {}/{} to {}", hop_idx + 1, total_hops, relay.addr);
     let (control_task, ready_rx) =
         start_auto_control(&conn, hop_idx, epoch, hop_label.clone(), config, failure_tx).await?;
@@ -700,6 +708,7 @@ async fn start_auto_control(
     let pricing_handle = conn.session_pricing_handle();
     let spilman_info_handle = conn.session_spilman_info_handle();
     let cashu_spilman_protocol_version = conn.cashu_spilman_protocol_version().await;
+    let cashu_spilman_keyset_versions = conn.cashu_spilman_keyset_versions().await;
     let wallet = Arc::new(MockWallet::new());
     let (ready_tx, ready_rx) = oneshot::channel();
 
@@ -889,6 +898,7 @@ async fn start_auto_control(
                                 .unwrap_or_default(),
                             keyset_info_json: String::new(),
                             cashu_spilman_protocol_version: cashu_spilman_protocol_version.clone(),
+                            cashu_spilman_keyset_versions: cashu_spilman_keyset_versions.clone(),
                         });
                         funding.set_active_channel(relay_offer, new_channel_id);
                         continue;

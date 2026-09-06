@@ -76,6 +76,12 @@ pub(super) async fn run_session_driver(
             .read()
             .await
             .clone(),
+        cashu_spilman_keyset_versions: config
+            .conn
+            .cashu_spilman_keyset_versions_handle
+            .read()
+            .await
+            .clone(),
         ..DriverState::default()
     };
     let mut ready_tx = Some(ready_tx);

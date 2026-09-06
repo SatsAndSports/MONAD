@@ -35,6 +35,7 @@ use monad_common::blinded_connect::BlindedConnectRequest;
 use monad_common::blinded_hop::{build_blinded_hop_descriptor, BlindedHopDescriptor};
 use monad_common::bootstrap::{
     decode_server_response, encode_client_hello, initial_server_capabilities,
+    required_cashu_spilman_keyset_versions, supported_cashu_spilman_protocol_keyset_versions,
     BootstrapCapabilities, BootstrapClientHello, BootstrapV1ClientHello, BOOTSTRAP_VERSION,
     CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29, PRICING_POLICY_SESSION_CONSTANT,
 };
@@ -12302,7 +12303,7 @@ async fn test_connector_rejects_blinded_hop_when_relay_lacks_capability() {
 }
 
 #[tokio::test]
-async fn test_connector_stores_negotiated_cashu_spilman_protocol_version() {
+async fn test_connector_stores_negotiated_cashu_spilman_capabilities() {
     let (relay_addr, relay_pubkey) = start_monad_relay().await;
 
     let conn = connect_route_hops(vec![cleartext_route_hop(
@@ -12315,6 +12316,10 @@ async fn test_connector_stores_negotiated_cashu_spilman_protocol_version() {
     assert_eq!(
         conn.cashu_spilman_protocol_version().await.as_deref(),
         Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+    );
+    assert_eq!(
+        conn.cashu_spilman_keyset_versions().await,
+        Some(required_cashu_spilman_keyset_versions())
     );
 
     conn.shutdown().await;
@@ -12347,9 +12352,8 @@ async fn test_bootstrap_rejects_client_without_mutual_pricing_policy() {
             BOOTSTRAP_VERSION.to_string(),
             serde_json::to_value(BootstrapV1ClientHello {
                 session_protocols: vec!["h2".to_string()],
-                cashu_spilman_protocol_versions: vec![
-                    CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()
-                ],
+                cashu_spilman_protocol_keyset_versions:
+                    supported_cashu_spilman_protocol_keyset_versions(),
                 pricing_policies: vec!["future".to_string()],
             })
             .unwrap(),
@@ -12385,7 +12389,10 @@ async fn test_bootstrap_rejects_client_without_mutual_cashu_spilman_protocol_ver
             BOOTSTRAP_VERSION.to_string(),
             serde_json::to_value(BootstrapV1ClientHello {
                 session_protocols: vec!["h2".to_string()],
-                cashu_spilman_protocol_versions: vec!["future".to_string()],
+                cashu_spilman_protocol_keyset_versions: BTreeMap::from([(
+                    "future".to_string(),
+                    BTreeSet::from(["v1".to_string(), "v2".to_string()]),
+                )]),
                 pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
             })
             .unwrap(),
@@ -12404,7 +12411,7 @@ async fn test_bootstrap_rejects_client_without_mutual_cashu_spilman_protocol_ver
 
     match response {
         monad_common::bootstrap::BootstrapServerResponse::Reject { reason, .. } => {
-            assert!(reason.contains("unsupported cashu_spilman_protocol_versions"));
+            assert!(reason.contains("unsupported cashu_spilman_protocol_keyset_versions"));
         }
         monad_common::bootstrap::BootstrapServerResponse::Accept { .. } => {
             panic!("expected bootstrap handshake to be rejected")

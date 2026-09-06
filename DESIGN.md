@@ -90,10 +90,12 @@ does not prescribe how the client discovers that address or key; it only checks
 that the reachable peer proves possession of the configured key.
 
 The two Noise handshake payloads also carry MONAD's bootstrap negotiation. The
-client offers the post-handshake protocol, supported Spilman channel versions,
-and pricing policies. The relay selects compatible values or rejects the
-session before HTTP/2 starts. This makes protocol upgrades explicit rather than
-allowing two peers to establish a session and later disagree about its meaning.
+client offers the post-handshake protocol, maps each supported Spilman channel
+version to supported keyset-format versions, and offers pricing policies. The
+relay selects one compatible Spilman version plus the full mutual keyset-format
+set, or rejects the session before HTTP/2 starts. This makes protocol upgrades
+explicit rather than allowing two peers to establish a session and later
+disagree about its meaning.
 
 ## TCP And QUIC
 

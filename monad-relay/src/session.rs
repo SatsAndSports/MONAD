@@ -26,7 +26,7 @@ use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::{clamp_i128_to_i64, SessionPricing};
 use monad_quic::client::ClientAuthMode;
 use monad_quic::stream::{STREAM_KIND_SECP_NOISE, STREAM_KIND_TWEAKED_NOISE};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -141,6 +141,7 @@ pub(crate) struct SessionState {
     trusted_mint_units: TrustedMintUnits,
     keyset_refresh: Option<Arc<RelayKeysetRefreshCoordinator>>,
     cashu_spilman_protocol_version: Option<String>,
+    cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
 }
 
 impl SessionState {
@@ -180,6 +181,7 @@ impl SessionState {
             trusted_mint_units: config.trusted_mint_units.clone(),
             keyset_refresh: config.keyset_refresh.clone(),
             cashu_spilman_protocol_version: config.cashu_spilman_protocol_version.clone(),
+            cashu_spilman_keyset_versions: config.cashu_spilman_keyset_versions.clone(),
         }
     }
 
@@ -209,7 +211,9 @@ impl SessionState {
         &self,
         payment_json: &str,
     ) -> Result<crate::payments::LinkOutcome, crate::payments::LinkError> {
-        if self.cashu_spilman_protocol_version.is_none() {
+        if self.cashu_spilman_protocol_version.is_none()
+            || self.cashu_spilman_keyset_versions.is_none()
+        {
             return Err(crate::payments::LinkError::UnsupportedCashuSpilmanProtocolVersion);
         }
         self.payments.link_channel(self.session_id, payment_json)
@@ -383,6 +387,7 @@ pub struct RelaySessionConfig {
     pub trusted_mint_units: TrustedMintUnits,
     pub keyset_refresh: Option<Arc<RelayKeysetRefreshCoordinator>>,
     pub cashu_spilman_protocol_version: Option<String>,
+    pub cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
 }

@@ -1,3 +1,6 @@
+use monad_common::bootstrap::{
+    required_cashu_spilman_keyset_versions, CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29,
+};
 use monad_common::protocol::{ServerErrorCode, ServerMessage};
 use monad_test_client::{Circuit, CircuitConfig, RebuildAfterFailureOutcome, TestRelayHandle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -78,6 +81,35 @@ async fn build_three_hop_circuit() -> (
     assert_tunnel_works(&circuit, &target_addr, b"before-rebuild").await;
 
     (circuit, failure_rx, relays, target_addr, initial_ids)
+}
+
+#[tokio::test]
+async fn circuit_publishes_negotiated_spilman_keyset_versions() {
+    let (circuit, _failure_rx, _relays, _target_addr, _initial_ids) =
+        build_three_hop_circuit().await;
+    let conn = circuit.final_conn().expect("final connection available");
+
+    assert_eq!(
+        conn.cashu_spilman_protocol_version().await.as_deref(),
+        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+    );
+    assert_eq!(
+        conn.cashu_spilman_keyset_versions().await,
+        Some(required_cashu_spilman_keyset_versions())
+    );
+
+    let info = conn
+        .session_spilman_info()
+        .await
+        .expect("Spilman session metadata should be published");
+    assert_eq!(
+        info.cashu_spilman_protocol_version.as_deref(),
+        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+    );
+    assert_eq!(
+        info.cashu_spilman_keyset_versions,
+        Some(required_cashu_spilman_keyset_versions())
+    );
 }
 
 async fn expect_failure(

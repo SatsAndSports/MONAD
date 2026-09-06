@@ -7,6 +7,7 @@
 use bytes::Bytes;
 use h2::client;
 use http::{Method, Request, Uri};
+use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -68,6 +69,7 @@ pub struct SessionSpilmanInfo {
     pub keyset_id: String,
     pub keyset_info_json: String,
     pub cashu_spilman_protocol_version: Option<String>,
+    pub cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
 }
 
 impl SessionPricing {
@@ -120,6 +122,8 @@ pub struct RelayConnection {
     session_spilman_info: Arc<RwLock<Option<SessionSpilmanInfo>>>,
     /// Bootstrap-negotiated Cashu Spilman protocol version for this session.
     cashu_spilman_protocol_version: Arc<RwLock<Option<String>>>,
+    /// Bootstrap-negotiated Cashu Spilman keyset-format versions for this session.
+    cashu_spilman_keyset_versions: Arc<RwLock<Option<BTreeSet<String>>>>,
     /// Client-side cleartext byte counters for this relay session.
     /// Semantics intentionally mirror the relay's `session_total_in/out`
     /// billing counters for CONNECT payload bytes and are read by the client
@@ -162,6 +166,7 @@ impl RelayConnection {
             session_pricing: Arc::new(RwLock::new(None)),
             session_spilman_info: Arc::new(RwLock::new(None)),
             cashu_spilman_protocol_version: Arc::new(RwLock::new(None)),
+            cashu_spilman_keyset_versions: Arc::new(RwLock::new(None)),
             cleartext_byte_counters: CleartextByteCounters::default(),
             failure_watchers: Mutex::new(Vec::new()),
         };
@@ -268,6 +273,14 @@ impl RelayConnection {
         *self.cashu_spilman_protocol_version.write().await = version;
     }
 
+    pub async fn cashu_spilman_keyset_versions(&self) -> Option<BTreeSet<String>> {
+        self.cashu_spilman_keyset_versions.read().await.clone()
+    }
+
+    pub async fn set_cashu_spilman_keyset_versions(&self, versions: Option<BTreeSet<String>>) {
+        *self.cashu_spilman_keyset_versions.write().await = versions;
+    }
+
     /// Get a shared handle to the Spilman session metadata storage.
     pub fn session_spilman_info_handle(&self) -> Arc<RwLock<Option<SessionSpilmanInfo>>> {
         self.session_spilman_info.clone()
@@ -275,6 +288,10 @@ impl RelayConnection {
 
     pub fn cashu_spilman_protocol_version_handle(&self) -> Arc<RwLock<Option<String>>> {
         self.cashu_spilman_protocol_version.clone()
+    }
+
+    pub fn cashu_spilman_keyset_versions_handle(&self) -> Arc<RwLock<Option<BTreeSet<String>>>> {
+        self.cashu_spilman_keyset_versions.clone()
     }
 
     /// Get a snapshot of `(inbound, outbound)` client-side cleartext bytes for this session.
