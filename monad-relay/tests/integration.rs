@@ -35,7 +35,7 @@ use monad_common::blinded_connect::BlindedConnectRequest;
 use monad_common::blinded_hop::{build_blinded_hop_descriptor, BlindedHopDescriptor};
 use monad_common::bootstrap::{
     decode_server_response, encode_client_hello, initial_server_capabilities,
-    required_cashu_spilman_keyset_versions, supported_cashu_spilman_protocol_keyset_versions,
+    supported_cashu_spilman_keyset_versions, supported_cashu_spilman_protocol_keyset_versions,
     BootstrapCapabilities, BootstrapClientHello, BootstrapV1ClientHello, BOOTSTRAP_VERSION,
     CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29, PRICING_POLICY_SESSION_CONSTANT,
 };
@@ -92,7 +92,7 @@ const TEST_CHANNEL_CAPACITY_UNITS: u64 = u64::MAX / 4096;
 const MAX_SHARED_BIND_RETRIES: usize = 32;
 const SYNTHETIC_TEST_MINT_URL: &str = "https://test-mint.invalid";
 const SYNTHETIC_TEST_MINT_UNIT: &str = "msat";
-const SYNTHETIC_TEST_KEYSET_ID: &str = "00testkeyset0000";
+const SYNTHETIC_TEST_KEYSET_ID: &str = "0000000000000001";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -233,7 +233,7 @@ fn synthetic_test_mint_cache() -> SpilmanMintCache {
         SYNTHETIC_TEST_MINT_URL,
         SYNTHETIC_TEST_MINT_UNIT,
         SYNTHETIC_TEST_KEYSET_ID,
-        r#"{"keysetId":"00testkeyset0000","unit":"msat","keys":{},"inputFeePpk":0}"#,
+        r#"{"keysetId":"0000000000000001","unit":"msat","keys":{},"inputFeePpk":0}"#,
         true,
     )
 }
@@ -1216,7 +1216,13 @@ async fn create_paid_closed_channel(
         .attach_channel_to_session(&channel_id, session_id)
         .unwrap();
     let link_json = wallet.build_link_request(&channel_id, offer).unwrap();
-    payments.link_channel(session_id, &link_json).unwrap();
+    payments
+        .link_channel(
+            &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+            session_id,
+            &link_json,
+        )
+        .unwrap();
     let payment_json = wallet
         .build_channel_payment(&channel_id, offer, 0, funded_balance_raw)
         .unwrap();
@@ -1252,7 +1258,13 @@ async fn create_paid_open_channel_with_expiry(
         .attach_channel_to_session(&channel_id, session_id)
         .unwrap();
     let link_json = wallet.build_link_request(&channel_id, offer).unwrap();
-    payments.link_channel(session_id, &link_json).unwrap();
+    payments
+        .link_channel(
+            &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+            session_id,
+            &link_json,
+        )
+        .unwrap();
     let payment_json = wallet
         .build_channel_payment(&channel_id, offer, 0, funded_balance_raw)
         .unwrap();
@@ -1656,6 +1668,43 @@ async fn connect_client_tcp(
         false,
     )])
     .await
+}
+
+async fn connect_with_keyset_versions<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+>(
+    mut stream: S,
+    pubkey: &Secp256k1Pubkey,
+    versions: BTreeSet<String>,
+) -> RelayConnection {
+    let mut hello = monad_common::bootstrap::initial_client_hello();
+    hello.versions.get_mut("1").unwrap()["cashu_spilman_protocol_keyset_versions"] =
+        serde_json::json!({"2026-08-29": versions});
+    let (send, recv, session_id, accept) =
+        noise_secp256k1::handshake_initiator_with_pubkey_and_hello(
+            &mut stream,
+            pubkey.to_compressed_bytes(),
+            &hello,
+        )
+        .await
+        .unwrap();
+    assert_eq!(accept.cashu_spilman_keyset_versions, Some(versions));
+    let noise = noise_secp256k1::SecpNoiseStream::new(
+        stream,
+        send,
+        recv,
+        session_id,
+        "custom hello".to_string(),
+    );
+    let (mut conn, driver) = RelayConnection::from_transport_stream(noise, session_id)
+        .await
+        .unwrap();
+    conn.add_driver(driver);
+    conn.set_cashu_spilman_protocol_version(accept.cashu_spilman_protocol_version)
+        .await;
+    conn.set_cashu_spilman_keyset_versions(accept.cashu_spilman_keyset_versions)
+        .await;
+    conn
 }
 
 fn cleartext_route_hop(
@@ -2625,6 +2674,7 @@ async fn test_session_payment_driver_links_unpauses_and_allows_data_flow() {
 async fn assert_session_payment_driver_pays_with_active_keyset_version(
     mint_helper: TestMintHelper,
     expected_keyset_prefix: &str,
+    singleton: bool,
 ) {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
@@ -2666,15 +2716,27 @@ async fn assert_session_payment_driver_pays_with_active_keyset_version(
     .await
     .unwrap();
 
-    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let versions = if singleton {
+        BTreeSet::from([if expected_keyset_prefix == "00" {
+            "v1"
+        } else {
+            "v2"
+        }
+        .to_string()])
+    } else {
+        supported_cashu_spilman_keyset_versions()
+    };
+    let pool = QuicPool::new().unwrap();
+    let stream = pool
+        .open_stream(&server_addr.to_string(), ClientAuthMode::Secp256k1(pubkey))
+        .await
+        .unwrap();
+    let conn = connect_with_keyset_versions(stream, &pubkey, versions.clone()).await;
     assert_eq!(
         conn.cashu_spilman_protocol_version().await.as_deref(),
         Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
     );
-    assert_eq!(
-        conn.cashu_spilman_keyset_versions().await,
-        Some(required_cashu_spilman_keyset_versions())
-    );
+    assert_eq!(conn.cashu_spilman_keyset_versions().await, Some(versions));
 
     let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
         &conn,
@@ -2713,6 +2775,7 @@ async fn test_session_payment_driver_pays_with_v1_active_keyset() {
     assert_session_payment_driver_pays_with_active_keyset_version(
         TestMintHelper::new_v1().await.unwrap(),
         "00",
+        true,
     )
     .await;
 }
@@ -2722,8 +2785,233 @@ async fn test_session_payment_driver_pays_with_v2_active_keyset() {
     assert_session_payment_driver_pays_with_active_keyset_version(
         TestMintHelper::new().await.unwrap(),
         "01",
+        true,
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_payment_driver_pays_with_default_keyset_versions() {
+    assert_session_payment_driver_pays_with_active_keyset_version(
+        TestMintHelper::new_v1().await.unwrap(),
+        "00",
+        false,
+    )
+    .await;
+    assert_session_payment_driver_pays_with_active_keyset_version(
+        TestMintHelper::new().await.unwrap(),
+        "01",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_negotiated_keyset_link_enforcement_is_session_local() {
+    let receiver = cashu::nuts::SecretKey::generate();
+    let mut cache = SpilmanMintCache::default();
+    let mut trusted = BTreeMap::new();
+    let mut wallets = Vec::new();
+    let mut offers = Vec::new();
+    let mut links = Vec::new();
+    let mut ids = Vec::new();
+    for (index, mint) in [
+        TestMintHelper::new_v1().await.unwrap(),
+        TestMintHelper::new().await.unwrap(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let url = format!("https://mint-{index}.invalid");
+        let id = mint.keyset_id().to_string();
+        assert!(id.starts_with(if index == 0 { "00" } else { "01" }));
+        let mint_cache =
+            mint_cache_with_keyset(&url, "sat", &id, mint.keyset_info_json().unwrap(), true);
+        cache.keysets.extend(mint_cache.keysets);
+        cache.advertised.extend(mint_cache.advertised);
+        trusted.insert(url.clone(), BTreeSet::from(["sat".to_string()]));
+        let wallet = TestSigningWallet::new(
+            mint.mint(),
+            receiver.public_key().to_hex(),
+            url.clone(),
+            id.clone(),
+            mint.keyset_info_json().unwrap(),
+        )
+        .await;
+        let channel = wallet.pre_create_channel(1000).await.unwrap();
+        let offer = RelayPaymentOffer {
+            receiver_pubkey: receiver.public_key().to_hex(),
+            mint_url: url,
+            unit: "sat".to_string(),
+            accepted_keyset_ids: vec![id],
+            in_bytes_per_millisat: 1,
+            out_bytes_per_millisat: 1,
+        };
+        wallet.attach_channel_to_session(&channel, [7; 32]).unwrap();
+        links.push(wallet.build_link_request(&channel, &offer).unwrap());
+        wallet
+            .detach_channel_from_session(&channel, [7; 32])
+            .unwrap();
+        offers.push(offer);
+        ids.push(channel);
+        wallets.push(wallet);
+    }
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let (addr, pubkey, relay, stop, payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &SecpTransportKeypair::generate(),
+        receiver,
+        db.path().to_str().unwrap(),
+        cache,
+        trusted,
+    )
+    .await
+    .unwrap();
+    let v1 = BTreeSet::from(["v1".to_string()]);
+    let v2 = BTreeSet::from(["v2".to_string()]);
+    // Reject before persistence, including a valid signed funding package.
+    assert_eq!(
+        payments.link_channel(&v1, [9; 32], &links[1]).unwrap_err(),
+        monad_relay::payments::LinkError::KeysetVersionNotNegotiated
+    );
+    assert!(payments.linked_channel_status(&ids[1]).is_none());
+    let pool = QuicPool::new().unwrap();
+    let good = connect_with_keyset_versions(
+        pool.open_stream(&addr.to_string(), ClientAuthMode::Secp256k1(pubkey))
+            .await
+            .unwrap(),
+        &pubkey,
+        v2.clone(),
+    )
+    .await;
+    let bad = connect_with_keyset_versions(
+        pool.open_stream(&addr.to_string(), ClientAuthMode::Secp256k1(pubkey))
+            .await
+            .unwrap(),
+        &pubkey,
+        v1.clone(),
+    )
+    .await;
+    let (mut good_send, mut good_recv) = good.open_control().await.unwrap();
+    let (mut bad_send, mut bad_recv) = bad.open_control().await.unwrap();
+    for (send, recv, index) in [
+        (&mut good_send, &mut good_recv, 1),
+        (&mut bad_send, &mut bad_recv, 0),
+    ] {
+        let status = control_handshake_status(send, recv).await;
+        assert_eq!(status.advertisements.len(), 1);
+        assert!(
+            status.advertisements[0].keyset_ids[0].starts_with(if index == 0 {
+                "00"
+            } else {
+                "01"
+            })
+        );
+        send_control_message(
+            send,
+            &ClientMessage::ChannelLink {
+                payment_json: links[index].clone(),
+            },
+            false,
+        )
+        .await;
+        let linked = expect_session_status_struct(read_control_message(recv).await);
+        assert_eq!(linked.linked_channel.unwrap().channel_id, ids[index]);
+    }
+    // Incoming params cannot override or bypass authoritative stored funding.
+    let mut omitted: serde_json::Value = serde_json::from_str(&links[1]).unwrap();
+    omitted.as_object_mut().unwrap().remove("params");
+    omitted.as_object_mut().unwrap().remove("funding_proofs");
+    for payload in [&links[1], &omitted.to_string()] {
+        assert_eq!(
+            payments
+                .link_channel(&v1, *bad.session_id(), payload)
+                .unwrap_err(),
+            monad_relay::payments::LinkError::KeysetVersionNotNegotiated
+        );
+        assert!(payments
+            .link_channel(&v2, *good.session_id(), &links[1])
+            .unwrap()
+            .evicted_session
+            .is_none());
+    }
+    let mut spoofed: serde_json::Value = serde_json::from_str(&links[1]).unwrap();
+    spoofed["params"] =
+        serde_json::from_str::<serde_json::Value>(&links[0]).unwrap()["params"].clone();
+    assert_eq!(
+        payments
+            .link_channel(&v1, *bad.session_id(), &spoofed.to_string())
+            .unwrap_err(),
+        monad_relay::payments::LinkError::KeysetVersionNotNegotiated
+    );
+
+    wallets[0]
+        .attach_channel_to_session(&ids[0], *bad.session_id())
+        .unwrap();
+    let payment = wallets[0]
+        .build_channel_payment(&ids[0], &offers[0], 0, 100)
+        .unwrap();
+    send_control_message(
+        &mut bad_send,
+        &ClientMessage::ChannelPayment {
+            payment_json: payment,
+        },
+        false,
+    )
+    .await;
+    assert!(!expect_session_status_struct(read_control_message(&mut bad_recv).await).paused);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(listener));
+    let mut tunnel = bad.open_tunnel(&target.to_string()).await.unwrap();
+    tunnel.write_all(b"x").await.unwrap();
+    let mut byte = [0];
+    tunnel.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"X");
+    send_control_message(
+        &mut bad_send,
+        &ClientMessage::ChannelLink {
+            payment_json: omitted.to_string(),
+        },
+        false,
+    )
+    .await;
+    assert!(matches!(
+        read_control_message(&mut bad_recv).await,
+        ServerMessage::Error {
+            code: ServerErrorCode::LinkKeysetVersionNotNegotiated,
+            ..
+        }
+    ));
+    let ended = timeout(Duration::from_secs(2), tunnel.read(&mut byte))
+        .await
+        .expect("offending data stream must end");
+    assert!(ended.is_err() || ended.unwrap() == 0);
+    assert!(
+        payments
+            .link_channel(&v1, [8; 32], &links[0])
+            .unwrap()
+            .evicted_session
+            .is_none(),
+        "fatal session must release its previous channel"
+    );
+    send_control_message(&mut good_send, &ClientMessage::GetSessionStatus, false).await;
+    assert_eq!(
+        expect_session_status_struct(read_control_message(&mut good_recv).await)
+            .linked_channel
+            .unwrap()
+            .channel_id,
+        ids[1]
+    );
+    assert!(payments
+        .link_channel(&v2, *good.session_id(), &links[1])
+        .unwrap()
+        .evicted_session
+        .is_none());
+    bad.shutdown().await;
+    good.shutdown().await;
+    let _ = stop.send(());
+    relay.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -5276,7 +5564,26 @@ async fn test_control_refresh_keysets_updates_advertisements() {
     .await
     .unwrap();
 
-    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    assert!(old_keyset_id.starts_with("01"));
+    let conn = connect_with_keyset_versions(
+        TcpStream::connect(server_addr).await.unwrap(),
+        &pubkey,
+        BTreeSet::from(["v2".to_string()]),
+    )
+    .await;
+    let incompatible = connect_with_keyset_versions(
+        TcpStream::connect(server_addr).await.unwrap(),
+        &pubkey,
+        BTreeSet::from(["v1".to_string()]),
+    )
+    .await;
+    let (mut incompatible_send, mut incompatible_recv) = incompatible.open_control().await.unwrap();
+    assert!(
+        control_handshake_status(&mut incompatible_send, &mut incompatible_recv)
+            .await
+            .advertisements
+            .is_empty()
+    );
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
     let initial = control_handshake_status(&mut control_send, &mut control_recv).await;
     let initial_sat = initial
@@ -5306,6 +5613,23 @@ async fn test_control_refresh_keysets_updates_advertisements() {
         .expect("refreshed sat advertisement");
     assert!(refreshed_sat.keyset_ids.contains(&old_keyset_id));
     assert!(refreshed_sat.keyset_ids.contains(&new_keyset_id));
+
+    send_control_message(
+        &mut incompatible_send,
+        &ClientMessage::RefreshKeysets {
+            mint_url: mint_url.clone(),
+            unit: "sat".to_string(),
+        },
+        false,
+    )
+    .await;
+    let incompatible_status =
+        expect_session_status_struct(read_control_message(&mut incompatible_recv).await);
+    assert!(
+        incompatible_status.advertisements.is_empty(),
+        "refresh must not leak incompatible IDs"
+    );
+    incompatible.shutdown().await;
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -5587,7 +5911,7 @@ async fn test_control_refresh_keysets_failure_preserves_old_keyset_channel_link_
 #[tokio::test(flavor = "multi_thread")]
 async fn test_control_refresh_keysets_rejects_untrusted_mint_or_unit() {
     let trusted_mint_url = "https://trusted-refresh-mint.invalid".to_string();
-    let keyset_id = "00trustedrefreshkeyset".to_string();
+    let keyset_id = "0000000000000002".to_string();
     let keyset_info_json = serde_json::json!({
         "keysetId": keyset_id,
         "unit": "sat",
@@ -5672,7 +5996,7 @@ async fn test_control_refresh_keysets_rejects_untrusted_mint_or_unit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_control_refresh_keysets_unavailable_without_refresher() {
     let trusted_mint_url = "https://trusted-refresh-mint.invalid".to_string();
-    let keyset_id = "00trustedrefreshkeyset".to_string();
+    let keyset_id = "0000000000000002".to_string();
     let keyset_info_json = serde_json::json!({
         "keysetId": keyset_id,
         "unit": "sat",
@@ -5761,7 +6085,7 @@ async fn test_control_refresh_keysets_unavailable_without_refresher() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_control_refresh_keysets_failure_preserves_cached_advertisements() {
-    let keyset_id = "00trustedrefreshkeyset".to_string();
+    let keyset_id = "0000000000000002".to_string();
     let keyset_info_json = serde_json::json!({
         "keysetId": keyset_id,
         "unit": "sat",
@@ -10317,7 +10641,13 @@ async fn test_wallet_manager_drain_swap_ignores_non_closed_channels() {
         .wallet
         .build_link_request(&channel_id, &ctx.offer)
         .unwrap();
-    ctx.payments.link_channel([14u8; 32], &link_json).unwrap();
+    ctx.payments
+        .link_channel(
+            &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+            [14u8; 32],
+            &link_json,
+        )
+        .unwrap();
     let payment_json = ctx
         .wallet
         .build_channel_payment(&channel_id, &ctx.offer, 0, 100)
@@ -12423,7 +12753,7 @@ async fn test_connector_stores_negotiated_cashu_spilman_capabilities() {
     );
     assert_eq!(
         conn.cashu_spilman_keyset_versions().await,
-        Some(required_cashu_spilman_keyset_versions())
+        Some(supported_cashu_spilman_keyset_versions())
     );
 
     conn.shutdown().await;

@@ -110,6 +110,109 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn fatal_keyset_error_ends_driver_without_invalidating_wallet_channel() {
+        use crate::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
+        use monad_common::control_codec::{send_json_line, try_decode_json_line};
+        use monad_common::protocol::{ClientMessage, ServerMessage};
+        let wallet = Arc::new(MockWallet::new());
+        wallet
+            .insert_channel(WalletChannel {
+                channel_id: "channel".to_string(),
+                state: WalletChannelState::Open,
+                receiver_pubkey: "receiver".to_string(),
+                mint_url: "https://mint".to_string(),
+                unit: "msat".to_string(),
+                keyset_id: "keyset-a".to_string(),
+                attached_session_id: None,
+                capacity_msats: 1000,
+                current_signed_balance_msats: 0,
+                expiry_timestamp: u64::MAX,
+            })
+            .unwrap();
+        let (client, server) = tokio::io::duplex(4096);
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server_task = tokio::spawn(async move {
+            let mut server = h2::server::handshake(server).await.unwrap();
+            let (request, mut respond) = server.accept().await.unwrap().unwrap();
+            let mut recv = request.into_body();
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let driver = tokio::spawn(async move { while server.accept().await.is_some() {} });
+            send_json_line(
+                &mut send,
+                &ServerMessage::SessionStatus {
+                    receiver_pubkey: "receiver".to_string(),
+                    advertisements: snapshot(true).advertisements,
+                    linked_channel: None,
+                    active_in_rate: 1,
+                    active_out_rate: 1,
+                    session_total_in: 0,
+                    session_total_out: 0,
+                    total_paid_millisats: 0,
+                    remaining_milli_sats: 0,
+                    paused: true,
+                    open_connects: 0,
+                    total_connects: 0,
+                },
+            )
+            .await
+            .unwrap();
+            let mut buf = Vec::new();
+            loop {
+                let data = recv.data().await.unwrap().unwrap();
+                recv.flow_control().release_capacity(data.len()).unwrap();
+                buf.extend_from_slice(&data);
+                if let Some(message) = try_decode_json_line::<ClientMessage>(&mut buf).unwrap() {
+                    assert!(matches!(message, ClientMessage::ChannelLink { .. }));
+                    break;
+                }
+            }
+            send_json_line(
+                &mut send,
+                &ServerMessage::Error {
+                    code: ServerErrorCode::LinkKeysetVersionNotNegotiated,
+                    message: "unnegotiated funding".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+            // Keep the stream open: termination must be caused by the error, not EOF.
+            let _ = stopped.await;
+            driver.abort();
+            let _ = driver.await;
+        });
+        let (mut conn, driver) =
+            monad_common::session::RelayConnection::from_transport_stream(client, [1; 32])
+                .await
+                .unwrap();
+        conn.add_driver(driver);
+        let (handle, ready, failed) = super::start_session_payment_driver(
+            &conn,
+            wallet.clone(),
+            "fatal test",
+            PaymentPolicy::default(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*failed.borrow());
+        assert!(ready.await.is_err());
+        let channel = wallet.get_channel("channel").unwrap();
+        assert_eq!(channel.state, WalletChannelState::Open);
+        assert_eq!(channel.attached_session_id, None);
+        wallet
+            .attach_channel_to_session("channel", [2; 32])
+            .unwrap();
+        let _ = stop.send(());
+        server_task.await.unwrap();
+        conn.shutdown().await;
+    }
+
     #[test]
     fn relay_confirms_active_channel_matches_ids() {
         let state = DriverState {

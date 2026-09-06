@@ -216,7 +216,13 @@ impl SessionState {
         {
             return Err(crate::payments::LinkError::UnsupportedCashuSpilmanProtocolVersion);
         }
-        self.payments.link_channel(self.session_id, payment_json)
+        self.payments.link_channel(
+            self.cashu_spilman_keyset_versions
+                .as_ref()
+                .expect("checked above"),
+            self.session_id,
+            payment_json,
+        )
     }
 
     pub(crate) fn apply_channel_payment(
@@ -262,7 +268,19 @@ impl SessionState {
             .clone();
         for (mint_url, trusted_units) in &self.trusted_mint_units {
             for unit in trusted_units {
-                let keyset_ids = mint_cache.keyset_ids(mint_url, unit);
+                let keyset_ids: Vec<_> = mint_cache
+                    .keyset_ids(mint_url, unit)
+                    .into_iter()
+                    .filter(|id| {
+                        id.parse::<cashu::nuts::Id>().ok().is_some_and(|id| {
+                            self.cashu_spilman_keyset_versions
+                                .as_ref()
+                                .is_some_and(|versions| {
+                                    crate::payments::keyset_version_is_negotiated(&id, versions)
+                                })
+                        })
+                    })
+                    .collect();
                 if keyset_ids.is_empty() {
                     continue;
                 }
@@ -298,7 +316,8 @@ impl SessionState {
     }
 
     async fn is_paused(&self) -> bool {
-        self.billing.lock().await.state.paused
+        let billing = self.billing.lock().await;
+        billing.state.paused || billing.state.terminated
     }
 
     async fn attach_control(&self, tx: mpsc::UnboundedSender<ServerMessage>) -> Result<(), ()> {
@@ -780,6 +799,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
             }
         }
 
+        if self.state.billing.lock().await.state.terminated {
+            // Flush queued control errors without letting a peer delay teardown indefinitely.
+            self.h2_conn.graceful_shutdown();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                std::future::poll_fn(|cx| self.h2_conn.poll_closed(cx)),
+            )
+            .await;
+        }
         self.state
             .session_registry
             .deregister_session(&self.session_id);
@@ -823,6 +851,7 @@ async fn handle_control_stream(
 ) -> io::Result<()> {
     info!("control channel opened");
 
+    let result = async {
     let mut buf = Vec::new();
     // Bootstrap stays outside the explicit steady-state session FSM. After the
     // pre-H2 Noise bootstrap selected the session protocol, we immediately send
@@ -933,12 +962,15 @@ async fn handle_control_stream(
         }
     }
 
-    let _ = process_session_event(&state, SessionEvent::ControlDetached, &mut h2_send).await?;
+    Ok(())
+    }.await;
 
+    // Cleanup must run even when a control write or reducer effect fails.
+    let _ = process_session_event(&state, SessionEvent::ControlDetached, &mut h2_send).await;
     state.detach_control().await;
     let _ = h2_send.send_data(Bytes::new(), true);
     info!("control channel closed");
-    Ok(())
+    result
 }
 
 async fn process_session_event(
@@ -969,4 +1001,181 @@ async fn process_session_event(
     }
 
     Ok(terminate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::listener::{shared_spilman_mint_cache, CachedKeyset, SpilmanMintCache};
+    use crate::payments::{testing::InMemoryRelayPayments, LinkError};
+    use monad_common::bootstrap::{
+        supported_cashu_spilman_keyset_versions, CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29,
+    };
+    use std::collections::BTreeMap;
+
+    fn test_state() -> (SessionState, Arc<InMemoryRelayPayments>) {
+        let payments = Arc::new(InMemoryRelayPayments::new());
+        let state = SessionState::new(
+            [1; 32],
+            &RelaySessionConfig {
+                payments: payments.clone(),
+                session_registry: Arc::new(SessionRegistry::default()),
+                transport_key: SecpTransportKeypair::generate(),
+                receiver_pubkey_hex: "receiver".to_string(),
+                spilman_mint_cache: shared_spilman_mint_cache(SpilmanMintCache::default()),
+                trusted_mint_units: BTreeMap::from([(
+                    "mint".to_string(),
+                    BTreeSet::from(["sat".to_string()]),
+                )]),
+                keyset_refresh: None,
+                cashu_spilman_protocol_version: Some(
+                    CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                ),
+                cashu_spilman_keyset_versions: Some(BTreeSet::from(["v1".to_string()])),
+                in_bytes_per_millisat: 1,
+                out_bytes_per_millisat: 1,
+            },
+        );
+        (state, payments)
+    }
+
+    #[tokio::test]
+    async fn status_filters_versions_and_rechecks_refreshed_cache() {
+        let (mut state, _) = test_state();
+        let v1 = "0000000000000001".to_string();
+        let inactive = "0000000000000002".to_string();
+        let v2 = format!("01{}", "11".repeat(32));
+        {
+            let mut cache = state.spilman_mint_cache.write().unwrap();
+            cache.advertised.insert(
+                "mint".to_string(),
+                BTreeMap::from([
+                    (
+                        "sat".to_string(),
+                        vec![
+                            v1.clone(),
+                            inactive.clone(),
+                            v2.clone(),
+                            "invalid".to_string(),
+                        ],
+                    ),
+                    ("msat".to_string(), vec![v1.clone()]),
+                ]),
+            );
+            cache.advertised.insert(
+                "untrusted".to_string(),
+                BTreeMap::from([("sat".to_string(), vec![v1.clone()])]),
+            );
+            cache.keysets.insert(
+                "mint".to_string(),
+                BTreeMap::from([(
+                    inactive.clone(),
+                    CachedKeyset {
+                        unit: "sat".to_string(),
+                        active: false,
+                        input_fee_ppk: 0,
+                        info_json: "{}".to_string(),
+                    },
+                )]),
+            );
+        }
+        let ServerMessage::SessionStatus { advertisements, .. } =
+            state.session_status_message().await
+        else {
+            panic!()
+        };
+        assert_eq!(advertisements.len(), 1);
+        assert_eq!(advertisements[0].keyset_ids, vec![v1, inactive.clone()]);
+        state.cashu_spilman_keyset_versions = Some(BTreeSet::from(["v2".to_string()]));
+        let ServerMessage::SessionStatus { advertisements, .. } =
+            state.session_status_message().await
+        else {
+            panic!()
+        };
+        assert_eq!(advertisements[0].keyset_ids, vec![v2]);
+        // A refresh replaces the shared cache; filtering is applied again at read time.
+        state
+            .spilman_mint_cache
+            .write()
+            .unwrap()
+            .advertised
+            .get_mut("mint")
+            .unwrap()
+            .insert("sat".to_string(), vec![inactive.clone()]);
+        let ServerMessage::SessionStatus { advertisements, .. } =
+            state.session_status_message().await
+        else {
+            panic!()
+        };
+        assert!(advertisements.is_empty());
+        assert_eq!(
+            state
+                .spilman_mint_cache
+                .read()
+                .unwrap()
+                .keyset_ids("mint", "sat"),
+            vec![inactive]
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_cleanup_survives_reset_and_blocked_error_delivery() {
+        for reset in [false, true] {
+            let (state, payments) = test_state();
+            let link = payments
+                .link_channel(
+                    &supported_cashu_spilman_keyset_versions(),
+                    state.session_id,
+                    r#"{"channel_id":"owned","balance":0,"capacity":100,"unit":"msat"}"#,
+                )
+                .unwrap();
+            state.billing.lock().await.state.linked_channel_id = Some(link.channel_id);
+            let (client, server) = tokio::io::duplex(4096);
+            let client_task = tokio::spawn(async move {
+                let (mut client, connection) = h2::client::Builder::new()
+                    .initial_window_size(0)
+                    .handshake::<_, Bytes>(client)
+                    .await
+                    .unwrap();
+                let driver = tokio::spawn(connection);
+                let request = Request::builder()
+                    .method(Method::POST)
+                    .uri("https://monad/control")
+                    .body(())
+                    .unwrap();
+                let (response, send) = client.send_request(request, false).unwrap();
+                (response, send, driver)
+            });
+            let mut server = h2::server::handshake(server).await.unwrap();
+            let (_request, mut respond) = server.accept().await.unwrap().unwrap();
+            let mut send = respond.send_response(Response::new(()), false).unwrap();
+            let server_driver =
+                tokio::spawn(async move { while server.accept().await.is_some() {} });
+            let (response, mut client_send, client_driver) = client_task.await.unwrap();
+            let _response = response.await.unwrap();
+            if reset {
+                client_send.send_reset(h2::Reason::CANCEL);
+            }
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                process_session_event(
+                    &state,
+                    SessionEvent::LinkValidationFinished(Err(
+                        LinkError::KeysetVersionNotNegotiated
+                    )),
+                    &mut send
+                )
+            )
+            .await
+            .unwrap()
+            .unwrap());
+            assert!(state.is_terminated());
+            assert!(payments.owner_of("owned").is_none());
+            assert!(state.billing.lock().await.state.terminated);
+            server_driver.abort();
+            client_driver.abort();
+            let _ = server_driver.await;
+            let _ = client_driver.await;
+        }
+    }
 }

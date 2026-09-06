@@ -43,6 +43,7 @@ pub enum ServerErrorCode {
     LinkReceiverMismatch,
     LinkMintOrKeysetUnacceptable,
     LinkUnsupportedCashuSpilmanProtocolVersion,
+    LinkKeysetVersionNotNegotiated,
     LinkUnsupportedUnit,
     LinkNonZeroBalance,
     ChannelExpired,

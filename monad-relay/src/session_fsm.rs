@@ -86,6 +86,19 @@ pub(crate) fn step(
                 effects.push(SessionEffect::SendStatus);
                 effects
             }
+            Err(LinkError::KeysetVersionNotNegotiated) => {
+                state.terminated = true;
+                let mut effects = Vec::new();
+                if let Some(channel_id) = state.linked_channel_id.take() {
+                    effects.push(SessionEffect::ReleaseLinkedChannelOwnership { channel_id });
+                }
+                effects.push(SessionEffect::SendControl(ServerMessage::Error {
+                    code: LinkError::KeysetVersionNotNegotiated.code(),
+                    message: LinkError::KeysetVersionNotNegotiated.to_string(),
+                }));
+                effects.push(SessionEffect::EndSession);
+                effects
+            }
             Err(err) => vec![SessionEffect::SendControl(ServerMessage::Error {
                 code: err.code(),
                 message: err.to_string(),

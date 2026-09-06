@@ -29,7 +29,7 @@ use tracing::{info, warn};
 pub const MAX_SHARED_BIND_RETRIES: usize = 32;
 pub const SYNTHETIC_TEST_MINT_URL: &str = "https://test-mint.invalid";
 pub const SYNTHETIC_TEST_MINT_UNIT: &str = "msat";
-pub const SYNTHETIC_TEST_KEYSET_ID: &str = "00testkeyset0000";
+pub const SYNTHETIC_TEST_KEYSET_ID: &str = "0000000000000001";
 pub const DEFAULT_MOCK_CHANNEL_CAPACITY_MSATS: u64 = 1_000_000_000_000;
 pub const DEFAULT_BYTES_PER_MILLISAT: u64 = 1024 * 1024;
 
@@ -600,7 +600,7 @@ fn synthetic_test_mint_cache() -> SpilmanMintCache {
                 active: true,
                 input_fee_ppk: 0,
                 info_json:
-                    r#"{"keysetId":"00testkeyset0000","unit":"msat","keys":{},"inputFeePpk":0}"#
+                    r#"{"keysetId":"0000000000000001","unit":"msat","keys":{},"inputFeePpk":0}"#
                         .to_string(),
             },
         )]),

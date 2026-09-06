@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::bootstrap::{
     decode_client_hello, decode_server_response, decode_v1_client_hello, decode_v1_server_accept,
     encode_client_hello, encode_server_response, highest_supported_version, initial_client_hello,
-    initial_server_accept, is_supported_cashu_spilman_protocol_version,
+    initial_server_accept_v1, is_supported_cashu_spilman_protocol_version,
     is_supported_pricing_policy, server_accept, supported_bootstrap_versions,
     validate_v1_client_hello, validate_v1_server_accept, BootstrapServerResponse,
     BootstrapV1ClientHello, BootstrapV1ServerAccept, BOOTSTRAP_VERSION,
@@ -359,7 +359,22 @@ pub async fn handshake_initiator_with_pubkey_and_server_accept<
     [u8; 32],
     BootstrapV1ServerAccept,
 )> {
-    let client_payload = encode_client_hello(&initial_client_hello())?;
+    handshake_initiator_with_pubkey_and_hello(stream, server_pubkey, &initial_client_hello()).await
+}
+
+/// Custom bootstrap offer for protocol conformance tests. Production uses the default hello.
+pub async fn handshake_initiator_with_pubkey_and_hello<T: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut T,
+    server_pubkey: [u8; 33],
+    hello: &crate::bootstrap::BootstrapClientHello,
+) -> io::Result<(
+    CipherState<ChaCha20Poly1305>,
+    CipherState<ChaCha20Poly1305>,
+    [u8; 32],
+    BootstrapV1ServerAccept,
+)> {
+    let client_payload = encode_client_hello(hello)?;
+    let offered = decode_v1_client_hello(hello).map_err(io::Error::other)?;
     let (send, recv, session_id, server_payload) =
         handshake_initiator_with_pubkey_and_payload(stream, server_pubkey, &client_payload).await?;
     let response = decode_server_response(&server_payload)?;
@@ -374,7 +389,7 @@ pub async fn handshake_initiator_with_pubkey_and_server_accept<
                 )));
             }
             let accept = decode_v1_server_accept(response)?;
-            validate_v1_server_accept(&accept)
+            validate_v1_server_accept(&accept, &offered)
                 .map_err(|e| io::Error::other(format!("invalid relay bootstrap accept: {e}")))?;
             let version = accept
                 .cashu_spilman_protocol_version
@@ -614,7 +629,13 @@ pub async fn handshake_responder_with_secret_key_bytes<T: AsyncRead + AsyncWrite
                     Some(BOOTSTRAP_VERSION) => match decode_v1_client_hello(&client_hello)
                         .and_then(|hello| validate_v1_client_hello(&hello).map(|_| hello))
                     {
-                        Ok(_) => (initial_server_accept(), true),
+                        Ok(hello) => {
+                            let mut accept = initial_server_accept_v1();
+                            let (protocol, versions) = crate::bootstrap::select_cashu_spilman_protocol_keyset_versions(&hello.cashu_spilman_protocol_keyset_versions).expect("validated hello");
+                            accept.cashu_spilman_protocol_version = Some(protocol);
+                            accept.cashu_spilman_keyset_versions = Some(versions);
+                            (server_accept(accept), true)
+                        }
                         Err(reason) => (
                             BootstrapServerResponse::Reject {
                                 supported_versions: supported_bootstrap_versions(),
@@ -706,6 +727,52 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn custom_hello_negotiates_singletons_and_rejects_unoffered_accept() {
+        for version in ["v1", "v2"] {
+            for unoffered_accept in [false, true] {
+                let key = SecpTransportKeypair::generate();
+                let pubkey = key.pubkey();
+                let (mut client, mut server) = tokio::io::duplex(4096);
+                let responder = tokio::spawn(async move {
+                    if unoffered_accept {
+                        handshake_responder_with_secret_key_bytes_and_server_accept(
+                            &mut server,
+                            key.normalized_secret_bytes(),
+                            initial_server_accept_v1(),
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        handshake_responder(&mut server, &key).await.unwrap();
+                    }
+                });
+                let mut hello = initial_client_hello();
+                hello.versions.get_mut("1").unwrap()["cashu_spilman_protocol_keyset_versions"] =
+                    serde_json::json!({"2026-08-29": [version]});
+                let result = handshake_initiator_with_pubkey_and_hello(
+                    &mut client,
+                    pubkey.to_compressed_bytes(),
+                    &hello,
+                )
+                .await;
+                if unoffered_accept {
+                    assert!(result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("unsupported cashu_spilman_keyset_versions"));
+                } else {
+                    assert_eq!(
+                        result.unwrap().3.cashu_spilman_keyset_versions,
+                        Some(std::collections::BTreeSet::from([version.to_string()]))
+                    );
+                }
+                responder.await.unwrap();
+            }
+        }
+    }
 
     struct LimitedWrite<T> {
         inner: T,

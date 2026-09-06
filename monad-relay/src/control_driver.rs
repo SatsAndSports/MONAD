@@ -32,7 +32,22 @@ impl<'a> ControlDriver<'a> {
     ) -> io::Result<bool> {
         match effect {
             SessionEffect::SendControl(message) => {
-                send_control_message(self.h2_send, &message).await?;
+                if matches!(
+                    &message,
+                    ServerMessage::Error {
+                        code: ServerErrorCode::LinkKeysetVersionNotNegotiated,
+                        ..
+                    }
+                ) {
+                    // Never let a reset or exhausted control window prevent EndSession.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(250),
+                        send_control_message(self.h2_send, &message),
+                    )
+                    .await;
+                } else {
+                    send_control_message(self.h2_send, &message).await?;
+                }
             }
             SessionEffect::SendStatus => {
                 let status = self.state.session_status_message().await;
