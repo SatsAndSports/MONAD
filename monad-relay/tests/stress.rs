@@ -32,7 +32,7 @@ use tokio::time::Instant;
 const MAX_SHARED_BIND_RETRIES: usize = 32;
 const SYNTHETIC_TEST_MINT_URL: &str = "https://test-mint.invalid";
 const SYNTHETIC_TEST_MINT_UNIT: &str = "msat";
-const SYNTHETIC_TEST_KEYSET_ID: &str = "00testkeyset0000";
+const SYNTHETIC_TEST_KEYSET_ID: &str = "0000000000000001";
 const STRESS_CHANNEL_CAPACITY_MSATS: u64 = 1_000_000_000_000;
 const DEFAULT_PAYMENT_STATUS_POLL_MS: u64 = 100;
 const DEFAULT_INITIAL_PAYMENT_MSATS: u64 = 100_000;
@@ -438,7 +438,7 @@ fn synthetic_test_mint_cache() -> SpilmanMintCache {
                 active: true,
                 input_fee_ppk: 0,
                 info_json:
-                    r#"{"keysetId":"00testkeyset0000","unit":"msat","keys":{},"inputFeePpk":0}"#
+                    r#"{"keysetId":"0000000000000001","unit":"msat","keys":{},"inputFeePpk":0}"#
                         .to_string(),
             },
         )]),

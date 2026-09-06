@@ -65,7 +65,7 @@ cargo run -p monad-quic -- ...
 ### Control Protocol
 
 - Wire format: JSON newline-delimited messages on the H2 control stream (`POST /control`)
-- Bootstrap: the two Noise handshake payloads negotiate the session version/capabilities and post-Noise session protocol (`h2` today), plus one Cashu Spilman protocol and the full mutual keyset-format version set; today `2026-08-29` requires both `v1` and `v2`, and the relay can reject with a reason before H2 starts
+- Bootstrap: the two Noise handshake payloads negotiate the session version/capabilities and post-Noise session protocol (`h2` today), plus one Cashu Spilman protocol and the full mutual keyset-format version set; today `2026-08-29` supports `v1` and `v2` and requires a nonempty intersection, and the relay can reject with a reason before H2 starts
 - Initial state: once the H2 control stream is established, the relay immediately sends a unified `SessionStatus` containing advertisements and initial state
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, integer-only via precomputed LCM
@@ -75,6 +75,7 @@ cargo run -p monad-quic -- ...
 - `RefreshKeysets { mint_url, unit }` asks the relay to refresh keyset metadata for one configured trusted mint/unit; on success or cooldown skip the relay replies with a fresh `SessionStatus`, while policy rejection or refresh failure returns `Error`. Requests are handled through a shared per-mint cooldown/singleflight coordinator with global concurrency and timeout limits.
 - `Error { code, message }` for relay-initiated rejections and notifications
 - `ChannelLink { payment_json }` links a Spilman channel to the session; relay validates and then sends an authoritative `SessionStatus` on success or `Error` on failure. Only one session can own a channel at a time.
+- Negotiated keyset versions filter session advertisements (including inactive IDs) and channel funding, not loose input proofs or shared close/drain caches. `ChannelLink` checks stored funding on relink before ownership changes; `LinkKeysetVersionNotNegotiated` is fatal only to the offending MONAD session, with bounded error delivery and unconditional ownership/data cleanup. The client preserves wallet channel usability.
 - `ChannelPayment { payment_json }` increments the session balance based on the delta of the channel's max balance seen.
 - `SessionStatus.linked_channel` carries the relay-authoritative linked channel id, latest accepted raw balance, raw capacity, and unit.
 - control-stream detach fully ends the session: linked ownership is released, active streams are torn down, and new streams are no longer accepted.

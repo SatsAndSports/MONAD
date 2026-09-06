@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub trait RelayPayments: Send + Sync + 'static {
     fn link_channel(
         &self,
+        negotiated_versions: &BTreeSet<String>,
         session_id: [u8; 32],
         payment_json: &str,
     ) -> Result<LinkOutcome, LinkError>;
@@ -58,6 +59,7 @@ pub enum LinkError {
     InvalidChannel(String),
     MintOrKeysetNotAcceptable,
     UnsupportedCashuSpilmanProtocolVersion,
+    KeysetVersionNotNegotiated,
     ReceiverKeyMismatch,
     UnsupportedUnit(String),
     NonZeroLinkBalance,
@@ -72,6 +74,9 @@ impl fmt::Display for LinkError {
             Self::InvalidPayment(s) => write!(f, "invalid payment: {s}"),
             Self::InvalidChannel(s) => write!(f, "invalid channel: {s}"),
             Self::MintOrKeysetNotAcceptable => write!(f, "mint or keyset not acceptable"),
+            Self::KeysetVersionNotNegotiated => {
+                write!(f, "channel funding keyset version was not negotiated")
+            }
             Self::UnsupportedCashuSpilmanProtocolVersion => {
                 write!(f, "unsupported cashu spilman protocol version")
             }
@@ -93,6 +98,7 @@ impl LinkError {
             Self::InvalidPayment(_) => ServerErrorCode::LinkInvalidPayment,
             Self::InvalidChannel(_) => ServerErrorCode::LinkInvalidChannel,
             Self::MintOrKeysetNotAcceptable => ServerErrorCode::LinkMintOrKeysetUnacceptable,
+            Self::KeysetVersionNotNegotiated => ServerErrorCode::LinkKeysetVersionNotNegotiated,
             Self::UnsupportedCashuSpilmanProtocolVersion => {
                 ServerErrorCode::LinkUnsupportedCashuSpilmanProtocolVersion
             }
@@ -499,6 +505,7 @@ impl SpilmanRelayPayments {
 impl RelayPayments for SpilmanRelayPayments {
     fn link_channel(
         &self,
+        negotiated_versions: &BTreeSet<String>,
         session_id: [u8; 32],
         payment_json: &str,
     ) -> Result<LinkOutcome, LinkError> {
@@ -508,12 +515,33 @@ impl RelayPayments for SpilmanRelayPayments {
             return Err(LinkError::NonZeroLinkBalance);
         }
 
-        let capacity_raw = if self
+        let stored = self
             .store
             .get_channel(&payment.channel_id)
-            .map_err(LinkError::Internal)?
-            .is_some()
-        {
+            .map_err(LinkError::Internal)?;
+        // Stored funding is authoritative on relink, even if the caller omits or spoofs params.
+        let params = if let Some(channel) = &stored {
+            serde_json::from_str::<serde_json::Value>(&channel.funding.params_json)
+                .map_err(|e| LinkError::Internal(e.to_string()))?
+        } else {
+            serde_json::to_value(
+                payment
+                    .params
+                    .as_ref()
+                    .ok_or_else(|| LinkError::InvalidPayment("missing params".to_string()))?,
+            )
+            .map_err(|e| LinkError::InvalidPayment(e.to_string()))?
+        };
+        let id: Id = params["keyset_id"]
+            .as_str()
+            .ok_or_else(|| LinkError::InvalidChannel("missing keyset_id".to_string()))?
+            .parse()
+            .map_err(|e| LinkError::InvalidChannel(format!("invalid keyset_id: {e}")))?;
+        if !keyset_version_is_negotiated(&id, negotiated_versions) {
+            return Err(LinkError::KeysetVersionNotNegotiated);
+        }
+
+        let capacity_raw = if stored.is_some() {
             // Relink validates the zero-balance registration signature without
             // mutating the relay-authoritative latest accepted balance.
             self.bridge
@@ -704,6 +732,13 @@ fn close_retry_result(
 
 fn parse_mint_error_value(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
+pub(crate) fn keyset_version_is_negotiated(id: &Id, versions: &BTreeSet<String>) -> bool {
+    match id.get_version() {
+        cashu::nuts::nut02::KeySetVersion::Version00 => versions.contains("v1"),
+        cashu::nuts::nut02::KeySetVersion::Version01 => versions.contains("v2"),
+    }
 }
 
 impl SpilmanHost<PaymentContext> for MonadHost {
@@ -1161,6 +1196,7 @@ pub mod testing {
     impl RelayPayments for InMemoryRelayPayments {
         fn link_channel(
             &self,
+            _negotiated_versions: &std::collections::BTreeSet<String>,
             session_id: [u8; 32],
             payment_json: &str,
         ) -> Result<LinkOutcome, LinkError> {
@@ -1372,6 +1408,7 @@ pub mod testing {
             let payments = InMemoryRelayPayments::new();
             let outcome = payments
                 .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
                     &payment_json("chan", 0, Some(123), Some("msat")),
                 )
@@ -1386,7 +1423,11 @@ pub mod testing {
         fn link_new_sat_channel_reports_millisat_capacity() {
             let payments = InMemoryRelayPayments::new();
             let outcome = payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(5), Some("sat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(5), Some("sat")),
+                )
                 .unwrap();
 
             assert_eq!(outcome.capacity_millisats, 5_000);
@@ -1396,7 +1437,11 @@ pub mod testing {
         fn link_rejects_non_zero_balance_without_storing_channel() {
             let payments = InMemoryRelayPayments::new();
             let err = payments
-                .link_channel(session(1), &payment_json("chan", 1, Some(5), Some("msat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 1, Some(5), Some("msat")),
+                )
                 .unwrap_err();
             assert_eq!(err, LinkError::NonZeroLinkBalance);
 
@@ -1410,19 +1455,31 @@ pub mod testing {
         fn relink_non_zero_balance_preserves_existing_latest_balance() {
             let payments = InMemoryRelayPayments::new();
             payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(10), Some("msat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(10), Some("msat")),
+                )
                 .unwrap();
             payments
                 .apply_channel_payment("chan", &payment_json("chan", 7, None, None))
                 .unwrap();
 
             let err = payments
-                .link_channel(session(2), &payment_json("chan", 3, Some(999), Some("sat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(2),
+                    &payment_json("chan", 3, Some(999), Some("sat")),
+                )
                 .unwrap_err();
             assert_eq!(err, LinkError::NonZeroLinkBalance);
 
             let outcome = payments
-                .link_channel(session(2), &payment_json("chan", 0, Some(999), Some("sat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(2),
+                    &payment_json("chan", 0, Some(999), Some("sat")),
+                )
                 .unwrap();
             assert_eq!(outcome.evicted_session, Some(session(1)));
 
@@ -1436,11 +1493,19 @@ pub mod testing {
         fn relink_same_session_does_not_evict() {
             let payments = InMemoryRelayPayments::new();
             payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(10), Some("msat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(10), Some("msat")),
+                )
                 .unwrap();
 
             let outcome = payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(99), Some("sat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(99), Some("sat")),
+                )
                 .unwrap();
             assert_eq!(outcome.evicted_session, None);
             assert_eq!(outcome.capacity_millisats, 10);
@@ -1450,7 +1515,11 @@ pub mod testing {
         fn unsupported_unit_is_rejected() {
             let payments = InMemoryRelayPayments::new();
             let err = payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(10), Some("usd")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(10), Some("usd")),
+                )
                 .unwrap_err();
             assert_eq!(err, LinkError::UnsupportedUnit("usd".to_string()));
         }
@@ -1458,7 +1527,13 @@ pub mod testing {
         #[test]
         fn malformed_payload_is_rejected() {
             let payments = InMemoryRelayPayments::new();
-            let err = payments.link_channel(session(1), "[]").unwrap_err();
+            let err = payments
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    "[]",
+                )
+                .unwrap_err();
             assert_eq!(
                 err,
                 LinkError::InvalidPayment("payment must be a JSON object".to_string())
@@ -1470,6 +1545,7 @@ pub mod testing {
             let payments = InMemoryRelayPayments::new();
             let err = payments
                 .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
                     &payment_json_with_flag("chan", 0, Some(10), Some("msat"), "closed", true),
                 )
@@ -1481,7 +1557,11 @@ pub mod testing {
         fn payment_wrong_channel_is_rejected() {
             let payments = InMemoryRelayPayments::new();
             payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(10), Some("msat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(10), Some("msat")),
+                )
                 .unwrap();
 
             let err = payments
@@ -1494,7 +1574,11 @@ pub mod testing {
         fn payment_no_new_funds_is_rejected() {
             let payments = InMemoryRelayPayments::new();
             payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(10), Some("msat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(10), Some("msat")),
+                )
                 .unwrap();
             payments
                 .apply_channel_payment("chan", &payment_json("chan", 5, None, None))
@@ -1510,7 +1594,11 @@ pub mod testing {
         fn funding_bearing_channel_payment_is_rejected() {
             let payments = InMemoryRelayPayments::new();
             payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(10), Some("msat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(10), Some("msat")),
+                )
                 .unwrap();
 
             let err = payments
@@ -1529,6 +1617,7 @@ pub mod testing {
             let payments = InMemoryRelayPayments::new();
             payments
                 .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
                     &payment_json("chan", 0, Some(100), Some("msat")),
                 )
@@ -1553,7 +1642,11 @@ pub mod testing {
         fn sat_payments_credit_delta_times_one_thousand() {
             let payments = InMemoryRelayPayments::new();
             payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(100), Some("sat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(100), Some("sat")),
+                )
                 .unwrap();
 
             let first = payments
@@ -1576,6 +1669,7 @@ pub mod testing {
             let payments = InMemoryRelayPayments::new();
             let err = payments
                 .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
                     &payment_json("chan", 0, Some(u64::MAX), Some("sat")),
                 )
@@ -1591,6 +1685,7 @@ pub mod testing {
             let payments = InMemoryRelayPayments::new();
             payments
                 .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
                     &payment_json("chan", 0, Some(u64::MAX / 1000), Some("sat")),
                 )
@@ -1608,7 +1703,11 @@ pub mod testing {
         fn closed_channel_payment_is_rejected() {
             let payments = InMemoryRelayPayments::new();
             payments
-                .link_channel(session(1), &payment_json("chan", 0, Some(10), Some("msat")))
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(10), Some("msat")),
+                )
                 .unwrap();
 
             let err = payments

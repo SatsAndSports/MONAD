@@ -188,6 +188,9 @@ pub(super) async fn run_session_driver(
                                 message,
                                 state_summary(&state, &config.conn.cleartext_byte_counters)
                             );
+                            if code == monad_common::protocol::ServerErrorCode::LinkKeysetVersionNotNegotiated {
+                                return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+                            }
                             apply_server_error(&config, &mut state, code).await;
                             false
                         }
