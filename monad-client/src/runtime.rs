@@ -173,6 +173,18 @@ where
         &client_wallet.channel_db_path,
         &client_wallet.sender_secret_hex,
     )?;
+    match wallet.recover_pending_openings() {
+        Ok(recovered) if !recovered.is_empty() => {
+            info!(
+                count = recovered.len(),
+                "recovered pending channel openings"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!("pending channel opening recovery did not complete: {error}");
+        }
+    }
     let wallet: Arc<dyn MonadWallet> = Arc::new(wallet);
     let runtime = ConnectorRuntime::with_payment_policy(
         Some(wallet.clone()),
