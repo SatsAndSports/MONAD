@@ -188,9 +188,13 @@ before it sees the response, the operator can run `monad-relay wallet
 recover-drain` to restore the exact persisted outputs instead of attempting a
 new, potentially conflicting swap.
 
-The client has the same discipline. It persists channel-opening recovery data
-before submitting a funding swap, so `recover-openings` can resolve an ambiguous
-open rather than lose the funding proofs. For expired-channel refunds, it saves
+The client has the same discipline. It atomically reserves channel-opening inputs
+and persists the exact prepared funding swap before submission. Ambiguous opens
+first use NUT-09; only a valid empty funding restore followed by an all-`UNSPENT`
+NUT-07 check may replay that same immutable request once per recovery invocation.
+Prepared openings that never entered the submit window are cancelled instead of
+being sent during recovery. A narrowly recognized inactive-output-keyset rejection
+can produce one immutable successor attempt. For expired-channel refunds, it saves
 the exact prepared refund, marks it `submitting` before contacting the mint, and
 imports recovered proofs into the loose-proof wallet before marking the channel
 closed. Those imports are idempotent, so a restart at any point can repeat the
