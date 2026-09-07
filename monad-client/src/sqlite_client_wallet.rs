@@ -4,24 +4,28 @@
 //! `cdk-spilman` Spilman channel operations, implementing `MonadWallet`.
 
 use crate::loose_proof_wallet::{
-    LooseProofWallet, LooseProofWalletError, NewLooseProof, ProofReservation,
+    new_reservation_id, LooseProofWallet, LooseProofWalletError, NewLooseProof, NewOpeningAttempt,
+    OpeningAttemptRecord, OpeningAttemptState, ProofReservation,
 };
 use crate::proof_selection::{select_mixed_fee_inputs_for_post_swap_target, ProofCandidate};
 use crate::wallet::{
     msats_to_raw_units, raw_to_msats, MonadWallet, RelayPaymentOffer, WalletChannel,
     WalletChannelState, WalletError,
 };
-use cashu::nuts::{CurrencyUnit, Id, Proof, SecretKey, State};
+use cashu::nuts::{
+    CheckStateRequest, CheckStateResponse, CurrencyUnit, Id, Proof, RestoreRequest,
+    RestoreResponse, SecretKey, State,
+};
 use cdk_spilman::{
-    compute_funding_token_amount, parse_keyset_info_from_json, with_active_keyset_retry,
-    ClientChannelFunding, ClientChannelInfo, ClientKeysetCacheEntry, CompletedOpenChannel,
-    ConfigurableClientHost, EstablishedChannel, FundingSpendKind, KeysetRetryError, MintConnection,
-    OpenChannelError, OpenChannelFailureStage, OpenChannelResult, PreparedOpenChannel,
-    PreparedSenderRefund, ReqwestClientNetworking, SelectedOutputKeyset, SpilmanClientBridge,
-    SpilmanClientHost, SpilmanClientNetworking, SqliteClientStorage,
+    compute_funding_token_amount, parse_keyset_info_from_json, ClientChannelFunding,
+    ClientChannelInfo, ClientKeysetCacheEntry, CompletedOpenChannel, ConfigurableClientHost,
+    EstablishedChannel, FundingSpendKind, MintConnection, OpenChannelError,
+    OpenChannelFailureStage, OpenChannelResult, PreparedOpenChannel, PreparedSenderRefund,
+    ReqwestClientNetworking, SelectedOutputKeyset, SpilmanClientBridge, SpilmanClientHost,
+    SpilmanClientNetworking, SqliteClientStorage,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +36,125 @@ type ClientBridge =
     SpilmanClientBridge<ConfigurableClientHost<SqliteClientStorage>, ReqwestClientNetworking>;
 
 const CHANNEL_EXPIRY_SECONDS: u64 = 24 * 3600;
+const OPENING_RECOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const HTTP_CLIENT_ERROR_PREFIX: &str = "MONAD_HTTP_CLIENT_ERROR ";
+
+trait OpeningRecoveryNetworking: SpilmanClientNetworking {
+    fn call_mint_check_state(
+        &self,
+        mint_url: &str,
+        check_state_request_json: &str,
+    ) -> Result<String, String>;
+}
+
+struct OpeningRecoveryHttpNetworking {
+    client: reqwest::Client,
+    runtime: tokio::runtime::Handle,
+}
+
+impl OpeningRecoveryHttpNetworking {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(OPENING_RECOVERY_REQUEST_TIMEOUT)
+                .build()
+                .map_err(|e| format!("build opening recovery HTTP client: {e}"))?,
+            runtime: tokio::runtime::Handle::current(),
+        })
+    }
+
+    fn blocking_get(&self, url: &str) -> Result<String, String> {
+        let client = self.client.clone();
+        let url = url.to_string();
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                let response = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("GET {url} failed: {e}"))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(format!("GET {url}: {status} - {body}"));
+                }
+                response
+                    .text()
+                    .await
+                    .map_err(|e| format!("GET {url} read body: {e}"))
+            })
+        })
+    }
+
+    fn blocking_post(&self, url: &str, body: &str) -> Result<String, String> {
+        let client = self.client.clone();
+        let url = url.to_string();
+        let body = body.to_string();
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                let response = client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| format!("POST {url} failed: {e}"))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    if status.is_client_error() {
+                        return Err(format!("{HTTP_CLIENT_ERROR_PREFIX}{status} - {body}"));
+                    }
+                    return Err(format!("POST {url}: {status} - {body}"));
+                }
+                response
+                    .text()
+                    .await
+                    .map_err(|e| format!("POST {url} read body: {e}"))
+            })
+        })
+    }
+}
+
+impl SpilmanClientNetworking for OpeningRecoveryHttpNetworking {
+    fn call_mint_swap(&self, mint_url: &str, swap_request_json: &str) -> Result<String, String> {
+        self.blocking_post(&format!("{mint_url}/v1/swap"), swap_request_json)
+    }
+
+    fn call_mint_restore(
+        &self,
+        mint_url: &str,
+        restore_request_json: &str,
+    ) -> Result<String, String> {
+        self.blocking_post(&format!("{mint_url}/v1/restore"), restore_request_json)
+    }
+
+    fn call_mint_keysets(&self, mint_url: &str) -> Result<String, String> {
+        self.blocking_get(&format!("{mint_url}/v1/keysets"))
+    }
+
+    fn call_mint_keys(&self, mint_url: &str, keyset_id: &str) -> Result<String, String> {
+        self.blocking_get(&format!("{mint_url}/v1/keys/{keyset_id}"))
+    }
+}
+
+impl OpeningRecoveryNetworking for OpeningRecoveryHttpNetworking {
+    fn call_mint_check_state(
+        &self,
+        mint_url: &str,
+        check_state_request_json: &str,
+    ) -> Result<String, String> {
+        self.blocking_post(
+            &format!("{mint_url}/v1/checkstate"),
+            check_state_request_json,
+        )
+    }
+}
+
+enum OpeningRestoreOutcome {
+    Completed(Box<CompletedOpenChannel>),
+    FundingOutputsAbsent,
+}
 
 const CREATE_CHANNELS_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS monad_client_channels (
@@ -125,8 +248,18 @@ pub enum ChannelFundRecoveryResult {
 
 #[derive(Debug, Clone)]
 struct ClientOpenAttempt {
+    opening_id: String,
     output_keyset: SelectedOutputKeyset,
     reservation: ProofReservation,
+    prepared: PreparedOpenChannel,
+    requested_capacity_raw: Option<u64>,
+    desired_funding_token_amount_raw: Option<u64>,
+    selected_input_msats: u64,
+    expiry_timestamp: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClientOpenPlan {
     requested_capacity_raw: Option<u64>,
     desired_funding_token_amount_raw: Option<u64>,
     selected_input_msats: u64,
@@ -452,80 +585,57 @@ impl SqliteClientWallet {
         // stale before swap submission, the retry helper centralizes the safe
         // mint-rejection policy: refresh keysets, reselect, skip retry if refresh
         // still selects the same id, otherwise reprepare and submit once.
-        let result = with_active_keyset_retry(
-            // Select an active relay-accepted output keyset, refreshing the
-            // client cache before reporting a stale relay offer.
-            || self.select_output_keyset_refreshing_client_first(offer),
-            // Prepare reserves a fresh set of loose proofs sized for the target
-            // capacity and the selected output keyset's fee/amount structure.
-            |output_keyset| {
-                self.prepare_target_capacity_attempt(
-                    offer,
-                    target_capacity_raw,
-                    output_keyset,
-                    expiry_timestamp,
-                )
-            },
-            // Submit the upstream channel-open swap using that reservation.
-            |attempt| self.submit_open_attempt(offer, attempt),
-            // Retry only safe keyset rejections; errors where inputs may be
-            // spent are never retried automatically.
-            |error| should_retry_open_after_keyset_rejection(error, false),
-            // Refresh the client's keyset cache for the mint before retry
-            // selection.
-            || self.refresh_client_keysets(offer),
-            // Target-capacity proof choice depends on the selected output
-            // keyset.  Release the first reservation before reselecting/retrying
-            // so the retry can choose a fresh proof set.
-            |attempt, _error| {
-                self.loose_wallet
-                    .release_reservation(&attempt.reservation.reservation_id)
-                    .map(|_| ())
-                    .map_err(loose_proof_error)
-            },
-        );
-        match result {
-            Ok(success) => self.finish_open_channel(
-                success.value,
-                &success.attempt.reservation,
-                success.attempt.expiry_timestamp,
-            ),
-            Err(KeysetRetryError::Submit { attempt, error, .. }) => self.handle_open_error(
-                error,
-                &attempt.reservation,
-                offer,
-                attempt.selected_input_msats,
-            ),
-            Err(KeysetRetryError::RetryKeysetUnchanged { attempt, error, .. }) => Err(
-                open_channel_error(error, &offer.unit, attempt.selected_input_msats),
-            ),
-            Err(KeysetRetryError::Select {
-                error: WalletError::StaleRelayKeysets { .. },
-                ..
-            }) => Err(WalletError::StaleRelayKeysets {
-                mint_url: offer.mint_url.clone(),
-                unit: offer.unit.clone(),
-                accepted_keyset_ids: offer.accepted_keyset_ids.clone(),
-            }),
-            Err(error) => Err(WalletError::Backend(format!(
-                "prepare channel open retry: {}",
-                describe_keyset_retry_prepare_error(error)
-            ))),
-        }
+        let output_keyset = self.select_output_keyset_refreshing_client_first(offer)?;
+        let attempt = self.prepare_target_capacity_attempt(
+            offer,
+            target_capacity_raw,
+            output_keyset,
+            expiry_timestamp,
+        )?;
+        self.execute_open_attempt(offer, attempt, true)
     }
 
     /// Recover channel openings whose funding swap may have reached the mint.
     ///
     /// Ambiguous failures leave loose proofs reserved and an upstream
-    /// `OpeningFromSwap` row behind. This method uses upstream NUT-09 restore to
-    /// recover those openings, then marks the loose-proof reservation spent and
-    /// stores normal MONAD channel metadata.
+    /// `OpeningFromSwap` row behind. This method first uses NUT-09 restore. If a
+    /// valid response has no funding outputs and NUT-07 reports every exact input
+    /// unspent, it replays the immutable swap request once.
     pub fn recover_pending_openings(&self) -> Result<Vec<String>, WalletError> {
-        let recoveries = self.list_opening_recoveries()?;
+        let attempts = self
+            .loose_wallet
+            .opening_attempts_for_recovery()
+            .map_err(loose_proof_error)?;
         let mut recovered = Vec::new();
-        let networking = ReqwestClientNetworking::new();
+        let networking = OpeningRecoveryHttpNetworking::new().map_err(WalletError::Backend)?;
+        for attempt in attempts {
+            match self.recover_journaled_opening(&attempt, &networking) {
+                Ok(Some(channel_id)) => recovered.push(channel_id),
+                Ok(None) => {}
+                Err(error) => {
+                    // Recovery is best effort per attempt. Keep its reservation and
+                    // journal state so one unavailable mint does not discard funds.
+                    tracing::warn!(
+                        attempt_id = %attempt.attempt_id,
+                        "channel opening remains pending recovery: {error}"
+                    );
+                }
+            }
+        }
+
+        // Legacy rows predate the authoritative pre-submit journal.
+        let recoveries = self.list_opening_recoveries()?;
 
         for recovery in recoveries {
+            if self
+                .loose_wallet
+                .opening_attempt(&recovery.channel_id)
+                .map_err(loose_proof_error)?
+                .is_some()
+            {
+                self.delete_opening_recovery(&recovery.channel_id)?;
+                continue;
+            }
             let result = self.recover_pending_opening(&recovery.channel_id, &networking);
 
             match result {
@@ -577,10 +687,255 @@ impl SqliteClientWallet {
         Ok(recovered)
     }
 
-    fn recover_pending_opening(
+    fn recover_journaled_opening<N: OpeningRecoveryNetworking>(
+        &self,
+        attempt: &OpeningAttemptRecord,
+        networking: &N,
+    ) -> Result<Option<String>, WalletError> {
+        if attempt.state == OpeningAttemptState::Rejected {
+            self.loose_wallet
+                .cancel_rejected_opening_attempt(&attempt.attempt_id)
+                .map_err(loose_proof_error)?;
+            return Ok(None);
+        }
+        if attempt.state == OpeningAttemptState::Prepared {
+            self.loose_wallet
+                .cancel_prepared_opening_attempt(&attempt.attempt_id)
+                .map_err(loose_proof_error)?;
+            return Ok(None);
+        }
+        let prepared: PreparedOpenChannel = serde_json::from_str(&attempt.prepared_open_json)
+            .map_err(|e| WalletError::Backend(format!("decode opening attempt: {e}")))?;
+        let completed = if attempt.state == OpeningAttemptState::Finalizing {
+            let json = attempt.completed_open_json.as_deref().ok_or_else(|| {
+                WalletError::Backend(format!(
+                    "finalizing opening attempt {} has no completion payload",
+                    attempt.attempt_id
+                ))
+            })?;
+            serde_json::from_str::<CompletedOpenChannel>(json).map_err(|e| {
+                WalletError::Backend(format!("decode completed opening attempt: {e}"))
+            })?
+        } else {
+            {
+                let bridge = self
+                    .bridge
+                    .lock()
+                    .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+                if bridge.get_channel_funding(&prepared.channel_id).is_none() {
+                    bridge.mark_prepared_open_saved(&prepared).map_err(|e| {
+                        open_channel_error(e, &attempt.unit, attempt.input_budget_msats)
+                    })?;
+                }
+            }
+            match self.recover_or_replay_submitted_opening(&prepared, networking) {
+                Ok(Some(result)) => {
+                    self.finish_open_channel(
+                        result,
+                        &ProofReservation {
+                            reservation_id: attempt.reservation_id.clone(),
+                            proofs: self
+                                .loose_wallet
+                                .proofs_for_reservation(&attempt.reservation_id)
+                                .map_err(loose_proof_error)?,
+                            total_amount_raw: 0,
+                        },
+                        attempt.expiry_timestamp,
+                    )?;
+                    return Ok(Some(attempt.attempt_id.clone()));
+                }
+                Ok(None) => return Ok(None),
+                Err(error) if error.stage == OpenChannelFailureStage::MintRejected => {
+                    self.loose_wallet
+                        .cancel_rejected_opening_attempt(&attempt.attempt_id)
+                        .map_err(loose_proof_error)?;
+                    return Err(open_channel_error(
+                        error,
+                        &attempt.unit,
+                        attempt.input_budget_msats,
+                    ));
+                }
+                Err(error) => {
+                    return Err(open_channel_error(
+                        error,
+                        &attempt.unit,
+                        attempt.input_budget_msats,
+                    ));
+                }
+            }
+        };
+
+        // If finalization was interrupted before upstream storage advanced, replay it.
+        {
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            if bridge.get_channel_funding(&completed.channel_id).is_none() {
+                bridge.mark_prepared_open_saved(&prepared).map_err(|e| {
+                    open_channel_error(e, &attempt.unit, attempt.input_budget_msats)
+                })?;
+                bridge.mark_completed_open(&completed).map_err(|e| {
+                    open_channel_error(e, &attempt.unit, attempt.input_budget_msats)
+                })?;
+            }
+        }
+        self.finish_open_channel(
+            completed.result,
+            &ProofReservation {
+                reservation_id: attempt.reservation_id.clone(),
+                proofs: self
+                    .loose_wallet
+                    .proofs_for_reservation(&attempt.reservation_id)
+                    .map_err(loose_proof_error)?,
+                total_amount_raw: 0,
+            },
+            attempt.expiry_timestamp,
+        )?;
+        Ok(Some(completed.channel_id))
+    }
+
+    fn recover_or_replay_submitted_opening<N: OpeningRecoveryNetworking>(
+        &self,
+        prepared: &PreparedOpenChannel,
+        networking: &N,
+    ) -> Result<Option<OpenChannelResult>, OpenChannelError> {
+        match self.restore_journaled_opening(prepared, networking)? {
+            OpeningRestoreOutcome::Completed(completed) => {
+                let completed = *completed;
+                let completed_json = serde_json::to_string(&completed).map_err(|e| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::FundingProofsReceived,
+                        Some(prepared.channel_id.clone()),
+                        format!("serialize recovered opening: {e}"),
+                    )
+                })?;
+                self.loose_wallet
+                    .mark_opening_attempt_finalizing(&prepared.channel_id, &completed_json)
+                    .map_err(|e| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::FundingProofsReceived,
+                            Some(prepared.channel_id.clone()),
+                            format!("persist recovered opening: {e}"),
+                        )
+                    })?;
+                let bridge = self.bridge.lock().map_err(|_| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::MarkOpen,
+                        Some(prepared.channel_id.clone()),
+                        "bridge mutex poisoned".to_string(),
+                    )
+                })?;
+                bridge.mark_completed_open(&completed)?;
+                Ok(Some(completed.result))
+            }
+            OpeningRestoreOutcome::FundingOutputsAbsent => {
+                if !prepared_inputs_are_all_unspent(prepared, networking)? {
+                    return Ok(None);
+                }
+                self.submit_prepared_open(prepared.clone(), networking)
+                    .map(Some)
+            }
+        }
+    }
+
+    fn restore_journaled_opening<N: OpeningRecoveryNetworking>(
+        &self,
+        prepared: &PreparedOpenChannel,
+        networking: &N,
+    ) -> Result<OpeningRestoreOutcome, OpenChannelError> {
+        let recovery = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::RestoreVerification,
+                    Some(prepared.channel_id.clone()),
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            bridge.prepare_open_channel_recovery(&prepared.channel_id)?
+        };
+        let funding_response = networking
+            .call_mint_restore(&recovery.mint_url, &recovery.funding_restore_request_json)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::RestoreVerification,
+                    Some(prepared.channel_id.clone()),
+                    e,
+                )
+            })?;
+        let Some(funding_response) = validate_and_canonicalize_restore_response(
+            &recovery.funding_restore_request_json,
+            &funding_response,
+        )
+        .map_err(|e| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::RestoreVerification,
+                Some(prepared.channel_id.clone()),
+                format!("validate funding restore response: {e}"),
+            )
+        })?
+        else {
+            return Ok(OpeningRestoreOutcome::FundingOutputsAbsent);
+        };
+        let change_response = match recovery.change_restore_request_json.as_deref() {
+            None => None,
+            Some(request) => {
+                let response = networking
+                    .call_mint_restore(&recovery.mint_url, request)
+                    .map_err(|e| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::RestoreVerification,
+                            Some(prepared.channel_id.clone()),
+                            e,
+                        )
+                    })?;
+                let response = validate_and_canonicalize_restore_response(request, &response)
+                    .map_err(|e| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::RestoreVerification,
+                            Some(prepared.channel_id.clone()),
+                            format!("validate change restore response: {e}"),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::RestoreVerification,
+                            Some(prepared.channel_id.clone()),
+                            "funding outputs were restored but change outputs were absent"
+                                .to_string(),
+                        )
+                    })?;
+                Some(response)
+            }
+        };
+        let completed = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::RestoreVerification,
+                    Some(prepared.channel_id.clone()),
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            bridge.complete_prepared_open_recovery(
+                &recovery,
+                &funding_response,
+                change_response.as_deref(),
+            )?
+        };
+        Ok(OpeningRestoreOutcome::Completed(Box::new(
+            CompletedOpenChannel {
+                channel_id: completed.channel_id,
+                funding_proofs_json: completed.funding_proofs_json,
+                change_proofs_json: completed.change_proofs_json,
+                result: completed.result,
+            },
+        )))
+    }
+
+    fn recover_pending_opening<N: SpilmanClientNetworking>(
         &self,
         channel_id: &str,
-        networking: &ReqwestClientNetworking,
+        networking: &N,
     ) -> Result<OpenChannelResult, OpenChannelError> {
         // MONAD owns restore I/O and retry boundaries; upstream owns request
         // construction, response completion, and the explicit mark-open step.
@@ -914,66 +1269,66 @@ impl SqliteClientWallet {
             .map_err(|e| WalletError::Backend(format!("convert capacity to msats: {e}")))?;
         let now = Self::now_seconds()?;
         let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO monad_client_channels
+        let capacity_msats = to_i64(capacity_msats)?;
+        let expiry_timestamp = to_i64(expiry_timestamp)?;
+        let inserted = conn
+            .execute(
+                "INSERT INTO monad_client_channels
              (channel_id, receiver_pubkey, mint_url, unit, keyset_id,
               capacity_msats, attached_session_id, state, reservation_id,
               expiry_timestamp, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?10)",
-            params![
-                open_result.channel_id,
-                open_result.receiver_pubkey_hex,
-                open_result.mint_url,
-                open_result.unit,
-                open_result.keyset_id,
-                to_i64(capacity_msats)?,
-                channel_state_str(WalletChannelState::Open),
-                reservation_id,
-                to_i64(expiry_timestamp)?,
-                to_i64(now)?,
-            ],
-        )
-        .map_err(|e| WalletError::Backend(format!("insert channel metadata: {e}")))?;
-        Ok(())
-    }
-
-    fn store_opening_recovery(
-        &self,
-        channel_id: &str,
-        reservation_id: &str,
-        offer: &RelayPaymentOffer,
-        input_budget_msats: u64,
-        error: &OpenChannelError,
-    ) -> Result<(), WalletError> {
-        let now = Self::now_seconds()?;
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO monad_client_channel_opening_recoveries
-             (channel_id, reservation_id, receiver_pubkey, mint_url, unit,
-              input_budget_msats, error_stage, error_message, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-             ON CONFLICT(channel_id) DO UPDATE SET
-                reservation_id = excluded.reservation_id,
-                receiver_pubkey = excluded.receiver_pubkey,
-                mint_url = excluded.mint_url,
-                unit = excluded.unit,
-                input_budget_msats = excluded.input_budget_msats,
-                error_stage = excluded.error_stage,
-                error_message = excluded.error_message,
-                updated_at = excluded.updated_at",
-            params![
-                channel_id,
-                reservation_id,
-                offer.receiver_pubkey,
-                offer.mint_url,
-                offer.unit,
-                to_i64(input_budget_msats)?,
-                format!("{:?}", error.stage),
-                error.message,
-                to_i64(now)?,
-            ],
-        )
-        .map_err(|e| WalletError::Backend(format!("store opening recovery: {e}")))?;
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?10)
+              ON CONFLICT(channel_id) DO NOTHING",
+                params![
+                    open_result.channel_id,
+                    open_result.receiver_pubkey_hex,
+                    open_result.mint_url,
+                    open_result.unit,
+                    open_result.keyset_id,
+                    capacity_msats,
+                    channel_state_str(WalletChannelState::Open),
+                    reservation_id,
+                    expiry_timestamp,
+                    to_i64(now)?,
+                ],
+            )
+            .map_err(|e| WalletError::Backend(format!("insert channel metadata: {e}")))?;
+        if inserted == 0 {
+            let existing = conn
+                .query_row(
+                    "SELECT receiver_pubkey, mint_url, unit, keyset_id, capacity_msats,
+                            reservation_id, expiry_timestamp
+                     FROM monad_client_channels WHERE channel_id = ?1",
+                    params![open_result.channel_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    },
+                )
+                .map_err(|e| WalletError::Backend(format!("verify channel metadata: {e}")))?;
+            let expected = (
+                open_result.receiver_pubkey_hex.clone(),
+                open_result.mint_url.clone(),
+                open_result.unit.clone(),
+                open_result.keyset_id.clone(),
+                capacity_msats,
+                reservation_id.to_string(),
+                expiry_timestamp,
+            );
+            if existing != expected {
+                return Err(WalletError::Backend(format!(
+                    "existing channel metadata conflicts with recovered opening {}",
+                    open_result.channel_id
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1032,93 +1387,148 @@ impl SqliteClientWallet {
 
     fn submit_open_attempt(
         &self,
-        offer: &RelayPaymentOffer,
         attempt: &ClientOpenAttempt,
     ) -> Result<OpenChannelResult, OpenChannelError> {
-        self.submit_reserved_channel(
-            offer,
-            &attempt.output_keyset.info_json,
-            &attempt.reservation,
-            attempt.requested_capacity_raw,
-            attempt.desired_funding_token_amount_raw,
-            attempt.expiry_timestamp,
-        )
+        let claimed = self
+            .loose_wallet
+            .claim_opening_attempt_submission(&attempt.prepared.channel_id)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    Some(attempt.prepared.channel_id.clone()),
+                    format!("mark opening attempt submitted: {e}"),
+                )
+            })?;
+        if !claimed {
+            return Err(open_channel_stage_error(
+                OpenChannelFailureStage::SwapSubmitted,
+                Some(attempt.prepared.channel_id.clone()),
+                "opening attempt was already submitted by another worker".to_string(),
+            ));
+        }
+        let networking = OpeningRecoveryHttpNetworking::new().map_err(|error| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::SwapSubmitted,
+                Some(attempt.prepared.channel_id.clone()),
+                error,
+            )
+        })?;
+        self.submit_prepared_open(attempt.prepared.clone(), &networking)
     }
 
-    fn submit_reserved_channel(
+    fn prepare_open_attempt(
         &self,
         offer: &RelayPaymentOffer,
-        output_keyset_info_json: &str,
-        reservation: &ProofReservation,
-        requested_capacity_raw: Option<u64>,
-        desired_funding_token_amount_raw: Option<u64>,
-        expiry_timestamp: u64,
-    ) -> Result<OpenChannelResult, OpenChannelError> {
-        let input_proofs_json = match proofs_json_from_reservation(reservation) {
+        output_keyset: SelectedOutputKeyset,
+        reservation: ProofReservation,
+        plan: ClientOpenPlan,
+    ) -> Result<ClientOpenAttempt, WalletError> {
+        let input_proofs_json = match proofs_json_from_reservation(&reservation) {
             Ok(json) => json,
             Err(e) => {
-                return Err(open_channel_stage_error(
-                    OpenChannelFailureStage::BeforeOpeningSaved,
-                    None,
-                    e.to_string(),
-                ));
+                return Err(e);
             }
         };
 
-        let networking = ReqwestClientNetworking::new();
+        let networking = OpeningRecoveryHttpNetworking::new().map_err(WalletError::Backend)?;
         let input_keyset_lookup = {
-            let bridge = self.bridge.lock().map_err(|_| {
-                open_channel_stage_error(
-                    OpenChannelFailureStage::BeforeOpeningSaved,
-                    None,
-                    "bridge mutex poisoned".to_string(),
-                )
-            })?;
-            proof_input_keysets_from_cache(&bridge, &offer.mint_url, &offer.unit, reservation)?
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            proof_input_keysets_from_cache(&bridge, &offer.mint_url, &offer.unit, &reservation)
+                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))?
         };
         let input_keysets_json =
-            proof_input_keysets_json(input_keyset_lookup, &offer.mint_url, &networking)?;
+            proof_input_keysets_json(input_keyset_lookup, &offer.mint_url, &networking)
+                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))?;
 
         let prepared = {
-            let bridge = self.bridge.lock().map_err(|_| {
-                open_channel_stage_error(
-                    OpenChannelFailureStage::BeforeOpeningSaved,
-                    None,
-                    "bridge mutex poisoned".to_string(),
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            bridge
+                .prepare_open_channel_from_proofs_with_input_keysets(
+                    &offer.mint_url,
+                    &offer.unit,
+                    &input_proofs_json,
+                    &input_keysets_json,
+                    &offer.receiver_pubkey,
+                    &self.sender_pubkey_hex,
+                    plan.expiry_timestamp,
+                    &output_keyset.info_json,
+                    0,
+                    plan.requested_capacity_raw,
+                    plan.desired_funding_token_amount_raw,
                 )
-            })?;
-            let prepared = bridge.prepare_open_channel_from_proofs_with_input_keysets(
+                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))?
+        };
+        let prepared_open_json = serde_json::to_string(&prepared)
+            .map_err(|e| WalletError::Backend(format!("serialize opening attempt: {e}")))?;
+        let journal = NewOpeningAttempt {
+            attempt_id: prepared.channel_id.clone(),
+            opening_id: prepared.channel_id.clone(),
+            predecessor_attempt_id: None,
+            reservation_id: reservation.reservation_id.clone(),
+            receiver_pubkey: offer.receiver_pubkey.clone(),
+            mint_url: offer.mint_url.clone(),
+            unit: offer.unit.clone(),
+            input_budget_msats: plan.selected_input_msats,
+            expiry_timestamp: plan.expiry_timestamp,
+            prepared_open_json,
+        };
+        let proof_ids = reservation
+            .proofs
+            .iter()
+            .map(|proof| proof.proof_id.clone())
+            .collect::<Vec<_>>();
+        let reservation = self
+            .loose_wallet
+            .reserve_selected_proofs_with_opening_attempt(
                 &offer.mint_url,
                 &offer.unit,
-                &input_proofs_json,
-                &input_keysets_json,
-                &offer.receiver_pubkey,
-                &self.sender_pubkey_hex,
-                expiry_timestamp,
-                output_keyset_info_json,
-                0,
-                requested_capacity_raw,
-                desired_funding_token_amount_raw,
-            )?;
-            // Persist before mint submission so ambiguous swap outcomes can be
-            // recovered via NUT-09 restore after a crash or network failure.
-            bridge.mark_prepared_open_saved(&prepared)?;
-            prepared
-        };
-
-        self.submit_prepared_open(prepared, &networking)
+                &proof_ids,
+                &journal,
+            )
+            .map_err(loose_proof_error)?;
+        let save_result = self
+            .bridge
+            .lock()
+            .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))
+            .and_then(|bridge| {
+                bridge
+                    .mark_prepared_open_saved(&prepared)
+                    .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))
+            });
+        if let Err(error) = save_result {
+            let _ = self
+                .loose_wallet
+                .cancel_prepared_opening_attempt(&prepared.channel_id);
+            return Err(error);
+        }
+        Ok(ClientOpenAttempt {
+            opening_id: prepared.channel_id.clone(),
+            output_keyset,
+            reservation,
+            prepared,
+            requested_capacity_raw: plan.requested_capacity_raw,
+            desired_funding_token_amount_raw: plan.desired_funding_token_amount_raw,
+            selected_input_msats: plan.selected_input_msats,
+            expiry_timestamp: plan.expiry_timestamp,
+        })
     }
 
-    fn submit_prepared_open(
+    fn submit_prepared_open<N: SpilmanClientNetworking>(
         &self,
         prepared: PreparedOpenChannel,
-        networking: &ReqwestClientNetworking,
+        networking: &N,
     ) -> Result<OpenChannelResult, OpenChannelError> {
         let swap_response_json = networking
             .call_mint_swap(&prepared.mint_url, &prepared.swap_request_json)
             .map_err(|e| {
                 let message = normalize_mint_error_string(e);
-                if cdk_spilman::extract_nut00_error_code(&message).is_some() {
+                if is_definitive_keyset_rejection(&message) {
                     return self
                         .mark_prepared_open_rejected(&prepared, message)
                         .unwrap_or_else(|error| error);
@@ -1145,6 +1555,36 @@ impl SqliteClientWallet {
         // moving upstream storage out of OpeningFromSwap.
         self.verify_prepared_open_restore(&prepared, &completed, networking)?;
 
+        let completed_json = serde_json::to_string(&completed).map_err(|e| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::FundingProofsReceived,
+                Some(prepared.channel_id.clone()),
+                format!("serialize completed opening: {e}"),
+            )
+        })?;
+        if self
+            .loose_wallet
+            .opening_attempt(&prepared.channel_id)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::FundingProofsReceived,
+                    Some(prepared.channel_id.clone()),
+                    format!("query opening attempt: {e}"),
+                )
+            })?
+            .is_some()
+        {
+            self.loose_wallet
+                .mark_opening_attempt_finalizing(&prepared.channel_id, &completed_json)
+                .map_err(|e| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::FundingProofsReceived,
+                        Some(prepared.channel_id.clone()),
+                        format!("persist completed opening: {e}"),
+                    )
+                })?;
+        }
+
         {
             let bridge = self.bridge.lock().map_err(|_| {
                 open_channel_stage_error(
@@ -1164,21 +1604,45 @@ impl SqliteClientWallet {
         prepared: &PreparedOpenChannel,
         message: String,
     ) -> Result<OpenChannelError, OpenChannelError> {
-        let bridge = self.bridge.lock().map_err(|_| {
-            open_channel_stage_error(
-                OpenChannelFailureStage::MarkOpen,
-                Some(prepared.channel_id.clone()),
-                format!("bridge mutex poisoned while marking mint rejection: {message}"),
-            )
-        })?;
-        bridge.mark_prepared_open_rejected(prepared, message)
+        self.loose_wallet
+            .mark_opening_attempt_rejected(&prepared.channel_id, Some(12_002), &message)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::SwapSubmitted,
+                    Some(prepared.channel_id.clone()),
+                    format!("persist mint rejection before cleanup: {e}; mint error: {message}"),
+                )
+            })?;
+        let fallback = OpenChannelError {
+            stage: OpenChannelFailureStage::MintRejected,
+            channel_id: Some(prepared.channel_id.clone()),
+            input_may_be_spent: false,
+            message: message.clone(),
+        };
+        let Ok(bridge) = self.bridge.lock() else {
+            tracing::warn!(
+                channel_id = %prepared.channel_id,
+                "opening rejection was journaled but upstream bridge mutex is poisoned"
+            );
+            return Ok(fallback);
+        };
+        match bridge.mark_prepared_open_rejected(prepared, message) {
+            Ok(error) => Ok(error),
+            Err(error) => {
+                tracing::warn!(
+                    channel_id = %prepared.channel_id,
+                    "opening rejection was journaled but upstream rejection bookkeeping failed: {error}"
+                );
+                Ok(fallback)
+            }
+        }
     }
 
-    fn verify_prepared_open_restore(
+    fn verify_prepared_open_restore<N: SpilmanClientNetworking>(
         &self,
         prepared: &PreparedOpenChannel,
         completed: &CompletedOpenChannel,
-        networking: &ReqwestClientNetworking,
+        networking: &N,
     ) -> Result<(), OpenChannelError> {
         let restore_request = {
             let bridge = self.bridge.lock().map_err(|_| {
@@ -1230,7 +1694,260 @@ impl SqliteClientWallet {
             &reservation.reservation_id,
             expiry_timestamp,
         )?;
+        if self
+            .loose_wallet
+            .opening_attempt(&open_result.channel_id)
+            .map_err(loose_proof_error)?
+            .is_some()
+        {
+            self.loose_wallet
+                .mark_opening_attempt_completed(&open_result.channel_id)
+                .map_err(loose_proof_error)?;
+        }
         Ok(open_result.channel_id)
+    }
+
+    #[cfg(test)]
+    fn submit_reserved_channel(
+        &self,
+        offer: &RelayPaymentOffer,
+        output_keyset_info_json: &str,
+        reservation: &ProofReservation,
+        requested_capacity_raw: Option<u64>,
+        desired_funding_token_amount_raw: Option<u64>,
+        expiry_timestamp: u64,
+    ) -> Result<OpenChannelResult, OpenChannelError> {
+        let input_proofs_json = proofs_json_from_reservation(reservation).map_err(|e| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::BeforeOpeningSaved,
+                None,
+                e.to_string(),
+            )
+        })?;
+        let networking = OpeningRecoveryHttpNetworking::new().map_err(|error| {
+            open_channel_stage_error(OpenChannelFailureStage::BeforeOpeningSaved, None, error)
+        })?;
+        let input_keyset_lookup = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    None,
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            proof_input_keysets_from_cache(&bridge, &offer.mint_url, &offer.unit, reservation)?
+        };
+        let input_keysets_json =
+            proof_input_keysets_json(input_keyset_lookup, &offer.mint_url, &networking)?;
+        let prepared = {
+            let bridge = self.bridge.lock().map_err(|_| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    None,
+                    "bridge mutex poisoned".to_string(),
+                )
+            })?;
+            let prepared = bridge.prepare_open_channel_from_proofs_with_input_keysets(
+                &offer.mint_url,
+                &offer.unit,
+                &input_proofs_json,
+                &input_keysets_json,
+                &offer.receiver_pubkey,
+                &self.sender_pubkey_hex,
+                expiry_timestamp,
+                output_keyset_info_json,
+                0,
+                requested_capacity_raw,
+                desired_funding_token_amount_raw,
+            )?;
+            bridge.mark_prepared_open_saved(&prepared)?;
+            prepared
+        };
+        self.submit_prepared_open(prepared, &networking)
+    }
+
+    fn execute_open_attempt(
+        &self,
+        offer: &RelayPaymentOffer,
+        attempt: ClientOpenAttempt,
+        allow_keyset_successor: bool,
+    ) -> Result<String, WalletError> {
+        let result = match self.submit_open_attempt(&attempt) {
+            Err(error) if error.input_may_be_spent => match OpeningRecoveryHttpNetworking::new() {
+                Ok(networking) => {
+                    match self.recover_or_replay_submitted_opening(&attempt.prepared, &networking) {
+                        Ok(Some(result)) => Ok(result),
+                        Ok(None) => Err(error),
+                        Err(recovery_error) => Err(recovery_error),
+                    }
+                }
+                Err(network_error) => Err(open_channel_stage_error(
+                    OpenChannelFailureStage::RestoreVerification,
+                    Some(attempt.prepared.channel_id.clone()),
+                    network_error,
+                )),
+            },
+            result => result,
+        };
+        match result {
+            Ok(result) => {
+                self.finish_open_channel(result, &attempt.reservation, attempt.expiry_timestamp)
+            }
+            Err(error)
+                if allow_keyset_successor
+                    && should_retry_open_after_keyset_rejection(&error, false) =>
+            {
+                if let Err(refresh_error) = self.refresh_client_keysets(offer) {
+                    let _ = self
+                        .loose_wallet
+                        .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
+                    return Err(refresh_error);
+                }
+                let output_keyset = match self.select_output_keyset_from_cache(offer) {
+                    Ok(output_keyset) => output_keyset,
+                    Err(select_error) => {
+                        let _ = self
+                            .loose_wallet
+                            .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
+                        return Err(select_error);
+                    }
+                };
+                let OutputKeysetSelection::Selected(output_keyset) = output_keyset else {
+                    let _ = self
+                        .loose_wallet
+                        .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
+                    return Err(WalletError::StaleRelayKeysets {
+                        mint_url: offer.mint_url.clone(),
+                        unit: offer.unit.clone(),
+                        accepted_keyset_ids: offer.accepted_keyset_ids.clone(),
+                    });
+                };
+                if output_keyset.id == attempt.output_keyset.id {
+                    let _ = self
+                        .loose_wallet
+                        .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
+                    return Err(open_channel_error(
+                        error,
+                        &offer.unit,
+                        attempt.selected_input_msats,
+                    ));
+                }
+                let successor = match self.prepare_open_successor(offer, &attempt, output_keyset) {
+                    Ok(successor) => successor,
+                    Err(error) => {
+                        let _ = self
+                            .loose_wallet
+                            .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
+                        return Err(error);
+                    }
+                };
+                self.execute_open_attempt(offer, successor, false)
+            }
+            Err(error) => self.handle_open_error(
+                error,
+                &attempt.reservation,
+                offer,
+                attempt.selected_input_msats,
+            ),
+        }
+    }
+
+    fn prepare_open_successor(
+        &self,
+        offer: &RelayPaymentOffer,
+        predecessor: &ClientOpenAttempt,
+        output_keyset: SelectedOutputKeyset,
+    ) -> Result<ClientOpenAttempt, WalletError> {
+        let input_proofs_json = proofs_json_from_reservation(&predecessor.reservation)?;
+        let networking = OpeningRecoveryHttpNetworking::new().map_err(WalletError::Backend)?;
+        let input_keyset_lookup = {
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            proof_input_keysets_from_cache(
+                &bridge,
+                &offer.mint_url,
+                &offer.unit,
+                &predecessor.reservation,
+            )
+            .map_err(|e| open_channel_error(e, &offer.unit, predecessor.selected_input_msats))?
+        };
+        let input_keysets_json =
+            proof_input_keysets_json(input_keyset_lookup, &offer.mint_url, &networking).map_err(
+                |e| open_channel_error(e, &offer.unit, predecessor.selected_input_msats),
+            )?;
+        let desired_funding_token_amount_raw = match predecessor.requested_capacity_raw {
+            Some(target) => Some(
+                compute_funding_token_amount(target, &output_keyset.info_json, 0).map_err(|e| {
+                    WalletError::Backend(format!("compute successor funding amount: {e}"))
+                })?,
+            ),
+            None => predecessor.desired_funding_token_amount_raw,
+        };
+        let prepared = {
+            let bridge = self
+                .bridge
+                .lock()
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            bridge
+                .prepare_open_channel_from_proofs_with_input_keysets(
+                    &offer.mint_url,
+                    &offer.unit,
+                    &input_proofs_json,
+                    &input_keysets_json,
+                    &offer.receiver_pubkey,
+                    &self.sender_pubkey_hex,
+                    predecessor.expiry_timestamp,
+                    &output_keyset.info_json,
+                    0,
+                    predecessor.requested_capacity_raw,
+                    desired_funding_token_amount_raw,
+                )
+                .map_err(|e| open_channel_error(e, &offer.unit, predecessor.selected_input_msats))?
+        };
+        let journal = NewOpeningAttempt {
+            attempt_id: prepared.channel_id.clone(),
+            opening_id: predecessor.opening_id.clone(),
+            predecessor_attempt_id: Some(predecessor.prepared.channel_id.clone()),
+            reservation_id: predecessor.reservation.reservation_id.clone(),
+            receiver_pubkey: offer.receiver_pubkey.clone(),
+            mint_url: offer.mint_url.clone(),
+            unit: offer.unit.clone(),
+            input_budget_msats: predecessor.selected_input_msats,
+            expiry_timestamp: predecessor.expiry_timestamp,
+            prepared_open_json: serde_json::to_string(&prepared).map_err(|e| {
+                WalletError::Backend(format!("serialize successor opening attempt: {e}"))
+            })?,
+        };
+        self.loose_wallet
+            .store_opening_attempt_for_reservation(&journal)
+            .map_err(loose_proof_error)?;
+        let save_result = self
+            .bridge
+            .lock()
+            .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))
+            .and_then(|bridge| {
+                bridge.mark_prepared_open_saved(&prepared).map_err(|e| {
+                    open_channel_error(e, &offer.unit, predecessor.selected_input_msats)
+                })
+            });
+        if let Err(error) = save_result {
+            let _ = self
+                .loose_wallet
+                .cancel_prepared_opening_attempt(&prepared.channel_id);
+            return Err(error);
+        }
+        Ok(ClientOpenAttempt {
+            opening_id: predecessor.opening_id.clone(),
+            output_keyset,
+            reservation: predecessor.reservation.clone(),
+            prepared,
+            requested_capacity_raw: predecessor.requested_capacity_raw,
+            desired_funding_token_amount_raw,
+            selected_input_msats: predecessor.selected_input_msats,
+            expiry_timestamp: predecessor.expiry_timestamp,
+        })
     }
 
     fn handle_open_error(
@@ -1241,15 +1958,14 @@ impl SqliteClientWallet {
         recovery_input_budget_msats: u64,
     ) -> Result<String, WalletError> {
         if error.input_may_be_spent {
-            if let Some(channel_id) = error.channel_id.as_deref() {
-                self.store_opening_recovery(
-                    channel_id,
-                    &reservation.reservation_id,
-                    offer,
-                    recovery_input_budget_msats,
-                    &error,
-                )?;
-            }
+            // The pre-submit journal is already the authoritative recovery index.
+        } else if error.stage == OpenChannelFailureStage::MintRejected {
+            let channel_id = error.channel_id.as_deref().ok_or_else(|| {
+                WalletError::Backend("mint-rejected opening has no channel id".to_string())
+            })?;
+            self.loose_wallet
+                .cancel_rejected_opening_attempt(channel_id)
+                .map_err(loose_proof_error)?;
         } else {
             let _ = self
                 .loose_wallet
@@ -1394,20 +2110,36 @@ impl SqliteClientWallet {
             select_mixed_fee_inputs_for_post_swap_target(candidates, required_post_swap_raw)
                 .map_err(|e| WalletError::Backend(format!("select loose proofs: {e}")))?;
 
-        let reservation = self
-            .loose_wallet
-            .reserve_selected_proofs(&offer.mint_url, &offer.unit, &selection.proof_ids)
-            .map_err(loose_proof_error)?;
+        let selected_set = selection
+            .proof_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        let selected_proofs = available_proofs
+            .into_iter()
+            .filter(|proof| selected_set.contains(&proof.proof_id))
+            .collect::<Vec<_>>();
+        let total_amount_raw = selected_proofs.iter().try_fold(0u64, |total, proof| {
+            total
+                .checked_add(proof.amount_raw)
+                .ok_or_else(|| WalletError::Backend("selected input total overflow".to_string()))
+        })?;
+        let reservation = ProofReservation {
+            reservation_id: new_reservation_id(),
+            proofs: selected_proofs,
+            total_amount_raw,
+        };
         let selected_input_msats = raw_to_msats(&offer.unit, reservation.total_amount_raw)?;
-
-        Ok(ClientOpenAttempt {
+        self.prepare_open_attempt(
+            offer,
             output_keyset,
             reservation,
-            requested_capacity_raw: Some(target_capacity_raw),
-            desired_funding_token_amount_raw: Some(required_post_swap_raw),
-            selected_input_msats,
-            expiry_timestamp,
-        })
+            ClientOpenPlan {
+                requested_capacity_raw: Some(target_capacity_raw),
+                desired_funding_token_amount_raw: Some(required_post_swap_raw),
+                selected_input_msats,
+                expiry_timestamp,
+            },
+        )
     }
 }
 
@@ -1554,7 +2286,6 @@ impl MonadWallet for SqliteClientWallet {
         self.ensure_offer_keysets_cached(offer)?;
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
         let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
-        let mut reservation: Option<ProofReservation> = None;
         // Plain provisioning uses an input budget rather than an exact target
         // capacity.  We reserve an arbitrary set of available proofs once, then
         // let upstream compute the resulting channel capacity.  If the mint
@@ -1564,81 +2295,46 @@ impl MonadWallet for SqliteClientWallet {
         // before reporting a stale relay offer; the retry helper handles the
         // mint-rejection refresh path and skips retry when refresh still selects
         // the same keyset.
-        let result = with_active_keyset_retry(
-            // Select an active relay-accepted output keyset, refreshing the
-            // client cache before reporting a stale relay offer.
-            || self.select_output_keyset_refreshing_client_first(offer),
-            // Prepare lazily creates the proof reservation on the first attempt;
-            // on retry, it reuses the same reserved proofs with the refreshed
-            // output keyset.
-            |output_keyset| {
-                let reservation = match reservation.as_ref() {
-                    Some(reservation) => reservation.clone(),
-                    None => {
-                        let new_reservation = self
-                            .loose_wallet
-                            .reserve_proofs_any_keyset(
-                                &offer.mint_url,
-                                &offer.unit,
-                                input_budget_raw,
-                            )
-                            .map_err(loose_proof_error)?;
-                        reservation = Some(new_reservation.clone());
-                        new_reservation
-                    }
-                };
-                Ok(ClientOpenAttempt {
-                    output_keyset,
-                    reservation,
-                    requested_capacity_raw: None,
-                    desired_funding_token_amount_raw: Some(input_budget_raw),
-                    selected_input_msats: input_budget_msats,
-                    expiry_timestamp,
-                })
-            },
-            // Submit the upstream open-channel swap for this reservation.
-            |attempt| self.submit_open_attempt(offer, attempt),
-            // Retry only safe keyset rejections.
-            |error| should_retry_open_after_keyset_rejection(error, false),
-            // Refresh keyset cache before reselecting the output keyset.
-            || self.refresh_client_keysets(offer),
-            // No cleanup here: the same reservation is reused across a changed
-            // keyset retry, and final error handling releases it if no open
-            // succeeds.
-            |_attempt, _error| Ok(()),
-        );
-        match result {
-            Ok(success) => self.finish_open_channel(
-                success.value,
-                &success.attempt.reservation,
-                success.attempt.expiry_timestamp,
-            ),
-            Err(KeysetRetryError::Submit { attempt, error, .. }) => self.handle_open_error(
-                error,
-                &attempt.reservation,
-                offer,
-                attempt.selected_input_msats,
-            ),
-            Err(KeysetRetryError::RetryKeysetUnchanged { attempt, error, .. }) => self
-                .handle_open_error(
-                    error,
-                    &attempt.reservation,
-                    offer,
-                    attempt.selected_input_msats,
-                ),
-            Err(KeysetRetryError::Select {
-                error: WalletError::StaleRelayKeysets { .. },
-                ..
-            }) => Err(WalletError::StaleRelayKeysets {
-                mint_url: offer.mint_url.clone(),
-                unit: offer.unit.clone(),
-                accepted_keyset_ids: offer.accepted_keyset_ids.clone(),
-            }),
-            Err(error) => Err(WalletError::Backend(format!(
-                "prepare channel open retry: {}",
-                describe_keyset_retry_prepare_error(error)
-            ))),
+        let available = self
+            .loose_wallet
+            .list_available_proofs(&offer.mint_url, &offer.unit, &[])
+            .map_err(loose_proof_error)?;
+        let mut selected = Vec::new();
+        let mut total = 0u64;
+        for proof in available {
+            total = total
+                .checked_add(proof.amount_raw)
+                .ok_or_else(|| WalletError::Backend("input budget overflow".to_string()))?;
+            selected.push(proof);
+            if total >= input_budget_raw {
+                break;
+            }
         }
+        if total < input_budget_raw {
+            return Err(loose_proof_error(
+                LooseProofWalletError::InsufficientBalance {
+                    requested: input_budget_raw,
+                    available: total,
+                },
+            ));
+        }
+        let output_keyset = self.select_output_keyset_refreshing_client_first(offer)?;
+        let attempt = self.prepare_open_attempt(
+            offer,
+            output_keyset,
+            ProofReservation {
+                reservation_id: new_reservation_id(),
+                proofs: selected,
+                total_amount_raw: total,
+            },
+            ClientOpenPlan {
+                requested_capacity_raw: None,
+                desired_funding_token_amount_raw: Some(input_budget_raw),
+                selected_input_msats: input_budget_msats,
+                expiry_timestamp,
+            },
+        )?;
+        self.execute_open_attempt(offer, attempt, true)
     }
 
     fn build_link_request(
@@ -1820,6 +2516,143 @@ fn channel_state_str(state: WalletChannelState) -> &'static str {
     }
 }
 
+fn validate_and_canonicalize_restore_response(
+    request_json: &str,
+    response_json: &str,
+) -> Result<Option<String>, String> {
+    let request: RestoreRequest =
+        serde_json::from_str(request_json).map_err(|e| format!("decode restore request: {e}"))?;
+    let response: RestoreResponse =
+        serde_json::from_str(response_json).map_err(|e| format!("decode restore response: {e}"))?;
+    if response.outputs.len() != response.signatures.len() {
+        return Err("restore response output/signature counts differ".to_string());
+    }
+    if response.outputs.is_empty() {
+        return Ok(None);
+    }
+
+    let requested = request.outputs.iter().cloned().collect::<HashSet<_>>();
+    if requested.len() != request.outputs.len() {
+        return Err("restore request contains duplicate outputs".to_string());
+    }
+    let mut signatures_by_output = HashMap::with_capacity(response.outputs.len());
+    for (output, signature) in response.outputs.into_iter().zip(response.signatures) {
+        if !requested.contains(&output) {
+            return Err("restore response contains an unknown output".to_string());
+        }
+        if signatures_by_output.insert(output, signature).is_some() {
+            return Err("restore response contains a duplicate output".to_string());
+        }
+    }
+    if signatures_by_output.len() != request.outputs.len() {
+        return Err("restore response does not contain every requested output".to_string());
+    }
+    let signatures = request
+        .outputs
+        .iter()
+        .map(|output| {
+            signatures_by_output
+                .remove(output)
+                .ok_or_else(|| "restore response omitted a requested output".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    serde_json::to_string(&RestoreResponse {
+        outputs: request.outputs,
+        signatures,
+    })
+    .map(Some)
+    .map_err(|e| format!("serialize canonical restore response: {e}"))
+}
+
+fn prepared_inputs_are_all_unspent<N: OpeningRecoveryNetworking>(
+    prepared: &PreparedOpenChannel,
+    networking: &N,
+) -> Result<bool, OpenChannelError> {
+    let proofs: Vec<Proof> = serde_json::from_str(&prepared.opening.input_token).map_err(|e| {
+        open_channel_stage_error(
+            OpenChannelFailureStage::RestoreVerification,
+            Some(prepared.channel_id.clone()),
+            format!("decode prepared opening inputs: {e}"),
+        )
+    })?;
+    if proofs.is_empty() {
+        return Err(open_channel_stage_error(
+            OpenChannelFailureStage::RestoreVerification,
+            Some(prepared.channel_id.clone()),
+            "prepared opening has no inputs".to_string(),
+        ));
+    }
+    let ys = proofs
+        .iter()
+        .map(|proof| {
+            proof.y().map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::RestoreVerification,
+                    Some(prepared.channel_id.clone()),
+                    format!("derive prepared input Y: {e}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut requested = ys.iter().map(ToString::to_string).collect::<HashSet<_>>();
+    if requested.len() != ys.len() {
+        return Err(open_channel_stage_error(
+            OpenChannelFailureStage::RestoreVerification,
+            Some(prepared.channel_id.clone()),
+            "prepared opening contains duplicate input Ys".to_string(),
+        ));
+    }
+    let request_json = serde_json::to_string(&CheckStateRequest { ys }).map_err(|e| {
+        open_channel_stage_error(
+            OpenChannelFailureStage::RestoreVerification,
+            Some(prepared.channel_id.clone()),
+            format!("serialize opening input state request: {e}"),
+        )
+    })?;
+    let response_json = networking
+        .call_mint_check_state(&prepared.mint_url, &request_json)
+        .map_err(|e| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::RestoreVerification,
+                Some(prepared.channel_id.clone()),
+                format!("check prepared opening input states: {e}"),
+            )
+        })?;
+    let response: CheckStateResponse = serde_json::from_str(&response_json).map_err(|e| {
+        open_channel_stage_error(
+            OpenChannelFailureStage::RestoreVerification,
+            Some(prepared.channel_id.clone()),
+            format!("decode opening input state response: {e}"),
+        )
+    })?;
+    if response.states.len() != requested.len() {
+        return Err(open_channel_stage_error(
+            OpenChannelFailureStage::RestoreVerification,
+            Some(prepared.channel_id.clone()),
+            "opening input state response did not cover every input".to_string(),
+        ));
+    }
+    let mut all_unspent = true;
+    for proof_state in response.states {
+        if !requested.remove(&proof_state.y.to_string()) {
+            return Err(open_channel_stage_error(
+                OpenChannelFailureStage::RestoreVerification,
+                Some(prepared.channel_id.clone()),
+                "opening input state response contained an unknown or duplicate Y".to_string(),
+            ));
+        }
+        all_unspent &= proof_state.state == State::Unspent;
+    }
+    if !requested.is_empty() {
+        return Err(open_channel_stage_error(
+            OpenChannelFailureStage::RestoreVerification,
+            Some(prepared.channel_id.clone()),
+            "opening input state response omitted an input Y".to_string(),
+        ));
+    }
+    Ok(all_unspent)
+}
+
 fn hex_to_session_id(hex: &str) -> Result<[u8; 32], WalletError> {
     let bytes =
         hex::decode(hex).map_err(|e| WalletError::Backend(format!("invalid session hex: {e}")))?;
@@ -1981,6 +2814,21 @@ fn normalize_mint_error_string(raw: String) -> String {
         .unwrap_or(raw)
 }
 
+fn is_definitive_keyset_rejection(message: &str) -> bool {
+    let trimmed = message.trim_start();
+    let payload = if let Some(client_error) = trimmed.strip_prefix(HTTP_CLIENT_ERROR_PREFIX) {
+        client_error
+            .split_once(" - ")
+            .map(|(_, body)| body)
+            .unwrap_or(client_error)
+    } else if trimmed.starts_with('{') {
+        trimmed
+    } else {
+        return false;
+    };
+    cdk_spilman::extract_nut00_error_code(payload) == Some(12002)
+}
+
 struct ProofInputKeysetLookup {
     unit: CurrencyUnit,
     summaries: Vec<serde_json::Value>,
@@ -2053,10 +2901,10 @@ where
     })
 }
 
-fn proof_input_keysets_json(
+fn proof_input_keysets_json<N: SpilmanClientNetworking>(
     mut lookup: ProofInputKeysetLookup,
     mint_url: &str,
-    networking: &ReqwestClientNetworking,
+    networking: &N,
 ) -> Result<String, OpenChannelError> {
     if !lookup.missing.is_empty() {
         lookup.summaries.extend(proof_input_keysets_from_mint(
@@ -2075,11 +2923,11 @@ fn proof_input_keysets_json(
     })
 }
 
-fn proof_input_keysets_from_mint(
+fn proof_input_keysets_from_mint<N: SpilmanClientNetworking>(
     mint_url: &str,
     unit: &CurrencyUnit,
     missing: &[Id],
-    networking: &ReqwestClientNetworking,
+    networking: &N,
 ) -> Result<Vec<serde_json::Value>, OpenChannelError> {
     let keysets_json = networking.call_mint_keysets(mint_url).map_err(|e| {
         open_channel_stage_error(OpenChannelFailureStage::BeforeOpeningSaved, None, e)
@@ -2227,25 +3075,14 @@ fn open_channel_error(
     }
 }
 
-fn describe_keyset_retry_prepare_error(
-    error: KeysetRetryError<ClientOpenAttempt, WalletError, OpenChannelError>,
-) -> String {
-    match error {
-        KeysetRetryError::Select { error, .. }
-        | KeysetRetryError::Prepare { error, .. }
-        | KeysetRetryError::Refresh { error }
-        | KeysetRetryError::Cleanup { error } => error.to_string(),
-        KeysetRetryError::Submit { .. } | KeysetRetryError::RetryKeysetUnchanged { .. } => {
-            "unexpected submit error".to_string()
-        }
-    }
-}
-
 fn should_retry_open_after_keyset_rejection(
     error: &OpenChannelError,
     already_retried: bool,
 ) -> bool {
-    !already_retried && !error.input_may_be_spent && error.is_retryable_keyset_rejection()
+    !already_retried
+        && !error.input_may_be_spent
+        && error.stage == OpenChannelFailureStage::MintRejected
+        && is_definitive_keyset_rejection(&error.message)
 }
 
 fn map_create_payment_error(
@@ -2456,6 +3293,122 @@ mod tests {
 
         fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
             Err("not used".to_string())
+        }
+    }
+
+    #[derive(Clone)]
+    enum CheckStateMode {
+        States(Vec<State>),
+        MissingLast,
+        DuplicateFirst,
+    }
+
+    struct StateCheckNetworking {
+        mode: CheckStateMode,
+        requested_y_count: Mutex<Option<usize>>,
+    }
+
+    impl StateCheckNetworking {
+        fn new(mode: CheckStateMode) -> Self {
+            Self {
+                mode,
+                requested_y_count: Mutex::new(None),
+            }
+        }
+    }
+
+    impl SpilmanClientNetworking for StateCheckNetworking {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+
+        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+    }
+
+    impl OpeningRecoveryNetworking for StateCheckNetworking {
+        fn call_mint_check_state(&self, _: &str, request_json: &str) -> Result<String, String> {
+            let request: CheckStateRequest =
+                serde_json::from_str(request_json).map_err(|e| e.to_string())?;
+            *self.requested_y_count.lock().unwrap() = Some(request.ys.len());
+            let mut states = request
+                .ys
+                .into_iter()
+                .enumerate()
+                .map(|(index, y)| cashu::nuts::ProofState {
+                    y,
+                    state: match &self.mode {
+                        CheckStateMode::States(states) => states[index],
+                        CheckStateMode::MissingLast | CheckStateMode::DuplicateFirst => {
+                            State::Unspent
+                        }
+                    },
+                    witness: None,
+                })
+                .collect::<Vec<_>>();
+            match self.mode {
+                CheckStateMode::States(_) => {}
+                CheckStateMode::MissingLast => {
+                    states.pop();
+                }
+                CheckStateMode::DuplicateFirst if states.len() > 1 => {
+                    states[1].y = states[0].y;
+                }
+                CheckStateMode::DuplicateFirst => {}
+            }
+            serde_json::to_string(&CheckStateResponse { states }).map_err(|e| e.to_string())
+        }
+    }
+
+    fn prepared_opening_with_input_secrets(secrets: &[&str]) -> PreparedOpenChannel {
+        let keyset_id =
+            test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
+        let c = "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2"
+            .parse()
+            .unwrap();
+        let proofs = secrets
+            .iter()
+            .map(|secret| Proof {
+                amount: cashu::Amount::from(1),
+                keyset_id,
+                secret: cashu::secret::Secret::new((*secret).to_string()),
+                c,
+                witness: None,
+                dleq: None,
+                p2pk_e: None,
+            })
+            .collect::<Vec<_>>();
+        PreparedOpenChannel {
+            channel_id: "channel".to_string(),
+            mint_url: "http://mint".to_string(),
+            swap_request_json: "{}".to_string(),
+            opening: ClientChannelOpeningFromSwap {
+                params_json: "{}".to_string(),
+                channel_secret_hex: "secret".to_string(),
+                keyset_info_json: "{}".to_string(),
+                sender_pubkey_hex: "sender".to_string(),
+                receiver_pubkey_hex: "receiver".to_string(),
+                capacity: 1,
+                funding_token_amount: 1,
+                mint_url: "http://mint".to_string(),
+                unit: "sat".to_string(),
+                input_token: serde_json::to_string(&proofs).unwrap(),
+                change_secrets_json: "[]".to_string(),
+                change_amount_raw: 0,
+                created_at: 1,
+            },
+            funding_secrets_json: "[]".to_string(),
+            change_secrets_json: "[]".to_string(),
+            keyset_id: keyset_id.to_string(),
         }
     }
 
@@ -3485,6 +4438,16 @@ mod tests {
         let after_open = SqliteClientWallet::now_seconds().unwrap();
 
         let channel = wallet.get_channel(&channel_id).unwrap();
+        let attempt = wallet
+            .loose_wallet()
+            .opening_attempt(&channel_id)
+            .unwrap()
+            .expect("completed opening journal");
+        assert_eq!(attempt.state, OpeningAttemptState::Completed);
+        let persisted_prepared: PreparedOpenChannel =
+            serde_json::from_str(&attempt.prepared_open_json).unwrap();
+        assert_eq!(persisted_prepared.channel_id, channel_id);
+        assert!(!persisted_prepared.swap_request_json.is_empty());
         assert_eq!(channel.receiver_pubkey, receiver_pubkey);
         assert_eq!(channel.mint_url, mint_url);
         assert_eq!(channel.unit, "sat");
@@ -3822,8 +4785,7 @@ mod tests {
         mint_task.await.unwrap().unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn recovers_persisted_ambiguous_opening() {
+    async fn assert_recovers_persisted_ambiguous_opening(swap_reached_mint: bool) {
         let port = free_loopback_port();
         let mint_url = format!("http://127.0.0.1:{port}");
         let config = TestMintConfig::for_port(port);
@@ -3892,7 +4854,6 @@ mod tests {
         let wallet = SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret).unwrap();
         let receiver_pubkey =
             "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
-        let offer = offer(&mint_url, &receiver_pubkey, &keyset_id);
         let input_budget_msats = desired_funding_raw * 1000;
         let input_budget_raw = msats_to_raw_units(unit, input_budget_msats).unwrap();
         let reservation = wallet
@@ -3966,55 +4927,84 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        storage
-            .save_opening_from_swap(
-                &channel_id,
-                ClientChannelOpeningFromSwap {
-                    params_json: params_json.clone(),
-                    channel_secret_hex: channel_secret_hex.clone(),
-                    keyset_info_json: keyset_info_json.clone(),
-                    sender_pubkey_hex: wallet.sender_pubkey_hex.clone(),
-                    receiver_pubkey_hex: receiver_pubkey.clone(),
-                    capacity,
-                    funding_token_amount,
+        let opening = ClientChannelOpeningFromSwap {
+            params_json: params_json.clone(),
+            channel_secret_hex: channel_secret_hex.clone(),
+            keyset_info_json: keyset_info_json.clone(),
+            sender_pubkey_hex: wallet.sender_pubkey_hex.clone(),
+            receiver_pubkey_hex: receiver_pubkey.clone(),
+            capacity,
+            funding_token_amount,
+            mint_url: mint_url.clone(),
+            unit: unit.to_string(),
+            input_token: input_proofs_json.clone(),
+            change_secrets_json: change_secrets_json.clone(),
+            change_amount_raw,
+            created_at: SqliteClientWallet::now_seconds().unwrap(),
+        };
+        let prepared = PreparedOpenChannel {
+            channel_id: channel_id.clone(),
+            mint_url: mint_url.clone(),
+            swap_request_json: swap_json["swap_request_json"].as_str().unwrap().to_string(),
+            opening: opening.clone(),
+            funding_secrets_json: swap_json["funding_secrets_json"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            change_secrets_json,
+            keyset_id: keyset_id.clone(),
+        };
+        let proof_ids = reservation
+            .proofs
+            .iter()
+            .map(|proof| proof.proof_id.clone())
+            .collect::<Vec<_>>();
+        wallet
+            .loose_wallet()
+            .release_reservation(&reservation.reservation_id)
+            .unwrap();
+        wallet
+            .loose_wallet()
+            .reserve_selected_proofs_with_opening_attempt(
+                &mint_url,
+                unit,
+                &proof_ids,
+                &NewOpeningAttempt {
+                    attempt_id: channel_id.clone(),
+                    opening_id: channel_id.clone(),
+                    predecessor_attempt_id: None,
+                    reservation_id: reservation.reservation_id.clone(),
+                    receiver_pubkey: receiver_pubkey.clone(),
                     mint_url: mint_url.clone(),
                     unit: unit.to_string(),
-                    input_token: input_proofs_json.clone(),
-                    change_secrets_json,
-                    change_amount_raw,
-                    created_at: SqliteClientWallet::now_seconds().unwrap(),
+                    input_budget_msats,
+                    expiry_timestamp,
+                    prepared_open_json: serde_json::to_string(&prepared).unwrap(),
                 },
             )
             .unwrap();
-        let swap_request_json = swap_json["swap_request_json"].as_str().unwrap();
-        let swap_response = client
-            .post(format!("{mint_url}/v1/swap"))
-            .header("Content-Type", "application/json")
-            .body(swap_request_json.to_string())
-            .send()
-            .await
+        assert!(wallet
+            .loose_wallet()
+            .claim_opening_attempt_submission(&channel_id)
+            .unwrap());
+        storage
+            .save_opening_from_swap(&channel_id, opening)
             .unwrap();
-        if !swap_response.status().is_success() {
-            let status = swap_response.status();
-            let body = swap_response.text().await.unwrap_or_default();
-            panic!("swap failed with {status}: {body}");
+        if swap_reached_mint {
+            let swap_response = client
+                .post(format!("{mint_url}/v1/swap"))
+                .header("Content-Type", "application/json")
+                .body(prepared.swap_request_json.clone())
+                .send()
+                .await
+                .unwrap();
+            if !swap_response.status().is_success() {
+                let status = swap_response.status();
+                let body = swap_response.text().await.unwrap_or_default();
+                panic!("swap failed with {status}: {body}");
+            }
         }
 
-        let simulated_error = OpenChannelError {
-            stage: OpenChannelFailureStage::RestoreVerification,
-            channel_id: Some(channel_id.clone()),
-            input_may_be_spent: true,
-            message: "simulated crash after swap".to_string(),
-        };
-        wallet
-            .store_opening_recovery(
-                &channel_id,
-                &reservation.reservation_id,
-                &offer,
-                input_budget_msats,
-                &simulated_error,
-            )
-            .unwrap();
         drop(storage);
         drop(wallet);
 
@@ -4022,6 +5012,15 @@ mod tests {
         let wallet = SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret).unwrap();
         let recovered = wallet.recover_pending_openings().unwrap();
         assert_eq!(recovered, vec![channel_id.clone()]);
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .opening_attempt(&channel_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            OpeningAttemptState::Completed
+        );
 
         let channel = wallet.get_channel(&channel_id).unwrap();
         assert_eq!(channel.state, WalletChannelState::Open);
@@ -4046,6 +5045,16 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovers_persisted_ambiguous_opening() {
+        assert_recovers_persisted_ambiguous_opening(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replays_submitted_opening_when_every_input_is_unspent() {
+        assert_recovers_persisted_ambiguous_opening(false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4212,11 +5221,23 @@ mod tests {
             stage: OpenChannelFailureStage::MintRejected,
             channel_id: Some("channel".to_string()),
             input_may_be_spent: false,
-            message: r#"{"code":12001,"detail":"keyset is not known"}"#.to_string(),
+            message: r#"{"code":12002,"detail":"keyset is inactive"}"#.to_string(),
         };
 
         assert!(should_retry_open_after_keyset_rejection(&error, false));
         assert!(!should_retry_open_after_keyset_rejection(&error, true));
+    }
+
+    #[test]
+    fn keyset_rejection_requires_direct_or_http_client_error_payload() {
+        let payload = r#"{"code":12002,"detail":"keyset is inactive"}"#;
+        assert!(is_definitive_keyset_rejection(payload));
+        assert!(is_definitive_keyset_rejection(&format!(
+            "{HTTP_CLIENT_ERROR_PREFIX}400 Bad Request - {payload}"
+        )));
+        assert!(!is_definitive_keyset_rejection(&format!(
+            "POST http://mint/v1/swap: 500 Internal Server Error - {payload}"
+        )));
     }
 
     #[test]
@@ -4239,5 +5260,155 @@ mod tests {
             &non_keyset,
             false
         ));
+
+        let unknown_keyset = OpenChannelError {
+            stage: OpenChannelFailureStage::MintRejected,
+            channel_id: Some("channel".to_string()),
+            input_may_be_spent: false,
+            message: r#"{"code":12001,"detail":"keyset is not known"}"#.to_string(),
+        };
+        assert!(!should_retry_open_after_keyset_rejection(
+            &unknown_keyset,
+            false
+        ));
+    }
+
+    #[test]
+    fn nut07_replay_gate_requires_every_input_unspent_in_one_response() {
+        let prepared = prepared_opening_with_input_secrets(&["input-a", "input-b"]);
+        let all_unspent =
+            StateCheckNetworking::new(CheckStateMode::States(vec![State::Unspent, State::Unspent]));
+        assert!(prepared_inputs_are_all_unspent(&prepared, &all_unspent).unwrap());
+        assert_eq!(*all_unspent.requested_y_count.lock().unwrap(), Some(2));
+
+        for other_state in [
+            State::Pending,
+            State::Spent,
+            State::Reserved,
+            State::PendingSpent,
+        ] {
+            let mixed = StateCheckNetworking::new(CheckStateMode::States(vec![
+                State::Unspent,
+                other_state,
+            ]));
+            assert!(!prepared_inputs_are_all_unspent(&prepared, &mixed).unwrap());
+        }
+    }
+
+    #[test]
+    fn nut07_replay_gate_rejects_incomplete_or_duplicate_responses() {
+        let prepared = prepared_opening_with_input_secrets(&["input-a", "input-b"]);
+        let missing = StateCheckNetworking::new(CheckStateMode::MissingLast);
+        assert!(prepared_inputs_are_all_unspent(&prepared, &missing).is_err());
+
+        let duplicate = StateCheckNetworking::new(CheckStateMode::DuplicateFirst);
+        assert!(prepared_inputs_are_all_unspent(&prepared, &duplicate).is_err());
+    }
+
+    #[test]
+    fn nut09_restore_validation_distinguishes_absence_and_canonicalizes_pairs() {
+        let keyset_id =
+            test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
+        let output_a = cashu::nuts::BlindedMessage::new(
+            cashu::Amount::from(1),
+            keyset_id,
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2"
+                .parse()
+                .unwrap(),
+        );
+        let output_b = cashu::nuts::BlindedMessage::new(
+            cashu::Amount::from(2),
+            keyset_id,
+            "03b287e320b3e35e9c0190626d6f0ad375b5f1f34c0f7c8f0b6be9f14c53c9d9d9"
+                .parse()
+                .unwrap(),
+        );
+        let signature_a = cashu::nuts::BlindSignature {
+            amount: cashu::Amount::from(1),
+            keyset_id,
+            c: output_a.blinded_secret,
+            dleq: None,
+        };
+        let signature_b = cashu::nuts::BlindSignature {
+            amount: cashu::Amount::from(2),
+            keyset_id,
+            c: output_b.blinded_secret,
+            dleq: None,
+        };
+        let request = serde_json::to_string(&RestoreRequest {
+            outputs: vec![output_a.clone(), output_b.clone()],
+        })
+        .unwrap();
+        let empty = serde_json::to_string(&RestoreResponse {
+            outputs: vec![],
+            signatures: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            validate_and_canonicalize_restore_response(&request, &empty).unwrap(),
+            None
+        );
+
+        let reversed = serde_json::to_string(&RestoreResponse {
+            outputs: vec![output_b.clone(), output_a.clone()],
+            signatures: vec![signature_b.clone(), signature_a.clone()],
+        })
+        .unwrap();
+        let canonical: RestoreResponse = serde_json::from_str(
+            &validate_and_canonicalize_restore_response(&request, &reversed)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(canonical.outputs, vec![output_a, output_b]);
+        assert_eq!(canonical.signatures, vec![signature_a, signature_b]);
+    }
+
+    #[test]
+    fn nut09_restore_validation_rejects_partial_or_mismatched_pairs() {
+        let keyset_id =
+            test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
+        let output = cashu::nuts::BlindedMessage::new(
+            cashu::Amount::from(1),
+            keyset_id,
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2"
+                .parse()
+                .unwrap(),
+        );
+        let request = serde_json::to_string(&RestoreRequest {
+            outputs: vec![output.clone()],
+        })
+        .unwrap();
+        let missing_signature = serde_json::to_string(&RestoreResponse {
+            outputs: vec![output.clone()],
+            signatures: vec![],
+        })
+        .unwrap();
+        assert!(validate_and_canonicalize_restore_response(&request, &missing_signature).is_err());
+
+        let partial_request = serde_json::to_string(&RestoreRequest {
+            outputs: vec![
+                output.clone(),
+                cashu::nuts::BlindedMessage::new(
+                    cashu::Amount::from(2),
+                    keyset_id,
+                    "03b287e320b3e35e9c0190626d6f0ad375b5f1f34c0f7c8f0b6be9f14c53c9d9d9"
+                        .parse()
+                        .unwrap(),
+                ),
+            ],
+        })
+        .unwrap();
+        let partial = serde_json::to_string(&RestoreResponse {
+            outputs: vec![output.clone()],
+            signatures: vec![cashu::nuts::BlindSignature {
+                amount: cashu::Amount::from(1),
+                keyset_id,
+                c: output.blinded_secret,
+                dleq: None,
+            }],
+        })
+        .unwrap();
+        assert!(validate_and_canonicalize_restore_response(&partial_request, &partial).is_err());
     }
 }

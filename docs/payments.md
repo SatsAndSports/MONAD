@@ -132,12 +132,19 @@ list with a `RELAY` column.
 
 The client wallet has the same cache-first shape for channel-opening swaps.
 
-Before the shared keyset retry helper runs, each call site ensures the upstream
-client cache has at least one keyset for the relevant `(mint, unit)`. That cache
-may be stale and may include inactive keysets. Inside the helper, output-keyset
-selection reads cache only. If the mint rejects the first open with a retryable
-keyset error, the helper refreshes that mint, reselects from cache, and retries
-once only if the selected output keyset id changed.
+Each call site ensures the upstream client cache has at least one keyset for the
+relevant `(mint, unit)`. The client prepares an exact opening, then atomically
+reserves its loose inputs and journals that preparation before submission. A
+submitted attempt is immutable and ambiguous outcomes first use NUT-09. When a
+valid funding restore is empty, one NUT-07 request checks all persisted input Ys;
+only an all-`UNSPENT` response permits one replay of the identical swap request per
+recovery invocation. Live opening ambiguity, configured-client startup, and
+`recover-openings` use this same bounded sequence. Recovery cancels a prepared
+attempt that never entered the submit window. If the mint explicitly rejects code
+`12002` for an inactive output keyset, the client may refresh and persist one
+successor attempt, but only when selection produces a different active output
+keyset. That successor is a new immutable attempt with its own one-exact-replay
+allowance per recovery invocation.
 
 Input proof keysets are independent from the selected output funding keyset:
 input proofs may be old, inactive, or mixed-keyset proofs as long as the mint

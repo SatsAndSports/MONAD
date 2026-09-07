@@ -611,9 +611,24 @@ channel metadata.
 Client channel opening is cache-first. Each opening call site selects an active
 client output keyset that intersects with the relay's advertised
 `accepted_keyset_ids`. A cache-only miss refreshes the client mint cache before
-the offer is classified as stale. If the mint rejects a selected cached keyset
-during swap submission, the retry path refreshes again and skips retry if refresh
-still selects the same output keyset.
+the offer is classified as stale. Before mint I/O, the loose-proof store atomically
+reserves the selected inputs and records the exact serialized prepared opening.
+The journal is authoritative across restarts. Submitted attempts first recover
+their original funding/change outputs through NUT-09. If a valid funding restore
+is empty, one NUT-07 request checks every persisted input Y; only an all-`UNSPENT`
+response permits one replay of the byte-identical swap per recovery invocation.
+Finalization replays local channel, change-proof, and metadata updates
+idempotently. Prepared attempts that were never claimed for submission are
+cancelled and their proofs released.
+
+If the mint explicitly rejects an inactive output keyset with code `12002`, the
+client records that immutable predecessor, refreshes, and may create one successor
+using a changed active keyset. Transport and protocol ambiguity never authorizes a
+successor submission. The configured runtime runs one bounded best-effort opening
+recovery pass before route provisioning; live ambiguous opens run the same bounded
+recovery once immediately. Unresolved attempts remain reserved. The exact-replay
+allowance is independent per immutable attempt, so a keyset successor receives
+its own allowance without authorizing a second successor.
 
 If that refreshed client cache has no active output keyset that is also present
 in the relay's advertised `accepted_keyset_ids`, `SqliteClientWallet` returns a
