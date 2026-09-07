@@ -1385,9 +1385,10 @@ impl SqliteClientWallet {
             .map_err(|e| WalletError::Backend(format!("system time before unix epoch: {e}")))
     }
 
-    fn submit_open_attempt(
+    fn submit_open_attempt_with_networking<N: SpilmanClientNetworking>(
         &self,
         attempt: &ClientOpenAttempt,
+        networking: &N,
     ) -> Result<OpenChannelResult, OpenChannelError> {
         let claimed = self
             .loose_wallet
@@ -1406,14 +1407,7 @@ impl SqliteClientWallet {
                 "opening attempt was already submitted by another worker".to_string(),
             ));
         }
-        let networking = OpeningRecoveryHttpNetworking::new().map_err(|error| {
-            open_channel_stage_error(
-                OpenChannelFailureStage::SwapSubmitted,
-                Some(attempt.prepared.channel_id.clone()),
-                error,
-            )
-        })?;
-        self.submit_prepared_open(attempt.prepared.clone(), &networking)
+        self.submit_prepared_open(attempt.prepared.clone(), networking)
     }
 
     fn prepare_open_attempt(
@@ -1772,21 +1766,38 @@ impl SqliteClientWallet {
         attempt: ClientOpenAttempt,
         allow_keyset_successor: bool,
     ) -> Result<String, WalletError> {
-        let result = match self.submit_open_attempt(&attempt) {
-            Err(error) if error.input_may_be_spent => match OpeningRecoveryHttpNetworking::new() {
-                Ok(networking) => {
-                    match self.recover_or_replay_submitted_opening(&attempt.prepared, &networking) {
-                        Ok(Some(result)) => Ok(result),
-                        Ok(None) => Err(error),
-                        Err(recovery_error) => Err(recovery_error),
-                    }
+        let networking = match OpeningRecoveryHttpNetworking::new() {
+            Ok(networking) => networking,
+            Err(error) => {
+                self.loose_wallet
+                    .cancel_prepared_opening_attempt(&attempt.prepared.channel_id)
+                    .map_err(loose_proof_error)?;
+                return Err(WalletError::Backend(error));
+            }
+        };
+        self.execute_open_attempt_with_networking(
+            offer,
+            attempt,
+            allow_keyset_successor,
+            &networking,
+        )
+    }
+
+    fn execute_open_attempt_with_networking<N: OpeningRecoveryNetworking>(
+        &self,
+        offer: &RelayPaymentOffer,
+        attempt: ClientOpenAttempt,
+        allow_keyset_successor: bool,
+        networking: &N,
+    ) -> Result<String, WalletError> {
+        let result = match self.submit_open_attempt_with_networking(&attempt, networking) {
+            Err(error) if error.input_may_be_spent => {
+                match self.recover_or_replay_submitted_opening(&attempt.prepared, networking) {
+                    Ok(Some(result)) => Ok(result),
+                    Ok(None) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
                 }
-                Err(network_error) => Err(open_channel_stage_error(
-                    OpenChannelFailureStage::RestoreVerification,
-                    Some(attempt.prepared.channel_id.clone()),
-                    network_error,
-                )),
-            },
+            }
             result => result,
         };
         match result {
@@ -1841,7 +1852,7 @@ impl SqliteClientWallet {
                         return Err(error);
                     }
                 };
-                self.execute_open_attempt(offer, successor, false)
+                self.execute_open_attempt_with_networking(offer, successor, false, networking)
             }
             Err(error) => self.handle_open_error(
                 error,
@@ -3366,6 +3377,62 @@ mod tests {
                 CheckStateMode::DuplicateFirst => {}
             }
             serde_json::to_string(&CheckStateResponse { states }).map_err(|e| e.to_string())
+        }
+    }
+
+    struct FourSubmissionNetworking {
+        inner: OpeningRecoveryHttpNetworking,
+        swap_requests: Mutex<Vec<String>>,
+        check_state_requests: Mutex<Vec<CheckStateRequest>>,
+    }
+
+    impl FourSubmissionNetworking {
+        fn new() -> Self {
+            Self {
+                inner: OpeningRecoveryHttpNetworking::new().unwrap(),
+                swap_requests: Mutex::new(Vec::new()),
+                check_state_requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SpilmanClientNetworking for FourSubmissionNetworking {
+        fn call_mint_swap(&self, mint_url: &str, request_json: &str) -> Result<String, String> {
+            let call_index = {
+                let mut requests = self.swap_requests.lock().unwrap();
+                requests.push(request_json.to_string());
+                requests.len() - 1
+            };
+            match call_index {
+                0 | 2 => Err("injected transport loss before mint submission".to_string()),
+                1 | 3 => self.inner.call_mint_swap(mint_url, request_json),
+                _ => Err(format!("unexpected swap submission {}", call_index + 1)),
+            }
+        }
+
+        fn call_mint_restore(&self, mint_url: &str, request_json: &str) -> Result<String, String> {
+            self.inner.call_mint_restore(mint_url, request_json)
+        }
+
+        fn call_mint_keysets(&self, mint_url: &str) -> Result<String, String> {
+            self.inner.call_mint_keysets(mint_url)
+        }
+
+        fn call_mint_keys(&self, mint_url: &str, keyset_id: &str) -> Result<String, String> {
+            self.inner.call_mint_keys(mint_url, keyset_id)
+        }
+    }
+
+    impl OpeningRecoveryNetworking for FourSubmissionNetworking {
+        fn call_mint_check_state(
+            &self,
+            mint_url: &str,
+            request_json: &str,
+        ) -> Result<String, String> {
+            let request: CheckStateRequest =
+                serde_json::from_str(request_json).map_err(|e| e.to_string())?;
+            self.check_state_requests.lock().unwrap().push(request);
+            self.inner.call_mint_check_state(mint_url, request_json)
         }
     }
 
@@ -5055,6 +5122,167 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replays_submitted_opening_when_every_input_is_unspent() {
         assert_recovers_persisted_ambiguous_opening(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opening_recovery_handles_ambiguity_then_12002_then_successor_ambiguity() {
+        let mint_helper = TestMintHelper::new().await.unwrap();
+        let mint = mint_helper.mint();
+        let initial_keyset_id = mint_helper.keyset_id().to_string();
+        let input_proofs = mint_helper.mint_proofs(128).await.unwrap();
+
+        let port = free_loopback_port();
+        let mint_url = format!("http://127.0.0.1:{port}");
+        let config = TestMintConfig::for_port(port);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let mint_for_server = mint.clone();
+        let mint_task = tokio::spawn(async move {
+            serve_existing_mint_with_shutdown(mint_for_server, config, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        let client = reqwest::Client::new();
+        wait_for_mint(&client, &mint_url).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let loose_db = temp.path().join("loose.sqlite");
+        let channel_db = temp.path().join("channels.sqlite");
+        let loose_wallet = LooseProofWallet::open(&loose_db, "alice").unwrap();
+        loose_wallet
+            .import_proofs(&loose_proofs_from_json(
+                &mint_url,
+                "sat",
+                "four-submission-quote",
+                "four-submission-batch",
+                &serde_json::to_string(&input_proofs).unwrap(),
+            ))
+            .unwrap();
+        let wallet =
+            SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret_hex()).unwrap();
+        let receiver_pubkey = "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2";
+        let mut offer = offer(&mint_url, receiver_pubkey, &initial_keyset_id);
+
+        wallet.ensure_offer_keysets_cached(&offer).unwrap();
+        let output_keyset = wallet
+            .select_output_keyset_refreshing_client_first(&offer)
+            .unwrap();
+        let attempt = wallet
+            .prepare_target_capacity_attempt(
+                &offer,
+                32,
+                output_keyset,
+                SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+            )
+            .unwrap();
+        let opening_id = attempt.opening_id.clone();
+        let reservation_id = attempt.reservation.reservation_id.clone();
+        let expected_input_ys =
+            serde_json::from_str::<Vec<Proof>>(&attempt.prepared.opening.input_token)
+                .unwrap()
+                .into_iter()
+                .map(|proof| proof.y().unwrap().to_string())
+                .collect::<HashSet<_>>();
+
+        let successor_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
+        assert_ne!(initial_keyset_id, successor_keyset_id);
+        offer.accepted_keyset_ids.push(successor_keyset_id.clone());
+
+        let networking = FourSubmissionNetworking::new();
+        let channel_id = wallet
+            .execute_open_attempt_with_networking(&offer, attempt, true, &networking)
+            .expect("four-submission opening recovery");
+
+        {
+            let swap_requests = networking.swap_requests.lock().unwrap();
+            assert_eq!(swap_requests.len(), 4);
+            assert_eq!(swap_requests[0], swap_requests[1]);
+            assert_eq!(swap_requests[2], swap_requests[3]);
+            assert_ne!(swap_requests[0], swap_requests[2]);
+        }
+
+        let root = wallet
+            .loose_wallet()
+            .opening_attempt(&opening_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.state, OpeningAttemptState::Rejected);
+        assert_eq!(root.rejection_code, Some(12_002));
+        assert_eq!(root.predecessor_attempt_id, None);
+        let root_prepared: PreparedOpenChannel =
+            serde_json::from_str(&root.prepared_open_json).unwrap();
+        assert_eq!(root_prepared.keyset_id, initial_keyset_id);
+
+        let successor = wallet
+            .loose_wallet()
+            .opening_attempt(&channel_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(successor.state, OpeningAttemptState::Completed);
+        assert_eq!(successor.opening_id, opening_id);
+        assert_eq!(
+            successor.predecessor_attempt_id.as_deref(),
+            Some(root.attempt_id.as_str())
+        );
+        let successor_prepared: PreparedOpenChannel =
+            serde_json::from_str(&successor.prepared_open_json).unwrap();
+        assert_eq!(successor_prepared.keyset_id, successor_keyset_id);
+
+        {
+            let state_requests = networking.check_state_requests.lock().unwrap();
+            assert_eq!(state_requests.len(), 2);
+            for request in state_requests.iter() {
+                assert_eq!(request.ys.len(), expected_input_ys.len());
+                assert_eq!(
+                    request
+                        .ys
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<HashSet<_>>(),
+                    expected_input_ys
+                );
+            }
+        }
+
+        let reserved = wallet
+            .loose_wallet()
+            .proofs_for_reservation(&reservation_id)
+            .unwrap();
+        assert!(!reserved.is_empty());
+        assert!(reserved
+            .iter()
+            .all(|proof| proof.state == LooseProofState::Spent));
+        assert_eq!(
+            wallet.get_channel(&channel_id).unwrap().state,
+            WalletChannelState::Open
+        );
+
+        let journal_db = Connection::open(&loose_db).unwrap();
+        let successor_count: u64 = journal_db
+            .query_row(
+                "SELECT COUNT(*) FROM monad_client_opening_attempts
+                 WHERE wallet_name = 'alice' AND opening_id = ?1
+                   AND predecessor_attempt_id IS NOT NULL",
+                params![opening_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(successor_count, 1);
+        let channel_count: u64 = wallet
+            .channel_db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM monad_client_channels", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(channel_count, 1);
+
+        assert!(wallet.recover_pending_openings().unwrap().is_empty());
+        assert_eq!(networking.swap_requests.lock().unwrap().len(), 4);
+
+        let _ = shutdown_tx.send(());
+        mint_task.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
