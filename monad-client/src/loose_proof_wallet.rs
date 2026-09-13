@@ -2727,7 +2727,8 @@ mod tests {
         let keyset_id = active_keyset_id(&client, &mint_url, unit).await;
         let bridge = SpilmanClientBridge::new(
             ConfigurableClientHost::new_in_memory(),
-            ReqwestClientNetworking::new(),
+            ReqwestClientNetworking::new(std::time::Duration::from_secs(15))
+                .expect("construct bridge HTTP networking"),
         );
         let keyset_info_json = bridge.fetch_keyset_info(&mint_url, &keyset_id).unwrap();
 

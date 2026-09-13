@@ -36,7 +36,7 @@ type ClientBridge =
     SpilmanClientBridge<ConfigurableClientHost<SqliteClientStorage>, ReqwestClientNetworking>;
 
 const CHANNEL_EXPIRY_SECONDS: u64 = 24 * 3600;
-const OPENING_RECOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const MINT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_CLIENT_ERROR_PREFIX: &str = "MONAD_HTTP_CLIENT_ERROR ";
 
 trait OpeningRecoveryNetworking: SpilmanClientNetworking {
@@ -56,7 +56,7 @@ impl OpeningRecoveryHttpNetworking {
     fn new() -> Result<Self, String> {
         Ok(Self {
             client: reqwest::Client::builder()
-                .timeout(OPENING_RECOVERY_REQUEST_TIMEOUT)
+                .timeout(MINT_HTTP_REQUEST_TIMEOUT)
                 .build()
                 .map_err(|e| format!("build opening recovery HTTP client: {e}"))?,
             runtime: tokio::runtime::Handle::current(),
@@ -327,7 +327,9 @@ impl SqliteClientWallet {
         let sender_pubkey_hex = sender_secret.public_key().to_hex();
         host.add_key(sender_secret.clone());
 
-        let bridge = SpilmanClientBridge::new(host, ReqwestClientNetworking::new());
+        let networking = ReqwestClientNetworking::new(MINT_HTTP_REQUEST_TIMEOUT)
+            .map_err(|e| WalletError::Backend(format!("create bridge HTTP networking: {e}")))?;
+        let bridge = SpilmanClientBridge::new(host, networking);
 
         let channel_db = Connection::open(path)
             .map_err(|e| WalletError::Backend(format!("open channel metadata database: {e}")))?;
@@ -3641,7 +3643,8 @@ mod tests {
 
         let bridge = SpilmanClientBridge::new(
             ConfigurableClientHost::new_in_memory(),
-            ReqwestClientNetworking::new(),
+            ReqwestClientNetworking::new(MINT_HTTP_REQUEST_TIMEOUT)
+                .expect("construct bridge HTTP networking"),
         );
         let keyset_info_json = bridge.fetch_keyset_info(&mint_url, &keyset_id).unwrap();
 
@@ -4435,7 +4438,8 @@ mod tests {
         let keyset_id = active_keyset_id(&client, &mint_url, unit).await;
         let bridge = SpilmanClientBridge::new(
             ConfigurableClientHost::new_in_memory(),
-            ReqwestClientNetworking::new(),
+            ReqwestClientNetworking::new(MINT_HTTP_REQUEST_TIMEOUT)
+                .expect("construct bridge HTTP networking"),
         );
         let keyset_info_json = bridge.fetch_keyset_info(&mint_url, &keyset_id).unwrap();
 
@@ -4779,7 +4783,8 @@ mod tests {
         let keyset_id = active_keyset_id(&client, &mint_url, unit).await;
         let bridge = SpilmanClientBridge::new(
             ConfigurableClientHost::new_in_memory(),
-            ReqwestClientNetworking::new(),
+            ReqwestClientNetworking::new(MINT_HTTP_REQUEST_TIMEOUT)
+                .expect("construct bridge HTTP networking"),
         );
         let keyset_info_json = bridge.fetch_keyset_info(&mint_url, &keyset_id).unwrap();
 
@@ -4871,7 +4876,8 @@ mod tests {
         let keyset_id = active_keyset_id(&client, &mint_url, unit).await;
         let helper_bridge = SpilmanClientBridge::new(
             ConfigurableClientHost::new_in_memory(),
-            ReqwestClientNetworking::new(),
+            ReqwestClientNetworking::new(MINT_HTTP_REQUEST_TIMEOUT)
+                .expect("construct bridge HTTP networking"),
         );
         let keyset_info_json = helper_bridge
             .fetch_keyset_info(&mint_url, &keyset_id)

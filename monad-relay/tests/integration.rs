@@ -6399,7 +6399,8 @@ async fn test_rotated_mint_stale_relay_old_channel_ok_new_open_refused() {
             channel_db_path.to_str().unwrap(),
         )
         .unwrap(),
-        cdk_spilman::ReqwestClientNetworking::new(),
+        cdk_spilman::ReqwestClientNetworking::new(Duration::from_secs(15))
+            .expect("construct bridge HTTP networking"),
     );
     refresh_bridge
         .refresh_keysets_response(&mint_url)
@@ -8826,7 +8827,8 @@ async fn test_configured_client_fresh_relay_stale_client_refreshes_locally_after
             fixture.channel_db_path.to_str().unwrap(),
         )
         .unwrap(),
-        cdk_spilman::ReqwestClientNetworking::new(),
+        cdk_spilman::ReqwestClientNetworking::new(Duration::from_secs(15))
+            .expect("construct bridge HTTP networking"),
     );
     let client_active_before: Vec<String> = client_bridge
         .cached_active_keyset_ids(&fixture.mint_url, &cashu::nuts::CurrencyUnit::Sat)
