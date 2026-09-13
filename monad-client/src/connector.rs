@@ -17,18 +17,22 @@ use monad_common::session::RelayConnection;
 use monad_quic::client::ClientAuthMode;
 use monad_quic::pool::QuicPool;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tracing::info;
 
+/// Reuse this runtime (or a clone) across retries to wait for cancelled setup
+/// cleanup before a new attempt touches the wallet.
 #[derive(Clone)]
 pub struct ConnectorRuntime {
     wallet: Option<Arc<dyn MonadWallet>>,
     first_hop_quic_pool: Arc<QuicPool>,
     payment_policy: PaymentPolicy,
+    setup_tail: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    setup_timeout: Option<Duration>,
 }
 
 impl ConnectorRuntime {
@@ -44,6 +48,8 @@ impl ConnectorRuntime {
             wallet,
             first_hop_quic_pool: Arc::new(QuicPool::new()?),
             payment_policy,
+            setup_tail: Arc::new(Mutex::new(None)),
+            setup_timeout: None,
         })
     }
 
@@ -51,10 +57,91 @@ impl ConnectorRuntime {
         Self::new(Some(Arc::new(MockWallet::new())))
     }
 
+    /// Bound setup work, excluding the time needed to quiesce cancelled tasks.
+    pub fn with_setup_timeout(mut self, timeout: Duration) -> Self {
+        self.setup_timeout = Some(timeout);
+        self
+    }
+
     pub fn reset_first_hop_quic_pool(&mut self) -> io::Result<()> {
         self.first_hop_quic_pool = Arc::new(QuicPool::new()?);
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct RouteSetup {
+    conns: Mutex<Vec<Arc<RelayConnection>>>,
+}
+
+impl RouteSetup {
+    fn track(&self, conn: Arc<RelayConnection>) {
+        self.conns.lock().unwrap().push(conn);
+    }
+
+    async fn cleanup(&self, runtime: &ConnectorRuntime) {
+        let conns = std::mem::take(&mut *self.conns.lock().unwrap());
+        // A mint call may still finish and attach a channel after abort(). Await
+        // every child before releasing wallet attachments or allowing a retry.
+        for conn in conns.iter().rev() {
+            conn.close().await;
+        }
+        for conn in &conns {
+            close_failed_funded_connection(conn, runtime);
+        }
+    }
+}
+
+async fn owned_setup<F, Fut>(runtime: ConnectorRuntime, build: F) -> io::Result<RouteConnection>
+where
+    F: FnOnce(Arc<RouteSetup>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = io::Result<RouteConnection>> + Send + 'static,
+{
+    // Reserve our place synchronously, before handing ownership to the
+    // supervisor. Even cancellation while queued must not drop an old suffix
+    // route (and its children) outside the supervisor's cleanup scope.
+    let (completed, completion) = tokio::sync::oneshot::channel();
+    let previous = runtime.setup_tail.lock().unwrap().replace(completion);
+    let (mut tx, rx) = tokio::sync::oneshot::channel();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    // The supervisor is intentionally not aborted with its caller. It owns the
+    // children and keeps the gate until asynchronous cleanup has completed.
+    tokio::spawn(async move {
+        let _completed = completed;
+        let setup = Arc::new(RouteSetup::default());
+        let build = build(setup.clone());
+        if let Some(previous) = previous {
+            let _ = previous.await;
+        }
+        let deadline = async {
+            match runtime.setup_timeout {
+                Some(duration) => tokio::time::sleep(duration).await,
+                None => std::future::pending().await,
+            }
+        };
+        let result = {
+            tokio::pin!(build);
+            tokio::select! {
+                biased;
+                _ = tx.closed() => Err(io::Error::new(io::ErrorKind::Interrupted, "route setup cancelled")),
+                _ = deadline => Err(io::Error::new(io::ErrorKind::TimedOut, "route setup timed out")),
+                result = &mut build => result,
+            }
+        };
+        if result.is_err() {
+            setup.cleanup(&runtime).await;
+            let _ = tx.send(result);
+        } else if tx.send(result).is_err() || accepted_rx.await.is_err() {
+            setup.cleanup(&runtime).await;
+        }
+    });
+    let result = rx
+        .await
+        .map_err(|_| io::Error::other("route setup supervisor exited"))?;
+    // Sending only buffers the route. Transfer ownership synchronously with
+    // returning it, without a cancellation point between receipt and acceptance.
+    let _ = accepted_tx.send(());
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -86,8 +173,8 @@ pub struct RouteConnection {
 impl RouteConnection {
     fn from_funded(funded: FundedConnection) -> Self {
         Self {
-            final_conn: Arc::new(funded.conn),
-            prefix_conns: funded.prefix_conns.into_iter().map(Arc::new).collect(),
+            final_conn: funded.conn,
+            prefix_conns: funded.prefix_conns,
             hops: funded.hops,
         }
     }
@@ -96,6 +183,8 @@ impl RouteConnection {
         &self.final_conn
     }
 
+    /// The final-hop handle does not own prefix tasks. Keep the route alive
+    /// while using it, and await route.close() to quiesce all hops.
     pub fn final_connection_arc(&self) -> Arc<RelayConnection> {
         self.final_conn.clone()
     }
@@ -247,12 +336,38 @@ pub async fn rebuild_route_from_with_runtime(
     old_route: Option<RouteConnection>,
     start_hop_idx: usize,
 ) -> io::Result<RouteConnection> {
+    let route = route.clone();
+    let runtime = runtime.clone();
+    owned_setup(runtime.clone(), move |setup| {
+        if let Some(old) = &old_route {
+            for idx in 0..old.hop_count() {
+                setup.track(old.connection_for_hop(idx).unwrap());
+            }
+        }
+        async move { rebuild_route_internal(&route, &runtime, old_route, start_hop_idx, setup).await }
+    })
+    .await
+}
+
+async fn rebuild_route_internal(
+    route: &Route,
+    runtime: &ConnectorRuntime,
+    old_route: Option<RouteConnection>,
+    start_hop_idx: usize,
+    setup: Arc<RouteSetup>,
+) -> io::Result<RouteConnection> {
     // Rebuilding from hop 0 is equivalent to a normal full-route reconnect.
     if start_hop_idx == 0 {
         if let Some(old_route) = old_route {
             old_route.close().await;
+            for idx in 0..old_route.hop_count() {
+                close_failed_funded_connection(
+                    &old_route.connection_for_hop(idx).unwrap(),
+                    runtime,
+                );
+            }
         }
-        return connect_route_internal(route, runtime.clone(), true).await;
+        return build_route(route, runtime.clone(), true, setup).await;
     }
 
     if start_hop_idx >= route.hops().len() {
@@ -319,43 +434,28 @@ pub async fn rebuild_route_from_with_runtime(
     old_suffix_conns.push(old_final_conn);
     for conn in old_suffix_conns {
         conn.close().await;
+        close_failed_funded_connection(&conn, runtime);
     }
 
     let preserved_hops = old_hops.into_iter().take(start_hop_idx).collect::<Vec<_>>();
-    let h2_connect_stream = match open_next_hop_tunnel(&prefix_tail, next_hop).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            for conn in &preserved_prefix_conns {
-                conn.close().await;
-            }
-            return Err(err);
-        }
-    };
-    let mut rebuilt_suffix = match chain_from_stream(
+    let h2_connect_stream = open_next_hop_tunnel(&prefix_tail, next_hop).await?;
+    let mut rebuilt_suffix = chain_from_stream(
         h2_connect_stream,
         route.clone(),
         start_hop_idx,
         runtime.clone(),
         true,
+        setup,
     )
-    .await
-    {
-        Ok(rebuilt_suffix) => rebuilt_suffix,
-        Err(err) => {
-            for conn in &preserved_prefix_conns {
-                conn.close().await;
-            }
-            return Err(err);
-        }
-    };
+    .await?;
 
     let mut hops = preserved_hops;
     hops.append(&mut rebuilt_suffix.hops);
     let mut prefix_conns = preserved_prefix_conns;
-    prefix_conns.extend(rebuilt_suffix.prefix_conns.into_iter().map(Arc::new));
+    prefix_conns.extend(rebuilt_suffix.prefix_conns);
 
     Ok(RouteConnection {
-        final_conn: Arc::new(rebuilt_suffix.conn),
+        final_conn: rebuilt_suffix.conn,
         prefix_conns,
         hops,
     })
@@ -365,6 +465,19 @@ async fn connect_route_internal(
     route: &Route,
     runtime: ConnectorRuntime,
     fund_last_hop: bool,
+) -> io::Result<RouteConnection> {
+    let route = route.clone();
+    owned_setup(runtime.clone(), move |setup| async move {
+        build_route(&route, runtime, fund_last_hop, setup).await
+    })
+    .await
+}
+
+async fn build_route(
+    route: &Route,
+    runtime: ConnectorRuntime,
+    fund_last_hop: bool,
+    setup: Arc<RouteSetup>,
 ) -> io::Result<RouteConnection> {
     let first = route.hops().first().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "at least one hop is required")
@@ -389,25 +502,25 @@ async fn connect_route_internal(
             .open_stream(addr, ClientAuthMode::Secp256k1(*pubkey))
             .await?;
         info!("QUIC connected to {addr}");
-        chain_from_stream(quic_stream, route.clone(), 0, runtime, fund_last_hop).await?
+        chain_from_stream(quic_stream, route.clone(), 0, runtime, fund_last_hop, setup).await?
     } else {
         info!("connecting to first hop: {addr}");
         let tcp_stream = TcpStream::connect(addr).await?;
         info!("TCP connected to {addr}");
-        chain_from_stream(tcp_stream, route.clone(), 0, runtime, fund_last_hop).await?
+        chain_from_stream(tcp_stream, route.clone(), 0, runtime, fund_last_hop, setup).await?
     };
     Ok(RouteConnection::from_funded(funded))
 }
 
 pub struct FundedConnection {
-    pub conn: RelayConnection,
-    pub prefix_conns: Vec<RelayConnection>,
+    pub conn: Arc<RelayConnection>,
+    pub prefix_conns: Vec<Arc<RelayConnection>>,
     pub failure_rx: Option<tokio::sync::watch::Receiver<bool>>,
     pub hops: Vec<RouteHopConnection>,
 }
 
 async fn optionally_fund_session(
-    conn: RelayConnection,
+    conn: Arc<RelayConnection>,
     wallet: Option<Arc<dyn MonadWallet>>,
     hop_label: &str,
     payment_policy: PaymentPolicy,
@@ -426,6 +539,7 @@ async fn optionally_fund_session(
         session_driver::start_session_payment_driver(&conn, wallet, hop_label, payment_policy)
             .await?;
     info!("{hop_label}: waiting for funded session readiness");
+    conn.add_task(control_task);
     ready_rx.await.map_err(|_| {
         io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -433,7 +547,6 @@ async fn optionally_fund_session(
         )
     })?;
     info!("{hop_label}: session funded and usable");
-    conn.add_task(control_task);
     Ok(FundedConnection {
         conn,
         prefix_conns: Vec::new(),
@@ -514,6 +627,7 @@ fn chain_from_stream<S>(
     hop_idx: usize,
     runtime: ConnectorRuntime,
     fund_last_hop: bool,
+    setup: Arc<RouteSetup>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<FundedConnection>> + Send>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -554,6 +668,8 @@ where
         let (mut conn, driver) =
             RelayConnection::from_transport_stream(noise_stream, session_id).await?;
         conn.add_driver(driver);
+        let conn = Arc::new(conn);
+        setup.track(conn.clone());
         conn.set_cashu_spilman_protocol_version(
             server_accept.cashu_spilman_protocol_version.clone(),
         )
@@ -586,7 +702,7 @@ where
             runtime.payment_policy,
         )
         .await?;
-        let mut conn = funded.conn;
+        let conn = funded.conn;
         let funded_hop = funded.failure_rx.is_some();
         if let Some(failure_rx) = funded.failure_rx {
             conn.add_failure_watcher(hop_idx, failure_rx);
@@ -600,11 +716,7 @@ where
 
         if hop_idx < route.hops().len() - 1 {
             let next_hop = &route.hops()[hop_idx + 1];
-            if let Err(err) = ensure_next_hop_capabilities(&route, hop_idx, &capabilities) {
-                close_failed_funded_connection(&conn, &runtime);
-                conn.close().await;
-                return Err(err);
-            }
+            ensure_next_hop_capabilities(&route, hop_idx, &capabilities)?;
 
             info!(
                 "hop {}/{}: opening CONNECT tunnel to next hop {}",
@@ -613,31 +725,17 @@ where
                 hop_display_label(next_hop)
             );
 
-            let h2_connect_stream = match open_next_hop_tunnel(&conn, next_hop).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    close_failed_funded_connection(&conn, &runtime);
-                    conn.close().await;
-                    return Err(err);
-                }
-            };
+            let h2_connect_stream = open_next_hop_tunnel(&conn, next_hop).await?;
 
-            let mut next_funded = match chain_from_stream(
+            let mut next_funded = chain_from_stream(
                 h2_connect_stream,
                 route.clone(),
                 hop_idx + 1,
                 runtime.clone(),
                 fund_last_hop,
+                setup,
             )
-            .await
-            {
-                Ok(funded) => funded,
-                Err(err) => {
-                    close_failed_funded_connection(&conn, &runtime);
-                    conn.close().await;
-                    return Err(err);
-                }
-            };
+            .await?;
             let mut prefix_conns = vec![conn];
             prefix_conns.append(&mut next_funded.prefix_conns);
             next_funded.prefix_conns = prefix_conns;
@@ -765,6 +863,163 @@ mod tests {
         assert!(err.to_string().contains("cannot forward"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_timeout_awaits_children_even_when_close_was_cancelled() {
+        let runtime = ConnectorRuntime::new(None)
+            .unwrap()
+            .with_setup_timeout(Duration::from_millis(100));
+        let conn = Arc::new(test_relay_connection(1).await);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            tokio::task::block_in_place(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            std::future::pending::<()>().await;
+        });
+        let child = task.abort_handle();
+        conn.add_task(task);
+        entered_rx.await.unwrap();
+
+        // Cancellation of close must leave the JoinHandle available for the
+        // supervisor, rather than detaching a still-running blocking task.
+        assert!(timeout(Duration::from_millis(10), conn.close())
+            .await
+            .is_err());
+        assert!(!child.is_finished());
+        let attempt = owned_setup(runtime, move |setup| async move {
+            setup.track(conn);
+            setup.track(Arc::new(test_relay_connection(2).await));
+            std::future::pending().await
+        });
+        tokio::pin!(attempt);
+        assert!(timeout(Duration::from_millis(200), &mut attempt)
+            .await
+            .is_err());
+        assert!(
+            !child.is_finished(),
+            "abort alone cannot stop block_in_place"
+        );
+        release_tx.send(()).unwrap();
+        let result = timeout(Duration::from_secs(2), attempt).await.unwrap();
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
+        assert!(
+            child.is_finished(),
+            "timeout must return only after child quiescence"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffered_setup_result_cancelled_before_receipt_awaits_cleanup_before_retry() {
+        use std::future::Future;
+        use std::task::{Context, Wake, Waker};
+
+        struct ResultBuffered(Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+        impl Wake for ResultBuffered {
+            fn wake(self: Arc<Self>) {
+                if let Some(tx) = self.0.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let wallet = Arc::new(MockWallet::new());
+        let runtime = ConnectorRuntime::new(Some(wallet.clone())).unwrap();
+        let route = test_route_with_connections(vec![
+            test_relay_connection(1).await,
+            test_relay_connection(2).await,
+        ])
+        .await;
+        for idx in 0..route.hop_count() {
+            let conn = route.connection_for_hop(idx).unwrap();
+            wallet
+                .insert_channel(crate::wallet::WalletChannel {
+                    channel_id: format!("buffered-{idx}"),
+                    state: crate::wallet::WalletChannelState::Open,
+                    receiver_pubkey: "receiver".to_string(),
+                    mint_url: "https://mint".to_string(),
+                    unit: "msat".to_string(),
+                    keyset_id: "keyset".to_string(),
+                    attached_session_id: Some(*conn.session_id()),
+                    capacity_msats: 1000,
+                    current_signed_balance_msats: 0,
+                    expiry_timestamp: u64::MAX,
+                })
+                .unwrap();
+        }
+        let original_channels = wallet.list_channels().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            tokio::task::block_in_place(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            std::future::pending::<()>().await;
+        });
+        let child = task.abort_handle();
+        route.final_connection().add_task(task);
+        entered_rx.await.unwrap();
+
+        let (publish_tx, publish_rx) = tokio::sync::oneshot::channel();
+        let mut attempt = Box::pin(owned_setup(runtime.clone(), move |setup| async move {
+            for idx in 0..route.hop_count() {
+                setup.track(route.connection_for_hop(idx).unwrap());
+            }
+            publish_rx.await.unwrap();
+            Ok(route)
+        }));
+        let (buffered_tx, buffered_rx) = tokio::sync::oneshot::channel();
+        let waker = Waker::from(Arc::new(ResultBuffered(Mutex::new(Some(buffered_tx)))));
+        assert!(attempt
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        publish_tx.send(()).unwrap();
+        // Only the result receiver uses this waker. Its wake proves the result
+        // was buffered, but we deliberately never poll it again to consume it.
+        timeout(Duration::from_secs(2), buffered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(attempt);
+
+        let retry = owned_setup(runtime, {
+            let wallet = wallet.clone();
+            move |_| async move {
+                assert!(child.is_finished(), "retry overtook child quiescence");
+                assert!(
+                    wallet
+                        .list_channels()
+                        .unwrap()
+                        .iter()
+                        .all(|channel| channel.attached_session_id.is_none()),
+                    "retry overtook wallet detachment"
+                );
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "retry reached setup",
+                ))
+            }
+        });
+        tokio::pin!(retry);
+        assert!(timeout(Duration::from_millis(100), &mut retry)
+            .await
+            .is_err());
+        assert_eq!(
+            wallet.list_channels().unwrap(),
+            original_channels,
+            "buffered cancellation must await the child before detaching either hop"
+        );
+        release_tx.send(()).unwrap();
+        let result = timeout(Duration::from_secs(2), retry).await.unwrap();
+        assert_eq!(
+            result.err().unwrap().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+    }
+
     #[tokio::test]
     async fn wait_for_failure_returns_none_with_no_watchers() {
         let route = test_route_with_connections(vec![test_relay_connection(1).await]).await;
@@ -779,8 +1034,8 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_failure_reports_single_failed_hop() {
-        let mut hop0 = test_relay_connection(1).await;
-        let mut hop1 = test_relay_connection(2).await;
+        let hop0 = test_relay_connection(1).await;
+        let hop1 = test_relay_connection(2).await;
         let (_hop0_tx, hop0_rx) = watch::channel(false);
         let (hop1_tx, hop1_rx) = watch::channel(false);
         hop0.add_failure_watcher(0, hop0_rx);
@@ -802,8 +1057,8 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_failure_debounces_and_reports_lowest_failed_hop() {
-        let mut hop0 = test_relay_connection(1).await;
-        let mut hop1 = test_relay_connection(2).await;
+        let hop0 = test_relay_connection(1).await;
+        let hop1 = test_relay_connection(2).await;
         let (hop0_tx, hop0_rx) = watch::channel(false);
         let (hop1_tx, hop1_rx) = watch::channel(false);
         hop0.add_failure_watcher(0, hop0_rx);

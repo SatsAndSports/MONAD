@@ -1656,6 +1656,8 @@ async fn connect_client_quic_secp(
         true,
     )])
     .await
+    .0
+    .final_connection_arc()
 }
 
 async fn connect_client_tcp(
@@ -1668,6 +1670,8 @@ async fn connect_client_tcp(
         false,
     )])
     .await
+    .0
+    .final_connection_arc()
 }
 
 async fn connect_with_keyset_versions<
@@ -1719,11 +1723,29 @@ fn cleartext_route_hop(
     }
 }
 
-async fn connect_route_hops(hops: Vec<RouteHop>) -> std::sync::Arc<RelayConnection> {
-    connector::connect_route(&Route::new(hops).unwrap())
-        .await
-        .unwrap()
-        .final_connection_arc()
+struct TestRouteConnection(connector::RouteConnection);
+
+impl std::ops::Deref for TestRouteConnection {
+    type Target = RelayConnection;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.final_connection()
+    }
+}
+
+impl TestRouteConnection {
+    async fn shutdown(&self) {
+        self.0.close().await;
+    }
+}
+
+async fn connect_route_hops(hops: Vec<RouteHop>) -> TestRouteConnection {
+    // A final-hop handle alone does not own the prefix tasks.
+    TestRouteConnection(
+        connector::connect_route(&Route::new(hops).unwrap())
+            .await
+            .unwrap(),
+    )
 }
 
 async fn connect_nested_session(
@@ -7782,14 +7804,24 @@ async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
     let route_stats = SharedRouteRuntimeStats::default();
     let route_connected_baseline = route_stats.snapshot().route_connected_total;
     let (client_shutdown_tx, client_shutdown_rx) = tokio::sync::oneshot::channel();
-    let client_task = tokio::spawn(run_configured_client_until_shutdown_with_stats(
-        fixture.config.clone(),
-        Some("local"),
-        route_stats.clone(),
-        async move {
-            let _ = client_shutdown_rx.await;
+    let options = monad_client::runtime::ConfiguredClientRuntimeOptions {
+        route_setup_timeout: if case.hop_count == 5 {
+            Duration::from_secs(30)
+        } else {
+            monad_client::runtime::ConfiguredClientRuntimeOptions::default().route_setup_timeout
         },
-    ));
+    };
+    let client_task = tokio::spawn(
+        monad_client::runtime::run_configured_client_until_shutdown_with_options(
+            fixture.config.clone(),
+            Some("local"),
+            route_stats.clone(),
+            options,
+            async move {
+                let _ = client_shutdown_rx.await;
+            },
+        ),
+    );
 
     assert!(
         wait_for_configured_route_connected(&route_stats, route_connected_baseline).await,
@@ -7810,8 +7842,10 @@ async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
     assert_eq!(
         initial_channels.len(),
         case.hop_count,
-        "{}: route should create one channel record per hop",
-        case.label
+        "{}: route should create one channel record per hop; stats={:?}, channels={:?}",
+        case.label,
+        route_stats.snapshot(),
+        initial_channels
     );
 
     let failed_shutdown_tx = fixture.relay_shutdown_txs.remove(case.failed_hop_idx);
@@ -8031,16 +8065,6 @@ async fn test_direct_connector_suffix_rebuild_preserves_prefix_sessions() {
         "direct suffix rebuild: initial route should create one channel per hop"
     );
 
-    let suffix_session_ids = active_route.suffix_session_ids_from(REBUILD_FROM);
-    for channel in wallet.list_channels().unwrap() {
-        if channel
-            .attached_session_id
-            .is_some_and(|session_id| suffix_session_ids.contains(&session_id))
-        {
-            wallet.force_detach_channel(&channel.channel_id).unwrap();
-        }
-    }
-
     let rebuilt_route = connector::rebuild_route_from_with_runtime(
         &route,
         &runtime,
@@ -8153,6 +8177,286 @@ async fn test_failed_route_build_detaches_and_reuses_funded_prefix_channel() {
     }));
 
     retried_route.close().await;
+    fixture.shutdown().await;
+}
+
+/// Stall provisioning after persistence, or a suffix relink after attachment,
+/// before the payment driver can publish readiness.
+struct StalledProvisionWallet {
+    inner: Arc<dyn MonadWallet>,
+    stall_on_link: bool,
+    calls: std::sync::atomic::AtomicUsize,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl StalledProvisionWallet {
+    fn stall(&self, id: &str) {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            tokio::task::block_in_place(|| {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(id.to_string())
+                    .unwrap();
+                // Bound the fixture wait so a failed assertion cannot hang shutdown.
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
+            });
+        }
+    }
+}
+
+impl MonadWallet for StalledProvisionWallet {
+    fn list_channels(&self) -> Result<Vec<WalletChannel>, WalletError> {
+        self.inner.list_channels()
+    }
+    fn get_channel(&self, id: &str) -> Result<WalletChannel, WalletError> {
+        self.inner.get_channel(id)
+    }
+    fn attach_channel_to_session(&self, id: &str, session: [u8; 32]) -> Result<(), WalletError> {
+        self.inner.attach_channel_to_session(id, session)
+    }
+    fn detach_channel_from_session(&self, id: &str, session: [u8; 32]) -> Result<(), WalletError> {
+        self.inner.detach_channel_from_session(id, session)
+    }
+    fn force_detach_channel(&self, id: &str) -> Result<(), WalletError> {
+        self.inner.force_detach_channel(id)
+    }
+    fn mark_channel_unusable(&self, id: &str) -> Result<(), WalletError> {
+        self.inner.mark_channel_unusable(id)
+    }
+    fn provision_channel(
+        &self,
+        offer: &RelayPaymentOffer,
+        budget: u64,
+    ) -> Result<String, WalletError> {
+        let id = self.inner.provision_channel(offer, budget)?;
+        if !self.stall_on_link {
+            self.stall(&id);
+        }
+        Ok(id)
+    }
+    fn build_link_request(
+        &self,
+        id: &str,
+        offer: &RelayPaymentOffer,
+    ) -> Result<String, WalletError> {
+        if self.stall_on_link {
+            self.stall(id);
+        }
+        self.inner.build_link_request(id, offer)
+    }
+    fn build_channel_payment(
+        &self,
+        id: &str,
+        offer: &RelayPaymentOffer,
+        latest: u64,
+        next: u64,
+    ) -> Result<String, WalletError> {
+        self.inner.build_channel_payment(id, offer, latest, next)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cancelled_route_setup_waits_for_stalled_provision_and_reuses_channels() {
+    let fixture = ConfiguredRouteFixture::start(ConfiguredRouteFixtureConfig {
+        subnet: 23,
+        hop_count: 2,
+        proof_batches: 3,
+        wallet_seed: 61,
+        channel_input_budget_msats: 11_000_000,
+        label: "cancelled-route-channel-reuse",
+    })
+    .await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let wallet = Arc::new(StalledProvisionWallet {
+        inner: Arc::new(fixture.open_client_wallet()),
+        stall_on_link: false,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let runtime = connector::ConnectorRuntime::with_payment_policy(
+        Some(wallet.clone()),
+        PaymentPolicy {
+            channel_input_budget_msats: 11_000_000,
+            target_topup_buffer_msats: 100_000,
+            minimum_topup_msats: 0,
+        },
+    )
+    .unwrap();
+    let route =
+        route_from_client_config(fixture.config.select_client(Some("local")).unwrap()).unwrap();
+    let attempt = tokio::spawn({
+        let runtime = runtime.clone();
+        let route = route.clone();
+        async move { connector::connect_route_with_runtime(&route, &runtime).await }
+    });
+    let completed_id = tokio::time::timeout(Duration::from_secs(30), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !attempt.is_finished(),
+        "second hop must still be awaiting readiness"
+    );
+    let original_channels = wallet.list_channels().unwrap();
+    assert_eq!(original_channels.len(), 2);
+    assert_eq!(
+        wallet
+            .get_channel(&completed_id)
+            .unwrap()
+            .attached_session_id,
+        None
+    );
+    attempt.abort();
+    assert!(attempt.await.err().unwrap().is_cancelled());
+
+    // Joining the outer task does not join its blocking child. The next setup
+    // must remain behind the cleanup gate, not race the old wallet attachment.
+    let retry = connector::connect_route_with_runtime(&route, &runtime);
+    tokio::pin!(retry);
+    assert!(tokio::time::timeout(Duration::from_millis(100), &mut retry)
+        .await
+        .is_err());
+    assert_eq!(wallet.list_channels().unwrap(), original_channels,
+        "cleanup must not detach the funded prefix while the old driver can still mutate the wallet");
+    release_tx.send(()).unwrap();
+    let rebuilt = tokio::time::timeout(Duration::from_secs(30), retry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        wallet.calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "retry must reuse both completed compatible channels"
+    );
+    let channels = wallet.list_channels().unwrap();
+    assert_eq!(channels.len(), 2, "channels={channels:?}");
+    for original in original_channels {
+        let current = wallet.get_channel(&original.channel_id).unwrap();
+        assert!(rebuilt
+            .hops()
+            .iter()
+            .any(|hop| Some(hop.session_id) == current.attached_session_id));
+    }
+    direct_route_roundtrip(&rebuilt, fixture.upper_addr, b"cancelled setup retry").await;
+    rebuilt.close().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cancelled_partial_suffix_quiesces_before_full_retry() {
+    let fixture = ConfiguredRouteFixture::start(ConfiguredRouteFixtureConfig {
+        subnet: 24,
+        hop_count: 3,
+        proof_batches: 4,
+        wallet_seed: 63,
+        channel_input_budget_msats: 11_000_000,
+        label: "cancelled-partial-suffix",
+    })
+    .await;
+    let inner: Arc<dyn MonadWallet> = Arc::new(fixture.open_client_wallet());
+    let policy = PaymentPolicy {
+        channel_input_budget_msats: 11_000_000,
+        target_topup_buffer_msats: 100_000,
+        minimum_topup_msats: 0,
+    };
+    let runtime =
+        connector::ConnectorRuntime::with_payment_policy(Some(inner.clone()), policy).unwrap();
+    let route =
+        route_from_client_config(fixture.config.select_client(Some("local")).unwrap()).unwrap();
+    let active = connector::connect_route_with_runtime(&route, &runtime)
+        .await
+        .unwrap();
+    let prefix = active.connection_for_hop(0).unwrap();
+    let initial_channels = inner.list_channels().unwrap();
+    assert_eq!(initial_channels.len(), 3);
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let wallet = Arc::new(StalledProvisionWallet {
+        inner,
+        stall_on_link: true,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let runtime =
+        connector::ConnectorRuntime::with_payment_policy(Some(wallet.clone()), policy).unwrap();
+    let attempt = tokio::spawn({
+        let runtime = runtime.clone();
+        let route = route.clone();
+        async move {
+            connector::rebuild_route_from_with_runtime(&route, &runtime, Some(active), 1).await
+        }
+    });
+    timeout(Duration::from_secs(30), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    // Hop two of the suffix is pending; the original prefix is still usable.
+    let prefix_channel = initial_channels
+        .iter()
+        .find(|channel| channel.attached_session_id == Some(*prefix.session_id()))
+        .unwrap();
+    assert_eq!(
+        wallet
+            .get_channel(&prefix_channel.channel_id)
+            .unwrap()
+            .attached_session_id,
+        Some(*prefix.session_id())
+    );
+    let mut tunnel = prefix
+        .open_tunnel(&fixture.upper_addr.to_string())
+        .await
+        .unwrap();
+    tunnel.write_all(b"prefix alive").await.unwrap();
+    tunnel.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    tunnel.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"PREFIX ALIVE");
+
+    attempt.abort();
+    assert!(attempt.await.err().unwrap().is_cancelled());
+    let retry = connector::connect_route_with_runtime(&route, &runtime);
+    tokio::pin!(retry);
+    assert!(timeout(Duration::from_millis(100), &mut retry)
+        .await
+        .is_err());
+    release_tx.send(()).unwrap();
+    let rebuilt = timeout(Duration::from_secs(30), retry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        wallet.list_channels().unwrap().len(),
+        3,
+        "partial suffix cleanup must not orphan reusable channels"
+    );
+    for channel in initial_channels {
+        let current = wallet.get_channel(&channel.channel_id).unwrap();
+        assert!(rebuilt
+            .hops()
+            .iter()
+            .any(|hop| current.attached_session_id == Some(hop.session_id)));
+    }
+    assert!(
+        prefix
+            .open_tunnel(&fixture.upper_addr.to_string())
+            .await
+            .is_err(),
+        "failed suffix must close the preserved prefix before full fallback"
+    );
+    direct_route_roundtrip(&rebuilt, fixture.upper_addr, b"partial suffix retry").await;
+    rebuilt.close().await;
     fixture.shutdown().await;
 }
 

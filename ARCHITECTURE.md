@@ -288,6 +288,27 @@ Failure handling is deliberately scoped:
   future streams
 - suffix rebuild failure falls back to a full route reconnect
 
+Route setup runs under an owned supervisor. Each H2 connection is registered
+immediately, and its payment task is attached before waiting for funded
+readiness. Caller cancellation or the setup deadline drops the setup future,
+but not the supervisor: it aborts and awaits every owned child before detaching
+wallet channels. The supervisor retains ownership of a buffered successful result
+until the receiver synchronously acknowledges receipt; dropping that receiver
+instead triggers cleanup. A per-connector completion chain prevents subsequent
+attempts from overtaking this handoff or cleanup, including cancellation while
+queued. This matters for
+synchronous mint calls using `block_in_place`, which can complete a channel
+opening after task abortion was requested. Completed compatible channels remain
+available for reuse; opening journals and ambiguous-opening recovery are unchanged.
+The deadline bounds setup work, not cleanup latency. Suffix rebuild closes and
+awaits old suffix tasks before detaching their channels, preserving prefix tasks
+on success; failure cleans up the partial suffix and prefix before full fallback.
+`RelayConnection::close` retains pending handles if it is itself cancelled; Drop
+only provides a last-resort abort, not an asynchronous quiescence guarantee.
+Library callers should reuse one `ConnectorRuntime` across retries and retain
+the `RouteConnection` while using its final-hop handle, which does not own prefix
+tasks. Await route closure before shutting down the Tokio runtime.
+
 Active application streams are not migrated across rebuilds. A local TCP/SOCKS
 stream stays bound to the route it started on and fails if that route breaks;
 new SOCKS connections use the next route published by the manager.
