@@ -616,7 +616,7 @@ reserves the selected inputs and records the exact serialized prepared opening.
 The journal is authoritative across restarts. Submitted attempts first recover
 their original funding/change outputs through NUT-09. If a valid funding restore
 is empty, one NUT-07 request checks every persisted input Y; only an all-`UNSPENT`
-response permits one replay of the byte-identical swap per recovery invocation.
+response permits one replay of the byte-identical swap during live opening recovery only.
 Finalization replays local channel, change-proof, and metadata updates
 idempotently. Prepared attempts that were never claimed for submission are
 cancelled and their proofs released.
@@ -624,9 +624,20 @@ cancelled and their proofs released.
 If the mint explicitly rejects an inactive output keyset with code `12002`, the
 client records that immutable predecessor, refreshes, and may create one successor
 using a changed active keyset. Transport and protocol ambiguity never authorizes a
-successor submission. The configured runtime runs one bounded best-effort opening
-recovery pass before route provisioning; live ambiguous opens run the same bounded
-recovery once immediately. Unresolved attempts remain reserved. The exact-replay
+successor submission. Live ambiguous opens run bounded recovery once immediately.
+The configured runtime runs one best-effort restore-only opening recovery pass
+before route provisioning, also exposed by manual `recover-openings`. This pass
+never submits swaps: prepared attempts and rejected attempts without a successor
+are cancelled; finalizing attempts finish local idempotent updates; submitted
+attempts with complete restored funding/change finalize. Valid empty funding
+restore plus complete exact-input `UNSPENT` evidence instead atomically marks the
+attempt `Abandoned` and releases its operation-owned reservation in the loose-proof
+database. The journal retains the immutable request, abandonment reason, and time.
+Abandoned attempts are excluded from ordinary recovery, with no automatic rechecks
+or late-completion machinery. All ambiguous, partial, invalid, pending, spent, or
+network-failed evidence remains unresolved and reserved. Reports separate recovered,
+cancelled, abandoned, and unresolved outcomes. Other swap policies are unchanged.
+The live exact-replay
 allowance is independent per immutable attempt, so a keyset successor receives
 its own allowance without authorizing a second successor.
 

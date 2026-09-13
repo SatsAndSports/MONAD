@@ -242,13 +242,32 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
         WalletCommand::RecoverOpenings => {
             let recovered = wallet.recover_pending_openings()?;
             if args.json {
-                print_json(&serde_json::json!({ "recovered_channel_ids": recovered }))?;
+                print_json(&serde_json::json!({
+                    "recovered_channel_ids": recovered.recovered_channel_ids,
+                    "cancelled_attempt_ids": recovered.cancelled_attempt_ids,
+                    "abandoned_attempt_ids": recovered.abandoned_attempt_ids,
+                    "unresolved": recovered.unresolved.iter().map(|entry| serde_json::json!({
+                        "attempt_id": entry.attempt_id,
+                        "reason": entry.reason,
+                    })).collect::<Vec<_>>(),
+                }))?;
             } else if recovered.is_empty() {
-                println!("No pending openings recovered.");
+                println!("No pending openings.");
             } else {
-                println!("Recovered pending openings:");
-                for channel_id in recovered {
-                    println!("  {channel_id}");
+                for channel_id in recovered.recovered_channel_ids {
+                    println!("Recovered: {channel_id}");
+                }
+                for attempt_id in recovered.cancelled_attempt_ids {
+                    println!("Cancelled: {attempt_id}");
+                }
+                for attempt_id in recovered.abandoned_attempt_ids {
+                    println!("Abandoned: {attempt_id}");
+                }
+                for unresolved in recovered.unresolved {
+                    println!(
+                        "Unresolved: {}: {}",
+                        unresolved.attempt_id, unresolved.reason
+                    );
                 }
             }
         }

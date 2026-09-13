@@ -156,6 +156,37 @@ enum OpeningRestoreOutcome {
     FundingOutputsAbsent,
 }
 
+/// Outcomes of a restore-only startup or manual opening recovery pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OpeningRecoveryReport {
+    pub recovered_channel_ids: Vec<String>,
+    pub cancelled_attempt_ids: Vec<String>,
+    pub abandoned_attempt_ids: Vec<String>,
+    pub unresolved: Vec<UnresolvedOpening>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnresolvedOpening {
+    pub attempt_id: String,
+    pub reason: String,
+}
+
+impl OpeningRecoveryReport {
+    pub fn is_empty(&self) -> bool {
+        self.recovered_channel_ids.is_empty()
+            && self.cancelled_attempt_ids.is_empty()
+            && self.abandoned_attempt_ids.is_empty()
+            && self.unresolved.is_empty()
+    }
+}
+
+enum OpeningRecoveryOutcome {
+    Recovered(String),
+    Cancelled,
+    Abandoned,
+    Unresolved,
+}
+
 const CREATE_CHANNELS_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS monad_client_channels (
         channel_id TEXT PRIMARY KEY,
@@ -602,18 +633,32 @@ impl SqliteClientWallet {
     /// Ambiguous failures leave loose proofs reserved and an upstream
     /// `OpeningFromSwap` row behind. This method first uses NUT-09 restore. If a
     /// valid response has no funding outputs and NUT-07 reports every exact input
-    /// unspent, it replays the immutable swap request once.
-    pub fn recover_pending_openings(&self) -> Result<Vec<String>, WalletError> {
+    /// unspent, it abandons the opening and releases its reservation atomically.
+    /// This method never submits swaps or revisits abandoned attempts.
+    pub fn recover_pending_openings(&self) -> Result<OpeningRecoveryReport, WalletError> {
         let attempts = self
             .loose_wallet
             .opening_attempts_for_recovery()
             .map_err(loose_proof_error)?;
-        let mut recovered = Vec::new();
+        let mut report = OpeningRecoveryReport::default();
         let networking = OpeningRecoveryHttpNetworking::new().map_err(WalletError::Backend)?;
         for attempt in attempts {
             match self.recover_journaled_opening(&attempt, &networking) {
-                Ok(Some(channel_id)) => recovered.push(channel_id),
-                Ok(None) => {}
+                Ok(OpeningRecoveryOutcome::Recovered(channel_id)) => {
+                    report.recovered_channel_ids.push(channel_id)
+                }
+                Ok(OpeningRecoveryOutcome::Cancelled) => report
+                    .cancelled_attempt_ids
+                    .push(attempt.attempt_id.clone()),
+                Ok(OpeningRecoveryOutcome::Abandoned) => report
+                    .abandoned_attempt_ids
+                    .push(attempt.attempt_id.clone()),
+                Ok(OpeningRecoveryOutcome::Unresolved) => {
+                    report.unresolved.push(UnresolvedOpening {
+                        attempt_id: attempt.attempt_id.clone(),
+                        reason: "funding absent but exact inputs are not all UNSPENT".to_string(),
+                    })
+                }
                 Err(error) => {
                     // Recovery is best effort per attempt. Keep its reservation and
                     // journal state so one unavailable mint does not discard funds.
@@ -621,6 +666,10 @@ impl SqliteClientWallet {
                         attempt_id = %attempt.attempt_id,
                         "channel opening remains pending recovery: {error}"
                     );
+                    report.unresolved.push(UnresolvedOpening {
+                        attempt_id: attempt.attempt_id.clone(),
+                        reason: error.to_string(),
+                    });
                 }
             }
         }
@@ -668,43 +717,43 @@ impl SqliteClientWallet {
                         expiry_timestamp,
                     )?;
                     self.delete_opening_recovery(&recovery.channel_id)?;
-                    recovered.push(open_result.channel_id);
-                }
-                Err(error) if !error.input_may_be_spent => {
-                    let _ = self
-                        .loose_wallet
-                        .release_reservation(&recovery.reservation_id);
-                    self.delete_opening_recovery(&recovery.channel_id)?;
+                    report.recovered_channel_ids.push(open_result.channel_id);
                 }
                 Err(error) => {
-                    return Err(open_channel_error(
-                        error,
-                        &recovery.unit,
-                        recovery.input_budget_msats,
-                    ));
+                    // A legacy row has no authoritative pre-submit journal.
+                    // Local preparation errors cannot prove its inputs are safe.
+                    report.unresolved.push(UnresolvedOpening {
+                        attempt_id: recovery.channel_id,
+                        reason: open_channel_error(
+                            error,
+                            &recovery.unit,
+                            recovery.input_budget_msats,
+                        )
+                        .to_string(),
+                    });
                 }
             }
         }
 
-        Ok(recovered)
+        Ok(report)
     }
 
     fn recover_journaled_opening<N: OpeningRecoveryNetworking>(
         &self,
         attempt: &OpeningAttemptRecord,
         networking: &N,
-    ) -> Result<Option<String>, WalletError> {
+    ) -> Result<OpeningRecoveryOutcome, WalletError> {
         if attempt.state == OpeningAttemptState::Rejected {
             self.loose_wallet
                 .cancel_rejected_opening_attempt(&attempt.attempt_id)
                 .map_err(loose_proof_error)?;
-            return Ok(None);
+            return Ok(OpeningRecoveryOutcome::Cancelled);
         }
         if attempt.state == OpeningAttemptState::Prepared {
             self.loose_wallet
                 .cancel_prepared_opening_attempt(&attempt.attempt_id)
                 .map_err(loose_proof_error)?;
-            return Ok(None);
+            return Ok(OpeningRecoveryOutcome::Cancelled);
         }
         let prepared: PreparedOpenChannel = serde_json::from_str(&attempt.prepared_open_json)
             .map_err(|e| WalletError::Backend(format!("decode opening attempt: {e}")))?;
@@ -730,39 +779,31 @@ impl SqliteClientWallet {
                     })?;
                 }
             }
-            match self.recover_or_replay_submitted_opening(&prepared, networking) {
-                Ok(Some(result)) => {
-                    self.finish_open_channel(
-                        result,
-                        &ProofReservation {
-                            reservation_id: attempt.reservation_id.clone(),
-                            proofs: self
-                                .loose_wallet
-                                .proofs_for_reservation(&attempt.reservation_id)
-                                .map_err(loose_proof_error)?,
-                            total_amount_raw: 0,
-                        },
-                        attempt.expiry_timestamp,
-                    )?;
-                    return Ok(Some(attempt.attempt_id.clone()));
-                }
-                Ok(None) => return Ok(None),
-                Err(error) if error.stage == OpenChannelFailureStage::MintRejected => {
+            match self
+                .restore_journaled_opening(&prepared, networking)
+                .map_err(|error| {
+                    open_channel_error(error, &attempt.unit, attempt.input_budget_msats)
+                })? {
+                OpeningRestoreOutcome::Completed(completed) => {
+                    let json = serde_json::to_string(&completed).map_err(|e| {
+                        WalletError::Backend(format!("serialize recovered opening: {e}"))
+                    })?;
                     self.loose_wallet
-                        .cancel_rejected_opening_attempt(&attempt.attempt_id)
+                        .mark_opening_attempt_finalizing(&attempt.attempt_id, &json)
                         .map_err(loose_proof_error)?;
-                    return Err(open_channel_error(
-                        error,
-                        &attempt.unit,
-                        attempt.input_budget_msats,
-                    ));
+                    *completed
                 }
-                Err(error) => {
-                    return Err(open_channel_error(
-                        error,
-                        &attempt.unit,
-                        attempt.input_budget_msats,
-                    ));
+                OpeningRestoreOutcome::FundingOutputsAbsent => {
+                    if !prepared_inputs_are_all_unspent(&prepared, networking).map_err(|error| {
+                        open_channel_error(error, &attempt.unit, attempt.input_budget_msats)
+                    })? {
+                        return Ok(OpeningRecoveryOutcome::Unresolved);
+                    }
+                    self.loose_wallet.abandon_opening_attempt(
+                        &attempt.attempt_id,
+                        "startup/manual recovery: funding restore empty; all exact inputs UNSPENT",
+                    ).map_err(loose_proof_error)?;
+                    return Ok(OpeningRecoveryOutcome::Abandoned);
                 }
             }
         };
@@ -794,7 +835,7 @@ impl SqliteClientWallet {
             },
             attempt.expiry_timestamp,
         )?;
-        Ok(Some(completed.channel_id))
+        Ok(OpeningRecoveryOutcome::Recovered(completed.channel_id))
     }
 
     fn recover_or_replay_submitted_opening<N: OpeningRecoveryNetworking>(
@@ -3314,11 +3355,13 @@ mod tests {
         States(Vec<State>),
         MissingLast,
         DuplicateFirst,
+        NetworkError,
     }
 
     struct StateCheckNetworking {
         mode: CheckStateMode,
         requested_y_count: Mutex<Option<usize>>,
+        restore_response: Result<String, String>,
     }
 
     impl StateCheckNetworking {
@@ -3326,17 +3369,18 @@ mod tests {
             Self {
                 mode,
                 requested_y_count: Mutex::new(None),
+                restore_response: Ok(r#"{"outputs":[],"signatures":[]}"#.to_string()),
             }
         }
     }
 
     impl SpilmanClientNetworking for StateCheckNetworking {
         fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+            panic!("startup recovery must never submit a swap")
         }
 
         fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+            self.restore_response.clone()
         }
 
         fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
@@ -3350,6 +3394,9 @@ mod tests {
 
     impl OpeningRecoveryNetworking for StateCheckNetworking {
         fn call_mint_check_state(&self, _: &str, request_json: &str) -> Result<String, String> {
+            if matches!(self.mode, CheckStateMode::NetworkError) {
+                return Err("injected checkstate network failure".to_string());
+            }
             let request: CheckStateRequest =
                 serde_json::from_str(request_json).map_err(|e| e.to_string())?;
             *self.requested_y_count.lock().unwrap() = Some(request.ys.len());
@@ -3361,15 +3408,15 @@ mod tests {
                     y,
                     state: match &self.mode {
                         CheckStateMode::States(states) => states[index],
-                        CheckStateMode::MissingLast | CheckStateMode::DuplicateFirst => {
-                            State::Unspent
-                        }
+                        CheckStateMode::MissingLast
+                        | CheckStateMode::DuplicateFirst
+                        | CheckStateMode::NetworkError => State::Unspent,
                     },
                     witness: None,
                 })
                 .collect::<Vec<_>>();
             match self.mode {
-                CheckStateMode::States(_) => {}
+                CheckStateMode::States(_) | CheckStateMode::NetworkError => {}
                 CheckStateMode::MissingLast => {
                     states.pop();
                 }
@@ -4857,7 +4904,90 @@ mod tests {
         mint_task.await.unwrap().unwrap();
     }
 
-    async fn assert_recovers_persisted_ambiguous_opening(swap_reached_mint: bool) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opening_recovery_reports_cancellation_and_unresolved_without_mint_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let loose = LooseProofWallet::open(temp.path().join("loose.sqlite"), "alice").unwrap();
+        let wallet = SqliteClientWallet::open(
+            loose,
+            temp.path().join("channels.sqlite"),
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        for id in ["prepared", "rejected", "submitted"] {
+            wallet
+                .loose_wallet()
+                .import_proofs(&[NewLooseProof {
+                    proof_id: id.to_string(),
+                    mint_url: "http://unused.invalid".to_string(),
+                    unit: "sat".to_string(),
+                    keyset_id: "keyset".to_string(),
+                    amount_raw: 8,
+                    proof_json: "{}".to_string(),
+                    source_quote_id: None,
+                    source_batch_id: None,
+                }])
+                .unwrap();
+            wallet
+                .loose_wallet()
+                .reserve_selected_proofs_with_opening_attempt(
+                    "http://unused.invalid",
+                    "sat",
+                    &[id.to_string()],
+                    &NewOpeningAttempt {
+                        attempt_id: id.to_string(),
+                        opening_id: id.to_string(),
+                        predecessor_attempt_id: None,
+                        reservation_id: id.to_string(),
+                        receiver_pubkey: "receiver".to_string(),
+                        mint_url: "http://unused.invalid".to_string(),
+                        unit: "sat".to_string(),
+                        input_budget_msats: 8000,
+                        expiry_timestamp: 123456,
+                        prepared_open_json: "invalid preparation".to_string(),
+                    },
+                )
+                .unwrap();
+            if id != "prepared" {
+                wallet
+                    .loose_wallet()
+                    .claim_opening_attempt_submission(id)
+                    .unwrap();
+            }
+            if id == "rejected" {
+                wallet
+                    .loose_wallet()
+                    .mark_opening_attempt_rejected(id, Some(12002), "inactive keyset")
+                    .unwrap();
+            }
+        }
+        let mut report = wallet.recover_pending_openings().unwrap();
+        report.cancelled_attempt_ids.sort();
+        assert_eq!(report.cancelled_attempt_ids, vec!["prepared", "rejected"]);
+        assert!(report.recovered_channel_ids.is_empty());
+        assert!(report.abandoned_attempt_ids.is_empty());
+        assert_eq!(report.unresolved.len(), 1);
+        assert_eq!(report.unresolved[0].attempt_id, "submitted");
+        assert!(report.unresolved[0]
+            .reason
+            .contains("decode opening attempt"));
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .proofs_for_reservation("submitted")
+                .unwrap()[0]
+                .state,
+            LooseProofState::Reserved
+        );
+        let repeated = wallet.recover_pending_openings().unwrap();
+        assert!(repeated.cancelled_attempt_ids.is_empty());
+        assert_eq!(repeated.unresolved, report.unresolved);
+    }
+
+    async fn assert_recovers_persisted_ambiguous_opening(
+        swap_reached_mint: bool,
+        finalizing_boundary: Option<usize>,
+    ) {
         let port = free_loopback_port();
         let mint_url = format!("http://127.0.0.1:{port}");
         let config = TestMintConfig::for_port(port);
@@ -5063,6 +5193,61 @@ mod tests {
         storage
             .save_opening_from_swap(&channel_id, opening)
             .unwrap();
+        let record = wallet
+            .loose_wallet()
+            .opening_attempt(&channel_id)
+            .unwrap()
+            .unwrap();
+        for mode in [
+            CheckStateMode::States(vec![State::Pending; reservation.proofs.len()]),
+            CheckStateMode::States(vec![State::Spent; reservation.proofs.len()]),
+            CheckStateMode::MissingLast,
+            CheckStateMode::NetworkError,
+        ] {
+            let networking = StateCheckNetworking::new(mode);
+            let outcome = wallet.recover_journaled_opening(&record, &networking);
+            assert!(matches!(
+                outcome,
+                Ok(OpeningRecoveryOutcome::Unresolved) | Err(_)
+            ));
+            assert_eq!(
+                wallet
+                    .loose_wallet()
+                    .opening_attempt(&channel_id)
+                    .unwrap()
+                    .unwrap(),
+                record
+            );
+            assert!(wallet
+                .loose_wallet()
+                .proofs_for_reservation(&reservation.reservation_id)
+                .unwrap()
+                .iter()
+                .all(|proof| proof.state == LooseProofState::Reserved));
+        }
+        for response in [
+            Err("restore network failure".to_string()),
+            Ok("invalid JSON".to_string()),
+            Ok(r#"{"outputs":[],"signatures":[{}]}"#.to_string()),
+        ] {
+            let mut networking = StateCheckNetworking::new(CheckStateMode::States(vec![
+                    State::Unspent;
+                    reservation.proofs.len()
+                ]));
+            networking.restore_response = response;
+            assert!(wallet
+                .recover_journaled_opening(&record, &networking)
+                .is_err());
+            assert!(networking.requested_y_count.lock().unwrap().is_none());
+            assert_eq!(
+                wallet
+                    .loose_wallet()
+                    .opening_attempt(&channel_id)
+                    .unwrap()
+                    .unwrap(),
+                record
+            );
+        }
         if swap_reached_mint {
             let swap_response = client
                 .post(format!("{mint_url}/v1/swap"))
@@ -5078,13 +5263,98 @@ mod tests {
             }
         }
 
+        if let Some(boundary) = finalizing_boundary {
+            let OpeningRestoreOutcome::Completed(completed) = wallet
+                .restore_journaled_opening(
+                    &prepared,
+                    &OpeningRecoveryHttpNetworking::new().unwrap(),
+                )
+                .unwrap()
+            else {
+                panic!("expected completed restore");
+            };
+            wallet
+                .loose_wallet()
+                .mark_opening_attempt_finalizing(
+                    &channel_id,
+                    &serde_json::to_string(&completed).unwrap(),
+                )
+                .unwrap();
+            if boundary >= 1 {
+                wallet
+                    .bridge
+                    .lock()
+                    .unwrap()
+                    .mark_completed_open(&completed)
+                    .unwrap();
+            }
+            if boundary >= 2 {
+                wallet
+                    .loose_wallet()
+                    .import_proofs(&change_proofs_to_loose_proofs(&completed.result).unwrap())
+                    .unwrap();
+            }
+            if boundary >= 3 {
+                wallet
+                    .loose_wallet()
+                    .mark_reservation_spent(&reservation.reservation_id, &channel_id)
+                    .unwrap();
+            }
+            if boundary >= 4 {
+                wallet
+                    .store_open_channel_metadata(
+                        &completed.result,
+                        &reservation.reservation_id,
+                        expiry_timestamp,
+                    )
+                    .unwrap();
+            }
+        }
         drop(storage);
         drop(wallet);
 
         let loose_wallet = LooseProofWallet::open(&loose_db, "alice").unwrap();
         let wallet = SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret).unwrap();
         let recovered = wallet.recover_pending_openings().unwrap();
-        assert_eq!(recovered, vec![channel_id.clone()]);
+        if !swap_reached_mint {
+            assert_eq!(recovered.abandoned_attempt_ids, vec![channel_id.clone()]);
+            assert!(recovered.recovered_channel_ids.is_empty());
+            assert!(recovered.unresolved.is_empty());
+            let record = wallet
+                .loose_wallet()
+                .opening_attempt(&channel_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, OpeningAttemptState::Abandoned);
+            assert!(record.abandonment_reason.is_some());
+            assert!(record.abandoned_at.is_some());
+            assert_eq!(
+                wallet
+                    .loose_wallet()
+                    .available_balance_raw(&mint_url, unit, std::slice::from_ref(&keyset_id))
+                    .unwrap(),
+                amount_raw
+            );
+            assert!(wallet.get_channel(&channel_id).is_err());
+            assert!(prepared_inputs_are_all_unspent(
+                &prepared,
+                &OpeningRecoveryHttpNetworking::new().unwrap()
+            )
+            .unwrap());
+            assert!(wallet.recover_pending_openings().unwrap().is_empty());
+            assert_eq!(
+                wallet
+                    .loose_wallet()
+                    .opening_attempt(&channel_id)
+                    .unwrap()
+                    .unwrap(),
+                record
+            );
+            let _ = shutdown_tx.send(());
+            mint_task.await.unwrap().unwrap();
+            return;
+        }
+        assert_eq!(recovered.recovered_channel_ids, vec![channel_id.clone()]);
         assert_eq!(
             wallet
                 .loose_wallet()
@@ -5122,12 +5392,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recovers_persisted_ambiguous_opening() {
-        assert_recovers_persisted_ambiguous_opening(true).await;
+        assert_recovers_persisted_ambiguous_opening(true, None).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn replays_submitted_opening_when_every_input_is_unspent() {
-        assert_recovers_persisted_ambiguous_opening(false).await;
+    async fn abandons_submitted_opening_without_startup_replay_when_inputs_unspent() {
+        assert_recovers_persisted_ambiguous_opening(false, None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalizing_opening_recovers_at_each_local_persistence_boundary() {
+        for boundary in 0..=4 {
+            assert_recovers_persisted_ambiguous_opening(true, Some(boundary)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

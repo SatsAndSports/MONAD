@@ -318,6 +318,7 @@ pub enum OpeningAttemptState {
     Finalizing,
     Completed,
     Cancelled,
+    Abandoned,
 }
 
 impl OpeningAttemptState {
@@ -329,6 +330,7 @@ impl OpeningAttemptState {
             Self::Finalizing => "finalizing",
             Self::Completed => "completed",
             Self::Cancelled => "cancelled",
+            Self::Abandoned => "abandoned",
         }
     }
 
@@ -340,6 +342,7 @@ impl OpeningAttemptState {
             "finalizing" => Ok(Self::Finalizing),
             "completed" => Ok(Self::Completed),
             "cancelled" => Ok(Self::Cancelled),
+            "abandoned" => Ok(Self::Abandoned),
             other => Err(sql_decode_error(format!(
                 "unknown opening attempt state '{other}'"
             ))),
@@ -377,6 +380,8 @@ pub struct OpeningAttemptRecord {
     pub state: OpeningAttemptState,
     pub rejection_code: Option<u64>,
     pub rejection_message: Option<String>,
+    pub abandonment_reason: Option<String>,
+    pub abandoned_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +454,21 @@ pub struct LooseProofWallet {
     conn: Arc<Mutex<Connection>>,
 }
 
+fn migrate_opening_abandonment(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(monad_client_opening_attempts)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, kind) in [("abandonment_reason", "TEXT"), ("abandoned_at", "INTEGER")] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE monad_client_opening_attempts ADD COLUMN {name} {kind};"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 impl LooseProofWallet {
     pub fn open(path: impl AsRef<Path>, wallet_name: impl Into<String>) -> Result<Self> {
         let conn = Connection::open(path).map_err(|e| {
@@ -462,6 +482,7 @@ impl LooseProofWallet {
             "{CREATE_MINT_QUOTES_SQL};{CREATE_PREMINT_BATCHES_SQL};{CREATE_LOOSE_PROOFS_SQL};{CREATE_LOOSE_PROOF_INDEX_SQL};{CREATE_OPENING_ATTEMPTS_SQL};{CREATE_OPENING_ATTEMPTS_INDEX_SQL};"
         ))
         .map_err(|e| LooseProofWalletError::Backend(format!("create loose proof wallet schema: {e}")))?;
+        migrate_opening_abandonment(&conn)?;
         Ok(Self {
             wallet_name: wallet_name.into(),
             conn: Arc::new(Mutex::new(conn)),
@@ -477,6 +498,7 @@ impl LooseProofWallet {
             "{CREATE_MINT_QUOTES_SQL};{CREATE_PREMINT_BATCHES_SQL};{CREATE_LOOSE_PROOFS_SQL};{CREATE_LOOSE_PROOF_INDEX_SQL};{CREATE_OPENING_ATTEMPTS_SQL};{CREATE_OPENING_ATTEMPTS_INDEX_SQL};"
         ))
         .map_err(|e| LooseProofWalletError::Backend(format!("create loose proof wallet schema: {e}")))?;
+        migrate_opening_abandonment(&conn)?;
         Ok(Self {
             wallet_name: wallet_name.into(),
             conn: Arc::new(Mutex::new(conn)),
@@ -1024,7 +1046,7 @@ impl LooseProofWallet {
             "SELECT attempt_id, opening_id, predecessor_attempt_id, reservation_id,
                     receiver_pubkey, mint_url, unit, input_budget_msats, expiry_timestamp,
                     prepared_open_json, completed_open_json, state, rejection_code,
-                    rejection_message
+                    rejection_message, abandonment_reason, abandoned_at
              FROM monad_client_opening_attempts
              WHERE wallet_name = ?1
                AND (
@@ -1051,7 +1073,7 @@ impl LooseProofWallet {
             "SELECT attempt_id, opening_id, predecessor_attempt_id, reservation_id,
                     receiver_pubkey, mint_url, unit, input_budget_msats, expiry_timestamp,
                     prepared_open_json, completed_open_json, state, rejection_code,
-                    rejection_message
+                    rejection_message, abandonment_reason, abandoned_at
              FROM monad_client_opening_attempts
              WHERE wallet_name = ?1 AND attempt_id = ?2",
             params![self.wallet_name, attempt_id],
@@ -1248,17 +1270,24 @@ impl LooseProofWallet {
     }
 
     pub fn cancel_rejected_opening_attempt(&self, attempt_id: &str) -> Result<()> {
-        self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Rejected)
+        self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Rejected, None)
     }
 
     pub fn cancel_prepared_opening_attempt(&self, attempt_id: &str) -> Result<()> {
-        self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Prepared)
+        self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Prepared, None)
+    }
+
+    /// Release operation-owned inputs only after restore found no funding and
+    /// every exact input was observed UNSPENT. Retain the journal as a tombstone.
+    pub(crate) fn abandon_opening_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
+        self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Submitted, Some(reason))
     }
 
     fn cancel_opening_attempt(
         &self,
         attempt_id: &str,
         expected_state: OpeningAttemptState,
+        abandonment_reason: Option<&str>,
     ) -> Result<()> {
         let now = now_seconds()?;
         let mut conn = self.conn()?;
@@ -1297,14 +1326,20 @@ impl LooseProofWallet {
         )?;
         tx.execute(
             "UPDATE monad_client_opening_attempts
-             SET state = ?3, updated_at = ?4
+             SET state = ?3, updated_at = ?4, abandonment_reason = ?6,
+                 abandoned_at = CASE WHEN ?6 IS NOT NULL THEN ?4 ELSE NULL END
              WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?5",
             params![
                 self.wallet_name,
                 attempt_id,
-                OpeningAttemptState::Cancelled.as_str(),
+                if abandonment_reason.is_some() {
+                    OpeningAttemptState::Abandoned.as_str()
+                } else {
+                    OpeningAttemptState::Cancelled.as_str()
+                },
                 to_i64(now)?,
                 expected_state.as_str(),
+                abandonment_reason,
             ],
         )?;
         tx.commit()?;
@@ -1711,6 +1746,8 @@ fn row_to_opening_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpeningAt
         state: OpeningAttemptState::parse(&row.get::<_, String>(11)?)?,
         rejection_code: row.get::<_, Option<i64>>(12)?.map(from_i64).transpose()?,
         rejection_message: row.get(13)?,
+        abandonment_reason: row.get(14)?,
+        abandoned_at: row.get(15)?,
     })
 }
 
@@ -2567,6 +2604,101 @@ mod tests {
             .proofs_for_reservation(&reservation_id)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn abandonment_is_atomic_and_repeat_is_noop() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        let attempt = NewOpeningAttempt {
+            attempt_id: "channel-a".to_string(),
+            opening_id: "opening-a".to_string(),
+            predecessor_attempt_id: None,
+            reservation_id: new_reservation_id(),
+            receiver_pubkey: "receiver".to_string(),
+            mint_url: MINT.to_string(),
+            unit: "sat".to_string(),
+            input_budget_msats: 8_000,
+            expiry_timestamp: 123_456,
+            prepared_open_json: "immutable prepared request".to_string(),
+        };
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &attempt,
+            )
+            .unwrap();
+        wallet
+            .claim_opening_attempt_submission(&attempt.attempt_id)
+            .unwrap();
+        // Fail after the proof UPDATE, proving the release rolls back with the journal.
+        wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_abandon BEFORE UPDATE ON monad_client_opening_attempts WHEN NEW.state = 'abandoned' BEGIN SELECT RAISE(ABORT, 'injected crash'); END;").unwrap();
+        assert!(wallet
+            .abandon_opening_attempt(&attempt.attempt_id, "empty restore, exact inputs UNSPENT")
+            .is_err());
+        assert_eq!(
+            wallet
+                .opening_attempt(&attempt.attempt_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            OpeningAttemptState::Submitted
+        );
+        assert_eq!(
+            wallet
+                .proofs_for_reservation(&attempt.reservation_id)
+                .unwrap()[0]
+                .state,
+            LooseProofState::Reserved
+        );
+        wallet
+            .conn()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_abandon;")
+            .unwrap();
+        wallet
+            .abandon_opening_attempt(&attempt.attempt_id, "empty restore, exact inputs UNSPENT")
+            .unwrap();
+        let record = wallet
+            .opening_attempt(&attempt.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, OpeningAttemptState::Abandoned);
+        assert_eq!(
+            record.abandonment_reason.as_deref(),
+            Some("empty restore, exact inputs UNSPENT")
+        );
+        assert!(record.abandoned_at.is_some());
+        assert!(wallet.opening_attempts_for_recovery().unwrap().is_empty());
+        assert_eq!(
+            wallet
+                .list_available_proofs(MINT, "sat", &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        let next_reservation = wallet.reserve_proofs(MINT, "sat", &[], 8).unwrap();
+        wallet
+            .abandon_opening_attempt(&attempt.attempt_id, "must not overwrite")
+            .unwrap();
+        assert_eq!(
+            wallet
+                .opening_attempt(&attempt.attempt_id)
+                .unwrap()
+                .unwrap(),
+            record
+        );
+        assert_eq!(
+            wallet
+                .proofs_for_reservation(&next_reservation.reservation_id)
+                .unwrap()[0]
+                .state,
+            LooseProofState::Reserved
+        );
     }
 
     #[test]

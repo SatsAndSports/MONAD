@@ -176,8 +176,11 @@ where
     match wallet.recover_pending_openings() {
         Ok(recovered) if !recovered.is_empty() => {
             info!(
-                count = recovered.len(),
-                "recovered pending channel openings"
+                recovered = recovered.recovered_channel_ids.len(),
+                cancelled = recovered.cancelled_attempt_ids.len(),
+                abandoned = recovered.abandoned_attempt_ids.len(),
+                unresolved = recovered.unresolved.len(),
+                "channel opening recovery outcomes"
             );
         }
         Ok(_) => {}
