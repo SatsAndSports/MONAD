@@ -189,12 +189,16 @@ recover-drain` to restore the exact persisted outputs instead of attempting a
 new, potentially conflicting swap.
 
 The client has the same discipline. It atomically reserves channel-opening inputs
-and persists the exact prepared funding swap before submission. Ambiguous opens
-first use NUT-09; only a valid empty funding restore followed by an all-`UNSPENT`
-NUT-07 check may replay that same immutable request once per recovery invocation.
-Prepared openings that never entered the submit window are cancelled instead of
-being sent during recovery. A narrowly recognized inactive-output-keyset rejection
-can produce one immutable successor attempt. For expired-channel refunds, it saves
+and persists the exact prepared funding swap before submission. Live opening
+recovery first uses NUT-09; only a valid empty funding restore followed by an
+all-`UNSPENT` NUT-07 check may replay that same immutable request once. Startup
+and manual recovery never submit swaps: prepared attempts are cancelled, while a
+submitted attempt with that complete empty-restore and unspent-input evidence is
+marked `Abandoned` and atomically releases its reservation. Ambiguous, partial,
+pending, spent, invalid, or unavailable evidence remains unresolved and retains
+the reservation. A narrowly recognized inactive-output-keyset rejection can
+produce one immutable successor attempt during live opening. For expired-channel
+refunds, it saves
 the exact prepared refund, marks it `submitting` before contacting the mint, and
 imports recovered proofs into the loose-proof wallet before marking the channel
 closed. Those imports are idempotent, so a restart at any point can repeat the
