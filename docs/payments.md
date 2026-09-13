@@ -12,11 +12,7 @@ Use it together with:
 
 The canonical client funding implementation is in `monad-client`:
 
-- `monad-client/src/session_driver.rs` - public entrypoints
-- `monad-client/src/session_driver/runtime.rs` - serialized control-loop executor
-- `monad-client/src/session_driver/state.rs` - local driver state and publishing helpers
-- `monad-client/src/session_driver/funding.rs` - channel acquisition, link, payment, recovery
-- `monad-client/src/session_driver/payment.rs` - payment math and protocol-safety checks
+- `monad-client/src/session_driver.rs` - public entrypoints and private `runtime`, `state`, `funding`, and `payment` modules for the serialized control loop, local state, funding lifecycle, and payment safety checks
 - `monad-client/src/wallet.rs` - wallet abstraction, selector, mock wallet
 - `monad-client/src/sqlite_client_wallet.rs` - SQLite-backed `MonadWallet` using upstream Spilman channels
 - `monad-client/src/loose_proof_wallet.rs` - loose Cashu proof custody, quote/premint records, reservations, and spend/release state
@@ -185,8 +181,8 @@ attachment metadata is cleared for the intended channel.
 
 ## Driver Shape
 
-Each relay session is handled by one serialized executor loop in
-`monad-client/src/session_driver/runtime.rs`.
+Each relay session is handled by the private `runtime` module in
+`monad-client/src/session_driver.rs`.
 
 Important consequences:
 
@@ -242,8 +238,8 @@ status update as a payment baseline.
 3. Relay `session_total_out` must never exceed the client's locally observed outbound total.
 4. Relay `total_paid_millisats` must never exceed the client's locally authorized payment total.
 
-These checks live with the payment logic in
-`monad-client/src/session_driver/payment.rs`.
+These checks live with the private `payment` module in
+`monad-client/src/session_driver.rs`.
 
 ## Harnesses And Tests
 
@@ -270,7 +266,7 @@ When changing payment code, keep these boundaries clear:
 - protocol framing belongs in `monad-common`
 - raw-unit conversion belongs in `monad-common`
 - wallet semantics belong in `monad-client/src/wallet.rs`
-- session funding policy belongs in `monad-client/src/session_driver/*`
+- session funding policy belongs in `monad-client/src/session_driver.rs`
 - relay authority and acceptance rules belong in `monad-relay`
 
 When reviewing future changes, verify at least:

@@ -293,13 +293,12 @@ Existing old-keyset channels keep working as long as the relay still knows the k
 
 ## Payment Code Map
 
-The canonical client funding implementation lives in `monad-client/src/session_driver/`:
+The canonical client funding implementation lives in `monad-client/src/session_driver.rs` and its private modules:
 
-- `session_driver.rs` exposes `PaymentPolicy` and `start_session_payment_driver(...)`
-- `runtime.rs` runs the serialized control loop
-- `state.rs` holds local driver state and publishing helpers
-- `funding.rs` handles channel selection, link, payment, eviction, and recovery
-- `payment.rs` holds payment math and relay/client safety checks
+- `runtime` runs the serialized control loop
+- `state` holds local driver state and publishing helpers
+- `funding` handles channel selection, link, payment, eviction, and recovery
+- `payment` holds payment math and relay/client safety checks
 
 Shared protocol helpers used by client, relay, and harness code live in:
 
@@ -507,8 +506,8 @@ fail while no route is published, then use the replacement route once it is
 connected. A first-hop failure triggers a full reconnect. Later-hop failures
 detach only channels tied to the old suffix sessions and try to rebuild from the
 failed hop, preserving the unaffected prefix when possible; suffix rebuild
-failure falls back to a full route reconnect. Failed or cancelled setup waits for
-old payment and H2 tasks to finish before detaching channels or retrying, so a
+failure falls back to a full route reconnect. Failed or cancelled setup aborts and
+awaits its owned payment and H2 tasks before detaching channels or retrying, so a
 completed compatible channel can be reused. The default setup budget is five
 seconds; cleanup can take longer if an in-flight mint call must finish. Library
 embedders can override the budget per instance with

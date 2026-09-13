@@ -368,7 +368,7 @@ Server to client (`ServerMessage`):
   - `total_paid_millisats`: Total payments received
   - `remaining_milli_sats`: Current session balance
   - `paused`: Boolean indicating if traffic is currently blocked
-- `SessionStatus { ... linked_channel: Some(...) ... }` — authoritative relay state after a successful link or payment
+- `SessionStatus { ... linked_channel: Some(...) ... }` — authoritative relay state after a successful link, payment, or relay keyset refresh
 - `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
 - `Error { code, message }` — relay-initiated error or rejection
 
@@ -462,13 +462,10 @@ The developer stress harness in `monad-relay/tests/stress.rs` can also run alter
 
 After the control stream is established and the initial `SessionStatus` arrives, steady-state client behavior is handled by one serialized direct control loop in `monad-client/src/session_driver.rs`.
 
-The current code is organized as:
-
-- `monad-client/src/session_driver.rs` - public entrypoints only
-- `monad-client/src/session_driver/runtime.rs` - executor loop and input ordering
-- `monad-client/src/session_driver/state.rs` - local driver state and publishing helpers
-- `monad-client/src/session_driver/funding.rs` - channel acquisition / link / payment progression
-- `monad-client/src/session_driver/payment.rs` - payment math and protocol-safety checks
+`session_driver.rs` contains the public entrypoints and private `runtime`,
+`state`, `funding`, and `payment` modules for executor input ordering, local
+state publishing, channel acquisition/link/payment progression, and payment
+protocol-safety checks.
 
 Shared control-stream framing and raw-unit conversion helpers are intentionally
 kept out of the client driver and live in `monad-common/src/control_codec.rs`
@@ -637,7 +634,8 @@ reserves the selected inputs and records the exact serialized prepared opening.
 The journal is authoritative across restarts. Submitted attempts first recover
 their original funding/change outputs through NUT-09. If a valid funding restore
 is empty, one NUT-07 request checks every persisted input Y; only an all-`UNSPENT`
-response permits one replay of the byte-identical swap during live opening recovery only.
+response permits one replay of the byte-identical swap during live opening
+recovery only.
 Finalization replays local channel, change-proof, and metadata updates
 idempotently. Prepared attempts that were never claimed for submission are
 cancelled and their proofs released.

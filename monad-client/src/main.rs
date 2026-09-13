@@ -108,7 +108,7 @@ enum WalletCommand {
         channel_id: String,
     },
 
-    /// Recover ambiguous channel-open attempts.
+    /// Restore ambiguous channel-open attempts without submitting swaps.
     RecoverOpenings,
 }
 
