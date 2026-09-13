@@ -137,14 +137,25 @@ relevant `(mint, unit)`. The client prepares an exact opening, then atomically
 reserves its loose inputs and journals that preparation before submission. A
 submitted attempt is immutable and ambiguous outcomes first use NUT-09. When a
 valid funding restore is empty, one NUT-07 request checks all persisted input Ys;
-only an all-`UNSPENT` response permits one replay of the identical swap request per
-recovery invocation. Live opening ambiguity, configured-client startup, and
-`recover-openings` use this same bounded sequence. Recovery cancels a prepared
-attempt that never entered the submit window. If the mint explicitly rejects code
+only an all-`UNSPENT` response permits one replay of the identical swap request in
+live opening recovery. Startup and manual `recover-openings` never submit swaps.
+They cancel prepared attempts and rejected attempts without a successor, finish
+finalizing attempts, and finalize submitted attempts only with complete restored
+funding/change. Valid empty funding restore plus complete exact-input `UNSPENT`
+evidence instead atomically marks the submitted attempt `Abandoned` and releases
+its operation-owned reservation. The authoritative journal retains the request,
+reason, and abandonment time; abandoned records are excluded from recovery and
+have no automatic rechecks or late-completion handling. Partial or invalid restore,
+incomplete input evidence, pending/spent inputs, and network errors retain the
+reservation as unresolved. CLI/runtime reports distinguish recovered, cancelled,
+abandoned, and unresolved outcomes. This policy is channel-opening-only, not a
+change to refunds, drains, or other swaps.
+
+During a live opening, if the mint explicitly rejects code
 `12002` for an inactive output keyset, the client may refresh and persist one
 successor attempt, but only when selection produces a different active output
 keyset. That successor is a new immutable attempt with its own one-exact-replay
-allowance per recovery invocation.
+allowance in that live opening.
 
 Input proof keysets are independent from the selected output funding keyset:
 input proofs may be old, inactive, or mixed-keyset proofs as long as the mint
