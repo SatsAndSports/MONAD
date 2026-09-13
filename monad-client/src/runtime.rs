@@ -24,6 +24,19 @@ const ROUTE_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const SOCKS_ROUTE_WAIT_TIMEOUT_MS: u64 = 10_000;
 pub const CONFIGURED_CLIENT_WALLET_NAME: &str = "default";
 
+#[derive(Debug, Clone, Copy)]
+pub struct ConfiguredClientRuntimeOptions {
+    pub route_setup_timeout: Duration,
+}
+
+impl Default for ConfiguredClientRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            route_setup_timeout: Duration::from_millis(ROUTE_CONNECT_TIMEOUT_MS),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ChannelDetachStats {
     scanned: usize,
@@ -158,6 +171,27 @@ pub async fn run_configured_client_until_shutdown_with_stats<S>(
 where
     S: Future<Output = ()> + Send,
 {
+    run_configured_client_until_shutdown_with_options(
+        config,
+        client_name,
+        stats,
+        ConfiguredClientRuntimeOptions::default(),
+        shutdown,
+    )
+    .await
+}
+
+/// Run with instance-local setup timing, without process-wide environment overrides.
+pub async fn run_configured_client_until_shutdown_with_options<S>(
+    config: MonadConfig,
+    client_name: Option<&str>,
+    stats: SharedRouteRuntimeStats,
+    options: ConfiguredClientRuntimeOptions,
+    shutdown: S,
+) -> anyhow::Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
     tokio::pin!(shutdown);
 
     let client = config.select_client(client_name)?;
@@ -198,6 +232,7 @@ where
         },
     )?;
     let route = route_from_client_config(client)?;
+    let runtime = runtime.with_setup_timeout(options.route_setup_timeout);
 
     info!(
         client = %client.name,
@@ -283,25 +318,16 @@ where
         info!(
             attempt,
             hops = route.hops().len(),
-            timeout_ms = ROUTE_CONNECT_TIMEOUT_MS,
             route_connect_attempts_total = snapshot.route_connect_attempts_total,
             full_reconnects_total = snapshot.full_reconnects_total,
             "connecting route"
         );
 
-        match tokio::time::timeout(
-            Duration::from_millis(ROUTE_CONNECT_TIMEOUT_MS),
-            connect_route_with_runtime(route, &runtime),
-        )
-        .await
-        {
-            Err(_) => {
-                warn!("timed out connecting route after {ROUTE_CONNECT_TIMEOUT_MS}ms");
-            }
-            Ok(Err(err)) => {
+        match connect_route_with_runtime(route, &runtime).await {
+            Err(err) => {
                 warn!("failed to connect route: {err}");
             }
-            Ok(Ok(route_conn)) => {
+            Ok(route_conn) => {
                 attempt = 0;
                 backoff_ms = INITIAL_RECONNECT_BACKOFF_MS;
                 route_has_connected = true;
@@ -387,6 +413,7 @@ where
                         suffix_rebuild_attempts_total = snapshot.suffix_rebuild_attempts_total,
                         "starting route suffix rebuild"
                     );
+                    active_route.close_suffix_from(hop_idx).await;
                     let detach_stats = detach_channels_for_sessions(&wallet, &suffix_session_ids);
                     info!(
                         hop = hop_idx + 1,

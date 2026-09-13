@@ -507,8 +507,14 @@ fail while no route is published, then use the replacement route once it is
 connected. A first-hop failure triggers a full reconnect. Later-hop failures
 detach only channels tied to the old suffix sessions and try to rebuild from the
 failed hop, preserving the unaffected prefix when possible; suffix rebuild
-failure falls back to a full route reconnect. The client does not run concurrent
-rebuilds; failures observed during an in-flight rebuild are treated as stale and
+failure falls back to a full route reconnect. Failed or cancelled setup waits for
+old payment and H2 tasks to finish before detaching channels or retrying, so a
+completed compatible channel can be reused. The default setup budget is five
+seconds; cleanup can take longer if an in-flight mint call must finish. Library
+embedders can override the budget per instance with
+`ConfiguredClientRuntimeOptions::route_setup_timeout` and
+`run_configured_client_until_shutdown_with_options`.
+The client does not run concurrent rebuilds; failures observed during an in-flight rebuild are treated as stale and
 ignored until the rebuilt route is active. Route (re)connects fail fast after a
 few attempts before the first successful connect, so startup misconfiguration is
 loud; once a route has connected, reconnects retry indefinitely with capped

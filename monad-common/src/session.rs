@@ -113,6 +113,7 @@ pub struct RelayConnection {
     /// Abortable background tasks associated with this relay connection, such as
     /// client-side control stream tasks.
     task_handles: Mutex<Vec<JoinHandle<()>>>,
+    close_lock: tokio::sync::Mutex<()>,
     /// Noise handshake hash — unique session identifier agreed by both sides.
     session_id: [u8; 32],
     /// Session pricing metadata, set by the control task after receiving
@@ -162,6 +163,7 @@ impl RelayConnection {
             h2_client: Arc::new(tokio::sync::Mutex::new(h2_client)),
             driver_handles: Mutex::new(Vec::new()),
             task_handles: Mutex::new(Vec::new()),
+            close_lock: tokio::sync::Mutex::new(()),
             session_id,
             session_pricing: Arc::new(RwLock::new(None)),
             session_spilman_info: Arc::new(RwLock::new(None)),
@@ -322,7 +324,7 @@ impl RelayConnection {
     /// Register a watch receiver that signals when a funded hop's session
     /// driver has terminated. The runtime can await any of these to detect
     /// route failure.
-    pub fn add_failure_watcher(&mut self, hop_idx: usize, rx: watch::Receiver<bool>) {
+    pub fn add_failure_watcher(&self, hop_idx: usize, rx: watch::Receiver<bool>) {
         self.failure_watchers.lock().unwrap().push((hop_idx, rx));
     }
 
@@ -386,33 +388,44 @@ impl RelayConnection {
     /// This is used by callers that only hold `Arc<RelayConnection>` handles and
     /// need to tear down a stale chain after swapping in a rebuilt replacement.
     pub async fn close(&self) {
-        let task_handles = {
-            let mut handles = self.task_handles.lock().unwrap();
-            std::mem::take(&mut *handles)
-        };
+        use std::future::Future;
+        use std::task::Poll;
 
-        for handle in task_handles {
-            handle.abort();
-            if let Err(e) = handle.await {
-                if !e.is_cancelled() {
-                    tracing::error!("background task panicked: {e}");
-                }
+        let _guard = self.close_lock.lock().await;
+        for handles in [&self.task_handles, &self.driver_handles] {
+            for handle in handles.lock().unwrap().iter() {
+                handle.abort();
             }
         }
-
-        let driver_handles = {
-            let mut handles = self.driver_handles.lock().unwrap();
-            std::mem::take(&mut *handles)
-        };
-
-        for handle in driver_handles {
-            handle.abort();
-            if let Err(e) = handle.await {
-                if !e.is_cancelled() {
-                    tracing::error!("H2 driver task panicked: {e}");
-                }
+        // Keep pending handles owned by the connection even if close itself is
+        // cancelled. A later close must still await a blocking wallet call.
+        std::future::poll_fn(|cx| {
+            let mut pending = false;
+            for handles in [&self.task_handles, &self.driver_handles] {
+                handles.lock().unwrap().retain_mut(|handle| {
+                    match std::pin::Pin::new(handle).poll(cx) {
+                        Poll::Pending => {
+                            pending = true;
+                            true
+                        }
+                        Poll::Ready(result) => {
+                            if let Err(e) = result {
+                                if !e.is_cancelled() {
+                                    tracing::error!("connection task panicked: {e}");
+                                }
+                            }
+                            false
+                        }
+                    }
+                });
             }
-        }
+            if pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
     }
 
     /// Shut down the hop chain by aborting background tasks attached to it.
@@ -463,6 +476,21 @@ impl RelayConnection {
             h2_recv,
             Some(self.cleartext_byte_counters.clone()),
         ))
+    }
+}
+
+impl Drop for RelayConnection {
+    fn drop(&mut self) {
+        // Fallback only: callers needing quiescence must await close().
+        for handle in self
+            .task_handles
+            .get_mut()
+            .unwrap()
+            .iter()
+            .chain(self.driver_handles.get_mut().unwrap().iter())
+        {
+            handle.abort();
+        }
     }
 }
 
