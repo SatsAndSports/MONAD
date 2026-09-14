@@ -92,7 +92,8 @@ impl<'a> ControlDriver<'a> {
                             | crate::keyset_refresh::KeysetRefreshError::UntrustedUnit => {
                                 ServerErrorCode::KeysetRefreshRejected
                             }
-                            crate::keyset_refresh::KeysetRefreshError::Timeout
+                            crate::keyset_refresh::KeysetRefreshError::Busy
+                            | crate::keyset_refresh::KeysetRefreshError::Timeout
                             | crate::keyset_refresh::KeysetRefreshError::RefreshFailed(_) => {
                                 ServerErrorCode::KeysetRefreshFailed
                             }

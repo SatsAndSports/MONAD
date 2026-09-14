@@ -3,7 +3,7 @@ use crate::wallet_manager::RelayWalletManager;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, Semaphore, TryAcquireError};
 use tokio::time::{timeout, Duration, Instant};
 
 const MAX_REFRESH_MINT_URL_LEN: usize = 2048;
@@ -20,6 +20,7 @@ pub(crate) enum KeysetRefreshError {
     RequestTooLarge,
     UntrustedMint,
     UntrustedUnit,
+    Busy,
     Timeout,
     RefreshFailed(String),
 }
@@ -30,6 +31,7 @@ impl std::fmt::Display for KeysetRefreshError {
             Self::RequestTooLarge => write!(f, "keyset refresh request too large"),
             Self::UntrustedMint => write!(f, "keyset refresh mint is not trusted"),
             Self::UntrustedUnit => write!(f, "keyset refresh unit is not trusted for mint"),
+            Self::Busy => write!(f, "keyset refresh service is busy"),
             Self::Timeout => write!(f, "keyset refresh timed out"),
             Self::RefreshFailed(message) => write!(f, "keyset refresh failed: {message}"),
         }
@@ -53,8 +55,7 @@ impl KeysetRefresher for RelayWalletManager {
 
 #[derive(Debug, Clone)]
 pub struct KeysetRefreshConfig {
-    pub success_cooldown: Duration,
-    pub failure_cooldown: Duration,
+    pub refresh_cooldown: Duration,
     pub timeout: Duration,
     pub max_concurrent_refreshes: usize,
 }
@@ -62,8 +63,7 @@ pub struct KeysetRefreshConfig {
 impl Default for KeysetRefreshConfig {
     fn default() -> Self {
         Self {
-            success_cooldown: Duration::from_secs(60),
-            failure_cooldown: Duration::from_secs(10),
+            refresh_cooldown: Duration::from_secs(60),
             timeout: Duration::from_secs(5),
             max_concurrent_refreshes: 2,
         }
@@ -72,9 +72,11 @@ impl Default for KeysetRefreshConfig {
 
 #[derive(Debug, Default)]
 struct MintRefreshState {
-    last_success: Option<Instant>,
-    last_failure: Option<Instant>,
+    last_attempt_started: Option<Instant>,
+    in_flight: Option<watch::Receiver<Option<RefreshResult>>>,
 }
+
+type RefreshResult = Result<KeysetRefreshOutcome, KeysetRefreshError>;
 
 #[derive(Debug, Default)]
 struct MintRefreshSlot {
@@ -85,7 +87,7 @@ pub struct RelayKeysetRefreshCoordinator {
     refresher: Arc<dyn KeysetRefresher>,
     trusted_mint_units: TrustedMintUnits,
     slots: Mutex<BTreeMap<String, Arc<MintRefreshSlot>>>,
-    global_semaphore: Semaphore,
+    global_semaphore: Arc<Semaphore>,
     config: KeysetRefreshConfig,
 }
 
@@ -118,50 +120,58 @@ impl RelayKeysetRefreshCoordinator {
             refresher,
             trusted_mint_units,
             slots: Mutex::new(BTreeMap::new()),
-            global_semaphore: Semaphore::new(config.max_concurrent_refreshes.max(1)),
+            global_semaphore: Arc::new(Semaphore::new(config.max_concurrent_refreshes.max(1))),
             config,
         }
     }
 
-    pub(crate) async fn refresh_mint_unit(
-        &self,
-        mint_url: &str,
-        unit: &str,
-    ) -> Result<KeysetRefreshOutcome, KeysetRefreshError> {
+    pub(crate) async fn refresh_mint_unit(&self, mint_url: &str, unit: &str) -> RefreshResult {
         self.validate_request(mint_url, unit)?;
         let slot = self.slot_for_mint(mint_url).await;
         let mut state = slot.state.lock().await;
         let now = Instant::now();
 
+        if let Some(receiver) = &state.in_flight {
+            let receiver = receiver.clone();
+            drop(state);
+            return wait_for_refresh_result(receiver).await;
+        }
         if state
-            .last_success
-            .is_some_and(|last| now.duration_since(last) < self.config.success_cooldown)
-            || state
-                .last_failure
-                .is_some_and(|last| now.duration_since(last) < self.config.failure_cooldown)
+            .last_attempt_started
+            .is_some_and(|last| now.duration_since(last) < self.config.refresh_cooldown)
         {
             return Ok(KeysetRefreshOutcome::SkippedCooldown);
         }
 
-        let _permit = self.global_semaphore.acquire().await.map_err(|_| {
-            KeysetRefreshError::RefreshFailed("refresh semaphore closed".to_string())
-        })?;
-        let result = timeout(self.config.timeout, self.refresher.refresh_mint(mint_url)).await;
+        let permit = match self.global_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => return Err(KeysetRefreshError::Busy),
+            Err(TryAcquireError::Closed) => {
+                return Err(KeysetRefreshError::RefreshFailed(
+                    "refresh semaphore closed".to_string(),
+                ))
+            }
+        };
+        state.last_attempt_started = Some(now);
+        let (result_tx, result_rx) = watch::channel(None);
+        state.in_flight = Some(result_rx.clone());
+        drop(state);
 
-        match result {
-            Ok(Ok(())) => {
-                state.last_success = Some(Instant::now());
-                Ok(KeysetRefreshOutcome::Refreshed)
-            }
-            Ok(Err(error)) => {
-                state.last_failure = Some(Instant::now());
-                Err(KeysetRefreshError::RefreshFailed(error))
-            }
-            Err(_) => {
-                state.last_failure = Some(Instant::now());
-                Err(KeysetRefreshError::Timeout)
-            }
-        }
+        let refresher = self.refresher.clone();
+        let mint_url = mint_url.to_string();
+        let refresh_timeout = self.config.timeout;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = match timeout(refresh_timeout, refresher.refresh_mint(&mint_url)).await {
+                Ok(Ok(())) => Ok(KeysetRefreshOutcome::Refreshed),
+                Ok(Err(error)) => Err(KeysetRefreshError::RefreshFailed(error)),
+                Err(_) => Err(KeysetRefreshError::Timeout),
+            };
+            slot.state.lock().await.in_flight = None;
+            result_tx.send_replace(Some(result));
+        });
+
+        wait_for_refresh_result(result_rx).await
     }
 
     fn validate_request(&self, mint_url: &str, unit: &str) -> Result<(), KeysetRefreshError> {
@@ -187,10 +197,24 @@ impl RelayKeysetRefreshCoordinator {
     }
 }
 
+async fn wait_for_refresh_result(
+    mut receiver: watch::Receiver<Option<RefreshResult>>,
+) -> RefreshResult {
+    loop {
+        if let Some(result) = receiver.borrow().clone() {
+            return result;
+        }
+        receiver.changed().await.map_err(|_| {
+            KeysetRefreshError::RefreshFailed("refresh task ended without a result".to_string())
+        })?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     struct CountingRefresher {
         calls: AtomicUsize,
@@ -198,6 +222,7 @@ mod tests {
         max_in_flight: AtomicUsize,
         delay: Duration,
         result: std::sync::Mutex<Result<(), String>>,
+        started: Notify,
     }
 
     impl CountingRefresher {
@@ -208,6 +233,7 @@ mod tests {
                 max_in_flight: AtomicUsize::new(0),
                 delay,
                 result: std::sync::Mutex::new(result),
+                started: Notify::new(),
             })
         }
 
@@ -232,6 +258,7 @@ mod tests {
     impl KeysetRefresher for CountingRefresher {
         async fn refresh_mint(&self, _mint_url: &str) -> Result<(), String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
             let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             let _guard = InFlightGuard(&self.in_flight);
             update_max(&self.max_in_flight, in_flight);
@@ -264,8 +291,7 @@ mod tests {
 
     fn config() -> KeysetRefreshConfig {
         KeysetRefreshConfig {
-            success_cooldown: Duration::from_secs(60),
-            failure_cooldown: Duration::from_secs(60),
+            refresh_cooldown: Duration::from_secs(60),
             timeout: Duration::from_secs(5),
             max_concurrent_refreshes: 2,
         }
@@ -326,9 +352,29 @@ mod tests {
         );
 
         assert_eq!(first, Ok(KeysetRefreshOutcome::Refreshed));
-        assert_eq!(second, Ok(KeysetRefreshOutcome::SkippedCooldown));
+        assert_eq!(second, Ok(KeysetRefreshOutcome::Refreshed));
         assert_eq!(refresher.calls(), 1);
         assert_eq!(refresher.max_in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinator_shares_same_mint_failure() {
+        let refresher = CountingRefresher::new(Duration::from_millis(50), Err("boom".to_string()));
+        let coordinator = RelayKeysetRefreshCoordinator::with_refresher(
+            refresher.clone(),
+            trusted(&[("https://mint", &["sat"])]),
+            config(),
+        );
+
+        let (first, second) = tokio::join!(
+            coordinator.refresh_mint_unit("https://mint", "sat"),
+            coordinator.refresh_mint_unit("https://mint", "sat"),
+        );
+
+        let expected = Err(KeysetRefreshError::RefreshFailed("boom".to_string()));
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+        assert_eq!(refresher.calls(), 1);
     }
 
     #[tokio::test]
@@ -346,14 +392,18 @@ mod tests {
             coordinator.refresh_mint_unit("https://mint", "sat").await,
             Err(KeysetRefreshError::Timeout)
         );
+        assert_eq!(
+            coordinator.refresh_mint_unit("https://mint", "sat").await,
+            Ok(KeysetRefreshOutcome::SkippedCooldown)
+        );
         assert_eq!(refresher.calls(), 1);
     }
 
     #[tokio::test]
-    async fn coordinator_global_semaphore_limits_cross_mint_concurrency() {
+    async fn coordinator_global_saturation_is_busy_without_starting_cooldown() {
         let refresher = CountingRefresher::new(Duration::from_millis(50), Ok(()));
         let mut config = config();
-        config.success_cooldown = Duration::ZERO;
+        config.refresh_cooldown = Duration::ZERO;
         config.max_concurrent_refreshes = 1;
         let coordinator = RelayKeysetRefreshCoordinator::with_refresher(
             refresher.clone(),
@@ -366,10 +416,52 @@ mod tests {
             coordinator.refresh_mint_unit("https://mint-b", "sat"),
         );
 
-        assert_eq!(first, Ok(KeysetRefreshOutcome::Refreshed));
-        assert_eq!(second, Ok(KeysetRefreshOutcome::Refreshed));
+        assert!(matches!(
+            (&first, &second),
+            (
+                Ok(KeysetRefreshOutcome::Refreshed),
+                Err(KeysetRefreshError::Busy)
+            ) | (
+                Err(KeysetRefreshError::Busy),
+                Ok(KeysetRefreshOutcome::Refreshed)
+            )
+        ));
+        let busy_mint = if first == Err(KeysetRefreshError::Busy) {
+            "https://mint-a"
+        } else {
+            "https://mint-b"
+        };
+        assert_eq!(
+            coordinator.refresh_mint_unit(busy_mint, "sat").await,
+            Ok(KeysetRefreshOutcome::Refreshed)
+        );
         assert_eq!(refresher.calls(), 2);
         assert_eq!(refresher.max_in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinator_refresh_survives_initiating_caller_cancellation() {
+        let refresher = CountingRefresher::new(Duration::from_millis(50), Ok(()));
+        let coordinator = Arc::new(RelayKeysetRefreshCoordinator::with_refresher(
+            refresher.clone(),
+            trusted(&[("https://mint", &["sat"])]),
+            config(),
+        ));
+        let started = refresher.started.notified();
+        let task_coordinator = coordinator.clone();
+        let task = tokio::spawn(async move {
+            task_coordinator
+                .refresh_mint_unit("https://mint", "sat")
+                .await
+        });
+        started.await;
+        task.abort();
+
+        assert_eq!(
+            coordinator.refresh_mint_unit("https://mint", "sat").await,
+            Ok(KeysetRefreshOutcome::Refreshed)
+        );
+        assert_eq!(refresher.calls(), 1);
     }
 
     #[tokio::test]
