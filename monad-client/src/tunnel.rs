@@ -3,7 +3,7 @@
 
 use crate::socks;
 use http::{Method, Request, Uri};
-use monad_common::proxy::proxy_bidirectional;
+use monad_common::proxy::proxy_bidirectional_from_client;
 use monad_common::session::RelayConnection;
 use std::io;
 use tokio::net::TcpStream;
@@ -60,7 +60,7 @@ pub async fn open_tunnel(
     // Proxy data bidirectionally between the H2 stream and the local socket.
     // `&mut TcpStream` implements AsyncRead + AsyncWrite, so the shared proxy
     // function works directly without transferring ownership.
-    proxy_bidirectional(
+    proxy_bidirectional_from_client(
         h2_send,
         h2_recv,
         &mut *local_stream,

@@ -288,9 +288,37 @@ async fn start_monad_relay() -> (std::net::SocketAddr, Secp256k1Pubkey) {
     start_monad_relay_with_transport_key(SecpTransportKeypair::generate()).await
 }
 
+async fn start_monad_relay_with_pricing(
+    in_bytes_per_millisat: u64,
+    out_bytes_per_millisat: u64,
+) -> (std::net::SocketAddr, Secp256k1Pubkey) {
+    start_monad_relay_with_transport_key_capabilities_and_pricing(
+        SecpTransportKeypair::generate(),
+        initial_server_capabilities(),
+        in_bytes_per_millisat,
+        out_bytes_per_millisat,
+    )
+    .await
+}
+
 async fn start_monad_relay_with_transport_key_and_capabilities(
     transport_key: SecpTransportKeypair,
     bootstrap_capabilities: BootstrapCapabilities,
+) -> (std::net::SocketAddr, Secp256k1Pubkey) {
+    start_monad_relay_with_transport_key_capabilities_and_pricing(
+        transport_key,
+        bootstrap_capabilities,
+        1,
+        1,
+    )
+    .await
+}
+
+async fn start_monad_relay_with_transport_key_capabilities_and_pricing(
+    transport_key: SecpTransportKeypair,
+    bootstrap_capabilities: BootstrapCapabilities,
+    in_bytes_per_millisat: u64,
+    out_bytes_per_millisat: u64,
 ) -> (std::net::SocketAddr, Secp256k1Pubkey) {
     let identity = QuicCertIdentity::generate().unwrap();
     let pubkey = transport_key.pubkey();
@@ -307,8 +335,8 @@ async fn start_monad_relay_with_transport_key_and_capabilities(
         transport_key: Some(transport_key),
         receiver_pubkey_hex: cashu::nuts::SecretKey::generate().public_key().to_hex(),
         trusted_mint_units: synthetic_trusted_mint_units(),
-        in_bytes_per_millisat: 1,
-        out_bytes_per_millisat: 1,
+        in_bytes_per_millisat,
+        out_bytes_per_millisat,
         bootstrap_capabilities: Some(bootstrap_capabilities),
         relay_wallet_name: "test-relay".to_string(),
         spilman_storage_path: tempfile::NamedTempFile::new()
@@ -12397,9 +12425,17 @@ async fn test_client_cleartext_accounting_matches_relay_nested_quic_sessions() {
 async fn test_client_tunnel_helper_updates_session_accounting() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
-    tokio::spawn(run_uppercase_server(upper_listener));
+    let request = b"helper path request";
+    let response = b"short response";
+    tokio::spawn(async move {
+        let (mut stream, _) = upper_listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, request);
+        stream.write_all(response).await.unwrap();
+    });
 
-    let (server_addr, pubkey) = start_monad_relay().await;
+    let (server_addr, pubkey) = start_monad_relay_with_pricing(2, 5).await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let (mut control_send, mut control_recv) =
         open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
@@ -12411,7 +12447,7 @@ async fn test_client_tunnel_helper_updates_session_accounting() {
         let mut socks_reply = [0u8; 10];
         stream.read_exact(&mut socks_reply).await.unwrap();
         assert_eq!(socks_reply, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
-        stream.write_all(b"helper path payload").await.unwrap();
+        stream.write_all(request).await.unwrap();
         stream.shutdown().await.unwrap();
         let mut result = Vec::new();
         stream.read_to_end(&mut result).await.unwrap();
@@ -12423,23 +12459,25 @@ async fn test_client_tunnel_helper_updates_session_accounting() {
         .await
         .unwrap();
     let result = local_peer.await.unwrap();
-    assert_eq!(result, b"HELPER PATH PAYLOAD");
+    assert_eq!(result, response);
 
     let (expected_in, expected_out) = conn.local_session_totals();
-    assert_eq!(expected_out, b"helper path payload".len() as u64);
-    assert_eq!(expected_in, b"HELPER PATH PAYLOAD".len() as u64);
+    assert_eq!(expected_out, request.len() as u64);
+    assert_eq!(expected_in, response.len() as u64);
 
-    let (session_total_in, session_total_out, _paid, _remaining, _paused) =
-        wait_for_session_totals(
-            &mut control_send,
-            &mut control_recv,
-            expected_in,
-            expected_out,
-        )
-        .await
-        .expect("tunnel helper accounting should converge to exact totals");
+    let (session_total_in, session_total_out, paid, remaining, paused) = wait_for_session_totals(
+        &mut control_send,
+        &mut control_recv,
+        expected_in,
+        expected_out,
+    )
+    .await
+    .expect("tunnel helper accounting should converge to exact totals");
     assert_eq!(session_total_in, expected_in);
     assert_eq!(session_total_out, expected_out);
+    assert_eq!(paid, TEST_SESSION_PAYMENT);
+    assert_eq!(remaining, TEST_SESSION_PAYMENT as i64 - 11);
+    assert!(!paused);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);

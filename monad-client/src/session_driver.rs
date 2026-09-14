@@ -622,6 +622,23 @@ mod tests {
     }
 
     #[test]
+    fn estimated_remaining_uses_directional_rates() {
+        let counters = CleartextByteCounters::default();
+        counters.note_inbound(14);
+        counters.note_outbound(19);
+        let state = DriverState {
+            established_pricing: Some(SessionPricing::new(2, 5)),
+            local_session_paid_msats: 20,
+            ..DriverState::default()
+        };
+
+        assert_eq!(
+            super::payment::compute_estimated_remaining(&state, &counters),
+            Some(9)
+        );
+    }
+
+    #[test]
     fn pre_ready_blocked_error_fires_when_session_newly_blocks_before_readiness() {
         let (ready_tx, _ready_rx) = oneshot::channel();
         let next_state = DriverState {

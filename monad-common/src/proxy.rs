@@ -77,6 +77,35 @@ pub async fn proxy_bidirectional<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    proxy_bidirectional_inner(&mut h2_send, &mut h2_recv, target, label, accounting, false).await
+}
+
+/// Client-side variant where `target` is the local application socket rather
+/// than the remote CONNECT destination.
+pub async fn proxy_bidirectional_from_client<T>(
+    mut h2_send: SendStream<Bytes>,
+    mut h2_recv: RecvStream,
+    target: T,
+    label: &str,
+    accounting: Option<CleartextByteCounters>,
+) -> io::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    proxy_bidirectional_inner(&mut h2_send, &mut h2_recv, target, label, accounting, true).await
+}
+
+async fn proxy_bidirectional_inner<T>(
+    h2_send: &mut SendStream<Bytes>,
+    h2_recv: &mut RecvStream,
+    target: T,
+    label: &str,
+    accounting: Option<CleartextByteCounters>,
+    target_is_client: bool,
+) -> io::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let (mut target_read, mut target_write) = tokio::io::split(target);
 
     // Byte counters shared between the two directions
@@ -99,7 +128,11 @@ where
 
                     bytes_to_target_ref.fetch_add(len as u64, Ordering::Relaxed);
                     if let Some(accounting) = &accounting_to_target {
-                        accounting.note_outbound(len);
+                        if target_is_client {
+                            accounting.note_inbound(len);
+                        } else {
+                            accounting.note_outbound(len);
+                        }
                     }
 
                     if let Err(e) = target_write.write_all(&data).await {
@@ -133,7 +166,11 @@ where
                 Ok(n) => {
                     bytes_from_target_ref.fetch_add(n as u64, Ordering::Relaxed);
                     if let Some(accounting) = &accounting_from_target {
-                        accounting.note_inbound(n);
+                        if target_is_client {
+                            accounting.note_outbound(n);
+                        } else {
+                            accounting.note_inbound(n);
+                        }
                     }
 
                     let data = Bytes::copy_from_slice(&buf[..n]);
@@ -141,7 +178,7 @@ where
                     // Wait for H2 flow control capacity (sleeps until
                     // the peer sends a WINDOW_UPDATE — no busy-looping)
                     h2_send.reserve_capacity(data.len());
-                    if let Err(e) = wait_for_send_capacity(&mut h2_send).await {
+                    if let Err(e) = wait_for_send_capacity(h2_send).await {
                         debug!("{e}");
                         break;
                     }
@@ -167,8 +204,17 @@ where
     // eventually causes the other direction to complete naturally.
     tokio::join!(h2_to_target, target_to_h2);
 
-    let outbound = bytes_to_target.load(Ordering::Relaxed);
-    let inbound = bytes_from_target.load(Ordering::Relaxed);
+    let (outbound, inbound) = if target_is_client {
+        (
+            bytes_from_target.load(Ordering::Relaxed),
+            bytes_to_target.load(Ordering::Relaxed),
+        )
+    } else {
+        (
+            bytes_to_target.load(Ordering::Relaxed),
+            bytes_from_target.load(Ordering::Relaxed),
+        )
+    };
     info!(
         "tunnel closed: {label} | outbound={outbound} inbound={inbound} total={}",
         outbound + inbound
