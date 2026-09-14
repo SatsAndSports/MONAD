@@ -11,23 +11,6 @@ use tracing::warn;
 use crate::session_driver::PaymentPolicy;
 use crate::wallet::{MonadWallet, RelayPaymentOffer};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct KeysetRefreshHint {
-    pub(super) mint_url: String,
-    pub(super) unit: String,
-    pub(super) accepted_keyset_ids: Vec<String>,
-}
-
-impl KeysetRefreshHint {
-    pub(super) fn from_offer(offer: &RelayPaymentOffer) -> Self {
-        Self {
-            mint_url: offer.mint_url.clone(),
-            unit: offer.unit.clone(),
-            accepted_keyset_ids: offer.accepted_keyset_ids.clone(),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct SessionDriverConfig {
     pub(super) wallet: Arc<dyn MonadWallet>,
@@ -87,7 +70,6 @@ pub(super) struct RelaySnapshot {
 pub(super) enum ControlOpInFlight {
     Link { channel_id: String },
     Payment { channel_id: String },
-    RefreshKeysets(KeysetRefreshHint),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,11 +87,11 @@ pub(super) struct DriverState {
     pub(super) cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
     pub(super) local_session_paid_msats: u64,
     pub(super) intended_channel_id: Option<String>,
+    pub(super) intended_channel_keyset_id: Option<String>,
     pub(super) intended_offer: Option<RelayPaymentOffer>,
     pub(super) session_excluded_channels: BTreeSet<String>,
     pub(super) control_op_in_flight: Option<ControlOpInFlight>,
-    pub(super) last_keyset_refresh_hint: Option<KeysetRefreshHint>,
-    pub(super) last_keyset_refresh_hint_at: Option<Instant>,
+    pub(super) funding_retry_not_before: Option<Instant>,
     pub(super) funding_blocked_reason: Option<FundingBlockedReason>,
     pub(super) ready_signaled: bool,
     pub(super) terminated: bool,
@@ -183,11 +165,7 @@ pub(super) fn current_spilman_info(state: &DriverState) -> Option<SessionSpilman
             receiver_pubkey: offer.receiver_pubkey.clone(),
             mint_url: offer.mint_url.clone(),
             unit: offer.unit.clone(),
-            keyset_id: offer
-                .accepted_keyset_ids
-                .first()
-                .cloned()
-                .unwrap_or_default(),
+            keyset_id: state.intended_channel_keyset_id.clone().unwrap_or_default(),
             keyset_info_json: String::new(),
             cashu_spilman_protocol_version,
             cashu_spilman_keyset_versions,
@@ -226,28 +204,11 @@ fn clear_resolved_control_op_on_status(state: &mut DriverState) -> bool {
     );
     if matches!(
         state.control_op_in_flight,
-        Some(ControlOpInFlight::Link { .. })
-            | Some(ControlOpInFlight::Payment { .. })
-            | Some(ControlOpInFlight::RefreshKeysets(_))
+        Some(ControlOpInFlight::Link { .. }) | Some(ControlOpInFlight::Payment { .. })
     ) {
         state.control_op_in_flight = None;
     }
     resolved_payment
-}
-
-fn clear_refresh_hint_if_advertisement_changed(state: &mut DriverState, snapshot: &RelaySnapshot) {
-    let Some(hint) = state.last_keyset_refresh_hint.as_ref() else {
-        return;
-    };
-    let current_keyset_ids = snapshot
-        .advertisements
-        .iter()
-        .find(|ad| ad.mint_url == hint.mint_url && ad.unit == hint.unit)
-        .map(|ad| &ad.keyset_ids);
-    if current_keyset_ids != Some(&hint.accepted_keyset_ids) {
-        state.last_keyset_refresh_hint = None;
-        state.last_keyset_refresh_hint_at = None;
-    }
 }
 
 pub(super) fn clear_channel_control_op(state: &mut DriverState, channel_id: &str) {
@@ -282,21 +243,17 @@ pub(super) fn exclude_channel(state: &mut DriverState, channel_id: &str) {
 pub(super) fn set_link_in_flight(
     state: &mut DriverState,
     channel_id: String,
+    keyset_id: String,
     offer: RelayPaymentOffer,
 ) {
     state.intended_channel_id = Some(channel_id.clone());
+    state.intended_channel_keyset_id = Some(keyset_id);
     state.intended_offer = Some(offer);
     state.control_op_in_flight = Some(ControlOpInFlight::Link { channel_id });
 }
 
 pub(super) fn set_payment_in_flight(state: &mut DriverState, channel_id: String) {
     state.control_op_in_flight = Some(ControlOpInFlight::Payment { channel_id });
-}
-
-pub(super) fn set_keyset_refresh_in_flight(state: &mut DriverState, hint: KeysetRefreshHint) {
-    state.last_keyset_refresh_hint = Some(hint.clone());
-    state.last_keyset_refresh_hint_at = Some(Instant::now());
-    state.control_op_in_flight = Some(ControlOpInFlight::RefreshKeysets(hint));
 }
 
 pub(super) fn clear_control_op(state: &mut DriverState) {
@@ -320,6 +277,7 @@ pub(super) async fn abandon_intended_channel(
         .detach_channel_from_session(&channel_id, config.conn.session_id);
     if state.intended_channel_id.as_deref() == Some(channel_id.as_str()) {
         state.intended_channel_id = None;
+        state.intended_channel_keyset_id = None;
         state.intended_offer = None;
     }
     clear_channel_control_op(state, &channel_id);
@@ -336,10 +294,9 @@ pub(super) async fn terminate_session(config: &SessionDriverConfig, state: &mut 
             .detach_channel_from_session(&channel_id, config.conn.session_id);
     }
     state.intended_channel_id = None;
+    state.intended_channel_keyset_id = None;
     state.intended_offer = None;
     state.control_op_in_flight = None;
-    state.last_keyset_refresh_hint = None;
-    state.last_keyset_refresh_hint_at = None;
     state.funding_blocked_reason = None;
     state.terminated = true;
     publish_spilman_info(config, state).await;
@@ -401,7 +358,6 @@ pub(super) fn pre_ready_blocked_error(
 // any link/payment operation that was waiting for the next status update.
 pub(super) fn apply_session_status(state: &mut DriverState, snapshot: RelaySnapshot) -> bool {
     let resolved_payment = clear_resolved_control_op_on_status(state);
-    clear_refresh_hint_if_advertisement_changed(state, &snapshot);
     state.relay_snapshot = Some(snapshot);
     resolved_payment
 }

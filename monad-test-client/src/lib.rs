@@ -841,6 +841,12 @@ async fn start_auto_control(
                     }
 
                     if funding.needs_channel() {
+                        let Some(negotiated_keyset_versions) =
+                            cashu_spilman_keyset_versions.as_ref()
+                        else {
+                            warn!("{hop_label}: no negotiated keyset formats");
+                            continue;
+                        };
                         let Some(advertisement) = advertisements.first() else {
                             warn!("{hop_label}: relay advertised no payment offers yet");
                             continue;
@@ -848,6 +854,7 @@ async fn start_auto_control(
                         let relay_offer = RelayPaymentOffer::from_advertisement(
                             receiver_pubkey.clone(),
                             advertisement,
+                            negotiated_keyset_versions,
                         );
                         let new_channel_id = match wallet
                             .provision_channel(&relay_offer, config.mock_channel_capacity_msats)
@@ -892,7 +899,7 @@ async fn start_auto_control(
                             mint_url: relay_offer.mint_url.clone(),
                             unit: relay_offer.unit.clone(),
                             keyset_id: relay_offer
-                                .accepted_keyset_ids
+                                .preferred_keyset_ids
                                 .first()
                                 .cloned()
                                 .unwrap_or_default(),

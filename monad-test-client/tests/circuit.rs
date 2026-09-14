@@ -1,5 +1,5 @@
 use monad_common::bootstrap::{
-    supported_cashu_spilman_keyset_versions, CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29,
+    supported_cashu_spilman_keyset_versions, CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14,
 };
 use monad_common::protocol::{ServerErrorCode, ServerMessage};
 use monad_test_client::{Circuit, CircuitConfig, RebuildAfterFailureOutcome, TestRelayHandle};
@@ -91,7 +91,7 @@ async fn circuit_publishes_negotiated_spilman_keyset_versions() {
 
     assert_eq!(
         conn.cashu_spilman_protocol_version().await.as_deref(),
-        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14)
     );
     assert_eq!(
         conn.cashu_spilman_keyset_versions().await,
@@ -104,7 +104,7 @@ async fn circuit_publishes_negotiated_spilman_keyset_versions() {
         .expect("Spilman session metadata should be published");
     assert_eq!(
         info.cashu_spilman_protocol_version.as_deref(),
-        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14)
     );
     assert_eq!(
         info.cashu_spilman_keyset_versions,

@@ -45,7 +45,7 @@ pub struct TestSigningWallet {
         SpilmanClientBridge<ConfigurableClientHost<MemoryClientStorage>, InMemoryMintNetworking>,
     >,
     mint: Arc<Mint>,
-    _sender_secret: SecretKey,
+    sender_secret: SecretKey,
     sender_pubkey_hex: String,
     receiver_pubkey_hex: String,
     mint_url: String,
@@ -80,7 +80,7 @@ impl TestSigningWallet {
         Self {
             bridge: Mutex::new(bridge),
             mint,
-            _sender_secret: sender_secret,
+            sender_secret,
             sender_pubkey_hex,
             receiver_pubkey_hex,
             mint_url,
@@ -173,7 +173,7 @@ impl TestSigningWallet {
     }
 
     pub fn sender_secret(&self) -> SecretKey {
-        self._sender_secret.clone()
+        self.sender_secret.clone()
     }
 
     pub fn forget_channel_metadata(&self, channel_id: &str) -> Result<(), String> {
@@ -254,13 +254,9 @@ impl TestSigningWallet {
         if metadata.unit != offer.unit {
             return Err(WalletError::OfferMismatch("unit mismatch".to_string()));
         }
-        if !offer
-            .accepted_keyset_ids
-            .iter()
-            .any(|keyset| keyset == &metadata.keyset_id)
-        {
+        if !offer.keyset_is_compatible(&metadata.keyset_id) {
             return Err(WalletError::OfferMismatch(
-                "keyset not accepted".to_string(),
+                "keyset format was not negotiated".to_string(),
             ));
         }
         Ok(())

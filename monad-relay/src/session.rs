@@ -225,6 +225,45 @@ impl SessionState {
         )
     }
 
+    pub(crate) async fn link_channel_with_keyset_refresh(
+        &self,
+        payment_json: &str,
+    ) -> Result<crate::payments::LinkOutcome, crate::payments::LinkError> {
+        use crate::keyset_refresh::{KeysetRefreshError, KeysetRefreshOutcome};
+        use crate::payments::LinkError;
+
+        let (mint_url, unit) = match self.link_channel(payment_json) {
+            Err(LinkError::UnknownTrustedKeyset { mint_url, unit }) => (mint_url, unit),
+            result => return result,
+        };
+        let Some(coordinator) = &self.keyset_refresh else {
+            return Err(LinkError::MintOrKeysetNotAcceptable);
+        };
+
+        info!(mint = %mint_url, unit = %unit, "refreshing unknown channel funding keyset");
+        match coordinator.refresh_mint_unit(&mint_url, &unit).await {
+            Ok(KeysetRefreshOutcome::Refreshed) => match self.link_channel(payment_json) {
+                Err(LinkError::UnknownTrustedKeyset { .. }) => {
+                    Err(LinkError::MintOrKeysetNotAcceptable)
+                }
+                result => result,
+            },
+            Ok(KeysetRefreshOutcome::SkippedCooldown) => Err(LinkError::KeysetRefreshRateLimited),
+            Err(KeysetRefreshError::Busy) => Err(LinkError::KeysetRefreshBusy),
+            Err(KeysetRefreshError::Timeout) => Err(LinkError::KeysetRefreshFailed(
+                "refresh timed out".to_string(),
+            )),
+            Err(KeysetRefreshError::RefreshFailed(message)) => {
+                Err(LinkError::KeysetRefreshFailed(message))
+            }
+            Err(
+                KeysetRefreshError::TargetTooLarge
+                | KeysetRefreshError::UntrustedMint
+                | KeysetRefreshError::UntrustedUnit,
+            ) => Err(LinkError::MintOrKeysetNotAcceptable),
+        }
+    }
+
     pub(crate) fn apply_channel_payment(
         &self,
         expected_channel_id: &str,
@@ -248,10 +287,6 @@ impl SessionState {
 
     pub(crate) fn update_pause_watch(&self, paused: bool) {
         let _ = self.pause_tx.send_replace(paused);
-    }
-
-    pub(crate) fn keyset_refresh_coordinator(&self) -> Option<Arc<RelayKeysetRefreshCoordinator>> {
-        self.keyset_refresh.clone()
     }
 
     // Billing state and status snapshots.
@@ -281,9 +316,6 @@ impl SessionState {
                         })
                     })
                     .collect();
-                if keyset_ids.is_empty() {
-                    continue;
-                }
                 advertisements.push(KeysetAdvertisement {
                     mint_url: mint_url.clone(),
                     unit: unit.clone(),
@@ -930,14 +962,6 @@ async fn handle_control_stream(
                                     )
                                     .await?;
                                 }
-                                ClientMessage::RefreshKeysets { mint_url, unit } => {
-                                    terminate_session = process_session_event(
-                                        &state,
-                                        SessionEvent::ClientRefreshKeysets { mint_url, unit },
-                                        &mut h2_send,
-                                    )
-                                    .await?;
-                                }
                             }
 
                             if terminate_session {
@@ -1009,7 +1033,7 @@ mod tests {
     use crate::listener::{shared_spilman_mint_cache, CachedKeyset, SpilmanMintCache};
     use crate::payments::{testing::InMemoryRelayPayments, LinkError};
     use monad_common::bootstrap::{
-        supported_cashu_spilman_keyset_versions, CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29,
+        supported_cashu_spilman_keyset_versions, CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14,
     };
     use std::collections::BTreeMap;
 
@@ -1029,7 +1053,7 @@ mod tests {
                 )]),
                 keyset_refresh: None,
                 cashu_spilman_protocol_version: Some(
-                    CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                    CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
                 ),
                 cashu_spilman_keyset_versions: Some(BTreeSet::from(["v1".to_string()])),
                 in_bytes_per_millisat: 1,
@@ -1040,7 +1064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_filters_versions_and_rechecks_refreshed_cache() {
+    async fn status_filters_versions_but_advertises_empty_preference_lists() {
         let (mut state, _) = test_state();
         let v1 = "0000000000000001".to_string();
         let inactive = "0000000000000002".to_string();
@@ -1107,7 +1131,8 @@ mod tests {
         else {
             panic!()
         };
-        assert!(advertisements.is_empty());
+        assert_eq!(advertisements.len(), 1);
+        assert!(advertisements[0].keyset_ids.is_empty());
         assert_eq!(
             state
                 .spilman_mint_cache

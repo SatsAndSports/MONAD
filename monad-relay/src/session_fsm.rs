@@ -19,7 +19,6 @@ pub(crate) enum SessionEvent {
     LinkValidationFinished(Result<LinkOutcome, LinkError>),
     ClientChannelPayment { payment_json: String },
     PaymentValidationFinished(Result<PaymentOutcome, ChannelPaymentError>),
-    ClientRefreshKeysets { mint_url: String, unit: String },
     ChannelEvicted { channel_id: String },
     ControlDetached,
 }
@@ -34,10 +33,6 @@ pub(crate) enum SessionEffect {
     RunPaymentValidation {
         expected_channel_id: String,
         payment_json: String,
-    },
-    RunKeysetRefresh {
-        mint_url: String,
-        unit: String,
     },
     NotifySessionEvicted {
         target_session_id: [u8; 32],
@@ -69,9 +64,6 @@ pub(crate) fn step(
         SessionEvent::ClientGetSessionStatus => vec![SessionEffect::SendStatus],
         SessionEvent::ClientChannelLink { payment_json } => {
             vec![SessionEffect::RunLinkValidation { payment_json }]
-        }
-        SessionEvent::ClientRefreshKeysets { mint_url, unit } => {
-            vec![SessionEffect::RunKeysetRefresh { mint_url, unit }]
         }
         SessionEvent::LinkValidationFinished(result) => match result {
             Ok(outcome) => {

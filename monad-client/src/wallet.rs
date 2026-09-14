@@ -5,7 +5,7 @@ use monad_common::payment_units::{
 use monad_common::protocol::KeysetAdvertisement;
 use rand::RngCore;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::sync::Mutex;
@@ -15,7 +15,8 @@ pub struct RelayPaymentOffer {
     pub receiver_pubkey: String,
     pub mint_url: String,
     pub unit: String,
-    pub accepted_keyset_ids: Vec<String>,
+    pub preferred_keyset_ids: Vec<String>,
+    pub negotiated_keyset_versions: BTreeSet<String>,
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
 }
@@ -24,15 +25,38 @@ impl RelayPaymentOffer {
     pub fn from_advertisement(
         receiver_pubkey: String,
         advertisement: &KeysetAdvertisement,
+        negotiated_keyset_versions: &BTreeSet<String>,
     ) -> Self {
         Self {
             receiver_pubkey,
             mint_url: advertisement.mint_url.clone(),
             unit: advertisement.unit.clone(),
-            accepted_keyset_ids: advertisement.keyset_ids.clone(),
+            preferred_keyset_ids: advertisement.keyset_ids.clone(),
+            negotiated_keyset_versions: negotiated_keyset_versions.clone(),
             in_bytes_per_millisat: advertisement.in_bytes_per_millisat,
             out_bytes_per_millisat: advertisement.out_bytes_per_millisat,
         }
+    }
+
+    pub fn keyset_is_compatible(&self, keyset_id: &str) -> bool {
+        let Ok(id) = keyset_id.parse::<cashu::nuts::Id>() else {
+            return false;
+        };
+        match id.get_version() {
+            cashu::nuts::nut02::KeySetVersion::Version00 => {
+                self.negotiated_keyset_versions.contains("v1")
+            }
+            cashu::nuts::nut02::KeySetVersion::Version01 => {
+                self.negotiated_keyset_versions.contains("v2")
+            }
+        }
+    }
+
+    fn preference_rank(&self, keyset_id: &str) -> usize {
+        self.preferred_keyset_ids
+            .iter()
+            .position(|preferred| preferred == keyset_id)
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -77,10 +101,20 @@ pub enum WalletError {
     NoNewFunds,
     ChannelUnusable,
     OfferMismatch(String),
-    StaleRelayKeysets {
+    NoCompatibleActiveKeyset {
         mint_url: String,
         unit: String,
-        accepted_keyset_ids: Vec<String>,
+    },
+    InsufficientLooseProofFunds {
+        mint_url: String,
+        unit: String,
+        requested_raw: u64,
+        available_raw: u64,
+    },
+    ProvisioningOfferUnavailable {
+        mint_url: String,
+        unit: String,
+        reason: String,
     },
     Backend(String),
 }
@@ -103,13 +137,26 @@ impl fmt::Display for WalletError {
             Self::NoNewFunds => write!(f, "no new funds"),
             Self::ChannelUnusable => write!(f, "channel unusable"),
             Self::OfferMismatch(message) => write!(f, "offer mismatch: {message}"),
-            Self::StaleRelayKeysets {
+            Self::NoCompatibleActiveKeyset { mint_url, unit } => write!(
+                f,
+                "no compatible active keyset for mint={mint_url} unit={unit}"
+            ),
+            Self::InsufficientLooseProofFunds {
                 mint_url,
                 unit,
-                accepted_keyset_ids,
+                requested_raw,
+                available_raw,
             } => write!(
                 f,
-                "stale relay keysets for mint={mint_url} unit={unit} accepted_keysets={accepted_keyset_ids:?}"
+                "insufficient loose proofs for mint={mint_url} unit={unit}: requested={requested_raw} available={available_raw}"
+            ),
+            Self::ProvisioningOfferUnavailable {
+                mint_url,
+                unit,
+                reason,
+            } => write!(
+                f,
+                "provisioning offer unavailable for mint={mint_url} unit={unit}: {reason}"
             ),
             Self::Backend(message) => write!(f, "backend error: {message}"),
         }
@@ -188,10 +235,7 @@ pub fn select_channel(
         if channel.receiver_pubkey != offer.receiver_pubkey
             || channel.mint_url != offer.mint_url
             || channel.unit != offer.unit
-            || !offer
-                .accepted_keyset_ids
-                .iter()
-                .any(|id| id == &channel.keyset_id)
+            || !offer.keyset_is_compatible(&channel.keyset_id)
         {
             continue;
         }
@@ -203,8 +247,14 @@ pub fn select_channel(
         }
     }
 
-    unattached.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
-    same_session.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
+    let order = |a: &WalletChannel, b: &WalletChannel| {
+        offer
+            .preference_rank(&a.keyset_id)
+            .cmp(&offer.preference_rank(&b.keyset_id))
+            .then_with(|| a.channel_id.cmp(&b.channel_id))
+    };
+    unattached.sort_by(order);
+    same_session.sort_by(order);
 
     unattached
         .into_iter()
@@ -527,9 +577,17 @@ impl MonadWallet for MockWallet {
                 break candidate;
             }
         };
-        let keyset_id = offer.accepted_keyset_ids.first().cloned().ok_or_else(|| {
-            WalletError::OfferMismatch("offer has no accepted keysets".to_string())
+        let keyset_id = offer.preferred_keyset_ids.first().cloned().ok_or_else(|| {
+            WalletError::NoCompatibleActiveKeyset {
+                mint_url: offer.mint_url.clone(),
+                unit: offer.unit.clone(),
+            }
         })?;
+        if !offer.keyset_is_compatible(&keyset_id) {
+            return Err(WalletError::OfferMismatch(
+                "preferred keyset format was not negotiated".to_string(),
+            ));
+        }
         let channel = WalletChannel {
             channel_id: channel_id.clone(),
             state: WalletChannelState::Open,
@@ -681,13 +739,9 @@ fn ensure_channel_matches_offer(
     if channel.unit != offer.unit {
         return Err(WalletError::OfferMismatch("unit mismatch".to_string()));
     }
-    if !offer
-        .accepted_keyset_ids
-        .iter()
-        .any(|keyset| keyset == &channel.keyset_id)
-    {
+    if !offer.keyset_is_compatible(&channel.keyset_id) {
         return Err(WalletError::OfferMismatch(
-            "keyset not accepted".to_string(),
+            "keyset format was not negotiated".to_string(),
         ));
     }
     Ok(())
@@ -728,7 +782,11 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: "https://mint".to_string(),
             unit: unit.to_string(),
-            accepted_keyset_ids: vec!["keyset-a".to_string(), "keyset-b".to_string()],
+            preferred_keyset_ids: vec![
+                "0000000000000001".to_string(),
+                "0000000000000002".to_string(),
+            ],
+            negotiated_keyset_versions: BTreeSet::from(["v1".to_string()]),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         }
@@ -741,7 +799,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: "https://mint".to_string(),
             unit: "msat".to_string(),
-            keyset_id: "keyset-a".to_string(),
+            keyset_id: "0000000000000001".to_string(),
             attached_session_id: None,
             capacity_msats: 10_000,
             current_signed_balance_msats: 0,
@@ -785,7 +843,45 @@ mod tests {
     }
 
     #[test]
-    fn selector_excludes_wrong_offer_and_non_open_channels() {
+    fn selector_prefers_advertised_keyset_within_attachment_category() {
+        let chosen = select_channel(
+            &[
+                WalletChannel {
+                    keyset_id: "0000000000000002".to_string(),
+                    ..channel("chan-z")
+                },
+                channel("chan-a"),
+            ],
+            &RelayPaymentOffer {
+                preferred_keyset_ids: vec!["0000000000000002".to_string()],
+                ..offer("msat")
+            },
+            session(1),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(chosen.channel_id, "chan-z");
+    }
+
+    #[test]
+    fn selector_allows_compatible_non_preferred_keyset() {
+        let chosen = select_channel(
+            &[channel("chan-a")],
+            &RelayPaymentOffer {
+                preferred_keyset_ids: Vec::new(),
+                ..offer("msat")
+            },
+            session(1),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(chosen.channel_id, "chan-a");
+    }
+
+    #[test]
+    fn selector_excludes_invalid_keyset_and_non_open_channels() {
         let chosen = select_channel(
             &[
                 WalletChannel {
@@ -980,7 +1076,7 @@ mod tests {
         assert_eq!(channel.receiver_pubkey, "receiver");
         assert_eq!(channel.mint_url, "https://mint");
         assert_eq!(channel.unit, "sat");
-        assert_eq!(channel.keyset_id, "keyset-a");
+        assert_eq!(channel.keyset_id, "0000000000000001");
         assert_eq!(channel.capacity_msats, 12_000);
     }
 }

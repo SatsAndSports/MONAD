@@ -704,6 +704,7 @@ async fn start_huge_funding_control(
                         offer = Some(RelayPaymentOffer::from_advertisement(
                             receiver_pubkey.clone(),
                             advertisement,
+                            &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                         ));
                     }
 

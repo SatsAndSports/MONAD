@@ -6,7 +6,6 @@ session-funding implementation.
 Use it together with:
 
 - `ARCHITECTURE.md` for protocol and lifecycle overview
-- `WALLET.md` for wallet/backend responsibilities
 
 ## Canonical Code Paths
 
@@ -92,10 +91,13 @@ from that cache, not when storing it.
 
 Consequences:
 
-- `SessionStatus` advertises only configured trusted mint/unit options.
-- `ChannelLink` / `ChannelPayment` accept only known keysets that belong to a trusted unit for that mint.
-- old inactive keysets can remain usable for existing channels as long as the keyset metadata is known.
-- channel close and relay drain swaps start from the shared cache and refresh that mint into SQLite and memory only if the mint rejects the swap with a keyset error.
+- `SessionStatus` advertises configured trusted mint/unit options in relay preference order. Each ordered relay-known keyset list may be empty and is not an exhaustive accepted-ID allowlist.
+- the client prefers advertised active IDs, but may use another locally active keyset for the same mint/unit when its format was negotiated. When nonempty preferences are unavailable locally, it refreshes its own mint cache before using a fallback; it also refreshes before reporting that no compatible active keyset exists.
+- first-time `ChannelLink` accepts known keysets that belong to a trusted unit for that mint. If such a keyset is unknown, the relay first performs metadata-independent channel and proof-structure checks, then transparently uses its bounded refresh coordinator and retries the immutable link once.
+- stored channels relink using persisted funding without requiring current keyset metadata.
+- channel close and relay drain swaps start from the shared cache and refresh that mint into SQLite and memory for missing-cache warmup or if the mint rejects the swap with a keyset error.
+
+There is no explicit client-requested relay refresh operation. Automatic link refresh permits one actual mint attempt per cooldown regardless of outcome and shares an in-flight attempt across sessions. A fresh response that still lacks the keyset is a permanent rejection. Cooldown, global saturation, timeout, and fetch failure produce transient link errors; the client keeps the intended channel and retries with backoff. Stored channel relinks use persisted funding and do not refresh. Startup discovery and the existing close/drain keyset-error refresh paths remain unchanged.
 
 This cache-first, single-refresh retry shape is the shared model for relay close
 and drain swaps.
@@ -156,6 +158,15 @@ allowance in that live opening.
 Input proof keysets are independent from the selected output funding keyset:
 input proofs may be old, inactive, or mixed-keyset proofs as long as the mint
 accepts them and fee metadata is known.
+
+When a session needs a new channel, it considers relay-advertised mint/unit
+offers in order. It may continue to a later offer only after an explicitly safe,
+offer-local result: no compatible active keyset, insufficient loose proofs for
+that offer, or a preparation failure before the atomic reservation/journal
+boundary. Reservation, persistence, and ambiguous submission failures stop the
+pass because the selected inputs may require recovery. If every offer is safely
+unavailable before initial session readiness, funding remains blocked; after
+readiness, the driver retries using its normal funding backoff.
 
 ## Funding Lifecycle
 

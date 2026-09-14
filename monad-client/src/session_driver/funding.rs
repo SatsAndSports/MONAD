@@ -1,14 +1,17 @@
 use bytes::Bytes;
 use monad_common::control_codec::send_json_line;
-use monad_common::protocol::{ClientMessage, ServerErrorCode};
+use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerErrorCode};
+use std::collections::BTreeSet;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::wallet::{select_channel, RelayPaymentOffer, WalletChannel, WalletError};
 
-pub(super) const KEYSET_REFRESH_HINT_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+pub(super) const LINK_REFRESH_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+pub(super) const LINK_REFRESH_BUSY_RETRY_DELAY: Duration = Duration::from_secs(1);
+pub(super) const LOCAL_KEYSET_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
 use super::payment::{
     compute_estimated_remaining, exclude_on_wallet_error, plan_payment_topup, raw_amount_to_msats,
@@ -17,9 +20,8 @@ use super::payment::{
 use super::state::{
     abandon_intended_channel, clear_control_op, exclude_channel, publish_spilman_info,
     relay_confirms_intended_channel, relay_linked_channel_id, session_is_paused,
-    set_blocked_reason, set_keyset_refresh_in_flight, set_link_in_flight, set_payment_in_flight,
-    state_summary, terminate_session, ControlOpInFlight, DriverState, FundingBlockedReason,
-    KeysetRefreshHint, SessionDriverConfig,
+    set_blocked_reason, set_link_in_flight, set_payment_in_flight, state_summary,
+    terminate_session, ControlOpInFlight, DriverState, FundingBlockedReason, SessionDriverConfig,
 };
 
 pub(super) async fn send_control_message(
@@ -37,6 +39,13 @@ fn choose_channel_and_offer(
     let Some(snapshot) = state.relay_snapshot.as_ref() else {
         return Ok(None);
     };
+    let Some(versions) = state
+        .cashu_spilman_keyset_versions
+        .as_ref()
+        .filter(|versions| !versions.is_empty())
+    else {
+        return Ok(None);
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -51,8 +60,11 @@ fn choose_channel_and_offer(
         })
         .collect::<Vec<_>>();
     for advertisement in &snapshot.advertisements {
-        let offer =
-            RelayPaymentOffer::from_advertisement(snapshot.receiver_pubkey.clone(), advertisement);
+        let offer = RelayPaymentOffer::from_advertisement(
+            snapshot.receiver_pubkey.clone(),
+            advertisement,
+            versions,
+        );
         if let Some(channel) = select_channel(&channels, &offer, session_id, now) {
             return Ok(Some((channel, offer)));
         }
@@ -60,14 +72,55 @@ fn choose_channel_and_offer(
     Ok(None)
 }
 
+fn provisioning_offer_is_unavailable(error: &WalletError) -> bool {
+    // These are the wallet's explicitly safe offer-local outcomes. Generic
+    // backend failures can follow a reservation or ambiguous submission, so they
+    // must stop traversal rather than funding a different offer.
+    matches!(
+        error,
+        WalletError::NoCompatibleActiveKeyset { .. }
+            | WalletError::InsufficientLooseProofFunds { .. }
+            | WalletError::ProvisioningOfferUnavailable { .. }
+    )
+}
+
+fn provision_from_advertisements<F>(
+    receiver_pubkey: &str,
+    advertisements: &[KeysetAdvertisement],
+    versions: &BTreeSet<String>,
+    mut provision: F,
+) -> Result<Option<(String, RelayPaymentOffer)>, WalletError>
+where
+    F: FnMut(&RelayPaymentOffer) -> Result<String, WalletError>,
+{
+    let mut unavailable = None;
+    for advertisement in advertisements {
+        let offer = RelayPaymentOffer::from_advertisement(
+            receiver_pubkey.to_string(),
+            advertisement,
+            versions,
+        );
+        match provision(&offer) {
+            Ok(channel_id) => return Ok(Some((channel_id, offer))),
+            Err(error) if provisioning_offer_is_unavailable(&error) => unavailable = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    match unavailable {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
 async fn send_channel_link(
     config: &SessionDriverConfig,
     state: &mut DriverState,
     h2_send: &mut h2::SendStream<Bytes>,
-    channel_id: String,
+    channel: WalletChannel,
     offer: RelayPaymentOffer,
     payment_json: String,
 ) -> io::Result<()> {
+    let channel_id = channel.channel_id.clone();
     info!(
         "{} sending ChannelLink for {} | {}",
         config.hop_label,
@@ -75,7 +128,8 @@ async fn send_channel_link(
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
     send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await?;
-    set_link_in_flight(state, channel_id, offer);
+    set_link_in_flight(state, channel_id, channel.keyset_id, offer);
+    publish_spilman_info(config, state).await;
     Ok(())
 }
 
@@ -108,7 +162,7 @@ async fn try_link_channel(
 
     match config.wallet.build_link_request(&channel_id, &offer) {
         Ok(payment_json) => {
-            send_channel_link(config, state, h2_send, channel_id, offer, payment_json).await?;
+            send_channel_link(config, state, h2_send, channel, offer, payment_json).await?;
             Ok(false)
         }
         Err(error) => {
@@ -132,56 +186,6 @@ async fn try_link_channel(
     }
 }
 
-async fn maybe_request_keyset_refresh(
-    config: &SessionDriverConfig,
-    state: &mut DriverState,
-    h2_send: &mut h2::SendStream<Bytes>,
-    offer: &RelayPaymentOffer,
-    error: &WalletError,
-) -> io::Result<bool> {
-    let WalletError::StaleRelayKeysets {
-        mint_url,
-        unit,
-        accepted_keyset_ids,
-    } = error
-    else {
-        return Ok(false);
-    };
-    let hint = KeysetRefreshHint::from_offer(offer);
-    if keyset_refresh_hint_is_suppressed(state, &hint) {
-        return Ok(true);
-    }
-
-    info!(
-        "{} requesting relay keyset refresh for mint={} unit={} accepted_keysets={:?} | {}",
-        config.hop_label,
-        mint_url,
-        unit,
-        accepted_keyset_ids,
-        state_summary(state, &config.conn.cleartext_byte_counters)
-    );
-    send_control_message(
-        h2_send,
-        &ClientMessage::RefreshKeysets {
-            mint_url: mint_url.clone(),
-            unit: unit.clone(),
-        },
-    )
-    .await?;
-    set_keyset_refresh_in_flight(state, hint);
-    Ok(true)
-}
-
-pub(super) fn keyset_refresh_hint_is_suppressed(
-    state: &DriverState,
-    hint: &KeysetRefreshHint,
-) -> bool {
-    state.last_keyset_refresh_hint.as_ref() == Some(hint)
-        && state
-            .last_keyset_refresh_hint_at
-            .is_some_and(|at| at.elapsed() < KEYSET_REFRESH_HINT_RETRY_COOLDOWN)
-}
-
 pub(super) async fn maybe_ensure_linked_channel(
     config: &SessionDriverConfig,
     state: &mut DriverState,
@@ -190,6 +194,14 @@ pub(super) async fn maybe_ensure_linked_channel(
     if state.terminated || state.funding_blocked_reason.is_some() || !session_is_paused(state) {
         return Ok(());
     }
+    let Some(versions) = state
+        .cashu_spilman_keyset_versions
+        .as_ref()
+        .filter(|versions| !versions.is_empty())
+        .cloned()
+    else {
+        return Ok(());
+    };
     if state.control_op_in_flight.is_some() {
         return Ok(());
     }
@@ -202,6 +214,13 @@ pub(super) async fn maybe_ensure_linked_channel(
         );
         return Ok(());
     }
+    if state
+        .funding_retry_not_before
+        .is_some_and(|deadline| Instant::now() < deadline)
+    {
+        return Ok(());
+    }
+    state.funding_retry_not_before = None;
 
     if let Some(intended_channel_id) = state.intended_channel_id.as_deref() {
         let relay_linked = relay_linked_channel_id(state).unwrap_or("none");
@@ -270,36 +289,58 @@ pub(super) async fn maybe_ensure_linked_channel(
                 }
             }
             Ok(None) => {
-                let Some(snapshot) = state.relay_snapshot.as_ref() else {
+                let Some((receiver_pubkey, advertisements)) =
+                    state.relay_snapshot.as_ref().map(|snapshot| {
+                        (
+                            snapshot.receiver_pubkey.clone(),
+                            snapshot.advertisements.clone(),
+                        )
+                    })
+                else {
                     return Ok(());
                 };
-                let Some(advertisement) = snapshot.advertisements.first() else {
-                    return Ok(());
-                };
-                let offer = RelayPaymentOffer::from_advertisement(
-                    snapshot.receiver_pubkey.clone(),
-                    advertisement,
+                let selected = provision_from_advertisements(
+                    &receiver_pubkey,
+                    &advertisements,
+                    &versions,
+                    |offer| {
+                        info!(
+                            "{} provisioning new channel for mint={} unit={} | {}",
+                            config.hop_label,
+                            offer.mint_url,
+                            offer.unit,
+                            state_summary(state, &config.conn.cleartext_byte_counters)
+                        );
+                        config.wallet.provision_channel(
+                            offer,
+                            config.payment_policy.channel_input_budget_msats,
+                        )
+                    },
                 );
-                let keyset_refresh_hint = KeysetRefreshHint::from_offer(&offer);
-                if keyset_refresh_hint_is_suppressed(state, &keyset_refresh_hint) {
-                    return Ok(());
-                }
-                info!(
-                    "{} provisioning new channel from first advertisement | {}",
-                    config.hop_label,
-                    state_summary(state, &config.conn.cleartext_byte_counters)
-                );
-                let channel_id = match config
-                    .wallet
-                    .provision_channel(&offer, config.payment_policy.channel_input_budget_msats)
-                {
-                    Ok(channel_id) => channel_id,
-                    Err(error) => {
-                        if maybe_request_keyset_refresh(config, state, h2_send, &offer, &error)
-                            .await?
-                        {
-                            return Ok(());
+                let (channel_id, offer) = match selected {
+                    Ok(Some(selected)) => selected,
+                    Ok(None) => return Ok(()),
+                    Err(error) if provisioning_offer_is_unavailable(&error) => {
+                        if state.ready_signaled {
+                            warn!(
+                                "{} deferring funding after advertised offers were unavailable: {} | {}",
+                                config.hop_label,
+                                error,
+                                state_summary(state, &config.conn.cleartext_byte_counters)
+                            );
+                            state.funding_retry_not_before =
+                                Some(Instant::now() + LOCAL_KEYSET_RETRY_COOLDOWN);
+                        } else {
+                            set_blocked_reason(
+                                config,
+                                state,
+                                FundingBlockedReason::ChannelAcquire,
+                                &error.to_string(),
+                            )?;
                         }
+                        return Ok(());
+                    }
+                    Err(error) => {
                         if matches!(error, WalletError::Backend(_)) {
                             set_blocked_reason(
                                 config,
@@ -519,6 +560,11 @@ pub(super) async fn apply_server_error(
 ) {
     clear_control_op(state);
 
+    if defer_link_after_refresh_error(state, &code, Instant::now()) {
+        publish_spilman_info(config, state).await;
+        return;
+    }
+
     if server_error_rejects_intended_channel(&code) {
         if let Some(channel_id) = state.intended_channel_id.clone() {
             if server_error_invalidates_channel(&code) {
@@ -534,6 +580,96 @@ pub(super) async fn apply_server_error(
     publish_spilman_info(config, state).await;
 }
 
+pub(super) fn link_refresh_retry_delay(code: &ServerErrorCode) -> Option<Duration> {
+    match code {
+        ServerErrorCode::LinkKeysetRefreshRateLimited
+        | ServerErrorCode::LinkKeysetRefreshFailed => Some(LINK_REFRESH_RETRY_COOLDOWN),
+        ServerErrorCode::LinkKeysetRefreshBusy => Some(LINK_REFRESH_BUSY_RETRY_DELAY),
+        _ => None,
+    }
+}
+
+pub(super) fn defer_link_after_refresh_error(
+    state: &mut DriverState,
+    code: &ServerErrorCode,
+    now: Instant,
+) -> bool {
+    let Some(delay) = link_refresh_retry_delay(code) else {
+        return false;
+    };
+    state.funding_retry_not_before = Some(now + delay);
+    true
+}
+
 pub(super) async fn handle_control_detached(config: &SessionDriverConfig, state: &mut DriverState) {
     terminate_session(config, state).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn advertisement(mint_url: &str) -> KeysetAdvertisement {
+        KeysetAdvertisement {
+            mint_url: mint_url.to_string(),
+            unit: "sat".to_string(),
+            keyset_ids: Vec::new(),
+            in_bytes_per_millisat: 1,
+            out_bytes_per_millisat: 1,
+        }
+    }
+
+    #[test]
+    fn provisioning_tries_later_offer_after_preflight_insufficient_funds() {
+        let advertisements = [
+            advertisement("https://mint-a"),
+            advertisement("https://mint-b"),
+        ];
+        let versions = BTreeSet::from(["v2".to_string()]);
+        let mut attempted = Vec::new();
+
+        let selected =
+            provision_from_advertisements("receiver", &advertisements, &versions, |offer| {
+                attempted.push(offer.mint_url.clone());
+                if offer.mint_url == "https://mint-a" {
+                    Err(WalletError::InsufficientLooseProofFunds {
+                        mint_url: offer.mint_url.clone(),
+                        unit: offer.unit.clone(),
+                        requested_raw: 10,
+                        available_raw: 5,
+                    })
+                } else {
+                    Ok("channel-b".to_string())
+                }
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(attempted, ["https://mint-a", "https://mint-b"]);
+        assert_eq!(selected.0, "channel-b");
+        assert_eq!(selected.1.mint_url, "https://mint-b");
+    }
+
+    #[test]
+    fn provisioning_does_not_try_later_offer_after_ambiguous_error() {
+        let advertisements = [
+            advertisement("https://mint-a"),
+            advertisement("https://mint-b"),
+        ];
+        let versions = BTreeSet::from(["v2".to_string()]);
+        let mut attempted = Vec::new();
+
+        let error =
+            provision_from_advertisements("receiver", &advertisements, &versions, |offer| {
+                attempted.push(offer.mint_url.clone());
+                Err(WalletError::Backend("input may be spent".to_string()))
+            })
+            .unwrap_err();
+
+        assert_eq!(attempted, ["https://mint-a"]);
+        assert_eq!(
+            error,
+            WalletError::Backend("input may be spent".to_string())
+        );
+    }
 }

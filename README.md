@@ -19,9 +19,9 @@ Implemented today:
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
 - `monad-test-client`: localhost SOCKS5/manual test harness for mocked relay funding, circuit rebuild testing, and daily-driver browser/SSH experiments
 - QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, configured client routes, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
-- Noise-payload bootstrap: MONAD uses the Noise `NK` pattern over secp256k1 with ChaCha20-Poly1305 and BLAKE2s; the client maps each supported Cashu Spilman channel protocol version to its supported keyset-format versions in the first handshake payload, and the relay selects one protocol plus the full mutual keyset-format set before H2 starts. Today `2026-08-29` supports `v1` and `v2` and requires a nonempty intersection, alongside `h2` and `session_constant` pricing
+- Noise-payload bootstrap: MONAD uses the Noise `NK` pattern over secp256k1 with ChaCha20-Poly1305 and BLAKE2s; the client maps each supported Cashu Spilman channel protocol version to its supported keyset-format versions in the first handshake payload, and the relay selects one protocol plus the full mutual keyset-format set before H2 starts. Today `2026-09-14` supports `v1` and `v2` and requires a nonempty intersection, alongside `h2` and `session_constant` pricing
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
-- session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, `RefreshKeysets`, and `ChannelEvicted`
+- session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, `ChannelLink`, `ChannelPayment`, and `ChannelEvicted`
 - relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - in-process relay wallet manager: multiple hosted relays can share one SQLite-backed relay wallet database while keeping distinct Cashu receiver keys / wallet names
@@ -30,7 +30,7 @@ Implemented today:
 - blinded-hop routing over QUIC: `CONNECT blinded.monad.invalid:443`, tweak-prefixed QUIC forwarded sessions, `RouteHop` / `Route` connector support, public-key-only blinded-path construction, and parity-aware reverse-tweak key recovery for MONAD's x-only secp256k1 identity model
 - integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
 
-Production clients offer both `v1` (keyset IDs starting with `00`) and `v2` (`01`). Relays advertise only keysets compatible with the session's negotiated set, including compatible inactive keysets for existing channels. Linking a channel funded by an unnegotiated version returns `LinkKeysetVersionNotNegotiated` and ends that MONAD session, not the shared QUIC connection. The client keeps the channel usable for a compatible session; loose input proofs are not restricted by this negotiation.
+Production clients offer both `v1` (keyset IDs starting with `00`) and `v2` (`01`). For each trusted mint/unit, relays advertise an ordered list of relay-known preferred keysets compatible with the session's negotiated set. The list may be empty and may include compatible inactive keysets; it is not an exhaustive accepted-ID allowlist. Clients prefer an advertised active ID, but may use another locally active keyset with a negotiated format. Linking a channel funded by an unnegotiated version returns `LinkKeysetVersionNotNegotiated` and ends that MONAD session, not the shared QUIC connection. The client keeps the channel usable for a compatible session; loose input proofs are not restricted by this negotiation.
 
 Not implemented yet:
 - user-facing client wallet commands for mint quotes, proof minting, and richer balances
@@ -128,7 +128,7 @@ client with `monad-client run --config monad.yaml --client <name>`.
 - `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata including expiry timestamps in SQLite, and implements `MonadWallet` for the session driver.
 - channel opening atomically reserves its loose proofs and journals the exact prepared swap before submission. Live ambiguous submissions restore their exact funding/change outputs through NUT-09; a valid empty funding restore plus every exact input `UNSPENT` permits one byte-identical replay, with at most one successor after an explicit `12002` rejection.
 - configured-client startup and manual `recover-openings` never submit opening swaps. They finish restored or finalizing channels, cancel prepared attempts and rejected attempts without successors, and abandon submitted attempts only after valid empty funding restore plus complete exact-input `UNSPENT` evidence. Abandonment atomically releases the reservation and retains a journal record with reason/time. Ambiguous, partial, invalid, pending, spent, or unavailable evidence keeps inputs reserved. Abandoned attempts are never automatically rechecked. Recovery reports distinguish recovered, cancelled, abandoned, and unresolved attempts (including reasons for unresolved attempts in JSON and CLI output).
-- output keyset handling is cache-first: channel opening selects an active client output keyset that intersects with the relay offer. An explicit inactive-output-keyset rejection (`12002`) may create one persisted successor using a changed active keyset; ambiguous errors never trigger another swap submission.
+- output keyset handling is cache-first: channel opening prefers an advertised active keyset, then falls back to another locally active same-mint/unit keyset with a negotiated format. When preferences are nonempty but unavailable locally, the client refreshes its own mint cache before using a non-preferred fallback; it also refreshes before concluding that no compatible active keyset exists. An explicit inactive-output-keyset rejection (`12002`) may create one persisted successor using a changed active keyset; ambiguous errors never trigger another swap submission.
 
 `client_wallet.channel_input_budget_msats` controls the loose-proof input budget for each newly provisioned channel. It is not a guaranteed channel capacity; fees and deterministic channel outputs can make the resulting capacity lower. The default is `1000000` msats.
 
@@ -240,7 +240,7 @@ The throughput/payment stress recipes expect a high `ulimit -n` and are intended
 Ignored but important regression tests can be run explicitly when changing route rebuild or keyset-refresh behavior:
 
 ```bash
-cargo test -p monad-relay test_configured_client_three_hop_middle_hop_keyset_rotation_triggers_relay_refresh_for_stale_offer --test integration -- --ignored
+cargo test -p monad-relay test_configured_client_three_hop_middle_rotation_refreshes_relay_on_channel_link --test integration -- --ignored
 ```
 
 Current coverage includes:
@@ -285,11 +285,11 @@ Current coverage includes:
 
 ### Relay Keyset Handling
 
-Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy only when advertising options or accepting incoming channel funding/payments.
+Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy only when advertising options or accepting incoming channel funding/payments. Every configured trusted mint/unit remains an advertisement even when its ordered relay-known preference list is empty.
 
-Clients can send `RefreshKeysets { mint_url, unit }` on the control stream when they suspect a relay's advertised keysets are stale, such as after mint keyset rotation. Configured clients do this automatically when their refreshed local mint cache has no active output keyset accepted by the relay's current advertisement. The relay treats this as a bounded hint: it only refreshes configured trusted mint/unit pairs, applies per-mint cooldown and singleflight protection, limits global refresh concurrency, times out slow mint calls, and responds with a fresh `SessionStatus` on success or cooldown skip. Policy rejection or refresh failure returns `Error` and preserves the existing cache.
+When a first-time `ChannelLink` uses an unknown keyset for a configured trusted mint/unit, the relay performs metadata-independent structural checks, transparently invokes its bounded refresh coordinator, and retries the immutable link once. A successful refresh that still does not know the keyset produces a permanent `LinkMintOrKeysetUnacceptable` rejection. If cooldown, global refresh saturation, timeout, or mint failure prevents a fresh decision, the relay returns a specific transient link error and the configured client preserves the channel and retries with backoff.
 
-Existing old-keyset channels keep working as long as the relay still knows the keyset and the mint/unit remains trusted. New channel opening should move to the currently active keyset once the client and relay have refreshed. Channel close and relay drain swaps also start from the shared cache; if the mint rejects a swap with a keyset error, the retry path refreshes that mint into SQLite and the shared cache before re-preparing the swap.
+There is no client-requested relay refresh operation. Automatic first-link refresh is limited to configured trusted mint/unit pairs: each mint gets at most one actual attempt per cooldown regardless of outcome, concurrent same-mint links share one cancellation-safe attempt, cross-mint saturation fails fast, and mint I/O has a timeout. Existing stored channels relink from authoritative persisted funding without requiring the current cache or triggering refresh. Startup discovery still populates the cache, and channel close and relay drain swaps still refresh that mint into SQLite and the shared cache when a mint keyset error requires one bounded retry.
 
 ## Payment Code Map
 
@@ -305,9 +305,8 @@ Shared protocol helpers used by client, relay, and harness code live in:
 - `monad-common/src/control_codec.rs` for newline-delimited control messages
 - `monad-common/src/payment_units.rs` for `msat` / `sat` raw-unit conversion
 
-For maintainers, the most focused reference is `docs/payments.md`. `ARCHITECTURE.md`
-stays the higher-level protocol overview, and `WALLET.md` covers wallet/backend
-responsibilities.
+For maintainers, the most focused reference is `docs/payments.md`; `ARCHITECTURE.md`
+stays the higher-level protocol overview.
 
 ## Transport Identities
 
