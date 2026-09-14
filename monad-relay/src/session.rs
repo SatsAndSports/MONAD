@@ -225,6 +225,45 @@ impl SessionState {
         )
     }
 
+    pub(crate) async fn link_channel_with_keyset_refresh(
+        &self,
+        payment_json: &str,
+    ) -> Result<crate::payments::LinkOutcome, crate::payments::LinkError> {
+        use crate::keyset_refresh::{KeysetRefreshError, KeysetRefreshOutcome};
+        use crate::payments::LinkError;
+
+        let (mint_url, unit) = match self.link_channel(payment_json) {
+            Err(LinkError::UnknownTrustedKeyset { mint_url, unit }) => (mint_url, unit),
+            result => return result,
+        };
+        let Some(coordinator) = &self.keyset_refresh else {
+            return Err(LinkError::MintOrKeysetNotAcceptable);
+        };
+
+        info!(mint = %mint_url, unit = %unit, "refreshing unknown channel funding keyset");
+        match coordinator.refresh_mint_unit(&mint_url, &unit).await {
+            Ok(KeysetRefreshOutcome::Refreshed) => match self.link_channel(payment_json) {
+                Err(LinkError::UnknownTrustedKeyset { .. }) => {
+                    Err(LinkError::MintOrKeysetNotAcceptable)
+                }
+                result => result,
+            },
+            Ok(KeysetRefreshOutcome::SkippedCooldown) => Err(LinkError::KeysetRefreshRateLimited),
+            Err(KeysetRefreshError::Busy) => Err(LinkError::KeysetRefreshBusy),
+            Err(KeysetRefreshError::Timeout) => Err(LinkError::KeysetRefreshFailed(
+                "refresh timed out".to_string(),
+            )),
+            Err(KeysetRefreshError::RefreshFailed(message)) => {
+                Err(LinkError::KeysetRefreshFailed(message))
+            }
+            Err(
+                KeysetRefreshError::RequestTooLarge
+                | KeysetRefreshError::UntrustedMint
+                | KeysetRefreshError::UntrustedUnit,
+            ) => Err(LinkError::MintOrKeysetNotAcceptable),
+        }
+    }
+
     pub(crate) fn apply_channel_payment(
         &self,
         expected_channel_id: &str,

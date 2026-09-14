@@ -55,7 +55,9 @@ impl<'a> ControlDriver<'a> {
             }
             SessionEffect::RunLinkValidation { payment_json } => {
                 pending.push_back(SessionEvent::LinkValidationFinished(
-                    self.state.link_channel(&payment_json),
+                    self.state
+                        .link_channel_with_keyset_refresh(&payment_json)
+                        .await,
                 ));
             }
             SessionEffect::RunPaymentValidation {

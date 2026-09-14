@@ -67,7 +67,11 @@ pub async fn start_session_payment_driver(
 
 #[cfg(test)]
 mod tests {
-    use super::funding::{keyset_refresh_hint_is_suppressed, KEYSET_REFRESH_HINT_RETRY_COOLDOWN};
+    use super::funding::{
+        defer_link_after_refresh_error, keyset_refresh_hint_is_suppressed,
+        link_refresh_retry_delay, KEYSET_REFRESH_HINT_RETRY_COOLDOWN,
+        LINK_REFRESH_BUSY_RETRY_DELAY, LINK_REFRESH_RETRY_COOLDOWN,
+    };
     use super::payment::{
         channel_signed_balance_raw, exclude_on_wallet_error, plan_payment_topup,
         raw_amount_to_msats, requested_delta_msats, server_error_rejects_intended_channel,
@@ -236,6 +240,48 @@ mod tests {
         };
 
         assert!(relay_confirms_intended_channel(&state));
+    }
+
+    #[test]
+    fn transient_link_refresh_errors_preserve_channel_and_back_off() {
+        for code in [
+            ServerErrorCode::LinkKeysetRefreshRateLimited,
+            ServerErrorCode::LinkKeysetRefreshFailed,
+            ServerErrorCode::LinkKeysetRefreshBusy,
+        ] {
+            assert!(!server_error_rejects_intended_channel(&code));
+        }
+        assert_eq!(
+            link_refresh_retry_delay(&ServerErrorCode::LinkKeysetRefreshRateLimited),
+            Some(LINK_REFRESH_RETRY_COOLDOWN)
+        );
+        assert_eq!(
+            link_refresh_retry_delay(&ServerErrorCode::LinkKeysetRefreshFailed),
+            Some(LINK_REFRESH_RETRY_COOLDOWN)
+        );
+        assert_eq!(
+            link_refresh_retry_delay(&ServerErrorCode::LinkKeysetRefreshBusy),
+            Some(LINK_REFRESH_BUSY_RETRY_DELAY)
+        );
+
+        let now = Instant::now();
+        let mut state = DriverState {
+            intended_channel_id: Some("channel".to_string()),
+            control_op_in_flight: Some(ControlOpInFlight::Link {
+                channel_id: "channel".to_string(),
+            }),
+            ..DriverState::default()
+        };
+        assert!(defer_link_after_refresh_error(
+            &mut state,
+            &ServerErrorCode::LinkKeysetRefreshRateLimited,
+            now,
+        ));
+        assert_eq!(state.intended_channel_id.as_deref(), Some("channel"));
+        assert_eq!(
+            state.link_retry_not_before,
+            Some(now + LINK_REFRESH_RETRY_COOLDOWN)
+        );
     }
 
     #[test]

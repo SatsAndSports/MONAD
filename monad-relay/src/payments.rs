@@ -58,6 +58,10 @@ pub enum LinkError {
     InvalidPayment(String),
     InvalidChannel(String),
     MintOrKeysetNotAcceptable,
+    UnknownTrustedKeyset { mint_url: String, unit: String },
+    KeysetRefreshRateLimited,
+    KeysetRefreshBusy,
+    KeysetRefreshFailed(String),
     UnsupportedCashuSpilmanProtocolVersion,
     KeysetVersionNotNegotiated,
     ReceiverKeyMismatch,
@@ -74,6 +78,10 @@ impl fmt::Display for LinkError {
             Self::InvalidPayment(s) => write!(f, "invalid payment: {s}"),
             Self::InvalidChannel(s) => write!(f, "invalid channel: {s}"),
             Self::MintOrKeysetNotAcceptable => write!(f, "mint or keyset not acceptable"),
+            Self::UnknownTrustedKeyset { .. } => write!(f, "trusted mint keyset is unknown"),
+            Self::KeysetRefreshRateLimited => write!(f, "keyset refresh is rate limited"),
+            Self::KeysetRefreshBusy => write!(f, "keyset refresh service is busy"),
+            Self::KeysetRefreshFailed(message) => write!(f, "keyset refresh failed: {message}"),
             Self::KeysetVersionNotNegotiated => {
                 write!(f, "channel funding keyset version was not negotiated")
             }
@@ -97,7 +105,12 @@ impl LinkError {
         match self {
             Self::InvalidPayment(_) => ServerErrorCode::LinkInvalidPayment,
             Self::InvalidChannel(_) => ServerErrorCode::LinkInvalidChannel,
-            Self::MintOrKeysetNotAcceptable => ServerErrorCode::LinkMintOrKeysetUnacceptable,
+            Self::MintOrKeysetNotAcceptable | Self::UnknownTrustedKeyset { .. } => {
+                ServerErrorCode::LinkMintOrKeysetUnacceptable
+            }
+            Self::KeysetRefreshRateLimited => ServerErrorCode::LinkKeysetRefreshRateLimited,
+            Self::KeysetRefreshBusy => ServerErrorCode::LinkKeysetRefreshBusy,
+            Self::KeysetRefreshFailed(_) => ServerErrorCode::LinkKeysetRefreshFailed,
             Self::KeysetVersionNotNegotiated => ServerErrorCode::LinkKeysetVersionNotNegotiated,
             Self::UnsupportedCashuSpilmanProtocolVersion => {
                 ServerErrorCode::LinkUnsupportedCashuSpilmanProtocolVersion
@@ -210,6 +223,7 @@ pub struct SpilmanRelayPayments {
     bridge: SpilmanBridge<MonadHost, PaymentContext>,
     store: ChannelStore,
     mint_cache: SharedSpilmanMintCache,
+    trusted_mint_units: TrustedMintUnits,
 }
 
 impl SpilmanRelayPayments {
@@ -238,7 +252,7 @@ impl SpilmanRelayPayments {
         let host = MonadHost {
             receiver_secret,
             mint_cache: mint_cache.clone(),
-            trusted_mint_units,
+            trusted_mint_units: trusted_mint_units.clone(),
             channel_policy,
             store: store.clone(),
         };
@@ -246,6 +260,7 @@ impl SpilmanRelayPayments {
             bridge: SpilmanBridge::new(host),
             store,
             mint_cache,
+            trusted_mint_units,
         }
     }
 
@@ -263,6 +278,44 @@ impl SpilmanRelayPayments {
             channel_policy,
             store,
         )
+    }
+
+    fn unknown_trusted_keyset_target(
+        &self,
+        params: &serde_json::Value,
+        keyset_id: &Id,
+    ) -> Option<(String, String)> {
+        let mint_url = params["mint"].as_str()?;
+        let unit = params["unit"].as_str()?;
+        if !self
+            .trusted_mint_units
+            .get(mint_url)
+            .is_some_and(|units| units.contains(unit))
+        {
+            return None;
+        }
+        if self
+            .mint_cache
+            .read()
+            .expect("spilman mint cache lock poisoned")
+            .contains_keyset(mint_url, keyset_id)
+        {
+            return None;
+        }
+        Some((mint_url.to_string(), unit.to_string()))
+    }
+
+    fn known_keyset_unit_mismatch(&self, params: &serde_json::Value, keyset_id: &Id) -> bool {
+        let (Some(mint_url), Some(claimed_unit)) =
+            (params["mint"].as_str(), params["unit"].as_str())
+        else {
+            return false;
+        };
+        self.mint_cache
+            .read()
+            .expect("spilman mint cache lock poisoned")
+            .keyset_unit(mint_url, keyset_id)
+            .is_some_and(|cached_unit| cached_unit != claimed_unit)
     }
 
     pub fn close_channel<M: SpilmanMintClient, R: SpilmanKeysetRefresher>(
@@ -553,6 +606,10 @@ impl RelayPayments for SpilmanRelayPayments {
                 .map_err(map_link_bridge_error)?
                 .capacity
         } else {
+            if self.known_keyset_unit_mismatch(&params, &id) {
+                return Err(LinkError::MintOrKeysetNotAcceptable);
+            }
+            let refresh_target = self.unknown_trusted_keyset_target(&params, &id);
             // First link validates funding, then explicitly records it so MONAD
             // controls the persistence boundary around session ownership.
             let validated =
@@ -568,7 +625,14 @@ impl RelayPayments for SpilmanRelayPayments {
                         payment.balance,
                         &payment.signature,
                     )
-                    .map_err(map_link_bridge_error)?;
+                    .map_err(|error| {
+                        if matches!(error, BridgeError::MintOrKeysetNotAcceptable) {
+                            if let Some((mint_url, unit)) = refresh_target.clone() {
+                                return LinkError::UnknownTrustedKeyset { mint_url, unit };
+                            }
+                        }
+                        map_link_bridge_error(error)
+                    })?;
             let capacity = validated.capacity;
             self.bridge.record_validated_new_channel(&validated);
             capacity
@@ -958,7 +1022,7 @@ fn map_link_bridge_error(err: BridgeError) -> LinkError {
         | BridgeError::InvalidSignature(s)
         | BridgeError::ServerMisconfigured(s)
         | BridgeError::Internal(s) => LinkError::InvalidPayment(s),
-        BridgeError::ChannelClosing => LinkError::InvalidPayment(err.to_string()),
+        BridgeError::ChannelClosing => LinkError::ChannelClosed,
         BridgeError::CapacityTooSmall { .. }
         | BridgeError::MaxAmountExceeded { .. }
         | BridgeError::BalanceExceedsCapacity { .. }
@@ -1001,6 +1065,19 @@ fn map_payment_bridge_error(err: BridgeError) -> ChannelPaymentError {
         | BridgeError::BalanceMismatch { .. } => {
             ChannelPaymentError::InvalidPayment(err.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod link_error_tests {
+    use super::{map_link_bridge_error, BridgeError, LinkError};
+
+    #[test]
+    fn closing_channel_link_is_permanently_rejected() {
+        assert_eq!(
+            map_link_bridge_error(BridgeError::ChannelClosing),
+            LinkError::ChannelClosed
+        );
     }
 }
 

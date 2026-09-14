@@ -5217,13 +5217,10 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
     handle2.await.unwrap().unwrap();
 }
 
-/// A relay must reject ChannelLink when the funding token itself uses a keyset
-/// outside the relay's accepted/known trusted set, regardless of whether that
-/// keyset is currently active at the mint. This test starts with relay-accepted
-/// keyset A, rotates the mint to active keyset B, then links a B-funded channel
-/// while the relay still accepts only A.
+/// A known keyset cannot be presented with a different claimed unit, even when
+/// both units are trusted, and that mismatch must not trigger a refresh.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_channel_link_rejects_unaccepted_funding_keyset() {
+async fn test_channel_link_rejects_known_keyset_unit_mismatch() {
     let mint_helper = TestMintHelper::new().await.unwrap();
     let mint = mint_helper.mint();
     let mint_url = "https://test-mint.invalid".to_string();
@@ -5240,15 +5237,35 @@ async fn test_channel_link_rejects_unaccepted_funding_keyset() {
         .fetch_keyset_info(&mint_url, &rejected_keyset_id)
         .expect("fetch rejected keyset info");
 
-    let accepted_mint_cache = mint_cache_with_keyset(
+    let mut accepted_mint_cache = mint_cache_with_keyset(
         &mint_url,
         "sat",
         &accepted_keyset_id,
         accepted_keyset_info_json,
         true,
     );
-    let trusted_mint_units =
-        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    accepted_mint_cache
+        .advertised
+        .entry(mint_url.clone())
+        .or_default()
+        .insert("msat".to_string(), vec![rejected_keyset_id.clone()]);
+    accepted_mint_cache
+        .keysets
+        .entry(mint_url.clone())
+        .or_default()
+        .insert(
+            rejected_keyset_id.clone(),
+            CachedKeyset {
+                unit: "msat".to_string(),
+                active: true,
+                input_fee_ppk: keyset_info_input_fee_ppk(&rejected_keyset_info_json),
+                info_json: rejected_keyset_info_json.clone(),
+            },
+        );
+    let trusted_mint_units = BTreeMap::from([(
+        mint_url.clone(),
+        BTreeSet::from(["sat".to_string(), "msat".to_string()]),
+    )]);
 
     let temp_db = tempfile::NamedTempFile::new().unwrap();
     let storage_path = temp_db.path().to_str().unwrap().to_string();
@@ -5691,7 +5708,7 @@ async fn test_control_refresh_keysets_updates_advertisements() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_control_refresh_keysets_then_accepts_new_keyset_channel_link() {
+async fn test_channel_link_refreshes_and_accepts_new_keyset() {
     let mint_helper = TestMintHelper::new().await.unwrap();
     let mint = mint_helper.mint();
     let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5758,23 +5775,6 @@ async fn test_control_refresh_keysets_then_accepts_new_keyset_channel_link() {
         .fetch_keyset_info(&mint_url, &new_keyset_id)
         .expect("fetch rotated keyset info");
 
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::RefreshKeysets {
-            mint_url: mint_url.clone(),
-            unit: "sat".to_string(),
-        },
-        false,
-    )
-    .await;
-    let refreshed = expect_session_status_struct(read_control_message(&mut control_recv).await);
-    let refreshed_sat = refreshed
-        .advertisements
-        .iter()
-        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
-        .expect("refreshed sat advertisement");
-    assert!(refreshed_sat.keyset_ids.contains(&new_keyset_id));
-
     let new_wallet = TestSigningWallet::new(
         mint,
         receiver_pubkey_hex.clone(),
@@ -5817,6 +5817,192 @@ async fn test_control_refresh_keysets_then_accepts_new_keyset_channel_link() {
         .capacity_msats
         / 1000;
     link_status.assert_linked_channel(&new_channel_id, 0, new_capacity_raw, "sat");
+    let refreshed_sat = link_status
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .expect("refreshed sat advertisement");
+    assert!(refreshed_sat.keyset_ids.contains(&new_keyset_id));
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_channel_link_unknown_keyset_refreshes_once_then_rate_limits() {
+    let (mint_url, keyset_id, keyset_requests, mint_helper, mint_shutdown_tx) =
+        start_counted_http_test_mint().await;
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let stale_mint_cache =
+        mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let transport_key = SecpTransportKeypair::generate();
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        receiver_secret,
+        "automatic-link-refresh-cooldown-relay",
+        wallet_manager,
+        stale_mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let wallet = TestSigningWallet::new(
+        mint_helper.mint(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        keyset_id.clone(),
+        keyset_info_json,
+    )
+    .await;
+    let offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex,
+        mint_url: mint_url.clone(),
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![keyset_id],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let _initial = control_handshake_status(&mut control_send, &mut control_recv).await;
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+    let original = wallet.build_link_request(&channel_id, &offer).unwrap();
+    let foreign_mint = TestMintHelper::new().await.unwrap();
+    let first_unknown_keyset = foreign_mint.keyset_id().to_string();
+    let second_unknown_keyset = rotate_sat_keyset(&foreign_mint.mint(), 1)
+        .await
+        .unwrap()
+        .to_string();
+
+    for (unknown_keyset, expected_code) in [
+        (
+            first_unknown_keyset,
+            ServerErrorCode::LinkMintOrKeysetUnacceptable,
+        ),
+        (
+            second_unknown_keyset,
+            ServerErrorCode::LinkKeysetRefreshRateLimited,
+        ),
+    ] {
+        let mut payment: serde_json::Value = serde_json::from_str(&original).unwrap();
+        payment["params"]["keyset_id"] = serde_json::json!(unknown_keyset);
+        send_control_message(
+            &mut control_send,
+            &ClientMessage::ChannelLink {
+                payment_json: serde_json::to_string(&payment).unwrap(),
+            },
+            false,
+        )
+        .await;
+        match read_control_message(&mut control_recv).await {
+            ServerMessage::Error { code, .. } => assert_eq!(code, expected_code),
+            other => panic!("expected channel-link keyset error, got {other:?}"),
+        }
+    }
+    assert_eq!(keyset_requests.load(Ordering::SeqCst), 1);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    let _ = mint_shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let known_keyset_id = mint_helper.keyset_id().to_string();
+    let known_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let foreign_mint = TestMintHelper::new().await.unwrap();
+    let unknown_keyset_id = foreign_mint.keyset_id().to_string();
+    let (mint_url, mint_shutdown_tx) = start_failing_keysets_mint().await;
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let stale_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &known_keyset_id,
+        &known_keyset_info_json,
+        true,
+    );
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let transport_key = SecpTransportKeypair::generate();
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        receiver_secret,
+        "automatic-link-refresh-failure-relay",
+        wallet_manager,
+        stale_mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let wallet = TestSigningWallet::new(
+        mint_helper.mint(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        known_keyset_id.clone(),
+        known_keyset_info_json,
+    )
+    .await;
+    let offer = RelayPaymentOffer {
+        receiver_pubkey: receiver_pubkey_hex,
+        mint_url,
+        unit: "sat".to_string(),
+        accepted_keyset_ids: vec![known_keyset_id],
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let _initial = control_handshake_status(&mut control_send, &mut control_recv).await;
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+    let mut payment: serde_json::Value =
+        serde_json::from_str(&wallet.build_link_request(&channel_id, &offer).unwrap()).unwrap();
+    payment["params"]["keyset_id"] = serde_json::json!(unknown_keyset_id);
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: serde_json::to_string(&payment).unwrap(),
+        },
+        false,
+    )
+    .await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::LinkKeysetRefreshFailed);
+            assert!(message.contains("keyset refresh failed"));
+        }
+        other => panic!("expected automatic keyset refresh failure, got {other:?}"),
+    }
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);

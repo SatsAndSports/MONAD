@@ -174,6 +174,21 @@ impl SpilmanMintCache {
             .map(|ks| ks.info_json.clone())
     }
 
+    /// True if this mint has advertised the keyset, regardless of unit or activity.
+    pub fn contains_keyset(&self, mint: &str, keyset_id: &Id) -> bool {
+        self.keysets
+            .get(mint)
+            .is_some_and(|by_id| by_id.contains_key(&keyset_id.to_string()))
+    }
+
+    /// The mint-reported unit for a known keyset.
+    pub fn keyset_unit(&self, mint: &str, keyset_id: &Id) -> Option<&str> {
+        self.keysets
+            .get(mint)
+            .and_then(|by_id| by_id.get(&keyset_id.to_string()))
+            .map(|keyset| keyset.unit.as_str())
+    }
+
     /// True if the keyset is known and belongs to a trusted unit for that mint.
     pub fn is_acceptable(
         &self,

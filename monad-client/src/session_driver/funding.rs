@@ -3,12 +3,14 @@ use monad_common::control_codec::send_json_line;
 use monad_common::protocol::{ClientMessage, ServerErrorCode};
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::wallet::{select_channel, RelayPaymentOffer, WalletChannel, WalletError};
 
 pub(super) const KEYSET_REFRESH_HINT_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+pub(super) const LINK_REFRESH_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+pub(super) const LINK_REFRESH_BUSY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 use super::payment::{
     compute_estimated_remaining, exclude_on_wallet_error, plan_payment_topup, raw_amount_to_msats,
@@ -202,6 +204,13 @@ pub(super) async fn maybe_ensure_linked_channel(
         );
         return Ok(());
     }
+    if state
+        .link_retry_not_before
+        .is_some_and(|deadline| Instant::now() < deadline)
+    {
+        return Ok(());
+    }
+    state.link_retry_not_before = None;
 
     if let Some(intended_channel_id) = state.intended_channel_id.as_deref() {
         let relay_linked = relay_linked_channel_id(state).unwrap_or("none");
@@ -519,6 +528,11 @@ pub(super) async fn apply_server_error(
 ) {
     clear_control_op(state);
 
+    if defer_link_after_refresh_error(state, &code, Instant::now()) {
+        publish_spilman_info(config, state).await;
+        return;
+    }
+
     if server_error_rejects_intended_channel(&code) {
         if let Some(channel_id) = state.intended_channel_id.clone() {
             if server_error_invalidates_channel(&code) {
@@ -532,6 +546,27 @@ pub(super) async fn apply_server_error(
     // No intended channel was rejected, but we still need to republish Spilman
     // info because the in-flight operation was cleared above.
     publish_spilman_info(config, state).await;
+}
+
+pub(super) fn link_refresh_retry_delay(code: &ServerErrorCode) -> Option<Duration> {
+    match code {
+        ServerErrorCode::LinkKeysetRefreshRateLimited
+        | ServerErrorCode::LinkKeysetRefreshFailed => Some(LINK_REFRESH_RETRY_COOLDOWN),
+        ServerErrorCode::LinkKeysetRefreshBusy => Some(LINK_REFRESH_BUSY_RETRY_DELAY),
+        _ => None,
+    }
+}
+
+pub(super) fn defer_link_after_refresh_error(
+    state: &mut DriverState,
+    code: &ServerErrorCode,
+    now: Instant,
+) -> bool {
+    let Some(delay) = link_refresh_retry_delay(code) else {
+        return false;
+    };
+    state.link_retry_not_before = Some(now + delay);
+    true
 }
 
 pub(super) async fn handle_control_detached(config: &SessionDriverConfig, state: &mut DriverState) {

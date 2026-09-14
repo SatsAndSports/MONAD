@@ -161,14 +161,22 @@ impl RelayKeysetRefreshCoordinator {
         let mint_url = mint_url.to_string();
         let refresh_timeout = self.config.timeout;
         tokio::spawn(async move {
-            let _permit = permit;
-            let result = match timeout(refresh_timeout, refresher.refresh_mint(&mint_url)).await {
-                Ok(Ok(())) => Ok(KeysetRefreshOutcome::Refreshed),
-                Ok(Err(error)) => Err(KeysetRefreshError::RefreshFailed(error)),
-                Err(_) => Err(KeysetRefreshError::Timeout),
+            let refresh_task = tokio::spawn(async move {
+                let _permit = permit;
+                match timeout(refresh_timeout, refresher.refresh_mint(&mint_url)).await {
+                    Ok(Ok(())) => Ok(KeysetRefreshOutcome::Refreshed),
+                    Ok(Err(error)) => Err(KeysetRefreshError::RefreshFailed(error)),
+                    Err(_) => Err(KeysetRefreshError::Timeout),
+                }
+            });
+            let result = match refresh_task.await {
+                Ok(result) => result,
+                Err(error) => Err(KeysetRefreshError::RefreshFailed(format!(
+                    "refresh task failed: {error}"
+                ))),
             };
-            slot.state.lock().await.in_flight = None;
             result_tx.send_replace(Some(result));
+            slot.state.lock().await.in_flight = None;
         });
 
         wait_for_refresh_result(result_rx).await
@@ -223,6 +231,20 @@ mod tests {
         delay: Duration,
         result: std::sync::Mutex<Result<(), String>>,
         started: Notify,
+    }
+
+    struct PanicOnceRefresher {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl KeysetRefresher for PanicOnceRefresher {
+        async fn refresh_mint(&self, _mint_url: &str) -> Result<(), String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("deterministic refresh panic");
+            }
+            Ok(())
+        }
     }
 
     impl CountingRefresher {
@@ -462,6 +484,32 @@ mod tests {
             Ok(KeysetRefreshOutcome::Refreshed)
         );
         assert_eq!(refresher.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinator_recovers_after_refresh_task_panics() {
+        let refresher = Arc::new(PanicOnceRefresher {
+            calls: AtomicUsize::new(0),
+        });
+        let mut config = config();
+        config.refresh_cooldown = Duration::ZERO;
+        let coordinator = RelayKeysetRefreshCoordinator::with_refresher(
+            refresher.clone(),
+            trusted(&[("https://mint", &["sat"])]),
+            config,
+        );
+
+        let first = coordinator.refresh_mint_unit("https://mint", "sat").await;
+        assert!(matches!(
+            first,
+            Err(KeysetRefreshError::RefreshFailed(message))
+                if message.contains("refresh task failed")
+        ));
+        assert_eq!(
+            coordinator.refresh_mint_unit("https://mint", "sat").await,
+            Ok(KeysetRefreshOutcome::Refreshed)
+        );
+        assert_eq!(refresher.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

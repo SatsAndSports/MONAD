@@ -374,18 +374,21 @@ Server to client (`ServerMessage`):
 
 ### Relay Keyset Refresh
 
-Relay keyset refresh is a bounded client hint, not open mint discovery. It exists so a client can ask a relay to re-check a mint after the client suspects the relay's advertised keysets are stale, for example after a Cashu mint rotates to a new active output keyset.
+Relay keyset refresh is bounded trusted-mint maintenance, not open mint discovery. It can be triggered automatically by a first-time channel link with an unknown keyset or explicitly when a client suspects the relay's advertisement is stale.
 
 The request is deliberately narrow:
 
 - The client sends `RefreshKeysets { mint_url, unit }` on the control stream.
+- A first-time `ChannelLink` rejected only because its trusted mint/unit keyset is unknown invokes the same coordinator and is retried once after a fresh successful result.
+- Stored channel relinks use authoritative persisted funding and never trigger keyset refresh.
 - The relay accepts the hint only when `mint_url` is already configured as trusted and `unit` is trusted for that mint.
 - The relay refreshes all keysets for that mint into the shared relay-wallet cache, not only the requested unit, because mint keyset endpoints are mint-scoped.
 - On successful refresh, the relay replies with a fresh `SessionStatus` containing the updated advertisements.
 - If the request is skipped by cooldown, the relay still replies with a fresh `SessionStatus` from the current cache.
 - If policy rejects the request or the mint refresh fails, the relay replies with `Error` and leaves the existing cache intact.
+- Automatic link refresh returns transient `LinkKeysetRefreshRateLimited`, `LinkKeysetRefreshBusy`, or `LinkKeysetRefreshFailed` errors when it cannot make a fresh decision. A fresh successful response that still omits the keyset yields permanent `LinkMintOrKeysetUnacceptable`.
 
-DoS resistance is part of the protocol behavior. The relay validates request sizes and trusted mint/unit policy before any network fetch, uses a per-mint singleflight lock so concurrent sessions cannot stampede one mint, applies per-mint success and failure cooldowns, bounds total concurrent refreshes with a global semaphore, and wraps mint I/O in a timeout. Refresh I/O runs outside session accounting locks, so slow or failing mints do not block data-path accounting or unrelated control state.
+DoS resistance is part of the protocol behavior. The relay validates request sizes and trusted mint/unit policy before any network fetch, permits at most one actual attempt per mint per cooldown regardless of outcome, shares cancellation-safe in-flight results among concurrent same-mint callers, fails fast when global cross-mint capacity is saturated, and wraps mint I/O in a timeout. Refresh I/O runs outside session accounting locks, so slow or failing mints do not block data-path accounting or unrelated control state.
 
 Refresh does not invalidate old keysets by itself. The relay cache stores all keysets returned by configured mints, active and inactive, and trusted policy filters advertisements and channel acceptance at read time. Existing channels funded by a still-known old keyset can continue to link and pay after a mint rotation, while newly opened channels should use a currently active keyset once both client and relay have refreshed.
 
@@ -581,6 +584,8 @@ The client selects a mint/unit and sends a `ChannelLink` message containing a Sp
 Production hellos offer both `v1` (`00` keyset IDs) and `v2` (`01` keyset IDs). The relay selects the full nonempty intersection; clients validate selections against the actual hello. Session advertisements apply negotiated-version filtering in addition to trusted mint/unit policy, omit empty offers, and retain compatible inactive IDs, including after refresh. The shared cache, channel close/drain output selection, and loose input proofs are unaffected.
 
 Before persisting a new channel or changing ownership, `ChannelLink` checks its funding keyset version. Existing channels use authoritative stored funding, never caller-supplied replacement or omitted params. A mismatch yields `LinkKeysetVersionNotNegotiated`, releases the offending session's previous ownership, and ends its data/control streams after a bounded best-effort error send. Other MONAD sessions on the same QUIC connection remain usable. The client terminates its driver without invalidating the wallet channel.
+
+For a first-time channel on a negotiated keyset format, an unknown keyset is refreshable only when the submitted mint/unit is already trusted. The relay invokes the shared bounded coordinator and retries the immutable link once after a fresh successful result. A still-unknown keyset is then permanently rejected. Cooldown, saturation, and refresh failure remain transient; the client retains its intended channel and backs off. Stored `Open` channels bypass this path and validate against persisted funding, while `Closing` and `Closed` channels remain unusable.
 - **One Session Per Channel**: The relay maintains a global registry of `ChannelId -> SessionId`.
 - **Exclusivity**: If a channel is already linked to another session, the relay sends `ChannelEvicted` to the old session and links the channel to the new one.
 - **Stateless Session Start**: Every new Noise session starts with a `total_paid_millisats` of 0. Only *new* payments made within the current session count as credit.

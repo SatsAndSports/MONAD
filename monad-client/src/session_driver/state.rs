@@ -110,6 +110,7 @@ pub(super) struct DriverState {
     pub(super) control_op_in_flight: Option<ControlOpInFlight>,
     pub(super) last_keyset_refresh_hint: Option<KeysetRefreshHint>,
     pub(super) last_keyset_refresh_hint_at: Option<Instant>,
+    pub(super) link_retry_not_before: Option<Instant>,
     pub(super) funding_blocked_reason: Option<FundingBlockedReason>,
     pub(super) ready_signaled: bool,
     pub(super) terminated: bool,
