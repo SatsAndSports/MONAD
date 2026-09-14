@@ -353,13 +353,12 @@ Client to server (`ClientMessage`):
 - `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0, funding proofs, sufficient capacity for the relay's configured channel policy, and an expiry at least `channel_policy.min_expiry` in the future
 - `ChannelPayment { payment_json }` — increment session balance; requires a Spilman `Payment` signature for a higher balance than previously seen for this channel
 - `GetSessionStatus` — request a fresh session status snapshot
-- `RefreshKeysets { mint_url, unit }` — request a bounded relay-side refresh of keyset metadata for one configured trusted mint/unit. On success, or when skipped by cooldown, the relay replies with a fresh `SessionStatus`; policy rejection or refresh failure returns `Error`.
 
 Server to client (`ServerMessage`):
 - `SessionStatus { ... }` — primary state synchronization message; sent immediately after control stream establishment and proactively whenever session state (balance, link, pricing) changes. Contains:
   - `version`: Negotiated protocol version
   - `receiver_pubkey`: Server's secp256k1 key for Spilman
-  - `advertisements`: List of supported `(Mint, Unit, Rates)` options
+  - `advertisements`: Ordered `(Mint, Unit, Rates)` options whose keyset ID lists are relay-known preferences and may be empty
   - `linked_channel`: Relay-authoritative linked channel status (if any), including channel id, latest accepted raw balance, raw capacity, and unit
   - `active_in_rate`: Rate currently being applied to inbound traffic
   - `active_out_rate`: Rate currently being applied to outbound traffic
@@ -368,27 +367,22 @@ Server to client (`ServerMessage`):
   - `total_paid_millisats`: Total payments received
   - `remaining_milli_sats`: Current session balance
   - `paused`: Boolean indicating if traffic is currently blocked
-- `SessionStatus { ... linked_channel: Some(...) ... }` — authoritative relay state after a successful link, payment, or relay keyset refresh
+- `SessionStatus { ... linked_channel: Some(...) ... }` — authoritative relay state after a successful link or payment
 - `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
 - `Error { code, message }` — relay-initiated error or rejection
 
 ### Relay Keyset Refresh
 
-Relay keyset refresh is bounded trusted-mint maintenance, not open mint discovery. It can be triggered automatically by a first-time channel link with an unknown keyset or explicitly when a client suspects the relay's advertisement is stale.
+Relay keyset refresh is bounded trusted-mint maintenance, not a client control operation or open mint discovery. A first-time channel link with an unknown keyset triggers it automatically.
 
-The request is deliberately narrow:
-
-- The client sends `RefreshKeysets { mint_url, unit }` on the control stream.
-- A first-time `ChannelLink` rejected only because its trusted mint/unit keyset is unknown invokes the same coordinator and is retried once after a fresh successful result.
+- A first-time `ChannelLink` rejected only because its trusted mint/unit keyset is unknown invokes the coordinator and retries the same immutable payment once after a fresh successful result.
 - Stored channel relinks use authoritative persisted funding and never trigger keyset refresh.
-- The relay accepts the hint only when `mint_url` is already configured as trusted and `unit` is trusted for that mint.
-- The relay refreshes all keysets for that mint into the shared relay-wallet cache, not only the requested unit, because mint keyset endpoints are mint-scoped.
-- On successful refresh, the relay replies with a fresh `SessionStatus` containing the updated advertisements.
-- If the request is skipped by cooldown, the relay still replies with a fresh `SessionStatus` from the current cache.
-- If policy rejects the request or the mint refresh fails, the relay replies with `Error` and leaves the existing cache intact.
-- Automatic link refresh returns transient `LinkKeysetRefreshRateLimited`, `LinkKeysetRefreshBusy`, or `LinkKeysetRefreshFailed` errors when it cannot make a fresh decision. A fresh successful response that still omits the keyset yields permanent `LinkMintOrKeysetUnacceptable`.
+- Refresh is eligible only when `mint_url` is already configured as trusted and `unit` is trusted for that mint.
+- The relay refreshes all keysets for that mint into the shared relay-wallet cache, not only the submitted channel's unit, because mint keyset endpoints are mint-scoped.
+- Automatic link refresh returns transient `LinkKeysetRefreshRateLimited`, `LinkKeysetRefreshBusy`, or `LinkKeysetRefreshFailed` errors when it cannot make a fresh decision. A fresh successful response that still does not contain the keyset yields permanent `LinkMintOrKeysetUnacceptable`.
+- Startup discovery still populates the cache. Close and drain swaps remain cache-first and refresh the mint only when a mint keyset error requires a bounded retry.
 
-DoS resistance is part of the protocol behavior. The relay validates request sizes and trusted mint/unit policy before any network fetch, permits at most one actual attempt per mint per cooldown regardless of outcome, shares cancellation-safe in-flight results among concurrent same-mint callers, fails fast when global cross-mint capacity is saturated, and wraps mint I/O in a timeout. Refresh I/O runs outside session accounting locks, so slow or failing mints do not block data-path accounting or unrelated control state.
+DoS resistance is part of the protocol behavior. The relay validates submitted mint/unit sizes and trusted policy before any network fetch, permits at most one actual attempt per mint per cooldown regardless of outcome, shares cancellation-safe in-flight results among concurrent same-mint links, fails fast when global cross-mint capacity is saturated, and wraps mint I/O in a timeout. Refresh I/O runs outside session accounting locks, so slow or failing mints do not block data-path accounting or unrelated control state.
 
 Refresh does not invalidate old keysets by itself. The relay cache stores all keysets returned by configured mints, active and inactive, and trusted policy filters advertisements and channel acceptance at read time. Existing channels funded by a still-known old keyset can continue to link and pay after a mint rotation, while newly opened channels should use a currently active keyset once both client and relay have refreshed.
 
@@ -581,7 +575,7 @@ The relay wallet manager owns a shared in-memory `SpilmanMintCache`. The cache s
 #### 2. Channel Linking
 The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs. If the bootstrap did not negotiate a supported Cashu Spilman channel protocol version and keyset-format set, the relay rejects linking immediately.
 
-Production hellos offer both `v1` (`00` keyset IDs) and `v2` (`01` keyset IDs). The relay selects the full nonempty intersection; clients validate selections against the actual hello. Session advertisements apply negotiated-version filtering in addition to trusted mint/unit policy, omit empty offers, and retain compatible inactive IDs, including after refresh. The shared cache, channel close/drain output selection, and loose input proofs are unaffected.
+Production hellos offer both `v1` (`00` keyset IDs) and `v2` (`01` keyset IDs). The relay selects the full nonempty intersection; clients validate selections against the actual hello. Session advertisements apply negotiated-version filtering in addition to trusted mint/unit policy and retain every configured mint/unit option even when its ordered relay-known preference list is empty. Preferences may include compatible inactive IDs and are not an exhaustive accepted-ID allowlist. The shared cache, channel close/drain output selection, and loose input proofs are unaffected.
 
 Before persisting a new channel or changing ownership, `ChannelLink` checks its funding keyset version. Existing channels use authoritative stored funding, never caller-supplied replacement or omitted params. A mismatch yields `LinkKeysetVersionNotNegotiated`, releases the offending session's previous ownership, and ends its data/control streams after a bounded best-effort error send. Other MONAD sessions on the same QUIC connection remain usable. The client terminates its driver without invalidating the wallet channel.
 
@@ -631,10 +625,12 @@ channel metadata.
   building zero-balance link payments, and signing incremental channel payments.
 - `MockWallet` remains available for deterministic tests and harnesses.
 
-Client channel opening is cache-first. Each opening call site selects an active
-client output keyset that intersects with the relay's advertised
-`accepted_keyset_ids`. A cache-only miss refreshes the client mint cache before
-the offer is classified as stale. Before mint I/O, the loose-proof store atomically
+Client channel opening is cache-first. Each opening call site prefers an active
+client output keyset from the relay's ordered advertised IDs, then may use any
+other locally active keyset for the same mint/unit whose format was negotiated.
+When the preference list is nonempty but unavailable locally, the client
+refreshes its own mint cache before using a non-preferred fallback. It also
+refreshes before concluding that no compatible active keyset exists. Before mint I/O, the loose-proof store atomically
 reserves the selected inputs and records the exact serialized prepared opening.
 The journal is authoritative across restarts. Submitted attempts first recover
 their original funding/change outputs through NUT-09. If a valid funding restore
@@ -665,14 +661,13 @@ The live exact-replay
 allowance is independent per immutable attempt, so a keyset successor receives
 its own allowance without authorizing a second successor.
 
-If that refreshed client cache has no active output keyset that is also present
-in the relay's advertised `accepted_keyset_ids`, `SqliteClientWallet` returns a
-dedicated stale-relay-keysets error. The session payment driver treats that as a
-hint that the relay advertisement is stale, sends `RefreshKeysets { mint_url,
-unit }`, waits for the next `SessionStatus`, and then retries normal funding.
-The driver records the advertised keyset set it hinted for and suppresses
-duplicate hints for that same stale set for a short cooldown so refresh failures
-cannot become a client-side control-message loop.
+If that refreshed client cache has no active same-mint/unit keyset with a
+negotiated format, `SqliteClientWallet` reports that no compatible active keyset
+exists and the session driver retries locally according to its funding policy.
+The client never asks the relay to refresh. If the client links a channel using
+a compatible active keyset absent from the relay's preferences, the first-time
+`ChannelLink` transparently drives the relay's bounded refresh and one immutable
+retry.
 
 The reusable wallet library path exists, and `monad-client wallet ...` exposes
 token import, proof/channel inspection, and recovery commands using either

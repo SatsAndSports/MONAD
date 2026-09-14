@@ -17,7 +17,7 @@ pub(crate) enum KeysetRefreshOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeysetRefreshError {
-    RequestTooLarge,
+    TargetTooLarge,
     UntrustedMint,
     UntrustedUnit,
     Busy,
@@ -28,7 +28,7 @@ pub(crate) enum KeysetRefreshError {
 impl std::fmt::Display for KeysetRefreshError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::RequestTooLarge => write!(f, "keyset refresh request too large"),
+            Self::TargetTooLarge => write!(f, "keyset refresh target too large"),
             Self::UntrustedMint => write!(f, "keyset refresh mint is not trusted"),
             Self::UntrustedUnit => write!(f, "keyset refresh unit is not trusted for mint"),
             Self::Busy => write!(f, "keyset refresh service is busy"),
@@ -184,7 +184,7 @@ impl RelayKeysetRefreshCoordinator {
 
     fn validate_request(&self, mint_url: &str, unit: &str) -> Result<(), KeysetRefreshError> {
         if mint_url.len() > MAX_REFRESH_MINT_URL_LEN || unit.len() > MAX_REFRESH_UNIT_LEN {
-            return Err(KeysetRefreshError::RequestTooLarge);
+            return Err(KeysetRefreshError::TargetTooLarge);
         }
         let trusted_units = self
             .trusted_mint_units
@@ -534,14 +534,14 @@ mod tests {
         let long_mint = "x".repeat(MAX_REFRESH_MINT_URL_LEN + 1);
         assert_eq!(
             coordinator.refresh_mint_unit(&long_mint, "sat").await,
-            Err(KeysetRefreshError::RequestTooLarge)
+            Err(KeysetRefreshError::TargetTooLarge)
         );
         let long_unit = "x".repeat(MAX_REFRESH_UNIT_LEN + 1);
         assert_eq!(
             coordinator
                 .refresh_mint_unit("https://mint", &long_unit)
                 .await,
-            Err(KeysetRefreshError::RequestTooLarge)
+            Err(KeysetRefreshError::TargetTooLarge)
         );
         assert_eq!(refresher.calls(), 0);
     }

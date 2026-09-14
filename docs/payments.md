@@ -92,12 +92,13 @@ from that cache, not when storing it.
 
 Consequences:
 
-- `SessionStatus` advertises only configured trusted mint/unit options.
-- first-time `ChannelLink` accepts known keysets that belong to a trusted unit for that mint. If such a keyset is unknown, the relay uses its bounded refresh coordinator and retries validation once.
+- `SessionStatus` advertises configured trusted mint/unit options in relay preference order. Each ordered relay-known keyset list may be empty and is not an exhaustive accepted-ID allowlist.
+- the client prefers advertised active IDs, but may use another locally active keyset for the same mint/unit when its format was negotiated. When nonempty preferences are unavailable locally, it refreshes its own mint cache before using a fallback; it also refreshes before reporting that no compatible active keyset exists.
+- first-time `ChannelLink` accepts known keysets that belong to a trusted unit for that mint. If such a keyset is unknown, the relay transparently uses its bounded refresh coordinator and retries the immutable link once.
 - old inactive keysets can remain usable for existing channels as long as the keyset metadata is known.
 - channel close and relay drain swaps start from the shared cache and refresh that mint into SQLite and memory only if the mint rejects the swap with a keyset error.
 
-Automatic link refresh permits one actual mint attempt per cooldown regardless of outcome and shares an in-flight attempt across sessions. A fresh response that still lacks the keyset is a permanent rejection. Cooldown, global saturation, timeout, and fetch failure produce transient link errors; the client keeps the intended channel and retries with backoff. Stored channel relinks use persisted funding and do not refresh.
+There is no explicit client-requested relay refresh operation. Automatic link refresh permits one actual mint attempt per cooldown regardless of outcome and shares an in-flight attempt across sessions. A fresh response that still lacks the keyset is a permanent rejection. Cooldown, global saturation, timeout, and fetch failure produce transient link errors; the client keeps the intended channel and retries with backoff. Stored channel relinks use persisted funding and do not refresh. Startup discovery and the existing close/drain keyset-error refresh paths remain unchanged.
 
 This cache-first, single-refresh retry shape is the shared model for relay close
 and drain swaps.

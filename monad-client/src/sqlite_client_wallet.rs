@@ -2347,9 +2347,9 @@ impl MonadWallet for SqliteClientWallet {
         // rejects the first open because our cached output keyset is stale, the
         // input reservation can be reused: only the output keyset selection and
         // swap construction need to change. Selection refreshes the client cache
-        // before reporting a stale relay offer; the retry helper handles the
-        // mint-rejection refresh path and skips retry when refresh still selects
-        // the same keyset.
+        // before reporting that no compatible active keyset exists; the retry
+        // helper handles the mint-rejection refresh path and skips retry when
+        // refresh still selects the same keyset.
         let available = self
             .loose_wallet
             .list_available_proofs(&offer.mint_url, &offer.unit, &[])

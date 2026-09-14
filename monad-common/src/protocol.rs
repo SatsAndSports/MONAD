@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Mint URL -> unit -> relay-accepted keyset IDs.
+/// Mint URL -> unit -> relay-known preferred keyset IDs.
 ///
 /// These IDs may include inactive mint keysets so existing channels funded by
 /// old keysets can still be re-linked, paid, and closed. A party creating a new
@@ -56,8 +56,6 @@ pub enum ServerErrorCode {
     PaymentUnknownChannel,
     PaymentInvalid,
     PaymentNoNewFunds,
-    KeysetRefreshRejected,
-    KeysetRefreshFailed,
     InternalError,
 }
 
@@ -76,11 +74,6 @@ pub enum ClientMessage {
     ChannelPayment { payment_json: String },
     /// Request a fresh session status snapshot.
     GetSessionStatus,
-    /// Ask the relay to refresh its trusted keyset cache for one mint/unit.
-    ///
-    /// The relay answers with a fresh `SessionStatus` on success or cooldown
-    /// skip, and with `Error` if policy rejects the request or refresh fails.
-    RefreshKeysets { mint_url: String, unit: String },
 }
 
 /// Messages sent from server to client on the control channel.

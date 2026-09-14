@@ -257,7 +257,7 @@ impl SessionState {
                 Err(LinkError::KeysetRefreshFailed(message))
             }
             Err(
-                KeysetRefreshError::RequestTooLarge
+                KeysetRefreshError::TargetTooLarge
                 | KeysetRefreshError::UntrustedMint
                 | KeysetRefreshError::UntrustedUnit,
             ) => Err(LinkError::MintOrKeysetNotAcceptable),
@@ -287,10 +287,6 @@ impl SessionState {
 
     pub(crate) fn update_pause_watch(&self, paused: bool) {
         let _ = self.pause_tx.send_replace(paused);
-    }
-
-    pub(crate) fn keyset_refresh_coordinator(&self) -> Option<Arc<RelayKeysetRefreshCoordinator>> {
-        self.keyset_refresh.clone()
     }
 
     // Billing state and status snapshots.
@@ -962,14 +958,6 @@ async fn handle_control_stream(
                                     terminate_session = process_session_event(
                                         &state,
                                         SessionEvent::ClientChannelPayment { payment_json },
-                                        &mut h2_send,
-                                    )
-                                    .await?;
-                                }
-                                ClientMessage::RefreshKeysets { mint_url, unit } => {
-                                    terminate_session = process_session_event(
-                                        &state,
-                                        SessionEvent::ClientRefreshKeysets { mint_url, unit },
                                         &mut h2_send,
                                     )
                                     .await?;
