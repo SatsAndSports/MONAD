@@ -37,7 +37,7 @@ use monad_common::bootstrap::{
     decode_server_response, encode_client_hello, initial_server_capabilities,
     supported_cashu_spilman_keyset_versions, supported_cashu_spilman_protocol_keyset_versions,
     BootstrapCapabilities, BootstrapClientHello, BootstrapV1ClientHello, BOOTSTRAP_VERSION,
-    CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29, PRICING_POLICY_SESSION_CONSTANT,
+    CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14, PRICING_POLICY_SESSION_CONSTANT,
 };
 use monad_common::control_codec::{encode_json_line, try_decode_json_line};
 use monad_common::h2stream::wait_for_send_capacity;
@@ -1713,7 +1713,7 @@ async fn connect_with_keyset_versions<
 ) -> RelayConnection {
     let mut hello = monad_common::bootstrap::initial_client_hello();
     hello.versions.get_mut("1").unwrap()["cashu_spilman_protocol_keyset_versions"] =
-        serde_json::json!({"2026-08-29": versions});
+        serde_json::json!({"2026-09-14": versions});
     let (send, recv, session_id, accept) =
         noise_secp256k1::handshake_initiator_with_pubkey_and_hello(
             &mut stream,
@@ -2786,7 +2786,7 @@ async fn assert_session_payment_driver_pays_with_active_keyset_version(
     let conn = connect_with_keyset_versions(stream, &pubkey, versions.clone()).await;
     assert_eq!(
         conn.cashu_spilman_protocol_version().await.as_deref(),
-        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14)
     );
     assert_eq!(conn.cashu_spilman_keyset_versions().await, Some(versions));
 
@@ -5729,14 +5729,22 @@ async fn test_channel_link_refreshes_and_accepts_new_keyset() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_channel_link_unknown_keyset_refreshes_once_then_rate_limits() {
-    let (mint_url, keyset_id, keyset_requests, mint_helper, mint_shutdown_tx) =
+async fn test_malformed_unknown_keyset_links_do_not_consume_refresh_budget() {
+    let (mint_url, unknown_keyset_id, keyset_requests, mint_helper, mint_shutdown_tx) =
         start_counted_http_test_mint().await;
-    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let unknown_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let stale_mint = TestMintHelper::new().await.unwrap();
+    let known_keyset_id = stale_mint.keyset_id().to_string();
+    let known_keyset_info_json = stale_mint.keyset_info_json().unwrap();
     let trusted_mint_units =
         BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
-    let stale_mint_cache =
-        mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let stale_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &known_keyset_id,
+        &known_keyset_info_json,
+        true,
+    );
     let receiver_secret = cashu::nuts::SecretKey::generate();
     let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
     let temp_db = tempfile::NamedTempFile::new().unwrap();
@@ -5759,15 +5767,15 @@ async fn test_channel_link_unknown_keyset_refreshes_once_then_rate_limits() {
         mint_helper.mint(),
         receiver_pubkey_hex.clone(),
         mint_url.clone(),
-        keyset_id.clone(),
-        keyset_info_json,
+        unknown_keyset_id.clone(),
+        unknown_keyset_info_json,
     )
     .await;
     let offer = RelayPaymentOffer {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![keyset_id],
+        preferred_keyset_ids: vec![unknown_keyset_id],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -5780,29 +5788,59 @@ async fn test_channel_link_unknown_keyset_refreshes_once_then_rate_limits() {
         .attach_channel_to_session(&channel_id, *conn.session_id())
         .unwrap();
     let original = wallet.build_link_request(&channel_id, &offer).unwrap();
-    let foreign_mint = TestMintHelper::new().await.unwrap();
-    let first_unknown_keyset = foreign_mint.keyset_id().to_string();
-    let second_unknown_keyset = rotate_sat_keyset(&foreign_mint.mint(), 1)
-        .await
-        .unwrap()
-        .to_string();
-
-    for (unknown_keyset, expected_code) in [
-        (
-            first_unknown_keyset,
-            ServerErrorCode::LinkMintOrKeysetUnacceptable,
-        ),
-        (
-            second_unknown_keyset,
-            ServerErrorCode::LinkKeysetRefreshRateLimited,
-        ),
-    ] {
+    for corrupt_channel_id in [true, false] {
         let mut payment: serde_json::Value = serde_json::from_str(&original).unwrap();
-        payment["params"]["keyset_id"] = serde_json::json!(unknown_keyset);
+        let expected_code = if corrupt_channel_id {
+            payment["channel_id"] = serde_json::json!("00".repeat(32));
+            ServerErrorCode::LinkInvalidChannel
+        } else {
+            payment["funding_proofs"][0]["id"] = serde_json::json!(known_keyset_id);
+            ServerErrorCode::LinkInvalidPayment
+        };
         send_control_message(
             &mut control_send,
             &ClientMessage::ChannelLink {
                 payment_json: serde_json::to_string(&payment).unwrap(),
+            },
+            false,
+        )
+        .await;
+        match read_control_message(&mut control_recv).await {
+            ServerMessage::Error { code, .. } => assert_eq!(code, expected_code),
+            other => panic!("expected channel-link keyset error, got {other:?}"),
+        }
+    }
+    assert_eq!(keyset_requests.load(Ordering::SeqCst), 0);
+
+    let foreign_mint = TestMintHelper::new().await.unwrap();
+    let foreign_keyset_id = foreign_mint.keyset_id().to_string();
+    let foreign_wallet = TestSigningWallet::new(
+        foreign_mint.mint(),
+        offer.receiver_pubkey.clone(),
+        mint_url.clone(),
+        foreign_keyset_id.clone(),
+        foreign_mint.keyset_info_json().unwrap(),
+    )
+    .await;
+    let foreign_offer = RelayPaymentOffer {
+        preferred_keyset_ids: vec![foreign_keyset_id],
+        ..offer
+    };
+    let foreign_channel_id = foreign_wallet.pre_create_channel(1000).await.unwrap();
+    foreign_wallet
+        .attach_channel_to_session(&foreign_channel_id, *conn.session_id())
+        .unwrap();
+    let foreign_link = foreign_wallet
+        .build_link_request(&foreign_channel_id, &foreign_offer)
+        .unwrap();
+    for expected_code in [
+        ServerErrorCode::LinkMintOrKeysetUnacceptable,
+        ServerErrorCode::LinkKeysetRefreshRateLimited,
+    ] {
+        send_control_message(
+            &mut control_send,
+            &ClientMessage::ChannelLink {
+                payment_json: foreign_link.clone(),
             },
             false,
         )
@@ -5826,10 +5864,11 @@ async fn test_channel_link_unknown_keyset_refreshes_once_then_rate_limits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
     let mint_helper = TestMintHelper::new().await.unwrap();
-    let known_keyset_id = mint_helper.keyset_id().to_string();
-    let known_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let unknown_keyset_id = mint_helper.keyset_id().to_string();
+    let unknown_keyset_info_json = mint_helper.keyset_info_json().unwrap();
     let foreign_mint = TestMintHelper::new().await.unwrap();
-    let unknown_keyset_id = foreign_mint.keyset_id().to_string();
+    let known_keyset_id = foreign_mint.keyset_id().to_string();
+    let known_keyset_info_json = foreign_mint.keyset_info_json().unwrap();
     let (mint_url, mint_shutdown_tx) = start_failing_keysets_mint().await;
     let trusted_mint_units =
         BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
@@ -5862,15 +5901,15 @@ async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
         mint_helper.mint(),
         receiver_pubkey_hex.clone(),
         mint_url.clone(),
-        known_keyset_id.clone(),
-        known_keyset_info_json,
+        unknown_keyset_id.clone(),
+        unknown_keyset_info_json,
     )
     .await;
     let offer = RelayPaymentOffer {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![known_keyset_id],
+        preferred_keyset_ids: vec![unknown_keyset_id],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -5882,20 +5921,21 @@ async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
     wallet
         .attach_channel_to_session(&channel_id, *conn.session_id())
         .unwrap();
-    let mut payment: serde_json::Value =
-        serde_json::from_str(&wallet.build_link_request(&channel_id, &offer).unwrap()).unwrap();
-    payment["params"]["keyset_id"] = serde_json::json!(unknown_keyset_id);
     send_control_message(
         &mut control_send,
         &ClientMessage::ChannelLink {
-            payment_json: serde_json::to_string(&payment).unwrap(),
+            payment_json: wallet.build_link_request(&channel_id, &offer).unwrap(),
         },
         false,
     )
     .await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::Error { code, message } => {
-            assert_eq!(code, ServerErrorCode::LinkKeysetRefreshFailed);
+            assert_eq!(
+                code,
+                ServerErrorCode::LinkKeysetRefreshFailed,
+                "unexpected link error: {message}"
+            );
             assert!(message.contains("keyset refresh failed"));
         }
         other => panic!("expected automatic keyset refresh failure, got {other:?}"),
@@ -12749,7 +12789,7 @@ async fn test_connector_stores_negotiated_cashu_spilman_capabilities() {
 
     assert_eq!(
         conn.cashu_spilman_protocol_version().await.as_deref(),
-        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+        Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14)
     );
     assert_eq!(
         conn.cashu_spilman_keyset_versions().await,

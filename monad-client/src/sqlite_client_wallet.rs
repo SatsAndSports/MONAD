@@ -1454,32 +1454,46 @@ impl SqliteClientWallet {
         output_keyset: SelectedOutputKeyset,
         reservation: ProofReservation,
         plan: ClientOpenPlan,
+        classify_preflight_as_offer_unavailable: bool,
     ) -> Result<ClientOpenAttempt, WalletError> {
-        let input_proofs_json = match proofs_json_from_reservation(&reservation) {
-            Ok(json) => json,
-            Err(e) => {
-                return Err(e);
+        let preflight_error = |error: WalletError| {
+            if classify_preflight_as_offer_unavailable {
+                WalletError::ProvisioningOfferUnavailable {
+                    mint_url: offer.mint_url.clone(),
+                    unit: offer.unit.clone(),
+                    reason: error.to_string(),
+                }
+            } else {
+                error
             }
         };
+        let input_proofs_json =
+            proofs_json_from_reservation(&reservation).map_err(&preflight_error)?;
 
-        let networking = OpeningRecoveryHttpNetworking::new().map_err(WalletError::Backend)?;
+        let networking = OpeningRecoveryHttpNetworking::new()
+            .map_err(WalletError::Backend)
+            .map_err(&preflight_error)?;
         let input_keyset_lookup = {
             let bridge = self
                 .bridge
                 .lock()
-                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))
+                .map_err(&preflight_error)?;
             proof_input_keysets_from_cache(&bridge, &offer.mint_url, &offer.unit, &reservation)
-                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))?
+                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))
+                .map_err(&preflight_error)?
         };
         let input_keysets_json =
             proof_input_keysets_json(input_keyset_lookup, &offer.mint_url, &networking)
-                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))?;
+                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))
+                .map_err(&preflight_error)?;
 
         let prepared = {
             let bridge = self
                 .bridge
                 .lock()
-                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))
+                .map_err(&preflight_error)?;
             bridge
                 .prepare_open_channel_from_proofs_with_input_keysets(
                     &offer.mint_url,
@@ -1494,10 +1508,12 @@ impl SqliteClientWallet {
                     plan.requested_capacity_raw,
                     plan.desired_funding_token_amount_raw,
                 )
-                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))?
+                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))
+                .map_err(&preflight_error)?
         };
         let prepared_open_json = serde_json::to_string(&prepared)
-            .map_err(|e| WalletError::Backend(format!("serialize opening attempt: {e}")))?;
+            .map_err(|e| WalletError::Backend(format!("serialize opening attempt: {e}")))
+            .map_err(&preflight_error)?;
         let journal = NewOpeningAttempt {
             attempt_id: prepared.channel_id.clone(),
             opening_id: prepared.channel_id.clone(),
@@ -1862,9 +1878,9 @@ impl SqliteClientWallet {
                     }
                 };
                 let OutputKeysetSelection::Selected(output_keyset) = output_keyset else {
-                    let _ = self
-                        .loose_wallet
-                        .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
+                    self.loose_wallet
+                        .cancel_rejected_opening_attempt(&attempt.prepared.channel_id)
+                        .map_err(loose_proof_error)?;
                     return Err(WalletError::NoCompatibleActiveKeyset {
                         mint_url: offer.mint_url.clone(),
                         unit: offer.unit.clone(),
@@ -2200,6 +2216,7 @@ impl SqliteClientWallet {
                 selected_input_msats,
                 expiry_timestamp,
             },
+            false,
         )
     }
 }
@@ -2338,7 +2355,6 @@ impl MonadWallet for SqliteClientWallet {
         // the caller is willing to commit. Upstream constructs the channel from
         // these proofs and returns the actual usable capacity, which may be lower
         // after Cashu input/output fees are applied.
-        self.ensure_offer_keysets_cached(offer)?;
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
         let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
         // Plain provisioning uses an input budget rather than an exact target
@@ -2366,14 +2382,27 @@ impl MonadWallet for SqliteClientWallet {
             }
         }
         if total < input_budget_raw {
-            return Err(loose_proof_error(
-                LooseProofWalletError::InsufficientBalance {
-                    requested: input_budget_raw,
-                    available: total,
-                },
-            ));
+            return Err(WalletError::InsufficientLooseProofFunds {
+                mint_url: offer.mint_url.clone(),
+                unit: offer.unit.clone(),
+                requested_raw: input_budget_raw,
+                available_raw: total,
+            });
         }
-        let output_keyset = self.select_output_keyset_refreshing_client_first(offer)?;
+        self.ensure_offer_keysets_cached(offer).map_err(|error| {
+            WalletError::ProvisioningOfferUnavailable {
+                mint_url: offer.mint_url.clone(),
+                unit: offer.unit.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        let output_keyset = self
+            .select_output_keyset_refreshing_client_first(offer)
+            .map_err(|error| WalletError::ProvisioningOfferUnavailable {
+                mint_url: offer.mint_url.clone(),
+                unit: offer.unit.clone(),
+                reason: error.to_string(),
+            })?;
         let attempt = self.prepare_open_attempt(
             offer,
             output_keyset,
@@ -2388,6 +2417,7 @@ impl MonadWallet for SqliteClientWallet {
                 selected_input_msats: input_budget_msats,
                 expiry_timestamp,
             },
+            true,
         )?;
         self.execute_open_attempt(offer, attempt, true)
     }
@@ -5725,6 +5755,87 @@ mod tests {
 
         let selected = active_output_keyset_id_from_cache(&bridge, &offer).unwrap();
         assert_eq!(selected, OutputKeysetSelection::NoCompatibleActiveKeyset);
+    }
+
+    #[tokio::test]
+    async fn plain_provisioning_reports_insufficient_funds_before_keyset_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let loose = LooseProofWallet::open(temp.path().join("loose.sqlite"), "alice").unwrap();
+        let wallet = SqliteClientWallet::open(
+            loose,
+            temp.path().join("channels.sqlite"),
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        let mint_url = "http://127.0.0.1:1";
+        let keyset_id =
+            test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101")
+                .to_string();
+        let receiver_pubkey = SecretKey::generate().public_key().to_hex();
+
+        let error = wallet
+            .provision_channel(&offer(mint_url, &receiver_pubkey, &keyset_id), 1_000)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            WalletError::InsufficientLooseProofFunds {
+                mint_url: mint_url.to_string(),
+                unit: "sat".to_string(),
+                requested_raw: 1,
+                available_raw: 0,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plain_provisioning_classifies_keyset_io_as_offer_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let loose = LooseProofWallet::open(temp.path().join("loose.sqlite"), "alice").unwrap();
+        let wallet = SqliteClientWallet::open(
+            loose,
+            temp.path().join("channels.sqlite"),
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        let mint_url = "http://127.0.0.1:1";
+        let keyset_id =
+            test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101")
+                .to_string();
+        wallet
+            .loose_wallet()
+            .import_proofs(&[NewLooseProof {
+                proof_id: "proof".to_string(),
+                mint_url: mint_url.to_string(),
+                unit: "sat".to_string(),
+                keyset_id: keyset_id.clone(),
+                amount_raw: 1,
+                proof_json: "{}".to_string(),
+                source_quote_id: None,
+                source_batch_id: None,
+            }])
+            .unwrap();
+        let receiver_pubkey = SecretKey::generate().public_key().to_hex();
+
+        let error = wallet
+            .provision_channel(&offer(mint_url, &receiver_pubkey, &keyset_id), 1_000)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WalletError::ProvisioningOfferUnavailable {
+                mint_url: failed_mint_url,
+                unit,
+                ..
+            } if failed_mint_url == mint_url && unit == "sat"
+        ));
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .available_balance_raw(mint_url, "sat", &[keyset_id])
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

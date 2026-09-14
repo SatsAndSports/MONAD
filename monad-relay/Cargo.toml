@@ -23,6 +23,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 dotenvy = "0.15"
 rusqlite = "0.31"
+sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "db9fb52954224d2f49b144eab0b00d08db368f26", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest"] }
 cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.17.6", package = "cashu", default-features = false }

@@ -5,7 +5,7 @@ use std::io;
 
 pub const BOOTSTRAP_VERSION: u8 = 1;
 pub const SESSION_PROTOCOL_H2: &str = "h2";
-pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29: &str = "2026-08-29";
+pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14: &str = "2026-09-14";
 pub const CASHU_SPILMAN_KEYSET_VERSION_V1: &str = "v1";
 pub const CASHU_SPILMAN_KEYSET_VERSION_V2: &str = "v2";
 pub const PRICING_POLICY_SESSION_CONSTANT: &str = "session_constant";
@@ -94,7 +94,7 @@ pub fn server_accept_v1(capabilities: BootstrapCapabilities) -> BootstrapV1Serve
     BootstrapV1ServerAccept {
         session_protocol: SESSION_PROTOCOL_H2.to_string(),
         capabilities,
-        cashu_spilman_protocol_version: Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string()),
+        cashu_spilman_protocol_version: Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string()),
         cashu_spilman_keyset_versions: Some(supported_cashu_spilman_keyset_versions()),
         pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
     }
@@ -128,7 +128,7 @@ pub fn supported_cashu_spilman_keyset_versions() -> BTreeSet<String> {
 
 pub fn supported_cashu_spilman_protocol_keyset_versions() -> CashuSpilmanProtocolKeysetVersions {
     BTreeMap::from([(
-        CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+        CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
         supported_cashu_spilman_keyset_versions(),
     )])
 }
@@ -322,7 +322,7 @@ mod tests {
         ] {
             let mut hello = decode_v1_client_hello(&initial_client_hello()).unwrap();
             hello.cashu_spilman_protocol_keyset_versions.insert(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
                 offered.into_iter().map(String::from).collect(),
             );
             let selected = select_cashu_spilman_protocol_keyset_versions(
@@ -349,7 +349,7 @@ mod tests {
         let mut accept = initial_server_accept_v1();
         hello
             .cashu_spilman_protocol_keyset_versions
-            .get_mut(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+            .get_mut(CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14)
             .unwrap()
             .remove("v2");
         assert!(validate_v1_server_accept(&accept, &hello).is_err());
@@ -387,7 +387,7 @@ mod tests {
                 "nested_monad_over_tcp": true,
                 "nested_monad_over_quic": true
             },
-            "cashu_spilman_protocol_version": "2026-08-29",
+            "cashu_spilman_protocol_version": "2026-09-14",
             "cashu_spilman_keyset_versions": ["v1", "v2"],
             "pricing_policy": "session_constant"
         });
@@ -400,7 +400,7 @@ mod tests {
         assert!(!decoded.capabilities.tweaked_noise_v1);
         assert_eq!(
             decoded.cashu_spilman_protocol_version.as_deref(),
-            Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29)
+            Some(CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14)
         );
         assert_eq!(
             decoded.pricing_policy.as_deref(),
@@ -420,7 +420,7 @@ mod tests {
                 tweaked_noise_v1: true,
             },
             cashu_spilman_protocol_version: Some(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
             ),
             cashu_spilman_keyset_versions: Some(supported_cashu_spilman_keyset_versions()),
             pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
@@ -440,7 +440,7 @@ mod tests {
                     json!({
                         "session_protocols": ["h2"],
                         "cashu_spilman_protocol_keyset_versions": {
-                            "2026-08-29": ["v1", "v2"]
+                            "2026-09-14": ["v1", "v2"]
                         },
                         "pricing_policies": ["session_constant"]
                     }),
@@ -482,7 +482,7 @@ mod tests {
             session_protocol: "future".to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: Some(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
             ),
             cashu_spilman_keyset_versions: Some(supported_cashu_spilman_keyset_versions()),
             pricing_policy: Some(PRICING_POLICY_SESSION_CONSTANT.to_string()),
@@ -529,11 +529,11 @@ mod tests {
     }
 
     #[test]
-    fn v1_rejects_the_pre_canonical_spilman_protocol_version() {
+    fn v1_rejects_the_explicit_refresh_spilman_protocol_version() {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
             cashu_spilman_protocol_keyset_versions: BTreeMap::from([(
-                "2026-03-20".to_string(),
+                "2026-08-29".to_string(),
                 supported_cashu_spilman_keyset_versions(),
             )]),
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
@@ -541,7 +541,7 @@ mod tests {
         assert_eq!(
             validate_v1_client_hello(&hello),
             Err(
-                "unsupported cashu_spilman_protocol_keyset_versions: {\"2026-03-20\": {\"v1\", \"v2\"}}"
+                "unsupported cashu_spilman_protocol_keyset_versions: {\"2026-08-29\": {\"v1\", \"v2\"}}"
                     .to_string()
             )
         );
@@ -550,11 +550,11 @@ mod tests {
     #[test]
     fn selects_full_mutual_keyset_version_set() {
         let client_versions = BTreeMap::from([(
-            CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+            CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
             BTreeSet::from(["v1".to_string(), "v2".to_string(), "v3".to_string()]),
         )]);
         let server_versions = BTreeMap::from([(
-            CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+            CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
             BTreeSet::from(["v1".to_string(), "v2".to_string()]),
         )]);
         let selected = select_cashu_spilman_protocol_keyset_versions_from_supported(
@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(
             selected,
             Some((
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
                 supported_cashu_spilman_keyset_versions(),
             ))
         );
@@ -573,11 +573,11 @@ mod tests {
     #[test]
     fn selects_nonempty_intersection() {
         let client_versions = BTreeMap::from([(
-            CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+            CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
             BTreeSet::from(["v1".to_string(), "v2".to_string(), "v3".to_string()]),
         )]);
         let server_versions = BTreeMap::from([(
-            CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+            CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
             BTreeSet::from(["v2".to_string(), "v3".to_string()]),
         )]);
 
@@ -587,7 +587,7 @@ mod tests {
                 &server_versions,
             ),
             Some((
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
                 BTreeSet::from(["v2".to_string(), "v3".to_string()])
             ))
         );
@@ -598,7 +598,7 @@ mod tests {
         let hello = BootstrapV1ClientHello {
             session_protocols: vec![SESSION_PROTOCOL_H2.to_string()],
             cashu_spilman_protocol_keyset_versions: BTreeMap::from([(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
                 BTreeSet::from([CASHU_SPILMAN_KEYSET_VERSION_V1.to_string()]),
             )]),
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],
@@ -705,7 +705,7 @@ mod tests {
             session_protocol: SESSION_PROTOCOL_H2.to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: Some(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
             ),
             cashu_spilman_keyset_versions: Some(supported_cashu_spilman_keyset_versions()),
             pricing_policy: None,
@@ -725,7 +725,7 @@ mod tests {
             session_protocol: SESSION_PROTOCOL_H2.to_string(),
             capabilities: initial_server_capabilities(),
             cashu_spilman_protocol_version: Some(
-                CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
             ),
             cashu_spilman_keyset_versions: Some(supported_cashu_spilman_keyset_versions()),
             pricing_policy: Some("future".to_string()),

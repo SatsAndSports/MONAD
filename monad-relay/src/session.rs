@@ -1033,7 +1033,7 @@ mod tests {
     use crate::listener::{shared_spilman_mint_cache, CachedKeyset, SpilmanMintCache};
     use crate::payments::{testing::InMemoryRelayPayments, LinkError};
     use monad_common::bootstrap::{
-        supported_cashu_spilman_keyset_versions, CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29,
+        supported_cashu_spilman_keyset_versions, CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14,
     };
     use std::collections::BTreeMap;
 
@@ -1053,7 +1053,7 @@ mod tests {
                 )]),
                 keyset_refresh: None,
                 cashu_spilman_protocol_version: Some(
-                    CASHU_SPILMAN_PROTOCOL_VERSION_2026_08_29.to_string(),
+                    CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14.to_string(),
                 ),
                 cashu_spilman_keyset_versions: Some(BTreeSet::from(["v1".to_string()])),
                 in_bytes_per_millisat: 1,

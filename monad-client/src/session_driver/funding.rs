@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use monad_common::control_codec::send_json_line;
-use monad_common::protocol::{ClientMessage, ServerErrorCode};
+use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerErrorCode};
+use std::collections::BTreeSet;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant};
@@ -69,6 +70,43 @@ fn choose_channel_and_offer(
         }
     }
     Ok(None)
+}
+
+fn provisioning_offer_is_unavailable(error: &WalletError) -> bool {
+    matches!(
+        error,
+        WalletError::NoCompatibleActiveKeyset { .. }
+            | WalletError::InsufficientLooseProofFunds { .. }
+            | WalletError::ProvisioningOfferUnavailable { .. }
+    )
+}
+
+fn provision_from_advertisements<F>(
+    receiver_pubkey: &str,
+    advertisements: &[KeysetAdvertisement],
+    versions: &BTreeSet<String>,
+    mut provision: F,
+) -> Result<Option<(String, RelayPaymentOffer)>, WalletError>
+where
+    F: FnMut(&RelayPaymentOffer) -> Result<String, WalletError>,
+{
+    let mut unavailable = None;
+    for advertisement in advertisements {
+        let offer = RelayPaymentOffer::from_advertisement(
+            receiver_pubkey.to_string(),
+            advertisement,
+            versions,
+        );
+        match provision(&offer) {
+            Ok(channel_id) => return Ok(Some((channel_id, offer))),
+            Err(error) if provisioning_offer_is_unavailable(&error) => unavailable = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    match unavailable {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 async fn send_channel_link(
@@ -258,50 +296,31 @@ pub(super) async fn maybe_ensure_linked_channel(
                 else {
                     return Ok(());
                 };
-                let mut selected = None;
-                let mut no_compatible = None;
-                for advertisement in &advertisements {
-                    let offer = RelayPaymentOffer::from_advertisement(
-                        receiver_pubkey.clone(),
-                        advertisement,
-                        &versions,
-                    );
-                    info!(
-                        "{} provisioning new channel for mint={} unit={} | {}",
-                        config.hop_label,
-                        offer.mint_url,
-                        offer.unit,
-                        state_summary(state, &config.conn.cleartext_byte_counters)
-                    );
-                    match config
-                        .wallet
-                        .provision_channel(&offer, config.payment_policy.channel_input_budget_msats)
-                    {
-                        Ok(channel_id) => {
-                            selected = Some((channel_id, offer));
-                            break;
-                        }
-                        Err(error @ WalletError::NoCompatibleActiveKeyset { .. }) => {
-                            no_compatible = Some(error);
-                        }
-                        Err(error) => {
-                            if matches!(error, WalletError::Backend(_)) {
-                                set_blocked_reason(
-                                    config,
-                                    state,
-                                    FundingBlockedReason::ChannelAcquire,
-                                    &error.to_string(),
-                                )?;
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-                let Some((channel_id, offer)) = selected else {
-                    if let Some(error) = no_compatible {
+                let selected = provision_from_advertisements(
+                    &receiver_pubkey,
+                    &advertisements,
+                    &versions,
+                    |offer| {
+                        info!(
+                            "{} provisioning new channel for mint={} unit={} | {}",
+                            config.hop_label,
+                            offer.mint_url,
+                            offer.unit,
+                            state_summary(state, &config.conn.cleartext_byte_counters)
+                        );
+                        config.wallet.provision_channel(
+                            offer,
+                            config.payment_policy.channel_input_budget_msats,
+                        )
+                    },
+                );
+                let (channel_id, offer) = match selected {
+                    Ok(Some(selected)) => selected,
+                    Ok(None) => return Ok(()),
+                    Err(error) if provisioning_offer_is_unavailable(&error) => {
                         if state.ready_signaled {
                             warn!(
-                                "{} deferring funding after client keyset selection failed: {} | {}",
+                                "{} deferring funding after advertised offers were unavailable: {} | {}",
                                 config.hop_label,
                                 error,
                                 state_summary(state, &config.conn.cleartext_byte_counters)
@@ -316,8 +335,19 @@ pub(super) async fn maybe_ensure_linked_channel(
                                 &error.to_string(),
                             )?;
                         }
+                        return Ok(());
                     }
-                    return Ok(());
+                    Err(error) => {
+                        if matches!(error, WalletError::Backend(_)) {
+                            set_blocked_reason(
+                                config,
+                                state,
+                                FundingBlockedReason::ChannelAcquire,
+                                &error.to_string(),
+                            )?;
+                        }
+                        return Ok(());
+                    }
                 };
                 let channel = match config.wallet.get_channel(&channel_id) {
                     Ok(channel) => channel,
@@ -570,4 +600,73 @@ pub(super) fn defer_link_after_refresh_error(
 
 pub(super) async fn handle_control_detached(config: &SessionDriverConfig, state: &mut DriverState) {
     terminate_session(config, state).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn advertisement(mint_url: &str) -> KeysetAdvertisement {
+        KeysetAdvertisement {
+            mint_url: mint_url.to_string(),
+            unit: "sat".to_string(),
+            keyset_ids: Vec::new(),
+            in_bytes_per_millisat: 1,
+            out_bytes_per_millisat: 1,
+        }
+    }
+
+    #[test]
+    fn provisioning_tries_later_offer_after_preflight_insufficient_funds() {
+        let advertisements = [
+            advertisement("https://mint-a"),
+            advertisement("https://mint-b"),
+        ];
+        let versions = BTreeSet::from(["v2".to_string()]);
+        let mut attempted = Vec::new();
+
+        let selected =
+            provision_from_advertisements("receiver", &advertisements, &versions, |offer| {
+                attempted.push(offer.mint_url.clone());
+                if offer.mint_url == "https://mint-a" {
+                    Err(WalletError::InsufficientLooseProofFunds {
+                        mint_url: offer.mint_url.clone(),
+                        unit: offer.unit.clone(),
+                        requested_raw: 10,
+                        available_raw: 5,
+                    })
+                } else {
+                    Ok("channel-b".to_string())
+                }
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(attempted, ["https://mint-a", "https://mint-b"]);
+        assert_eq!(selected.0, "channel-b");
+        assert_eq!(selected.1.mint_url, "https://mint-b");
+    }
+
+    #[test]
+    fn provisioning_does_not_try_later_offer_after_ambiguous_error() {
+        let advertisements = [
+            advertisement("https://mint-a"),
+            advertisement("https://mint-b"),
+        ];
+        let versions = BTreeSet::from(["v2".to_string()]);
+        let mut attempted = Vec::new();
+
+        let error =
+            provision_from_advertisements("receiver", &advertisements, &versions, |offer| {
+                attempted.push(offer.mint_url.clone());
+                Err(WalletError::Backend("input may be spent".to_string()))
+            })
+            .unwrap_err();
+
+        assert_eq!(attempted, ["https://mint-a"]);
+        assert_eq!(
+            error,
+            WalletError::Backend("input may be spent".to_string())
+        );
+    }
 }

@@ -91,12 +91,31 @@ impl WalletChannel {
 pub enum WalletError {
     NotFound,
     NotOpen,
-    AttachedToDifferentSession { current: [u8; 32] },
-    InsufficientCapacity { requested: u64, capacity: u64 },
+    AttachedToDifferentSession {
+        current: [u8; 32],
+    },
+    InsufficientCapacity {
+        requested: u64,
+        capacity: u64,
+    },
     NoNewFunds,
     ChannelUnusable,
     OfferMismatch(String),
-    NoCompatibleActiveKeyset { mint_url: String, unit: String },
+    NoCompatibleActiveKeyset {
+        mint_url: String,
+        unit: String,
+    },
+    InsufficientLooseProofFunds {
+        mint_url: String,
+        unit: String,
+        requested_raw: u64,
+        available_raw: u64,
+    },
+    ProvisioningOfferUnavailable {
+        mint_url: String,
+        unit: String,
+        reason: String,
+    },
     Backend(String),
 }
 
@@ -121,6 +140,23 @@ impl fmt::Display for WalletError {
             Self::NoCompatibleActiveKeyset { mint_url, unit } => write!(
                 f,
                 "no compatible active keyset for mint={mint_url} unit={unit}"
+            ),
+            Self::InsufficientLooseProofFunds {
+                mint_url,
+                unit,
+                requested_raw,
+                available_raw,
+            } => write!(
+                f,
+                "insufficient loose proofs for mint={mint_url} unit={unit}: requested={requested_raw} available={available_raw}"
+            ),
+            Self::ProvisioningOfferUnavailable {
+                mint_url,
+                unit,
+                reason,
+            } => write!(
+                f,
+                "provisioning offer unavailable for mint={mint_url} unit={unit}: {reason}"
             ),
             Self::Backend(message) => write!(f, "backend error: {message}"),
         }

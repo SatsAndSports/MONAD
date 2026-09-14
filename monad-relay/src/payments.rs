@@ -14,6 +14,7 @@ use cdk_spilman::{
 };
 use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
@@ -224,6 +225,7 @@ pub struct SpilmanRelayPayments {
     store: ChannelStore,
     mint_cache: SharedSpilmanMintCache,
     trusted_mint_units: TrustedMintUnits,
+    receiver_secret: SecretKey,
 }
 
 impl SpilmanRelayPayments {
@@ -250,7 +252,7 @@ impl SpilmanRelayPayments {
         store: ChannelStore,
     ) -> Self {
         let host = MonadHost {
-            receiver_secret,
+            receiver_secret: receiver_secret.clone(),
             mint_cache: mint_cache.clone(),
             trusted_mint_units: trusted_mint_units.clone(),
             channel_policy,
@@ -261,6 +263,7 @@ impl SpilmanRelayPayments {
             store,
             mint_cache,
             trusted_mint_units,
+            receiver_secret,
         }
     }
 
@@ -316,6 +319,111 @@ impl SpilmanRelayPayments {
             .expect("spilman mint cache lock poisoned")
             .keyset_unit(mint_url, keyset_id)
             .is_some_and(|cached_unit| cached_unit != claimed_unit)
+    }
+
+    fn prevalidate_unknown_keyset_link(
+        &self,
+        payment: &Payment,
+        params: &serde_json::Value,
+        keyset_id: &Id,
+    ) -> Result<(), LinkError> {
+        let invalid = |message: &str| LinkError::InvalidPayment(message.to_string());
+        let mint = params["mint"]
+            .as_str()
+            .ok_or_else(|| invalid("missing mint"))?;
+        if mint.contains('|') {
+            return Err(invalid("mint URL contains invalid delimiter"));
+        }
+        let mint = mint.trim_end_matches('/');
+        let unit = params["unit"]
+            .as_str()
+            .ok_or_else(|| invalid("missing unit"))?;
+        if unit.contains('|') {
+            return Err(invalid("unit contains invalid delimiter"));
+        }
+        let unit: CurrencyUnit = unit
+            .parse()
+            .map_err(|error| invalid(&format!("invalid unit: {error}")))?;
+        let required_u64 = |field: &str| {
+            params[field]
+                .as_u64()
+                .ok_or_else(|| invalid(&format!("missing {field}")))
+        };
+        let capacity = required_u64("capacity")?;
+        let funding_token_amount = required_u64("funding_token_amount")?;
+        let input_fee_ppk = required_u64("input_fee_ppk")?;
+        if input_fee_ppk > 999 {
+            return Err(invalid("input_fee_ppk exceeds 999"));
+        }
+        let maximum_amount = required_u64("maximum_amount")?;
+        let setup_timestamp = required_u64("setup_timestamp")?;
+        let expiry_timestamp = required_u64("expiry_timestamp")?;
+        let sender_pubkey: PublicKey = params["sender_pubkey"]
+            .as_str()
+            .ok_or_else(|| invalid("missing sender_pubkey"))?
+            .parse()
+            .map_err(|error| invalid(&format!("invalid sender_pubkey: {error}")))?;
+        let receiver_pubkey: PublicKey = params["receiver_pubkey"]
+            .as_str()
+            .ok_or_else(|| invalid("missing receiver_pubkey"))?
+            .parse()
+            .map_err(|error| invalid(&format!("invalid receiver_pubkey: {error}")))?;
+        if receiver_pubkey != self.receiver_secret.public_key() {
+            return Err(LinkError::ReceiverKeyMismatch);
+        }
+
+        let channel_secret = compute_channel_secret_from_hex(
+            &self.receiver_secret.to_secret_hex(),
+            &sender_pubkey.to_hex(),
+        )
+        .map_err(LinkError::InvalidPayment)?;
+        // Keep this canonical input aligned with cdk-spilman's pinned
+        // ChannelParameters::get_channel_id_bytes implementation.
+        let channel_id_input = format!(
+            "{mint}|{unit}|{capacity}|{funding_token_amount}|{keyset_id}|{input_fee_ppk}|{maximum_amount}|{setup_timestamp}|{}|{}|{expiry_timestamp}|{channel_secret}",
+            sender_pubkey.to_hex(),
+            receiver_pubkey.to_hex(),
+        );
+        let expected_channel_id = hex::encode(Sha256::digest(channel_id_input.as_bytes()));
+        if payment.channel_id != expected_channel_id {
+            return Err(LinkError::InvalidChannel(
+                "channel ID does not match funding parameters".to_string(),
+            ));
+        }
+
+        let proofs = payment
+            .funding_proofs
+            .as_deref()
+            .ok_or_else(|| LinkError::InvalidPayment("missing funding_proofs".to_string()))?;
+        if proofs.is_empty() {
+            return Err(LinkError::InvalidPayment(
+                "funding_proofs is empty".to_string(),
+            ));
+        }
+        let mut proof_total = 0u64;
+        for proof in proofs {
+            if proof.keyset_id != *keyset_id {
+                return Err(LinkError::InvalidPayment(
+                    "funding proof keyset does not match parameters".to_string(),
+                ));
+            }
+            if proof.dleq.is_none() {
+                return Err(LinkError::InvalidPayment(
+                    "funding proof is missing DLEQ data".to_string(),
+                ));
+            }
+            proof_total = proof_total
+                .checked_add(u64::from(proof.amount))
+                .ok_or_else(|| {
+                    LinkError::InvalidPayment("funding proof total overflow".to_string())
+                })?;
+        }
+        if proof_total != funding_token_amount {
+            return Err(LinkError::InvalidPayment(
+                "funding proof total does not match parameters".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn close_channel<M: SpilmanMintClient, R: SpilmanKeysetRefresher>(
@@ -610,6 +718,9 @@ impl RelayPayments for SpilmanRelayPayments {
                 return Err(LinkError::MintOrKeysetNotAcceptable);
             }
             let refresh_target = self.unknown_trusted_keyset_target(&params, &id);
+            if refresh_target.is_some() {
+                self.prevalidate_unknown_keyset_link(&payment, &params, &id)?;
+            }
             // First link validates funding, then explicitly records it so MONAD
             // controls the persistence boundary around session ownership.
             let validated =

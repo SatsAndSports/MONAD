@@ -750,7 +750,7 @@ mod tests {
                 });
                 let mut hello = initial_client_hello();
                 hello.versions.get_mut("1").unwrap()["cashu_spilman_protocol_keyset_versions"] =
-                    serde_json::json!({"2026-08-29": [version]});
+                    serde_json::json!({"2026-09-14": [version]});
                 let result = handshake_initiator_with_pubkey_and_hello(
                     &mut client,
                     pubkey.to_compressed_bytes(),

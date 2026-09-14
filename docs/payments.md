@@ -94,7 +94,7 @@ Consequences:
 
 - `SessionStatus` advertises configured trusted mint/unit options in relay preference order. Each ordered relay-known keyset list may be empty and is not an exhaustive accepted-ID allowlist.
 - the client prefers advertised active IDs, but may use another locally active keyset for the same mint/unit when its format was negotiated. When nonempty preferences are unavailable locally, it refreshes its own mint cache before using a fallback; it also refreshes before reporting that no compatible active keyset exists.
-- first-time `ChannelLink` accepts known keysets that belong to a trusted unit for that mint. If such a keyset is unknown, the relay transparently uses its bounded refresh coordinator and retries the immutable link once.
+- first-time `ChannelLink` accepts known keysets that belong to a trusted unit for that mint. If such a keyset is unknown, the relay first performs metadata-independent channel and proof-structure checks, then transparently uses its bounded refresh coordinator and retries the immutable link once.
 - old inactive keysets can remain usable for existing channels as long as the keyset metadata is known.
 - channel close and relay drain swaps start from the shared cache and refresh that mint into SQLite and memory only if the mint rejects the swap with a keyset error.
 
