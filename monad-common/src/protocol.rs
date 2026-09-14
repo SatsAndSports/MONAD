@@ -15,8 +15,9 @@ pub type MintUnitKeysets = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
 /// Advertisement for a specific mint/unit pricing option.
 ///
-/// `keyset_ids` are the relay-known keysets accepted by policy for this
-/// mint/unit; they are not necessarily all active output keysets at the mint.
+/// `keyset_ids` are relay-known preferences for this mint/unit and may include
+/// inactive keysets. Clients may use another active keyset with a negotiated
+/// format; the relay validates and refreshes its cache when that channel links.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeysetAdvertisement {
     pub mint_url: String,

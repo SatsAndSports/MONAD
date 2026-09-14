@@ -68,9 +68,8 @@ pub async fn start_session_payment_driver(
 #[cfg(test)]
 mod tests {
     use super::funding::{
-        defer_link_after_refresh_error, keyset_refresh_hint_is_suppressed,
-        link_refresh_retry_delay, KEYSET_REFRESH_HINT_RETRY_COOLDOWN,
-        LINK_REFRESH_BUSY_RETRY_DELAY, LINK_REFRESH_RETRY_COOLDOWN,
+        defer_link_after_refresh_error, link_refresh_retry_delay, LINK_REFRESH_BUSY_RETRY_DELAY,
+        LINK_REFRESH_RETRY_COOLDOWN,
     };
     use super::payment::{
         channel_signed_balance_raw, exclude_on_wallet_error, plan_payment_topup,
@@ -79,9 +78,8 @@ mod tests {
         validate_session_status_baseline_against_local_counters, PaymentTopupPlan,
     };
     use super::state::{
-        apply_session_status, pre_ready_blocked_error, relay_confirms_intended_channel,
-        set_keyset_refresh_in_flight, ControlOpInFlight, DriverState, FundingBlockedReason,
-        KeysetRefreshHint, RelaySnapshot,
+        current_spilman_info, pre_ready_blocked_error, relay_confirms_intended_channel,
+        set_link_in_flight, ControlOpInFlight, DriverState, FundingBlockedReason, RelaySnapshot,
     };
     use super::PaymentPolicy;
     use crate::wallet::WalletError;
@@ -101,7 +99,7 @@ mod tests {
             advertisements: vec![KeysetAdvertisement {
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
-                keyset_ids: vec!["keyset-a".to_string()],
+                keyset_ids: vec!["0000000000000001".to_string()],
                 in_bytes_per_millisat: 1,
                 out_bytes_per_millisat: 1,
             }],
@@ -127,7 +125,7 @@ mod tests {
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
-                keyset_id: "keyset-a".to_string(),
+                keyset_id: "0000000000000001".to_string(),
                 attached_session_id: None,
                 capacity_msats: 1000,
                 current_signed_balance_msats: 0,
@@ -191,6 +189,10 @@ mod tests {
             monad_common::session::RelayConnection::from_transport_stream(client, [1; 32])
                 .await
                 .unwrap();
+        conn.set_cashu_spilman_keyset_versions(Some(std::collections::BTreeSet::from([
+            "v1".to_string()
+        ])))
+        .await;
         conn.add_driver(driver);
         let (handle, ready, failed) = super::start_session_payment_driver(
             &conn,
@@ -243,6 +245,30 @@ mod tests {
     }
 
     #[test]
+    fn intended_spilman_info_uses_selected_channel_keyset() {
+        let mut state = DriverState::default();
+        set_link_in_flight(
+            &mut state,
+            "channel".to_string(),
+            "0000000000000002".to_string(),
+            crate::wallet::RelayPaymentOffer {
+                receiver_pubkey: "receiver".to_string(),
+                mint_url: "https://mint".to_string(),
+                unit: "sat".to_string(),
+                preferred_keyset_ids: vec!["0000000000000001".to_string()],
+                negotiated_keyset_versions: std::collections::BTreeSet::from(["v1".to_string()]),
+                in_bytes_per_millisat: 1,
+                out_bytes_per_millisat: 1,
+            },
+        );
+
+        assert_eq!(
+            current_spilman_info(&state).unwrap().keyset_id,
+            "0000000000000002"
+        );
+    }
+
+    #[test]
     fn transient_link_refresh_errors_preserve_channel_and_back_off() {
         for code in [
             ServerErrorCode::LinkKeysetRefreshRateLimited,
@@ -279,7 +305,7 @@ mod tests {
         ));
         assert_eq!(state.intended_channel_id.as_deref(), Some("channel"));
         assert_eq!(
-            state.link_retry_not_before,
+            state.funding_retry_not_before,
             Some(now + LINK_REFRESH_RETRY_COOLDOWN)
         );
     }
@@ -758,103 +784,15 @@ mod tests {
         assert!(exclude_on_wallet_error(&WalletError::OfferMismatch(
             "nope".to_string()
         )));
-        assert!(exclude_on_wallet_error(&WalletError::StaleRelayKeysets {
-            mint_url: "https://mint".to_string(),
-            unit: "msat".to_string(),
-            accepted_keyset_ids: vec!["keyset-a".to_string()],
-        }));
+        assert!(!exclude_on_wallet_error(
+            &WalletError::NoCompatibleActiveKeyset {
+                mint_url: "https://mint".to_string(),
+                unit: "msat".to_string(),
+            }
+        ));
         assert!(!exclude_on_wallet_error(&WalletError::Backend(
             "boom".to_string()
         )));
-    }
-
-    #[test]
-    fn session_status_clears_keyset_refresh_in_flight() {
-        let hint = KeysetRefreshHint {
-            mint_url: "https://mint".to_string(),
-            unit: "msat".to_string(),
-            accepted_keyset_ids: vec!["keyset-a".to_string()],
-        };
-        let mut state = DriverState::default();
-        set_keyset_refresh_in_flight(&mut state, hint.clone());
-
-        let resolved_payment = apply_session_status(&mut state, snapshot(true));
-
-        assert!(!resolved_payment);
-        assert!(state.control_op_in_flight.is_none());
-        assert_eq!(state.last_keyset_refresh_hint, Some(hint));
-        assert!(state.last_keyset_refresh_hint_at.is_some());
-    }
-
-    #[test]
-    fn changed_advertisement_clears_last_keyset_refresh_hint() {
-        let hint = KeysetRefreshHint {
-            mint_url: "https://mint".to_string(),
-            unit: "msat".to_string(),
-            accepted_keyset_ids: vec!["keyset-a".to_string()],
-        };
-        let mut state = DriverState {
-            control_op_in_flight: Some(ControlOpInFlight::RefreshKeysets(hint.clone())),
-            last_keyset_refresh_hint: Some(hint),
-            ..DriverState::default()
-        };
-        let mut updated = snapshot(true);
-        updated.advertisements[0]
-            .keyset_ids
-            .push("keyset-b".to_string());
-
-        let resolved_payment = apply_session_status(&mut state, updated);
-
-        assert!(!resolved_payment);
-        assert!(state.control_op_in_flight.is_none());
-        assert!(state.last_keyset_refresh_hint.is_none());
-        assert!(state.last_keyset_refresh_hint_at.is_none());
-    }
-
-    #[test]
-    fn duplicate_keyset_refresh_hint_is_suppressed_within_cooldown() {
-        let hint = KeysetRefreshHint {
-            mint_url: "https://mint".to_string(),
-            unit: "sat".to_string(),
-            accepted_keyset_ids: vec!["keyset-a".to_string()],
-        };
-        let mut state = DriverState::default();
-        set_keyset_refresh_in_flight(&mut state, hint.clone());
-
-        assert!(keyset_refresh_hint_is_suppressed(&state, &hint));
-    }
-
-    #[test]
-    fn same_keyset_refresh_hint_can_retry_after_cooldown() {
-        let hint = KeysetRefreshHint {
-            mint_url: "https://mint".to_string(),
-            unit: "sat".to_string(),
-            accepted_keyset_ids: vec!["keyset-a".to_string()],
-        };
-        let mut state = DriverState::default();
-        set_keyset_refresh_in_flight(&mut state, hint.clone());
-        state.last_keyset_refresh_hint_at =
-            Some(Instant::now() - KEYSET_REFRESH_HINT_RETRY_COOLDOWN - Duration::from_secs(1));
-
-        assert!(!keyset_refresh_hint_is_suppressed(&state, &hint));
-    }
-
-    #[test]
-    fn changed_keyset_refresh_hint_is_not_suppressed() {
-        let previous = KeysetRefreshHint {
-            mint_url: "https://mint".to_string(),
-            unit: "sat".to_string(),
-            accepted_keyset_ids: vec!["keyset-a".to_string()],
-        };
-        let changed = KeysetRefreshHint {
-            mint_url: "https://mint".to_string(),
-            unit: "sat".to_string(),
-            accepted_keyset_ids: vec!["keyset-b".to_string()],
-        };
-        let mut state = DriverState::default();
-        set_keyset_refresh_in_flight(&mut state, previous);
-
-        assert!(!keyset_refresh_hint_is_suppressed(&state, &changed));
     }
 
     #[test]
@@ -903,7 +841,8 @@ mod tests {
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
-                accepted_keyset_ids: vec!["keyset-a".to_string()],
+                preferred_keyset_ids: vec!["keyset-a".to_string()],
+                negotiated_keyset_versions: std::collections::BTreeSet::from(["v1".to_string()]),
                 in_bytes_per_millisat: 1,
                 out_bytes_per_millisat: 1,
             }),

@@ -320,9 +320,6 @@ impl SessionState {
                         })
                     })
                     .collect();
-                if keyset_ids.is_empty() {
-                    continue;
-                }
                 advertisements.push(KeysetAdvertisement {
                     mint_url: mint_url.clone(),
                     unit: unit.clone(),
@@ -1079,7 +1076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_filters_versions_and_rechecks_refreshed_cache() {
+    async fn status_filters_versions_but_advertises_empty_preference_lists() {
         let (mut state, _) = test_state();
         let v1 = "0000000000000001".to_string();
         let inactive = "0000000000000002".to_string();
@@ -1146,7 +1143,8 @@ mod tests {
         else {
             panic!()
         };
-        assert!(advertisements.is_empty());
+        assert_eq!(advertisements.len(), 1);
+        assert!(advertisements[0].keyset_ids.is_empty());
         assert_eq!(
             state
                 .spilman_mint_cache

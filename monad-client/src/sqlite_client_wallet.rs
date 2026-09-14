@@ -300,7 +300,7 @@ struct ClientOpenPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputKeysetSelection<T> {
     Selected(T),
-    NoActiveAcceptedKeyset,
+    NoCompatibleActiveKeyset,
 }
 
 #[derive(Debug, Clone)]
@@ -594,12 +594,6 @@ impl SqliteClientWallet {
         offer: &RelayPaymentOffer,
         target_capacity_msats: u64,
     ) -> Result<String, WalletError> {
-        if offer.accepted_keyset_ids.is_empty() {
-            return Err(WalletError::OfferMismatch(
-                "offer has no accepted keysets".to_string(),
-            ));
-        }
-
         let target_capacity_raw = msats_to_raw_units(&offer.unit, target_capacity_msats)?;
         if target_capacity_raw == 0 {
             return Err(WalletError::OfferMismatch(
@@ -612,9 +606,10 @@ impl SqliteClientWallet {
         // capacity we want, selects loose proofs that can fund it after input
         // fees, and then asks the mint to swap those proofs into channel funding
         // outputs.  The output keyset info comes from the client's local mint
-        // keyset cache.  Selection first tries the cached active keysets that
-        // intersect with the relay offer, then refreshes the client cache before
-        // deciding the relay offer is stale.  If a selected cached keyset becomes
+        // keyset cache. Selection prefers relay-listed IDs and then falls back to
+        // any active keyset whose format was negotiated. The client cache is
+        // refreshed once before concluding no compatible output exists. If a
+        // selected cached keyset becomes
         // stale before swap submission, the retry helper centralizes the safe
         // mint-rejection policy: refresh keysets, reselect, skip retry if refresh
         // still selects the same id, otherwise reprepare and submit once.
@@ -1870,10 +1865,9 @@ impl SqliteClientWallet {
                     let _ = self
                         .loose_wallet
                         .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
-                    return Err(WalletError::StaleRelayKeysets {
+                    return Err(WalletError::NoCompatibleActiveKeyset {
                         mint_url: offer.mint_url.clone(),
                         unit: offer.unit.clone(),
-                        accepted_keyset_ids: offer.accepted_keyset_ids.clone(),
                     });
                 };
                 if output_keyset.id == attempt.output_keyset.id {
@@ -2065,18 +2059,31 @@ impl SqliteClientWallet {
         offer: &RelayPaymentOffer,
     ) -> Result<SelectedOutputKeyset, WalletError> {
         match self.select_output_keyset_from_cache(offer)? {
-            OutputKeysetSelection::Selected(output_keyset) => return Ok(output_keyset),
-            OutputKeysetSelection::NoActiveAcceptedKeyset => {}
+            OutputKeysetSelection::Selected(output_keyset)
+                if offer.preferred_keyset_ids.is_empty()
+                    || offer
+                        .preferred_keyset_ids
+                        .iter()
+                        .any(|id| id == &output_keyset.id) =>
+            {
+                return Ok(output_keyset);
+            }
+            // The cache has a compatible fallback but not a preferred active
+            // keyset. Refresh once before using the fallback in case the relay
+            // knows about a newer active keyset than this client does.
+            OutputKeysetSelection::Selected(_) => {}
+            OutputKeysetSelection::NoCompatibleActiveKeyset => {}
         }
 
         self.refresh_client_keysets(offer)?;
         match self.select_output_keyset_from_cache(offer)? {
             OutputKeysetSelection::Selected(output_keyset) => Ok(output_keyset),
-            OutputKeysetSelection::NoActiveAcceptedKeyset => Err(WalletError::StaleRelayKeysets {
-                mint_url: offer.mint_url.clone(),
-                unit: offer.unit.clone(),
-                accepted_keyset_ids: offer.accepted_keyset_ids.clone(),
-            }),
+            OutputKeysetSelection::NoCompatibleActiveKeyset => {
+                Err(WalletError::NoCompatibleActiveKeyset {
+                    mint_url: offer.mint_url.clone(),
+                    unit: offer.unit.clone(),
+                })
+            }
         }
     }
 
@@ -2090,8 +2097,8 @@ impl SqliteClientWallet {
             .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
         let output_keyset_id = match active_output_keyset_id_from_cache(&bridge, offer)? {
             OutputKeysetSelection::Selected(output_keyset_id) => output_keyset_id,
-            OutputKeysetSelection::NoActiveAcceptedKeyset => {
-                return Ok(OutputKeysetSelection::NoActiveAcceptedKeyset);
+            OutputKeysetSelection::NoCompatibleActiveKeyset => {
+                return Ok(OutputKeysetSelection::NoCompatibleActiveKeyset);
             }
         };
         let info_json = cached_keyset_info_json(&bridge, &offer.mint_url, &output_keyset_id)?;
@@ -2331,12 +2338,6 @@ impl MonadWallet for SqliteClientWallet {
         // the caller is willing to commit. Upstream constructs the channel from
         // these proofs and returns the actual usable capacity, which may be lower
         // after Cashu input/output fees are applied.
-        if offer.accepted_keyset_ids.is_empty() {
-            return Err(WalletError::OfferMismatch(
-                "offer has no accepted keysets".to_string(),
-            ));
-        }
-
         self.ensure_offer_keysets_cached(offer)?;
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
         let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
@@ -2806,14 +2807,24 @@ where
 {
     let unit = parse_currency_unit(&offer.unit)?;
     let active_ids = bridge.cached_active_keyset_ids(&offer.mint_url, &unit);
+    let mut compatible_ids = active_ids
+        .into_iter()
+        .map(|id| id.to_string())
+        .filter(|id| offer.keyset_is_compatible(id))
+        .collect::<Vec<_>>();
+    compatible_ids.sort();
 
-    for accepted_id in &offer.accepted_keyset_ids {
-        if active_ids.iter().any(|id| id.to_string() == *accepted_id) {
-            return Ok(OutputKeysetSelection::Selected(accepted_id.clone()));
+    for preferred_id in &offer.preferred_keyset_ids {
+        if compatible_ids.iter().any(|id| id == preferred_id) {
+            return Ok(OutputKeysetSelection::Selected(preferred_id.clone()));
         }
     }
 
-    Ok(OutputKeysetSelection::NoActiveAcceptedKeyset)
+    Ok(compatible_ids
+        .into_iter()
+        .next()
+        .map(OutputKeysetSelection::Selected)
+        .unwrap_or(OutputKeysetSelection::NoCompatibleActiveKeyset))
 }
 
 fn cached_keyset_info_json<H, N>(
@@ -3174,13 +3185,9 @@ fn ensure_channel_matches_offer(
     if channel.unit != offer.unit {
         return Err(WalletError::OfferMismatch("unit mismatch".to_string()));
     }
-    if !offer
-        .accepted_keyset_ids
-        .iter()
-        .any(|keyset| keyset == &channel.keyset_id)
-    {
+    if !offer.keyset_is_compatible(&channel.keyset_id) {
         return Err(WalletError::OfferMismatch(
-            "keyset not accepted".to_string(),
+            "keyset format was not negotiated".to_string(),
         ));
     }
     Ok(())
@@ -3226,6 +3233,7 @@ mod tests {
         TestMintConfig, TestMintHelper,
     };
     use rand::RngCore;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use tokio::sync::oneshot;
 
@@ -3659,7 +3667,8 @@ mod tests {
             receiver_pubkey: receiver_pubkey.to_string(),
             mint_url: mint_url.to_string(),
             unit: "sat".to_string(),
-            accepted_keyset_ids: vec![keyset_id.to_string()],
+            preferred_keyset_ids: vec![keyset_id.to_string()],
+            negotiated_keyset_versions: BTreeSet::from(["v1".to_string(), "v2".to_string()]),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         }
@@ -4680,8 +4689,8 @@ mod tests {
         let receiver_pubkey =
             "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
         let mut offer = offer(&mint_url, &receiver_pubkey, &input_keyset_id);
-        offer.accepted_keyset_ids.push(output_keyset_id.clone());
-        assert_eq!(offer.accepted_keyset_ids[0], input_keyset_id);
+        offer.preferred_keyset_ids.push(output_keyset_id.clone());
+        assert_eq!(offer.preferred_keyset_ids[0], input_keyset_id);
 
         let channel_id = wallet
             .provision_channel(&offer, amount_raw * 1000)
@@ -4763,7 +4772,7 @@ mod tests {
         let receiver_pubkey =
             "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
         let offer = offer(&mint_url, &receiver_pubkey, &output_keyset_id);
-        assert!(!offer.accepted_keyset_ids.contains(&input_keyset_id));
+        assert!(!offer.preferred_keyset_ids.contains(&input_keyset_id));
 
         let target_capacity_raw = 32u64;
         let target_capacity_msats = target_capacity_raw * 1000;
@@ -5469,7 +5478,7 @@ mod tests {
 
         let successor_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
         assert_ne!(initial_keyset_id, successor_keyset_id);
-        offer.accepted_keyset_ids.push(successor_keyset_id.clone());
+        offer.preferred_keyset_ids.push(successor_keyset_id.clone());
 
         let networking = FourSubmissionNetworking::new();
         let channel_id = wallet
@@ -5569,7 +5578,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn output_keyset_selection_refreshes_stale_client_when_relay_offer_is_fresh() {
+    async fn output_keyset_selection_refreshes_for_new_relay_preference() {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint = mint_helper.mint();
         let first_keyset_id = mint_helper.keyset_id().to_string();
@@ -5606,9 +5615,8 @@ mod tests {
         assert_eq!(selected.id, first_keyset_id);
 
         let second_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
-        // The relay offer is already fresh, but this wallet has only cached the
-        // old keyset. Selection must refresh the client cache and pick the
-        // relay-advertised active keyset instead of reporting a stale relay.
+        // The relay preference is newer, so refresh before falling back to the
+        // cached active keyset. The refresh reveals the preferred active ID.
         let second_offer = offer(&mint_url, receiver_pubkey, &second_keyset_id);
         let selected = wallet
             .select_output_keyset_refreshing_client_first(&second_offer)
@@ -5620,7 +5628,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn output_keyset_selection_reports_stale_relay_only_after_client_refresh() {
+    async fn output_keyset_selection_falls_back_after_client_refresh() {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint = mint_helper.mint();
         let first_keyset_id = mint_helper.keyset_id().to_string();
@@ -5654,9 +5662,9 @@ mod tests {
         let receiver_pubkey = "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2";
 
         let first_offer = offer(&mint_url, receiver_pubkey, &unknown_keyset_id);
-        let error = wallet
+        let selected = wallet
             .select_output_keyset_refreshing_client_first(&first_offer)
-            .unwrap_err();
+            .unwrap();
         let cached_keysets = wallet
             .bridge
             .lock()
@@ -5665,23 +5673,14 @@ mod tests {
         assert!(cached_keysets
             .iter()
             .any(|(keyset_id, _entry)| keyset_id.to_string() == first_keyset_id));
-        assert!(matches!(
-            error,
-            WalletError::StaleRelayKeysets {
-                mint_url: error_mint_url,
-                unit,
-                accepted_keyset_ids,
-            } if error_mint_url == mint_url
-                && unit == "sat"
-                && accepted_keyset_ids == vec![unknown_keyset_id]
-        ));
+        assert_eq!(selected.id, first_keyset_id);
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
     }
 
     #[test]
-    fn active_output_keyset_selection_skips_inactive_accepted_keysets() {
+    fn active_output_keyset_selection_falls_back_from_inactive_preference() {
         let old =
             test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
         let new =
@@ -5690,7 +5689,8 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),
-            accepted_keyset_ids: vec![old.to_string(), new.to_string()],
+            preferred_keyset_ids: vec![old.to_string()],
+            negotiated_keyset_versions: BTreeSet::from(["v1".to_string(), "v2".to_string()]),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         };
@@ -5704,7 +5704,7 @@ mod tests {
     }
 
     #[test]
-    fn active_output_keyset_selection_rejects_without_active_accepted_keyset() {
+    fn active_output_keyset_selection_rejects_without_compatible_active_keyset() {
         let old =
             test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
         let other_unit =
@@ -5713,17 +5713,18 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),
-            accepted_keyset_ids: vec![old.to_string(), other_unit.to_string()],
+            preferred_keyset_ids: vec![old.to_string(), other_unit.to_string()],
+            negotiated_keyset_versions: BTreeSet::from(["v2".to_string()]),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         };
         let bridge = bridge_with_cached_keysets(vec![
-            (old, CurrencyUnit::Sat, false),
+            (old, CurrencyUnit::Sat, true),
             (other_unit, CurrencyUnit::Msat, true),
         ]);
 
         let selected = active_output_keyset_id_from_cache(&bridge, &offer).unwrap();
-        assert_eq!(selected, OutputKeysetSelection::NoActiveAcceptedKeyset);
+        assert_eq!(selected, OutputKeysetSelection::NoCompatibleActiveKeyset);
     }
 
     #[test]

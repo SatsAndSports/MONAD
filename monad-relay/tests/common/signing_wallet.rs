@@ -254,13 +254,9 @@ impl TestSigningWallet {
         if metadata.unit != offer.unit {
             return Err(WalletError::OfferMismatch("unit mismatch".to_string()));
         }
-        if !offer
-            .accepted_keyset_ids
-            .iter()
-            .any(|keyset| keyset == &metadata.keyset_id)
-        {
+        if !offer.keyset_is_compatible(&metadata.keyset_id) {
             return Err(WalletError::OfferMismatch(
-                "keyset not accepted".to_string(),
+                "keyset format was not negotiated".to_string(),
             ));
         }
         Ok(())

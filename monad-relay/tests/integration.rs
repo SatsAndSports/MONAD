@@ -1352,7 +1352,8 @@ async fn test_expiring_channel_auto_close_worker_closes_near_expiry_channel() {
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![keyset_id],
+        preferred_keyset_ids: vec![keyset_id],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -1622,7 +1623,8 @@ impl DrainTestContext {
             receiver_pubkey: receiver_pubkey_hex,
             mint_url: mint_url.clone(),
             unit: "sat".to_string(),
-            accepted_keyset_ids: vec![keyset_id],
+            preferred_keyset_ids: vec![keyset_id],
+            negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         };
@@ -2893,7 +2895,8 @@ async fn test_negotiated_keyset_link_enforcement_is_session_local() {
             receiver_pubkey: receiver.public_key().to_hex(),
             mint_url: url,
             unit: "sat".to_string(),
-            accepted_keyset_ids: vec![id],
+            preferred_keyset_ids: vec![id],
+            negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         };
@@ -2949,14 +2952,21 @@ async fn test_negotiated_keyset_link_enforcement_is_session_local() {
         (&mut bad_send, &mut bad_recv, 0),
     ] {
         let status = control_handshake_status(send, recv).await;
-        assert_eq!(status.advertisements.len(), 1);
-        assert!(
-            status.advertisements[0].keyset_ids[0].starts_with(if index == 0 {
-                "00"
-            } else {
-                "01"
-            })
+        assert_eq!(status.advertisements.len(), 2);
+        assert_eq!(
+            status
+                .advertisements
+                .iter()
+                .filter(|advertisement| advertisement.keyset_ids.is_empty())
+                .count(),
+            1
         );
+        let compatible = status
+            .advertisements
+            .iter()
+            .find(|advertisement| !advertisement.keyset_ids.is_empty())
+            .unwrap();
+        assert!(compatible.keyset_ids[0].starts_with(if index == 0 { "00" } else { "01" }));
         send_control_message(
             send,
             &ClientMessage::ChannelLink {
@@ -4730,6 +4740,7 @@ async fn test_two_relays_share_one_wallet_manager_db() {
             .iter()
             .find(|a| a.unit == "sat")
             .expect("relay-a should advertise sat keyset"),
+        &supported_cashu_spilman_keyset_versions(),
     );
     wallet_a
         .attach_channel_to_session(&channel_id_a, *conn_a.session_id())
@@ -4770,6 +4781,7 @@ async fn test_two_relays_share_one_wallet_manager_db() {
             .iter()
             .find(|a| a.unit == "sat")
             .expect("relay-b should advertise sat keyset"),
+        &supported_cashu_spilman_keyset_versions(),
     );
     wallet_b
         .attach_channel_to_session(&channel_id_b, *conn_b.session_id())
@@ -4956,6 +4968,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
             .iter()
             .find(|a| a.unit == "sat")
             .expect("relay should advertise sat keyset"),
+        &supported_cashu_spilman_keyset_versions(),
     );
 
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
@@ -5087,6 +5100,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
             .iter()
             .find(|a| a.unit == "sat")
             .expect("relay should advertise sat keyset before policy change"),
+        &supported_cashu_spilman_keyset_versions(),
     );
 
     wallet
@@ -5166,7 +5180,8 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![keyset_id],
+        preferred_keyset_ids: vec![keyset_id],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -5401,7 +5416,8 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![old_keyset_id.clone()],
+        preferred_keyset_ids: vec![old_keyset_id.clone()],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -5533,7 +5549,8 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![new_keyset_id.clone()],
+        preferred_keyset_ids: vec![new_keyset_id.clone()],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -5645,12 +5662,10 @@ async fn test_control_refresh_keysets_updates_advertisements() {
     )
     .await;
     let (mut incompatible_send, mut incompatible_recv) = incompatible.open_control().await.unwrap();
-    assert!(
-        control_handshake_status(&mut incompatible_send, &mut incompatible_recv)
-            .await
-            .advertisements
-            .is_empty()
-    );
+    let incompatible_initial =
+        control_handshake_status(&mut incompatible_send, &mut incompatible_recv).await;
+    assert_eq!(incompatible_initial.advertisements.len(), 1);
+    assert!(incompatible_initial.advertisements[0].keyset_ids.is_empty());
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
     let initial = control_handshake_status(&mut control_send, &mut control_recv).await;
     let initial_sat = initial
@@ -5692,8 +5707,9 @@ async fn test_control_refresh_keysets_updates_advertisements() {
     .await;
     let incompatible_status =
         expect_session_status_struct(read_control_message(&mut incompatible_recv).await);
+    assert_eq!(incompatible_status.advertisements.len(), 1);
     assert!(
-        incompatible_status.advertisements.is_empty(),
+        incompatible_status.advertisements[0].keyset_ids.is_empty(),
         "refresh must not leak incompatible IDs"
     );
     incompatible.shutdown().await;
@@ -5787,7 +5803,8 @@ async fn test_channel_link_refreshes_and_accepts_new_keyset() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![new_keyset_id.clone()],
+        preferred_keyset_ids: vec![new_keyset_id.clone()],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -5872,7 +5889,8 @@ async fn test_channel_link_unknown_keyset_refreshes_once_then_rate_limits() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![keyset_id],
+        preferred_keyset_ids: vec![keyset_id],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -5974,7 +5992,8 @@ async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![known_keyset_id],
+        preferred_keyset_ids: vec![known_keyset_id],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -6102,7 +6121,8 @@ async fn test_control_refresh_keysets_failure_preserves_old_keyset_channel_link_
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![old_keyset_id],
+        preferred_keyset_ids: vec![old_keyset_id],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -6496,11 +6516,10 @@ async fn test_control_refresh_keysets_success_cooldown_skips_second_mint_fetch()
 /// after mint rotation: the stale relay still advertises only the old keyset,
 /// an existing old-keyset channel can be re-linked and paid (relay acceptance
 /// is "known + trusted unit", deliberately not active-gated), and data flows.
-/// Provisioning a NEW channel from the stale offer must fail cleanly before
-/// any mint call, because the refreshed client knows the old keyset is
-/// inactive and the mint can no longer sign outputs for it.
+/// A new channel uses the client's active compatible keyset despite the stale
+/// preference, and linking it drives the relay's automatic cache refresh.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_rotated_mint_stale_relay_old_channel_ok_new_open_refused() {
+async fn test_rotated_mint_stale_relay_falls_back_and_refreshes_on_link() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
@@ -6585,7 +6604,11 @@ async fn test_rotated_mint_stale_relay_old_channel_ok_new_open_refused() {
         .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
         .expect("relay should advertise sat keyset");
     assert_eq!(advertisement1.keyset_ids, vec![old_keyset_id.clone()]);
-    let offer = RelayPaymentOffer::from_advertisement(receiver_pubkey_hex.clone(), advertisement1);
+    let offer = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_hex.clone(),
+        advertisement1,
+        &supported_cashu_spilman_keyset_versions(),
+    );
 
     let channel_id = wallet.provision_channel(&offer, 10_000_000).unwrap();
     assert_eq!(
@@ -6693,7 +6716,11 @@ async fn test_rotated_mint_stale_relay_old_channel_ok_new_open_refused() {
         vec![old_keyset_id.clone()],
         "stale relay must advertise only the old keyset"
     );
-    let offer2 = RelayPaymentOffer::from_advertisement(receiver_pubkey_hex.clone(), advertisement2);
+    let offer2 = RelayPaymentOffer::from_advertisement(
+        receiver_pubkey_hex.clone(),
+        advertisement2,
+        &supported_cashu_spilman_keyset_versions(),
+    );
 
     // Re-link the existing old-keyset channel; relay-side ownership release
     // from session 1 may race, so retry on Error for a bounded time.
@@ -6759,21 +6786,40 @@ async fn test_rotated_mint_stale_relay_old_channel_ok_new_open_refused() {
     tunnel.read_to_end(&mut result).await.unwrap();
     assert_eq!(result, b"CLIENT AHEAD OF RELAY");
 
-    // Boundary: provisioning a NEW channel from the stale offer fails cleanly
-    // after refreshing the client cache and identifying the relay offer as
-    // stale. Existing old-keyset channels remain usable, but new channel opens
-    // need an active client keyset accepted by the relay.
-    let err = wallet.provision_channel(&offer2, 10_000_000).unwrap_err();
-    assert!(matches!(
-        err,
-        WalletError::StaleRelayKeysets {
-            mint_url,
-            unit,
-            accepted_keyset_ids,
-        } if mint_url == offer2.mint_url
-            && unit == offer2.unit
-            && accepted_keyset_ids == offer2.accepted_keyset_ids
-    ));
+    // A new channel falls back to the locally active compatible keyset even
+    // though the relay still prefers the old ID. ChannelLink then drives the
+    // relay's existing automatic keyset refresh path; no explicit refresh
+    // control request is needed.
+    let new_channel_id = wallet.provision_channel(&offer2, 10_000_000).unwrap();
+    assert_eq!(
+        wallet.get_channel(&new_channel_id).unwrap().keyset_id,
+        new_keyset_id
+    );
+    wallet
+        .attach_channel_to_session(&new_channel_id, *conn2.session_id())
+        .unwrap();
+    let new_link_json = wallet.build_link_request(&new_channel_id, &offer2).unwrap();
+    send_control_message(
+        &mut control_send2,
+        &ClientMessage::ChannelLink {
+            payment_json: new_link_json,
+        },
+        false,
+    )
+    .await;
+    let refreshed_status =
+        expect_session_status_struct(read_control_message(&mut control_recv2).await);
+    assert_eq!(
+        refreshed_status.linked_channel.unwrap().channel_id,
+        new_channel_id
+    );
+    assert!(refreshed_status
+        .advertisements
+        .iter()
+        .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
+        .unwrap()
+        .keyset_ids
+        .contains(&new_keyset_id));
 
     let _ = control_send2.send_data(Bytes::new(), true);
     drop(control_send2);
@@ -9444,7 +9490,7 @@ async fn test_configured_client_keyset_rotation_triggers_relay_refresh_for_stale
         wallet_seed: 61,
         channel_input_budget_msats: 10_000_000,
         target_topup_buffer_msats: 1_000_000,
-        label: "configured-keyset-rotation-refresh-hint",
+        label: "configured-keyset-rotation-link-refresh",
     })
     .await;
 
@@ -9474,8 +9520,8 @@ async fn test_configured_client_keyset_rotation_triggers_relay_refresh_for_stale
 
     // Deliberately do not refresh the relay keyset cache. The restarted relay
     // initially advertises the old cache snapshot; the configured client should
-    // detect that no advertised keyset is active locally, send RefreshKeysets,
-    // and recover once the relay advertises the rotated active keyset.
+    // use its locally active compatible keyset, then recover when ChannelLink
+    // causes the relay to refresh and accept that keyset.
     assert!(
         !fixture
             .mint_cache
@@ -9486,8 +9532,8 @@ async fn test_configured_client_keyset_rotation_triggers_relay_refresh_for_stale
     );
 
     // Retire the old-keyset channels so post-restart funding must provision
-    // fresh channels through the stale-offer RefreshKeysets path instead of
-    // relinking the old ones.
+    // fresh channels through the stale-offer fallback path instead of relinking
+    // the old ones.
     fixture.mark_channels_unusable(&initial_channels);
 
     fixture.restart_hop(1).await;
@@ -9509,7 +9555,7 @@ async fn test_configured_client_keyset_rotation_triggers_relay_refresh_for_stale
         final_channels
             .iter()
             .any(|channel| channel.keyset_id == new_keyset_id),
-        "keyset refresh hint: client-triggered relay refresh should allow provisioning on the rotated active keyset; channels={final_channels:?}"
+        "ChannelLink-triggered relay refresh should allow provisioning on the rotated active keyset; channels={final_channels:?}"
     );
     let relay_cache = fixture.wallet_manager.keyset_cache_snapshot();
     assert!(
@@ -9517,14 +9563,14 @@ async fn test_configured_client_keyset_rotation_triggers_relay_refresh_for_stale
             .keyset_ids(&fixture.mint_url, "sat")
             .iter()
             .any(|keyset| keyset == &new_keyset_id),
-        "keyset refresh hint: relay wallet cache should contain the client-requested rotated keyset"
+        "relay wallet cache should contain the ChannelLink-selected rotated keyset"
     );
 
     fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_configured_client_first_hop_keyset_rotation_triggers_relay_refresh_for_stale_offer() {
+async fn test_configured_client_first_hop_rotation_refreshes_relay_on_channel_link() {
     init_test_tracing();
     // Keep channels far from capacity: a re-linked session funds its buffer
     // from the channel's remaining capacity, so pinned channels are effectively
@@ -9578,8 +9624,8 @@ async fn test_configured_client_first_hop_keyset_rotation_triggers_relay_refresh
     );
 
     // Retire the old-keyset channels so post-restart funding must provision
-    // fresh channels through the stale-offer RefreshKeysets path instead of
-    // relinking the old ones.
+    // fresh channels through compatible-keyset fallback instead of relinking
+    // the old ones.
     fixture.mark_channels_unusable(&initial_channels);
 
     fixture.restart_hop(0).await;
@@ -9601,7 +9647,7 @@ async fn test_configured_client_first_hop_keyset_rotation_triggers_relay_refresh
         final_channels
             .iter()
             .any(|channel| channel.keyset_id == new_keyset_id),
-        "first-hop keyset refresh hint: client-triggered relay refresh should allow provisioning on the rotated active keyset; channels={final_channels:?}"
+        "first-hop ChannelLink refresh should allow provisioning on the rotated active keyset; channels={final_channels:?}"
     );
     let relay_cache = fixture.wallet_manager.keyset_cache_snapshot();
     assert!(
@@ -9609,7 +9655,7 @@ async fn test_configured_client_first_hop_keyset_rotation_triggers_relay_refresh
             .keyset_ids(&fixture.mint_url, "sat")
             .iter()
             .any(|keyset| keyset == &new_keyset_id),
-        "first-hop keyset refresh hint: relay wallet cache should contain the client-requested rotated keyset"
+        "first-hop relay wallet cache should contain the ChannelLink-selected rotated keyset"
     );
 
     let stats = fixture.route_stats.snapshot();
@@ -9627,8 +9673,7 @@ async fn test_configured_client_first_hop_keyset_rotation_triggers_relay_refresh
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "manual 3-hop middle-hop configured-client keyset refresh regression"]
-async fn test_configured_client_three_hop_middle_hop_keyset_rotation_triggers_relay_refresh_for_stale_offer(
-) {
+async fn test_configured_client_three_hop_middle_rotation_refreshes_relay_on_channel_link() {
     init_test_tracing();
     // Keep channels far from capacity: a re-linked session funds its buffer
     // from the channel's remaining capacity, so pinned channels are effectively
@@ -9682,8 +9727,8 @@ async fn test_configured_client_three_hop_middle_hop_keyset_rotation_triggers_re
     );
 
     // Retire the old-keyset channels so post-restart funding must provision
-    // fresh channels through the stale-offer RefreshKeysets path instead of
-    // relinking the old ones.
+    // fresh channels through compatible-keyset fallback instead of relinking
+    // the old ones.
     fixture.mark_channels_unusable(&initial_channels);
 
     fixture.restart_hop(1).await;
@@ -9705,7 +9750,7 @@ async fn test_configured_client_three_hop_middle_hop_keyset_rotation_triggers_re
         final_channels
             .iter()
             .any(|channel| channel.keyset_id == new_keyset_id),
-        "middle-hop keyset refresh hint: client-triggered relay refresh should allow provisioning on the rotated active keyset; channels={final_channels:?}"
+        "middle-hop ChannelLink refresh should allow provisioning on the rotated active keyset; channels={final_channels:?}"
     );
     let stats = fixture.route_stats.snapshot();
     assert!(
@@ -10218,6 +10263,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
             .iter()
             .find(|a| a.unit == "sat")
             .expect("relay should advertise sat keyset"),
+        &supported_cashu_spilman_keyset_versions(),
     );
 
     // Link the pre-created channel to this session.
@@ -10395,6 +10441,7 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
             .iter()
             .find(|a| a.unit == "sat")
             .expect("relay should advertise sat keyset"),
+        &supported_cashu_spilman_keyset_versions(),
     );
 
     wallet
@@ -10552,6 +10599,7 @@ async fn test_sqlite_client_recovery_falls_back_to_relay_close_restore() {
             .iter()
             .find(|a| a.unit == "sat")
             .expect("relay should advertise sat keyset"),
+        &supported_cashu_spilman_keyset_versions(),
     );
 
     let channel_id = wallet
@@ -10713,6 +10761,7 @@ async fn test_wallet_manager_close_channel_by_id() {
             .iter()
             .find(|a| a.unit == "sat")
             .expect("relay should advertise sat keyset"),
+        &supported_cashu_spilman_keyset_versions(),
     );
 
     wallet
@@ -10842,6 +10891,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
             .iter()
             .find(|a| a.unit == "sat")
             .expect("relay should advertise sat keyset"),
+        &supported_cashu_spilman_keyset_versions(),
     );
 
     wallet
@@ -10970,7 +11020,8 @@ async fn test_wallet_manager_drain_swap_combines_multiple_closed_channels() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![keyset_id],
+        preferred_keyset_ids: vec![keyset_id],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -11053,7 +11104,8 @@ async fn test_wallet_manager_drain_swap_recovers_after_ambiguous_submission() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![keyset_id],
+        preferred_keyset_ids: vec![keyset_id],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -11365,7 +11417,8 @@ async fn test_wallet_manager_drain_keyset_rejection_refreshes_reprepares_and_ret
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![old_keyset_id.clone()],
+        preferred_keyset_ids: vec![old_keyset_id.clone()],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -11536,7 +11589,7 @@ async fn test_wallet_manager_drain_retry_refresh_failure_marks_failed_and_releas
     drop(conn);
 
     let stale_cache = ctx.wallet_manager.keyset_cache_snapshot();
-    let old_keyset_id = ctx.offer.accepted_keyset_ids[0].clone();
+    let old_keyset_id = ctx.offer.preferred_keyset_ids[0].clone();
     let old_keyset = stale_cache
         .keysets
         .get(&ctx.mint_url)
@@ -11699,7 +11752,8 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![old_keyset_id.clone()],
+        preferred_keyset_ids: vec![old_keyset_id.clone()],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -11748,7 +11802,8 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![new_keyset_id.clone()],
+        preferred_keyset_ids: vec![new_keyset_id.clone()],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -11876,7 +11931,8 @@ async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_an
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![old_keyset_id.clone()],
+        preferred_keyset_ids: vec![old_keyset_id.clone()],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
@@ -11924,7 +11980,8 @@ async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_an
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        accepted_keyset_ids: vec![new_keyset_id.clone()],
+        preferred_keyset_ids: vec![new_keyset_id.clone()],
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
     };
