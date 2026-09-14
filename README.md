@@ -305,9 +305,8 @@ Shared protocol helpers used by client, relay, and harness code live in:
 - `monad-common/src/control_codec.rs` for newline-delimited control messages
 - `monad-common/src/payment_units.rs` for `msat` / `sat` raw-unit conversion
 
-For maintainers, the most focused reference is `docs/payments.md`. `ARCHITECTURE.md`
-stays the higher-level protocol overview, and `WALLET.md` covers wallet/backend
-responsibilities.
+For maintainers, the most focused reference is `docs/payments.md`; `ARCHITECTURE.md`
+stays the higher-level protocol overview.
 
 ## Transport Identities
 

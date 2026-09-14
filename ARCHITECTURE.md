@@ -380,11 +380,11 @@ Relay keyset refresh is bounded trusted-mint maintenance, not a client control o
 - Refresh is eligible only when `mint_url` is already configured as trusted and `unit` is trusted for that mint.
 - The relay refreshes all keysets for that mint into the shared relay-wallet cache, not only the submitted channel's unit, because mint keyset endpoints are mint-scoped.
 - Automatic link refresh returns transient `LinkKeysetRefreshRateLimited`, `LinkKeysetRefreshBusy`, or `LinkKeysetRefreshFailed` errors when it cannot make a fresh decision. A fresh successful response that still does not contain the keyset yields permanent `LinkMintOrKeysetUnacceptable`.
-- Startup discovery still populates the cache. Close and drain swaps remain cache-first and refresh the mint only when a mint keyset error requires a bounded retry.
+- Startup discovery still populates the cache. Close and drain swaps remain cache-first and refresh the mint on missing-cache warmup or when a mint keyset error requires a bounded retry.
 
 DoS resistance is part of the protocol behavior. The relay validates submitted mint/unit sizes and trusted policy before any network fetch, permits at most one actual attempt per mint per cooldown regardless of outcome, shares cancellation-safe in-flight results among concurrent same-mint links, fails fast when global cross-mint capacity is saturated, and wraps mint I/O in a timeout. Refresh I/O runs outside session accounting locks, so slow or failing mints do not block data-path accounting or unrelated control state.
 
-Refresh does not invalidate old keysets by itself. The relay cache stores all keysets returned by configured mints, active and inactive, and trusted policy filters advertisements and channel acceptance at read time. Existing channels funded by a still-known old keyset can continue to link and pay after a mint rotation, while newly opened channels should use a currently active keyset once both client and relay have refreshed.
+Refresh does not invalidate old keysets by itself. The relay cache stores all keysets returned by configured mints, active and inactive, and trusted policy filters advertisements and channel acceptance at read time. Stored channels relink using persisted funding without requiring the current mint cache, while newly opened channels should use a currently active keyset once both client and relay have refreshed.
 
 ### Version Negotiation
 
@@ -630,8 +630,9 @@ client output keyset from the relay's ordered advertised IDs, then may use any
 other locally active keyset for the same mint/unit whose format was negotiated.
 When the preference list is nonempty but unavailable locally, the client
 refreshes its own mint cache before using a non-preferred fallback. It also
-refreshes before concluding that no compatible active keyset exists. Before mint I/O, the loose-proof store atomically
-reserves the selected inputs and records the exact serialized prepared opening.
+refreshes before concluding that no compatible active keyset exists. Before
+submitting the opening swap, the loose-proof store atomically reserves the
+selected inputs and records the exact serialized prepared opening.
 The journal is authoritative across restarts. Submitted attempts first recover
 their original funding/change outputs through NUT-09. If a valid funding restore
 is empty, one NUT-07 request checks every persisted input Y; only an all-`UNSPENT`
@@ -663,11 +664,14 @@ its own allowance without authorizing a second successor.
 
 If that refreshed client cache has no active same-mint/unit keyset with a
 negotiated format, `SqliteClientWallet` reports that no compatible active keyset
-exists and the session driver retries locally according to its funding policy.
-The client never asks the relay to refresh. If the client links a channel using
-a compatible active keyset absent from the relay's preferences, the first-time
-`ChannelLink` transparently drives the relay's bounded refresh and one immutable
-retry.
+exists. For new channels, the session driver tries advertised mint/unit offers in
+order. It advances only after an explicitly safe offer-local failure, such as no
+compatible active keyset, insufficient loose proofs, or a pre-reservation
+preparation failure; ambiguous opening failures stop traversal. Before readiness,
+all unavailable offers block acquisition; after readiness, they retry with the
+funding backoff. The client never asks the relay to refresh. If a first-time link
+uses a trusted, compatible keyset still unknown to the relay cache, it
+transparently drives the relay's bounded refresh and one immutable retry.
 
 The reusable wallet library path exists, and `monad-client wallet ...` exposes
 token import, proof/channel inspection, and recovery commands using either

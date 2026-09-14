@@ -73,6 +73,9 @@ fn choose_channel_and_offer(
 }
 
 fn provisioning_offer_is_unavailable(error: &WalletError) -> bool {
+    // These are the wallet's explicitly safe offer-local outcomes. Generic
+    // backend failures can follow a reservation or ambiguous submission, so they
+    // must stop traversal rather than funding a different offer.
     matches!(
         error,
         WalletError::NoCompatibleActiveKeyset { .. }

@@ -1456,6 +1456,8 @@ impl SqliteClientWallet {
         plan: ClientOpenPlan,
         classify_preflight_as_offer_unavailable: bool,
     ) -> Result<ClientOpenAttempt, WalletError> {
+        // Only preparation failures before the atomic reservation/journal boundary
+        // can safely make this offer unavailable. Later failures may need recovery.
         let preflight_error = |error: WalletError| {
             if classify_preflight_as_offer_unavailable {
                 WalletError::ProvisioningOfferUnavailable {
@@ -2358,8 +2360,9 @@ impl MonadWallet for SqliteClientWallet {
         let input_budget_raw = msats_to_raw_units(&offer.unit, input_budget_msats)?;
         let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
         // Plain provisioning uses an input budget rather than an exact target
-        // capacity.  We reserve an arbitrary set of available proofs once, then
-        // let upstream compute the resulting channel capacity.  If the mint
+        // capacity. We select available proofs, prepare the opening, then
+        // atomically reserve and journal them before submission. Upstream computes
+        // the resulting channel capacity. If the mint
         // rejects the first open because our cached output keyset is stale, the
         // input reservation can be reused: only the output keyset selection and
         // swap construction need to change. Selection refreshes the client cache
