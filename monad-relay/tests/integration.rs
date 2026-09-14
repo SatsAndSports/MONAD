@@ -8540,8 +8540,20 @@ async fn test_cancelled_route_setup_waits_for_stalled_provision_and_reuses_chann
     assert!(tokio::time::timeout(Duration::from_millis(100), &mut retry)
         .await
         .is_err());
-    assert_eq!(wallet.list_channels().unwrap(), original_channels,
-        "cleanup must not detach the funded prefix while the old driver can still mutate the wallet");
+    let blocked_channels = wallet.list_channels().unwrap();
+    assert_eq!(blocked_channels.len(), original_channels.len());
+    for original in &original_channels {
+        let mut current = wallet.get_channel(&original.channel_id).unwrap();
+        assert!(
+            current.current_signed_balance_msats >= original.current_signed_balance_msats,
+            "a live payment driver must not decrease the signed channel balance"
+        );
+        current.current_signed_balance_msats = original.current_signed_balance_msats;
+        assert_eq!(
+            &current, original,
+            "cleanup must not detach or otherwise mutate channels before the old drivers quiesce"
+        );
+    }
     release_tx.send(()).unwrap();
     let rebuilt = tokio::time::timeout(Duration::from_secs(30), retry)
         .await
