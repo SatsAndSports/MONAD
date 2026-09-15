@@ -1,11 +1,13 @@
 # Client Channel Opening Review
 
-Status: implementation in progress. The first implementation PR covers the
+Status: opening recovery policy implemented. The first implementation PR covers the
 upstream validation/storage API pin, client wallet manager, cross-process locking,
 read-only inspection, and multi-client supervision. The stacked opening-journal
 authority PR now covers exact durable inputs, submission authority/execution
 records, monotonic submission uncertainty, exact atomic completion, and removal of
-legacy opening recovery state.
+legacy opening recovery state. This stacked PR completes bounded live replay,
+direct-only `12002` successors, exclusive aged abandonment, and typed duplicate
+opening coordination.
 
 This document is a handoff for resuming work on client channel-opening swaps. It
 records the current findings, decisions, open questions, and proposed sequence.
@@ -76,8 +78,18 @@ before reviewing the other Cashu swap paths and adding journals where appropriat
 - The `monad_client_channel_opening_recoveries` compatibility path/table is removed.
   Empty obsolete tables are dropped; nonempty obsolete recovery or pre-authority
   journal state is rejected rather than inferred.
-- Detailed live replay policy, one-hour administrative abandonment, and in-memory
-  same-channel singleflight remain explicitly deferred to the next stacked PR.
+- Live ambiguity now performs exact restore, at most one permit-backed byte-identical
+  replay after complete all-`UNSPENT` NUT-07 evidence, and one final exact restore
+  after replay ambiguity or rejection. Replay rejection remains unresolved and
+  cannot create a successor; only a direct unambiguous initial `12002` rejection
+  can create the operation's one successor.
+- Exclusive startup/manual recovery may abandon only after 3600 seconds from the
+  latest authorized execution, exact funding/change restore absence, and one
+  complete all-`UNSPENT` input response. Atomic release revalidates state,
+  timestamp, execution sequence, and exact reservation.
+- Complete deterministic opening identities use process-local singleflight plus
+  journal/database uniqueness and typed `AlreadyOpen`, `OpeningInProgress`, and
+  `Conflict` outcomes.
 
 ## Current Model
 
@@ -176,9 +188,11 @@ mutating maintenance:
   logical client wallet.
 
 Within the client process, `ClientWalletManager` owns the shared wallet instance,
-startup recovery, and active opening coordination. An in-memory map may coalesce
-same-channel callers, but database uniqueness, atomic reservation/journal creation,
-and conditional submission claims remain the correctness boundary.
+startup recovery, and active opening coordination. Fail-fast singleflight admits
+one same-channel leader and returns `OpeningInProgress` to followers; it does not
+wait for or share the leader's result. Database uniqueness, atomic
+reservation/journal creation, and conditional submission claims remain the
+correctness boundary.
 
 ### Ambiguous Abandonment
 

@@ -654,7 +654,11 @@ The journal is authoritative across restarts. Submitted attempts first recover
 their original funding/change outputs through NUT-09. If a valid funding restore
 is empty, one NUT-07 request checks every persisted input Y; only an all-`UNSPENT`
 response permits one replay of the byte-identical swap during live opening
-recovery only.
+recovery only. Each immutable attempt has at most one replay execution. Replay
+success finalizes normally; replay ambiguity or rejection performs one immediate
+exact restore and otherwise leaves the operation submitted and reserved. A replay
+rejection cannot authorize a keyset successor because it does not settle the
+earlier ambiguous execution.
 Finalization replays local channel, change-proof, and metadata updates
 idempotently. Prepared attempts that were never claimed for submission are
 cancelled and their proofs released.
@@ -668,12 +672,21 @@ before route provisioning, also exposed by manual `recover-openings`. This pass
 never submits swaps: prepared attempts and rejected attempts without a successor
 are cancelled; finalizing attempts finish local idempotent updates; submitted
 attempts with complete restored funding/change finalize. Empty, partial, invalid,
-or network-failed restore evidence remains unresolved and reserved. Startup and
-manual recovery do not use input `UNSPENT` observations to abandon a submitted
-attempt. Other swap policies are unchanged.
+or network-failed restore evidence normally remains unresolved and reserved. Under
+the manager's exclusive startup/maintenance lock, an attempt may be abandoned only
+at least 3600 seconds after its latest authorized execution, after exact funding
+and change restores are empty and one complete NUT-07 response reports every exact
+input `UNSPENT`. The atomic release revalidates the attempt state, timestamp,
+latest execution sequence, and exact reservation; recent, clock-rollback, stale,
+or inconclusive evidence remains reserved. Other swap policies are unchanged.
 The live exact-replay
 allowance is independent per immutable attempt, so a keyset successor receives
 its own allowance without authorizing a second successor.
+
+Exact duplicate opening identities are coordinated in-process and protected by
+journal/database uniqueness across wallet handles. Duplicate callers receive a
+typed already-open, opening-in-progress, or conflict result rather than sharing a
+channel that another session may already have attached.
 
 If that refreshed client cache has no active same-mint/unit keyset with a
 negotiated format, `SqliteClientWallet` reports that no compatible active keyset

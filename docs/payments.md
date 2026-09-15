@@ -136,12 +136,19 @@ reserves its loose inputs and journals that preparation before submission. A
 submitted attempt is immutable and ambiguous outcomes first use NUT-09. When a
 valid funding restore is empty, one NUT-07 request checks all persisted input Ys;
 only an all-`UNSPENT` response permits one replay of the identical swap request in
-live opening recovery. Startup and manual `recover-openings` never submit swaps.
+live opening recovery. Replay success finalizes; replay ambiguity or rejection
+gets one immediate exact restore and otherwise remains unresolved, and a replay
+rejection cannot create a keyset successor. Startup and manual `recover-openings`
+never submit swaps.
 They cancel prepared attempts and rejected attempts without a successor, finish
 finalizing attempts, and finalize submitted attempts only with complete restored
 funding/change. Empty, partial, invalid, or unavailable restore evidence keeps a
-submitted attempt unresolved and reserved. Startup/manual recovery does not use
-an input `UNSPENT` observation to abandon it. This policy is
+submitted attempt unresolved and reserved. With exclusive wallet maintenance
+access, recovery may abandon an attempt only 3600 seconds after its latest
+authorized submission/replay, when exact funding/change restores are empty and
+one complete NUT-07 response reports every exact input `UNSPENT`. Atomic release
+revalidates the state, timestamp, execution sequence, and exact reservation, so
+recent, clock-rollback, stale, or inconclusive evidence stays reserved. This policy is
 channel-opening-only, not a change to refunds, drains, or other swaps.
 
 During a live opening, if the mint explicitly rejects code
@@ -149,6 +156,14 @@ During a live opening, if the mint explicitly rejects code
 successor attempt, but only when selection produces a different active output
 keyset. That successor is a new immutable attempt with its own one-exact-replay
 allowance in that live opening.
+
+Opening execution uses fail-fast singleflight: one caller is the leader for a
+complete deterministic opening identity, while concurrent followers receive
+`OpeningInProgress` rather than waiting for or sharing the leader's result. The
+journal/database uniqueness constraints protect the same identity across wallet
+handles. Other duplicate callers receive typed `AlreadyOpen` or `Conflict`
+errors; they never silently reuse a channel that may be attached to another
+session.
 
 Input proof keysets are independent from the selected output funding keyset:
 input proofs may be old, inactive, or mixed-keyset proofs as long as the mint
