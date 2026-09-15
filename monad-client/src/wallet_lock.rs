@@ -14,6 +14,33 @@ pub struct ClientWalletLocks {
     runtime_owner: Vec<File>,
     maintenance: Vec<File>,
     maintenance_exclusive: bool,
+    identity: WalletLockIdentity,
+}
+
+pub struct ExclusiveWalletAccess<'a> {
+    _locks: &'a ClientWalletLocks,
+    identity: &'a WalletLockIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WalletLockIdentity(Vec<PathBuf>);
+
+impl WalletLockIdentity {
+    pub(crate) fn new(
+        loose_db_path: impl AsRef<Path>,
+        channel_db_path: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        Ok(Self(normalized_db_paths([
+            loose_db_path.as_ref(),
+            channel_db_path.as_ref(),
+        ])?))
+    }
+}
+
+impl ExclusiveWalletAccess<'_> {
+    pub(crate) fn authorizes(&self, identity: &WalletLockIdentity) -> bool {
+        self.identity == identity
+    }
 }
 
 impl ClientWalletLocks {
@@ -22,12 +49,13 @@ impl ClientWalletLocks {
         channel_db_path: impl AsRef<Path>,
         mode: WalletLockMode,
     ) -> io::Result<Self> {
-        let db_paths = normalized_db_paths([loose_db_path.as_ref(), channel_db_path.as_ref()])?;
+        let identity = WalletLockIdentity::new(loose_db_path, channel_db_path)?;
+        let db_paths = &identity.0;
         let mut runtime_owner = Vec::new();
         let mut maintenance = Vec::new();
 
         if mode == WalletLockMode::Runtime {
-            for path in sidecar_paths(&db_paths, "runtime-owner.lock") {
+            for path in sidecar_paths(db_paths, "runtime-owner.lock") {
                 let file = open_sidecar(&path)?;
                 file.try_lock()
                     .map_err(io::Error::from)
@@ -36,7 +64,7 @@ impl ClientWalletLocks {
             }
         }
 
-        for path in sidecar_paths(&db_paths, "maintenance.lock") {
+        for path in sidecar_paths(db_paths, "maintenance.lock") {
             let file = open_sidecar(&path)?;
             if mode == WalletLockMode::ReadOnly {
                 File::lock_shared(&file).map_err(|error| lock_error(&path, mode, error))?;
@@ -52,6 +80,7 @@ impl ClientWalletLocks {
             runtime_owner,
             maintenance,
             maintenance_exclusive: mode != WalletLockMode::ReadOnly,
+            identity,
         })
     }
 
@@ -64,6 +93,19 @@ impl ClientWalletLocks {
         }
         self.maintenance_exclusive = false;
         Ok(())
+    }
+
+    pub fn exclusive_access(&self) -> io::Result<ExclusiveWalletAccess<'_>> {
+        if !self.maintenance_exclusive {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "exclusive wallet maintenance access is not held",
+            ));
+        }
+        Ok(ExclusiveWalletAccess {
+            _locks: self,
+            identity: &self.identity,
+        })
     }
 
     pub fn holds_runtime_owner(&self) -> bool {
@@ -80,7 +122,7 @@ fn normalized_db_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> io::Res
         .map(Iterator::collect)
 }
 
-fn normalize_path(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn normalize_path(path: &Path) -> io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -166,12 +208,14 @@ mod tests {
         let mut runtime = ClientWalletLocks::acquire(&loose, &channels, WalletLockMode::Runtime)
             .expect("first runtime lock");
         assert!(runtime.holds_runtime_owner());
+        assert!(runtime.exclusive_access().is_ok());
         assert!(ClientWalletLocks::acquire(&loose, &channels, WalletLockMode::Runtime).is_err());
         assert!(
             ClientWalletLocks::acquire(&loose, &channels, WalletLockMode::Maintenance).is_err()
         );
 
         runtime.enter_steady_state().unwrap();
+        assert!(runtime.exclusive_access().is_err());
         let inspection =
             ClientWalletLocks::acquire(&loose, &channels, WalletLockMode::ReadOnly).unwrap();
         assert!(
@@ -180,8 +224,10 @@ mod tests {
         drop(inspection);
         drop(runtime);
 
-        ClientWalletLocks::acquire(&loose, &channels, WalletLockMode::Maintenance)
-            .expect("maintenance after runtime exit");
+        let maintenance =
+            ClientWalletLocks::acquire(&loose, &channels, WalletLockMode::Maintenance)
+                .expect("maintenance after runtime exit");
+        assert!(maintenance.exclusive_access().is_ok());
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::wallet::{
     msats_to_raw_units, raw_to_msats, MonadWallet, RelayPaymentOffer, WalletChannel,
     WalletChannelState, WalletError,
 };
+use crate::wallet_lock::{ExclusiveWalletAccess, WalletLockIdentity};
 use cashu::nuts::{
     CheckStateRequest, CheckStateResponse, CurrencyUnit, Id, Proof, RestoreRequest,
     RestoreResponse, SecretKey, State,
@@ -29,8 +30,8 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type ClientBridge =
@@ -39,6 +40,31 @@ type ClientBridge =
 const CHANNEL_EXPIRY_SECONDS: u64 = 24 * 3600;
 const MINT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_CLIENT_ERROR_PREFIX: &str = "MONAD_HTTP_CLIENT_ERROR ";
+
+static ACTIVE_OPENINGS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+struct ActiveOpeningGuard(String);
+
+impl Drop for ActiveOpeningGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_OPENINGS.get_or_init(Default::default).lock() {
+            active.remove(&self.0);
+        }
+    }
+}
+
+fn enter_active_opening(channel_id: &str) -> Result<ActiveOpeningGuard, WalletError> {
+    let mut active = ACTIVE_OPENINGS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| WalletError::Backend("opening singleflight mutex poisoned".to_string()))?;
+    if !active.insert(channel_id.to_string()) {
+        return Err(WalletError::OpeningInProgress {
+            channel_id: channel_id.to_string(),
+        });
+    }
+    Ok(ActiveOpeningGuard(channel_id.to_string()))
+}
 
 trait OpeningRecoveryNetworking: SpilmanClientNetworking {
     fn call_mint_check_state(
@@ -157,7 +183,7 @@ enum OpeningRestoreOutcome {
     FundingOutputsAbsent,
 }
 
-/// Outcomes of a restore-only startup or manual opening recovery pass.
+/// Outcomes of an exclusive startup or manual opening recovery pass.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct OpeningRecoveryReport {
     pub recovered_channel_ids: Vec<String>,
@@ -186,6 +212,7 @@ impl OpeningRecoveryReport {
 enum OpeningRecoveryOutcome {
     Recovered(String),
     Cancelled,
+    Abandoned,
     Unresolved,
 }
 
@@ -245,6 +272,8 @@ pub struct SqliteClientWallet {
     bridge: Mutex<ClientBridge>,
     sender_secret: SecretKey,
     sender_pubkey_hex: String,
+    opening_scope: String,
+    wallet_lock_identity: WalletLockIdentity,
     channel_db: Mutex<Connection>,
     #[cfg(test)]
     fail_next_recovered_proof_import: AtomicBool,
@@ -496,6 +525,12 @@ impl SqliteClientWallet {
         sender_secret_hex: &str,
     ) -> Result<Self, WalletError> {
         let path = channel_db_path.as_ref();
+        let loose_db_path = loose_wallet.database_path().ok_or_else(|| {
+            WalletError::Backend("in-memory loose proof wallets are unsupported here".to_string())
+        })?;
+        let wallet_lock_identity = WalletLockIdentity::new(loose_db_path, path).map_err(|e| {
+            WalletError::Backend(format!("normalize wallet database identity: {e}"))
+        })?;
         let path_str = path.to_str().ok_or_else(|| {
             WalletError::Backend("channel database path is not valid UTF-8".to_string())
         })?;
@@ -524,12 +559,18 @@ impl SqliteClientWallet {
             ))
             .map_err(|e| WalletError::Backend(format!("create channel metadata schema: {e}")))?;
         reject_and_remove_legacy_opening_recoveries(&channel_db)?;
+        let opening_scope = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string();
 
         Ok(Self {
             loose_wallet,
             bridge: Mutex::new(bridge),
             sender_secret,
             sender_pubkey_hex,
+            opening_scope,
+            wallet_lock_identity,
             channel_db: Mutex::new(channel_db),
             #[cfg(test)]
             fail_next_recovered_proof_import: AtomicBool::new(false),
@@ -779,10 +820,24 @@ impl SqliteClientWallet {
     ///
     /// Ambiguous failures leave loose proofs reserved and an upstream
     /// `OpeningFromSwap` row behind. This method first uses NUT-09 restore. If a
-    /// valid response has no funding outputs, the submitted attempt remains
-    /// unresolved and reserved. This method never submits swaps, abandons submitted
-    /// attempts, or revisits abandoned attempts.
-    pub fn recover_pending_openings(&self) -> Result<OpeningRecoveryReport, WalletError> {
+    /// valid response has no funding or change outputs, an attempt at least one hour
+    /// past its latest authorized execution may be abandoned only after one complete
+    /// exact-input NUT-07 response reports every input `UNSPENT`. This method never
+    /// submits swaps or revisits abandoned attempts. Callers must hold exclusive
+    /// wallet-manager maintenance access for the entire pass.
+    pub fn recover_pending_openings(
+        &self,
+        access: &ExclusiveWalletAccess<'_>,
+    ) -> Result<OpeningRecoveryReport, WalletError> {
+        if !access.authorizes(&self.wallet_lock_identity) {
+            return Err(WalletError::Backend(
+                "exclusive wallet maintenance access belongs to a different wallet".to_string(),
+            ));
+        }
+        self.recover_pending_openings_inner()
+    }
+
+    fn recover_pending_openings_inner(&self) -> Result<OpeningRecoveryReport, WalletError> {
         let attempts = self
             .loose_wallet
             .opening_attempts_for_recovery()
@@ -796,6 +851,9 @@ impl SqliteClientWallet {
                 }
                 Ok(OpeningRecoveryOutcome::Cancelled) => report
                     .cancelled_attempt_ids
+                    .push(attempt.attempt_id.clone()),
+                Ok(OpeningRecoveryOutcome::Abandoned) => report
+                    .abandoned_attempt_ids
                     .push(attempt.attempt_id.clone()),
                 Ok(OpeningRecoveryOutcome::Unresolved) => {
                     report.unresolved.push(UnresolvedOpening {
@@ -877,6 +935,10 @@ impl SqliteClientWallet {
                     })?;
                 }
             }
+            let abandonment_evidence = self
+                .loose_wallet
+                .opening_abandonment_evidence(&attempt.attempt_id)
+                .map_err(loose_proof_error)?;
             match self
                 .restore_journaled_opening(&prepared, networking)
                 .map_err(|error| {
@@ -892,6 +954,26 @@ impl SqliteClientWallet {
                     *completed
                 }
                 OpeningRestoreOutcome::FundingOutputsAbsent => {
+                    let Some(evidence) = abandonment_evidence else {
+                        return Ok(OpeningRecoveryOutcome::Unresolved);
+                    };
+                    let now = Self::now_seconds()?;
+                    if !prepared_inputs_are_all_unspent(&prepared, networking).map_err(|error| {
+                        open_channel_error(error, &attempt.unit, attempt.input_budget_msats)
+                    })? {
+                        return Ok(OpeningRecoveryOutcome::Unresolved);
+                    }
+                    if self
+                        .loose_wallet
+                        .abandon_opening_attempt_if_evidence_current(
+                            &evidence,
+                            now,
+                            "aged empty exact restore with every exact input UNSPENT",
+                        )
+                        .map_err(loose_proof_error)?
+                    {
+                        return Ok(OpeningRecoveryOutcome::Abandoned);
+                    }
                     return Ok(OpeningRecoveryOutcome::Unresolved);
                 }
             }
@@ -933,34 +1015,9 @@ impl SqliteClientWallet {
         networking: &N,
     ) -> Result<Option<OpenChannelResult>, OpenChannelError> {
         match self.restore_journaled_opening(prepared, networking)? {
-            OpeningRestoreOutcome::Completed(completed) => {
-                let completed = *completed;
-                let completed_json = serde_json::to_string(&completed).map_err(|e| {
-                    open_channel_stage_error(
-                        OpenChannelFailureStage::FundingProofsReceived,
-                        Some(prepared.channel_id.clone()),
-                        format!("serialize recovered opening: {e}"),
-                    )
-                })?;
-                self.loose_wallet
-                    .mark_opening_attempt_finalizing(&prepared.channel_id, &completed_json)
-                    .map_err(|e| {
-                        open_channel_stage_error(
-                            OpenChannelFailureStage::FundingProofsReceived,
-                            Some(prepared.channel_id.clone()),
-                            format!("persist recovered opening: {e}"),
-                        )
-                    })?;
-                let bridge = self.bridge.lock().map_err(|_| {
-                    open_channel_stage_error(
-                        OpenChannelFailureStage::MarkOpen,
-                        Some(prepared.channel_id.clone()),
-                        "bridge mutex poisoned".to_string(),
-                    )
-                })?;
-                bridge.mark_completed_open(&completed)?;
-                Ok(Some(completed.result))
-            }
+            OpeningRestoreOutcome::Completed(completed) => self
+                .complete_live_restored_opening(prepared, *completed)
+                .map(Some),
             OpeningRestoreOutcome::FundingOutputsAbsent => {
                 if !prepared_inputs_are_all_unspent(prepared, networking)? {
                     return Ok(None);
@@ -998,10 +1055,51 @@ impl SqliteClientWallet {
                         ));
                     }
                 };
-                self.submit_prepared_open(prepared.clone(), permit, networking)
-                    .map(Some)
+                match self.submit_prepared_open(prepared.clone(), permit, networking) {
+                    Ok(result) => Ok(Some(result)),
+                    Err(_replay_error) => {
+                        match self.restore_journaled_opening(prepared, networking)? {
+                            OpeningRestoreOutcome::Completed(completed) => self
+                                .complete_live_restored_opening(prepared, *completed)
+                                .map(Some),
+                            OpeningRestoreOutcome::FundingOutputsAbsent => Ok(None),
+                        }
+                    }
+                }
             }
         }
+    }
+
+    fn complete_live_restored_opening(
+        &self,
+        prepared: &PreparedOpenChannel,
+        completed: CompletedOpenChannel,
+    ) -> Result<OpenChannelResult, OpenChannelError> {
+        let completed_json = serde_json::to_string(&completed).map_err(|e| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::FundingProofsReceived,
+                Some(prepared.channel_id.clone()),
+                format!("serialize recovered opening: {e}"),
+            )
+        })?;
+        self.loose_wallet
+            .mark_opening_attempt_finalizing(&prepared.channel_id, &completed_json)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::FundingProofsReceived,
+                    Some(prepared.channel_id.clone()),
+                    format!("persist recovered opening: {e}"),
+                )
+            })?;
+        let bridge = self.bridge.lock().map_err(|_| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::MarkOpen,
+                Some(prepared.channel_id.clone()),
+                "bridge mutex poisoned".to_string(),
+            )
+        })?;
+        bridge.mark_completed_open(&completed)?;
+        Ok(completed.result)
     }
 
     fn restore_journaled_opening<N: OpeningRecoveryNetworking>(
@@ -1040,6 +1138,33 @@ impl SqliteClientWallet {
             )
         })?
         else {
+            if let Some(request) = recovery.change_restore_request_json.as_deref() {
+                let response = networking
+                    .call_mint_restore(&recovery.mint_url, request)
+                    .map_err(|e| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::RestoreVerification,
+                            Some(prepared.channel_id.clone()),
+                            e,
+                        )
+                    })?;
+                if validate_and_canonicalize_restore_response(request, &response)
+                    .map_err(|e| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::RestoreVerification,
+                            Some(prepared.channel_id.clone()),
+                            format!("validate change restore response: {e}"),
+                        )
+                    })?
+                    .is_some()
+                {
+                    return Err(open_channel_stage_error(
+                        OpenChannelFailureStage::RestoreVerification,
+                        Some(prepared.channel_id.clone()),
+                        "funding outputs were absent but change outputs were present".to_string(),
+                    ));
+                }
+            }
             return Ok(OpeningRestoreOutcome::FundingOutputsAbsent);
         };
         let change_response = match recovery.change_restore_request_json.as_deref() {
@@ -1458,9 +1583,20 @@ impl SqliteClientWallet {
         let permit = match claim {
             OpeningSubmissionClaim::Acquired(permit) => permit,
             OpeningSubmissionClaim::NotReplayable { state } => {
-                return Err(SubmitOpenAttemptError::Authority(WalletError::Backend(
-                    format!("opening submission authority unavailable in state {state:?}"),
-                )));
+                let error = match state {
+                    OpeningAttemptState::Completed => WalletError::AlreadyOpen {
+                        channel_id: attempt.prepared.channel_id.clone(),
+                    },
+                    OpeningAttemptState::Prepared
+                    | OpeningAttemptState::Submitted
+                    | OpeningAttemptState::Finalizing => WalletError::OpeningInProgress {
+                        channel_id: attempt.prepared.channel_id.clone(),
+                    },
+                    _ => WalletError::Conflict {
+                        channel_id: attempt.prepared.channel_id.clone(),
+                    },
+                };
+                return Err(SubmitOpenAttemptError::Authority(error));
             }
             OpeningSubmissionClaim::NotFound => {
                 return Err(SubmitOpenAttemptError::Authority(WalletError::Backend(
@@ -2057,6 +2193,13 @@ impl SqliteClientWallet {
         allow_keyset_successor: bool,
         networking: &N,
     ) -> Result<String, WalletError> {
+        let flight_key = format!("{}:{}", self.opening_scope, attempt.prepared.channel_id);
+        let _active_opening = enter_active_opening(&flight_key).map_err(|error| match error {
+            WalletError::OpeningInProgress { .. } => WalletError::OpeningInProgress {
+                channel_id: attempt.prepared.channel_id.clone(),
+            },
+            error => error,
+        })?;
         let result = match self.submit_open_attempt_with_networking(&attempt, networking) {
             Err(SubmitOpenAttemptError::Authority(error)) => return Err(error),
             Err(SubmitOpenAttemptError::Open(error)) if error.input_may_be_spent => {
@@ -3110,7 +3253,14 @@ fn change_proofs_to_loose_proofs(
 }
 
 fn loose_proof_error(error: LooseProofWalletError) -> WalletError {
-    WalletError::Backend(format!("loose proof wallet: {error}"))
+    match error {
+        LooseProofWalletError::AlreadyOpen(channel_id) => WalletError::AlreadyOpen { channel_id },
+        LooseProofWalletError::OpeningInProgress(channel_id) => {
+            WalletError::OpeningInProgress { channel_id }
+        }
+        LooseProofWalletError::OpeningConflict(channel_id) => WalletError::Conflict { channel_id },
+        error => WalletError::Backend(format!("loose proof wallet: {error}")),
+    }
 }
 
 fn active_output_keyset_id_from_cache<H, N>(
@@ -3536,6 +3686,7 @@ mod tests {
     use crate::loose_proof_wallet::OpeningExecutionKind;
     use crate::loose_proof_wallet::{LooseProofState, NewLooseProof};
     use crate::proof_selection::input_fee_raw_from_ppk_sum;
+    use crate::wallet_lock::ClientWalletLocks;
     use cdk_spilman::{
         channel_parameters_get_channel_id,
         compute_channel_from_proofs_with_input_keysets_and_funding_amount,
@@ -3679,6 +3830,53 @@ mod tests {
         calls: Mutex<usize>,
     }
 
+    struct BlockingSwapNetworking {
+        calls: AtomicUsize,
+        entered: (Mutex<bool>, std::sync::Condvar),
+        release: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl BlockingSwapNetworking {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                entered: (Mutex::new(false), std::sync::Condvar::new()),
+                release: (Mutex::new(false), std::sync::Condvar::new()),
+            }
+        }
+    }
+
+    impl SpilmanClientNetworking for BlockingSwapNetworking {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.entered.0.lock().unwrap() = true;
+            self.entered.1.notify_one();
+            let mut release = self.release.0.lock().unwrap();
+            while !*release {
+                release = self.release.1.wait(release).unwrap();
+            }
+            Err("injected ambiguous submission".to_string())
+        }
+
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
+            Ok(r#"{"outputs":[],"signatures":[]}"#.to_string())
+        }
+
+        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+    }
+
+    impl OpeningRecoveryNetworking for BlockingSwapNetworking {
+        fn call_mint_check_state(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+    }
+
     impl SpilmanClientNetworking for CountingSwapNetworking {
         fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
             *self.calls.lock().unwrap() += 1;
@@ -3801,7 +3999,10 @@ mod tests {
                 requests.len() - 1
             };
             match call_index {
-                0 | 2 => Err("injected transport loss before mint submission".to_string()),
+                0 | 2 => {
+                    std::thread::sleep(Duration::from_millis(1_100));
+                    Err("injected transport loss before mint submission".to_string())
+                }
                 1 | 3 => self.inner.call_mint_swap(mint_url, request_json),
                 _ => Err(format!("unexpected swap submission {}", call_index + 1)),
             }
@@ -5370,6 +5571,82 @@ mod tests {
         mint_task.await.unwrap().unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_recovery_rejects_exclusive_access_for_another_wallet() {
+        let temp = tempfile::tempdir().unwrap();
+        let loose_a = temp.path().join("loose-a.sqlite");
+        let channels_a = temp.path().join("channels-a.sqlite");
+        let loose_b = temp.path().join("loose-b.sqlite");
+        let channels_b = temp.path().join("channels-b.sqlite");
+        let locks_b = ClientWalletLocks::acquire(
+            &loose_b,
+            &channels_b,
+            crate::wallet_lock::WalletLockMode::Maintenance,
+        )
+        .unwrap();
+        let wallet_a = SqliteClientWallet::open(
+            LooseProofWallet::open(&loose_a, "alice").unwrap(),
+            &channels_a,
+            &sender_secret_hex(),
+        )
+        .unwrap();
+
+        let error = wallet_a
+            .recover_pending_openings(&locks_b.exclusive_access().unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("belongs to a different wallet"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_recovery_accepts_aliases_and_deduplicated_same_file_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let loose = temp.path().join("loose.sqlite");
+        let channels = temp.path().join("channels.sqlite");
+        let loose_alias = temp.path().join("loose-alias.sqlite");
+        let channels_alias = temp.path().join("channels-alias.sqlite");
+        symlink(&loose, &loose_alias).unwrap();
+        symlink(&channels, &channels_alias).unwrap();
+        let locks = ClientWalletLocks::acquire(
+            &loose_alias,
+            &channels_alias,
+            crate::wallet_lock::WalletLockMode::Maintenance,
+        )
+        .unwrap();
+        let wallet = SqliteClientWallet::open(
+            LooseProofWallet::open(&loose, "alice").unwrap(),
+            &channels,
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        assert!(wallet
+            .recover_pending_openings(&locks.exclusive_access().unwrap())
+            .unwrap()
+            .is_empty());
+        drop(wallet);
+        drop(locks);
+
+        let combined = temp.path().join("combined.sqlite");
+        let locks = ClientWalletLocks::acquire(
+            &combined,
+            &combined,
+            crate::wallet_lock::WalletLockMode::Maintenance,
+        )
+        .unwrap();
+        let wallet = SqliteClientWallet::open(
+            LooseProofWallet::open(&combined, "alice").unwrap(),
+            &combined,
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        assert!(wallet
+            .recover_pending_openings(&locks.exclusive_access().unwrap())
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn opening_recovery_reports_cancellation_and_unresolved_without_mint_io() {
         let temp = tempfile::tempdir().unwrap();
@@ -5435,7 +5712,7 @@ mod tests {
                 }
             }
         }
-        let mut report = wallet.recover_pending_openings().unwrap();
+        let mut report = wallet.recover_pending_openings_inner().unwrap();
         report.cancelled_attempt_ids.sort();
         assert_eq!(report.cancelled_attempt_ids, vec!["prepared", "rejected"]);
         assert!(report.recovered_channel_ids.is_empty());
@@ -5453,7 +5730,7 @@ mod tests {
                 .state,
             LooseProofState::Reserved
         );
-        let repeated = wallet.recover_pending_openings().unwrap();
+        let repeated = wallet.recover_pending_openings_inner().unwrap();
         assert!(repeated.cancelled_attempt_ids.is_empty());
         assert_eq!(repeated.unresolved, report.unresolved);
     }
@@ -5500,6 +5777,109 @@ mod tests {
             .loose_wallet()
             .cancel_prepared_opening_attempt(&prepared.channel_id)
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_same_opening_across_handles_submits_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let loose_db = temp.path().join("loose.sqlite");
+        let channel_db = temp.path().join("channels.sqlite");
+        let sender_secret = sender_secret_hex();
+        let first = SqliteClientWallet::open(
+            LooseProofWallet::open(&loose_db, "alice").unwrap(),
+            &channel_db,
+            &sender_secret,
+        )
+        .unwrap();
+        let prepared = prepared_opening_with_input_secrets(&["proof-a"]);
+        let claim = journal_prepared_opening_for_authority_test(&first, &prepared);
+        first
+            .loose_wallet()
+            .cancel_opening_submission_claim(claim)
+            .unwrap();
+        let second = SqliteClientWallet::open(
+            LooseProofWallet::open(&loose_db, "alice").unwrap(),
+            &channel_db,
+            &sender_secret,
+        )
+        .unwrap();
+        let record = first
+            .loose_wallet()
+            .opening_attempt(&prepared.channel_id)
+            .unwrap()
+            .unwrap();
+        let reservation = ProofReservation {
+            reservation_id: record.reservation_id,
+            proofs: first
+                .loose_wallet()
+                .proofs_for_reservation("reservation")
+                .unwrap(),
+            total_amount_raw: 1,
+        };
+        let attempt = ClientOpenAttempt {
+            opening_id: prepared.channel_id.clone(),
+            output_keyset: SelectedOutputKeyset {
+                id: prepared.keyset_id.clone(),
+                info_json: prepared.opening.keyset_info_json.clone(),
+            },
+            reservation,
+            prepared: prepared.clone(),
+            requested_capacity_raw: None,
+            desired_funding_token_amount_raw: Some(1),
+            selected_input_msats: 1_000,
+            expiry_timestamp: 123_456,
+        };
+        let offer = RelayPaymentOffer {
+            receiver_pubkey: "receiver".to_string(),
+            mint_url: prepared.mint_url.clone(),
+            unit: "sat".to_string(),
+            preferred_keyset_ids: vec![prepared.keyset_id.clone()],
+            negotiated_keyset_versions: BTreeSet::from(["v1".to_string()]),
+            in_bytes_per_millisat: 1,
+            out_bytes_per_millisat: 1,
+        };
+        let networking = BlockingSwapNetworking::new();
+
+        std::thread::scope(|scope| {
+            let leader_attempt = attempt.clone();
+            let leader = scope.spawn(|| {
+                first.execute_open_attempt_with_networking(
+                    &offer,
+                    leader_attempt,
+                    false,
+                    &networking,
+                )
+            });
+            let mut entered = networking.entered.0.lock().unwrap();
+            while !*entered {
+                entered = networking.entered.1.wait(entered).unwrap();
+            }
+            drop(entered);
+
+            let follower = scope.spawn(|| {
+                second.execute_open_attempt_with_networking(&offer, attempt, false, &networking)
+            });
+            assert_eq!(
+                follower.join().unwrap().unwrap_err(),
+                WalletError::OpeningInProgress {
+                    channel_id: prepared.channel_id.clone()
+                }
+            );
+            *networking.release.0.lock().unwrap() = true;
+            networking.release.1.notify_one();
+            assert!(leader.join().unwrap().is_err());
+        });
+        assert_eq!(networking.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first
+                .loose_wallet()
+                .opening_executions(&prepared.channel_id)
+                .unwrap()
+                .iter()
+                .filter(|execution| execution.status != OpeningExecutionStatus::Cancelled)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5939,7 +6319,7 @@ mod tests {
 
         let loose_wallet = LooseProofWallet::open(&loose_db, "alice").unwrap();
         let wallet = SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret).unwrap();
-        let recovered = wallet.recover_pending_openings().unwrap();
+        let recovered = wallet.recover_pending_openings_inner().unwrap();
         if !swap_reached_mint {
             assert!(recovered.abandoned_attempt_ids.is_empty());
             assert!(recovered.recovered_channel_ids.is_empty());
@@ -5961,7 +6341,7 @@ mod tests {
                 0
             );
             assert!(wallet.get_channel(&channel_id).is_err());
-            let repeated = wallet.recover_pending_openings().unwrap();
+            let repeated = wallet.recover_pending_openings_inner().unwrap();
             assert_eq!(repeated.unresolved.len(), 1);
             assert_eq!(
                 wallet
@@ -6009,7 +6389,7 @@ mod tests {
             .available_balance_raw(&mint_url, unit, std::slice::from_ref(&keyset_id))
             .unwrap();
         assert_eq!(available_change, expected_change_raw);
-        assert!(wallet.recover_pending_openings().unwrap().is_empty());
+        assert!(wallet.recover_pending_openings_inner().unwrap().is_empty());
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
@@ -6105,9 +6485,12 @@ mod tests {
         let losing_error = wallet
             .execute_open_attempt_with_networking(&offer, losing_attempt, true, &networking)
             .unwrap_err();
-        assert!(losing_error
-            .to_string()
-            .contains("submission authority unavailable"));
+        assert_eq!(
+            losing_error,
+            WalletError::OpeningInProgress {
+                channel_id: opening_id.clone()
+            }
+        );
 
         {
             let swap_requests = networking.swap_requests.lock().unwrap();

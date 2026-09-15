@@ -116,6 +116,15 @@ pub enum WalletError {
         unit: String,
         reason: String,
     },
+    AlreadyOpen {
+        channel_id: String,
+    },
+    OpeningInProgress {
+        channel_id: String,
+    },
+    Conflict {
+        channel_id: String,
+    },
     Backend(String),
 }
 
@@ -158,6 +167,13 @@ impl fmt::Display for WalletError {
                 f,
                 "provisioning offer unavailable for mint={mint_url} unit={unit}: {reason}"
             ),
+            Self::AlreadyOpen { channel_id } => write!(f, "channel already open: {channel_id}"),
+            Self::OpeningInProgress { channel_id } => {
+                write!(f, "channel opening already in progress: {channel_id}")
+            }
+            Self::Conflict { channel_id } => {
+                write!(f, "conflicting channel opening: {channel_id}")
+            }
             Self::Backend(message) => write!(f, "backend error: {message}"),
         }
     }

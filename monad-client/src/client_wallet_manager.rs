@@ -25,7 +25,7 @@ impl ClientWalletManager {
             &config.channel_db_path,
             &config.sender_secret_hex,
         )?);
-        let recovery = wallet.recover_pending_openings()?;
+        let recovery = wallet.recover_pending_openings(&locks.exclusive_access()?)?;
         locks.enter_steady_state()?;
         Ok((
             Self {
