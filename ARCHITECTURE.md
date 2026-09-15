@@ -650,6 +650,14 @@ refreshes its own mint cache before using a non-preferred fallback. It also
 refreshes before concluding that no compatible active keyset exists. Before
 submitting the opening swap, the loose-proof store atomically reserves the
 selected inputs and records the exact serialized prepared opening.
+The configured `channel_funding_token_target_msats` is a desired funding-token
+value. Plain provisioning selects strict smallest-first `(amount, proof_id)`
+inputs until their post-input-fee value covers that target, so input fees are
+additional rather than deducted from the configured value. Input keyset metadata
+gets one bounded refresh when needed; an unresolved proof cannot be skipped
+before the plain target, while exact-capacity selection can proceed from known,
+positive-net inputs after refresh when they suffice. Both preparation and storage
+enforce a portable maximum of 992 selected proof IDs.
 The journal is authoritative across restarts. Submitted attempts first recover
 their original funding/change outputs through NUT-09. If a valid funding restore
 is empty, one NUT-07 request checks every persisted input Y; only an all-`UNSPENT`
@@ -679,6 +687,9 @@ and change restores are empty and one complete NUT-07 response reports every exa
 input `UNSPENT`. The atomic release revalidates the attempt state, timestamp,
 latest execution sequence, and exact reservation; recent, clock-rollback, stale,
 or inconclusive evidence remains reserved. Other swap policies are unchanged.
+The authoritative opening journal migrates schema v1 to v2 atomically by renaming
+the persisted input-budget field to the funding-token target while preserving all
+attempts, executions, proof IDs, states, timestamps, indexes, and authority data.
 The live exact-replay
 allowance is independent per immutable attempt, so a keyset successor receives
 its own allowance without authorizing a second successor.

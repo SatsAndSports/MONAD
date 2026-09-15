@@ -1,13 +1,20 @@
 # Client Channel Opening Review
 
-Status: opening recovery policy implemented. The first implementation PR covers the
-upstream validation/storage API pin, client wallet manager, cross-process locking,
-read-only inspection, and multi-client supervision. The stacked opening-journal
+Status: opening input selection implemented on top of the opening recovery
+policy. The first implementation PR covers the upstream validation/storage API
+pin, client wallet manager, cross-process locking, read-only inspection, and
+multi-client supervision. The stacked opening-journal
 authority PR now covers exact durable inputs, submission authority/execution
 records, monotonic submission uncertainty, exact atomic completion, and removal of
 legacy opening recovery state. This stacked PR completes bounded live replay,
 direct-only `12002` successors, exclusive aged abandonment, and typed duplicate
 opening coordination.
+
+This stacked input-selection PR renames the configured funding amount to
+`channel_funding_token_target_msats`, makes Cashu input fees additional to that
+target, preserves deterministic smallest-first plain selection, adds one bounded
+input-keyset metadata refresh, excludes non-contributing exact-capacity inputs,
+and enforces a typed portable 992-proof limit before preparation and at storage.
 
 This document is a handoff for resuming work on client channel-opening swaps. It
 records the current findings, decisions, open questions, and proposed sequence.
@@ -218,6 +225,7 @@ correctness boundary.
   selection with the intended funding-token-value semantics.
 - Selection must gather enough gross input value to cover the desired funding
   token plus input fees.
+- Implemented by the opening input-selection PR.
 
 ### Channel Identity
 
@@ -237,6 +245,8 @@ correctness boundary.
   policy.
 - Target-capacity selection is a separate fee-aware policy and can be corrected
   independently.
+- Implemented with strict `(amount, proof ID)` plain ordering and a 992-proof
+  portable limit.
 
 ### Legacy Data
 
@@ -461,10 +471,12 @@ Current uniqueness notes:
 
 Severity: medium.
 
-The API currently calls the value `input_budget_msats`, but plain provisioning uses
-it as the desired funding-token amount. It selects gross proof value until gross
-value reaches that target, while upstream requires the target to fit after input
-fees.
+Status: resolved by the opening input-selection PR.
+
+Before this PR, the API described the value as an input budget, but plain
+provisioning used it as the desired funding-token amount. It selected gross proof
+value until gross value reached that target, while upstream required the target
+to fit after input fees.
 
 Example:
 
@@ -489,6 +501,9 @@ Required direction:
 
 Severity: medium availability issue.
 
+Status: resolved by one bounded refresh; understood proofs may proceed only when
+they suffice after that refresh.
+
 The target-capacity path looks up cached keyset/fee metadata for every available
 input proof before selection. If one proof's keyset is absent from the client cache,
 it returns an error before reservation or submission. It does not crash and does
@@ -507,6 +522,9 @@ Required direction:
 
 Severity: medium availability issue.
 
+Status: resolved with a portable maximum of 992 IDs and typed pre-preparation and
+storage-boundary errors; batching was intentionally not added.
+
 Plain provisioning intentionally consumes proofs in smallest-first order. The
 reservation code guards against roughly 999 SQLite parameters and currently checks
 `proof_ids.len() + 5 > 999`, although the update statement appears to bind seven
@@ -524,6 +542,9 @@ Required direction:
 ### 11. Target Fee-Aware Selection Has A Feasible-Subset Edge Case
 
 Severity: medium.
+
+Status: resolved by excluding proofs whose individual net contribution is not
+positive while preserving largest-first/lower-fee ordering.
 
 The target-capacity selector is a largest-first heuristic with a lower-fee
 tie-break. A high-fee proof with nonpositive net value can be included first and

@@ -169,11 +169,24 @@ Input proof keysets are independent from the selected output funding keyset:
 input proofs may be old, inactive, or mixed-keyset proofs as long as the mint
 accepts them and fee metadata is known.
 
+`client_wallet.channel_funding_token_target_msats` is the desired value of the
+funding token, not a gross loose-proof budget. Plain opening selection consumes
+proofs in strict `(amount, proof_id)` order until value after Cashu input fees
+covers that target; input fees are additional and surplus returns as change.
+Gross insufficiency is reported before keyset network I/O. If the next required
+proof lacks input-fee metadata, the client refreshes once and does not skip it;
+metadata missing after the target is reached is irrelevant. Exact-capacity
+selection retains its largest-first/lower-fee ordering, ignores nonpositive-net
+proofs, and may ignore still-unknown proofs only when understood proofs suffice
+after one refresh. Openings are limited to 992 input proof IDs before preparation
+and again at the SQLite reservation boundary.
+
 When a session needs a new channel, it considers relay-advertised mint/unit
 offers in order. It may continue to a later offer only after an explicitly safe,
-offer-local result: no compatible active keyset, insufficient loose proofs for
-that offer, or a preparation failure before the atomic reservation/journal
-boundary. Reservation, persistence, and ambiguous submission failures stop the
+offer-local result: no compatible active keyset, insufficient loose proofs,
+unavailable input-keyset metadata, too many selected inputs for that offer, or a
+preparation failure before the atomic reservation/journal boundary. Reservation,
+persistence, and ambiguous submission failures stop the
 pass because the selected inputs may require recovery. If every offer is safely
 unavailable before initial session readiness, funding remains blocked; after
 readiness, the driver retries using its normal funding backoff.

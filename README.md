@@ -50,7 +50,7 @@ client_wallet:
   loose_db_path: /var/lib/monad/client-loose.db
   channel_db_path: /var/lib/monad/client-channels.db
   sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
-  channel_input_budget_msats: 1000000
+  channel_funding_token_target_msats: 1000000
   target_topup_buffer_msats: 10000000
   minimum_topup_msats: 0
 
@@ -131,7 +131,7 @@ YAML order; add `--client <name>` to run only one entry.
 - configured-client startup and manual `recover-openings` never submit opening swaps. They finish restored or finalizing channels and cancel prepared attempts and rejected attempts without successors. Under exclusive wallet access, a submitted attempt can be abandoned only at least one hour after its latest submission/replay when exact funding/change restores are empty and one complete exact-input check reports every input `UNSPENT`; recent, stale, clock-rollback, partial, invalid, or unavailable evidence remains reserved.
 - output keyset handling is cache-first: channel opening prefers an advertised active keyset, then falls back to another locally active same-mint/unit keyset with a negotiated format. When preferences are nonempty but unavailable locally, the client refreshes its own mint cache before using a non-preferred fallback; it also refreshes before concluding that no compatible active keyset exists. An explicit inactive-output-keyset rejection (`12002`) may create one persisted successor using a changed active keyset; ambiguous errors never trigger another swap submission.
 
-`client_wallet.channel_input_budget_msats` controls the loose-proof input budget for each newly provisioned channel. It is not a guaranteed channel capacity; fees and deterministic channel outputs can make the resulting capacity lower. The default is `1000000` msats.
+`client_wallet.channel_funding_token_target_msats` controls the desired funding-token value for each newly provisioned channel. Cashu input fees are selected in addition to this target; output fees and deterministic channel outputs can make usable channel capacity lower. The default is `1000000` msats.
 
 `client_wallet.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `client_wallet.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats.
 
@@ -371,7 +371,7 @@ client_wallet:
   loose_db_path: /var/lib/monad/client-loose.db
   channel_db_path: /var/lib/monad/client-channels.db
   sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
-  channel_input_budget_msats: 1000000
+  channel_funding_token_target_msats: 1000000
   target_topup_buffer_msats: 10000000
   minimum_topup_msats: 0
 
