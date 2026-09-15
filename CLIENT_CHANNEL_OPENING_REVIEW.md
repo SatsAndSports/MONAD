@@ -1,8 +1,11 @@
 # Client Channel Opening Review
 
-Status: design and correctness review in progress. The first implementation PR
-now covers the upstream validation/storage API pin, client wallet manager,
-cross-process locking, read-only inspection, and multi-client supervision.
+Status: implementation in progress. The first implementation PR covers the
+upstream validation/storage API pin, client wallet manager, cross-process locking,
+read-only inspection, and multi-client supervision. The stacked opening-journal
+authority PR now covers exact durable inputs, submission authority/execution
+records, monotonic submission uncertainty, exact atomic completion, and removal of
+legacy opening recovery state.
 
 This document is a handoff for resuming work on client channel-opening swaps. It
 records the current findings, decisions, open questions, and proposed sequence.
@@ -50,6 +53,31 @@ before reviewing the other Cashu swap paths and adding journals where appropriat
 - Submitted startup/manual recovery is restore-only and non-abandoning. Empty
   restore evidence remains unresolved and its inputs remain reserved. The wider
   journal/replay/aged-abandonment policy remains future scope.
+
+## Opening Journal Authority PR Implemented
+
+- Opening attempts persist canonical exact selected local proof IDs. Creation and
+  recovery verify those IDs against the exact reserved proof rows and immutable
+  prepared input token.
+- Initial submissions and immutable live replays use two-step move-only authority.
+  A typed transactional claim creates only a durable `Claimed` execution; after all
+  fallible request/journal/reservation checks, authorization consumes that permit,
+  rechecks current state, transitions the execution to `Authorized`, and atomically
+  advances `latest_submitted_at` immediately before the HTTP call.
+- A failed initial claim exits without restore, replay, submission, or cleanup.
+  Once any execution may have reached the mint, later local/recovery failures retain
+  the original uncertainty and generic reservation release is fenced out.
+- A replay rejection is recorded for that execution but does not resolve an earlier
+  ambiguous execution, release inputs, or authorize a keyset successor.
+- Finalization atomically verifies/transitions every exact selected proof together
+  with `Finalizing -> Completed`. Idempotency requires the exact proofs already be
+  spent for that channel; missing, available, reassigned, extra, or differently
+  spent proofs are conflicts.
+- The `monad_client_channel_opening_recoveries` compatibility path/table is removed.
+  Empty obsolete tables are dropped; nonempty obsolete recovery or pre-authority
+  journal state is rejected rather than inferred.
+- Detailed live replay policy, one-hour administrative abandonment, and in-memory
+  same-channel singleflight remain explicitly deferred to the next stacked PR.
 
 ## Current Model
 
