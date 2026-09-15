@@ -6559,7 +6559,7 @@ client_wallet:
   loose_db_path: {}
   channel_db_path: {}
   sender_secret_hex: "{}"
-  channel_input_budget_msats: 1000000
+  channel_funding_token_target_msats: 1000000
   target_topup_buffer_msats: 500000
 relays:
   - name: yaml-relay
@@ -6779,7 +6779,7 @@ client_wallet:
   loose_db_path: {}
   channel_db_path: {}
   sender_secret_hex: "{}"
-  channel_input_budget_msats: 20000000
+  channel_funding_token_target_msats: 20000000
   # Low target keeps the reused channel far from capacity during reconnect.
   target_topup_buffer_msats: 500000
 relays:
@@ -7239,7 +7239,7 @@ struct ConfiguredRouteFixtureConfig {
     hop_count: usize,
     proof_batches: usize,
     wallet_seed: u8,
-    channel_input_budget_msats: u64,
+    channel_funding_token_target_msats: u64,
     label: &'static str,
 }
 
@@ -7401,7 +7401,7 @@ client_wallet:
   # Budget is parameterized per test. The small explicit topup target keeps
   # channels far from capacity: relinked sessions fund from remaining
   # capacity, so channels stay reusable across connect retries and rebuilds.
-  channel_input_budget_msats: {}
+  channel_funding_token_target_msats: {}
   target_topup_buffer_msats: 1000000
 relays:
 {}clients:
@@ -7413,7 +7413,7 @@ relays:
             loose_db_path.display(),
             channel_db_path.display(),
             sender_secret_hex,
-            fixture_config.channel_input_budget_msats,
+            fixture_config.channel_funding_token_target_msats,
             relays_yaml,
             socks_listen,
             route_yaml,
@@ -7494,7 +7494,7 @@ async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
         hop_count: case.hop_count,
         proof_batches: case.proof_batches,
         wallet_seed: case.wallet_seed,
-        channel_input_budget_msats: 11_000_000,
+        channel_funding_token_target_msats: 11_000_000,
         label: case.label,
     })
     .await;
@@ -7727,7 +7727,7 @@ async fn test_direct_connector_suffix_rebuild_preserves_prefix_sessions() {
         hop_count: HOP_COUNT,
         proof_batches: 8,
         wallet_seed: 53,
-        channel_input_budget_msats: 11_000_000,
+        channel_funding_token_target_msats: 11_000_000,
         label: "direct-suffix-rebuild",
     })
     .await;
@@ -7738,7 +7738,7 @@ async fn test_direct_connector_suffix_rebuild_preserves_prefix_sessions() {
     let runtime = connector::ConnectorRuntime::with_payment_policy(
         Some(wallet.clone()),
         PaymentPolicy {
-            channel_input_budget_msats: client_wallet.channel_input_budget_msats,
+            channel_funding_token_target_msats: client_wallet.channel_funding_token_target_msats,
             target_topup_buffer_msats: client_wallet.target_topup_buffer_msats,
             minimum_topup_msats: client_wallet.minimum_topup_msats,
         },
@@ -7813,7 +7813,7 @@ async fn test_failed_route_build_detaches_and_reuses_funded_prefix_channel() {
         hop_count: 2,
         proof_batches: 3,
         wallet_seed: 59,
-        channel_input_budget_msats: 11_000_000,
+        channel_funding_token_target_msats: 11_000_000,
         label: "failed-route-channel-reuse",
     })
     .await;
@@ -7824,7 +7824,7 @@ async fn test_failed_route_build_detaches_and_reuses_funded_prefix_channel() {
     let runtime = connector::ConnectorRuntime::with_payment_policy(
         Some(wallet.clone()),
         PaymentPolicy {
-            channel_input_budget_msats: client_wallet.channel_input_budget_msats,
+            channel_funding_token_target_msats: client_wallet.channel_funding_token_target_msats,
             target_topup_buffer_msats: client_wallet.target_topup_buffer_msats,
             minimum_topup_msats: client_wallet.minimum_topup_msats,
         },
@@ -7968,7 +7968,7 @@ async fn test_cancelled_route_setup_waits_for_stalled_provision_and_reuses_chann
         hop_count: 2,
         proof_batches: 3,
         wallet_seed: 61,
-        channel_input_budget_msats: 11_000_000,
+        channel_funding_token_target_msats: 11_000_000,
         label: "cancelled-route-channel-reuse",
     })
     .await;
@@ -7984,7 +7984,7 @@ async fn test_cancelled_route_setup_waits_for_stalled_provision_and_reuses_chann
     let runtime = connector::ConnectorRuntime::with_payment_policy(
         Some(wallet.clone()),
         PaymentPolicy {
-            channel_input_budget_msats: 11_000_000,
+            channel_funding_token_target_msats: 11_000_000,
             target_topup_buffer_msats: 100_000,
             minimum_topup_msats: 0,
         },
@@ -8069,13 +8069,13 @@ async fn test_cancelled_partial_suffix_quiesces_before_full_retry() {
         hop_count: 3,
         proof_batches: 4,
         wallet_seed: 63,
-        channel_input_budget_msats: 11_000_000,
+        channel_funding_token_target_msats: 11_000_000,
         label: "cancelled-partial-suffix",
     })
     .await;
     let inner: Arc<dyn MonadWallet> = Arc::new(fixture.open_client_wallet());
     let policy = PaymentPolicy {
-        channel_input_budget_msats: 11_000_000,
+        channel_funding_token_target_msats: 11_000_000,
         target_topup_buffer_msats: 100_000,
         minimum_topup_msats: 0,
     };
@@ -8188,7 +8188,7 @@ struct ConfiguredChaosFixtureConfig {
     hop_count: usize,
     proof_batches: usize,
     wallet_seed: u8,
-    channel_input_budget_msats: u64,
+    channel_funding_token_target_msats: u64,
     target_topup_buffer_msats: u64,
     label: &'static str,
 }
@@ -8348,7 +8348,7 @@ client_wallet:
   loose_db_path: {}
   channel_db_path: {}
   sender_secret_hex: "{}"
-  channel_input_budget_msats: {}
+  channel_funding_token_target_msats: {}
   target_topup_buffer_msats: {}
 relays:
 {}clients:
@@ -8360,7 +8360,7 @@ relays:
             loose_db_path.display(),
             channel_db_path.display(),
             sender_secret_hex,
-            fixture_config.channel_input_budget_msats,
+            fixture_config.channel_funding_token_target_msats,
             fixture_config.target_topup_buffer_msats,
             relays_yaml,
             socks_listen,
@@ -8615,7 +8615,7 @@ async fn test_configured_client_chaos_restarts_all_hop_positions() {
         hop_count: 3,
         proof_batches: 12,
         wallet_seed: 47,
-        channel_input_budget_msats: 11_000_000,
+        channel_funding_token_target_msats: 11_000_000,
         target_topup_buffer_msats: 1_000_000,
         label: "configured-chaos-restarts",
     })
@@ -8691,7 +8691,7 @@ async fn test_configured_client_keyset_rotation_after_relay_cache_refresh() {
         hop_count: 2,
         proof_batches: 4,
         wallet_seed: 59,
-        channel_input_budget_msats: 10_000_000,
+        channel_funding_token_target_msats: 10_000_000,
         target_topup_buffer_msats: 1_000_000,
         label: "configured-keyset-rotation",
     })
@@ -8793,7 +8793,7 @@ async fn test_configured_client_fresh_relay_stale_client_refreshes_locally_after
         hop_count: 2,
         proof_batches: 4,
         wallet_seed: 73,
-        channel_input_budget_msats: 10_000_000,
+        channel_funding_token_target_msats: 10_000_000,
         target_topup_buffer_msats: 1_000_000,
         label: "configured-keyset-rotation-fresh-relay-stale-client",
     })
@@ -8926,7 +8926,7 @@ async fn test_configured_client_keyset_rotation_triggers_relay_refresh_for_stale
         hop_count: 2,
         proof_batches: 4,
         wallet_seed: 61,
-        channel_input_budget_msats: 10_000_000,
+        channel_funding_token_target_msats: 10_000_000,
         target_topup_buffer_msats: 1_000_000,
         label: "configured-keyset-rotation-link-refresh",
     })
@@ -9022,7 +9022,7 @@ async fn test_configured_client_first_hop_rotation_refreshes_relay_on_channel_li
         hop_count: 2,
         proof_batches: 4,
         wallet_seed: 67,
-        channel_input_budget_msats: 10_000_000,
+        channel_funding_token_target_msats: 10_000_000,
         target_topup_buffer_msats: 1_000_000,
         label: "configured-keyset-rotation-first-hop-link-refresh",
     })
@@ -9125,7 +9125,7 @@ async fn test_configured_client_three_hop_middle_rotation_refreshes_relay_on_cha
         hop_count: 3,
         proof_batches: 5,
         wallet_seed: 71,
-        channel_input_budget_msats: 10_000_000,
+        channel_funding_token_target_msats: 10_000_000,
         target_topup_buffer_msats: 1_000_000,
         label: "configured-keyset-rotation-middle-hop-link-refresh",
     })
@@ -9234,7 +9234,7 @@ async fn chaos_configured_client_restarts() {
         hop_count,
         proof_batches: read_chaos_usize("MONAD_CHAOS_PROOF_BATCHES", 40),
         wallet_seed: 53,
-        channel_input_budget_msats: 1_000_000,
+        channel_funding_token_target_msats: 1_000_000,
         target_topup_buffer_msats: 100_000,
         label: "configured-chaos-stress",
     })
@@ -9459,7 +9459,7 @@ client_wallet:
   loose_db_path: {}
   channel_db_path: {}
   sender_secret_hex: "{}"
-  channel_input_budget_msats: 1000000
+  channel_funding_token_target_msats: 1000000
   target_topup_buffer_msats: 500000
 relays:
   - name: hop1

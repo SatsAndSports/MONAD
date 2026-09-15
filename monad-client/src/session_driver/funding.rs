@@ -80,7 +80,10 @@ fn provisioning_offer_is_unavailable(error: &WalletError) -> bool {
         error,
         WalletError::NoCompatibleActiveKeyset { .. }
             | WalletError::InsufficientLooseProofFunds { .. }
+            | WalletError::InputKeysetMetadataUnavailable { .. }
+            | WalletError::TooManyInputProofs { .. }
             | WalletError::ProvisioningOfferUnavailable { .. }
+            | WalletError::ProvisioningPreflight { .. }
     )
 }
 
@@ -313,7 +316,7 @@ pub(super) async fn maybe_ensure_linked_channel(
                         );
                         config.wallet.provision_channel(
                             offer,
-                            config.payment_policy.channel_input_budget_msats,
+                            config.payment_policy.channel_funding_token_target_msats,
                         )
                     },
                 );
@@ -671,5 +674,34 @@ mod tests {
             error,
             WalletError::Backend("input may be spent".to_string())
         );
+    }
+
+    #[test]
+    fn provisioning_tries_later_offer_after_typed_preflight_error() {
+        let advertisements = [
+            advertisement("https://mint-a"),
+            advertisement("https://mint-b"),
+        ];
+        let versions = BTreeSet::from(["v2".to_string()]);
+        let mut attempted = Vec::new();
+
+        let selected =
+            provision_from_advertisements("receiver", &advertisements, &versions, |offer| {
+                attempted.push(offer.mint_url.clone());
+                if offer.mint_url == "https://mint-a" {
+                    Err(WalletError::ProvisioningPreflight {
+                        mint_url: offer.mint_url.clone(),
+                        unit: offer.unit.clone(),
+                        reason: "malformed cached input keyset metadata".to_string(),
+                    })
+                } else {
+                    Ok("channel-b".to_string())
+                }
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(attempted, ["https://mint-a", "https://mint-b"]);
+        assert_eq!(selected.0, "channel-b");
     }
 }

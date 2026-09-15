@@ -111,7 +111,21 @@ pub enum WalletError {
         requested_raw: u64,
         available_raw: u64,
     },
+    InputKeysetMetadataUnavailable {
+        mint_url: String,
+        unit: String,
+        keyset_ids: Vec<String>,
+    },
+    TooManyInputProofs {
+        selected: usize,
+        maximum: usize,
+    },
     ProvisioningOfferUnavailable {
+        mint_url: String,
+        unit: String,
+        reason: String,
+    },
+    ProvisioningPreflight {
         mint_url: String,
         unit: String,
         reason: String,
@@ -159,6 +173,19 @@ impl fmt::Display for WalletError {
                 f,
                 "insufficient loose proofs for mint={mint_url} unit={unit}: requested={requested_raw} available={available_raw}"
             ),
+            Self::InputKeysetMetadataUnavailable {
+                mint_url,
+                unit,
+                keyset_ids,
+            } => write!(
+                f,
+                "input keyset metadata unavailable for mint={mint_url} unit={unit}: {}",
+                keyset_ids.join(", ")
+            ),
+            Self::TooManyInputProofs { selected, maximum } => write!(
+                f,
+                "too many input proofs: selected={selected} maximum={maximum}"
+            ),
             Self::ProvisioningOfferUnavailable {
                 mint_url,
                 unit,
@@ -166,6 +193,14 @@ impl fmt::Display for WalletError {
             } => write!(
                 f,
                 "provisioning offer unavailable for mint={mint_url} unit={unit}: {reason}"
+            ),
+            Self::ProvisioningPreflight {
+                mint_url,
+                unit,
+                reason,
+            } => write!(
+                f,
+                "provisioning preflight failed for mint={mint_url} unit={unit}: {reason}"
             ),
             Self::AlreadyOpen { channel_id } => write!(f, "channel already open: {channel_id}"),
             Self::OpeningInProgress { channel_id } => {
@@ -206,15 +241,13 @@ pub trait MonadWallet: Send + Sync + 'static {
 
     /// Provision a new channel by spending loose proofs from this wallet.
     ///
-    /// `input_budget_msats` is the amount of loose proof value the caller is
-    /// willing to commit as input to the channel opening. The actual usable
-    /// channel capacity may be lower because Cashu input/output fees are applied
-    /// by upstream during funding. The returned channel stores the actual
-    /// upstream-reported capacity.
+    /// `funding_token_target_msats` is the desired funding-token value. Cashu
+    /// input fees are additional; output fees can still make usable channel
+    /// capacity lower than the funding-token value.
     fn provision_channel(
         &self,
         offer: &RelayPaymentOffer,
-        input_budget_msats: u64,
+        funding_token_target_msats: u64,
     ) -> Result<String, WalletError>;
 
     fn build_link_request(
@@ -579,7 +612,7 @@ impl MonadWallet for MockWallet {
     fn provision_channel(
         &self,
         offer: &RelayPaymentOffer,
-        input_budget_msats: u64,
+        funding_token_target_msats: u64,
     ) -> Result<String, WalletError> {
         let mut inner = self
             .inner
@@ -612,7 +645,7 @@ impl MonadWallet for MockWallet {
             unit: offer.unit.clone(),
             keyset_id,
             attached_session_id: None,
-            capacity_msats: input_budget_msats,
+            capacity_msats: funding_token_target_msats,
             current_signed_balance_msats: 0,
             expiry_timestamp: u64::MAX,
         };

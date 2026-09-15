@@ -85,7 +85,7 @@ const CREATE_OPENING_ATTEMPTS_SQL: &str = r#"
         receiver_pubkey TEXT NOT NULL,
         mint_url TEXT NOT NULL,
         unit TEXT NOT NULL,
-        input_budget_msats INTEGER NOT NULL,
+        funding_token_target_msats INTEGER NOT NULL,
         expiry_timestamp INTEGER NOT NULL,
         prepared_open_json TEXT NOT NULL,
         selected_proof_ids_json TEXT NOT NULL,
@@ -132,7 +132,8 @@ const CREATE_OPENING_JOURNAL_META_SQL: &str = r#"
     )
 "#;
 
-const OPENING_JOURNAL_SCHEMA_VERSION: i64 = 1;
+const OPENING_JOURNAL_SCHEMA_VERSION: i64 = 2;
+const OPENING_JOURNAL_SCHEMA_VERSION_V1: i64 = 1;
 const OPENING_JOURNAL_AUTHORITY_MARKER: &str = "exact-input-two-step-execution-authority";
 
 const CREATE_OPENING_ATTEMPTS_INDEX_SQL: &str = r#"
@@ -403,7 +404,7 @@ pub struct NewOpeningAttempt {
     pub receiver_pubkey: String,
     pub mint_url: String,
     pub unit: String,
-    pub input_budget_msats: u64,
+    pub funding_token_target_msats: u64,
     pub expiry_timestamp: u64,
     pub prepared_open_json: String,
     pub selected_proof_ids: Vec<String>,
@@ -418,7 +419,7 @@ pub struct OpeningAttemptRecord {
     pub receiver_pubkey: String,
     pub mint_url: String,
     pub unit: String,
-    pub input_budget_msats: u64,
+    pub funding_token_target_msats: u64,
     pub expiry_timestamp: u64,
     pub prepared_open_json: String,
     pub selected_proof_ids: Vec<String>,
@@ -552,6 +553,10 @@ pub enum LooseProofWalletError {
         expected: usize,
         updated: usize,
     },
+    TooManyInputProofs {
+        selected: usize,
+        maximum: usize,
+    },
     AlreadyOpen(String),
     OpeningInProgress(String),
     OpeningConflict(String),
@@ -577,6 +582,10 @@ impl fmt::Display for LooseProofWalletError {
             Self::ReservationConflict { expected, updated } => write!(
                 f,
                 "proof reservation conflict: expected to reserve {expected} proofs, reserved {updated}"
+            ),
+            Self::TooManyInputProofs { selected, maximum } => write!(
+                f,
+                "too many input proofs: selected={selected} maximum={maximum}"
             ),
             Self::AlreadyOpen(channel_id) => write!(f, "channel already open: {channel_id}"),
             Self::OpeningInProgress(channel_id) => {
@@ -654,13 +663,20 @@ fn table_columns(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<HashSet<
 }
 
 fn initialize_schema(conn: &mut Connection) -> Result<()> {
+    initialize_schema_with_migration_hook(conn, || Ok(()))
+}
+
+fn initialize_schema_with_migration_hook(
+    conn: &mut Connection,
+    after_v1_rename: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let attempts_exist = sqlite_object_exists(&tx, "monad_client_opening_attempts")?;
     let executions_exist = sqlite_object_exists(&tx, "monad_client_opening_executions")?;
     let meta_exists = sqlite_object_exists(&tx, "monad_client_opening_journal_meta")?;
     let nonempty = (attempts_exist && table_is_nonempty(&tx, "monad_client_opening_attempts")?)
         || (executions_exist && table_is_nonempty(&tx, "monad_client_opening_executions")?);
-    let marker_valid = if meta_exists {
+    let marker = if meta_exists {
         tx.query_row(
             "SELECT schema_version, authority_marker FROM monad_client_opening_journal_meta
              WHERE singleton = 1",
@@ -668,11 +684,8 @@ fn initialize_schema(conn: &mut Connection) -> Result<()> {
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
-        .is_some_and(|(version, marker)| {
-            version == OPENING_JOURNAL_SCHEMA_VERSION && marker == OPENING_JOURNAL_AUTHORITY_MARKER
-        })
     } else {
-        false
+        None
     };
     let attempt_columns = if attempts_exist {
         table_columns(&tx, "monad_client_opening_attempts")?
@@ -684,7 +697,34 @@ fn initialize_schema(conn: &mut Connection) -> Result<()> {
     } else {
         HashSet::new()
     };
-    let attempts_valid = attempts_exist
+    let attempts_v2_valid = attempts_exist
+        && [
+            "attempt_id",
+            "opening_id",
+            "predecessor_attempt_id",
+            "wallet_name",
+            "reservation_id",
+            "receiver_pubkey",
+            "mint_url",
+            "unit",
+            "funding_token_target_msats",
+            "expiry_timestamp",
+            "prepared_open_json",
+            "selected_proof_ids_json",
+            "completed_open_json",
+            "state",
+            "rejection_code",
+            "rejection_message",
+            "latest_submitted_at",
+            "created_at",
+            "updated_at",
+            "abandonment_reason",
+            "abandoned_at",
+        ]
+        .into_iter()
+        .all(|column| attempt_columns.contains(column));
+    let attempts_v1_valid = attempts_exist
+        && !attempt_columns.contains("funding_token_target_msats")
         && [
             "attempt_id",
             "opening_id",
@@ -726,7 +766,35 @@ fn initialize_schema(conn: &mut Connection) -> Result<()> {
         .all(|column| execution_columns.contains(column));
     let active_index_valid =
         sqlite_index_exists(&tx, "idx_monad_client_opening_executions_active")?;
-    if !(marker_valid && attempts_valid && executions_valid && active_index_valid) {
+    let v2_valid = marker.as_ref().is_some_and(|(version, authority)| {
+        *version == OPENING_JOURNAL_SCHEMA_VERSION && authority == OPENING_JOURNAL_AUTHORITY_MARKER
+    }) && attempts_v2_valid
+        && executions_valid
+        && active_index_valid;
+    let v1_valid = marker.as_ref().is_some_and(|(version, authority)| {
+        *version == OPENING_JOURNAL_SCHEMA_VERSION_V1
+            && authority == OPENING_JOURNAL_AUTHORITY_MARKER
+    }) && attempts_v1_valid
+        && executions_valid
+        && active_index_valid;
+
+    if v1_valid {
+        tx.execute(
+            "ALTER TABLE monad_client_opening_attempts
+             RENAME COLUMN input_budget_msats TO funding_token_target_msats",
+            [],
+        )?;
+        after_v1_rename()?;
+        tx.execute(
+            "UPDATE monad_client_opening_journal_meta SET schema_version = ?1
+             WHERE singleton = 1 AND schema_version = ?2 AND authority_marker = ?3",
+            params![
+                OPENING_JOURNAL_SCHEMA_VERSION,
+                OPENING_JOURNAL_SCHEMA_VERSION_V1,
+                OPENING_JOURNAL_AUTHORITY_MARKER
+            ],
+        )?;
+    } else if !v2_valid {
         if nonempty {
             return Err(LooseProofWalletError::Backend(
                 "nonempty unversioned or partial client opening journal is not authoritative"
@@ -1180,11 +1248,11 @@ impl LooseProofWallet {
                 "selected proof ids must not be empty".to_string(),
             ));
         }
-        if proof_ids.len() + 5 > 999 {
-            return Err(LooseProofWalletError::InvalidInput(format!(
-                "too many selected proof ids ({})",
-                proof_ids.len()
-            )));
+        if proof_ids.len() > crate::proof_selection::MAX_SELECTED_INPUT_PROOFS {
+            return Err(LooseProofWalletError::TooManyInputProofs {
+                selected: proof_ids.len(),
+                maximum: crate::proof_selection::MAX_SELECTED_INPUT_PROOFS,
+            });
         }
         if attempt.is_some_and(|attempt| attempt.predecessor_attempt_id.is_some()) {
             return Err(LooseProofWalletError::InvalidInput(
@@ -1218,7 +1286,7 @@ impl LooseProofWallet {
             let existing = tx
                 .query_row(
                     "SELECT attempt_id, opening_id, reservation_id, receiver_pubkey, mint_url,
-                            unit, input_budget_msats, expiry_timestamp, prepared_open_json,
+                            unit, funding_token_target_msats, expiry_timestamp, prepared_open_json,
                             selected_proof_ids_json, state
                      FROM monad_client_opening_attempts
                      WHERE wallet_name = ?1 AND (attempt_id = ?2 OR opening_id = ?3)",
@@ -1247,7 +1315,7 @@ impl LooseProofWallet {
                     && existing.3 == attempt.receiver_pubkey
                     && existing.4 == attempt.mint_url
                     && existing.5 == attempt.unit
-                    && existing.6 == to_i64(attempt.input_budget_msats)?
+                    && existing.6 == to_i64(attempt.funding_token_target_msats)?
                     && existing.7 == to_i64(attempt.expiry_timestamp)?
                     && existing.8 == attempt.prepared_open_json
                     && existing.9 == selected_json;
@@ -1371,7 +1439,7 @@ impl LooseProofWallet {
             tx.execute(
                 "INSERT INTO monad_client_opening_attempts
                  (attempt_id, opening_id, predecessor_attempt_id, wallet_name,
-                   reservation_id, receiver_pubkey, mint_url, unit, input_budget_msats,
+                   reservation_id, receiver_pubkey, mint_url, unit, funding_token_target_msats,
                    expiry_timestamp, prepared_open_json, selected_proof_ids_json,
                    completed_open_json, state, rejection_code, rejection_message,
                    latest_submitted_at, created_at, updated_at)
@@ -1386,7 +1454,7 @@ impl LooseProofWallet {
                     attempt.receiver_pubkey,
                     attempt.mint_url,
                     attempt.unit,
-                    to_i64(attempt.input_budget_msats)?,
+                    to_i64(attempt.funding_token_target_msats)?,
                     to_i64(attempt.expiry_timestamp)?,
                     attempt.prepared_open_json,
                     selected_proof_ids_json,
@@ -1417,7 +1485,7 @@ impl LooseProofWallet {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT attempt_id, opening_id, predecessor_attempt_id, reservation_id,
-                    receiver_pubkey, mint_url, unit, input_budget_msats, expiry_timestamp,
+                    receiver_pubkey, mint_url, unit, funding_token_target_msats, expiry_timestamp,
                     prepared_open_json, selected_proof_ids_json, completed_open_json, state,
                     rejection_code, rejection_message, latest_submitted_at,
                     abandonment_reason, abandoned_at
@@ -1445,7 +1513,7 @@ impl LooseProofWallet {
         let conn = self.conn()?;
         conn.query_row(
             "SELECT attempt_id, opening_id, predecessor_attempt_id, reservation_id,
-                    receiver_pubkey, mint_url, unit, input_budget_msats, expiry_timestamp,
+                    receiver_pubkey, mint_url, unit, funding_token_target_msats, expiry_timestamp,
                     prepared_open_json, selected_proof_ids_json, completed_open_json, state,
                     rejection_code, rejection_message, latest_submitted_at,
                     abandonment_reason, abandoned_at
@@ -1935,7 +2003,7 @@ impl LooseProofWallet {
             let predecessor_record = tx
                 .query_row(
                     "SELECT state, rejection_code, opening_id, reservation_id, receiver_pubkey,
-                            mint_url, unit, input_budget_msats, expiry_timestamp,
+                            mint_url, unit, funding_token_target_msats, expiry_timestamp,
                             predecessor_attempt_id, selected_proof_ids_json
                      FROM monad_client_opening_attempts
                      WHERE wallet_name = ?1 AND attempt_id = ?2",
@@ -1965,7 +2033,7 @@ impl LooseProofWallet {
                 attempt.receiver_pubkey.clone(),
                 attempt.mint_url.clone(),
                 attempt.unit.clone(),
-                to_i64(attempt.input_budget_msats)?,
+                to_i64(attempt.funding_token_target_msats)?,
                 to_i64(attempt.expiry_timestamp)?,
                 None,
                 canonical_proof_ids_json(&attempt.selected_proof_ids)?,
@@ -1990,7 +2058,7 @@ impl LooseProofWallet {
         tx.execute(
             "INSERT INTO monad_client_opening_attempts
              (attempt_id, opening_id, predecessor_attempt_id, wallet_name,
-              reservation_id, receiver_pubkey, mint_url, unit, input_budget_msats,
+              reservation_id, receiver_pubkey, mint_url, unit, funding_token_target_msats,
                expiry_timestamp, prepared_open_json, selected_proof_ids_json,
                completed_open_json, state, rejection_code, rejection_message,
                latest_submitted_at, created_at, updated_at)
@@ -2005,7 +2073,7 @@ impl LooseProofWallet {
                 attempt.receiver_pubkey,
                 attempt.mint_url,
                 attempt.unit,
-                to_i64(attempt.input_budget_msats)?,
+                to_i64(attempt.funding_token_target_msats)?,
                 to_i64(attempt.expiry_timestamp)?,
                 attempt.prepared_open_json,
                 selected_proof_ids_json,
@@ -2841,6 +2909,12 @@ fn validate_opening_attempt(
             "opening attempt selected proofs must not be empty".to_string(),
         ));
     }
+    if attempt.selected_proof_ids.len() > crate::proof_selection::MAX_SELECTED_INPUT_PROOFS {
+        return Err(LooseProofWalletError::TooManyInputProofs {
+            selected: attempt.selected_proof_ids.len(),
+            maximum: crate::proof_selection::MAX_SELECTED_INPUT_PROOFS,
+        });
+    }
     if attempt.reservation_id != reservation_id
         || attempt.mint_url != mint_url
         || attempt.unit != unit
@@ -2972,7 +3046,7 @@ fn row_to_opening_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpeningAt
         receiver_pubkey: row.get(4)?,
         mint_url: row.get(5)?,
         unit: row.get(6)?,
-        input_budget_msats: from_i64(row.get(7)?)?,
+        funding_token_target_msats: from_i64(row.get(7)?)?,
         expiry_timestamp: from_i64(row.get(8)?)?,
         prepared_open_json: row.get(9)?,
         selected_proof_ids: serde_json::from_str(&row.get::<_, String>(10)?).map_err(|e| {
@@ -3093,7 +3167,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: MINT.to_string(),
             unit: "sat".to_string(),
-            input_budget_msats: 8_000,
+            funding_token_target_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: format!(r#"{{"channel_id":"{attempt_id}"}}"#),
             selected_proof_ids: proof_ids.iter().map(|id| (*id).to_string()).collect(),
@@ -3623,6 +3697,41 @@ mod tests {
     }
 
     #[test]
+    fn reserve_selected_proofs_enforces_portable_992_id_limit() {
+        let wallet = wallet();
+        let proofs = (0..crate::proof_selection::MAX_SELECTED_INPUT_PROOFS)
+            .map(|i| proof(&format!("proof-{i:04}"), 1, "keyset-a"))
+            .collect::<Vec<_>>();
+        let ids = proofs
+            .iter()
+            .map(|proof| proof.proof_id.clone())
+            .collect::<Vec<_>>();
+        wallet.import_proofs(&proofs).unwrap();
+        assert_eq!(
+            wallet
+                .reserve_selected_proofs(MINT, "sat", &ids)
+                .unwrap()
+                .proofs
+                .len(),
+            crate::proof_selection::MAX_SELECTED_INPUT_PROOFS
+        );
+
+        let oversized_wallet = LooseProofWallet::open_in_memory("bob").unwrap();
+        let oversized = (0..=crate::proof_selection::MAX_SELECTED_INPUT_PROOFS)
+            .map(|i| format!("proof-{i:04}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            oversized_wallet
+                .reserve_selected_proofs(MINT, "sat", &oversized)
+                .unwrap_err(),
+            LooseProofWalletError::TooManyInputProofs {
+                selected: crate::proof_selection::MAX_SELECTED_INPUT_PROOFS + 1,
+                maximum: crate::proof_selection::MAX_SELECTED_INPUT_PROOFS,
+            }
+        );
+    }
+
+    #[test]
     fn reserve_selected_proofs_rejects_duplicate_ids() {
         let wallet = wallet();
         wallet
@@ -3709,7 +3818,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: MINT.to_string(),
             unit: "sat".to_string(),
-            input_budget_msats: 8_000,
+            funding_token_target_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: r#"{"channel_id":"channel-a"}"#.to_string(),
             selected_proof_ids: vec!["proof-a".to_string()],
@@ -4469,7 +4578,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: MINT.to_string(),
             unit: "sat".to_string(),
-            input_budget_msats: 8_000,
+            funding_token_target_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: "{}".to_string(),
             selected_proof_ids: vec!["proof-a".to_string()],
@@ -4510,7 +4619,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: MINT.to_string(),
             unit: "sat".to_string(),
-            input_budget_msats: 8_000,
+            funding_token_target_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: r#"{"channel_id":"channel-a"}"#.to_string(),
             selected_proof_ids: vec!["proof-a".to_string()],
@@ -4566,7 +4675,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: MINT.to_string(),
             unit: "sat".to_string(),
-            input_budget_msats: 8_000,
+            funding_token_target_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: "not needed to cancel".to_string(),
             selected_proof_ids: vec!["proof-a".to_string()],
@@ -4698,7 +4807,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: MINT.to_string(),
             unit: "sat".to_string(),
-            input_budget_msats: 8_000,
+            funding_token_target_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: "immutable prepared request".to_string(),
             selected_proof_ids: vec!["proof-a".to_string()],
@@ -4793,7 +4902,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: MINT.to_string(),
             unit: "sat".to_string(),
-            input_budget_msats: 8_000,
+            funding_token_target_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: r#"{"channel_id":"channel-a"}"#.to_string(),
             selected_proof_ids: vec!["proof-a".to_string()],
@@ -4818,7 +4927,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: MINT.to_string(),
             unit: "sat".to_string(),
-            input_budget_msats: 8_000,
+            funding_token_target_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: r#"{"channel_id":"channel-b"}"#.to_string(),
             selected_proof_ids: vec!["proof-a".to_string()],
@@ -4965,6 +5074,198 @@ mod tests {
         );
     }
 
+    fn create_populated_v1_opening_journal(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE monad_client_opening_attempts (
+                attempt_id TEXT PRIMARY KEY, opening_id TEXT NOT NULL,
+                predecessor_attempt_id TEXT, wallet_name TEXT NOT NULL,
+                reservation_id TEXT NOT NULL, receiver_pubkey TEXT NOT NULL,
+                mint_url TEXT NOT NULL, unit TEXT NOT NULL,
+                input_budget_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
+                prepared_open_json TEXT NOT NULL, selected_proof_ids_json TEXT NOT NULL,
+                completed_open_json TEXT, state TEXT NOT NULL, rejection_code INTEGER,
+                rejection_message TEXT, latest_submitted_at INTEGER,
+                abandonment_reason TEXT, abandoned_at INTEGER,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE(wallet_name, opening_id, attempt_id));
+             CREATE TABLE monad_client_opening_executions (
+                wallet_name TEXT NOT NULL, attempt_id TEXT NOT NULL,
+                execution_sequence INTEGER NOT NULL, kind TEXT NOT NULL,
+                status TEXT NOT NULL, error_message TEXT, claimed_at INTEGER NOT NULL,
+                authorized_at INTEGER, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (wallet_name, attempt_id, execution_sequence),
+                FOREIGN KEY (attempt_id) REFERENCES monad_client_opening_attempts(attempt_id));
+             CREATE UNIQUE INDEX idx_monad_client_opening_executions_active
+                ON monad_client_opening_executions(wallet_name, attempt_id)
+                WHERE status IN ('claimed', 'authorized');
+             CREATE INDEX idx_monad_client_opening_attempts_recovery
+                ON monad_client_opening_attempts(wallet_name, state, created_at);
+             CREATE UNIQUE INDEX idx_monad_client_opening_attempts_successor
+                ON monad_client_opening_attempts(wallet_name, predecessor_attempt_id)
+                WHERE predecessor_attempt_id IS NOT NULL;
+             CREATE UNIQUE INDEX idx_monad_client_opening_attempts_operation_successor
+                ON monad_client_opening_attempts(wallet_name, opening_id)
+                WHERE predecessor_attempt_id IS NOT NULL;
+             CREATE UNIQUE INDEX idx_monad_client_opening_attempts_operation_root
+                ON monad_client_opening_attempts(wallet_name, opening_id)
+                WHERE predecessor_attempt_id IS NULL;
+             CREATE TABLE monad_client_opening_journal_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                schema_version INTEGER NOT NULL, authority_marker TEXT NOT NULL);
+             INSERT INTO monad_client_opening_journal_meta VALUES
+                (1, 1, 'exact-input-two-step-execution-authority');
+             INSERT INTO monad_client_opening_attempts VALUES
+                ('root', 'opening', NULL, 'alice', 'reservation', 'receiver',
+                 'https://mint.invalid', 'sat', 8000, 123456, '{\"root\":true}',
+                 '[\"proof-a\",\"proof-b\"]', NULL, 'rejected', 12002, 'stale',
+                 100, NULL, NULL, 10, 101),
+                ('successor', 'opening', 'root', 'alice', 'reservation', 'receiver',
+                 'https://mint.invalid', 'sat', 8000, 123456, '{\"successor\":true}',
+                 '[\"proof-a\",\"proof-b\"]', '{\"complete\":true}', 'submitted',
+                 NULL, NULL, 200, NULL, NULL, 102, 201);
+             INSERT INTO monad_client_opening_executions VALUES
+                ('alice', 'root', 1, 'initial', 'rejected', 'stale', 90, 100, 101),
+                ('alice', 'successor', 1, 'initial', 'authorized', NULL, 190, 200, 201);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn populated_v1_opening_journal_migrates_atomically_to_v2() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        create_populated_v1_opening_journal(&conn);
+        drop(conn);
+
+        let wallet = LooseProofWallet::open(&path, "alice").unwrap();
+        let conn = wallet.conn().unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(monad_client_opening_attempts)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<HashSet<String>>>()
+            .unwrap();
+        assert!(columns.contains("funding_token_target_msats"));
+        assert!(!columns.contains("input_budget_msats"));
+        let attempts: Vec<(String, i64, String, String, i64, i64)> = conn
+            .prepare(
+                "SELECT attempt_id, funding_token_target_msats, selected_proof_ids_json,
+                        state, created_at, updated_at
+                 FROM monad_client_opening_attempts ORDER BY created_at",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            attempts,
+            vec![
+                (
+                    "root".to_string(),
+                    8000,
+                    "[\"proof-a\",\"proof-b\"]".to_string(),
+                    "rejected".to_string(),
+                    10,
+                    101
+                ),
+                (
+                    "successor".to_string(),
+                    8000,
+                    "[\"proof-a\",\"proof-b\"]".to_string(),
+                    "submitted".to_string(),
+                    102,
+                    201
+                ),
+            ]
+        );
+        let execution_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM monad_client_opening_executions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(execution_count, 2);
+        let marker: (i64, String) = conn
+            .query_row(
+                "SELECT schema_version, authority_marker FROM monad_client_opening_journal_meta",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(marker, (2, OPENING_JOURNAL_AUTHORITY_MARKER.to_string()));
+        for index in [
+            "idx_monad_client_opening_executions_active",
+            "idx_monad_client_opening_attempts_recovery",
+            "idx_monad_client_opening_attempts_successor",
+            "idx_monad_client_opening_attempts_operation_successor",
+            "idx_monad_client_opening_attempts_operation_root",
+        ] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                    [index],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn v1_opening_journal_migration_fault_rolls_back_rename_and_marker() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_populated_v1_opening_journal(&conn);
+        let error = initialize_schema_with_migration_hook(&mut conn, || {
+            Err(LooseProofWalletError::Backend(
+                "injected migration fault".to_string(),
+            ))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected migration fault"));
+        let tx = conn.unchecked_transaction().unwrap();
+        let columns = table_columns(&tx, "monad_client_opening_attempts").unwrap();
+        assert!(columns.contains("input_budget_msats"));
+        assert!(!columns.contains("funding_token_target_msats"));
+        let marker: i64 = tx
+            .query_row(
+                "SELECT schema_version FROM monad_client_opening_journal_meta",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1);
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM monad_client_opening_attempts",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM monad_client_opening_executions",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+    }
+
     #[test]
     fn nonempty_obsolete_opening_journal_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
@@ -4976,7 +5277,7 @@ mod tests {
                 predecessor_attempt_id TEXT, wallet_name TEXT NOT NULL,
                 reservation_id TEXT NOT NULL, receiver_pubkey TEXT NOT NULL,
                 mint_url TEXT NOT NULL, unit TEXT NOT NULL,
-                input_budget_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
+                funding_token_target_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
                 prepared_open_json TEXT NOT NULL, completed_open_json TEXT,
                 state TEXT NOT NULL, rejection_code INTEGER, rejection_message TEXT,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
@@ -5005,7 +5306,7 @@ mod tests {
                 predecessor_attempt_id TEXT, wallet_name TEXT NOT NULL,
                 reservation_id TEXT NOT NULL, receiver_pubkey TEXT NOT NULL,
                 mint_url TEXT NOT NULL, unit TEXT NOT NULL,
-                input_budget_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
+                funding_token_target_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
                 prepared_open_json TEXT NOT NULL, selected_proof_ids_json TEXT NOT NULL,
                 completed_open_json TEXT, state TEXT NOT NULL, rejection_code INTEGER,
                 rejection_message TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
@@ -5052,7 +5353,7 @@ mod tests {
                 predecessor_attempt_id TEXT, wallet_name TEXT NOT NULL,
                 reservation_id TEXT NOT NULL, receiver_pubkey TEXT NOT NULL,
                 mint_url TEXT NOT NULL, unit TEXT NOT NULL,
-                input_budget_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
+                funding_token_target_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
                 prepared_open_json TEXT NOT NULL, completed_open_json TEXT,
                 state TEXT NOT NULL, rejection_code INTEGER, rejection_message TEXT,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
