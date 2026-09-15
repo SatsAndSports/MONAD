@@ -256,6 +256,23 @@ This means:
 
 ## Configured Client Route Rebuilds
 
+The client process has one `ClientWalletManager`. It acquires OS-backed locks for
+the normalized, deduplicated loose-proof and channel database paths, opens and
+migrates one `SqliteClientWallet`, and runs one startup opening-recovery pass
+under exclusive maintenance access. It then converts the maintenance locks to
+shared mode and starts either every configured client in YAML order or one named
+client. All leaves share the same wallet instance. A `JoinSet` supervises the
+leaves; SOCKS listener failure is fatal to the process, shutdown is broadcast to
+all leaves, and their route/listener/accepted-connection tasks are awaited before
+the manager and its runtime-owner locks are dropped.
+
+Each database has runtime-owner and maintenance sidecars. Runtime ownership is
+exclusive. Startup open/migration/recovery and mutating CLI operations take the
+maintenance gate exclusively; runtime steady state and read-only CLI inspection
+take it shared. Mutating CLI acquisition is fail-fast. Channel/proof inspection
+opens MONAD SQLite connections and upstream `SqliteClientStorage` read-only,
+performs no schema initialization, and does not load the sender secret.
+
 The configured client owns a `RouteConnection`, not just the final hop. That
 handle keeps the final `RelayConnection`, all prefix hop connections, and per-hop
 session metadata together so route failures can be handled at hop granularity.
@@ -646,18 +663,14 @@ If the mint explicitly rejects an inactive output keyset with code `12002`, the
 client records that immutable predecessor, refreshes, and may create one successor
 using a changed active keyset. Transport and protocol ambiguity never authorizes a
 successor submission. Live ambiguous opens run bounded recovery once immediately.
-The configured runtime runs one best-effort restore-only opening recovery pass
+The configured runtime manager runs one restore-only opening recovery pass
 before route provisioning, also exposed by manual `recover-openings`. This pass
 never submits swaps: prepared attempts and rejected attempts without a successor
 are cancelled; finalizing attempts finish local idempotent updates; submitted
-attempts with complete restored funding/change finalize. Valid empty funding
-restore plus complete exact-input `UNSPENT` evidence instead atomically marks the
-attempt `Abandoned` and releases its operation-owned reservation in the loose-proof
-database. The journal retains the immutable request, abandonment reason, and time.
-Abandoned attempts are excluded from ordinary recovery, with no automatic rechecks
-or late-completion machinery. All ambiguous, partial, invalid, pending, spent, or
-network-failed evidence remains unresolved and reserved. Reports separate recovered,
-cancelled, abandoned, and unresolved outcomes. Other swap policies are unchanged.
+attempts with complete restored funding/change finalize. Empty, partial, invalid,
+or network-failed restore evidence remains unresolved and reserved. Startup and
+manual recovery do not use input `UNSPENT` observations to abandon a submitted
+attempt. Other swap policies are unchanged.
 The live exact-replay
 allowance is independent per immutable attempt, so a keyset successor receives
 its own allowance without authorizing a second successor.
@@ -677,8 +690,10 @@ The reusable wallet library path exists, and `monad-client wallet ...` exposes
 token import, proof/channel inspection, and recovery commands using either
 top-level `client_wallet` YAML config or explicit DB/key flags. The configured
 SOCKS runtime uses the persisted loose-proof and channel wallets from that same
-YAML config. Remaining wallet UX work is mostly mint quote/mint commands, richer
-balance inspection, and close/sweep flows.
+YAML config. Inspection is read-only and does not require sender key material;
+mutating commands require exclusive wallet maintenance access. Remaining wallet
+UX work is mostly mint quote/mint commands, richer balance inspection, and
+close/sweep flows.
 
 ### Relay Wallet Layer
 

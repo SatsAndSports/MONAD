@@ -139,15 +139,10 @@ only an all-`UNSPENT` response permits one replay of the identical swap request 
 live opening recovery. Startup and manual `recover-openings` never submit swaps.
 They cancel prepared attempts and rejected attempts without a successor, finish
 finalizing attempts, and finalize submitted attempts only with complete restored
-funding/change. Valid empty funding restore plus complete exact-input `UNSPENT`
-evidence instead atomically marks the submitted attempt `Abandoned` and releases
-its operation-owned reservation. The authoritative journal retains the request,
-reason, and abandonment time; abandoned records are excluded from recovery and
-have no automatic rechecks or late-completion handling. Partial or invalid restore,
-incomplete input evidence, pending/spent inputs, and network errors retain the
-reservation as unresolved. CLI/runtime reports distinguish recovered, cancelled,
-abandoned, and unresolved outcomes. This policy is channel-opening-only, not a
-change to refunds, drains, or other swaps.
+funding/change. Empty, partial, invalid, or unavailable restore evidence keeps a
+submitted attempt unresolved and reserved. Startup/manual recovery does not use
+an input `UNSPENT` observation to abandon it. This policy is
+channel-opening-only, not a change to refunds, drains, or other swaps.
 
 During a live opening, if the mint explicitly rejects code
 `12002` for an inactive output keyset, the client may refresh and persist one
