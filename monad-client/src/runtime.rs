@@ -1,20 +1,20 @@
+use crate::client_wallet_manager::ClientWalletManager;
 use crate::config_runtime::route_from_client_config;
 use crate::connector::{
     cascaded_route_failure_debounce, connect_route_with_runtime, rebuild_route_from_with_runtime,
     ConnectorRuntime,
 };
-use crate::loose_proof_wallet::LooseProofWallet;
 use crate::session_driver::PaymentPolicy;
-use crate::sqlite_client_wallet::SqliteClientWallet;
 use crate::wallet::{MonadWallet, WalletChannelState};
 use crate::{socks, tunnel};
-use monad_common::config::MonadConfig;
+use monad_common::config::{ClientConfig, MonadConfig};
 use monad_common::session::RelayConnection;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 const MAX_STARTUP_CONNECT_ATTEMPTS: u32 = 5;
@@ -142,8 +142,7 @@ impl RouteFailurePath {
     }
 }
 
-/// Run a configured client until the shutdown signal fires or the route cannot
-/// be rebuilt after the maximum number of reconnect attempts.
+/// Run all configured clients, or one selected client, until shutdown.
 pub async fn run_configured_client_until_shutdown<S>(
     config: MonadConfig,
     client_name: Option<&str>,
@@ -193,78 +192,171 @@ where
     S: Future<Output = ()> + Send,
 {
     tokio::pin!(shutdown);
-
-    let client = config.select_client(client_name)?;
+    let clients = selected_clients(&config, client_name)?;
     let client_wallet = config
         .client_wallet
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("client_wallet is required to run a client"))?;
+    let policy = PaymentPolicy {
+        channel_input_budget_msats: client_wallet.channel_input_budget_msats,
+        target_topup_buffer_msats: client_wallet.target_topup_buffer_msats,
+        minimum_topup_msats: client_wallet.minimum_topup_msats,
+    };
+    let mut prepared_clients = Vec::with_capacity(clients.len());
+    for client in clients {
+        let route = route_from_client_config(&client)?;
+        let listener = TcpListener::bind(&client.socks).await.map_err(|error| {
+            anyhow::anyhow!("bind client '{}' at {}: {error}", client.name, client.socks)
+        })?;
+        prepared_clients.push(PreparedConfiguredClient {
+            client,
+            route,
+            listener,
+        });
+    }
+    let (manager, recovered) = ClientWalletManager::open(client_wallet)?;
+    if !recovered.is_empty() {
+        info!(
+            recovered = recovered.recovered_channel_ids.len(),
+            cancelled = recovered.cancelled_attempt_ids.len(),
+            abandoned = recovered.abandoned_attempt_ids.len(),
+            unresolved = recovered.unresolved.len(),
+            "channel opening recovery outcomes"
+        );
+    }
 
-    let loose_wallet =
-        LooseProofWallet::open(&client_wallet.loose_db_path, CONFIGURED_CLIENT_WALLET_NAME)?;
-    let wallet = SqliteClientWallet::open(
-        loose_wallet,
-        &client_wallet.channel_db_path,
-        &client_wallet.sender_secret_hex,
-    )?;
-    match wallet.recover_pending_openings() {
-        Ok(recovered) if !recovered.is_empty() => {
-            info!(
-                recovered = recovered.recovered_channel_ids.len(),
-                cancelled = recovered.cancelled_attempt_ids.len(),
-                abandoned = recovered.abandoned_attempt_ids.len(),
-                unresolved = recovered.unresolved.len(),
-                "channel opening recovery outcomes"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            warn!("pending channel opening recovery did not complete: {error}");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    for prepared in prepared_clients {
+        let wallet = manager.wallet();
+        let stats = stats.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        tasks.spawn(async move {
+            let name = prepared.client.name.clone();
+            run_configured_client_leaf(prepared, wallet, policy, stats, options, shutdown_rx)
+                .await
+                .map_err(|error| anyhow::anyhow!("client '{name}' failed: {error}"))
+        });
+    }
+
+    let mut result = Ok(());
+    tokio::select! {
+        _ = &mut shutdown => {}
+        joined = tasks.join_next() => {
+            result = match joined {
+                Some(Ok(Ok(()))) => Err(anyhow::anyhow!("configured client exited before shutdown")),
+                Some(Ok(Err(error))) => Err(error),
+                Some(Err(error)) => Err(anyhow::anyhow!("configured client task failed: {error}")),
+                None => Err(anyhow::anyhow!("no configured client tasks were started")),
+            };
         }
     }
-    let wallet: Arc<dyn MonadWallet> = Arc::new(wallet);
-    let runtime = ConnectorRuntime::with_payment_policy(
-        Some(wallet.clone()),
-        PaymentPolicy {
-            channel_input_budget_msats: client_wallet.channel_input_budget_msats,
-            target_topup_buffer_msats: client_wallet.target_topup_buffer_msats,
-            minimum_topup_msats: client_wallet.minimum_topup_msats,
-        },
-    )?;
-    let route = route_from_client_config(client)?;
-    let runtime = runtime.with_setup_timeout(options.route_setup_timeout);
+    let _ = shutdown_tx.send(true);
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if result.is_ok() => result = Err(error),
+            Err(error) if result.is_ok() => {
+                result = Err(anyhow::anyhow!("configured client task failed: {error}"))
+            }
+            _ => {}
+        }
+    }
+    drop(manager);
+    result
+}
 
-    info!(
-        client = %client.name,
-        socks = %client.socks,
-        hops = route.hops().len(),
-        "connecting configured route"
-    );
+fn selected_clients(
+    config: &MonadConfig,
+    client_name: Option<&str>,
+) -> anyhow::Result<Vec<ClientConfig>> {
+    match client_name {
+        Some(name) => Ok(vec![config.select_client(Some(name))?.clone()]),
+        None if config.clients.is_empty() => anyhow::bail!("config contains no clients"),
+        None => Ok(config.clients.clone()),
+    }
+}
 
-    let listener = TcpListener::bind(&client.socks).await?;
+struct PreparedConfiguredClient {
+    client: ClientConfig,
+    route: crate::route::Route,
+    listener: TcpListener,
+}
+
+async fn run_configured_client_leaf(
+    prepared: PreparedConfiguredClient,
+    wallet: Arc<dyn MonadWallet>,
+    policy: PaymentPolicy,
+    stats: SharedRouteRuntimeStats,
+    options: ConfiguredClientRuntimeOptions,
+    shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let PreparedConfiguredClient {
+        client,
+        route,
+        listener,
+    } = prepared;
+    let runtime = ConnectorRuntime::with_payment_policy(Some(wallet.clone()), policy)?
+        .with_setup_timeout(options.route_setup_timeout);
+    info!(client = %client.name, socks = %client.socks, hops = route.hops().len(), "connecting configured route");
     info!(client = %client.name, socks = %client.socks, "SOCKS5 listener ready");
 
     let (conn_tx, conn_rx) = watch::channel::<Option<Arc<RelayConnection>>>(None);
-    let (socks_shutdown_tx, socks_shutdown_rx) = watch::channel(false);
-    let socks_task = tokio::spawn(run_socks_listener(listener, conn_rx, socks_shutdown_rx));
-
-    let result = connection_manager_loop(
+    let (leaf_shutdown_tx, leaf_shutdown_rx) = watch::channel(false);
+    let mut manager_shutdown = Box::pin(shutdown_signal(
+        shutdown_rx.clone(),
+        leaf_shutdown_rx.clone(),
+    ));
+    let manager = connection_manager_loop(
         &route,
         runtime,
         wallet,
         conn_tx.clone(),
         stats,
-        &mut shutdown,
-    )
-    .await;
+        &mut manager_shutdown,
+    );
+    let listener = run_socks_listener(listener, conn_rx, leaf_shutdown_rx);
+    tokio::pin!(manager);
+    tokio::pin!(listener);
 
-    // Stop accepting SOCKS connections before tearing down tasks.
-    let _ = conn_tx.send(None);
-    let _ = socks_shutdown_tx.send(true);
-    if let Err(err) = socks_task.await {
-        warn!("SOCKS listener task failed: {err}");
-    }
+    let result = tokio::select! {
+        result = &mut manager => {
+            let _ = conn_tx.send(None);
+            let _ = leaf_shutdown_tx.send(true);
+            let listener_result = listener.await;
+            result.and(listener_result.map_err(Into::into))
+        }
+        listener_result = &mut listener => {
+            let _ = conn_tx.send(None);
+            let _ = leaf_shutdown_tx.send(true);
+            let manager_result = manager.await;
+            listener_result.map_err(anyhow::Error::from).and(manager_result)
+        }
+    };
     result
+}
+
+async fn shutdown_signal(
+    mut process_shutdown_rx: watch::Receiver<bool>,
+    mut leaf_shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        if *process_shutdown_rx.borrow() || *leaf_shutdown_rx.borrow() {
+            return;
+        }
+        tokio::select! {
+            changed = process_shutdown_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            changed = leaf_shutdown_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 async fn connection_manager_loop<S>(
@@ -286,6 +378,7 @@ where
     // relay restarts, wallet top-ups) should never permanently kill the SOCKS
     // listener.
     let mut route_has_connected = false;
+    let mut owned_session_ids = Vec::new();
 
     loop {
         if attempt > 0 {
@@ -301,9 +394,9 @@ where
             } else {
                 info!(attempt, "reset first-hop QUIC pool before reconnect");
             }
-            // Detach any channels still linked to a previous session so the
-            // next session can re-link or provision fresh channels.
-            let detach_stats = detach_all_channels(&wallet);
+            // Detach only this leaf's previous route sessions. Other client
+            // leaves share the wallet and may still be actively using theirs.
+            let detach_stats = detach_channels_for_sessions(&wallet, &owned_session_ids);
             info!(
                 attempt,
                 scanned = detach_stats.scanned,
@@ -334,6 +427,7 @@ where
                 let mut active_route = route_conn;
 
                 loop {
+                    owned_session_ids = active_route.suffix_session_ids_from(0);
                     let hop_count = active_route.hops().len();
                     let funded_hop_count =
                         active_route.hops().iter().filter(|hop| hop.funded).count();
@@ -492,35 +586,6 @@ where
     }
 }
 
-fn detach_all_channels(wallet: &Arc<dyn MonadWallet>) -> ChannelDetachStats {
-    let mut stats = ChannelDetachStats::default();
-    match wallet.list_channels() {
-        Ok(channels) => {
-            stats.scanned = channels.len();
-            for channel in channels {
-                if channel.state == WalletChannelState::Open
-                    && channel.attached_session_id.is_some()
-                {
-                    stats.matched += 1;
-                    if let Err(err) = wallet.force_detach_channel(&channel.channel_id) {
-                        stats.failed += 1;
-                        warn!(
-                            channel_id = %channel.channel_id,
-                            "failed to detach channel from previous session: {err}"
-                        );
-                    } else {
-                        stats.detached += 1;
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            warn!("failed to list channels for detach: {err}");
-        }
-    }
-    stats
-}
-
 fn detach_channels_for_sessions(
     wallet: &Arc<dyn MonadWallet>,
     session_ids: &[[u8; 32]],
@@ -564,16 +629,20 @@ pub async fn run_socks_listener(
     conn_rx: watch::Receiver<Option<Arc<RelayConnection>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    loop {
+    let mut connections = JoinSet::new();
+    let result = loop {
         // Wait for either an incoming SOCKS connection or an explicit shutdown
         // signal so the listener task can exit promptly.
         tokio::select! {
             accept_result = listener.accept() => {
-                let (mut stream, peer_addr) = accept_result?;
+                let (mut stream, peer_addr) = match accept_result {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error),
+                };
                 let conn_rx = conn_rx.clone();
                 let shutdown_rx = shutdown_rx.clone();
 
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let result = async {
                         let conn = match wait_for_active_route(conn_rx, shutdown_rx).await {
                             Some(conn) => conn,
@@ -594,14 +663,21 @@ pub async fn run_socks_listener(
                     }
                 });
             }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    warn!("SOCKS connection task failed: {error}");
+                }
+            }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    // Sender dropped or explicit shutdown.
-                    return Ok(());
+                    break Ok(());
                 }
             }
         }
-    }
+    };
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    result
 }
 
 async fn wait_for_active_route(
@@ -639,6 +715,7 @@ async fn wait_for_active_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::{MockWallet, WalletChannel};
 
     #[test]
     fn route_runtime_stats_start_at_zero() {
@@ -724,5 +801,132 @@ mod tests {
         assert_eq!(snapshot.failure_watchers_unavailable_total, 1);
         assert_eq!(snapshot.full_reconnects_total, 1);
         assert_eq!(snapshot.route_failures_total, 0);
+    }
+
+    #[test]
+    fn full_reconnect_detaches_only_sessions_owned_by_that_client_leaf() {
+        let wallet = Arc::new(MockWallet::new());
+        for (channel_id, session_id) in [("first", [1; 32]), ("sibling", [2; 32])] {
+            wallet
+                .insert_channel(WalletChannel {
+                    channel_id: channel_id.to_string(),
+                    state: WalletChannelState::Open,
+                    receiver_pubkey: "receiver".to_string(),
+                    mint_url: "https://mint".to_string(),
+                    unit: "msat".to_string(),
+                    keyset_id: "keyset".to_string(),
+                    attached_session_id: Some(session_id),
+                    capacity_msats: 1_000,
+                    current_signed_balance_msats: 0,
+                    expiry_timestamp: u64::MAX,
+                })
+                .unwrap();
+        }
+        let shared: Arc<dyn MonadWallet> = wallet.clone();
+
+        let stats = detach_channels_for_sessions(&shared, &[[1; 32]]);
+
+        assert_eq!(stats.detached, 1);
+        let channels = wallet.list_channels().unwrap();
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.channel_id == "first")
+                .unwrap()
+                .attached_session_id,
+            None
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.channel_id == "sibling")
+                .unwrap()
+                .attached_session_id,
+            Some([2; 32])
+        );
+    }
+
+    #[test]
+    fn omitted_selector_preserves_all_clients_in_yaml_order() {
+        let config = test_config_with_clients(&["first", "second"]);
+        let selected = selected_clients(&config, None).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn selector_runs_one_named_client() {
+        let config = test_config_with_clients(&["first", "second"]);
+        let selected = selected_clients(&config, Some("second")).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "second");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_client_supervisor_propagates_listener_failure() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let loose_db = dir.path().join("loose.db");
+        let channel_db = dir.path().join("channels.db");
+        let mut config = test_config_with_clients(&["first", "second"]);
+        config.clients[1].socks = occupied_addr.to_string();
+        config.client_wallet = Some(monad_common::config::ClientWalletConfig {
+            loose_db_path: loose_db.display().to_string(),
+            channel_db_path: channel_db.display().to_string(),
+            sender_secret_hex: hex::encode([9u8; 32]),
+            channel_input_budget_msats: 1_000,
+            target_topup_buffer_msats: 1_000,
+            minimum_topup_msats: 1,
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_configured_client_until_shutdown_with_options(
+                config,
+                None,
+                SharedRouteRuntimeStats::default(),
+                ConfiguredClientRuntimeOptions {
+                    route_setup_timeout: Duration::from_millis(100),
+                },
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("supervisor should not hang")
+        .unwrap_err();
+        assert!(result.to_string().contains("bind client 'second'"));
+        assert!(!loose_db.exists());
+        assert!(!channel_db.exists());
+    }
+
+    fn test_config_with_clients(names: &[&str]) -> MonadConfig {
+        let secret = monad_common::secp_identity::SecpTransportKeypair::from_secret_bytes(&[7; 32])
+            .unwrap()
+            .pubkey()
+            .to_hex();
+        let clients = names
+            .iter()
+            .map(|name| ClientConfig {
+                name: (*name).to_string(),
+                socks: "127.0.0.1:0".to_string(),
+                route: vec![monad_common::config::ClientRouteHopConfig {
+                    addr: "127.0.0.1:1".to_string(),
+                    pubkey: secret.clone(),
+                }],
+            })
+            .collect();
+        MonadConfig {
+            relay_wallet: None,
+            client_wallet: None,
+            management: None,
+            relays: Vec::new(),
+            clients,
+        }
     }
 }

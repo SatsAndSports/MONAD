@@ -6,7 +6,9 @@
 
 use rand::RngCore;
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{
+    params, params_from_iter, Connection, OpenFlags, OptionalExtension, TransactionBehavior,
+};
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
@@ -483,6 +485,24 @@ impl LooseProofWallet {
         ))
         .map_err(|e| LooseProofWalletError::Backend(format!("create loose proof wallet schema: {e}")))?;
         migrate_opening_abandonment(&conn)?;
+        Ok(Self {
+            wallet_name: wallet_name.into(),
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Open an existing wallet without creating files, changing pragmas, or migrating schema.
+    pub fn open_read_only(path: impl AsRef<Path>, wallet_name: impl Into<String>) -> Result<Self> {
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
+                LooseProofWalletError::Backend(format!("open read-only loose proof wallet db: {e}"))
+            })?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| {
+                LooseProofWalletError::Backend(format!(
+                    "set read-only loose proof wallet busy timeout: {e}"
+                ))
+            })?;
         Ok(Self {
             wallet_name: wallet_name.into(),
             conn: Arc::new(Mutex::new(conn)),
@@ -1277,9 +1297,8 @@ impl LooseProofWallet {
         self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Prepared, None)
     }
 
-    /// Release operation-owned inputs only after restore found no funding and
-    /// every exact input was observed UNSPENT. Retain the journal as a tombstone.
-    pub(crate) fn abandon_opening_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
+    #[cfg(test)]
+    fn abandon_opening_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
         self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Submitted, Some(reason))
     }
 

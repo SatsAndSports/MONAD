@@ -296,6 +296,44 @@ pub struct ClientWalletConfig {
     pub minimum_topup_msats: u64,
 }
 
+/// Database paths needed by read-only client wallet inspection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClientWalletInspectionConfig {
+    pub loose_db_path: String,
+    pub channel_db_path: String,
+}
+
+impl ClientWalletInspectionConfig {
+    /// Load only client wallet database paths, substituting environment values
+    /// in those paths without reading or validating sender key material.
+    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        #[derive(Deserialize)]
+        struct InspectionDocument {
+            client_wallet: Option<ClientWalletInspectionConfig>,
+        }
+
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            let _ = dotenvy::from_path(parent.join(".env"));
+        }
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read config file {}: {e}", path.display()))?;
+        let mut config = serde_yaml::from_str::<InspectionDocument>(&raw)
+            .map_err(|e| anyhow::anyhow!("failed to parse config file {}: {e}", path.display()))?
+            .client_wallet
+            .ok_or_else(|| anyhow::anyhow!("client_wallet is required when using --config"))?;
+        config.loose_db_path = substitute_env_vars(&config.loose_db_path)?;
+        config.channel_db_path = substitute_env_vars(&config.channel_db_path)?;
+        if config.loose_db_path.trim().is_empty() {
+            anyhow::bail!("client_wallet.loose_db_path must not be empty");
+        }
+        if config.channel_db_path.trim().is_empty() {
+            anyhow::bail!("client_wallet.channel_db_path must not be empty");
+        }
+        Ok(config)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagementConfig {
     pub listen: String,
