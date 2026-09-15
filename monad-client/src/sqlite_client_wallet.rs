@@ -4,8 +4,9 @@
 //! `cdk-spilman` Spilman channel operations, implementing `MonadWallet`.
 
 use crate::loose_proof_wallet::{
-    new_reservation_id, LooseProofWallet, LooseProofWalletError, NewLooseProof, NewOpeningAttempt,
-    OpeningAttemptRecord, OpeningAttemptState, ProofReservation,
+    new_reservation_id, LooseProofRecord, LooseProofWallet, LooseProofWalletError, NewLooseProof,
+    NewOpeningAttempt, OpeningAttemptRecord, OpeningAttemptState, OpeningExecutionStatus,
+    OpeningSubmissionClaim, OpeningSubmissionPermit, ProofReservation,
 };
 use crate::proof_selection::{select_mixed_fee_inputs_for_post_swap_target, ProofCandidate};
 use crate::wallet::{
@@ -168,6 +169,8 @@ pub struct OpeningRecoveryReport {
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnresolvedOpening {
     pub attempt_id: String,
+    pub state: OpeningAttemptState,
+    pub latest_submitted_at: Option<u64>,
     pub reason: String,
 }
 
@@ -203,8 +206,9 @@ const CREATE_CHANNELS_SQL: &str = r#"
     )
 "#;
 
-const CREATE_OPENING_RECOVERIES_SQL: &str = r#"
-    CREATE TABLE IF NOT EXISTS monad_client_channel_opening_recoveries (
+#[cfg(test)]
+const CREATE_OPENING_RECOVERIES_SQL_FOR_TEST: &str = r#"
+    CREATE TABLE monad_client_channel_opening_recoveries (
         channel_id TEXT PRIMARY KEY,
         reservation_id TEXT NOT NULL,
         receiver_pubkey TEXT NOT NULL,
@@ -356,6 +360,39 @@ fn checked_upstream_info(
     })
 }
 
+fn reject_and_remove_legacy_opening_recoveries(conn: &Connection) -> Result<(), WalletError> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name =
+                    'monad_client_channel_opening_recoveries')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            WalletError::Backend(format!("inspect obsolete opening recovery table: {e}"))
+        })?;
+    if !exists {
+        return Ok(());
+    }
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM monad_client_channel_opening_recoveries",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            WalletError::Backend(format!("inspect obsolete opening recovery rows: {e}"))
+        })?;
+    if rows != 0 {
+        return Err(WalletError::Backend(
+            "obsolete nonempty monad_client_channel_opening_recoveries state is unsupported"
+                .to_string(),
+        ));
+    }
+    conn.execute_batch("DROP TABLE monad_client_channel_opening_recoveries")
+        .map_err(|e| WalletError::Backend(format!("remove obsolete opening recovery table: {e}")))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelFundRecoveryResult {
     AlreadyRecovered {
@@ -396,6 +433,11 @@ struct ClientOpenAttempt {
     desired_funding_token_amount_raw: Option<u64>,
     selected_input_msats: u64,
     expiry_timestamp: u64,
+}
+
+enum SubmitOpenAttemptError {
+    Authority(WalletError),
+    Open(OpenChannelError),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -478,9 +520,10 @@ impl SqliteClientWallet {
             .map_err(|e| WalletError::Backend(format!("set channel db busy timeout: {e}")))?;
         channel_db
             .execute_batch(&format!(
-                "{CREATE_CHANNELS_SQL};{CREATE_OPENING_RECOVERIES_SQL};{CREATE_CHANNEL_RECOVERIES_SQL};"
+                "{CREATE_CHANNELS_SQL};{CREATE_CHANNEL_RECOVERIES_SQL};"
             ))
             .map_err(|e| WalletError::Backend(format!("create channel metadata schema: {e}")))?;
+        reject_and_remove_legacy_opening_recoveries(&channel_db)?;
 
         Ok(Self {
             loose_wallet,
@@ -757,6 +800,8 @@ impl SqliteClientWallet {
                 Ok(OpeningRecoveryOutcome::Unresolved) => {
                     report.unresolved.push(UnresolvedOpening {
                         attempt_id: attempt.attempt_id.clone(),
+                        state: attempt.state,
+                        latest_submitted_at: attempt.latest_submitted_at,
                         reason:
                             "funding restore empty; submitted attempt retained without abandonment"
                                 .to_string(),
@@ -771,68 +816,9 @@ impl SqliteClientWallet {
                     );
                     report.unresolved.push(UnresolvedOpening {
                         attempt_id: attempt.attempt_id.clone(),
+                        state: attempt.state,
+                        latest_submitted_at: attempt.latest_submitted_at,
                         reason: error.to_string(),
-                    });
-                }
-            }
-        }
-
-        // Legacy rows predate the authoritative pre-submit journal.
-        let recoveries = self.list_opening_recoveries()?;
-
-        for recovery in recoveries {
-            if self
-                .loose_wallet
-                .opening_attempt(&recovery.channel_id)
-                .map_err(loose_proof_error)?
-                .is_some()
-            {
-                self.delete_opening_recovery(&recovery.channel_id)?;
-                continue;
-            }
-            let result = self.recover_pending_opening(&recovery.channel_id, &networking);
-
-            match result {
-                Ok(open_result) => {
-                    self.loose_wallet
-                        .import_proofs(&change_proofs_to_loose_proofs(&open_result)?)
-                        .map_err(loose_proof_error)?;
-                    self.loose_wallet
-                        .mark_reservation_spent(&recovery.reservation_id, &open_result.channel_id)
-                        .map_err(loose_proof_error)?;
-                    let expiry_timestamp = {
-                        let bridge = self.bridge.lock().map_err(|_| {
-                            WalletError::Backend("bridge mutex poisoned".to_string())
-                        })?;
-                        let funding = bridge
-                            .get_channel_funding(&open_result.channel_id)
-                            .ok_or_else(|| {
-                                WalletError::Backend(format!(
-                                    "recovered channel {} has no funding data",
-                                    open_result.channel_id
-                                ))
-                            })?;
-                        expiry_from_params_json(&funding.params_json)?
-                    };
-                    self.store_open_channel_metadata(
-                        &open_result,
-                        &recovery.reservation_id,
-                        expiry_timestamp,
-                    )?;
-                    self.delete_opening_recovery(&recovery.channel_id)?;
-                    report.recovered_channel_ids.push(open_result.channel_id);
-                }
-                Err(error) => {
-                    // A legacy row has no authoritative pre-submit journal.
-                    // Local preparation errors cannot prove its inputs are safe.
-                    report.unresolved.push(UnresolvedOpening {
-                        attempt_id: recovery.channel_id,
-                        reason: open_channel_error(
-                            error,
-                            &recovery.unit,
-                            recovery.input_budget_msats,
-                        )
-                        .to_string(),
                     });
                 }
             }
@@ -860,6 +846,15 @@ impl SqliteClientWallet {
         }
         let prepared: PreparedOpenChannel = serde_json::from_str(&attempt.prepared_open_json)
             .map_err(|e| WalletError::Backend(format!("decode opening attempt: {e}")))?;
+        let reserved_proofs = self
+            .loose_wallet
+            .proofs_for_reservation(&attempt.reservation_id)
+            .map_err(loose_proof_error)?;
+        verify_prepared_inputs_match_selected_proofs(
+            &prepared,
+            &attempt.selected_proof_ids,
+            &reserved_proofs,
+        )?;
         let completed = if attempt.state == OpeningAttemptState::Finalizing {
             let json = attempt.completed_open_json.as_deref().ok_or_else(|| {
                 WalletError::Backend(format!(
@@ -970,7 +965,40 @@ impl SqliteClientWallet {
                 if !prepared_inputs_are_all_unspent(prepared, networking)? {
                     return Ok(None);
                 }
-                self.submit_prepared_open(prepared.clone(), networking)
+                let permit = match self
+                    .loose_wallet
+                    .claim_opening_attempt_replay(&prepared.channel_id)
+                    .map_err(|e| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::SwapSubmitted,
+                            Some(prepared.channel_id.clone()),
+                            format!("claim immutable opening replay: {e}"),
+                        )
+                    })? {
+                    OpeningSubmissionClaim::Acquired(permit) => permit,
+                    OpeningSubmissionClaim::NotReplayable { state } => {
+                        return Err(open_channel_stage_error(
+                            OpenChannelFailureStage::SwapSubmitted,
+                            Some(prepared.channel_id.clone()),
+                            format!("opening replay authority unavailable in state {state:?}"),
+                        ));
+                    }
+                    OpeningSubmissionClaim::NotFound => {
+                        return Err(open_channel_stage_error(
+                            OpenChannelFailureStage::SwapSubmitted,
+                            Some(prepared.channel_id.clone()),
+                            "opening replay authority is missing".to_string(),
+                        ));
+                    }
+                    OpeningSubmissionClaim::InProgress => {
+                        return Err(open_channel_stage_error(
+                            OpenChannelFailureStage::SwapSubmitted,
+                            Some(prepared.channel_id.clone()),
+                            "opening replay is already in progress".to_string(),
+                        ));
+                    }
+                };
+                self.submit_prepared_open(prepared.clone(), permit, networking)
                     .map(Some)
             }
         }
@@ -1067,68 +1095,6 @@ impl SqliteClientWallet {
                 result: completed.result,
             },
         )))
-    }
-
-    fn recover_pending_opening<N: SpilmanClientNetworking>(
-        &self,
-        channel_id: &str,
-        networking: &N,
-    ) -> Result<OpenChannelResult, OpenChannelError> {
-        // MONAD owns restore I/O and retry boundaries; upstream owns request
-        // construction, response completion, and the explicit mark-open step.
-        let prepared = {
-            let bridge = self.bridge.lock().map_err(|_| {
-                open_channel_stage_error(
-                    OpenChannelFailureStage::BeforeOpeningSaved,
-                    Some(channel_id.to_string()),
-                    "bridge mutex poisoned".to_string(),
-                )
-            })?;
-            bridge.prepare_open_channel_recovery(channel_id)?
-        };
-
-        let funding_restore_response = networking
-            .call_mint_restore(&prepared.mint_url, &prepared.funding_restore_request_json)
-            .map_err(|e| {
-                open_channel_stage_error(
-                    OpenChannelFailureStage::RestoreVerification,
-                    Some(prepared.channel_id.clone()),
-                    e,
-                )
-            })?;
-        let change_restore_response = match prepared.change_restore_request_json.as_ref() {
-            Some(request) => Some(
-                networking
-                    .call_mint_restore(&prepared.mint_url, request)
-                    .map_err(|e| {
-                        open_channel_stage_error(
-                            OpenChannelFailureStage::RestoreVerification,
-                            Some(prepared.channel_id.clone()),
-                            e,
-                        )
-                    })?,
-            ),
-            None => None,
-        };
-
-        let completed = {
-            let bridge = self.bridge.lock().map_err(|_| {
-                open_channel_stage_error(
-                    OpenChannelFailureStage::RestoreVerification,
-                    Some(prepared.channel_id.clone()),
-                    "bridge mutex poisoned".to_string(),
-                )
-            })?;
-            let completed = bridge.complete_prepared_open_recovery(
-                &prepared,
-                &funding_restore_response,
-                change_restore_response.as_deref(),
-            )?;
-            bridge.mark_completed_open_recovery(&completed)?;
-            completed
-        };
-
-        Ok(completed.result)
     }
 
     fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, WalletError> {
@@ -1469,52 +1435,6 @@ impl SqliteClientWallet {
         Ok(())
     }
 
-    fn list_opening_recoveries(&self) -> Result<Vec<OpeningRecovery>, WalletError> {
-        let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT channel_id, reservation_id, unit, input_budget_msats
-                 FROM monad_client_channel_opening_recoveries
-                 ORDER BY created_at ASC",
-            )
-            .map_err(|e| WalletError::Backend(format!("prepare opening recoveries: {e}")))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| WalletError::Backend(format!("query opening recoveries: {e}")))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| WalletError::Backend(format!("read opening recovery row: {e}")))?
-        {
-            out.push(OpeningRecovery {
-                channel_id: row.get(0).map_err(|e| {
-                    WalletError::Backend(format!("decode recovery channel_id: {e}"))
-                })?,
-                reservation_id: row.get(1).map_err(|e| {
-                    WalletError::Backend(format!("decode recovery reservation_id: {e}"))
-                })?,
-                unit: row
-                    .get(2)
-                    .map_err(|e| WalletError::Backend(format!("decode recovery unit: {e}")))?,
-                input_budget_msats: from_i64(row.get(3).map_err(|e| {
-                    WalletError::Backend(format!("decode recovery input budget: {e}"))
-                })?)
-                .map_err(|e| WalletError::Backend(format!("decode recovery input budget: {e}")))?,
-            });
-        }
-        Ok(out)
-    }
-
-    fn delete_opening_recovery(&self, channel_id: &str) -> Result<(), WalletError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM monad_client_channel_opening_recoveries WHERE channel_id = ?1",
-            params![channel_id],
-        )
-        .map_err(|e| WalletError::Backend(format!("delete opening recovery: {e}")))?;
-        Ok(())
-    }
-
     fn now_seconds() -> Result<u64, WalletError> {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1526,25 +1446,35 @@ impl SqliteClientWallet {
         &self,
         attempt: &ClientOpenAttempt,
         networking: &N,
-    ) -> Result<OpenChannelResult, OpenChannelError> {
-        let claimed = self
+    ) -> Result<OpenChannelResult, SubmitOpenAttemptError> {
+        let claim = self
             .loose_wallet
             .claim_opening_attempt_submission(&attempt.prepared.channel_id)
             .map_err(|e| {
-                open_channel_stage_error(
-                    OpenChannelFailureStage::BeforeOpeningSaved,
-                    Some(attempt.prepared.channel_id.clone()),
-                    format!("mark opening attempt submitted: {e}"),
-                )
+                SubmitOpenAttemptError::Authority(WalletError::Backend(format!(
+                    "claim opening submission authority: {e}"
+                )))
             })?;
-        if !claimed {
-            return Err(open_channel_stage_error(
-                OpenChannelFailureStage::SwapSubmitted,
-                Some(attempt.prepared.channel_id.clone()),
-                "opening attempt was already submitted by another worker".to_string(),
-            ));
-        }
-        self.submit_prepared_open(attempt.prepared.clone(), networking)
+        let permit = match claim {
+            OpeningSubmissionClaim::Acquired(permit) => permit,
+            OpeningSubmissionClaim::NotReplayable { state } => {
+                return Err(SubmitOpenAttemptError::Authority(WalletError::Backend(
+                    format!("opening submission authority unavailable in state {state:?}"),
+                )));
+            }
+            OpeningSubmissionClaim::NotFound => {
+                return Err(SubmitOpenAttemptError::Authority(WalletError::Backend(
+                    "opening submission authority is missing".to_string(),
+                )));
+            }
+            OpeningSubmissionClaim::InProgress => {
+                return Err(SubmitOpenAttemptError::Authority(WalletError::Backend(
+                    "opening submission is already in progress".to_string(),
+                )));
+            }
+        };
+        self.submit_prepared_open(attempt.prepared.clone(), permit, networking)
+            .map_err(SubmitOpenAttemptError::Open)
     }
 
     fn prepare_open_attempt(
@@ -1615,6 +1545,17 @@ impl SqliteClientWallet {
         let prepared_open_json = serde_json::to_string(&prepared)
             .map_err(|e| WalletError::Backend(format!("serialize opening attempt: {e}")))
             .map_err(&preflight_error)?;
+        let selected_proof_ids = reservation
+            .proofs
+            .iter()
+            .map(|proof| proof.proof_id.clone())
+            .collect::<Vec<_>>();
+        verify_prepared_inputs_match_selected_proofs(
+            &prepared,
+            &selected_proof_ids,
+            &reservation.proofs,
+        )
+        .map_err(&preflight_error)?;
         let journal = NewOpeningAttempt {
             attempt_id: prepared.channel_id.clone(),
             opening_id: prepared.channel_id.clone(),
@@ -1626,6 +1567,7 @@ impl SqliteClientWallet {
             input_budget_msats: plan.selected_input_msats,
             expiry_timestamp: plan.expiry_timestamp,
             prepared_open_json,
+            selected_proof_ids,
         };
         let proof_ids = reservation
             .proofs
@@ -1671,23 +1613,149 @@ impl SqliteClientWallet {
     fn submit_prepared_open<N: SpilmanClientNetworking>(
         &self,
         prepared: PreparedOpenChannel,
+        permit: OpeningSubmissionPermit,
         networking: &N,
     ) -> Result<OpenChannelResult, OpenChannelError> {
-        let swap_response_json = networking
-            .call_mint_swap(&prepared.mint_url, &prepared.swap_request_json)
-            .map_err(|e| {
-                let message = normalize_mint_error_string(e);
-                if is_definitive_keyset_rejection(&message) {
-                    return self
-                        .mark_prepared_open_rejected(&prepared, message)
-                        .unwrap_or_else(|error| error);
-                }
+        let authority_check = (|| {
+            if permit.attempt_id() != prepared.channel_id {
+                return Err(open_channel_stage_error(
+                    OpenChannelFailureStage::SwapSubmitted,
+                    Some(prepared.channel_id.clone()),
+                    "submission permit does not match prepared opening".to_string(),
+                ));
+            }
+            let journal = self
+                .loose_wallet
+                .opening_attempt(permit.attempt_id())
+                .map_err(|e| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::SwapSubmitted,
+                        Some(prepared.channel_id.clone()),
+                        format!("load authoritative opening journal: {e}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::SwapSubmitted,
+                        Some(prepared.channel_id.clone()),
+                        "authoritative opening journal is missing".to_string(),
+                    )
+                })?;
+            let prepared_json = serde_json::to_string(&prepared).map_err(|e| {
                 open_channel_stage_error(
                     OpenChannelFailureStage::SwapSubmitted,
                     Some(prepared.channel_id.clone()),
-                    message,
+                    format!("serialize prepared opening for authority check: {e}"),
                 )
             })?;
+            if prepared_json != journal.prepared_open_json {
+                return Err(open_channel_stage_error(
+                    OpenChannelFailureStage::SwapSubmitted,
+                    Some(prepared.channel_id.clone()),
+                    "prepared opening differs from the authoritative journal".to_string(),
+                ));
+            }
+            let reserved_proofs = self
+                .loose_wallet
+                .proofs_for_reservation(&journal.reservation_id)
+                .map_err(|e| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::SwapSubmitted,
+                        Some(prepared.channel_id.clone()),
+                        format!("load exact reserved opening proofs: {e}"),
+                    )
+                })?;
+            verify_prepared_inputs_match_selected_proofs(
+                &prepared,
+                &journal.selected_proof_ids,
+                &reserved_proofs,
+            )
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::SwapSubmitted,
+                    Some(prepared.channel_id.clone()),
+                    e.to_string(),
+                )
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = authority_check {
+            self.loose_wallet
+                .cancel_opening_submission_claim(permit)
+                .map_err(|cancel_error| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::BeforeOpeningSaved,
+                        Some(prepared.channel_id.clone()),
+                        format!(
+                            "release unsubmitted opening claim after preflight failure: {cancel_error}; original error: {error}"
+                        ),
+                    )
+                })?;
+            return Err(error);
+        }
+        let authorized = self
+            .loose_wallet
+            .authorize_opening_submission(permit)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    Some(prepared.channel_id.clone()),
+                    format!("authorize opening immediately before submission: {e}"),
+                )
+            })?;
+        let swap_response_json = match networking
+            .call_mint_swap(&prepared.mint_url, &prepared.swap_request_json)
+        {
+            Ok(response) => {
+                self.loose_wallet
+                    .finish_opening_execution(
+                        authorized,
+                        OpeningExecutionStatus::ResponseReceived,
+                        None,
+                    )
+                    .map_err(|e| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::SwapSubmitted,
+                            Some(prepared.channel_id.clone()),
+                            format!("persist opening execution response: {e}"),
+                        )
+                    })?;
+                response
+            }
+            Err(error) => {
+                let message = normalize_mint_error_string(error);
+                let definitive = is_definitive_keyset_rejection(&message);
+                let attempt_rejected = if definitive {
+                    self.loose_wallet
+                        .record_definitive_opening_rejection(authorized, 12_002, &message)
+                } else {
+                    self.loose_wallet
+                        .finish_opening_execution(
+                            authorized,
+                            OpeningExecutionStatus::Uncertain,
+                            Some(&message),
+                        )
+                        .map(|_| false)
+                }
+                .map_err(|e| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::SwapSubmitted,
+                        Some(prepared.channel_id.clone()),
+                        format!("persist opening execution failure: {e}; mint error: {message}"),
+                    )
+                })?;
+                if attempt_rejected {
+                    return Err(self
+                        .mark_prepared_open_rejected(&prepared, message)
+                        .unwrap_or_else(|error| error));
+                }
+                return Err(open_channel_stage_error(
+                    OpenChannelFailureStage::SwapSubmitted,
+                    Some(prepared.channel_id.clone()),
+                    message,
+                ));
+            }
+        };
 
         let completed = {
             let bridge = self.bridge.lock().map_err(|_| {
@@ -1753,15 +1821,6 @@ impl SqliteClientWallet {
         prepared: &PreparedOpenChannel,
         message: String,
     ) -> Result<OpenChannelError, OpenChannelError> {
-        self.loose_wallet
-            .mark_opening_attempt_rejected(&prepared.channel_id, Some(12_002), &message)
-            .map_err(|e| {
-                open_channel_stage_error(
-                    OpenChannelFailureStage::SwapSubmitted,
-                    Some(prepared.channel_id.clone()),
-                    format!("persist mint rejection before cleanup: {e}; mint error: {message}"),
-                )
-            })?;
         let fallback = OpenChannelError {
             stage: OpenChannelFailureStage::MintRejected,
             channel_id: Some(prepared.channel_id.clone()),
@@ -1835,24 +1894,14 @@ impl SqliteClientWallet {
         self.loose_wallet
             .import_proofs(&change_proofs_to_loose_proofs(&open_result)?)
             .map_err(loose_proof_error)?;
-        self.loose_wallet
-            .mark_reservation_spent(&reservation.reservation_id, &open_result.channel_id)
-            .map_err(loose_proof_error)?;
         self.store_open_channel_metadata(
             &open_result,
             &reservation.reservation_id,
             expiry_timestamp,
         )?;
-        if self
-            .loose_wallet
-            .opening_attempt(&open_result.channel_id)
-            .map_err(loose_proof_error)?
-            .is_some()
-        {
-            self.loose_wallet
-                .mark_opening_attempt_completed(&open_result.channel_id)
-                .map_err(loose_proof_error)?;
-        }
+        self.loose_wallet
+            .complete_opening_attempt_exact(&open_result.channel_id)
+            .map_err(loose_proof_error)?;
         Ok(open_result.channel_id)
     }
 
@@ -1912,7 +1961,70 @@ impl SqliteClientWallet {
             bridge.mark_prepared_open_saved(&prepared)?;
             prepared
         };
-        self.submit_prepared_open(prepared, &networking)
+        let proof_ids = reservation
+            .proofs
+            .iter()
+            .map(|proof| proof.proof_id.clone())
+            .collect::<Vec<_>>();
+        self.loose_wallet
+            .release_reservation(&reservation.reservation_id)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    Some(prepared.channel_id.clone()),
+                    e.to_string(),
+                )
+            })?;
+        self.loose_wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                &offer.mint_url,
+                &offer.unit,
+                &proof_ids,
+                &NewOpeningAttempt {
+                    attempt_id: prepared.channel_id.clone(),
+                    opening_id: prepared.channel_id.clone(),
+                    predecessor_attempt_id: None,
+                    reservation_id: reservation.reservation_id.clone(),
+                    receiver_pubkey: offer.receiver_pubkey.clone(),
+                    mint_url: offer.mint_url.clone(),
+                    unit: offer.unit.clone(),
+                    input_budget_msats: reservation.total_amount_raw.saturating_mul(1000),
+                    expiry_timestamp,
+                    prepared_open_json: serde_json::to_string(&prepared).map_err(|e| {
+                        open_channel_stage_error(
+                            OpenChannelFailureStage::BeforeOpeningSaved,
+                            Some(prepared.channel_id.clone()),
+                            e.to_string(),
+                        )
+                    })?,
+                    selected_proof_ids: proof_ids.clone(),
+                },
+            )
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    Some(prepared.channel_id.clone()),
+                    e.to_string(),
+                )
+            })?;
+        let OpeningSubmissionClaim::Acquired(permit) = self
+            .loose_wallet
+            .claim_opening_attempt_submission(&prepared.channel_id)
+            .map_err(|e| {
+                open_channel_stage_error(
+                    OpenChannelFailureStage::BeforeOpeningSaved,
+                    Some(prepared.channel_id.clone()),
+                    e.to_string(),
+                )
+            })?
+        else {
+            return Err(open_channel_stage_error(
+                OpenChannelFailureStage::BeforeOpeningSaved,
+                Some(prepared.channel_id.clone()),
+                "test opening submission claim lost".to_string(),
+            ));
+        };
+        self.submit_prepared_open(prepared, permit, &networking)
     }
 
     fn execute_open_attempt(
@@ -1946,14 +2058,24 @@ impl SqliteClientWallet {
         networking: &N,
     ) -> Result<String, WalletError> {
         let result = match self.submit_open_attempt_with_networking(&attempt, networking) {
-            Err(error) if error.input_may_be_spent => {
+            Err(SubmitOpenAttemptError::Authority(error)) => return Err(error),
+            Err(SubmitOpenAttemptError::Open(error)) if error.input_may_be_spent => {
                 match self.recover_or_replay_submitted_opening(&attempt.prepared, networking) {
                     Ok(Some(result)) => Ok(result),
                     Ok(None) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
+                    // The original execution remains authoritative if later local
+                    // recovery fails; never downgrade its remote uncertainty.
+                    Err(recovery_error) => {
+                        tracing::warn!(
+                            channel_id = %attempt.prepared.channel_id,
+                            "live opening recovery failed after uncertain submission: {recovery_error}"
+                        );
+                        Err(error)
+                    }
                 }
             }
-            result => result,
+            Err(SubmitOpenAttemptError::Open(error)) => Err(error),
+            Ok(result) => Ok(result),
         };
         match result {
             Ok(result) => {
@@ -2084,6 +2206,12 @@ impl SqliteClientWallet {
             prepared_open_json: serde_json::to_string(&prepared).map_err(|e| {
                 WalletError::Backend(format!("serialize successor opening attempt: {e}"))
             })?,
+            selected_proof_ids: predecessor
+                .reservation
+                .proofs
+                .iter()
+                .map(|proof| proof.proof_id.clone())
+                .collect(),
         };
         self.loose_wallet
             .store_opening_attempt_for_reservation(&journal)
@@ -2657,14 +2785,6 @@ fn upstream_info<N: SpilmanClientNetworking>(
 }
 
 #[derive(Debug, Clone)]
-struct OpeningRecovery {
-    channel_id: String,
-    reservation_id: String,
-    unit: String,
-    input_budget_msats: u64,
-}
-
-#[derive(Debug, Clone)]
 struct ChannelMeta {
     channel_id: String,
     receiver_pubkey: String,
@@ -2853,17 +2973,6 @@ fn hex_to_session_id(hex: &str) -> Result<[u8; 32], WalletError> {
         .map_err(|_| WalletError::Backend("session id is not 32 bytes".to_string()))
 }
 
-fn expiry_from_params_json(params_json: &str) -> Result<u64, WalletError> {
-    let value: serde_json::Value = serde_json::from_str(params_json)
-        .map_err(|e| WalletError::Backend(format!("parse channel params json: {e}")))?;
-    value
-        .get("expiry_timestamp")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| {
-            WalletError::Backend("channel params json missing expiry_timestamp".to_string())
-        })
-}
-
 fn proofs_json_from_reservation(
     reservation: &crate::loose_proof_wallet::ProofReservation,
 ) -> Result<String, WalletError> {
@@ -2876,6 +2985,76 @@ fn proofs_json_from_reservation(
         values.map_err(|e| WalletError::Backend(format!("parse reserved proof json: {e}")))?;
     serde_json::to_string(&values)
         .map_err(|e| WalletError::Backend(format!("serialize reserved proofs: {e}")))
+}
+
+fn prepared_input_ys(prepared: &PreparedOpenChannel) -> Result<Vec<String>, WalletError> {
+    let proofs: Vec<Proof> = serde_json::from_str(&prepared.opening.input_token).map_err(|e| {
+        WalletError::Backend(format!("decode immutable prepared opening inputs: {e}"))
+    })?;
+    if proofs.is_empty() {
+        return Err(WalletError::Backend(
+            "immutable prepared opening has no inputs".to_string(),
+        ));
+    }
+    let mut ids = proofs
+        .iter()
+        .map(|proof| {
+            proof
+                .y()
+                .map(|y| y.to_hex())
+                .map_err(|e| WalletError::Backend(format!("derive prepared input proof id: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.sort();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(WalletError::Backend(
+            "immutable prepared opening contains duplicate inputs".to_string(),
+        ));
+    }
+    Ok(ids)
+}
+
+fn verify_prepared_inputs_match_selected_proofs(
+    prepared: &PreparedOpenChannel,
+    selected_proof_ids: &[String],
+    selected_proofs: &[LooseProofRecord],
+) -> Result<(), WalletError> {
+    let mut expected_ids = selected_proof_ids.to_vec();
+    expected_ids.sort();
+    let mut actual_ids = selected_proofs
+        .iter()
+        .map(|proof| proof.proof_id.clone())
+        .collect::<Vec<_>>();
+    actual_ids.sort();
+    if expected_ids.is_empty()
+        || expected_ids.windows(2).any(|pair| pair[0] == pair[1])
+        || actual_ids != expected_ids
+    {
+        return Err(WalletError::Backend(format!(
+            "opening journal exact proof ids do not match reservation for {}",
+            prepared.channel_id
+        )));
+    }
+    let prepared_ys = prepared_input_ys(prepared)?;
+    let mut selected_ys = selected_proofs
+        .iter()
+        .map(|record| {
+            let proof: Proof = serde_json::from_str(&record.proof_json).map_err(|e| {
+                WalletError::Backend(format!("decode selected proof '{}': {e}", record.proof_id))
+            })?;
+            proof.y().map(|y| y.to_hex()).map_err(|e| {
+                WalletError::Backend(format!("derive selected proof '{}': {e}", record.proof_id))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    selected_ys.sort();
+    if selected_ys != prepared_ys {
+        return Err(WalletError::Backend(format!(
+            "opening journal selected proofs do not match immutable prepared token for {}",
+            prepared.channel_id
+        )));
+    }
+    Ok(())
 }
 
 fn proof_to_new_loose_proof(
@@ -3354,6 +3533,7 @@ fn sql_decode_error(message: impl Into<String>) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loose_proof_wallet::OpeningExecutionKind;
     use crate::loose_proof_wallet::{LooseProofState, NewLooseProof};
     use crate::proof_selection::input_fee_raw_from_ppk_sum;
     use cdk_spilman::{
@@ -3492,6 +3672,29 @@ mod tests {
 
         fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
             Err("not used".to_string())
+        }
+    }
+
+    struct CountingSwapNetworking {
+        calls: Mutex<usize>,
+    }
+
+    impl SpilmanClientNetworking for CountingSwapNetworking {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+            *self.calls.lock().unwrap() += 1;
+            Ok("{}".to_string())
+        }
+
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
+            panic!("restore is not expected")
+        }
+
+        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
+            panic!("keyset lookup is not expected")
+        }
+
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
+            panic!("key lookup is not expected")
         }
     }
 
@@ -3671,6 +3874,60 @@ mod tests {
             change_secrets_json: "[]".to_string(),
             keyset_id: keyset_id.to_string(),
         }
+    }
+
+    fn journal_prepared_opening_for_authority_test(
+        wallet: &SqliteClientWallet,
+        prepared: &PreparedOpenChannel,
+    ) -> OpeningSubmissionPermit {
+        let proofs: Vec<Proof> = serde_json::from_str(&prepared.opening.input_token).unwrap();
+        let records = proofs
+            .iter()
+            .map(|proof| NewLooseProof {
+                proof_id: proof.y().unwrap().to_hex(),
+                mint_url: prepared.mint_url.clone(),
+                unit: "sat".to_string(),
+                keyset_id: proof.keyset_id.to_string(),
+                amount_raw: u64::from(proof.amount),
+                proof_json: serde_json::to_string(proof).unwrap(),
+                source_quote_id: None,
+                source_batch_id: None,
+            })
+            .collect::<Vec<_>>();
+        wallet.loose_wallet().import_proofs(&records).unwrap();
+        let proof_ids = records
+            .iter()
+            .map(|proof| proof.proof_id.clone())
+            .collect::<Vec<_>>();
+        wallet
+            .loose_wallet()
+            .reserve_selected_proofs_with_opening_attempt(
+                &prepared.mint_url,
+                "sat",
+                &proof_ids,
+                &NewOpeningAttempt {
+                    attempt_id: prepared.channel_id.clone(),
+                    opening_id: prepared.channel_id.clone(),
+                    predecessor_attempt_id: None,
+                    reservation_id: "reservation".to_string(),
+                    receiver_pubkey: "receiver".to_string(),
+                    mint_url: prepared.mint_url.clone(),
+                    unit: "sat".to_string(),
+                    input_budget_msats: 1_000,
+                    expiry_timestamp: 123_456,
+                    prepared_open_json: serde_json::to_string(prepared).unwrap(),
+                    selected_proof_ids: proof_ids.clone(),
+                },
+            )
+            .unwrap();
+        let OpeningSubmissionClaim::Acquired(permit) = wallet
+            .loose_wallet()
+            .claim_opening_attempt_submission(&prepared.channel_id)
+            .unwrap()
+        else {
+            panic!("submission claim not acquired");
+        };
+        permit
     }
 
     fn free_loopback_port() -> u16 {
@@ -5154,20 +5411,28 @@ mod tests {
                         input_budget_msats: 8000,
                         expiry_timestamp: 123456,
                         prepared_open_json: "invalid preparation".to_string(),
+                        selected_proof_ids: vec![id.to_string()],
                     },
                 )
                 .unwrap();
             if id != "prepared" {
-                wallet
+                let OpeningSubmissionClaim::Acquired(permit) = wallet
                     .loose_wallet()
                     .claim_opening_attempt_submission(id)
-                    .unwrap();
-            }
-            if id == "rejected" {
-                wallet
+                    .unwrap()
+                else {
+                    panic!("submission claim not acquired");
+                };
+                let authorized = wallet
                     .loose_wallet()
-                    .mark_opening_attempt_rejected(id, Some(12002), "inactive keyset")
+                    .authorize_opening_submission(permit)
                     .unwrap();
+                if id == "rejected" {
+                    wallet
+                        .loose_wallet()
+                        .record_definitive_opening_rejection(authorized, 12_002, "inactive keyset")
+                        .unwrap();
+                }
             }
         }
         let mut report = wallet.recover_pending_openings().unwrap();
@@ -5191,6 +5456,148 @@ mod tests {
         let repeated = wallet.recover_pending_openings().unwrap();
         assert!(repeated.cancelled_attempt_ids.is_empty());
         assert_eq!(repeated.unresolved, report.unresolved);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submission_preflight_failure_cancels_claim_without_http_or_ambiguity() {
+        let temp = tempfile::tempdir().unwrap();
+        let loose = LooseProofWallet::open(temp.path().join("loose.sqlite"), "alice").unwrap();
+        let wallet = SqliteClientWallet::open(
+            loose,
+            temp.path().join("channels.sqlite"),
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        let prepared = prepared_opening_with_input_secrets(&["proof-a"]);
+        let permit = journal_prepared_opening_for_authority_test(&wallet, &prepared);
+        let mut conflicting = prepared.clone();
+        conflicting.swap_request_json = "different request".to_string();
+        let networking = CountingSwapNetworking {
+            calls: Mutex::new(0),
+        };
+
+        let error = wallet
+            .submit_prepared_open(conflicting, permit, &networking)
+            .unwrap_err();
+        assert!(error.message.contains("authoritative journal"));
+        assert_eq!(*networking.calls.lock().unwrap(), 0);
+        let attempt = wallet
+            .loose_wallet()
+            .opening_attempt(&prepared.channel_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, OpeningAttemptState::Prepared);
+        assert_eq!(attempt.latest_submitted_at, None);
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .opening_executions(&prepared.channel_id)
+                .unwrap()[0]
+                .status,
+            OpeningExecutionStatus::Cancelled
+        );
+        wallet
+            .loose_wallet()
+            .cancel_prepared_opening_attempt(&prepared.channel_id)
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_success_then_execution_result_record_failure_remains_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let loose_db = temp.path().join("loose.sqlite");
+        let loose = LooseProofWallet::open(&loose_db, "alice").unwrap();
+        let wallet = SqliteClientWallet::open(
+            loose,
+            temp.path().join("channels.sqlite"),
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        let prepared = prepared_opening_with_input_secrets(&["proof-a"]);
+        let permit = journal_prepared_opening_for_authority_test(&wallet, &prepared);
+        Connection::open(&loose_db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_execution_result BEFORE UPDATE
+                 ON monad_client_opening_executions
+                 WHEN OLD.status = 'authorized' AND NEW.status = 'response_received'
+                 BEGIN SELECT RAISE(ABORT, 'injected execution result fault'); END;",
+            )
+            .unwrap();
+        let networking = CountingSwapNetworking {
+            calls: Mutex::new(0),
+        };
+
+        let error = wallet
+            .submit_prepared_open(prepared.clone(), permit, &networking)
+            .unwrap_err();
+        assert!(error.message.contains("persist opening execution response"));
+        assert_eq!(*networking.calls.lock().unwrap(), 1);
+        let attempt = wallet
+            .loose_wallet()
+            .opening_attempt(&prepared.channel_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, OpeningAttemptState::Submitted);
+        assert!(attempt.latest_submitted_at.is_some());
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .opening_executions(&prepared.channel_id)
+                .unwrap()[0]
+                .status,
+            OpeningExecutionStatus::Authorized
+        );
+        assert!(wallet
+            .loose_wallet()
+            .proofs_for_reservation("reservation")
+            .unwrap()
+            .iter()
+            .all(|proof| proof.state == LooseProofState::Reserved));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn obsolete_opening_recovery_table_is_dropped_only_when_empty() {
+        for nonempty in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let channel_db = temp.path().join("channels.sqlite");
+            let conn = Connection::open(&channel_db).unwrap();
+            conn.execute_batch(CREATE_OPENING_RECOVERIES_SQL_FOR_TEST)
+                .unwrap();
+            if nonempty {
+                conn.execute(
+                    "INSERT INTO monad_client_channel_opening_recoveries VALUES
+                     ('channel', 'reservation', 'receiver', 'https://mint.invalid', 'sat',
+                      1000, 'submitted', 'unknown', 1, 1)",
+                    [],
+                )
+                .unwrap();
+            }
+            drop(conn);
+            let loose = LooseProofWallet::open(temp.path().join("loose.sqlite"), "alice").unwrap();
+            let result = SqliteClientWallet::open(loose, &channel_db, &sender_secret_hex());
+            if nonempty {
+                assert!(result
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("obsolete nonempty"));
+            } else {
+                let wallet = result.unwrap();
+                let exists: bool = wallet
+                    .channel_db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name =
+                                'monad_client_channel_opening_recoveries')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(!exists);
+            }
+        }
     }
 
     async fn assert_recovers_persisted_ambiguous_opening(
@@ -5392,13 +5799,21 @@ mod tests {
                     input_budget_msats,
                     expiry_timestamp,
                     prepared_open_json: serde_json::to_string(&prepared).unwrap(),
+                    selected_proof_ids: proof_ids.clone(),
                 },
             )
             .unwrap();
-        assert!(wallet
+        let OpeningSubmissionClaim::Acquired(permit) = wallet
             .loose_wallet()
             .claim_opening_attempt_submission(&channel_id)
-            .unwrap());
+            .unwrap()
+        else {
+            panic!("submission claim not acquired");
+        };
+        let _authorized = wallet
+            .loose_wallet()
+            .authorize_opening_submission(permit)
+            .unwrap();
         storage
             .save_opening_from_swap(&channel_id, opening)
             .unwrap();
@@ -5505,17 +5920,17 @@ mod tests {
             }
             if boundary >= 3 {
                 wallet
-                    .loose_wallet()
-                    .mark_reservation_spent(&reservation.reservation_id, &channel_id)
-                    .unwrap();
-            }
-            if boundary >= 4 {
-                wallet
                     .store_open_channel_metadata(
                         &completed.result,
                         &reservation.reservation_id,
                         expiry_timestamp,
                     )
+                    .unwrap();
+            }
+            if boundary >= 4 {
+                wallet
+                    .loose_wallet()
+                    .complete_opening_attempt_exact(&channel_id)
                     .unwrap();
             }
         }
@@ -5560,7 +5975,11 @@ mod tests {
             mint_task.await.unwrap().unwrap();
             return;
         }
-        assert_eq!(recovered.recovered_channel_ids, vec![channel_id.clone()]);
+        if finalizing_boundary == Some(4) {
+            assert!(recovered.recovered_channel_ids.is_empty());
+        } else {
+            assert_eq!(recovered.recovered_channel_ids, vec![channel_id.clone()]);
+        }
         assert_eq!(
             wallet
                 .loose_wallet()
@@ -5614,7 +6033,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn opening_recovery_handles_ambiguity_then_12002_then_successor_ambiguity() {
+    async fn replay_rejection_does_not_resolve_prior_execution_uncertainty() {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint = mint_helper.mint();
         let initial_keyset_id = mint_helper.keyset_id().to_string();
@@ -5664,6 +6083,7 @@ mod tests {
                 SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
             )
             .unwrap();
+        let losing_attempt = attempt.clone();
         let opening_id = attempt.opening_id.clone();
         let reservation_id = attempt.reservation.reservation_id.clone();
         let expected_input_ys =
@@ -5678,16 +6098,21 @@ mod tests {
         offer.preferred_keyset_ids.push(successor_keyset_id.clone());
 
         let networking = FourSubmissionNetworking::new();
-        let channel_id = wallet
+        let error = wallet
             .execute_open_attempt_with_networking(&offer, attempt, true, &networking)
-            .expect("four-submission opening recovery");
+            .unwrap_err();
+        assert!(error.to_string().contains("input may be spent"));
+        let losing_error = wallet
+            .execute_open_attempt_with_networking(&offer, losing_attempt, true, &networking)
+            .unwrap_err();
+        assert!(losing_error
+            .to_string()
+            .contains("submission authority unavailable"));
 
         {
             let swap_requests = networking.swap_requests.lock().unwrap();
-            assert_eq!(swap_requests.len(), 4);
+            assert_eq!(swap_requests.len(), 2);
             assert_eq!(swap_requests[0], swap_requests[1]);
-            assert_eq!(swap_requests[2], swap_requests[3]);
-            assert_ne!(swap_requests[0], swap_requests[2]);
         }
 
         let root = wallet
@@ -5695,31 +6120,29 @@ mod tests {
             .opening_attempt(&opening_id)
             .unwrap()
             .unwrap();
-        assert_eq!(root.state, OpeningAttemptState::Rejected);
-        assert_eq!(root.rejection_code, Some(12_002));
+        assert_eq!(root.state, OpeningAttemptState::Submitted);
+        assert_eq!(root.rejection_code, None);
+        assert!(root.latest_submitted_at.is_some());
         assert_eq!(root.predecessor_attempt_id, None);
         let root_prepared: PreparedOpenChannel =
             serde_json::from_str(&root.prepared_open_json).unwrap();
         assert_eq!(root_prepared.keyset_id, initial_keyset_id);
 
-        let successor = wallet
+        let executions = wallet
             .loose_wallet()
-            .opening_attempt(&channel_id)
-            .unwrap()
+            .opening_executions(&opening_id)
             .unwrap();
-        assert_eq!(successor.state, OpeningAttemptState::Completed);
-        assert_eq!(successor.opening_id, opening_id);
-        assert_eq!(
-            successor.predecessor_attempt_id.as_deref(),
-            Some(root.attempt_id.as_str())
-        );
-        let successor_prepared: PreparedOpenChannel =
-            serde_json::from_str(&successor.prepared_open_json).unwrap();
-        assert_eq!(successor_prepared.keyset_id, successor_keyset_id);
+        assert_eq!(executions.len(), 2);
+        assert_eq!(executions[0].execution_sequence, 1);
+        assert_eq!(executions[0].kind, OpeningExecutionKind::Initial);
+        assert_eq!(executions[0].status, OpeningExecutionStatus::Uncertain);
+        assert_eq!(executions[1].execution_sequence, 2);
+        assert_eq!(executions[1].kind, OpeningExecutionKind::Replay);
+        assert_eq!(executions[1].status, OpeningExecutionStatus::Rejected);
 
         {
             let state_requests = networking.check_state_requests.lock().unwrap();
-            assert_eq!(state_requests.len(), 2);
+            assert_eq!(state_requests.len(), 1);
             for request in state_requests.iter() {
                 assert_eq!(request.ys.len(), expected_input_ys.len());
                 assert_eq!(
@@ -5740,11 +6163,7 @@ mod tests {
         assert!(!reserved.is_empty());
         assert!(reserved
             .iter()
-            .all(|proof| proof.state == LooseProofState::Spent));
-        assert_eq!(
-            wallet.get_channel(&channel_id).unwrap().state,
-            WalletChannelState::Open
-        );
+            .all(|proof| proof.state == LooseProofState::Reserved));
 
         let journal_db = Connection::open(&loose_db).unwrap();
         let successor_count: u64 = journal_db
@@ -5756,7 +6175,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(successor_count, 1);
+        assert_eq!(successor_count, 0);
         let channel_count: u64 = wallet
             .channel_db
             .lock()
@@ -5765,10 +6184,9 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(channel_count, 1);
+        assert_eq!(channel_count, 0);
 
-        assert!(wallet.recover_pending_openings().unwrap().is_empty());
-        assert_eq!(networking.swap_requests.lock().unwrap().len(), 4);
+        assert_eq!(networking.swap_requests.lock().unwrap().len(), 2);
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
