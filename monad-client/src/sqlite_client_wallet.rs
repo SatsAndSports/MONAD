@@ -533,7 +533,7 @@ impl SqliteClientWallet {
         let loose_db_path = loose_wallet.database_path().ok_or_else(|| {
             WalletError::Backend("in-memory loose proof wallets are unsupported here".to_string())
         })?;
-        let wallet_lock_identity = WalletLockIdentity::new(loose_db_path, path).map_err(|e| {
+        let wallet_lock_identity = WalletLockIdentity::new([loose_db_path, path]).map_err(|e| {
             WalletError::Backend(format!("normalize wallet database identity: {e}"))
         })?;
         let path_str = path.to_str().ok_or_else(|| {

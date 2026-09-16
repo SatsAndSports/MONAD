@@ -271,7 +271,11 @@ exclusive. Startup open/migration/recovery and mutating CLI operations take the
 maintenance gate exclusively; runtime steady state and read-only CLI inspection
 take it shared. Mutating CLI acquisition is fail-fast. Channel/proof inspection
 opens MONAD SQLite connections and upstream `SqliteClientStorage` read-only,
-performs no schema initialization, and does not load the sender secret.
+performs no schema initialization, and does not load the sender secret. Inspection
+still participates in filesystem coordination through adjacent lock sidecars and
+therefore requires sidecar access in the database directories. Existing database
+files with multiple hard links are rejected because path normalization cannot
+safely establish one lock identity for hard-link aliases.
 
 The configured client owns a `RouteConnection`, not just the final hop. That
 handle keeps the final `RelayConnection`, all prefix hop connections, and per-hop
@@ -733,6 +737,32 @@ That manager owns:
 This lets one MONAD process host multiple relays with different receiver keys
 while still sharing one persistent relay-wallet DB. Transport identity remains a
 separate concern from the Cashu receiver identity used for Spilman channels.
+
+The relay runtime validates all selected identities and pre-binds every TCP and
+QUIC listener before wallet mutation. It then acquires the normalized database's
+OS-backed runtime-owner and maintenance sidecars, opens/migrates exactly one
+`RelayWalletManager`, registers the selected receiver identities, and refreshes
+the union of their trusted mint URLs into one shared cache. Startup holds the
+maintenance gate exclusively. Steady state downgrades it to shared mode. Omitting
+`--relay` starts every configured relay in YAML order; selecting one relay still
+owns the complete configured wallet, preventing a second process from hosting a
+sibling identity against the same database.
+
+Each listener receives the same manager and cache but constructs payments with
+its own wallet name, receiver key, trusted mint/unit policy, pricing, and channel
+policy. A process-level `JoinSet` treats any listener exit as fatal, broadcasts
+shutdown to siblings, and awaits all listener, auto-close, connection, stream,
+session, control-stream, and keyset-refresh task trees before releasing wallet
+ownership. Refresh coordinator shutdown fences new refreshes and drains already
+owned refresh work after sessions and auto-close workers stop.
+
+Read-only wallet commands take the maintenance gate shared and open SQLite with
+read-only flags, without schema initialization. Mutating close/drain/recovery
+commands take it exclusively and fail before normal database opening or network
+work while a runtime is active. Read-only here describes SQLite access; inspection
+still opens or creates the adjacent maintenance sidecar and requires directory
+permission for it. Hard-linked existing wallet databases are rejected. Kernel
+file locks provide process-death release.
 
 The relay binary now also exposes wallet-admin commands over that same durable
 state (`monad-relay wallet ...`) so operators can list identities, inspect

@@ -38,7 +38,7 @@ Not implemented yet:
 
 ## Relay Wallet
 
-`monad-relay` now uses a named relay-wallet identity inside a shared SQLite relay-wallet database.  Relay configuration lives in a single YAML file; one file can describe many relays, and each relay process selects its relay with `--relay <name>`.
+`monad-relay` uses named relay-wallet identities inside one shared SQLite relay-wallet database. Relay configuration lives in a single YAML file. Omitting `--relay` starts every configured relay in YAML order in one process; `--relay <name>` starts only that relay while the process still exclusively owns the whole configured relay wallet.
 
 Example `monad.yaml`:
 
@@ -92,6 +92,10 @@ Environment variables are substituted from the process environment or from a `.e
 Run the relay:
 
 ```bash
+# Run every configured relay through one wallet manager.
+monad-relay run --config monad.yaml
+
+# Or run one selected relay while owning the same complete wallet.
 monad-relay run --config monad.yaml --relay relay-a
 ```
 
@@ -114,9 +118,22 @@ monad-relay wallet --config monad.yaml --relay relay-a recover-drain --drain-id 
 
 Add `--json` to any wallet command for machine-readable output.
 
+One runtime process exclusively owns `relay_wallet.db_path`. It holds exclusive
+maintenance access while opening/migrating the database, registering identities,
+and populating the startup keyset cache, then shared maintenance access while
+listeners run. `list`, `show`, `channels`, `expiring-channels`, `drains`, and
+`close-expiring-channels --dry-run` remain available during runtime and use
+read-only SQLite connections without migrations. Closing, draining, recovery,
+and other mutating commands require exclusive maintenance access and fail before
+opening the wallet or contacting a mint when a runtime is active. OS-backed
+sidecar locks are released automatically if the process exits or dies. Inspection
+does not write SQLite, but it still opens or creates the adjacent maintenance
+sidecar for cross-process coordination, so the wallet directory must permit that
+sidecar access. Existing database files with multiple hard links are rejected.
+
 On first start, `receiver_secret_hex` is required so the relay can register its identity in the wallet database.  On later restarts of the same relay wallet identity, omit `receiver_secret_hex`; the relay will load the existing receiver key for `relay-a` from the shared wallet DB.
 
-All configured relays share `relay_wallet.db_path` safely because each relay uses a distinct receiver key, so their channel rows are disjoint.  The config loader rejects any two relays that share the same `receiver_secret_hex`.
+All configured relays in a process share one `RelayWalletManager`, persistent store, and in-memory mint cache while retaining distinct receiver keys and wallet-name metadata. The config loader rejects any two relays that share the same `receiver_secret_hex`.
 
 ## Client Wallet
 
@@ -149,11 +166,13 @@ monad-client wallet --config monad.yaml recover-openings
 One in-process `ClientWalletManager` owns the configured loose-proof and channel
 databases. Startup opens/migrates and performs recovery exactly once before any
 client starts, then all client leaves share that wallet. A second runtime using
-either database fails immediately. `channels` and `proofs` use true read-only
-SQLite access, require no sender secret in explicit-path mode, and may run while
+either database fails immediately. `channels` and `proofs` use read-only SQLite
+access, require no sender secret in explicit-path mode, and may run while
 the runtime is active. Import and recovery commands require exclusive maintenance
 access and fail immediately while a runtime owns the wallet. Lock sidecars are
-created next to each normalized, deduplicated database path.
+created next to each normalized, deduplicated database path, including for
+inspection when absent; the containing directories must allow sidecar access.
+Existing database files with multiple hard links are rejected.
 
 They can also use explicit DB paths and sender key material for manual or emergency access:
 
@@ -361,7 +380,7 @@ This prints:
 
 ### 2. Start one or more relays
 
-Create a `monad.yaml` file.  A single file can hold the shared wallets, many relays, and one or more client route definitions. Each relay process selects one relay with `--relay <name>`.
+Create a `monad.yaml` file. A single file can hold the shared wallets, many relays, and one or more client route definitions. A relay process runs all configured relays by default or one relay selected with `--relay <name>`.
 
 ```yaml
 relay_wallet:

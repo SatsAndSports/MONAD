@@ -85,6 +85,14 @@ test or compatibility wrapper.
 The relay wallet manager owns one shared in-memory `SpilmanMintCache` plus the
 SQLite-backed relay wallet database.
 
+One relay process owns that database through an OS-backed runtime-owner lock and
+hosts all configured relays by default through one manager/cache. Runtime startup
+uses exclusive maintenance access; steady state and read-only SQLite wallet
+inspection share the maintenance gate. Inspection performs no SQLite schema or
+data writes but still requires access to the adjacent lock sidecar. Mutating
+close/drain administration is fail-fast while the runtime is active and does not
+begin database or mint work.
+
 The in-memory cache stores all keysets returned by configured mints: all units,
 active and inactive. The relay's trusted mint/unit policy is applied when reading
 from that cache, not when storing it.

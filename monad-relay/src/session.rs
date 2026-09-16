@@ -34,6 +34,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -622,6 +623,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
     /// Run the accept loop: accept H2 streams and dispatch them to handlers.
     pub async fn run(mut self) -> io::Result<()> {
         let termination = self.state.termination_token();
+        let mut control_tasks = JoinSet::new();
         loop {
             let result = tokio::select! {
                 _ = termination.cancelled() => break,
@@ -789,7 +791,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                 Ok(h2_send) => {
                                     let (_, h2_recv) = request.into_parts();
                                     let state = self.state.clone();
-                                    tokio::spawn(async move {
+                                    control_tasks.spawn(async move {
                                         if let Err(e) =
                                             handle_control_stream(h2_send, h2_recv, state, event_rx)
                                                 .await
@@ -843,6 +845,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
         self.state
             .session_registry
             .deregister_session(&self.session_id);
+        while let Some(result) = control_tasks.join_next().await {
+            if let Err(error) = result {
+                if !error.is_cancelled() {
+                    error!("control stream task failed while draining: {error}");
+                }
+            }
+        }
         info!("H2 connection closed");
         Ok(())
     }

@@ -54,8 +54,9 @@ before reviewing the other Cashu swap paths and adding journals where appropriat
   deduplicated loose/channel database paths in deterministic order. Runtime
   startup is exclusive, steady state is shared for inspection, and mutating CLI
   maintenance is exclusive and fail-fast.
-- `channels` and `proofs` are true read-only operations and do not require or load
-  the sender secret. CLI mode is classified before databases are opened.
+- `channels` and `proofs` use read-only SQLite paths and do not require or load
+  the sender secret. CLI mode is classified before databases are opened. They
+  still acquire adjacent sidecar locks, which may create a missing sidecar.
 - Omitted `--client` starts all configured clients in YAML order. A named selector
   starts one leaf but still owns the whole logical wallet. Supervision propagates
   SOCKS failures and awaits children before manager teardown.
@@ -652,6 +653,15 @@ The latest proposed sequence, subject to the remaining open questions above, is:
 14. After client channel opening is stable, give the relay runtime the equivalent
     all-or-selected supervision, single `RelayWalletManager`, and exclusive wallet
     ownership policy. Do not broaden this step into a review of relay swap logic.
+
+Item 14 is implemented on `feat/relay-wallet-manager`: relay startup is
+all-or-selected, one process owns the normalized relay DB and one in-process
+manager/cache, listener failures coordinate sibling shutdown, read-only admin
+uses migration-free SQLite paths, and mutating close/drain administration is
+gated before database or network work. Close/drain swap semantics were not
+redesigned. Session control tasks, auto-close aborts, and coordinator-owned
+refresh work are drained before wallet ownership release; hard-linked existing
+wallet databases are rejected.
 
 ## Test Matrix To Add
 

@@ -79,6 +79,15 @@ impl MonadConfig {
         }
     }
 
+    /// Select one named relay, or every configured relay in YAML order.
+    pub fn select_relays(&self, name: Option<&str>) -> anyhow::Result<Vec<&RelayConfig>> {
+        match name {
+            Some(name) => Ok(vec![self.select_relay(Some(name))?]),
+            None if self.relays.is_empty() => Err(anyhow::anyhow!("config contains no relays")),
+            None => Ok(self.relays.iter().collect()),
+        }
+    }
+
     /// Select a client by name, or return the only client if `name` is `None`.
     pub fn select_client(&self, name: Option<&str>) -> anyhow::Result<&ClientConfig> {
         match name {
@@ -1130,6 +1139,29 @@ clients:
         config.validate().unwrap();
         assert!(config.clients.is_empty());
         assert!(config.relay_wallet.is_some());
+    }
+
+    #[test]
+    fn relay_selection_is_all_in_yaml_order_or_one_named() {
+        let mut config: MonadConfig = serde_yaml::from_str(&minimal_config_yaml()).unwrap();
+        let mut second = config.relays[0].clone();
+        second.name = "relay-2".to_string();
+        second.listen = "127.0.0.1:9051".to_string();
+        second.receiver_secret_hex = None;
+        config.relays.push(second);
+
+        let all = config.select_relays(None).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|relay| relay.name.as_str())
+                .collect::<Vec<_>>(),
+            ["r1", "relay-2"]
+        );
+        assert_eq!(
+            config.select_relays(Some("relay-2")).unwrap()[0].name,
+            "relay-2"
+        );
+        assert!(config.select_relays(Some("missing")).is_err());
     }
 
     #[test]

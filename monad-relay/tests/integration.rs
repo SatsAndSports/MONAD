@@ -6427,24 +6427,22 @@ relays:
     let relay_a = config.select_relay(Some("relay-a")).unwrap();
     let relay_b = config.select_relay(Some("relay-b")).unwrap();
 
-    let wallet_manager_a =
+    let wallet_manager =
         Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let (server_addr_a, pubkey_a, handle_a, shutdown_tx_a, _payments_a) =
         start_relay_from_config_bound(
             relay_a,
-            wallet_manager_a,
+            wallet_manager.clone(),
             mint_cache.clone(),
             listener_a,
             quic_endpoint_a,
         )
         .await
         .unwrap();
-    let wallet_manager_b =
-        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
     let (server_addr_b, pubkey_b, handle_b, shutdown_tx_b, _payments_b) =
         start_relay_from_config_bound(
             relay_b,
-            wallet_manager_b,
+            wallet_manager,
             mint_cache,
             listener_b,
             quic_endpoint_b,
