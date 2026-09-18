@@ -3,6 +3,7 @@ use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result};
 use quinn::Endpoint;
+use rustls::pki_types::pem::PemObject;
 use tracing::{error, info, warn};
 
 static CRYPTO_PROVIDER: Once = Once::new();
@@ -96,7 +97,7 @@ pub fn build_server_config(cert_pem: &str, key_pem: &str) -> Result<quinn::Serve
     ensure_crypto_provider();
     // Parse certificate chain
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("failed to parse certificate PEM")?;
 
@@ -105,9 +106,8 @@ pub fn build_server_config(cert_pem: &str, key_pem: &str) -> Result<quinn::Serve
     }
 
     // Parse private key
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .context("failed to parse private key PEM")?
-        .context("no private key found in PEM")?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .context("failed to parse private key PEM")?;
 
     // Build rustls server config — no client auth (one-way authentication)
     let mut tls_config = rustls::ServerConfig::builder()
