@@ -111,7 +111,7 @@ enum WalletCommand {
         channel_id: String,
     },
 
-    /// Restore ambiguous channel-open attempts without submitting swaps.
+    /// Recover openings without submitting swaps; abandon only aged, fully evidenced attempts.
     RecoverOpenings,
 }
 
@@ -191,7 +191,7 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
         WalletCommand::Channels | WalletCommand::Proofs
     );
     let resolved = resolve_wallet_args(&args, read_only)?;
-    let _locks = ClientWalletLocks::acquire(
+    let locks = ClientWalletLocks::acquire(
         &resolved.loose_db,
         &resolved.channel_db,
         if read_only {
@@ -272,7 +272,7 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
             }
         }
         WalletCommand::RecoverOpenings => {
-            let recovered = wallet.recover_pending_openings()?;
+            let recovered = wallet.recover_pending_openings(&locks.exclusive_access()?)?;
             if args.json {
                 print_json(&serde_json::json!({
                     "recovered_channel_ids": recovered.recovered_channel_ids,

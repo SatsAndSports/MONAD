@@ -10,11 +10,12 @@ use cdk_spilman::configurable_networking::{
 };
 use cdk_spilman::{
     complete_funding_swap, create_plain_blinded_messages, is_retryable_keyset_mint_error,
-    with_active_keyset_retry_async, ActiveKeysetSelection, ChannelState, CloseError, CloseSuccess,
-    KeysetRetryError, SelectedOutputKeyset, SpilmanAsyncKeysetRefresher, SpilmanAsyncMintClient,
+    with_active_keyset_retry_async, ActiveKeysetSelection, ChannelFunding, ChannelState,
+    CloseError, CloseSuccess, KeysetRetryError, SelectedOutputKeyset, SpilmanAsyncKeysetRefresher,
+    SpilmanAsyncMintClient,
 };
 use monad_common::config::RelayChannelPolicyConfig;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -332,6 +333,197 @@ pub struct RelayWalletManager {
     trusted_mint_units: Arc<RwLock<TrustedMintUnits>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RelayWalletInspection {
+    db_path: String,
+}
+
+impl RelayWalletInspection {
+    pub fn open(db_path: impl Into<String>) -> io::Result<Self> {
+        let inspection = Self {
+            db_path: db_path.into(),
+        };
+        inspection.connection()?;
+        Ok(inspection)
+    }
+
+    fn connection(&self) -> io::Result<Connection> {
+        Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| io::Error::other(format!("open relay wallet db read-only: {e}")))
+    }
+
+    pub fn list_identities(&self) -> io::Result<Vec<RelayWalletIdentitySummary>> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT relay_name, receiver_pubkey_hex
+                 FROM monad_relay_wallet_identities ORDER BY relay_name",
+            )
+            .map_err(|e| io::Error::other(format!("prepare relay identity list: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RelayWalletIdentitySummary {
+                    name: row.get(0)?,
+                    receiver_pubkey_hex: row.get(1)?,
+                })
+            })
+            .map_err(|e| io::Error::other(format!("query relay identities: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::other(format!("decode relay identities: {e}")))
+    }
+
+    pub fn list_channels(&self, relay_name: Option<&str>) -> io::Result<Vec<ChannelSummary>> {
+        let records = self.channel_records(relay_name)?;
+        records.into_iter().map(|record| record.summary()).collect()
+    }
+
+    pub fn find_expiring_channels(
+        &self,
+        relay_name: Option<&str>,
+        now: u64,
+        close_before_expiry_secs: u64,
+    ) -> io::Result<Vec<ExpiringChannelSummary>> {
+        let cutoff = now.saturating_add(close_before_expiry_secs);
+        let mut summaries = self
+            .channel_records(relay_name)?
+            .into_iter()
+            .filter_map(|record| match record.expiring_summary(now, cutoff) {
+                Ok(summary) => summary.map(Ok),
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        summaries.sort_by_key(|summary| summary.seconds_until_expiry);
+        Ok(summaries)
+    }
+
+    pub fn list_drains(&self) -> io::Result<Vec<DrainSummary>> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT drain_id, relay_name, mint_url, unit, state,
+                        input_amount_raw, output_amount_raw
+                 FROM monad_relay_drains ORDER BY created_at, drain_id",
+            )
+            .map_err(|e| io::Error::other(format!("prepare drain list: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DrainSummary {
+                    drain_id: row.get(0)?,
+                    relay_name: row.get(1)?,
+                    mint_url: row.get(2)?,
+                    unit: row.get(3)?,
+                    state: row.get(4)?,
+                    input_amount_raw: u64_from_i64(row.get(5)?)?,
+                    output_amount_raw: u64_from_i64(row.get(6)?)?,
+                })
+            })
+            .map_err(|e| io::Error::other(format!("query drains: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::other(format!("decode drains: {e}")))
+    }
+
+    fn channel_records(&self, relay_name: Option<&str>) -> io::Result<Vec<InspectionChannel>> {
+        let conn = self.connection()?;
+        let sql = "SELECT m.channel_id, m.relay_name, m.receiver_pubkey_hex,
+                          c.funding_json, c.balance, c.state, c.closing_json
+                   FROM monad_relay_channel_meta m
+                   JOIN spilman_channels c ON c.channel_id = m.channel_id
+                   WHERE (?1 IS NULL OR m.relay_name = ?1)
+                   ORDER BY m.channel_id";
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| io::Error::other(format!("prepare relay channel list: {e}")))?;
+        let rows = stmt
+            .query_map(params![relay_name], |row| {
+                let state: String = row.get(5)?;
+                Ok(InspectionChannel {
+                    channel_id: row.get(0)?,
+                    relay_name: row.get(1)?,
+                    receiver_pubkey_hex: row.get(2)?,
+                    funding_json: row.get(3)?,
+                    balance_raw: u64_from_i64(row.get(4)?)?,
+                    state: match state.as_str() {
+                        "Closing" => ChannelState::Closing,
+                        "Closed" => ChannelState::Closed,
+                        _ => ChannelState::Open,
+                    },
+                    closing_json: row.get(6)?,
+                })
+            })
+            .map_err(|e| io::Error::other(format!("query relay channels: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::other(format!("decode relay channels: {e}")))
+    }
+}
+
+struct InspectionChannel {
+    channel_id: String,
+    relay_name: String,
+    receiver_pubkey_hex: String,
+    funding_json: String,
+    balance_raw: u64,
+    state: ChannelState,
+    closing_json: Option<String>,
+}
+
+impl InspectionChannel {
+    fn funding(&self) -> io::Result<ChannelSummaryMetadata> {
+        let funding: ChannelFunding =
+            serde_json::from_str(&self.funding_json).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("decode funding for channel '{}': {error}", self.channel_id),
+                )
+            })?;
+        parse_channel_summary_metadata(&self.channel_id, &funding.params_json)
+    }
+
+    fn summary(self) -> io::Result<ChannelSummary> {
+        let funding = self.funding()?;
+        Ok(ChannelSummary {
+            channel_id: self.channel_id,
+            relay_name: self.relay_name,
+            receiver_pubkey_hex: self.receiver_pubkey_hex,
+            state: self.state,
+            mint_url: funding.mint_url,
+            unit: funding.unit,
+            capacity_raw: funding.capacity_raw,
+            balance_raw: self.balance_raw,
+        })
+    }
+
+    fn expiring_summary(self, now: u64, cutoff: u64) -> io::Result<Option<ExpiringChannelSummary>> {
+        if self.state == ChannelState::Closed {
+            return Ok(None);
+        }
+        let funding = self.funding()?;
+        let expiry_timestamp = if self.state == ChannelState::Closing {
+            self.closing_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|closing| closing["expiry_timestamp"].as_u64())
+                .unwrap_or(funding.expiry_timestamp)
+        } else {
+            funding.expiry_timestamp
+        };
+        if expiry_timestamp > cutoff {
+            return Ok(None);
+        }
+        Ok(Some(ExpiringChannelSummary {
+            channel_id: self.channel_id,
+            relay_name: self.relay_name,
+            receiver_pubkey_hex: self.receiver_pubkey_hex,
+            state: self.state,
+            mint_url: funding.mint_url,
+            unit: funding.unit,
+            expiry_timestamp,
+            seconds_until_expiry: seconds_until_expiry(now, expiry_timestamp),
+            capacity_raw: funding.capacity_raw,
+            balance_raw: self.balance_raw,
+        }))
+    }
+}
+
 impl std::fmt::Debug for RelayWalletManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RelayWalletManager").finish_non_exhaustive()
@@ -475,6 +667,29 @@ impl RelayWalletManager {
             self.spilman_payments_for_live_with_policy(relay_name, channel_policy)?
                 as Arc<dyn RelayPayments>,
         )
+    }
+
+    pub fn payments_for_with_trusted_mints_and_policy(
+        &self,
+        relay_name: &str,
+        trusted_mint_units: TrustedMintUnits,
+        channel_policy: RelayChannelPolicyConfig,
+    ) -> io::Result<Arc<dyn RelayPayments>> {
+        let receiver_secret = self.receiver_secret(relay_name)?;
+        let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+        let store = ChannelStore::with_relay_metadata(
+            self.storage.clone(),
+            self.metadata.clone(),
+            relay_name.to_string(),
+            receiver_pubkey_hex,
+        );
+        Ok(Arc::new(SpilmanRelayPayments::from_store(
+            receiver_secret,
+            self.keyset_cache.clone(),
+            trusted_mint_units,
+            channel_policy,
+            store,
+        )))
     }
 
     pub fn spilman_payments_for_live(
@@ -1957,6 +2172,8 @@ pub struct CloseExpiringChannelFailure {
 
 struct ChannelSummaryMetadata {
     mint_url: String,
+    unit: String,
+    capacity_raw: u64,
     expiry_timestamp: u64,
 }
 
@@ -1967,6 +2184,12 @@ fn parse_channel_summary_metadata(
     let value: serde_json::Value = serde_json::from_str(params_json)
         .map_err(|e| io::Error::other(format!("corrupt funding JSON for {channel_id}: {e}")))?;
     let mint_url = value["mint"].as_str().unwrap_or("unknown").to_string();
+    let unit = value["unit"].as_str().unwrap_or("unknown").to_string();
+    let capacity_raw = value["capacity"].as_u64().ok_or_else(|| {
+        io::Error::other(format!(
+            "corrupt funding JSON for {channel_id}: missing capacity"
+        ))
+    })?;
     let expiry_timestamp = value["expiry_timestamp"].as_u64().ok_or_else(|| {
         io::Error::other(format!(
             "corrupt funding JSON for {channel_id}: missing expiry_timestamp"
@@ -1974,6 +2197,8 @@ fn parse_channel_summary_metadata(
     })?;
     Ok(ChannelSummaryMetadata {
         mint_url,
+        unit,
+        capacity_raw,
         expiry_timestamp,
     })
 }
@@ -2088,6 +2313,7 @@ mod tests {
                 "mint": "https://test.mint",
                 "unit": "sat",
                 "capacity": 1000u64,
+                "expiry_timestamp": 4_000_000_000u64,
                 "keyset_id": "00testkeyset0000",
                 "receiver_pubkey": receiver_pubkey_hex,
                 "sender_pubkey": "0000000000000000000000000000000000000000000000000000000000000002",
@@ -2127,6 +2353,24 @@ mod tests {
     }
 
     #[test]
+    fn read_only_inspection_reads_existing_wallet_and_never_creates_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("relay.db");
+        let manager = RelayWalletManager::open(db_path.to_str().unwrap()).unwrap();
+        manager
+            .register_identity("relay-a", SecretKey::generate())
+            .unwrap();
+        drop(manager);
+
+        let inspection = RelayWalletInspection::open(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(inspection.list_identities().unwrap().len(), 1);
+
+        let missing = dir.path().join("missing.db");
+        assert!(RelayWalletInspection::open(missing.to_str().unwrap()).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
     fn list_channels_returns_saved_channel() {
         let db_path = temp_db_path();
         let manager = RelayWalletManager::open(&db_path).unwrap();
@@ -2147,6 +2391,7 @@ mod tests {
                 "mint": "https://test.mint",
                 "unit": "sat",
                 "capacity": 1000u64,
+                "expiry_timestamp": 4_000_000_000u64,
                 "keyset_id": "00testkeyset0000",
                 "receiver_pubkey": &pubkey_hex,
                 "sender_pubkey": "0000000000000000000000000000000000000000000000000000000000000002",
@@ -2172,6 +2417,13 @@ mod tests {
         assert_eq!(channels[0].mint_url, "https://test.mint");
         assert_eq!(channels[0].unit, "sat");
         assert_eq!(channels[0].capacity_raw, 1000);
+
+        let inspection = RelayWalletInspection::open(&db_path).unwrap();
+        let inspected = inspection.list_channels(Some("r1")).unwrap();
+        assert_eq!(inspected.len(), 1);
+        assert_eq!(inspected[0].channel_id, channel_id);
+        assert_eq!(inspected[0].mint_url, "https://test.mint");
+        assert_eq!(inspected[0].capacity_raw, 1000);
         assert_eq!(channels[0].balance_raw, 250);
 
         let all_channels = manager.list_channels(None).unwrap();

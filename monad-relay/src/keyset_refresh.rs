@@ -2,8 +2,10 @@ use crate::listener::TrustedMintUnits;
 use crate::wallet_manager::RelayWalletManager;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex, Semaphore, TryAcquireError};
+use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration, Instant};
 
 const MAX_REFRESH_MINT_URL_LEN: usize = 2048;
@@ -88,6 +90,8 @@ pub struct RelayKeysetRefreshCoordinator {
     trusted_mint_units: TrustedMintUnits,
     slots: Mutex<BTreeMap<String, Arc<MintRefreshSlot>>>,
     global_semaphore: Arc<Semaphore>,
+    tasks: Mutex<JoinSet<()>>,
+    shutting_down: AtomicBool,
     config: KeysetRefreshConfig,
 }
 
@@ -121,18 +125,32 @@ impl RelayKeysetRefreshCoordinator {
             trusted_mint_units,
             slots: Mutex::new(BTreeMap::new()),
             global_semaphore: Arc::new(Semaphore::new(config.max_concurrent_refreshes.max(1))),
+            tasks: Mutex::new(JoinSet::new()),
+            shutting_down: AtomicBool::new(false),
             config,
         }
     }
 
     pub(crate) async fn refresh_mint_unit(&self, mint_url: &str, unit: &str) -> RefreshResult {
         self.validate_request(mint_url, unit)?;
+        let mut tasks = self.tasks.lock().await;
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result {
+                tracing::error!(%error, "keyset refresh coordinator task failed");
+            }
+        }
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(KeysetRefreshError::RefreshFailed(
+                "keyset refresh coordinator is shutting down".to_string(),
+            ));
+        }
         let slot = self.slot_for_mint(mint_url).await;
         let mut state = slot.state.lock().await;
         let now = Instant::now();
 
         if let Some(receiver) = &state.in_flight {
             let receiver = receiver.clone();
+            drop(tasks);
             drop(state);
             return wait_for_refresh_result(receiver).await;
         }
@@ -160,8 +178,9 @@ impl RelayKeysetRefreshCoordinator {
         let refresher = self.refresher.clone();
         let mint_url = mint_url.to_string();
         let refresh_timeout = self.config.timeout;
-        tokio::spawn(async move {
-            let refresh_task = tokio::spawn(async move {
+        tasks.spawn(async move {
+            let mut refresh_tasks = JoinSet::new();
+            refresh_tasks.spawn(async move {
                 let _permit = permit;
                 match timeout(refresh_timeout, refresher.refresh_mint(&mint_url)).await {
                     Ok(Ok(())) => Ok(KeysetRefreshOutcome::Refreshed),
@@ -169,17 +188,34 @@ impl RelayKeysetRefreshCoordinator {
                     Err(_) => Err(KeysetRefreshError::Timeout),
                 }
             });
-            let result = match refresh_task.await {
-                Ok(result) => result,
-                Err(error) => Err(KeysetRefreshError::RefreshFailed(format!(
+            let result = match refresh_tasks.join_next().await {
+                Some(Ok(result)) => result,
+                None => Err(KeysetRefreshError::RefreshFailed(
+                    "refresh task ended without a result".to_string(),
+                )),
+                Some(Err(error)) => Err(KeysetRefreshError::RefreshFailed(format!(
                     "refresh task failed: {error}"
                 ))),
             };
             result_tx.send_replace(Some(result));
             slot.state.lock().await.in_flight = None;
         });
+        drop(tasks);
 
         wait_for_refresh_result(result_rx).await
+    }
+
+    pub async fn shutdown_and_drain(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.global_semaphore.close();
+        let mut tasks = self.tasks.lock().await;
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                if !error.is_cancelled() {
+                    tracing::error!(%error, "keyset refresh coordinator task failed while draining");
+                }
+            }
+        }
     }
 
     fn validate_request(&self, mint_url: &str, unit: &str) -> Result<(), KeysetRefreshError> {
@@ -235,6 +271,24 @@ mod tests {
 
     struct PanicOnceRefresher {
         calls: AtomicUsize,
+    }
+
+    struct GatedRefresher {
+        calls: AtomicUsize,
+        started: Notify,
+        release: Notify,
+        completed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl KeysetRefresher for GatedRefresher {
+        async fn refresh_mint(&self, _mint_url: &str) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -544,5 +598,53 @@ mod tests {
             Err(KeysetRefreshError::TargetTooLarge)
         );
         assert_eq!(refresher.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_shutdown_drains_refresh_and_rejects_new_work() {
+        let refresher = Arc::new(GatedRefresher {
+            calls: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+            completed: AtomicBool::new(false),
+        });
+        let coordinator = Arc::new(RelayKeysetRefreshCoordinator::with_refresher(
+            refresher.clone(),
+            trusted(&[("https://mint", &["sat"])]),
+            config(),
+        ));
+        let refresh_coordinator = coordinator.clone();
+        let refresh = tokio::spawn(async move {
+            refresh_coordinator
+                .refresh_mint_unit("https://mint", "sat")
+                .await
+        });
+        refresher.started.notified().await;
+
+        let shutdown_coordinator = coordinator.clone();
+        let mut shutdown = tokio::spawn(async move {
+            shutdown_coordinator.shutdown_and_drain().await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned before the owned refresh completed"
+        );
+        refresher.release.notify_one();
+        shutdown.await.unwrap();
+        assert_eq!(refresh.await.unwrap(), Ok(KeysetRefreshOutcome::Refreshed));
+        assert!(refresher.completed.load(Ordering::SeqCst));
+        assert_eq!(refresher.calls.load(Ordering::SeqCst), 1);
+
+        let error = coordinator
+            .refresh_mint_unit("https://mint", "sat")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            KeysetRefreshError::RefreshFailed(message) if message.contains("shutting down")
+        ));
+        assert_eq!(refresher.calls.load(Ordering::SeqCst), 1);
     }
 }

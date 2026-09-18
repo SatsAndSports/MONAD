@@ -198,7 +198,7 @@ where
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("client_wallet is required to run a client"))?;
     let policy = PaymentPolicy {
-        channel_input_budget_msats: client_wallet.channel_input_budget_msats,
+        channel_funding_token_target_msats: client_wallet.channel_funding_token_target_msats,
         target_topup_buffer_msats: client_wallet.target_topup_buffer_msats,
         minimum_topup_msats: client_wallet.minimum_topup_msats,
     };
@@ -880,7 +880,7 @@ mod tests {
             loose_db_path: loose_db.display().to_string(),
             channel_db_path: channel_db.display().to_string(),
             sender_secret_hex: hex::encode([9u8; 32]),
-            channel_input_budget_msats: 1_000,
+            channel_funding_token_target_msats: 1_000,
             target_topup_buffer_msats: 1_000,
             minimum_topup_msats: 1,
         });

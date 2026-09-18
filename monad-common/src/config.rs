@@ -79,6 +79,15 @@ impl MonadConfig {
         }
     }
 
+    /// Select one named relay, or every configured relay in YAML order.
+    pub fn select_relays(&self, name: Option<&str>) -> anyhow::Result<Vec<&RelayConfig>> {
+        match name {
+            Some(name) => Ok(vec![self.select_relay(Some(name))?]),
+            None if self.relays.is_empty() => Err(anyhow::anyhow!("config contains no relays")),
+            None => Ok(self.relays.iter().collect()),
+        }
+    }
+
     /// Select a client by name, or return the only client if `name` is `None`.
     pub fn select_client(&self, name: Option<&str>) -> anyhow::Result<&ClientConfig> {
         match name {
@@ -130,8 +139,10 @@ impl MonadConfig {
                 "client_wallet.sender_secret_hex",
                 &client_wallet.sender_secret_hex,
             )?;
-            if client_wallet.channel_input_budget_msats == 0 {
-                anyhow::bail!("client_wallet.channel_input_budget_msats must be greater than zero");
+            if client_wallet.channel_funding_token_target_msats == 0 {
+                anyhow::bail!(
+                    "client_wallet.channel_funding_token_target_msats must be greater than zero"
+                );
             }
         }
 
@@ -284,12 +295,13 @@ pub struct RelayWalletConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientWalletConfig {
     pub loose_db_path: String,
     pub channel_db_path: String,
     pub sender_secret_hex: String,
-    #[serde(default = "default_channel_input_budget_msats")]
-    pub channel_input_budget_msats: u64,
+    #[serde(default = "default_channel_funding_token_target_msats")]
+    pub channel_funding_token_target_msats: u64,
     #[serde(default = "default_target_topup_buffer_msats")]
     pub target_topup_buffer_msats: u64,
     #[serde(default = "default_minimum_topup_msats")]
@@ -473,7 +485,7 @@ pub struct ClientRouteHopConfig {
     pub pubkey: String,
 }
 
-fn default_channel_input_budget_msats() -> u64 {
+fn default_channel_funding_token_target_msats() -> u64 {
     1_000_000
 }
 
@@ -775,7 +787,7 @@ clients:
                 .client_wallet
                 .as_ref()
                 .unwrap()
-                .channel_input_budget_msats,
+                .channel_funding_token_target_msats,
             1_000_000
         );
         assert_eq!(
@@ -931,13 +943,27 @@ clients:
     }
 
     #[test]
-    fn zero_client_channel_input_budget_is_rejected() {
+    fn zero_client_channel_funding_token_target_is_rejected() {
         let yaml = minimal_config_yaml().replace(
             &format!("sender_secret_hex: \"{ZERO_SECRET}\""),
-            &format!("sender_secret_hex: \"{ZERO_SECRET}\"\n  channel_input_budget_msats: 0"),
+            &format!(
+                "sender_secret_hex: \"{ZERO_SECRET}\"\n  channel_funding_token_target_msats: 0"
+            ),
         );
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("channel_funding_token_target_msats"));
+    }
+
+    #[test]
+    fn old_client_channel_input_budget_key_is_rejected() {
+        let yaml = minimal_config_yaml().replace(
+            &format!("sender_secret_hex: \"{ZERO_SECRET}\""),
+            &format!("sender_secret_hex: \"{ZERO_SECRET}\"\n  channel_input_budget_msats: 1"),
+        );
+        let err = serde_yaml::from_str::<MonadConfig>(&yaml)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("channel_input_budget_msats"));
     }
 
@@ -1113,6 +1139,29 @@ clients:
         config.validate().unwrap();
         assert!(config.clients.is_empty());
         assert!(config.relay_wallet.is_some());
+    }
+
+    #[test]
+    fn relay_selection_is_all_in_yaml_order_or_one_named() {
+        let mut config: MonadConfig = serde_yaml::from_str(&minimal_config_yaml()).unwrap();
+        let mut second = config.relays[0].clone();
+        second.name = "relay-2".to_string();
+        second.listen = "127.0.0.1:9051".to_string();
+        second.receiver_secret_hex = None;
+        config.relays.push(second);
+
+        let all = config.select_relays(None).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|relay| relay.name.as_str())
+                .collect::<Vec<_>>(),
+            ["r1", "relay-2"]
+        );
+        assert_eq!(
+            config.select_relays(Some("relay-2")).unwrap()[0].name,
+            "relay-2"
+        );
+        assert!(config.select_relays(Some("missing")).is_err());
     }
 
     #[test]

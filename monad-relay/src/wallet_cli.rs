@@ -6,12 +6,14 @@
 
 use crate::wallet_manager::{
     ChannelSummary, CloseExpiringChannelsResult, DrainSummary, DrainSwapResult,
-    ExpiringChannelSummary, RelayWalletManager,
+    ExpiringChannelSummary, RelayWalletInspection, RelayWalletManager,
 };
 use cdk_spilman::CloseSuccess;
 use clap::{Parser, Subcommand};
 use monad_common::config::{MonadConfig, RelayChannelPolicyConfig};
+use monad_common::wallet_lock::{WalletLockMode, WalletLocks};
 use std::io::Write;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
@@ -114,83 +116,31 @@ pub enum WalletCommand {
 
 pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
     let wallet_db_path = resolve_wallet_db_path(&args)?;
-    let manager = RelayWalletManager::open(&wallet_db_path)?;
+    let read_only = wallet_command_is_read_only(&args.command);
+    let _locks = WalletLocks::acquire(
+        [Path::new(&wallet_db_path)],
+        if read_only {
+            WalletLockMode::ReadOnly
+        } else {
+            WalletLockMode::Maintenance
+        },
+        "relay",
+    )?;
 
+    if read_only {
+        let inspection = RelayWalletInspection::open(&wallet_db_path)?;
+        return run_read_only_wallet_command(&args, &wallet_db_path, &inspection);
+    }
+
+    let manager = RelayWalletManager::open(&wallet_db_path)?;
     match args.command {
-        WalletCommand::List => {
-            let identities = manager.list_identities();
-            if args.json {
-                print_json(&identities)?;
-            } else {
-                println!("Identities in {wallet_db_path}:");
-                for id in identities {
-                    println!("  {}  receiver={}", id.name, id.receiver_pubkey_hex);
-                }
-            }
-        }
-        WalletCommand::Show {
-            wallet_name: ref name_opt,
-        } => {
-            let name = resolve_wallet_name(&args, name_opt.clone())?;
-            let identities = manager.list_identities();
-            let identity = identities
-                .into_iter()
-                .find(|i| i.name == name)
-                .ok_or_else(|| anyhow::anyhow!("unknown relay identity '{name}'"))?;
-            let channel_count = manager.list_channels(Some(&name))?.len();
-            if args.json {
-                print_json(&serde_json::json!({
-                    "name": identity.name,
-                    "receiver_pubkey_hex": identity.receiver_pubkey_hex,
-                    "channel_count": channel_count,
-                }))?;
-            } else {
-                println!("relay: {}", identity.name);
-                println!("receiver: {}", identity.receiver_pubkey_hex);
-                println!("channels: {channel_count}");
-            }
-        }
-        WalletCommand::Channels {
-            wallet_name: ref name_opt,
-        } => {
-            let name = resolve_wallet_name(&args, name_opt.clone())?;
-            let channels = manager.list_channels(Some(&name))?;
-            if args.json {
-                print_json(&channels)?;
-            } else {
-                print_channels(&channels);
-            }
-        }
-        WalletCommand::ExpiringChannels {
-            wallet_name: ref name_opt,
-        } => {
-            let (channels, close_before_expiry_secs) =
-                find_expiring_channels_for_command(&args, &manager, name_opt.clone())?;
-            if args.json {
-                print_json(&channels)?;
-            } else {
-                print_expiring_channels(&channels, close_before_expiry_secs);
-            }
-        }
         WalletCommand::CloseExpiringChannels {
             wallet_name: ref name_opt,
             dry_run,
         } => {
+            debug_assert!(!dry_run);
             let (channels, close_before_expiry_secs) =
                 find_expiring_channels_for_command(&args, &manager, name_opt.clone())?;
-            if dry_run {
-                if args.json {
-                    print_json(&CloseExpiringChannelsResult::dry_run(
-                        close_before_expiry_secs,
-                        channels,
-                    ))?;
-                } else {
-                    println!("Dry run: no channels will be closed.");
-                    print_expiring_channels(&channels, close_before_expiry_secs);
-                }
-                return Ok(());
-            }
-
             if !args.json {
                 print_close_expiring_header(channels.len(), close_before_expiry_secs);
             }
@@ -226,14 +176,6 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                 println!("  total_value: {}", result.total_value);
                 println!("  receiver_sum: {}", result.receiver_sum);
                 println!("  sender_sum: {}", result.sender_sum);
-            }
-        }
-        WalletCommand::Drains => {
-            let drains = manager.list_drains().map_err(|e| anyhow::anyhow!(e))?;
-            if args.json {
-                print_json(&drains)?;
-            } else {
-                print_drains(&drains);
             }
         }
         WalletCommand::Drain {
@@ -276,9 +218,117 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                 print_drain_result(&result);
             }
         }
+        WalletCommand::List
+        | WalletCommand::Show { .. }
+        | WalletCommand::Channels { .. }
+        | WalletCommand::ExpiringChannels { .. }
+        | WalletCommand::Drains => {
+            unreachable!("read-only command classified before opening the manager")
+        }
     }
 
     Ok(())
+}
+
+fn wallet_command_is_read_only(command: &WalletCommand) -> bool {
+    matches!(
+        command,
+        WalletCommand::List
+            | WalletCommand::Show { .. }
+            | WalletCommand::Channels { .. }
+            | WalletCommand::ExpiringChannels { .. }
+            | WalletCommand::Drains
+            | WalletCommand::CloseExpiringChannels { dry_run: true, .. }
+    )
+}
+
+fn run_read_only_wallet_command(
+    args: &WalletArgs,
+    wallet_db_path: &str,
+    inspection: &RelayWalletInspection,
+) -> anyhow::Result<()> {
+    match &args.command {
+        WalletCommand::List => {
+            let identities = inspection.list_identities()?;
+            if args.json {
+                print_json(&identities)
+            } else {
+                println!("Identities in {wallet_db_path}:");
+                for id in identities {
+                    println!("  {}  receiver={}", id.name, id.receiver_pubkey_hex);
+                }
+                Ok(())
+            }
+        }
+        WalletCommand::Show { wallet_name } => {
+            let name = resolve_wallet_name(args, wallet_name.clone())?;
+            let identity = inspection
+                .list_identities()?
+                .into_iter()
+                .find(|identity| identity.name == name)
+                .ok_or_else(|| anyhow::anyhow!("unknown relay identity '{name}'"))?;
+            let channel_count = inspection.list_channels(Some(&name))?.len();
+            if args.json {
+                print_json(&serde_json::json!({
+                    "name": identity.name,
+                    "receiver_pubkey_hex": identity.receiver_pubkey_hex,
+                    "channel_count": channel_count,
+                }))
+            } else {
+                println!("relay: {}", identity.name);
+                println!("receiver: {}", identity.receiver_pubkey_hex);
+                println!("channels: {channel_count}");
+                Ok(())
+            }
+        }
+        WalletCommand::Channels { wallet_name } => {
+            let name = resolve_wallet_name(args, wallet_name.clone())?;
+            let channels = inspection.list_channels(Some(&name))?;
+            if args.json {
+                print_json(&channels)
+            } else {
+                print_channels(&channels);
+                Ok(())
+            }
+        }
+        WalletCommand::ExpiringChannels { wallet_name } => {
+            let (channels, close_before_expiry_secs) =
+                find_expiring_channels_for_inspection(args, inspection, wallet_name.clone())?;
+            if args.json {
+                print_json(&channels)
+            } else {
+                print_expiring_channels(&channels, close_before_expiry_secs);
+                Ok(())
+            }
+        }
+        WalletCommand::CloseExpiringChannels {
+            wallet_name,
+            dry_run: true,
+        } => {
+            let (channels, close_before_expiry_secs) =
+                find_expiring_channels_for_inspection(args, inspection, wallet_name.clone())?;
+            if args.json {
+                print_json(&CloseExpiringChannelsResult::dry_run(
+                    close_before_expiry_secs,
+                    channels,
+                ))
+            } else {
+                println!("Dry run: no channels will be closed.");
+                print_expiring_channels(&channels, close_before_expiry_secs);
+                Ok(())
+            }
+        }
+        WalletCommand::Drains => {
+            let drains = inspection.list_drains()?;
+            if args.json {
+                print_json(&drains)
+            } else {
+                print_drains(&drains);
+                Ok(())
+            }
+        }
+        _ => unreachable!("mutating command classified as read-only"),
+    }
 }
 
 fn resolve_wallet_db_path(args: &WalletArgs) -> anyhow::Result<String> {
@@ -358,6 +408,46 @@ fn find_expiring_channels_for_command(
         .expiring_channels
         .close_before_expiry_secs;
     let channels = manager.find_expiring_channels(None, now, close_before_expiry_secs)?;
+    Ok((channels, close_before_expiry_secs))
+}
+
+fn find_expiring_channels_for_inspection(
+    args: &WalletArgs,
+    inspection: &RelayWalletInspection,
+    explicit: Option<String>,
+) -> anyhow::Result<(Vec<ExpiringChannelSummary>, u64)> {
+    let now = now_seconds();
+    if let Some(name) = explicit.or_else(|| args.relay.clone()) {
+        let close_before_expiry_secs = close_before_expiry_secs_for_relay(args, Some(&name))?;
+        let channels =
+            inspection.find_expiring_channels(Some(&name), now, close_before_expiry_secs)?;
+        return Ok((channels, close_before_expiry_secs));
+    }
+
+    if let Some(config_path) = &args.config {
+        let config = MonadConfig::load(config_path)?;
+        let mut channels = Vec::new();
+        let mut max_close_before_expiry_secs = 0u64;
+        for relay in &config.relays {
+            let threshold = relay
+                .channel_policy
+                .expiring_channels
+                .close_before_expiry_secs;
+            max_close_before_expiry_secs = max_close_before_expiry_secs.max(threshold);
+            channels.extend(inspection.find_expiring_channels(
+                Some(&relay.name),
+                now,
+                threshold,
+            )?);
+        }
+        channels.sort_by_key(|channel| channel.seconds_until_expiry);
+        return Ok((channels, max_close_before_expiry_secs));
+    }
+
+    let close_before_expiry_secs = RelayChannelPolicyConfig::default()
+        .expiring_channels
+        .close_before_expiry_secs;
+    let channels = inspection.find_expiring_channels(None, now, close_before_expiry_secs)?;
     Ok((channels, close_before_expiry_secs))
 }
 
@@ -649,5 +739,37 @@ mod tests {
         assert_eq!(format_duration(125), "2m05s");
         assert_eq!(format_duration(7_260), "2h01m");
         assert_eq!(format_duration(-30), "-30s");
+    }
+
+    #[test]
+    fn wallet_commands_classify_inspection_and_mutation_before_opening_database() {
+        assert!(wallet_command_is_read_only(&WalletCommand::List));
+        assert!(wallet_command_is_read_only(&WalletCommand::Channels {
+            wallet_name: None,
+        }));
+        assert!(wallet_command_is_read_only(
+            &WalletCommand::CloseExpiringChannels {
+                wallet_name: None,
+                dry_run: true,
+            }
+        ));
+        assert!(!wallet_command_is_read_only(&WalletCommand::Close {
+            channel_id: "channel".to_string(),
+        }));
+        assert!(!wallet_command_is_read_only(
+            &WalletCommand::CloseExpiringChannels {
+                wallet_name: None,
+                dry_run: false,
+            }
+        ));
+        assert!(!wallet_command_is_read_only(&WalletCommand::Drain {
+            wallet_name: None,
+            mint_url: "https://mint.invalid".to_string(),
+            unit: "sat".to_string(),
+            limit: None,
+        }));
+        assert!(!wallet_command_is_read_only(&WalletCommand::RecoverDrain {
+            drain_id: "drain".to_string(),
+        }));
     }
 }

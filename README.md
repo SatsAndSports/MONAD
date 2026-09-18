@@ -38,7 +38,7 @@ Not implemented yet:
 
 ## Relay Wallet
 
-`monad-relay` now uses a named relay-wallet identity inside a shared SQLite relay-wallet database.  Relay configuration lives in a single YAML file; one file can describe many relays, and each relay process selects its relay with `--relay <name>`.
+`monad-relay` uses named relay-wallet identities inside one shared SQLite relay-wallet database. Relay configuration lives in a single YAML file. Omitting `--relay` starts every configured relay in YAML order in one process; `--relay <name>` starts only that relay while the process still exclusively owns the whole configured relay wallet.
 
 Example `monad.yaml`:
 
@@ -50,7 +50,7 @@ client_wallet:
   loose_db_path: /var/lib/monad/client-loose.db
   channel_db_path: /var/lib/monad/client-channels.db
   sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
-  channel_input_budget_msats: 1000000
+  channel_funding_token_target_msats: 1000000
   target_topup_buffer_msats: 10000000
   minimum_topup_msats: 0
 
@@ -92,6 +92,10 @@ Environment variables are substituted from the process environment or from a `.e
 Run the relay:
 
 ```bash
+# Run every configured relay through one wallet manager.
+monad-relay run --config monad.yaml
+
+# Or run one selected relay while owning the same complete wallet.
 monad-relay run --config monad.yaml --relay relay-a
 ```
 
@@ -114,9 +118,22 @@ monad-relay wallet --config monad.yaml --relay relay-a recover-drain --drain-id 
 
 Add `--json` to any wallet command for machine-readable output.
 
+One runtime process exclusively owns `relay_wallet.db_path`. It holds exclusive
+maintenance access while opening/migrating the database, registering identities,
+and populating the startup keyset cache, then shared maintenance access while
+listeners run. `list`, `show`, `channels`, `expiring-channels`, `drains`, and
+`close-expiring-channels --dry-run` remain available during runtime and use
+read-only SQLite connections without migrations. Closing, draining, recovery,
+and other mutating commands require exclusive maintenance access and fail before
+opening the wallet or contacting a mint when a runtime is active. OS-backed
+sidecar locks are released automatically if the process exits or dies. Inspection
+does not write SQLite, but it still opens or creates the adjacent maintenance
+sidecar for cross-process coordination, so the wallet directory must permit that
+sidecar access. Existing database files with multiple hard links are rejected.
+
 On first start, `receiver_secret_hex` is required so the relay can register its identity in the wallet database.  On later restarts of the same relay wallet identity, omit `receiver_secret_hex`; the relay will load the existing receiver key for `relay-a` from the shared wallet DB.
 
-All configured relays share `relay_wallet.db_path` safely because each relay uses a distinct receiver key, so their channel rows are disjoint.  The config loader rejects any two relays that share the same `receiver_secret_hex`.
+All configured relays in a process share one `RelayWalletManager`, persistent store, and in-memory mint cache while retaining distinct receiver keys and wallet-name metadata. The config loader rejects any two relays that share the same `receiver_secret_hex`.
 
 ## Client Wallet
 
@@ -128,10 +145,10 @@ YAML order; add `--client <name>` to run only one entry.
 - `LooseProofWallet` stores loose Cashu proofs, mint quote state, premint batches, reservations, and spend/release state in SQLite.
 - `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata including expiry timestamps in SQLite, and implements `MonadWallet` for the session driver.
 - channel opening atomically reserves its loose proofs and journals the exact prepared swap before submission. Live ambiguous submissions restore their exact funding/change outputs through NUT-09; a valid empty funding restore plus every exact input `UNSPENT` permits one byte-identical replay, with at most one successor after an explicit `12002` rejection.
-- configured-client startup and manual `recover-openings` never submit opening swaps. They finish restored or finalizing channels and cancel prepared attempts and rejected attempts without successors. A submitted attempt with empty, partial, invalid, or unavailable restore evidence remains unresolved and reserved; startup/manual recovery does not abandon it based on `UNSPENT` observations.
+- configured-client startup and manual `recover-openings` never submit opening swaps. They finish restored or finalizing channels and cancel prepared attempts and rejected attempts without successors. Under exclusive wallet access, a submitted attempt can be abandoned only at least one hour after its latest submission/replay when exact funding/change restores are empty and one complete exact-input check reports every input `UNSPENT`; recent, stale, clock-rollback, partial, invalid, or unavailable evidence remains reserved.
 - output keyset handling is cache-first: channel opening prefers an advertised active keyset, then falls back to another locally active same-mint/unit keyset with a negotiated format. When preferences are nonempty but unavailable locally, the client refreshes its own mint cache before using a non-preferred fallback; it also refreshes before concluding that no compatible active keyset exists. An explicit inactive-output-keyset rejection (`12002`) may create one persisted successor using a changed active keyset; ambiguous errors never trigger another swap submission.
 
-`client_wallet.channel_input_budget_msats` controls the loose-proof input budget for each newly provisioned channel. It is not a guaranteed channel capacity; fees and deterministic channel outputs can make the resulting capacity lower. The default is `1000000` msats.
+`client_wallet.channel_funding_token_target_msats` controls the desired funding-token value for each newly provisioned channel. Cashu input fees are selected in addition to this target; output fees and deterministic channel outputs can make usable channel capacity lower. The default is `1000000` msats.
 
 `client_wallet.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `client_wallet.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats.
 
@@ -149,11 +166,13 @@ monad-client wallet --config monad.yaml recover-openings
 One in-process `ClientWalletManager` owns the configured loose-proof and channel
 databases. Startup opens/migrates and performs recovery exactly once before any
 client starts, then all client leaves share that wallet. A second runtime using
-either database fails immediately. `channels` and `proofs` use true read-only
-SQLite access, require no sender secret in explicit-path mode, and may run while
+either database fails immediately. `channels` and `proofs` use read-only SQLite
+access, require no sender secret in explicit-path mode, and may run while
 the runtime is active. Import and recovery commands require exclusive maintenance
 access and fail immediately while a runtime owns the wallet. Lock sidecars are
-created next to each normalized, deduplicated database path.
+created next to each normalized, deduplicated database path, including for
+inspection when absent; the containing directories must allow sidecar access.
+Existing database files with multiple hard links are rejected.
 
 They can also use explicit DB paths and sender key material for manual or emergency access:
 
@@ -361,7 +380,7 @@ This prints:
 
 ### 2. Start one or more relays
 
-Create a `monad.yaml` file.  A single file can hold the shared wallets, many relays, and one or more client route definitions. Each relay process selects one relay with `--relay <name>`.
+Create a `monad.yaml` file. A single file can hold the shared wallets, many relays, and one or more client route definitions. A relay process runs all configured relays by default or one relay selected with `--relay <name>`.
 
 ```yaml
 relay_wallet:
@@ -371,7 +390,7 @@ client_wallet:
   loose_db_path: /var/lib/monad/client-loose.db
   channel_db_path: /var/lib/monad/client-channels.db
   sender_secret_hex: "${MONAD_CLIENT_SENDER_KEY}"
-  channel_input_budget_msats: 1000000
+  channel_funding_token_target_msats: 1000000
   target_topup_buffer_msats: 10000000
   minimum_topup_msats: 0
 

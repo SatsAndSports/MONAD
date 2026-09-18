@@ -17,8 +17,8 @@ use self::state::{RelayConnectionHandles, SessionDriverConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaymentPolicy {
-    /// Loose-proof input budget used when provisioning a new channel.
-    pub channel_input_budget_msats: u64,
+    /// Desired funding-token value when provisioning a new channel.
+    pub channel_funding_token_target_msats: u64,
     /// Target positive remaining balance the client tries to restore whenever
     /// funding is needed.
     pub target_topup_buffer_msats: u64,
@@ -31,7 +31,7 @@ pub struct PaymentPolicy {
 impl Default for PaymentPolicy {
     fn default() -> Self {
         Self {
-            channel_input_budget_msats: 1_000_000,
+            channel_funding_token_target_msats: 1_000_000,
             target_topup_buffer_msats: 10_000_000,
             minimum_topup_msats: 0,
         }

@@ -271,7 +271,11 @@ exclusive. Startup open/migration/recovery and mutating CLI operations take the
 maintenance gate exclusively; runtime steady state and read-only CLI inspection
 take it shared. Mutating CLI acquisition is fail-fast. Channel/proof inspection
 opens MONAD SQLite connections and upstream `SqliteClientStorage` read-only,
-performs no schema initialization, and does not load the sender secret.
+performs no schema initialization, and does not load the sender secret. Inspection
+still participates in filesystem coordination through adjacent lock sidecars and
+therefore requires sidecar access in the database directories. Existing database
+files with multiple hard links are rejected because path normalization cannot
+safely establish one lock identity for hard-link aliases.
 
 The configured client owns a `RouteConnection`, not just the final hop. That
 handle keeps the final `RelayConnection`, all prefix hop connections, and per-hop
@@ -650,11 +654,23 @@ refreshes its own mint cache before using a non-preferred fallback. It also
 refreshes before concluding that no compatible active keyset exists. Before
 submitting the opening swap, the loose-proof store atomically reserves the
 selected inputs and records the exact serialized prepared opening.
+The configured `channel_funding_token_target_msats` is a desired funding-token
+value. Plain provisioning selects strict smallest-first `(amount, proof_id)`
+inputs until their post-input-fee value covers that target, so input fees are
+additional rather than deducted from the configured value. Input keyset metadata
+gets one bounded refresh when needed; an unresolved proof cannot be skipped
+before the plain target, while exact-capacity selection can proceed from known,
+positive-net inputs after refresh when they suffice. Both preparation and storage
+enforce a portable maximum of 992 selected proof IDs.
 The journal is authoritative across restarts. Submitted attempts first recover
 their original funding/change outputs through NUT-09. If a valid funding restore
 is empty, one NUT-07 request checks every persisted input Y; only an all-`UNSPENT`
 response permits one replay of the byte-identical swap during live opening
-recovery only.
+recovery only. Each immutable attempt has at most one replay execution. Replay
+success finalizes normally; replay ambiguity or rejection performs one immediate
+exact restore and otherwise leaves the operation submitted and reserved. A replay
+rejection cannot authorize a keyset successor because it does not settle the
+earlier ambiguous execution.
 Finalization replays local channel, change-proof, and metadata updates
 idempotently. Prepared attempts that were never claimed for submission are
 cancelled and their proofs released.
@@ -668,12 +684,24 @@ before route provisioning, also exposed by manual `recover-openings`. This pass
 never submits swaps: prepared attempts and rejected attempts without a successor
 are cancelled; finalizing attempts finish local idempotent updates; submitted
 attempts with complete restored funding/change finalize. Empty, partial, invalid,
-or network-failed restore evidence remains unresolved and reserved. Startup and
-manual recovery do not use input `UNSPENT` observations to abandon a submitted
-attempt. Other swap policies are unchanged.
+or network-failed restore evidence normally remains unresolved and reserved. Under
+the manager's exclusive startup/maintenance lock, an attempt may be abandoned only
+at least 3600 seconds after its latest authorized execution, after exact funding
+and change restores are empty and one complete NUT-07 response reports every exact
+input `UNSPENT`. The atomic release revalidates the attempt state, timestamp,
+latest execution sequence, and exact reservation; recent, clock-rollback, stale,
+or inconclusive evidence remains reserved. Other swap policies are unchanged.
+The authoritative opening journal migrates schema v1 to v2 atomically by renaming
+the persisted input-budget field to the funding-token target while preserving all
+attempts, executions, proof IDs, states, timestamps, indexes, and authority data.
 The live exact-replay
 allowance is independent per immutable attempt, so a keyset successor receives
 its own allowance without authorizing a second successor.
+
+Exact duplicate opening identities are coordinated in-process and protected by
+journal/database uniqueness across wallet handles. Duplicate callers receive a
+typed already-open, opening-in-progress, or conflict result rather than sharing a
+channel that another session may already have attached.
 
 If that refreshed client cache has no active same-mint/unit keyset with a
 negotiated format, `SqliteClientWallet` reports that no compatible active keyset
@@ -709,6 +737,32 @@ That manager owns:
 This lets one MONAD process host multiple relays with different receiver keys
 while still sharing one persistent relay-wallet DB. Transport identity remains a
 separate concern from the Cashu receiver identity used for Spilman channels.
+
+The relay runtime validates all selected identities and pre-binds every TCP and
+QUIC listener before wallet mutation. It then acquires the normalized database's
+OS-backed runtime-owner and maintenance sidecars, opens/migrates exactly one
+`RelayWalletManager`, registers the selected receiver identities, and refreshes
+the union of their trusted mint URLs into one shared cache. Startup holds the
+maintenance gate exclusively. Steady state downgrades it to shared mode. Omitting
+`--relay` starts every configured relay in YAML order; selecting one relay still
+owns the complete configured wallet, preventing a second process from hosting a
+sibling identity against the same database.
+
+Each listener receives the same manager and cache but constructs payments with
+its own wallet name, receiver key, trusted mint/unit policy, pricing, and channel
+policy. A process-level `JoinSet` treats any listener exit as fatal, broadcasts
+shutdown to siblings, and awaits all listener, auto-close, connection, stream,
+session, control-stream, and keyset-refresh task trees before releasing wallet
+ownership. Refresh coordinator shutdown fences new refreshes and drains already
+owned refresh work after sessions and auto-close workers stop.
+
+Read-only wallet commands take the maintenance gate shared and open SQLite with
+read-only flags, without schema initialization. Mutating close/drain/recovery
+commands take it exclusively and fail before normal database opening or network
+work while a runtime is active. Read-only here describes SQLite access; inspection
+still opens or creates the adjacent maintenance sidecar and requires directory
+permission for it. Hard-linked existing wallet databases are rejected. Kernel
+file locks provide process-death release.
 
 The relay binary now also exposes wallet-admin commands over that same durable
 state (`monad-relay wallet ...`) so operators can list identities, inspect

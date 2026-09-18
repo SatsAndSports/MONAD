@@ -1,11 +1,20 @@
 # Client Channel Opening Review
 
-Status: implementation in progress. The first implementation PR covers the
-upstream validation/storage API pin, client wallet manager, cross-process locking,
-read-only inspection, and multi-client supervision. The stacked opening-journal
+Status: opening input selection implemented on top of the opening recovery
+policy. The first implementation PR covers the upstream validation/storage API
+pin, client wallet manager, cross-process locking, read-only inspection, and
+multi-client supervision. The stacked opening-journal
 authority PR now covers exact durable inputs, submission authority/execution
 records, monotonic submission uncertainty, exact atomic completion, and removal of
-legacy opening recovery state.
+legacy opening recovery state. This stacked PR completes bounded live replay,
+direct-only `12002` successors, exclusive aged abandonment, and typed duplicate
+opening coordination.
+
+This stacked input-selection PR renames the configured funding amount to
+`channel_funding_token_target_msats`, makes Cashu input fees additional to that
+target, preserves deterministic smallest-first plain selection, adds one bounded
+input-keyset metadata refresh, excludes non-contributing exact-capacity inputs,
+and enforces a typed portable 992-proof limit before preparation and at storage.
 
 This document is a handoff for resuming work on client channel-opening swaps. It
 records the current findings, decisions, open questions, and proposed sequence.
@@ -45,8 +54,9 @@ before reviewing the other Cashu swap paths and adding journals where appropriat
   deduplicated loose/channel database paths in deterministic order. Runtime
   startup is exclusive, steady state is shared for inspection, and mutating CLI
   maintenance is exclusive and fail-fast.
-- `channels` and `proofs` are true read-only operations and do not require or load
-  the sender secret. CLI mode is classified before databases are opened.
+- `channels` and `proofs` use read-only SQLite paths and do not require or load
+  the sender secret. CLI mode is classified before databases are opened. They
+  still acquire adjacent sidecar locks, which may create a missing sidecar.
 - Omitted `--client` starts all configured clients in YAML order. A named selector
   starts one leaf but still owns the whole logical wallet. Supervision propagates
   SOCKS failures and awaits children before manager teardown.
@@ -76,8 +86,18 @@ before reviewing the other Cashu swap paths and adding journals where appropriat
 - The `monad_client_channel_opening_recoveries` compatibility path/table is removed.
   Empty obsolete tables are dropped; nonempty obsolete recovery or pre-authority
   journal state is rejected rather than inferred.
-- Detailed live replay policy, one-hour administrative abandonment, and in-memory
-  same-channel singleflight remain explicitly deferred to the next stacked PR.
+- Live ambiguity now performs exact restore, at most one permit-backed byte-identical
+  replay after complete all-`UNSPENT` NUT-07 evidence, and one final exact restore
+  after replay ambiguity or rejection. Replay rejection remains unresolved and
+  cannot create a successor; only a direct unambiguous initial `12002` rejection
+  can create the operation's one successor.
+- Exclusive startup/manual recovery may abandon only after 3600 seconds from the
+  latest authorized execution, exact funding/change restore absence, and one
+  complete all-`UNSPENT` input response. Atomic release revalidates state,
+  timestamp, execution sequence, and exact reservation.
+- Complete deterministic opening identities use process-local singleflight plus
+  journal/database uniqueness and typed `AlreadyOpen`, `OpeningInProgress`, and
+  `Conflict` outcomes.
 
 ## Current Model
 
@@ -176,9 +196,11 @@ mutating maintenance:
   logical client wallet.
 
 Within the client process, `ClientWalletManager` owns the shared wallet instance,
-startup recovery, and active opening coordination. An in-memory map may coalesce
-same-channel callers, but database uniqueness, atomic reservation/journal creation,
-and conditional submission claims remain the correctness boundary.
+startup recovery, and active opening coordination. Fail-fast singleflight admits
+one same-channel leader and returns `OpeningInProgress` to followers; it does not
+wait for or share the leader's result. Database uniqueness, atomic
+reservation/journal creation, and conditional submission claims remain the
+correctness boundary.
 
 ### Ambiguous Abandonment
 
@@ -204,6 +226,7 @@ and conditional submission claims remain the correctness boundary.
   selection with the intended funding-token-value semantics.
 - Selection must gather enough gross input value to cover the desired funding
   token plus input fees.
+- Implemented by the opening input-selection PR.
 
 ### Channel Identity
 
@@ -223,6 +246,8 @@ and conditional submission claims remain the correctness boundary.
   policy.
 - Target-capacity selection is a separate fee-aware policy and can be corrected
   independently.
+- Implemented with strict `(amount, proof ID)` plain ordering and a 992-proof
+  portable limit.
 
 ### Legacy Data
 
@@ -447,10 +472,12 @@ Current uniqueness notes:
 
 Severity: medium.
 
-The API currently calls the value `input_budget_msats`, but plain provisioning uses
-it as the desired funding-token amount. It selects gross proof value until gross
-value reaches that target, while upstream requires the target to fit after input
-fees.
+Status: resolved by the opening input-selection PR.
+
+Before this PR, the API described the value as an input budget, but plain
+provisioning used it as the desired funding-token amount. It selected gross proof
+value until gross value reached that target, while upstream required the target
+to fit after input fees.
 
 Example:
 
@@ -475,6 +502,9 @@ Required direction:
 
 Severity: medium availability issue.
 
+Status: resolved by one bounded refresh; understood proofs may proceed only when
+they suffice after that refresh.
+
 The target-capacity path looks up cached keyset/fee metadata for every available
 input proof before selection. If one proof's keyset is absent from the client cache,
 it returns an error before reservation or submission. It does not crash and does
@@ -493,6 +523,9 @@ Required direction:
 
 Severity: medium availability issue.
 
+Status: resolved with a portable maximum of 992 IDs and typed pre-preparation and
+storage-boundary errors; batching was intentionally not added.
+
 Plain provisioning intentionally consumes proofs in smallest-first order. The
 reservation code guards against roughly 999 SQLite parameters and currently checks
 `proof_ids.len() + 5 > 999`, although the update statement appears to bind seven
@@ -510,6 +543,9 @@ Required direction:
 ### 11. Target Fee-Aware Selection Has A Feasible-Subset Edge Case
 
 Severity: medium.
+
+Status: resolved by excluding proofs whose individual net contribution is not
+positive while preserving largest-first/lower-fee ordering.
 
 The target-capacity selector is a largest-first heuristic with a lower-fee
 tie-break. A high-fee proof with nonpositive net value can be included first and
@@ -617,6 +653,15 @@ The latest proposed sequence, subject to the remaining open questions above, is:
 14. After client channel opening is stable, give the relay runtime the equivalent
     all-or-selected supervision, single `RelayWalletManager`, and exclusive wallet
     ownership policy. Do not broaden this step into a review of relay swap logic.
+
+Item 14 is implemented on `feat/relay-wallet-manager`: relay startup is
+all-or-selected, one process owns the normalized relay DB and one in-process
+manager/cache, listener failures coordinate sibling shutdown, read-only admin
+uses migration-free SQLite paths, and mutating close/drain administration is
+gated before database or network work. Close/drain swap semantics were not
+redesigned. Session control tasks, auto-close aborts, and coordinator-owned
+refresh work are drained before wallet ownership release; hard-linked existing
+wallet databases are rejected.
 
 ## Test Matrix To Add
 

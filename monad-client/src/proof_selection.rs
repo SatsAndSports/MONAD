@@ -19,6 +19,16 @@
 
 use std::fmt;
 
+pub const MAX_SELECTED_INPUT_PROOFS: usize = 992;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmallestFirstProofCandidate {
+    pub proof_id: String,
+    pub keyset_id: String,
+    pub amount_raw: u64,
+    pub input_fee_ppk: Option<u64>,
+}
+
 /// A single available proof that may be selected to fund a target value.
 ///
 /// `amount_raw` is the face value in the mint's raw units (e.g. satoshis). The
@@ -49,6 +59,13 @@ pub enum ProofSelectionError {
         target_post_swap_raw: u64,
         available_post_swap_raw: u64,
     },
+    InputKeysetMetadataUnavailable {
+        keyset_ids: Vec<String>,
+    },
+    TooManyInputProofs {
+        selected: usize,
+        maximum: usize,
+    },
     /// An internal total overflowed during selection.
     Overflow,
 }
@@ -63,9 +80,70 @@ impl fmt::Display for ProofSelectionError {
                 f,
                 "insufficient proofs: target_post_swap_raw={target_post_swap_raw} available_post_swap_raw={available_post_swap_raw}"
             ),
+            Self::InputKeysetMetadataUnavailable { keyset_ids } => write!(
+                f,
+                "input keyset metadata unavailable for: {}",
+                keyset_ids.join(", ")
+            ),
+            Self::TooManyInputProofs { selected, maximum } => write!(
+                f,
+                "too many input proofs: selected={selected} maximum={maximum}"
+            ),
             Self::Overflow => write!(f, "proof selection total overflow"),
         }
     }
+}
+
+/// Select strict smallest-first inputs until their value after input fees covers
+/// `target_post_swap_raw`. Unknown metadata is an error only when encountered
+/// before the target is reached; later proofs are irrelevant to this policy.
+pub fn select_smallest_first_inputs_for_funding_target(
+    mut candidates: Vec<SmallestFirstProofCandidate>,
+    target_post_swap_raw: u64,
+) -> Result<ProofSelection, ProofSelectionError> {
+    candidates.sort_by(|a, b| {
+        a.amount_raw
+            .cmp(&b.amount_raw)
+            .then(a.proof_id.cmp(&b.proof_id))
+    });
+    let mut selected = ProofTotals::ZERO;
+    let mut proof_ids = Vec::new();
+
+    for candidate in candidates {
+        if selected.post_swap_value() >= target_post_swap_raw {
+            break;
+        }
+        let Some(input_fee_ppk) = candidate.input_fee_ppk else {
+            return Err(ProofSelectionError::InputKeysetMetadataUnavailable {
+                keyset_ids: vec![candidate.keyset_id],
+            });
+        };
+        selected = selected.checked_add(ProofTotals {
+            amount_raw: candidate.amount_raw,
+            fee_ppk_sum: input_fee_ppk,
+        })?;
+        proof_ids.push(candidate.proof_id);
+        if proof_ids.len() > MAX_SELECTED_INPUT_PROOFS {
+            return Err(ProofSelectionError::TooManyInputProofs {
+                selected: proof_ids.len(),
+                maximum: MAX_SELECTED_INPUT_PROOFS,
+            });
+        }
+    }
+
+    let post_swap_value_raw = selected.post_swap_value();
+    if post_swap_value_raw < target_post_swap_raw {
+        return Err(ProofSelectionError::Insufficient {
+            target_post_swap_raw,
+            available_post_swap_raw: post_swap_value_raw,
+        });
+    }
+    Ok(ProofSelection {
+        proof_ids,
+        input_value_raw: selected.amount_raw,
+        input_fee_raw: selected.input_fee_raw(),
+        post_swap_value_raw,
+    })
 }
 
 impl std::error::Error for ProofSelectionError {}
@@ -139,6 +217,9 @@ pub fn select_mixed_fee_inputs_for_post_swap_target(
         });
     }
 
+    candidates.retain(|candidate| {
+        candidate.amount_raw > input_fee_raw_from_ppk_sum(candidate.input_fee_ppk)
+    });
     candidates.sort_by(|a, b| {
         b.amount_raw
             .cmp(&a.amount_raw)
@@ -176,6 +257,12 @@ pub fn select_mixed_fee_inputs_for_post_swap_target(
         return Err(ProofSelectionError::Insufficient {
             target_post_swap_raw,
             available_post_swap_raw: suffix[0].post_swap_value(),
+        });
+    }
+    if proof_ids.len() > MAX_SELECTED_INPUT_PROOFS {
+        return Err(ProofSelectionError::TooManyInputProofs {
+            selected: proof_ids.len(),
+            maximum: MAX_SELECTED_INPUT_PROOFS,
         });
     }
 
@@ -223,6 +310,98 @@ mod tests {
             amount_raw,
             input_fee_ppk,
         }
+    }
+
+    fn smallest_candidate(
+        id: &str,
+        keyset_id: &str,
+        amount_raw: u64,
+        input_fee_ppk: Option<u64>,
+    ) -> SmallestFirstProofCandidate {
+        SmallestFirstProofCandidate {
+            proof_id: id.to_string(),
+            keyset_id: keyset_id.to_string(),
+            amount_raw,
+            input_fee_ppk,
+        }
+    }
+
+    #[test]
+    fn smallest_first_is_deterministic_and_input_fees_are_additional() {
+        let selection = select_smallest_first_inputs_for_funding_target(
+            vec![
+                smallest_candidate("b", "known", 5, Some(500)),
+                smallest_candidate("c", "known", 1, Some(0)),
+                smallest_candidate("a", "known", 5, Some(500)),
+            ],
+            10,
+        )
+        .unwrap();
+        assert_eq!(selection.proof_ids, vec!["c", "a", "b"]);
+        assert_eq!(selection.input_value_raw, 11);
+        assert_eq!(selection.input_fee_raw, 1);
+        assert_eq!(selection.post_swap_value_raw, 10);
+    }
+
+    #[test]
+    fn smallest_first_does_not_skip_unknown_metadata_before_target() {
+        let error = select_smallest_first_inputs_for_funding_target(
+            vec![
+                smallest_candidate("first", "missing", 1, None),
+                smallest_candidate("enough", "known", 10, Some(0)),
+            ],
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProofSelectionError::InputKeysetMetadataUnavailable {
+                keyset_ids: vec!["missing".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn smallest_first_ignores_unknown_metadata_after_target() {
+        let selection = select_smallest_first_inputs_for_funding_target(
+            vec![
+                smallest_candidate("enough", "known", 10, Some(0)),
+                smallest_candidate("later", "missing", 20, None),
+            ],
+            10,
+        )
+        .unwrap();
+        assert_eq!(selection.proof_ids, vec!["enough"]);
+    }
+
+    #[test]
+    fn smallest_first_enforces_portable_proof_limit() {
+        let candidates = (0..=MAX_SELECTED_INPUT_PROOFS)
+            .map(|i| smallest_candidate(&format!("{i:04}"), "known", 1, Some(0)))
+            .collect();
+        assert_eq!(
+            select_smallest_first_inputs_for_funding_target(
+                candidates,
+                MAX_SELECTED_INPUT_PROOFS as u64 + 1
+            ),
+            Err(ProofSelectionError::TooManyInputProofs {
+                selected: MAX_SELECTED_INPUT_PROOFS + 1,
+                maximum: MAX_SELECTED_INPUT_PROOFS,
+            })
+        );
+    }
+
+    #[test]
+    fn smallest_first_accepts_992_proofs() {
+        let candidates = (0..MAX_SELECTED_INPUT_PROOFS)
+            .map(|i| smallest_candidate(&format!("{i:04}"), "known", 1, Some(0)))
+            .collect();
+        let selection = select_smallest_first_inputs_for_funding_target(
+            candidates,
+            MAX_SELECTED_INPUT_PROOFS as u64,
+        )
+        .unwrap();
+        assert_eq!(selection.proof_ids.len(), MAX_SELECTED_INPUT_PROOFS);
     }
 
     #[test]
@@ -470,5 +649,25 @@ mod tests {
                 available_post_swap_raw: 8,
             }
         );
+    }
+
+    #[test]
+    fn exact_capacity_excludes_non_contributing_proofs() {
+        let selection = select_mixed_fee_inputs_for_post_swap_target(
+            vec![candidate("toxic", 100, 100_000), candidate("good", 10, 0)],
+            10,
+        )
+        .unwrap();
+        assert_eq!(selection.proof_ids, vec!["good"]);
+    }
+
+    #[test]
+    fn exact_capacity_uses_ceil_fee_when_filtering_non_contributing_proofs() {
+        let selection = select_mixed_fee_inputs_for_post_swap_target(
+            vec![candidate("toxic", 2, 1001), candidate("good", 2, 0)],
+            2,
+        )
+        .unwrap();
+        assert_eq!(selection.proof_ids, vec!["good"]);
     }
 }

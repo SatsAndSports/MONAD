@@ -25,7 +25,7 @@ impl ClientWalletManager {
             &config.channel_db_path,
             &config.sender_secret_hex,
         )?);
-        let recovery = wallet.recover_pending_openings()?;
+        let recovery = wallet.recover_pending_openings(&locks.exclusive_access()?)?;
         locks.enter_steady_state()?;
         Ok((
             Self {
@@ -52,7 +52,7 @@ mod tests {
             loose_db_path: dir.path().join("loose.db").display().to_string(),
             channel_db_path: dir.path().join("channels.db").display().to_string(),
             sender_secret_hex: hex::encode([7u8; 32]),
-            channel_input_budget_msats: 1_000,
+            channel_funding_token_target_msats: 1_000,
             target_topup_buffer_msats: 1_000,
             minimum_topup_msats: 1,
         };

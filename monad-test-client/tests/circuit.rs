@@ -121,6 +121,25 @@ async fn expect_failure(
         .expect("failure channel should stay open")
 }
 
+async fn expect_failure_for_hop(
+    failure_rx: &mut mpsc::UnboundedReceiver<monad_test_client::HopFailure>,
+    hop_idx: usize,
+) -> monad_test_client::HopFailure {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let failure = failure_rx
+                .recv()
+                .await
+                .expect("failure channel should stay open");
+            if failure.hop_idx == hop_idx {
+                return failure;
+            }
+        }
+    })
+    .await
+    .expect("expected hop failure should arrive before timeout")
+}
+
 async fn assert_suffix_rebuild(
     failed_hop_idx: usize,
     rebuild_from: usize,
@@ -159,7 +178,7 @@ async fn rebuild_after_failure_rebuilds_middle_suffix_and_preserves_entry_sessio
     let killed_session_id = initial_ids[1].expect("session id for failed hop");
     assert!(relays[1].terminate_session(&killed_session_id));
 
-    let failure = expect_failure(&mut failure_rx).await;
+    let failure = expect_failure_for_hop(&mut failure_rx, 1).await;
     assert_eq!(failure.hop_idx, 1);
     assert_eq!(failure.epoch, circuit.hop_epoch(1).unwrap());
 
@@ -207,7 +226,7 @@ async fn stale_failure_after_successful_rebuild_does_not_trigger_second_rebuild(
     let killed_session_id = initial_ids[1].expect("session id for failed hop");
     assert!(relays[1].terminate_session(&killed_session_id));
 
-    let stale_failure = expect_failure(&mut failure_rx).await;
+    let stale_failure = expect_failure_for_hop(&mut failure_rx, 1).await;
     assert_eq!(stale_failure.hop_idx, 1);
     assert_eq!(
         circuit

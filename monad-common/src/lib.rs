@@ -11,3 +11,4 @@ pub mod proxy;
 pub mod quic_cert_identity;
 pub mod secp_identity;
 pub mod session;
+pub mod wallet_lock;

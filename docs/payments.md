@@ -85,6 +85,14 @@ test or compatibility wrapper.
 The relay wallet manager owns one shared in-memory `SpilmanMintCache` plus the
 SQLite-backed relay wallet database.
 
+One relay process owns that database through an OS-backed runtime-owner lock and
+hosts all configured relays by default through one manager/cache. Runtime startup
+uses exclusive maintenance access; steady state and read-only SQLite wallet
+inspection share the maintenance gate. Inspection performs no SQLite schema or
+data writes but still requires access to the adjacent lock sidecar. Mutating
+close/drain administration is fail-fast while the runtime is active and does not
+begin database or mint work.
+
 The in-memory cache stores all keysets returned by configured mints: all units,
 active and inactive. The relay's trusted mint/unit policy is applied when reading
 from that cache, not when storing it.
@@ -136,12 +144,19 @@ reserves its loose inputs and journals that preparation before submission. A
 submitted attempt is immutable and ambiguous outcomes first use NUT-09. When a
 valid funding restore is empty, one NUT-07 request checks all persisted input Ys;
 only an all-`UNSPENT` response permits one replay of the identical swap request in
-live opening recovery. Startup and manual `recover-openings` never submit swaps.
+live opening recovery. Replay success finalizes; replay ambiguity or rejection
+gets one immediate exact restore and otherwise remains unresolved, and a replay
+rejection cannot create a keyset successor. Startup and manual `recover-openings`
+never submit swaps.
 They cancel prepared attempts and rejected attempts without a successor, finish
 finalizing attempts, and finalize submitted attempts only with complete restored
 funding/change. Empty, partial, invalid, or unavailable restore evidence keeps a
-submitted attempt unresolved and reserved. Startup/manual recovery does not use
-an input `UNSPENT` observation to abandon it. This policy is
+submitted attempt unresolved and reserved. With exclusive wallet maintenance
+access, recovery may abandon an attempt only 3600 seconds after its latest
+authorized submission/replay, when exact funding/change restores are empty and
+one complete NUT-07 response reports every exact input `UNSPENT`. Atomic release
+revalidates the state, timestamp, execution sequence, and exact reservation, so
+recent, clock-rollback, stale, or inconclusive evidence stays reserved. This policy is
 channel-opening-only, not a change to refunds, drains, or other swaps.
 
 During a live opening, if the mint explicitly rejects code
@@ -150,15 +165,36 @@ successor attempt, but only when selection produces a different active output
 keyset. That successor is a new immutable attempt with its own one-exact-replay
 allowance in that live opening.
 
+Opening execution uses fail-fast singleflight: one caller is the leader for a
+complete deterministic opening identity, while concurrent followers receive
+`OpeningInProgress` rather than waiting for or sharing the leader's result. The
+journal/database uniqueness constraints protect the same identity across wallet
+handles. Other duplicate callers receive typed `AlreadyOpen` or `Conflict`
+errors; they never silently reuse a channel that may be attached to another
+session.
+
 Input proof keysets are independent from the selected output funding keyset:
 input proofs may be old, inactive, or mixed-keyset proofs as long as the mint
 accepts them and fee metadata is known.
 
+`client_wallet.channel_funding_token_target_msats` is the desired value of the
+funding token, not a gross loose-proof budget. Plain opening selection consumes
+proofs in strict `(amount, proof_id)` order until value after Cashu input fees
+covers that target; input fees are additional and surplus returns as change.
+Gross insufficiency is reported before keyset network I/O. If the next required
+proof lacks input-fee metadata, the client refreshes once and does not skip it;
+metadata missing after the target is reached is irrelevant. Exact-capacity
+selection retains its largest-first/lower-fee ordering, ignores nonpositive-net
+proofs, and may ignore still-unknown proofs only when understood proofs suffice
+after one refresh. Openings are limited to 992 input proof IDs before preparation
+and again at the SQLite reservation boundary.
+
 When a session needs a new channel, it considers relay-advertised mint/unit
 offers in order. It may continue to a later offer only after an explicitly safe,
-offer-local result: no compatible active keyset, insufficient loose proofs for
-that offer, or a preparation failure before the atomic reservation/journal
-boundary. Reservation, persistence, and ambiguous submission failures stop the
+offer-local result: no compatible active keyset, insufficient loose proofs,
+unavailable input-keyset metadata, too many selected inputs for that offer, or a
+preparation failure before the atomic reservation/journal boundary. Reservation,
+persistence, and ambiguous submission failures stop the
 pass because the selected inputs may require recovery. If every offer is safely
 unavailable before initial session readiness, funding remains blocked; after
 readiness, the driver retries using its normal funding backoff.

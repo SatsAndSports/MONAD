@@ -383,13 +383,16 @@ where
     S: Future<Output = ()> + Send,
 {
     let discovered_spilman_mint_cache = wallet_manager.keyset_cache();
-    let keyset_refresh = Some(Arc::new(RelayKeysetRefreshCoordinator::new(
+    let keyset_refresh = Arc::new(RelayKeysetRefreshCoordinator::new(
         wallet_manager.clone(),
         config.trusted_mint_units.clone(),
-    )));
+    ));
     let receiver_pubkey_hex = wallet_manager.receiver_pubkey_hex(&config.relay_wallet_name)?;
-    let payments = wallet_manager
-        .payments_for_with_policy(&config.relay_wallet_name, config.channel_policy.clone())?;
+    let payments = wallet_manager.payments_for_with_trusted_mints_and_policy(
+        &config.relay_wallet_name,
+        config.trusted_mint_units.clone(),
+        config.channel_policy.clone(),
+    )?;
     let config = Arc::new(ServerConfig {
         identity: QuicCertIdentity::from_seed(*config.identity.seed())
             .map_err(|e| io::Error::other(format!("clone relay identity: {e}")))?,
@@ -426,7 +429,7 @@ where
         discovered_spilman_mint_cache,
         RelayRuntimeServices {
             session_registry: Arc::new(SessionRegistry::new()),
-            keyset_refresh,
+            keyset_refresh: Some(keyset_refresh.clone()),
         },
         shutdown,
     )
@@ -470,6 +473,13 @@ async fn stop_expiring_channel_auto_close_worker(
         Err(_) => {
             error!("timed out waiting for expiring-channel auto-close worker to stop");
             handle.abort();
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    error!(error = %e, "expiring-channel auto-close worker failed while aborting")
+                }
+            }
         }
     }
 }
@@ -614,10 +624,13 @@ where
     // This is separate from the QUIC endpoint (which handles inbound connections).
     let quic_pool = QuicPool::new().ok();
     // Accept loop — runs until shutdown signal
-    loop {
+    let result = loop {
         tokio::select! {
             result = listener.accept() => {
-                let (mut tcp_stream, peer_addr) = result?;
+                let (mut tcp_stream, peer_addr) = match result {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error),
+                };
                 info!("accepted TCP connection from {peer_addr}");
 
                 let config = config.clone();
@@ -883,10 +896,10 @@ where
             }
             _ = &mut shutdown => {
                 info!("shutting down (signal)...");
-                break;
+                break Ok(());
             }
         }
-    }
+    };
 
     // Graceful shutdown: wait for active sessions to finish.
     let active = sessions.len();
@@ -912,6 +925,13 @@ where
                     let remaining = sessions.len();
                     info!("shutdown timeout, aborting {remaining} remaining session(s)");
                     sessions.abort_all();
+                    while let Some(result) = sessions.join_next().await {
+                        if let Err(e) = result {
+                            if !e.is_cancelled() {
+                                error!("session task failed while aborting: {e}");
+                            }
+                        }
+                    }
                     break;
                 }
             }
@@ -922,6 +942,10 @@ where
         ep.close(0u32.into(), b"shutdown");
     }
 
+    if let Some(keyset_refresh) = services.keyset_refresh {
+        keyset_refresh.shutdown_and_drain().await;
+    }
+
     info!("relay shut down");
-    Ok(())
+    result
 }
