@@ -121,13 +121,14 @@ All configured relays share `relay_wallet.db_path` safely because each relay use
 ## Client Wallet
 
 The reusable client wallet pieces exist in `monad-client`. The binary exposes
-wallet admin/funding/recovery commands and can run a configured QUIC SOCKS
-client with `monad-client run --config monad.yaml --client <name>`.
+wallet admin/funding/recovery commands and can run configured QUIC SOCKS
+clients. `monad-client run --config monad.yaml` runs every `clients` entry in
+YAML order; add `--client <name>` to run only one entry.
 
 - `LooseProofWallet` stores loose Cashu proofs, mint quote state, premint batches, reservations, and spend/release state in SQLite.
 - `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata including expiry timestamps in SQLite, and implements `MonadWallet` for the session driver.
 - channel opening atomically reserves its loose proofs and journals the exact prepared swap before submission. Live ambiguous submissions restore their exact funding/change outputs through NUT-09; a valid empty funding restore plus every exact input `UNSPENT` permits one byte-identical replay, with at most one successor after an explicit `12002` rejection.
-- configured-client startup and manual `recover-openings` never submit opening swaps. They finish restored or finalizing channels, cancel prepared attempts and rejected attempts without successors, and abandon submitted attempts only after valid empty funding restore plus complete exact-input `UNSPENT` evidence. Abandonment atomically releases the reservation and retains a journal record with reason/time. Ambiguous, partial, invalid, pending, spent, or unavailable evidence keeps inputs reserved. Abandoned attempts are never automatically rechecked. Recovery reports distinguish recovered, cancelled, abandoned, and unresolved attempts (including reasons for unresolved attempts in JSON and CLI output).
+- configured-client startup and manual `recover-openings` never submit opening swaps. They finish restored or finalizing channels and cancel prepared attempts and rejected attempts without successors. A submitted attempt with empty, partial, invalid, or unavailable restore evidence remains unresolved and reserved; startup/manual recovery does not abandon it based on `UNSPENT` observations.
 - output keyset handling is cache-first: channel opening prefers an advertised active keyset, then falls back to another locally active same-mint/unit keyset with a negotiated format. When preferences are nonempty but unavailable locally, the client refreshes its own mint cache before using a non-preferred fallback; it also refreshes before concluding that no compatible active keyset exists. An explicit inactive-output-keyset rejection (`12002`) may create one persisted successor using a changed active keyset; ambiguous errors never trigger another swap submission.
 
 `client_wallet.channel_input_budget_msats` controls the loose-proof input budget for each newly provisioned channel. It is not a guaranteed channel capacity; fees and deterministic channel outputs can make the resulting capacity lower. The default is `1000000` msats.
@@ -145,20 +146,27 @@ monad-client wallet --config monad.yaml recover-channel --channel-id <channel-id
 monad-client wallet --config monad.yaml recover-openings
 ```
 
+One in-process `ClientWalletManager` owns the configured loose-proof and channel
+databases. Startup opens/migrates and performs recovery exactly once before any
+client starts, then all client leaves share that wallet. A second runtime using
+either database fails immediately. `channels` and `proofs` use true read-only
+SQLite access, require no sender secret in explicit-path mode, and may run while
+the runtime is active. Import and recovery commands require exclusive maintenance
+access and fail immediately while a runtime owns the wallet. Lock sidecars are
+created next to each normalized, deduplicated database path.
+
 They can also use explicit DB paths and sender key material for manual or emergency access:
 
 ```bash
 monad-client wallet \
   --loose-db ~/.monad/client-loose.sqlite \
   --channel-db ~/.monad/client-channels.sqlite \
-  --sender-secret-hex <hex> \
   --wallet-name default \
   channels
 
 monad-client wallet \
   --loose-db ~/.monad/client-loose.sqlite \
   --channel-db ~/.monad/client-channels.sqlite \
-  --sender-secret-hex <hex> \
   proofs
 
 monad-client wallet \
@@ -446,7 +454,13 @@ inspection and recovery commands; explicit DB/key flags remain available for
 manual access. `monad-client run --config monad.yaml --client local` starts the
 configured route and binds the configured SOCKS5 listener.
 
-Configured client:
+All configured clients:
+
+```bash
+RUST_LOG=info cargo run -p monad-client -- run --config monad.yaml
+```
+
+One configured client:
 
 ```bash
 RUST_LOG=info cargo run -p monad-client -- run --config monad.yaml --client local
@@ -478,8 +492,10 @@ clients:
         pubkey: "<HOP3_SECP_PUB>"
 ```
 
-The configured client listens locally as a SOCKS5 proxy at the address in
-`clients[].socks`.
+Each configured client listens locally as a SOCKS5 proxy at its
+`clients[].socks` address. If any client leaf or SOCKS listener fails, the
+process coordinates shutdown and awaits every managed client before releasing
+the shared wallet.
 
 Configured routes currently use QUIC for every hop:
 

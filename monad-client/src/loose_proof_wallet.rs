@@ -6,7 +6,9 @@
 
 use rand::RngCore;
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{
+    params, params_from_iter, Connection, OpenFlags, OptionalExtension, TransactionBehavior,
+};
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
@@ -86,15 +88,52 @@ const CREATE_OPENING_ATTEMPTS_SQL: &str = r#"
         input_budget_msats INTEGER NOT NULL,
         expiry_timestamp INTEGER NOT NULL,
         prepared_open_json TEXT NOT NULL,
+        selected_proof_ids_json TEXT NOT NULL,
         completed_open_json TEXT,
         state TEXT NOT NULL,
         rejection_code INTEGER,
         rejection_message TEXT,
+        latest_submitted_at INTEGER,
+        abandonment_reason TEXT,
+        abandoned_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         UNIQUE(wallet_name, opening_id, attempt_id)
     )
 "#;
+
+const CREATE_OPENING_EXECUTIONS_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS monad_client_opening_executions (
+        wallet_name TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        execution_sequence INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error_message TEXT,
+        claimed_at INTEGER NOT NULL,
+        authorized_at INTEGER,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (wallet_name, attempt_id, execution_sequence),
+        FOREIGN KEY (attempt_id) REFERENCES monad_client_opening_attempts(attempt_id)
+    )
+"#;
+
+const CREATE_OPENING_EXECUTIONS_INDEX_SQL: &str = r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_monad_client_opening_executions_active
+    ON monad_client_opening_executions(wallet_name, attempt_id)
+    WHERE status IN ('claimed', 'authorized')
+"#;
+
+const CREATE_OPENING_JOURNAL_META_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS monad_client_opening_journal_meta (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        schema_version INTEGER NOT NULL,
+        authority_marker TEXT NOT NULL
+    )
+"#;
+
+const OPENING_JOURNAL_SCHEMA_VERSION: i64 = 1;
+const OPENING_JOURNAL_AUTHORITY_MARKER: &str = "exact-input-two-step-execution-authority";
 
 const CREATE_OPENING_ATTEMPTS_INDEX_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_monad_client_opening_attempts_recovery
@@ -362,6 +401,7 @@ pub struct NewOpeningAttempt {
     pub input_budget_msats: u64,
     pub expiry_timestamp: u64,
     pub prepared_open_json: String,
+    pub selected_proof_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,12 +416,114 @@ pub struct OpeningAttemptRecord {
     pub input_budget_msats: u64,
     pub expiry_timestamp: u64,
     pub prepared_open_json: String,
+    pub selected_proof_ids: Vec<String>,
     pub completed_open_json: Option<String>,
     pub state: OpeningAttemptState,
     pub rejection_code: Option<u64>,
     pub rejection_message: Option<String>,
+    pub latest_submitted_at: Option<u64>,
     pub abandonment_reason: Option<String>,
     pub abandoned_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpeningExecutionKind {
+    Initial,
+    Replay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpeningExecutionStatus {
+    Claimed,
+    Authorized,
+    ResponseReceived,
+    Rejected,
+    Uncertain,
+    Cancelled,
+}
+
+impl OpeningExecutionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::Authorized => "authorized",
+            Self::ResponseReceived => "response_received",
+            Self::Rejected => "rejected",
+            Self::Uncertain => "uncertain",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn parse(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "claimed" => Ok(Self::Claimed),
+            "authorized" => Ok(Self::Authorized),
+            "response_received" => Ok(Self::ResponseReceived),
+            "rejected" => Ok(Self::Rejected),
+            "uncertain" => Ok(Self::Uncertain),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(sql_decode_error(format!(
+                "unknown opening execution status '{other}'"
+            ))),
+        }
+    }
+}
+
+impl OpeningExecutionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpeningExecutionRecord {
+    pub attempt_id: String,
+    pub execution_sequence: u64,
+    pub kind: OpeningExecutionKind,
+    pub status: OpeningExecutionStatus,
+    pub error_message: Option<String>,
+    pub authorized_at: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct OpeningSubmissionPermit {
+    attempt_id: String,
+    execution_sequence: u64,
+    kind: OpeningExecutionKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuthorizedOpeningSubmission {
+    attempt_id: String,
+    execution_sequence: u64,
+    kind: OpeningExecutionKind,
+}
+
+impl AuthorizedOpeningSubmission {
+    pub fn kind(&self) -> OpeningExecutionKind {
+        self.kind
+    }
+}
+
+impl OpeningSubmissionPermit {
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    pub fn kind(&self) -> OpeningExecutionKind {
+        self.kind
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpeningSubmissionClaim {
+    Acquired(OpeningSubmissionPermit),
+    NotReplayable { state: OpeningAttemptState },
+    InProgress,
+    NotFound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,35 +596,172 @@ pub struct LooseProofWallet {
     conn: Arc<Mutex<Connection>>,
 }
 
-fn migrate_opening_abandonment(conn: &Connection) -> Result<()> {
-    let columns = conn
-        .prepare("PRAGMA table_info(monad_client_opening_attempts)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (name, kind) in [("abandonment_reason", "TEXT"), ("abandoned_at", "INTEGER")] {
-        if !columns.iter().any(|column| column == name) {
-            conn.execute_batch(&format!(
-                "ALTER TABLE monad_client_opening_attempts ADD COLUMN {name} {kind};"
-            ))?;
+fn sqlite_object_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![name],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn sqlite_index_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+        params![name],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn table_is_nonempty(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<bool> {
+    let count: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })?;
+    Ok(count != 0)
+}
+
+fn table_columns(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<HashSet<String>> {
+    tx.prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(Into::into)
+}
+
+fn initialize_schema(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let attempts_exist = sqlite_object_exists(&tx, "monad_client_opening_attempts")?;
+    let executions_exist = sqlite_object_exists(&tx, "monad_client_opening_executions")?;
+    let meta_exists = sqlite_object_exists(&tx, "monad_client_opening_journal_meta")?;
+    let nonempty = (attempts_exist && table_is_nonempty(&tx, "monad_client_opening_attempts")?)
+        || (executions_exist && table_is_nonempty(&tx, "monad_client_opening_executions")?);
+    let marker_valid = if meta_exists {
+        tx.query_row(
+            "SELECT schema_version, authority_marker FROM monad_client_opening_journal_meta
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .is_some_and(|(version, marker)| {
+            version == OPENING_JOURNAL_SCHEMA_VERSION && marker == OPENING_JOURNAL_AUTHORITY_MARKER
+        })
+    } else {
+        false
+    };
+    let attempt_columns = if attempts_exist {
+        table_columns(&tx, "monad_client_opening_attempts")?
+    } else {
+        HashSet::new()
+    };
+    let execution_columns = if executions_exist {
+        table_columns(&tx, "monad_client_opening_executions")?
+    } else {
+        HashSet::new()
+    };
+    let attempts_valid = attempts_exist
+        && [
+            "attempt_id",
+            "opening_id",
+            "predecessor_attempt_id",
+            "wallet_name",
+            "reservation_id",
+            "receiver_pubkey",
+            "mint_url",
+            "unit",
+            "input_budget_msats",
+            "expiry_timestamp",
+            "prepared_open_json",
+            "selected_proof_ids_json",
+            "completed_open_json",
+            "state",
+            "rejection_code",
+            "rejection_message",
+            "latest_submitted_at",
+            "created_at",
+            "updated_at",
+            "abandonment_reason",
+            "abandoned_at",
+        ]
+        .into_iter()
+        .all(|column| attempt_columns.contains(column));
+    let executions_valid = executions_exist
+        && [
+            "wallet_name",
+            "attempt_id",
+            "execution_sequence",
+            "kind",
+            "status",
+            "error_message",
+            "claimed_at",
+            "authorized_at",
+            "updated_at",
+        ]
+        .into_iter()
+        .all(|column| execution_columns.contains(column));
+    let active_index_valid =
+        sqlite_index_exists(&tx, "idx_monad_client_opening_executions_active")?;
+    if !(marker_valid && attempts_valid && executions_valid && active_index_valid) {
+        if nonempty {
+            return Err(LooseProofWalletError::Backend(
+                "nonempty unversioned or partial client opening journal is not authoritative"
+                    .to_string(),
+            ));
         }
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS monad_client_opening_executions;
+             DROP TABLE IF EXISTS monad_client_opening_attempts;
+             DROP TABLE IF EXISTS monad_client_opening_journal_meta;",
+        )?;
     }
+    tx.execute_batch(&format!(
+        "{CREATE_MINT_QUOTES_SQL};{CREATE_PREMINT_BATCHES_SQL};{CREATE_LOOSE_PROOFS_SQL};
+         {CREATE_LOOSE_PROOF_INDEX_SQL};{CREATE_OPENING_ATTEMPTS_SQL};
+         {CREATE_OPENING_EXECUTIONS_SQL};{CREATE_OPENING_EXECUTIONS_INDEX_SQL};
+         {CREATE_OPENING_ATTEMPTS_INDEX_SQL};{CREATE_OPENING_JOURNAL_META_SQL};"
+    ))?;
+    tx.execute(
+        "INSERT INTO monad_client_opening_journal_meta
+         (singleton, schema_version, authority_marker) VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET schema_version = excluded.schema_version,
+             authority_marker = excluded.authority_marker",
+        params![
+            OPENING_JOURNAL_SCHEMA_VERSION,
+            OPENING_JOURNAL_AUTHORITY_MARKER
+        ],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
 impl LooseProofWallet {
     pub fn open(path: impl AsRef<Path>, wallet_name: impl Into<String>) -> Result<Self> {
-        let conn = Connection::open(path).map_err(|e| {
+        let mut conn = Connection::open(path).map_err(|e| {
             LooseProofWalletError::Backend(format!("open loose proof wallet db: {e}"))
         })?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| {
                 LooseProofWalletError::Backend(format!("set loose proof wallet busy timeout: {e}"))
             })?;
-        conn.execute_batch(&format!(
-            "{CREATE_MINT_QUOTES_SQL};{CREATE_PREMINT_BATCHES_SQL};{CREATE_LOOSE_PROOFS_SQL};{CREATE_LOOSE_PROOF_INDEX_SQL};{CREATE_OPENING_ATTEMPTS_SQL};{CREATE_OPENING_ATTEMPTS_INDEX_SQL};"
-        ))
-        .map_err(|e| LooseProofWalletError::Backend(format!("create loose proof wallet schema: {e}")))?;
-        migrate_opening_abandonment(&conn)?;
+        initialize_schema(&mut conn)?;
+        Ok(Self {
+            wallet_name: wallet_name.into(),
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Open an existing wallet without creating files, changing pragmas, or migrating schema.
+    pub fn open_read_only(path: impl AsRef<Path>, wallet_name: impl Into<String>) -> Result<Self> {
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
+                LooseProofWalletError::Backend(format!("open read-only loose proof wallet db: {e}"))
+            })?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| {
+                LooseProofWalletError::Backend(format!(
+                    "set read-only loose proof wallet busy timeout: {e}"
+                ))
+            })?;
         Ok(Self {
             wallet_name: wallet_name.into(),
             conn: Arc::new(Mutex::new(conn)),
@@ -491,14 +770,10 @@ impl LooseProofWallet {
 
     #[cfg(test)]
     fn open_in_memory(wallet_name: impl Into<String>) -> Result<Self> {
-        let conn = Connection::open_in_memory().map_err(|e| {
+        let mut conn = Connection::open_in_memory().map_err(|e| {
             LooseProofWalletError::Backend(format!("open loose proof wallet db: {e}"))
         })?;
-        conn.execute_batch(&format!(
-            "{CREATE_MINT_QUOTES_SQL};{CREATE_PREMINT_BATCHES_SQL};{CREATE_LOOSE_PROOFS_SQL};{CREATE_LOOSE_PROOF_INDEX_SQL};{CREATE_OPENING_ATTEMPTS_SQL};{CREATE_OPENING_ATTEMPTS_INDEX_SQL};"
-        ))
-        .map_err(|e| LooseProofWalletError::Backend(format!("create loose proof wallet schema: {e}")))?;
-        migrate_opening_abandonment(&conn)?;
+        initialize_schema(&mut conn)?;
         Ok(Self {
             wallet_name: wallet_name.into(),
             conn: Arc::new(Mutex::new(conn)),
@@ -996,13 +1271,21 @@ impl LooseProofWallet {
         }
         if let Some(attempt) = attempt {
             validate_opening_attempt(attempt, &reservation_id, mint_url, unit)?;
+            let selected_proof_ids_json = canonical_proof_ids_json(proof_ids)?;
+            if selected_proof_ids_json != canonical_proof_ids_json(&attempt.selected_proof_ids)? {
+                return Err(LooseProofWalletError::InvalidInput(
+                    "opening attempt selected proofs do not match the reservation".to_string(),
+                ));
+            }
             tx.execute(
                 "INSERT INTO monad_client_opening_attempts
                  (attempt_id, opening_id, predecessor_attempt_id, wallet_name,
-                  reservation_id, receiver_pubkey, mint_url, unit, input_budget_msats,
-                  expiry_timestamp, prepared_open_json, completed_open_json, state,
-                  rejection_code, rejection_message, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, NULL, NULL, ?13, ?13)",
+                   reservation_id, receiver_pubkey, mint_url, unit, input_budget_msats,
+                   expiry_timestamp, prepared_open_json, selected_proof_ids_json,
+                   completed_open_json, state, rejection_code, rejection_message,
+                   latest_submitted_at, created_at, updated_at)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                          NULL, ?13, NULL, NULL, NULL, ?14, ?14)",
                 params![
                     attempt.attempt_id,
                     attempt.opening_id,
@@ -1015,13 +1298,12 @@ impl LooseProofWallet {
                     to_i64(attempt.input_budget_msats)?,
                     to_i64(attempt.expiry_timestamp)?,
                     attempt.prepared_open_json,
+                    selected_proof_ids_json,
                     OpeningAttemptState::Prepared.as_str(),
                     to_i64(now)?,
                 ],
             )
-            .map_err(|e| {
-                LooseProofWalletError::Backend(format!("insert opening attempt: {e}"))
-            })?;
+            .map_err(|e| LooseProofWalletError::Backend(format!("insert opening attempt: {e}")))?;
         }
         tx.commit().map_err(|e| {
             LooseProofWalletError::Backend(format!("commit selected proof reservation: {e}"))
@@ -1045,8 +1327,9 @@ impl LooseProofWallet {
         let mut stmt = conn.prepare(
             "SELECT attempt_id, opening_id, predecessor_attempt_id, reservation_id,
                     receiver_pubkey, mint_url, unit, input_budget_msats, expiry_timestamp,
-                    prepared_open_json, completed_open_json, state, rejection_code,
-                    rejection_message, abandonment_reason, abandoned_at
+                    prepared_open_json, selected_proof_ids_json, completed_open_json, state,
+                    rejection_code, rejection_message, latest_submitted_at,
+                    abandonment_reason, abandoned_at
              FROM monad_client_opening_attempts
              WHERE wallet_name = ?1
                AND (
@@ -1072,8 +1355,9 @@ impl LooseProofWallet {
         conn.query_row(
             "SELECT attempt_id, opening_id, predecessor_attempt_id, reservation_id,
                     receiver_pubkey, mint_url, unit, input_budget_msats, expiry_timestamp,
-                    prepared_open_json, completed_open_json, state, rejection_code,
-                    rejection_message, abandonment_reason, abandoned_at
+                    prepared_open_json, selected_proof_ids_json, completed_open_json, state,
+                    rejection_code, rejection_message, latest_submitted_at,
+                    abandonment_reason, abandoned_at
              FROM monad_client_opening_attempts
              WHERE wallet_name = ?1 AND attempt_id = ?2",
             params![self.wallet_name, attempt_id],
@@ -1083,22 +1367,389 @@ impl LooseProofWallet {
         .map_err(Into::into)
     }
 
-    pub fn claim_opening_attempt_submission(&self, attempt_id: &str) -> Result<bool> {
+    pub fn claim_opening_attempt_submission(
+        &self,
+        attempt_id: &str,
+    ) -> Result<OpeningSubmissionClaim> {
         let now = now_seconds()?;
-        let conn = self.conn()?;
-        let changed = conn.execute(
-            "UPDATE monad_client_opening_attempts
-             SET state = ?3, updated_at = ?4
-             WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?5",
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(state) = opening_attempt_state_in_transaction(&tx, &self.wallet_name, attempt_id)?
+        else {
+            return Ok(OpeningSubmissionClaim::NotFound);
+        };
+        if state != OpeningAttemptState::Prepared {
+            return Ok(OpeningSubmissionClaim::NotReplayable { state });
+        }
+        if has_active_opening_execution(&tx, &self.wallet_name, attempt_id)? {
+            return Ok(OpeningSubmissionClaim::InProgress);
+        }
+        let sequence: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(execution_sequence), 0) + 1
+             FROM monad_client_opening_executions
+             WHERE wallet_name = ?1 AND attempt_id = ?2",
+            params![self.wallet_name, attempt_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO monad_client_opening_executions
+             (wallet_name, attempt_id, execution_sequence, kind, status, error_message,
+              claimed_at, authorized_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'claimed', NULL, ?5, NULL, ?5)",
             params![
                 self.wallet_name,
                 attempt_id,
-                OpeningAttemptState::Submitted.as_str(),
-                to_i64(now)?,
-                OpeningAttemptState::Prepared.as_str(),
+                sequence,
+                OpeningExecutionKind::Initial.as_str(),
+                to_i64(now)?
             ],
         )?;
-        Ok(changed == 1)
+        tx.commit()?;
+        Ok(OpeningSubmissionClaim::Acquired(OpeningSubmissionPermit {
+            attempt_id: attempt_id.to_string(),
+            execution_sequence: from_i64(sequence)?,
+            kind: OpeningExecutionKind::Initial,
+        }))
+    }
+
+    pub fn claim_opening_attempt_replay(&self, attempt_id: &str) -> Result<OpeningSubmissionClaim> {
+        let now = now_seconds()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = tx
+            .query_row(
+                "SELECT state FROM monad_client_opening_attempts
+                 WHERE wallet_name = ?1 AND attempt_id = ?2",
+                params![self.wallet_name, attempt_id],
+                |row| OpeningAttemptState::parse(&row.get::<_, String>(0)?),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            return Ok(OpeningSubmissionClaim::NotFound);
+        };
+        if state != OpeningAttemptState::Submitted {
+            return Ok(OpeningSubmissionClaim::NotReplayable { state });
+        }
+        if has_active_opening_execution(&tx, &self.wallet_name, attempt_id)? {
+            return Ok(OpeningSubmissionClaim::InProgress);
+        }
+        let sequence: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(execution_sequence), 0) + 1
+             FROM monad_client_opening_executions
+             WHERE wallet_name = ?1 AND attempt_id = ?2",
+            params![self.wallet_name, attempt_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO monad_client_opening_executions
+             (wallet_name, attempt_id, execution_sequence, kind, status, error_message,
+              claimed_at, authorized_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'claimed', NULL, ?5, NULL, ?5)",
+            params![
+                self.wallet_name,
+                attempt_id,
+                sequence,
+                OpeningExecutionKind::Replay.as_str(),
+                to_i64(now)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(OpeningSubmissionClaim::Acquired(OpeningSubmissionPermit {
+            attempt_id: attempt_id.to_string(),
+            execution_sequence: from_i64(sequence)?,
+            kind: OpeningExecutionKind::Replay,
+        }))
+    }
+
+    pub fn authorize_opening_submission(
+        &self,
+        permit: OpeningSubmissionPermit,
+    ) -> Result<AuthorizedOpeningSubmission> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expected_state = match permit.kind {
+            OpeningExecutionKind::Initial => OpeningAttemptState::Prepared,
+            OpeningExecutionKind::Replay => OpeningAttemptState::Submitted,
+        };
+        let execution_matches: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM monad_client_opening_executions
+                WHERE wallet_name = ?1 AND attempt_id = ?2 AND execution_sequence = ?3
+                  AND kind = ?4 AND status = 'claimed')",
+            params![
+                self.wallet_name,
+                permit.attempt_id,
+                to_i64(permit.execution_sequence)?,
+                permit.kind.as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        let state =
+            opening_attempt_state_in_transaction(&tx, &self.wallet_name, &permit.attempt_id)?;
+        if !execution_matches || state != Some(expected_state) {
+            return Err(LooseProofWalletError::InvalidStateTransition {
+                entity: "opening submission claim",
+                id: format!("{}#{}", permit.attempt_id, permit.execution_sequence),
+                expected: expected_state.as_str(),
+                actual: state
+                    .map(|state| state.as_str().to_string())
+                    .unwrap_or_else(|| "missing or stale claim".to_string()),
+                requested: "authorized",
+            });
+        }
+        let now = now_seconds()?;
+        if permit.kind == OpeningExecutionKind::Initial {
+            tx.execute(
+                "UPDATE monad_client_opening_attempts
+                 SET state = 'submitted', latest_submitted_at = ?3, updated_at = ?3
+                 WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'prepared'",
+                params![self.wallet_name, permit.attempt_id, to_i64(now)?],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE monad_client_opening_attempts
+                 SET latest_submitted_at = ?3, updated_at = ?3
+                 WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'submitted'",
+                params![self.wallet_name, permit.attempt_id, to_i64(now)?],
+            )?;
+        }
+        let changed = tx.execute(
+            "UPDATE monad_client_opening_executions
+             SET status = 'authorized', authorized_at = ?5, updated_at = ?5
+             WHERE wallet_name = ?1 AND attempt_id = ?2 AND execution_sequence = ?3
+               AND kind = ?4 AND status = 'claimed'",
+            params![
+                self.wallet_name,
+                permit.attempt_id,
+                to_i64(permit.execution_sequence)?,
+                permit.kind.as_str(),
+                to_i64(now)?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(LooseProofWalletError::InvalidStateTransition {
+                entity: "opening submission claim",
+                id: format!("{}#{}", permit.attempt_id, permit.execution_sequence),
+                expected: "claimed",
+                actual: "missing or stale claim".to_string(),
+                requested: "authorized",
+            });
+        }
+        tx.commit()?;
+        Ok(AuthorizedOpeningSubmission {
+            attempt_id: permit.attempt_id,
+            execution_sequence: permit.execution_sequence,
+            kind: permit.kind,
+        })
+    }
+
+    pub fn cancel_opening_submission_claim(&self, permit: OpeningSubmissionPermit) -> Result<()> {
+        let now = now_seconds()?;
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE monad_client_opening_executions
+             SET status = 'cancelled', updated_at = ?5
+             WHERE wallet_name = ?1 AND attempt_id = ?2 AND execution_sequence = ?3
+               AND kind = ?4 AND status = 'claimed'",
+            params![
+                self.wallet_name,
+                permit.attempt_id,
+                to_i64(permit.execution_sequence)?,
+                permit.kind.as_str(),
+                to_i64(now)?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(LooseProofWalletError::InvalidStateTransition {
+                entity: "opening submission claim",
+                id: format!("{}#{}", permit.attempt_id, permit.execution_sequence),
+                expected: "claimed",
+                actual: "missing or stale claim".to_string(),
+                requested: "cancelled",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn finish_opening_execution(
+        &self,
+        permit: AuthorizedOpeningSubmission,
+        status: OpeningExecutionStatus,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        if matches!(
+            status,
+            OpeningExecutionStatus::Claimed
+                | OpeningExecutionStatus::Authorized
+                | OpeningExecutionStatus::Rejected
+                | OpeningExecutionStatus::Cancelled
+        ) {
+            return Err(LooseProofWalletError::InvalidInput(format!(
+                "invalid terminal opening execution status '{status:?}'"
+            )));
+        }
+        let now = now_seconds()?;
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE monad_client_opening_executions
+             SET status = ?4, error_message = ?5, updated_at = ?6
+             WHERE wallet_name = ?1 AND attempt_id = ?2 AND execution_sequence = ?3
+               AND kind = ?7 AND status = 'authorized'",
+            params![
+                self.wallet_name,
+                permit.attempt_id,
+                to_i64(permit.execution_sequence)?,
+                status.as_str(),
+                error_message,
+                to_i64(now)?,
+                permit.kind.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(LooseProofWalletError::InvalidStateTransition {
+                entity: "opening execution",
+                id: format!("{}#{}", permit.attempt_id, permit.execution_sequence),
+                expected: "authorized",
+                actual: "missing or already completed".to_string(),
+                requested: "terminal execution status",
+            });
+        }
+        Ok(())
+    }
+
+    /// Atomically records a definitive mint rejection and, for the first
+    /// execution only, makes the attempt safe to replace or cancel.
+    pub(crate) fn record_definitive_opening_rejection(
+        &self,
+        permit: AuthorizedOpeningSubmission,
+        code: u64,
+        message: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let execution_matches: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM monad_client_opening_executions
+                WHERE wallet_name = ?1 AND attempt_id = ?2 AND execution_sequence = ?3
+                  AND kind = ?4 AND status = 'authorized')",
+            params![
+                self.wallet_name,
+                permit.attempt_id,
+                to_i64(permit.execution_sequence)?,
+                permit.kind.as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        if !execution_matches {
+            return Err(LooseProofWalletError::InvalidStateTransition {
+                entity: "opening execution",
+                id: format!("{}#{}", permit.attempt_id, permit.execution_sequence),
+                expected: "authorized",
+                actual: "missing or already completed".to_string(),
+                requested: "definitive rejection",
+            });
+        }
+
+        let reject_attempt = permit.kind == OpeningExecutionKind::Initial;
+        if reject_attempt {
+            let prior_ambiguous_execution: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM monad_client_opening_executions
+                    WHERE wallet_name = ?1 AND attempt_id = ?2
+                      AND execution_sequence < ?3
+                      AND status IN ('authorized', 'response_received', 'uncertain'))",
+                params![
+                    self.wallet_name,
+                    permit.attempt_id,
+                    to_i64(permit.execution_sequence)?
+                ],
+                |row| row.get(0),
+            )?;
+            if permit.execution_sequence != 1 || prior_ambiguous_execution {
+                return Err(LooseProofWalletError::InvalidStateTransition {
+                    entity: "opening attempt",
+                    id: permit.attempt_id,
+                    expected: "first authoritative execution without prior ambiguity",
+                    actual: "prior mint-visible execution exists".to_string(),
+                    requested: OpeningAttemptState::Rejected.as_str(),
+                });
+            }
+        }
+
+        let now = now_seconds()?;
+        let changed = tx.execute(
+            "UPDATE monad_client_opening_executions
+             SET status = 'rejected', error_message = ?5, updated_at = ?6
+             WHERE wallet_name = ?1 AND attempt_id = ?2 AND execution_sequence = ?3
+               AND kind = ?4 AND status = 'authorized'",
+            params![
+                self.wallet_name,
+                permit.attempt_id,
+                to_i64(permit.execution_sequence)?,
+                permit.kind.as_str(),
+                message,
+                to_i64(now)?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(LooseProofWalletError::ReservationConflict {
+                expected: 1,
+                updated: changed,
+            });
+        }
+        if reject_attempt {
+            let changed = tx.execute(
+                "UPDATE monad_client_opening_attempts
+                 SET state = 'rejected', rejection_code = ?3, rejection_message = ?4,
+                     updated_at = ?5
+                 WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'submitted'",
+                params![
+                    self.wallet_name,
+                    permit.attempt_id,
+                    to_i64(code)?,
+                    message,
+                    to_i64(now)?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(LooseProofWalletError::ReservationConflict {
+                    expected: 1,
+                    updated: changed,
+                });
+            }
+        }
+        tx.commit()?;
+        Ok(reject_attempt)
+    }
+
+    pub fn opening_executions(&self, attempt_id: &str) -> Result<Vec<OpeningExecutionRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT attempt_id, execution_sequence, kind, status, error_message, authorized_at
+             FROM monad_client_opening_executions
+             WHERE wallet_name = ?1 AND attempt_id = ?2 ORDER BY execution_sequence",
+        )?;
+        let rows = stmt.query_map(params![self.wallet_name, attempt_id], |row| {
+            let kind = match row.get::<_, String>(2)?.as_str() {
+                "initial" => OpeningExecutionKind::Initial,
+                "replay" => OpeningExecutionKind::Replay,
+                other => {
+                    return Err(sql_decode_error(format!(
+                        "unknown execution kind '{other}'"
+                    )))
+                }
+            };
+            Ok(OpeningExecutionRecord {
+                attempt_id: row.get(0)?,
+                execution_sequence: from_i64(row.get(1)?)?,
+                kind,
+                status: OpeningExecutionStatus::parse(&row.get::<_, String>(3)?)?,
+                error_message: row.get(4)?,
+                authorized_at: optional_from_i64(row.get(5)?)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Persist a successor attempt while retaining the operation-owned reservation.
@@ -1138,7 +1789,7 @@ impl LooseProofWallet {
                 .query_row(
                     "SELECT state, rejection_code, opening_id, reservation_id, receiver_pubkey,
                             mint_url, unit, input_budget_msats, expiry_timestamp,
-                            predecessor_attempt_id
+                            predecessor_attempt_id, selected_proof_ids_json
                      FROM monad_client_opening_attempts
                      WHERE wallet_name = ?1 AND attempt_id = ?2",
                     params![self.wallet_name, predecessor],
@@ -1154,6 +1805,7 @@ impl LooseProofWallet {
                             row.get::<_, i64>(7)?,
                             row.get::<_, i64>(8)?,
                             row.get::<_, Option<String>>(9)?,
+                            row.get::<_, String>(10)?,
                         ))
                     },
                 )
@@ -1169,6 +1821,7 @@ impl LooseProofWallet {
                 to_i64(attempt.input_budget_msats)?,
                 to_i64(attempt.expiry_timestamp)?,
                 None,
+                canonical_proof_ids_json(&attempt.selected_proof_ids)?,
             );
             if predecessor_record != Some(expected) {
                 return Err(LooseProofWalletError::InvalidInput(format!(
@@ -1176,13 +1829,26 @@ impl LooseProofWallet {
                 )));
             }
         }
+        let selected_proof_ids_json = canonical_proof_ids_json(&attempt.selected_proof_ids)?;
+        let reserved_ids = proof_ids_for_reservation_in_transaction(
+            &tx,
+            &self.wallet_name,
+            &attempt.reservation_id,
+        )?;
+        if canonical_proof_ids_json(&reserved_ids)? != selected_proof_ids_json {
+            return Err(LooseProofWalletError::InvalidInput(
+                "successor selected proofs do not exactly match its reservation".to_string(),
+            ));
+        }
         tx.execute(
             "INSERT INTO monad_client_opening_attempts
              (attempt_id, opening_id, predecessor_attempt_id, wallet_name,
               reservation_id, receiver_pubkey, mint_url, unit, input_budget_msats,
-              expiry_timestamp, prepared_open_json, completed_open_json, state,
-              rejection_code, rejection_message, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, NULL, NULL, ?13, ?13)",
+               expiry_timestamp, prepared_open_json, selected_proof_ids_json,
+               completed_open_json, state, rejection_code, rejection_message,
+               latest_submitted_at, created_at, updated_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                      NULL, ?13, NULL, NULL, NULL, ?14, ?14)",
             params![
                 attempt.attempt_id,
                 attempt.opening_id,
@@ -1195,27 +1861,13 @@ impl LooseProofWallet {
                 to_i64(attempt.input_budget_msats)?,
                 to_i64(attempt.expiry_timestamp)?,
                 attempt.prepared_open_json,
+                selected_proof_ids_json,
                 OpeningAttemptState::Prepared.as_str(),
                 to_i64(now)?,
             ],
         )?;
         tx.commit()?;
         Ok(())
-    }
-
-    pub fn mark_opening_attempt_rejected(
-        &self,
-        attempt_id: &str,
-        code: Option<u64>,
-        message: &str,
-    ) -> Result<()> {
-        self.transition_opening_attempt(
-            attempt_id,
-            OpeningAttemptState::Submitted,
-            OpeningAttemptState::Rejected,
-            code,
-            Some(message),
-        )
     }
 
     pub fn mark_opening_attempt_finalizing(
@@ -1259,14 +1911,128 @@ impl LooseProofWallet {
         }
     }
 
-    pub fn mark_opening_attempt_completed(&self, attempt_id: &str) -> Result<()> {
-        self.transition_opening_attempt(
-            attempt_id,
-            OpeningAttemptState::Finalizing,
-            OpeningAttemptState::Completed,
-            None,
-            None,
-        )
+    pub fn complete_opening_attempt_exact(&self, attempt_id: &str) -> Result<()> {
+        let now = now_seconds()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = tx
+            .query_row(
+                "SELECT state, reservation_id, selected_proof_ids_json, prepared_open_json,
+                        completed_open_json
+                 FROM monad_client_opening_attempts
+                 WHERE wallet_name = ?1 AND attempt_id = ?2",
+                params![self.wallet_name, attempt_id],
+                |row| {
+                    Ok((
+                        OpeningAttemptState::parse(&row.get::<_, String>(0)?)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                LooseProofWalletError::NotFound(format!("opening attempt '{attempt_id}'"))
+            })?;
+        let (state, reservation_id, selected_json, prepared_json, completed_json) = row;
+        if !matches!(
+            state,
+            OpeningAttemptState::Finalizing | OpeningAttemptState::Completed
+        ) {
+            return Err(LooseProofWalletError::InvalidStateTransition {
+                entity: "opening attempt",
+                id: attempt_id.to_string(),
+                expected: OpeningAttemptState::Finalizing.as_str(),
+                actual: state.as_str().to_string(),
+                requested: OpeningAttemptState::Completed.as_str(),
+            });
+        }
+        let expected: Vec<String> = serde_json::from_str(&selected_json).map_err(|e| {
+            LooseProofWalletError::Backend(format!(
+                "decode selected proofs for opening attempt '{attempt_id}': {e}"
+            ))
+        })?;
+        let expected_json = canonical_proof_ids_json(&expected)?;
+        if expected_json != selected_json || expected.is_empty() {
+            return Err(LooseProofWalletError::Backend(format!(
+                "opening attempt '{attempt_id}' has invalid selected proof ids"
+            )));
+        }
+        let completed_json = completed_json.ok_or_else(|| {
+            LooseProofWalletError::Backend(format!(
+                "opening attempt '{attempt_id}' has no authoritative completion payload"
+            ))
+        })?;
+        let channel_id = authoritative_completed_channel_id(&completed_json)?;
+        let prepared_channel_id = authoritative_prepared_channel_id(&prepared_json)?;
+        if channel_id != attempt_id || prepared_channel_id != attempt_id {
+            return Err(LooseProofWalletError::Backend(format!(
+                "opening attempt '{attempt_id}' has conflicting prepared/completed channel identity"
+            )));
+        }
+
+        let mut stmt = tx.prepare(
+            "SELECT proof_id, state, reserved_by, spent_channel_id
+             FROM monad_client_loose_proofs
+             WHERE wallet_name = ?1 AND (reserved_by = ?2 OR spent_channel_id = ?3)",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![self.wallet_name, reservation_id, channel_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if rows.len() != expected.len() {
+            return Err(LooseProofWalletError::ReservationConflict {
+                expected: expected.len(),
+                updated: rows.len(),
+            });
+        }
+        let expected_set = expected.iter().collect::<HashSet<_>>();
+        for (proof_id, proof_state, reserved_by, spent_channel_id) in &rows {
+            let reserved_for_attempt = proof_state == "reserved"
+                && reserved_by.as_deref() == Some(reservation_id.as_str())
+                && spent_channel_id.is_none();
+            let spent_for_channel = proof_state == "spent"
+                && reserved_by.as_deref() == Some(reservation_id.as_str())
+                && spent_channel_id.as_deref() == Some(channel_id.as_str());
+            if !expected_set.contains(proof_id) || !(reserved_for_attempt || spent_for_channel) {
+                return Err(LooseProofWalletError::InvalidInput(format!(
+                    "proof '{proof_id}' conflicts with exact completion of opening '{attempt_id}'"
+                )));
+            }
+        }
+        tx.execute(
+            "UPDATE monad_client_loose_proofs
+             SET state = 'spent', spent_channel_id = ?3, updated_at = ?4
+             WHERE wallet_name = ?1 AND reserved_by = ?2 AND state = 'reserved'",
+            params![self.wallet_name, reservation_id, channel_id, to_i64(now)?],
+        )?;
+        if state == OpeningAttemptState::Finalizing {
+            let changed = tx.execute(
+                "UPDATE monad_client_opening_attempts SET state = 'completed', updated_at = ?3
+                 WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'finalizing'",
+                params![self.wallet_name, attempt_id, to_i64(now)?],
+            )?;
+            if changed != 1 {
+                return Err(LooseProofWalletError::ReservationConflict {
+                    expected: 1,
+                    updated: changed,
+                });
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn cancel_rejected_opening_attempt(&self, attempt_id: &str) -> Result<()> {
@@ -1277,9 +2043,8 @@ impl LooseProofWallet {
         self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Prepared, None)
     }
 
-    /// Release operation-owned inputs only after restore found no funding and
-    /// every exact input was observed UNSPENT. Retain the journal as a tombstone.
-    pub(crate) fn abandon_opening_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
+    #[cfg(test)]
+    fn abandon_opening_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
         self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Submitted, Some(reason))
     }
 
@@ -1292,9 +2057,10 @@ impl LooseProofWallet {
         let now = now_seconds()?;
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let reservation_id: Option<String> = tx
+        let attempt: Option<(String, String)> = tx
             .query_row(
-                "SELECT reservation_id FROM monad_client_opening_attempts
+                "SELECT reservation_id, selected_proof_ids_json
+                 FROM monad_client_opening_attempts
                  WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?3
                    AND NOT EXISTS (
                        SELECT 1 FROM monad_client_opening_attempts successor
@@ -1306,25 +2072,50 @@ impl LooseProofWallet {
                     attempt_id,
                     expected_state.as_str()
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some(reservation_id) = reservation_id else {
+        let Some((reservation_id, selected_json)) = attempt else {
             return Ok(());
         };
-        tx.execute(
-            "UPDATE monad_client_loose_proofs
-             SET state = ?4, reserved_by = NULL, updated_at = ?5
-             WHERE wallet_name = ?1 AND reserved_by = ?2 AND state = ?3",
-            params![
-                self.wallet_name,
-                reservation_id,
-                LooseProofState::Reserved.as_str(),
-                LooseProofState::Available.as_str(),
-                to_i64(now)?,
-            ],
+        let expected: Vec<String> = serde_json::from_str(&selected_json).map_err(|e| {
+            LooseProofWalletError::Backend(format!(
+                "decode selected proofs for opening attempt '{attempt_id}': {e}"
+            ))
+        })?;
+        if expected.is_empty() || canonical_proof_ids_json(&expected)? != selected_json {
+            return Err(LooseProofWalletError::Backend(format!(
+                "opening attempt '{attempt_id}' has invalid selected proof ids"
+            )));
+        }
+        let mut stmt = tx.prepare(
+            "SELECT proof_id, state, spent_channel_id FROM monad_client_loose_proofs
+             WHERE wallet_name = ?1 AND reserved_by = ?2",
         )?;
-        tx.execute(
+        let rows = stmt
+            .query_map(params![self.wallet_name, reservation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let expected_set = expected.iter().collect::<HashSet<_>>();
+        if rows.len() != expected.len()
+            || rows.iter().any(|(proof_id, state, spent_channel_id)| {
+                !expected_set.contains(proof_id)
+                    || state != LooseProofState::Reserved.as_str()
+                    || spent_channel_id.is_some()
+            })
+        {
+            return Err(LooseProofWalletError::ReservationConflict {
+                expected: expected.len(),
+                updated: rows.len(),
+            });
+        }
+        let changed = tx.execute(
             "UPDATE monad_client_opening_attempts
              SET state = ?3, updated_at = ?4, abandonment_reason = ?6,
                  abandoned_at = CASE WHEN ?6 IS NOT NULL THEN ?4 ELSE NULL END
@@ -1342,41 +2133,35 @@ impl LooseProofWallet {
                 abandonment_reason,
             ],
         )?;
+        if changed != 1 {
+            return Err(LooseProofWalletError::ReservationConflict {
+                expected: 1,
+                updated: changed,
+            });
+        }
+        for proof_id in &expected {
+            let changed = tx.execute(
+                "UPDATE monad_client_loose_proofs
+                 SET state = 'available', reserved_by = NULL, updated_at = ?4
+                 WHERE wallet_name = ?1 AND proof_id = ?2 AND reserved_by = ?3
+                   AND state = 'reserved' AND spent_channel_id IS NULL",
+                params![self.wallet_name, proof_id, reservation_id, to_i64(now)?],
+            )?;
+            if changed != 1 {
+                return Err(LooseProofWalletError::ReservationConflict {
+                    expected: expected.len(),
+                    updated: 0,
+                });
+            }
+        }
+        tx.execute(
+            "UPDATE monad_client_opening_executions
+             SET status = 'cancelled', updated_at = ?3
+             WHERE wallet_name = ?1 AND attempt_id = ?2 AND status = 'claimed'",
+            params![self.wallet_name, attempt_id, to_i64(now)?],
+        )?;
         tx.commit()?;
         Ok(())
-    }
-
-    fn transition_opening_attempt(
-        &self,
-        attempt_id: &str,
-        expected: OpeningAttemptState,
-        next: OpeningAttemptState,
-        rejection_code: Option<u64>,
-        rejection_message: Option<&str>,
-    ) -> Result<()> {
-        let now = now_seconds()?;
-        let conn = self.conn()?;
-        let changed = conn.execute(
-            "UPDATE monad_client_opening_attempts
-             SET state = ?3, rejection_code = COALESCE(?4, rejection_code),
-                 rejection_message = COALESCE(?5, rejection_message), updated_at = ?6
-             WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?7",
-            params![
-                self.wallet_name,
-                attempt_id,
-                next.as_str(),
-                rejection_code.map(to_i64).transpose()?,
-                rejection_message,
-                to_i64(now)?,
-                expected.as_str(),
-            ],
-        )?;
-        if changed == 1 {
-            Ok(())
-        } else {
-            drop(conn);
-            self.ensure_opening_attempt_state(attempt_id, next)
-        }
     }
 
     fn ensure_opening_attempt_state(
@@ -1405,7 +2190,12 @@ impl LooseProofWallet {
         conn.execute(
             "UPDATE monad_client_loose_proofs
              SET state = ?4, reserved_by = NULL, updated_at = ?5
-             WHERE wallet_name = ?1 AND reserved_by = ?2 AND state = ?3",
+             WHERE wallet_name = ?1 AND reserved_by = ?2 AND state = ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM monad_client_opening_attempts
+                   WHERE wallet_name = ?1 AND reservation_id = ?2
+                     AND state IN ('prepared', 'submitted', 'finalizing')
+               )",
             params![
                 self.wallet_name,
                 reservation_id,
@@ -1719,6 +2509,11 @@ fn validate_opening_attempt(
     validate_nonempty("opening_id", &attempt.opening_id)?;
     validate_nonempty("receiver_pubkey", &attempt.receiver_pubkey)?;
     validate_nonempty("prepared_open_json", &attempt.prepared_open_json)?;
+    if attempt.selected_proof_ids.is_empty() {
+        return Err(LooseProofWalletError::InvalidInput(
+            "opening attempt selected proofs must not be empty".to_string(),
+        ));
+    }
     if attempt.reservation_id != reservation_id
         || attempt.mint_url != mint_url
         || attempt.unit != unit
@@ -1728,6 +2523,117 @@ fn validate_opening_attempt(
         ));
     }
     Ok(())
+}
+
+fn canonical_proof_ids_json(proof_ids: &[String]) -> Result<String> {
+    let mut ids = proof_ids.to_vec();
+    ids.sort();
+    if ids.iter().any(|id| id.trim().is_empty()) {
+        return Err(LooseProofWalletError::InvalidInput(
+            "selected proof id must not be empty".to_string(),
+        ));
+    }
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(LooseProofWalletError::InvalidInput(
+            "selected proof ids contain a duplicate".to_string(),
+        ));
+    }
+    serde_json::to_string(&ids)
+        .map_err(|e| LooseProofWalletError::Backend(format!("serialize selected proof ids: {e}")))
+}
+
+fn authoritative_completed_channel_id(completed_json: &str) -> Result<String> {
+    let completed: serde_json::Value = serde_json::from_str(completed_json).map_err(|e| {
+        LooseProofWalletError::Backend(format!(
+            "decode authoritative completed opening payload: {e}"
+        ))
+    })?;
+    let channel_id = completed
+        .get("channel_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LooseProofWalletError::Backend(
+                "authoritative completed opening payload has no channel_id".to_string(),
+            )
+        })?;
+    let result_channel_id = completed
+        .get("result")
+        .and_then(|result| result.get("channel_id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LooseProofWalletError::Backend(
+                "authoritative completed opening result has no channel_id".to_string(),
+            )
+        })?;
+    if channel_id != result_channel_id {
+        return Err(LooseProofWalletError::Backend(format!(
+            "authoritative completed opening channel ids conflict: '{channel_id}' and '{result_channel_id}'"
+        )));
+    }
+    Ok(channel_id.to_string())
+}
+
+fn authoritative_prepared_channel_id(prepared_json: &str) -> Result<String> {
+    serde_json::from_str::<serde_json::Value>(prepared_json)
+        .map_err(|e| {
+            LooseProofWalletError::Backend(format!(
+                "decode authoritative prepared opening payload: {e}"
+            ))
+        })?
+        .get("channel_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            LooseProofWalletError::Backend(
+                "authoritative prepared opening payload has no channel_id".to_string(),
+            )
+        })
+}
+
+fn proof_ids_for_reservation_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    wallet_name: &str,
+    reservation_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT proof_id FROM monad_client_loose_proofs
+         WHERE wallet_name = ?1 AND reserved_by = ?2 AND state = 'reserved'",
+    )?;
+    let ids = stmt
+        .query_map(params![wallet_name, reservation_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+fn opening_attempt_state_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    wallet_name: &str,
+    attempt_id: &str,
+) -> Result<Option<OpeningAttemptState>> {
+    tx.query_row(
+        "SELECT state FROM monad_client_opening_attempts
+         WHERE wallet_name = ?1 AND attempt_id = ?2",
+        params![wallet_name, attempt_id],
+        |row| OpeningAttemptState::parse(&row.get::<_, String>(0)?),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn has_active_opening_execution(
+    tx: &rusqlite::Transaction<'_>,
+    wallet_name: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM monad_client_opening_executions
+            WHERE wallet_name = ?1 AND attempt_id = ?2
+              AND status IN ('claimed', 'authorized'))",
+        params![wallet_name, attempt_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn row_to_opening_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpeningAttemptRecord> {
@@ -1742,12 +2648,18 @@ fn row_to_opening_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpeningAt
         input_budget_msats: from_i64(row.get(7)?)?,
         expiry_timestamp: from_i64(row.get(8)?)?,
         prepared_open_json: row.get(9)?,
-        completed_open_json: row.get(10)?,
-        state: OpeningAttemptState::parse(&row.get::<_, String>(11)?)?,
-        rejection_code: row.get::<_, Option<i64>>(12)?.map(from_i64).transpose()?,
-        rejection_message: row.get(13)?,
-        abandonment_reason: row.get(14)?,
-        abandoned_at: row.get(15)?,
+        selected_proof_ids: serde_json::from_str(&row.get::<_, String>(10)?).map_err(|e| {
+            sql_decode_error(format!(
+                "invalid selected proof ids in opening journal: {e}"
+            ))
+        })?,
+        completed_open_json: row.get(11)?,
+        state: OpeningAttemptState::parse(&row.get::<_, String>(12)?)?,
+        rejection_code: row.get::<_, Option<i64>>(13)?.map(from_i64).transpose()?,
+        rejection_message: row.get(14)?,
+        latest_submitted_at: optional_from_i64(row.get(15)?)?,
+        abandonment_reason: row.get(16)?,
+        abandoned_at: row.get(17)?,
     })
 }
 
@@ -1839,6 +2751,42 @@ mod tests {
             source_quote_id: Some("quote-a".to_string()),
             source_batch_id: Some("batch-a".to_string()),
         }
+    }
+
+    fn opening_attempt(
+        attempt_id: &str,
+        reservation_id: &str,
+        proof_ids: &[&str],
+    ) -> NewOpeningAttempt {
+        NewOpeningAttempt {
+            attempt_id: attempt_id.to_string(),
+            opening_id: attempt_id.to_string(),
+            predecessor_attempt_id: None,
+            reservation_id: reservation_id.to_string(),
+            receiver_pubkey: "receiver".to_string(),
+            mint_url: MINT.to_string(),
+            unit: "sat".to_string(),
+            input_budget_msats: 8_000,
+            expiry_timestamp: 123_456,
+            prepared_open_json: format!(r#"{{"channel_id":"{attempt_id}"}}"#),
+            selected_proof_ids: proof_ids.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
+    fn claim_and_authorize(
+        wallet: &LooseProofWallet,
+        attempt_id: &str,
+    ) -> AuthorizedOpeningSubmission {
+        let OpeningSubmissionClaim::Acquired(permit) =
+            wallet.claim_opening_attempt_submission(attempt_id).unwrap()
+        else {
+            panic!("opening submission claim was not acquired");
+        };
+        wallet.authorize_opening_submission(permit).unwrap()
+    }
+
+    fn completed_payload(channel_id: &str) -> String {
+        format!(r#"{{"channel_id":"{channel_id}","result":{{"channel_id":"{channel_id}"}}}}"#)
     }
 
     fn free_loopback_port() -> u16 {
@@ -2422,6 +3370,7 @@ mod tests {
             input_budget_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: r#"{"channel_id":"channel-a"}"#.to_string(),
+            selected_proof_ids: vec!["proof-a".to_string()],
         };
 
         let reservation = wallet
@@ -2441,26 +3390,455 @@ mod tests {
             LooseProofState::Reserved
         );
 
-        assert!(wallet
+        let permit = match wallet
             .claim_opening_attempt_submission("channel-a")
-            .unwrap());
-        assert!(!wallet
-            .claim_opening_attempt_submission("channel-a")
-            .unwrap());
+            .unwrap()
+        {
+            OpeningSubmissionClaim::Acquired(permit) => permit,
+            other => panic!("unexpected submission claim: {other:?}"),
+        };
+        assert_eq!(
+            wallet.opening_attempt("channel-a").unwrap().unwrap().state,
+            OpeningAttemptState::Prepared
+        );
+        assert_eq!(
+            wallet
+                .opening_attempt("channel-a")
+                .unwrap()
+                .unwrap()
+                .latest_submitted_at,
+            None
+        );
+        let claimed = wallet.opening_executions("channel-a").unwrap();
+        assert_eq!(claimed[0].status, OpeningExecutionStatus::Claimed);
+        assert_eq!(claimed[0].authorized_at, None);
+        assert_eq!(
+            wallet
+                .claim_opening_attempt_submission("channel-a")
+                .unwrap(),
+            OpeningSubmissionClaim::InProgress
+        );
+        let permit = wallet.authorize_opening_submission(permit).unwrap();
         wallet
-            .mark_opening_attempt_finalizing("channel-a", r#"{"result":"ok"}"#)
+            .finish_opening_execution(permit, OpeningExecutionStatus::ResponseReceived, None)
             .unwrap();
         wallet
-            .mark_opening_attempt_finalizing("channel-a", r#"{"result":"ok"}"#)
+            .mark_opening_attempt_finalizing("channel-a", &completed_payload("channel-a"))
+            .unwrap();
+        wallet
+            .mark_opening_attempt_finalizing("channel-a", &completed_payload("channel-a"))
             .unwrap();
         assert!(wallet
             .mark_opening_attempt_finalizing("channel-a", r#"{"result":"different"}"#)
             .is_err());
-        wallet.mark_opening_attempt_completed("channel-a").unwrap();
+        wallet.complete_opening_attempt_exact("channel-a").unwrap();
         assert_eq!(
             wallet.opening_attempt("channel-a").unwrap().unwrap().state,
             OpeningAttemptState::Completed
         );
+        wallet.complete_opening_attempt_exact("channel-a").unwrap();
+    }
+
+    #[test]
+    fn opening_attempt_rejects_selected_proof_id_mismatch_atomically() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        let attempt = opening_attempt("channel-a", "reservation-a", &["proof-b"]);
+        assert!(wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &attempt,
+            )
+            .is_err());
+        assert_eq!(
+            wallet
+                .list_available_proofs(MINT, "sat", &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(wallet.opening_attempt("channel-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn submission_claim_and_replay_are_typed_and_durably_sequenced() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        let attempt = opening_attempt("channel-a", "reservation-a", &["proof-a"]);
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &attempt,
+            )
+            .unwrap();
+        let initial = match wallet
+            .claim_opening_attempt_submission("channel-a")
+            .unwrap()
+        {
+            OpeningSubmissionClaim::Acquired(permit) => permit,
+            other => panic!("unexpected claim: {other:?}"),
+        };
+        assert_eq!(
+            wallet
+                .opening_attempt("channel-a")
+                .unwrap()
+                .unwrap()
+                .latest_submitted_at,
+            None
+        );
+        assert_eq!(
+            wallet.claim_opening_attempt_replay("channel-a").unwrap(),
+            OpeningSubmissionClaim::NotReplayable {
+                state: OpeningAttemptState::Prepared
+            }
+        );
+        let initial = wallet.authorize_opening_submission(initial).unwrap();
+        assert!(wallet
+            .opening_attempt("channel-a")
+            .unwrap()
+            .unwrap()
+            .latest_submitted_at
+            .is_some());
+        assert_eq!(wallet.release_reservation("reservation-a").unwrap(), 0);
+        assert_eq!(
+            wallet.proofs_for_reservation("reservation-a").unwrap()[0].state,
+            LooseProofState::Reserved
+        );
+        assert_eq!(
+            wallet
+                .claim_opening_attempt_submission("channel-a")
+                .unwrap(),
+            OpeningSubmissionClaim::NotReplayable {
+                state: OpeningAttemptState::Submitted
+            }
+        );
+        wallet
+            .finish_opening_execution(initial, OpeningExecutionStatus::Uncertain, Some("timeout"))
+            .unwrap();
+        let replay = match wallet.claim_opening_attempt_replay("channel-a").unwrap() {
+            OpeningSubmissionClaim::Acquired(permit) => permit,
+            other => panic!("unexpected replay claim: {other:?}"),
+        };
+        assert_eq!(
+            wallet.claim_opening_attempt_replay("channel-a").unwrap(),
+            OpeningSubmissionClaim::InProgress
+        );
+        let replay = wallet.authorize_opening_submission(replay).unwrap();
+        wallet
+            .finish_opening_execution(replay, OpeningExecutionStatus::ResponseReceived, None)
+            .unwrap();
+        let executions = wallet.opening_executions("channel-a").unwrap();
+        assert_eq!(executions.len(), 2);
+        assert_eq!(executions[0].kind, OpeningExecutionKind::Initial);
+        assert_eq!(executions[0].status, OpeningExecutionStatus::Uncertain);
+        assert_eq!(executions[1].kind, OpeningExecutionKind::Replay);
+        assert_eq!(executions[1].execution_sequence, 2);
+    }
+
+    #[test]
+    fn submission_claim_rolls_back_state_and_timestamp_if_execution_insert_fails() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &opening_attempt("channel-a", "reservation-a", &["proof-a"]),
+            )
+            .unwrap();
+        wallet
+            .conn()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_execution_insert BEFORE INSERT ON monad_client_opening_executions
+                 BEGIN SELECT RAISE(ABORT, 'injected execution insert fault'); END;",
+            )
+            .unwrap();
+        assert!(wallet
+            .claim_opening_attempt_submission("channel-a")
+            .is_err());
+        let attempt = wallet.opening_attempt("channel-a").unwrap().unwrap();
+        assert_eq!(attempt.state, OpeningAttemptState::Prepared);
+        assert_eq!(attempt.latest_submitted_at, None);
+        assert!(wallet.opening_executions("channel-a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn generic_execution_completion_cannot_bypass_rejection_authority() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &opening_attempt("channel-a", "reservation-a", &["proof-a"]),
+            )
+            .unwrap();
+        let authorized = claim_and_authorize(&wallet, "channel-a");
+
+        assert!(wallet
+            .finish_opening_execution(
+                authorized,
+                OpeningExecutionStatus::Rejected,
+                Some("forged rejection"),
+            )
+            .is_err());
+        assert_eq!(
+            wallet.opening_attempt("channel-a").unwrap().unwrap().state,
+            OpeningAttemptState::Submitted
+        );
+        assert_eq!(
+            wallet.opening_executions("channel-a").unwrap()[0].status,
+            OpeningExecutionStatus::Authorized
+        );
+        assert_eq!(wallet.release_reservation("reservation-a").unwrap(), 0);
+    }
+
+    #[test]
+    fn definitive_initial_rejection_is_atomic_across_fault() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &opening_attempt("channel-a", "reservation-a", &["proof-a"]),
+            )
+            .unwrap();
+        let authorized = claim_and_authorize(&wallet, "channel-a");
+        wallet
+            .conn()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_attempt_rejection BEFORE UPDATE
+                 ON monad_client_opening_attempts WHEN NEW.state = 'rejected'
+                 BEGIN SELECT RAISE(ABORT, 'injected rejection fault'); END;",
+            )
+            .unwrap();
+
+        assert!(wallet
+            .record_definitive_opening_rejection(authorized, 12_002, "inactive keyset")
+            .is_err());
+        let attempt = wallet.opening_attempt("channel-a").unwrap().unwrap();
+        assert_eq!(attempt.state, OpeningAttemptState::Submitted);
+        assert_eq!(attempt.rejection_code, None);
+        let executions = wallet.opening_executions("channel-a").unwrap();
+        assert_eq!(executions[0].status, OpeningExecutionStatus::Authorized);
+        assert_eq!(executions[0].error_message, None);
+    }
+
+    #[test]
+    fn definitive_replay_rejection_preserves_prior_ambiguity() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &opening_attempt("channel-a", "reservation-a", &["proof-a"]),
+            )
+            .unwrap();
+        let initial = claim_and_authorize(&wallet, "channel-a");
+        wallet
+            .finish_opening_execution(initial, OpeningExecutionStatus::Uncertain, Some("timeout"))
+            .unwrap();
+        let OpeningSubmissionClaim::Acquired(replay) =
+            wallet.claim_opening_attempt_replay("channel-a").unwrap()
+        else {
+            panic!("replay claim not acquired");
+        };
+        let replay = wallet.authorize_opening_submission(replay).unwrap();
+
+        assert!(!wallet
+            .record_definitive_opening_rejection(replay, 12_002, "inactive keyset")
+            .unwrap());
+        let attempt = wallet.opening_attempt("channel-a").unwrap().unwrap();
+        assert_eq!(attempt.state, OpeningAttemptState::Submitted);
+        assert_eq!(attempt.rejection_code, None);
+        let executions = wallet.opening_executions("channel-a").unwrap();
+        assert_eq!(executions[0].status, OpeningExecutionStatus::Uncertain);
+        assert_eq!(executions[1].status, OpeningExecutionStatus::Rejected);
+        assert_eq!(wallet.release_reservation("reservation-a").unwrap(), 0);
+    }
+
+    #[test]
+    fn reopen_preserves_recovery_states_for_terminal_executions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet.sqlite");
+        let wallet = LooseProofWallet::open(&path, "alice").unwrap();
+        wallet
+            .import_proofs(&[
+                proof("proof-rejected", 8, "keyset-a"),
+                proof("proof-response", 8, "keyset-a"),
+                proof("proof-replay", 8, "keyset-a"),
+            ])
+            .unwrap();
+        for (attempt_id, proof_id) in [
+            ("rejected", "proof-rejected"),
+            ("response", "proof-response"),
+            ("replay", "proof-replay"),
+        ] {
+            wallet
+                .reserve_selected_proofs_with_opening_attempt(
+                    MINT,
+                    "sat",
+                    &[proof_id.to_string()],
+                    &opening_attempt(attempt_id, attempt_id, &[proof_id]),
+                )
+                .unwrap();
+        }
+        let rejected = claim_and_authorize(&wallet, "rejected");
+        wallet
+            .record_definitive_opening_rejection(rejected, 12_002, "inactive keyset")
+            .unwrap();
+        let response = claim_and_authorize(&wallet, "response");
+        wallet
+            .finish_opening_execution(response, OpeningExecutionStatus::ResponseReceived, None)
+            .unwrap();
+        let initial = claim_and_authorize(&wallet, "replay");
+        wallet
+            .finish_opening_execution(initial, OpeningExecutionStatus::Uncertain, Some("timeout"))
+            .unwrap();
+        let OpeningSubmissionClaim::Acquired(replay) =
+            wallet.claim_opening_attempt_replay("replay").unwrap()
+        else {
+            panic!("replay claim not acquired");
+        };
+        let replay = wallet.authorize_opening_submission(replay).unwrap();
+        wallet
+            .record_definitive_opening_rejection(replay, 12_002, "inactive keyset")
+            .unwrap();
+        drop(wallet);
+
+        let reopened = LooseProofWallet::open(&path, "alice").unwrap();
+        let recovered = reopened.opening_attempts_for_recovery().unwrap();
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(
+            recovered
+                .iter()
+                .find(|attempt| attempt.attempt_id == "rejected")
+                .unwrap()
+                .state,
+            OpeningAttemptState::Rejected
+        );
+        assert!(recovered
+            .iter()
+            .filter(|attempt| attempt.attempt_id != "rejected")
+            .all(|attempt| attempt.state == OpeningAttemptState::Submitted));
+        assert_eq!(
+            reopened.opening_executions("response").unwrap()[0].status,
+            OpeningExecutionStatus::ResponseReceived
+        );
+        assert_eq!(
+            reopened.opening_executions("replay").unwrap()[1].status,
+            OpeningExecutionStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn exact_completion_is_atomic_across_fault_and_idempotent() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        let attempt = opening_attempt("channel-a", "reservation-a", &["proof-a"]);
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &attempt,
+            )
+            .unwrap();
+        let _authorized = claim_and_authorize(&wallet, "channel-a");
+        wallet
+            .mark_opening_attempt_finalizing("channel-a", &completed_payload("channel-a"))
+            .unwrap();
+        wallet.conn().unwrap().execute_batch(
+            "CREATE TRIGGER fail_exact_completion BEFORE UPDATE ON monad_client_opening_attempts
+             WHEN NEW.state = 'completed' BEGIN SELECT RAISE(ABORT, 'injected fault'); END;",
+        ).unwrap();
+        assert!(wallet.complete_opening_attempt_exact("channel-a").is_err());
+        assert_eq!(
+            wallet.proofs_for_reservation("reservation-a").unwrap()[0].state,
+            LooseProofState::Reserved
+        );
+        wallet
+            .conn()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_exact_completion")
+            .unwrap();
+        wallet.complete_opening_attempt_exact("channel-a").unwrap();
+        wallet.complete_opening_attempt_exact("channel-a").unwrap();
+    }
+
+    #[test]
+    fn exact_completion_rejects_every_conflicting_proof_state() {
+        for conflict in [
+            "missing",
+            "available",
+            "reassigned",
+            "extra",
+            "differently-spent",
+        ] {
+            let wallet = wallet();
+            wallet
+                .import_proofs(&[
+                    proof("proof-a", 8, "keyset-a"),
+                    proof("proof-extra", 1, "keyset-a"),
+                ])
+                .unwrap();
+            let attempt = opening_attempt("channel-a", "reservation-a", &["proof-a"]);
+            wallet
+                .reserve_selected_proofs_with_opening_attempt(
+                    MINT,
+                    "sat",
+                    &["proof-a".to_string()],
+                    &attempt,
+                )
+                .unwrap();
+            let _authorized = claim_and_authorize(&wallet, "channel-a");
+            wallet
+                .mark_opening_attempt_finalizing("channel-a", &completed_payload("channel-a"))
+                .unwrap();
+            let sql = match conflict {
+                "missing" => "DELETE FROM monad_client_loose_proofs WHERE proof_id = 'proof-a'",
+                "available" => "UPDATE monad_client_loose_proofs SET state = 'available', reserved_by = NULL WHERE proof_id = 'proof-a'",
+                "reassigned" => "UPDATE monad_client_loose_proofs SET reserved_by = 'other' WHERE proof_id = 'proof-a'",
+                "extra" => "UPDATE monad_client_loose_proofs SET state = 'reserved', reserved_by = 'reservation-a' WHERE proof_id = 'proof-extra'",
+                "differently-spent" => "UPDATE monad_client_loose_proofs SET state = 'spent', spent_channel_id = 'other-channel' WHERE proof_id = 'proof-a'",
+                _ => unreachable!(),
+            };
+            wallet.conn().unwrap().execute_batch(sql).unwrap();
+            assert!(
+                wallet.complete_opening_attempt_exact("channel-a").is_err(),
+                "conflict {conflict} was accepted"
+            );
+            assert_eq!(
+                wallet.opening_attempt("channel-a").unwrap().unwrap().state,
+                OpeningAttemptState::Finalizing
+            );
+        }
     }
 
     #[test]
@@ -2480,6 +3858,7 @@ mod tests {
             input_budget_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: "{}".to_string(),
+            selected_proof_ids: vec!["proof-a".to_string()],
         };
         assert!(wallet
             .reserve_selected_proofs_with_opening_attempt(
@@ -2520,6 +3899,7 @@ mod tests {
             input_budget_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: r#"{"channel_id":"channel-a"}"#.to_string(),
+            selected_proof_ids: vec!["proof-a".to_string()],
         };
         wallet
             .reserve_selected_proofs_with_opening_attempt(
@@ -2529,11 +3909,9 @@ mod tests {
                 &attempt,
             )
             .unwrap();
+        let authorized = claim_and_authorize(&wallet, "channel-a");
         wallet
-            .claim_opening_attempt_submission("channel-a")
-            .unwrap();
-        wallet
-            .mark_opening_attempt_rejected("channel-a", Some(12_002), "inactive keyset")
+            .record_definitive_opening_rejection(authorized, 12_002, "inactive keyset")
             .unwrap();
 
         assert_eq!(
@@ -2577,6 +3955,7 @@ mod tests {
             input_budget_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: "not needed to cancel".to_string(),
+            selected_proof_ids: vec!["proof-a".to_string()],
         };
         wallet
             .reserve_selected_proofs_with_opening_attempt(
@@ -2607,6 +3986,91 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_rejects_exact_id_mismatch_without_releasing_any_proof() {
+        for expected_state in [OpeningAttemptState::Prepared, OpeningAttemptState::Rejected] {
+            let wallet = wallet();
+            wallet
+                .import_proofs(&[
+                    proof("proof-a", 8, "keyset-a"),
+                    proof("proof-b", 1, "keyset-a"),
+                ])
+                .unwrap();
+            wallet
+                .reserve_selected_proofs_with_opening_attempt(
+                    MINT,
+                    "sat",
+                    &["proof-a".to_string()],
+                    &opening_attempt("channel-a", "reservation-a", &["proof-a"]),
+                )
+                .unwrap();
+            if expected_state == OpeningAttemptState::Rejected {
+                let authorized = claim_and_authorize(&wallet, "channel-a");
+                wallet
+                    .record_definitive_opening_rejection(authorized, 12_002, "rejected")
+                    .unwrap();
+            }
+            wallet
+                .conn()
+                .unwrap()
+                .execute(
+                    "UPDATE monad_client_loose_proofs
+                     SET state = 'reserved', reserved_by = 'reservation-a'
+                     WHERE wallet_name = 'alice' AND proof_id = 'proof-b'",
+                    [],
+                )
+                .unwrap();
+
+            let result = if expected_state == OpeningAttemptState::Prepared {
+                wallet.cancel_prepared_opening_attempt("channel-a")
+            } else {
+                wallet.cancel_rejected_opening_attempt("channel-a")
+            };
+            assert!(result.is_err());
+            assert_eq!(
+                wallet.opening_attempt("channel-a").unwrap().unwrap().state,
+                expected_state
+            );
+            assert!(wallet
+                .proofs_for_reservation("reservation-a")
+                .unwrap()
+                .iter()
+                .all(|proof| proof.state == LooseProofState::Reserved));
+        }
+    }
+
+    #[test]
+    fn cancelled_claim_cannot_later_authorize() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &opening_attempt("channel-a", "reservation-a", &["proof-a"]),
+            )
+            .unwrap();
+        let OpeningSubmissionClaim::Acquired(permit) = wallet
+            .claim_opening_attempt_submission("channel-a")
+            .unwrap()
+        else {
+            panic!("claim not acquired");
+        };
+        wallet.cancel_prepared_opening_attempt("channel-a").unwrap();
+
+        assert!(wallet.authorize_opening_submission(permit).is_err());
+        let attempt = wallet.opening_attempt("channel-a").unwrap().unwrap();
+        assert_eq!(attempt.state, OpeningAttemptState::Cancelled);
+        assert_eq!(attempt.latest_submitted_at, None);
+        assert_eq!(
+            wallet.opening_executions("channel-a").unwrap()[0].status,
+            OpeningExecutionStatus::Cancelled
+        );
+    }
+
+    #[test]
     fn abandonment_is_atomic_and_repeat_is_noop() {
         let wallet = wallet();
         wallet
@@ -2623,6 +4087,7 @@ mod tests {
             input_budget_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: "immutable prepared request".to_string(),
+            selected_proof_ids: vec!["proof-a".to_string()],
         };
         wallet
             .reserve_selected_proofs_with_opening_attempt(
@@ -2632,9 +4097,7 @@ mod tests {
                 &attempt,
             )
             .unwrap();
-        wallet
-            .claim_opening_attempt_submission(&attempt.attempt_id)
-            .unwrap();
+        let _authorized = claim_and_authorize(&wallet, &attempt.attempt_id);
         // Fail after the proof UPDATE, proving the release rolls back with the journal.
         wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_abandon BEFORE UPDATE ON monad_client_opening_attempts WHEN NEW.state = 'abandoned' BEGIN SELECT RAISE(ABORT, 'injected crash'); END;").unwrap();
         assert!(wallet
@@ -2719,6 +4182,7 @@ mod tests {
             input_budget_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: r#"{"channel_id":"channel-a"}"#.to_string(),
+            selected_proof_ids: vec!["proof-a".to_string()],
         };
         wallet
             .reserve_selected_proofs_with_opening_attempt(
@@ -2728,11 +4192,9 @@ mod tests {
                 &predecessor,
             )
             .unwrap();
+        let authorized = claim_and_authorize(&wallet, "channel-a");
         wallet
-            .claim_opening_attempt_submission("channel-a")
-            .unwrap();
-        wallet
-            .mark_opening_attempt_rejected("channel-a", Some(12_002), "inactive keyset")
+            .record_definitive_opening_rejection(authorized, 12_002, "inactive keyset")
             .unwrap();
         let mut successor = NewOpeningAttempt {
             attempt_id: "channel-b".to_string(),
@@ -2745,6 +4207,7 @@ mod tests {
             input_budget_msats: 8_000,
             expiry_timestamp: 123_456,
             prepared_open_json: r#"{"channel_id":"channel-b"}"#.to_string(),
+            selected_proof_ids: vec!["proof-a".to_string()],
         };
         assert!(wallet
             .store_opening_attempt_for_reservation(&successor)
@@ -2792,6 +4255,229 @@ mod tests {
             LooseProofWalletError::InsufficientBalance { .. }
         ));
         assert_eq!(wallet_b.available_balance_raw(MINT, "sat", &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn separate_wallet_handles_only_allow_one_initial_submission_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet.sqlite");
+        let wallet_a = LooseProofWallet::open(&path, "alice").unwrap();
+        wallet_a
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        wallet_a
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &opening_attempt("channel-a", "reservation-a", &["proof-a"]),
+            )
+            .unwrap();
+        let wallet_b = LooseProofWallet::open(&path, "alice").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn_claim = |wallet: LooseProofWallet| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                wallet
+                    .claim_opening_attempt_submission("channel-a")
+                    .unwrap()
+            })
+        };
+        let first = spawn_claim(wallet_a.clone());
+        let second = spawn_claim(wallet_b);
+        barrier.wait();
+        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, OpeningSubmissionClaim::Acquired(_)))
+                .count(),
+            1
+        );
+        assert_eq!(wallet_a.opening_executions("channel-a").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_replay_claims_allow_only_one_nonterminal_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet.sqlite");
+        let wallet_a = LooseProofWallet::open(&path, "alice").unwrap();
+        wallet_a
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        wallet_a
+            .reserve_selected_proofs_with_opening_attempt(
+                MINT,
+                "sat",
+                &["proof-a".to_string()],
+                &opening_attempt("channel-a", "reservation-a", &["proof-a"]),
+            )
+            .unwrap();
+        let authorized = claim_and_authorize(&wallet_a, "channel-a");
+        wallet_a
+            .finish_opening_execution(
+                authorized,
+                OpeningExecutionStatus::Uncertain,
+                Some("timeout"),
+            )
+            .unwrap();
+        let wallet_b = LooseProofWallet::open(&path, "alice").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn = |wallet: LooseProofWallet| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                wallet.claim_opening_attempt_replay("channel-a").unwrap()
+            })
+        };
+        let first = spawn(wallet_a.clone());
+        let second = spawn(wallet_b);
+        barrier.wait();
+        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, OpeningSubmissionClaim::Acquired(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, OpeningSubmissionClaim::InProgress))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nonempty_obsolete_opening_journal_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE monad_client_opening_attempts (
+                attempt_id TEXT PRIMARY KEY, opening_id TEXT NOT NULL,
+                predecessor_attempt_id TEXT, wallet_name TEXT NOT NULL,
+                reservation_id TEXT NOT NULL, receiver_pubkey TEXT NOT NULL,
+                mint_url TEXT NOT NULL, unit TEXT NOT NULL,
+                input_budget_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
+                prepared_open_json TEXT NOT NULL, completed_open_json TEXT,
+                state TEXT NOT NULL, rejection_code INTEGER, rejection_message TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE(wallet_name, opening_id, attempt_id));
+             INSERT INTO monad_client_opening_attempts VALUES
+                ('attempt', 'opening', NULL, 'alice', 'reservation', 'receiver',
+                 'https://mint.invalid', 'sat', 1, 2, '{}', NULL, 'prepared',
+                 NULL, NULL, 3, 3);",
+        )
+        .unwrap();
+        drop(conn);
+        let error = LooseProofWallet::open(&path, "alice").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("nonempty unversioned or partial client opening journal"));
+    }
+
+    #[test]
+    fn nonempty_partial_authority_schema_is_rejected_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE monad_client_opening_attempts (
+                attempt_id TEXT PRIMARY KEY, opening_id TEXT NOT NULL,
+                predecessor_attempt_id TEXT, wallet_name TEXT NOT NULL,
+                reservation_id TEXT NOT NULL, receiver_pubkey TEXT NOT NULL,
+                mint_url TEXT NOT NULL, unit TEXT NOT NULL,
+                input_budget_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
+                prepared_open_json TEXT NOT NULL, selected_proof_ids_json TEXT NOT NULL,
+                completed_open_json TEXT, state TEXT NOT NULL, rejection_code INTEGER,
+                rejection_message TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+             INSERT INTO monad_client_opening_attempts VALUES
+                ('attempt', 'opening', NULL, 'alice', 'reservation', 'receiver',
+                 'https://mint.invalid', 'sat', 1, 2, '{}', '[\"proof-a\"]', NULL,
+                 'prepared', NULL, NULL, 3, 3);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = LooseProofWallet::open(&path, "alice").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("nonempty unversioned or partial client opening journal"));
+        let conn = Connection::open(&path).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(monad_client_opening_attempts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "latest_submitted_at"));
+        let executions_exist: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table'
+                 AND name = 'monad_client_opening_executions')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!executions_exist);
+    }
+
+    #[test]
+    fn empty_obsolete_opening_journal_migrates_to_authoritative_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE monad_client_opening_attempts (
+                attempt_id TEXT PRIMARY KEY, opening_id TEXT NOT NULL,
+                predecessor_attempt_id TEXT, wallet_name TEXT NOT NULL,
+                reservation_id TEXT NOT NULL, receiver_pubkey TEXT NOT NULL,
+                mint_url TEXT NOT NULL, unit TEXT NOT NULL,
+                input_budget_msats INTEGER NOT NULL, expiry_timestamp INTEGER NOT NULL,
+                prepared_open_json TEXT NOT NULL, completed_open_json TEXT,
+                state TEXT NOT NULL, rejection_code INTEGER, rejection_message TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE(wallet_name, opening_id, attempt_id));",
+        )
+        .unwrap();
+        drop(conn);
+        let wallet = LooseProofWallet::open(&path, "alice").unwrap();
+        let conn = wallet.conn().unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(monad_client_opening_attempts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns
+            .iter()
+            .any(|column| column == "selected_proof_ids_json"));
+        assert!(columns.iter().any(|column| column == "latest_submitted_at"));
+        let execution_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name =
+                        'monad_client_opening_executions')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(execution_table);
+        let marker: (i64, String) = conn
+            .query_row(
+                "SELECT schema_version, authority_marker
+                 FROM monad_client_opening_journal_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(marker.0, OPENING_JOURNAL_SCHEMA_VERSION);
+        assert_eq!(marker.1, OPENING_JOURNAL_AUTHORITY_MARKER);
     }
 
     #[test]
