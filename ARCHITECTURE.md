@@ -689,15 +689,14 @@ never submits swaps: prepared attempts and rejected attempts without a successor
 are cancelled; finalizing attempts finish local idempotent updates; submitted
 attempts with complete restored funding/change finalize. Empty, partial, invalid,
 or network-failed restore evidence normally remains unresolved and reserved. Under
-the manager's exclusive startup/maintenance lock, an attempt may be abandoned only
-at least 3600 seconds after its latest authorized execution, after exact funding
-and change restores are empty and one complete NUT-07 response reports every exact
-input `UNSPENT`. The atomic release revalidates the attempt state, timestamp,
-latest execution sequence, and exact reservation; recent, clock-rollback, stale,
-or inconclusive evidence remains reserved. Other swap policies are unchanged.
-The authoritative opening journal migrates schema v1 to v2 atomically by renaming
-the persisted input-budget field to the funding-token target while preserving all
-attempts, executions, proof IDs, states, timestamps, indexes, and authority data.
+the manager's exclusive startup/maintenance lock, `export-stale-opening-inputs`
+may mark an eligible submitted attempt `Exported` after 3600 seconds, exact empty
+funding/change restore, and complete all-`UNSPENT` NUT-07 evidence, then prints its
+Cashu bearer token while retaining its reservation. Recovery still checks exported
+attempts: a delayed completion wins; all exact inputs `SPENT` plus a final empty
+restore atomically marks the attempt `ExternallySpent` and its proofs spent.
+Incompatible nonempty opening journals are rejected and require export or reset
+before upgrading. Other swap policies are unchanged.
 The live exact-replay
 allowance is independent per immutable attempt, so a keyset successor receives
 its own allowance without authorizing a second successor.

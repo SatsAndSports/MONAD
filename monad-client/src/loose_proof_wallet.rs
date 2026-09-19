@@ -94,8 +94,6 @@ const CREATE_OPENING_ATTEMPTS_SQL: &str = r#"
         rejection_code INTEGER,
         rejection_message TEXT,
         latest_submitted_at INTEGER,
-        abandonment_reason TEXT,
-        abandoned_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         UNIQUE(wallet_name, opening_id, attempt_id)
@@ -132,8 +130,7 @@ const CREATE_OPENING_JOURNAL_META_SQL: &str = r#"
     )
 "#;
 
-const OPENING_JOURNAL_SCHEMA_VERSION: i64 = 2;
-const OPENING_JOURNAL_SCHEMA_VERSION_V1: i64 = 1;
+const OPENING_JOURNAL_SCHEMA_VERSION: i64 = 3;
 const OPENING_JOURNAL_AUTHORITY_MARKER: &str = "exact-input-two-step-execution-authority";
 
 const CREATE_OPENING_ATTEMPTS_INDEX_SQL: &str = r#"
@@ -150,7 +147,7 @@ const CREATE_OPENING_ATTEMPTS_INDEX_SQL: &str = r#"
     WHERE predecessor_attempt_id IS NULL
 "#;
 
-pub const OPENING_ABANDONMENT_MIN_AGE_SECONDS: u64 = 3600;
+pub const OPENING_EXPORT_MIN_AGE_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MintQuoteState {
@@ -363,7 +360,8 @@ pub enum OpeningAttemptState {
     Finalizing,
     Completed,
     Cancelled,
-    Abandoned,
+    Exported,
+    ExternallySpent,
 }
 
 impl OpeningAttemptState {
@@ -375,7 +373,8 @@ impl OpeningAttemptState {
             Self::Finalizing => "finalizing",
             Self::Completed => "completed",
             Self::Cancelled => "cancelled",
-            Self::Abandoned => "abandoned",
+            Self::Exported => "exported",
+            Self::ExternallySpent => "externally_spent",
         }
     }
 
@@ -387,7 +386,8 @@ impl OpeningAttemptState {
             "finalizing" => Ok(Self::Finalizing),
             "completed" => Ok(Self::Completed),
             "cancelled" => Ok(Self::Cancelled),
-            "abandoned" => Ok(Self::Abandoned),
+            "exported" => Ok(Self::Exported),
+            "externally_spent" => Ok(Self::ExternallySpent),
             other => Err(sql_decode_error(format!(
                 "unknown opening attempt state '{other}'"
             ))),
@@ -428,8 +428,6 @@ pub struct OpeningAttemptRecord {
     pub rejection_code: Option<u64>,
     pub rejection_message: Option<String>,
     pub latest_submitted_at: Option<u64>,
-    pub abandonment_reason: Option<String>,
-    pub abandoned_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,12 +493,13 @@ pub struct OpeningExecutionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpeningAbandonmentEvidence {
+pub(crate) struct OpeningExportEvidence {
     attempt_id: String,
     reservation_id: String,
     selected_proof_ids: Vec<String>,
     latest_submitted_at: u64,
     execution_sequence: u64,
+    state: OpeningAttemptState,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -668,7 +667,7 @@ fn initialize_schema(conn: &mut Connection) -> Result<()> {
 
 fn initialize_schema_with_migration_hook(
     conn: &mut Connection,
-    after_v1_rename: impl FnOnce() -> Result<()>,
+    _migration_hook: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let attempts_exist = sqlite_object_exists(&tx, "monad_client_opening_attempts")?;
@@ -697,7 +696,7 @@ fn initialize_schema_with_migration_hook(
     } else {
         HashSet::new()
     };
-    let attempts_v2_valid = attempts_exist
+    let attempts_v3_valid = attempts_exist
         && [
             "attempt_id",
             "opening_id",
@@ -718,35 +717,6 @@ fn initialize_schema_with_migration_hook(
             "latest_submitted_at",
             "created_at",
             "updated_at",
-            "abandonment_reason",
-            "abandoned_at",
-        ]
-        .into_iter()
-        .all(|column| attempt_columns.contains(column));
-    let attempts_v1_valid = attempts_exist
-        && !attempt_columns.contains("funding_token_target_msats")
-        && [
-            "attempt_id",
-            "opening_id",
-            "predecessor_attempt_id",
-            "wallet_name",
-            "reservation_id",
-            "receiver_pubkey",
-            "mint_url",
-            "unit",
-            "input_budget_msats",
-            "expiry_timestamp",
-            "prepared_open_json",
-            "selected_proof_ids_json",
-            "completed_open_json",
-            "state",
-            "rejection_code",
-            "rejection_message",
-            "latest_submitted_at",
-            "created_at",
-            "updated_at",
-            "abandonment_reason",
-            "abandoned_at",
         ]
         .into_iter()
         .all(|column| attempt_columns.contains(column));
@@ -766,38 +736,16 @@ fn initialize_schema_with_migration_hook(
         .all(|column| execution_columns.contains(column));
     let active_index_valid =
         sqlite_index_exists(&tx, "idx_monad_client_opening_executions_active")?;
-    let v2_valid = marker.as_ref().is_some_and(|(version, authority)| {
+    let v3_valid = marker.as_ref().is_some_and(|(version, authority)| {
         *version == OPENING_JOURNAL_SCHEMA_VERSION && authority == OPENING_JOURNAL_AUTHORITY_MARKER
-    }) && attempts_v2_valid
-        && executions_valid
-        && active_index_valid;
-    let v1_valid = marker.as_ref().is_some_and(|(version, authority)| {
-        *version == OPENING_JOURNAL_SCHEMA_VERSION_V1
-            && authority == OPENING_JOURNAL_AUTHORITY_MARKER
-    }) && attempts_v1_valid
+    }) && attempts_v3_valid
         && executions_valid
         && active_index_valid;
 
-    if v1_valid {
-        tx.execute(
-            "ALTER TABLE monad_client_opening_attempts
-             RENAME COLUMN input_budget_msats TO funding_token_target_msats",
-            [],
-        )?;
-        after_v1_rename()?;
-        tx.execute(
-            "UPDATE monad_client_opening_journal_meta SET schema_version = ?1
-             WHERE singleton = 1 AND schema_version = ?2 AND authority_marker = ?3",
-            params![
-                OPENING_JOURNAL_SCHEMA_VERSION,
-                OPENING_JOURNAL_SCHEMA_VERSION_V1,
-                OPENING_JOURNAL_AUTHORITY_MARKER
-            ],
-        )?;
-    } else if !v2_valid {
+    if !v3_valid {
         if nonempty {
             return Err(LooseProofWalletError::Backend(
-                "nonempty unversioned or partial client opening journal is not authoritative"
+                "client opening journal schema is incompatible; export or reset the wallet database before upgrading"
                     .to_string(),
             ));
         }
@@ -1485,14 +1433,13 @@ impl LooseProofWallet {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT attempt_id, opening_id, predecessor_attempt_id, reservation_id,
-                    receiver_pubkey, mint_url, unit, funding_token_target_msats, expiry_timestamp,
-                    prepared_open_json, selected_proof_ids_json, completed_open_json, state,
-                    rejection_code, rejection_message, latest_submitted_at,
-                    abandonment_reason, abandoned_at
+                     receiver_pubkey, mint_url, unit, funding_token_target_msats, expiry_timestamp,
+                     prepared_open_json, selected_proof_ids_json, completed_open_json, state,
+                     rejection_code, rejection_message, latest_submitted_at
              FROM monad_client_opening_attempts
              WHERE wallet_name = ?1
                AND (
-                    state IN ('prepared', 'submitted', 'finalizing')
+                     state IN ('prepared', 'submitted', 'exported', 'finalizing')
                     OR (
                         state = 'rejected'
                         AND NOT EXISTS (
@@ -1513,10 +1460,9 @@ impl LooseProofWallet {
         let conn = self.conn()?;
         conn.query_row(
             "SELECT attempt_id, opening_id, predecessor_attempt_id, reservation_id,
-                    receiver_pubkey, mint_url, unit, funding_token_target_msats, expiry_timestamp,
-                    prepared_open_json, selected_proof_ids_json, completed_open_json, state,
-                    rejection_code, rejection_message, latest_submitted_at,
-                    abandonment_reason, abandoned_at
+                     receiver_pubkey, mint_url, unit, funding_token_target_msats, expiry_timestamp,
+                     prepared_open_json, selected_proof_ids_json, completed_open_json, state,
+                     rejection_code, rejection_message, latest_submitted_at
              FROM monad_client_opening_attempts
              WHERE wallet_name = ?1 AND attempt_id = ?2",
             params![self.wallet_name, attempt_id],
@@ -2251,17 +2197,18 @@ impl LooseProofWallet {
     }
 
     pub fn cancel_rejected_opening_attempt(&self, attempt_id: &str) -> Result<()> {
-        self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Rejected, None)
+        self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Rejected)
     }
 
     pub fn cancel_prepared_opening_attempt(&self, attempt_id: &str) -> Result<()> {
-        self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Prepared, None)
+        self.cancel_opening_attempt(attempt_id, OpeningAttemptState::Prepared)
     }
 
-    pub(crate) fn opening_abandonment_evidence(
+    pub(crate) fn opening_export_evidence(
         &self,
         attempt_id: &str,
-    ) -> Result<Option<OpeningAbandonmentEvidence>> {
+        state: OpeningAttemptState,
+    ) -> Result<Option<OpeningExportEvidence>> {
         let conn = self.conn()?;
         let row = conn
             .query_row(
@@ -2271,8 +2218,8 @@ impl LooseProofWallet {
                          WHERE executions.wallet_name = attempts.wallet_name
                            AND executions.attempt_id = attempts.attempt_id)
                  FROM monad_client_opening_attempts attempts
-                 WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'submitted'",
-                params![self.wallet_name, attempt_id],
+                 WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?3",
+                params![self.wallet_name, attempt_id, state.as_str()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -2297,26 +2244,29 @@ impl LooseProofWallet {
             || sequence <= 0
         {
             return Err(LooseProofWalletError::Backend(format!(
-                "opening attempt '{attempt_id}' has invalid abandonment evidence"
+                "opening attempt '{attempt_id}' has invalid export evidence"
             )));
         }
-        Ok(Some(OpeningAbandonmentEvidence {
+        Ok(Some(OpeningExportEvidence {
             attempt_id: attempt_id.to_string(),
             reservation_id,
             selected_proof_ids,
             latest_submitted_at: from_i64(latest_submitted_at)?,
             execution_sequence: from_i64(sequence)?,
+            state,
         }))
     }
 
-    pub(crate) fn abandon_opening_attempt_if_evidence_current(
+    pub(crate) fn mark_opening_attempt_exported_if_evidence_current(
         &self,
-        evidence: &OpeningAbandonmentEvidence,
+        evidence: &OpeningExportEvidence,
         now: u64,
-        reason: &str,
     ) -> Result<bool> {
+        if evidence.state != OpeningAttemptState::Submitted {
+            return Ok(false);
+        }
         if now < evidence.latest_submitted_at
-            || now - evidence.latest_submitted_at < OPENING_ABANDONMENT_MIN_AGE_SECONDS
+            || now - evidence.latest_submitted_at < OPENING_EXPORT_MIN_AGE_SECONDS
         {
             return Ok(false);
         }
@@ -2326,9 +2276,9 @@ impl LooseProofWallet {
         let attempt_matches: bool = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM monad_client_opening_attempts attempts
-                WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'submitted'
-                  AND reservation_id = ?3 AND selected_proof_ids_json = ?4
-                  AND latest_submitted_at = ?5
+                WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?3
+                  AND reservation_id = ?4 AND selected_proof_ids_json = ?5
+                  AND latest_submitted_at = ?6
                   AND NOT EXISTS (
                       SELECT 1 FROM monad_client_opening_attempts successor
                       WHERE successor.wallet_name = attempts.wallet_name
@@ -2336,10 +2286,11 @@ impl LooseProofWallet {
                   AND (SELECT COALESCE(MAX(execution_sequence), 0)
                        FROM monad_client_opening_executions executions
                        WHERE executions.wallet_name = attempts.wallet_name
-                         AND executions.attempt_id = attempts.attempt_id) = ?6)",
+                         AND executions.attempt_id = attempts.attempt_id) = ?7)",
             params![
                 self.wallet_name,
                 evidence.attempt_id,
+                OpeningAttemptState::Submitted.as_str(),
                 evidence.reservation_id,
                 selected_json,
                 to_i64(evidence.latest_submitted_at)?,
@@ -2377,77 +2328,95 @@ impl LooseProofWallet {
         }
         let changed = tx.execute(
             "UPDATE monad_client_opening_attempts
-             SET state = 'abandoned', updated_at = ?4, abandonment_reason = ?5,
-                 abandoned_at = ?4
+             SET state = 'exported', updated_at = ?4
              WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'submitted'
-               AND latest_submitted_at = ?3",
+                AND latest_submitted_at = ?3",
             params![
                 self.wallet_name,
                 evidence.attempt_id,
                 to_i64(evidence.latest_submitted_at)?,
                 to_i64(now)?,
-                reason,
             ],
         )?;
         if changed != 1 {
             return Ok(false);
         }
-        for proof_id in &evidence.selected_proof_ids {
-            let changed = tx.execute(
-                "UPDATE monad_client_loose_proofs
-                 SET state = 'available', reserved_by = NULL, updated_at = ?4
-                 WHERE wallet_name = ?1 AND proof_id = ?2 AND reserved_by = ?3
-                   AND state = 'reserved' AND spent_channel_id IS NULL",
-                params![
-                    self.wallet_name,
-                    proof_id,
-                    evidence.reservation_id,
-                    to_i64(now)?
-                ],
-            )?;
-            if changed != 1 {
-                return Err(LooseProofWalletError::ReservationConflict {
-                    expected: evidence.selected_proof_ids.len(),
-                    updated: 0,
-                });
-            }
-        }
         tx.commit()?;
         Ok(true)
     }
 
-    #[cfg(test)]
-    fn abandon_opening_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
-        let Some(evidence) = self.opening_abandonment_evidence(attempt_id)? else {
-            if self
-                .opening_attempt(attempt_id)?
-                .is_some_and(|attempt| attempt.state == OpeningAttemptState::Abandoned)
-            {
-                return Ok(());
-            }
-            return Err(LooseProofWalletError::NotFound(attempt_id.to_string()));
-        };
-        let now = evidence
-            .latest_submitted_at
-            .saturating_add(OPENING_ABANDONMENT_MIN_AGE_SECONDS);
-        if self.abandon_opening_attempt_if_evidence_current(&evidence, now, reason)? {
-            Ok(())
-        } else {
-            Err(LooseProofWalletError::InvalidStateTransition {
-                entity: "opening attempt",
-                id: attempt_id.to_string(),
-                expected: "current aged abandonment evidence",
-                actual: "stale or recent evidence".to_string(),
-                requested: OpeningAttemptState::Abandoned.as_str(),
-            })
+    pub(crate) fn mark_opening_attempt_externally_spent_if_evidence_current(
+        &self,
+        evidence: &OpeningExportEvidence,
+        now: u64,
+    ) -> Result<bool> {
+        if evidence.state != OpeningAttemptState::Exported {
+            return Ok(false);
         }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let selected_json = canonical_proof_ids_json(&evidence.selected_proof_ids)?;
+        let attempt_matches: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM monad_client_opening_attempts attempts
+                WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'exported'
+                  AND reservation_id = ?3 AND selected_proof_ids_json = ?4
+                  AND latest_submitted_at = ?5
+                  AND (SELECT COALESCE(MAX(execution_sequence), 0)
+                       FROM monad_client_opening_executions executions
+                       WHERE executions.wallet_name = attempts.wallet_name
+                         AND executions.attempt_id = attempts.attempt_id) = ?6)",
+            params![
+                self.wallet_name,
+                evidence.attempt_id,
+                evidence.reservation_id,
+                selected_json,
+                to_i64(evidence.latest_submitted_at)?,
+                to_i64(evidence.execution_sequence)?,
+            ],
+            |row| row.get(0),
+        )?;
+        if !attempt_matches {
+            return Ok(false);
+        }
+        let proof_ids = proof_ids_for_reservation_in_transaction(
+            &tx,
+            &self.wallet_name,
+            &evidence.reservation_id,
+        )?;
+        if canonical_proof_ids_json(&proof_ids)? != selected_json {
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE monad_client_opening_attempts
+             SET state = 'externally_spent', updated_at = ?3
+             WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'exported'",
+            params![self.wallet_name, evidence.attempt_id, to_i64(now)?],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE monad_client_loose_proofs
+             SET state = 'spent', reserved_by = NULL, updated_at = ?3
+             WHERE wallet_name = ?1 AND reserved_by = ?2 AND state = 'reserved'
+               AND spent_channel_id IS NULL",
+            params![self.wallet_name, evidence.reservation_id, to_i64(now)?],
+        )?;
+        if changed != evidence.selected_proof_ids.len() {
+            return Err(LooseProofWalletError::ReservationConflict {
+                expected: evidence.selected_proof_ids.len(),
+                updated: changed,
+            });
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     fn cancel_opening_attempt(
         &self,
         attempt_id: &str,
         expected_state: OpeningAttemptState,
-        abandonment_reason: Option<&str>,
     ) -> Result<()> {
         let now = now_seconds()?;
         let mut conn = self.conn()?;
@@ -2512,20 +2481,14 @@ impl LooseProofWallet {
         }
         let changed = tx.execute(
             "UPDATE monad_client_opening_attempts
-             SET state = ?3, updated_at = ?4, abandonment_reason = ?6,
-                 abandoned_at = CASE WHEN ?6 IS NOT NULL THEN ?4 ELSE NULL END
+             SET state = ?3, updated_at = ?4
              WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?5",
             params![
                 self.wallet_name,
                 attempt_id,
-                if abandonment_reason.is_some() {
-                    OpeningAttemptState::Abandoned.as_str()
-                } else {
-                    OpeningAttemptState::Cancelled.as_str()
-                },
+                OpeningAttemptState::Cancelled.as_str(),
                 to_i64(now)?,
                 expected_state.as_str(),
-                abandonment_reason,
             ],
         )?;
         if changed != 1 {
@@ -2589,7 +2552,7 @@ impl LooseProofWallet {
                AND NOT EXISTS (
                    SELECT 1 FROM monad_client_opening_attempts
                    WHERE wallet_name = ?1 AND reservation_id = ?2
-                     AND state IN ('prepared', 'submitted', 'finalizing')
+                      AND state IN ('prepared', 'submitted', 'exported', 'finalizing')
                )",
             params![
                 self.wallet_name,
@@ -3059,8 +3022,6 @@ fn row_to_opening_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpeningAt
         rejection_code: row.get::<_, Option<i64>>(13)?.map(from_i64).transpose()?,
         rejection_message: row.get(14)?,
         latest_submitted_at: optional_from_i64(row.get(15)?)?,
-        abandonment_reason: row.get(16)?,
-        abandoned_at: row.get(17)?,
     })
 }
 
@@ -4001,11 +3962,11 @@ mod tests {
     }
 
     #[test]
-    fn abandonment_enforces_age_boundary_and_clock_rollback() {
+    fn export_enforces_age_boundary_and_clock_rollback() {
         for (age, expected) in [
             (0, false),
-            (OPENING_ABANDONMENT_MIN_AGE_SECONDS - 1, false),
-            (OPENING_ABANDONMENT_MIN_AGE_SECONDS, true),
+            (OPENING_EXPORT_MIN_AGE_SECONDS - 1, false),
+            (OPENING_EXPORT_MIN_AGE_SECONDS, true),
         ] {
             let wallet = wallet();
             wallet
@@ -4028,15 +3989,14 @@ mod tests {
                 )
                 .unwrap();
             let evidence = wallet
-                .opening_abandonment_evidence("channel-a")
+                .opening_export_evidence("channel-a", OpeningAttemptState::Submitted)
                 .unwrap()
                 .unwrap();
             assert_eq!(
                 wallet
-                    .abandon_opening_attempt_if_evidence_current(
+                    .mark_opening_attempt_exported_if_evidence_current(
                         &evidence,
                         evidence.latest_submitted_at + age,
-                        "test evidence",
                     )
                     .unwrap(),
                 expected
@@ -4060,14 +4020,13 @@ mod tests {
             .finish_opening_execution(authorized, OpeningExecutionStatus::Uncertain, None)
             .unwrap();
         let evidence = wallet
-            .opening_abandonment_evidence("channel-a")
+            .opening_export_evidence("channel-a", OpeningAttemptState::Submitted)
             .unwrap()
             .unwrap();
         assert!(!wallet
-            .abandon_opening_attempt_if_evidence_current(
+            .mark_opening_attempt_exported_if_evidence_current(
                 &evidence,
                 evidence.latest_submitted_at - 1,
-                "clock rollback",
             )
             .unwrap());
     }
@@ -4143,7 +4102,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_replay_invalidates_abandonment_evidence_and_resets_age() {
+    fn newer_replay_invalidates_export_evidence_and_resets_age() {
         let wallet = wallet();
         wallet
             .import_proofs(&[proof("proof-a", 8, "keyset-a")])
@@ -4161,7 +4120,7 @@ mod tests {
             .finish_opening_execution(initial, OpeningExecutionStatus::Uncertain, None)
             .unwrap();
         let old = wallet
-            .opening_abandonment_evidence("channel-a")
+            .opening_export_evidence("channel-a", OpeningAttemptState::Submitted)
             .unwrap()
             .unwrap();
         let OpeningSubmissionClaim::Acquired(replay) =
@@ -4174,29 +4133,26 @@ mod tests {
             .finish_opening_execution(replay, OpeningExecutionStatus::Uncertain, None)
             .unwrap();
         assert!(!wallet
-            .abandon_opening_attempt_if_evidence_current(
+            .mark_opening_attempt_exported_if_evidence_current(
                 &old,
-                old.latest_submitted_at + OPENING_ABANDONMENT_MIN_AGE_SECONDS,
-                "stale evidence",
+                old.latest_submitted_at + OPENING_EXPORT_MIN_AGE_SECONDS,
             )
             .unwrap());
         let current = wallet
-            .opening_abandonment_evidence("channel-a")
+            .opening_export_evidence("channel-a", OpeningAttemptState::Submitted)
             .unwrap()
             .unwrap();
         assert_eq!(current.execution_sequence, old.execution_sequence + 1);
         assert!(!wallet
-            .abandon_opening_attempt_if_evidence_current(
+            .mark_opening_attempt_exported_if_evidence_current(
                 &current,
-                current.latest_submitted_at + OPENING_ABANDONMENT_MIN_AGE_SECONDS - 1,
-                "recent replay",
+                current.latest_submitted_at + OPENING_EXPORT_MIN_AGE_SECONDS - 1,
             )
             .unwrap());
         assert!(wallet
-            .abandon_opening_attempt_if_evidence_current(
+            .mark_opening_attempt_exported_if_evidence_current(
                 &current,
-                current.latest_submitted_at + OPENING_ABANDONMENT_MIN_AGE_SECONDS,
-                "aged replay",
+                current.latest_submitted_at + OPENING_EXPORT_MIN_AGE_SECONDS,
             )
             .unwrap());
     }
@@ -4794,7 +4750,7 @@ mod tests {
     }
 
     #[test]
-    fn abandonment_is_atomic_and_repeat_is_noop() {
+    fn external_spend_is_atomic_and_never_releases_proofs() {
         let wallet = wallet();
         wallet
             .import_proofs(&[proof("proof-a", 8, "keyset-a")])
@@ -4821,10 +4777,24 @@ mod tests {
             )
             .unwrap();
         let _authorized = claim_and_authorize(&wallet, &attempt.attempt_id);
-        // Fail after the proof UPDATE, proving the release rolls back with the journal.
-        wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_abandon BEFORE UPDATE ON monad_client_opening_attempts WHEN NEW.state = 'abandoned' BEGIN SELECT RAISE(ABORT, 'injected crash'); END;").unwrap();
+        let submitted = wallet
+            .opening_export_evidence(&attempt.attempt_id, OpeningAttemptState::Submitted)
+            .unwrap()
+            .unwrap();
         assert!(wallet
-            .abandon_opening_attempt(&attempt.attempt_id, "empty restore, exact inputs UNSPENT")
+            .mark_opening_attempt_exported_if_evidence_current(
+                &submitted,
+                submitted.latest_submitted_at + OPENING_EXPORT_MIN_AGE_SECONDS,
+            )
+            .unwrap());
+        let exported = wallet
+            .opening_export_evidence(&attempt.attempt_id, OpeningAttemptState::Exported)
+            .unwrap()
+            .unwrap();
+        // Fail after the journal UPDATE, proving the proof and attempt changes roll back together.
+        wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_external_spend BEFORE UPDATE ON monad_client_loose_proofs WHEN NEW.state = 'spent' BEGIN SELECT RAISE(ABORT, 'injected crash'); END;").unwrap();
+        assert!(wallet
+            .mark_opening_attempt_externally_spent_if_evidence_current(&exported, 123_456)
             .is_err());
         assert_eq!(
             wallet
@@ -4832,7 +4802,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            OpeningAttemptState::Submitted
+            OpeningAttemptState::Exported
         );
         assert_eq!(
             wallet
@@ -4844,47 +4814,27 @@ mod tests {
         wallet
             .conn()
             .unwrap()
-            .execute_batch("DROP TRIGGER fail_abandon;")
+            .execute_batch("DROP TRIGGER fail_external_spend;")
             .unwrap();
         wallet
-            .abandon_opening_attempt(&attempt.attempt_id, "empty restore, exact inputs UNSPENT")
+            .mark_opening_attempt_externally_spent_if_evidence_current(&exported, 123_456)
             .unwrap();
         let record = wallet
             .opening_attempt(&attempt.attempt_id)
             .unwrap()
             .unwrap();
-        assert_eq!(record.state, OpeningAttemptState::Abandoned);
-        assert_eq!(
-            record.abandonment_reason.as_deref(),
-            Some("empty restore, exact inputs UNSPENT")
-        );
-        assert!(record.abandoned_at.is_some());
+        assert_eq!(record.state, OpeningAttemptState::ExternallySpent);
         assert!(wallet.opening_attempts_for_recovery().unwrap().is_empty());
-        assert_eq!(
-            wallet
-                .list_available_proofs(MINT, "sat", &[])
-                .unwrap()
-                .len(),
-            1
-        );
-        let next_reservation = wallet.reserve_proofs(MINT, "sat", &[], 8).unwrap();
-        wallet
-            .abandon_opening_attempt(&attempt.attempt_id, "must not overwrite")
+        let proof_state: String = wallet
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM monad_client_loose_proofs WHERE proof_id = 'proof-a'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(
-            wallet
-                .opening_attempt(&attempt.attempt_id)
-                .unwrap()
-                .unwrap(),
-            record
-        );
-        assert_eq!(
-            wallet
-                .proofs_for_reservation(&next_reservation.reservation_id)
-                .unwrap()[0]
-                .state,
-            LooseProofState::Reserved
-        );
+        assert_eq!(proof_state, "spent");
     }
 
     #[test]
@@ -5074,7 +5024,7 @@ mod tests {
         );
     }
 
-    fn create_populated_v1_opening_journal(conn: &Connection) {
+    fn create_populated_obsolete_opening_journal(conn: &Connection) {
         conn.execute_batch(
             "CREATE TABLE monad_client_opening_attempts (
                 attempt_id TEXT PRIMARY KEY, opening_id TEXT NOT NULL,
@@ -5131,139 +5081,17 @@ mod tests {
     }
 
     #[test]
-    fn populated_v1_opening_journal_migrates_atomically_to_v2() {
+    fn populated_obsolete_opening_journal_requires_export_or_reset() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("wallet.sqlite");
         let conn = Connection::open(&path).unwrap();
-        create_populated_v1_opening_journal(&conn);
+        create_populated_obsolete_opening_journal(&conn);
         drop(conn);
 
-        let wallet = LooseProofWallet::open(&path, "alice").unwrap();
-        let conn = wallet.conn().unwrap();
-        let columns = conn
-            .prepare("PRAGMA table_info(monad_client_opening_attempts)")
-            .unwrap()
-            .query_map([], |row| row.get(1))
-            .unwrap()
-            .collect::<rusqlite::Result<HashSet<String>>>()
-            .unwrap();
-        assert!(columns.contains("funding_token_target_msats"));
-        assert!(!columns.contains("input_budget_msats"));
-        let attempts: Vec<(String, i64, String, String, i64, i64)> = conn
-            .prepare(
-                "SELECT attempt_id, funding_token_target_msats, selected_proof_ids_json,
-                        state, created_at, updated_at
-                 FROM monad_client_opening_attempts ORDER BY created_at",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(
-            attempts,
-            vec![
-                (
-                    "root".to_string(),
-                    8000,
-                    "[\"proof-a\",\"proof-b\"]".to_string(),
-                    "rejected".to_string(),
-                    10,
-                    101
-                ),
-                (
-                    "successor".to_string(),
-                    8000,
-                    "[\"proof-a\",\"proof-b\"]".to_string(),
-                    "submitted".to_string(),
-                    102,
-                    201
-                ),
-            ]
-        );
-        let execution_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM monad_client_opening_executions",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(execution_count, 2);
-        let marker: (i64, String) = conn
-            .query_row(
-                "SELECT schema_version, authority_marker FROM monad_client_opening_journal_meta",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(marker, (2, OPENING_JOURNAL_AUTHORITY_MARKER.to_string()));
-        for index in [
-            "idx_monad_client_opening_executions_active",
-            "idx_monad_client_opening_attempts_recovery",
-            "idx_monad_client_opening_attempts_successor",
-            "idx_monad_client_opening_attempts_operation_successor",
-            "idx_monad_client_opening_attempts_operation_root",
-        ] {
-            assert!(conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
-                    [index],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap());
-        }
-    }
-
-    #[test]
-    fn v1_opening_journal_migration_fault_rolls_back_rename_and_marker() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        create_populated_v1_opening_journal(&conn);
-        let error = initialize_schema_with_migration_hook(&mut conn, || {
-            Err(LooseProofWalletError::Backend(
-                "injected migration fault".to_string(),
-            ))
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("injected migration fault"));
-        let tx = conn.unchecked_transaction().unwrap();
-        let columns = table_columns(&tx, "monad_client_opening_attempts").unwrap();
-        assert!(columns.contains("input_budget_msats"));
-        assert!(!columns.contains("funding_token_target_msats"));
-        let marker: i64 = tx
-            .query_row(
-                "SELECT schema_version FROM monad_client_opening_journal_meta",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(marker, 1);
-        assert_eq!(
-            tx.query_row(
-                "SELECT COUNT(*) FROM monad_client_opening_attempts",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-            2
-        );
-        assert_eq!(
-            tx.query_row(
-                "SELECT COUNT(*) FROM monad_client_opening_executions",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-            2
-        );
+        let error = LooseProofWallet::open(&path, "alice").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("export or reset the wallet database before upgrading"));
     }
 
     #[test]
@@ -5292,7 +5120,7 @@ mod tests {
         let error = LooseProofWallet::open(&path, "alice").unwrap_err();
         assert!(error
             .to_string()
-            .contains("nonempty unversioned or partial client opening journal"));
+            .contains("export or reset the wallet database before upgrading"));
     }
 
     #[test]
@@ -5321,7 +5149,7 @@ mod tests {
         let error = LooseProofWallet::open(&path, "alice").unwrap_err();
         assert!(error
             .to_string()
-            .contains("nonempty unversioned or partial client opening journal"));
+            .contains("export or reset the wallet database before upgrading"));
         let conn = Connection::open(&path).unwrap();
         let columns = conn
             .prepare("PRAGMA table_info(monad_client_opening_attempts)")

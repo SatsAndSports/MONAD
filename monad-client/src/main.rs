@@ -111,8 +111,11 @@ enum WalletCommand {
         channel_id: String,
     },
 
-    /// Recover openings without submitting swaps; abandon only aged, fully evidenced attempts.
+    /// Recover openings without submitting swaps or releasing ambiguous inputs.
     RecoverOpenings,
+
+    /// Print tokens for stale, unspent ambiguous opening inputs.
+    ExportStaleOpeningInputs,
 }
 
 struct HttpMintConnection {
@@ -277,7 +280,7 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                 print_json(&serde_json::json!({
                     "recovered_channel_ids": recovered.recovered_channel_ids,
                     "cancelled_attempt_ids": recovered.cancelled_attempt_ids,
-                    "abandoned_attempt_ids": recovered.abandoned_attempt_ids,
+                    "externally_spent_attempt_ids": recovered.externally_spent_attempt_ids,
                     "unresolved": recovered.unresolved.iter().map(|entry| serde_json::json!({
                         "attempt_id": entry.attempt_id,
                         "reason": entry.reason,
@@ -292,14 +295,42 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                 for attempt_id in recovered.cancelled_attempt_ids {
                     println!("Cancelled: {attempt_id}");
                 }
-                for attempt_id in recovered.abandoned_attempt_ids {
-                    println!("Abandoned: {attempt_id}");
+                for attempt_id in recovered.externally_spent_attempt_ids {
+                    println!("Externally spent: {attempt_id}");
                 }
                 for unresolved in recovered.unresolved {
                     println!(
                         "Unresolved: {}: {}",
                         unresolved.attempt_id, unresolved.reason
                     );
+                }
+            }
+        }
+        WalletCommand::ExportStaleOpeningInputs => {
+            let exports = wallet.export_stale_opening_inputs(&locks.exclusive_access()?)?;
+            if args.json {
+                print_json(&serde_json::json!({
+                    "exports": exports.into_iter().map(|entry| serde_json::json!({
+                        "mint_url": entry.mint_url,
+                        "unit": entry.unit,
+                        "amount_raw": entry.amount_raw,
+                        "proof_count": entry.proof_count,
+                        "attempt_ids": entry.attempt_ids,
+                        "token": entry.token,
+                    })).collect::<Vec<_>>(),
+                }))?;
+            } else if exports.is_empty() {
+                println!("No stale opening inputs are currently exportable.");
+            } else {
+                println!("WARNING: each token below is bearer value. Import or swap it promptly; MONAD keeps the original opening reserved until recovery resolves it.");
+                for entry in exports {
+                    println!();
+                    println!("mint: {}", entry.mint_url);
+                    println!("unit: {}", entry.unit);
+                    println!("amount_raw: {}", entry.amount_raw);
+                    println!("proof_count: {}", entry.proof_count);
+                    println!("attempt_ids: {}", entry.attempt_ids.join(","));
+                    println!("token: {}", entry.token);
                 }
             }
         }

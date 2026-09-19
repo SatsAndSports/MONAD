@@ -213,9 +213,18 @@ fn lock_error(owner_name: &str, path: &Path, mode: WalletLockMode, error: io::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn process_lock_test_guard() -> MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn lock_matrix_enforces_runtime_and_maintenance_ownership() {
+        // The process-death test forks this test binary; serialize it so the child
+        // cannot transiently inherit this test's open lock descriptors.
+        let _guard = process_lock_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("wallet.db");
         let paths = [&db as &Path];
@@ -316,6 +325,7 @@ mod tests {
 
     #[test]
     fn runtime_ownership_is_released_when_process_dies() {
+        let _guard = process_lock_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("wallet.db");
         let marker = dir.path().join("locked");

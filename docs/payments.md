@@ -118,7 +118,7 @@ Their durable recovery models are intentionally different:
 
 | Operation | Durable boundary and recovery |
 | --- | --- |
-| Client opening | Exact immutable attempt plus execution authority; bounded identical live replay; one direct-rejection-only successor; exclusive aged abandonment. |
+| Client opening | Exact immutable attempt plus execution authority; bounded identical live replay; one direct-rejection-only successor; exclusive stale-input bearer-token export. |
 | Relay drain | Exact swap/restore requests, output secrets, keyset metadata, and source-channel reservations are persisted. Ambiguous submission remains `Submitted`; `recover-drain` restores the persisted outputs and does not replay the swap. |
 | Relay close | The channel enters durable `Closing` before mint I/O. Resumption reconstructs close execution from stored closing authorization; it is not drain-style restoration of a journaled exact swap request. |
 
@@ -166,14 +166,15 @@ They cancel prepared attempts and rejected attempts without a successor, finish
 finalizing attempts, and finalize submitted attempts only with complete restored
 funding/change. Empty, partial, invalid, or unavailable restore evidence normally
 keeps a submitted attempt unresolved and reserved. With exclusive wallet maintenance
-access, recovery may abandon an attempt only 3600 seconds after its latest
-authorized submission/replay, when exact funding/change restores are empty and
-one complete NUT-07 response reports every exact input `UNSPENT`. Atomic release
-revalidates the state, timestamp, execution sequence, and exact reservation, so
-recent, clock-rollback, stale, or inconclusive evidence stays reserved. This policy is
-channel-opening-only, not a change to refunds, drains, or other swaps. It is a
-risk-based release policy rather than mint cancellation: even complete evidence
-does not prove that an earlier remotely queued request cannot execute later.
+access, `export-stale-opening-inputs` may mark an attempt `Exported` only 3600
+seconds after its latest authorized submission/replay, when exact funding/change
+restores are empty and one complete NUT-07 response reports every input `UNSPENT`.
+The durable transition precedes bearer-token output and does not release proofs.
+Recovery completes a delayed opening first; only exported attempts with every exact
+input `SPENT` and a final empty restore become `ExternallySpent`, atomically marking
+their proofs spent. Recent, clock-rollback, stale, or inconclusive evidence stays
+reserved. This policy is channel-opening-only, not a change to refunds, drains, or
+other swaps.
 
 During a live opening, if the mint explicitly rejects code
 `12002` for an inactive output keyset, the client may refresh and persist one
