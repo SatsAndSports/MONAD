@@ -144,9 +144,9 @@ YAML order; add `--client <name>` to run only one entry.
 
 - `LooseProofWallet` stores loose Cashu proofs, mint quote state, premint batches, reservations, and spend/release state in SQLite.
 - `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata including expiry timestamps in SQLite, and implements `MonadWallet` for the session driver.
-- channel opening atomically reserves its loose proofs and journals the exact prepared swap before submission. Live ambiguous submissions restore their exact funding/change outputs through NUT-09; a valid empty funding restore plus every exact input `UNSPENT` permits one byte-identical replay, with at most one successor after an explicit `12002` rejection.
-- configured-client startup and manual `recover-openings` never submit opening swaps. They finish restored or finalizing channels and cancel prepared attempts and rejected attempts without successors. Under exclusive wallet access, a submitted attempt can be abandoned only at least one hour after its latest submission/replay when exact funding/change restores are empty and one complete exact-input check reports every input `UNSPENT`; recent, stale, clock-rollback, partial, invalid, or unavailable evidence remains reserved.
-- output keyset handling is cache-first: channel opening prefers an advertised active keyset, then falls back to another locally active same-mint/unit keyset with a negotiated format. When preferences are nonempty but unavailable locally, the client refreshes its own mint cache before using a non-preferred fallback; it also refreshes before concluding that no compatible active keyset exists. An explicit inactive-output-keyset rejection (`12002`) may create one persisted successor using a changed active keyset; ambiguous errors never trigger another swap submission.
+- channel opening atomically reserves its loose proofs and journals the exact prepared swap before submission. Live ambiguous submissions restore their exact funding/change outputs through NUT-09; a valid empty funding restore plus every exact input `UNSPENT` may authorize at most one byte-identical replay submission. Authorization also requires execution authority and a wall-clock second later than the preceding authorized submission.
+- configured-client startup and manual `recover-openings` never submit opening swaps. They finish restored or finalizing channels and cancel prepared attempts and rejected attempts without successors. Under exclusive wallet access, a submitted attempt can be abandoned only at least one hour after its latest submission/replay when exact funding/change restores are empty and one complete exact-input check reports every input `UNSPENT`; recent, stale, clock-rollback, partial, invalid, or unavailable evidence remains reserved. This is a risk-based release policy, not remote cancellation: those observations do not prove that an earlier request queued at the mint cannot execute later.
+- output keyset handling is cache-first: channel opening prefers an advertised active keyset, then falls back to another locally active same-mint/unit keyset with a negotiated format. When preferences are nonempty but unavailable locally, the client refreshes its own mint cache before using a non-preferred fallback; it also refreshes before concluding that no compatible active keyset exists. A direct, unambiguous initial inactive-output-keyset rejection (`12002`) may create one persisted successor using a changed active keyset. Ambiguous outcomes may authorize the one identical replay described above, but never a changed-request successor.
 
 `client_wallet.channel_funding_token_target_msats` controls the desired funding-token value for each newly provisioned channel. Cashu input fees are selected in addition to this target; output fees and deterministic channel outputs can make usable channel capacity lower. The default is `1000000` msats.
 
@@ -312,11 +312,11 @@ Current coverage includes:
 
 ### Relay Keyset Handling
 
-Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy only when advertising options or accepting incoming channel funding/payments. Every configured trusted mint/unit remains an advertisement even when its ordered relay-known preference list is empty.
+Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. The relay applies its configured trusted mint/unit policy when advertising options and accepting first-time channel funding. Stored channels can relink and continue paying after a later policy change. Every configured trusted mint/unit remains an advertisement even when its ordered relay-known preference list is empty.
 
-When a first-time `ChannelLink` uses an unknown keyset for a configured trusted mint/unit, the relay performs metadata-independent structural checks, transparently invokes its bounded refresh coordinator, and retries the immutable link once. A successful refresh that still does not know the keyset produces a permanent `LinkMintOrKeysetUnacceptable` rejection. If cooldown, global refresh saturation, timeout, or mint failure prevents a fresh decision, the relay returns a specific transient link error and the configured client preserves the channel and retries with backoff.
+When a first-time `ChannelLink` uses an unknown keyset for a configured trusted mint/unit, the relay performs metadata-independent structural checks, transparently invokes its bounded refresh coordinator, and retries the immutable link once. A successful refresh that still does not know the keyset produces a permanent `LinkMintOrKeysetUnacceptable` rejection. If cooldown, that relay coordinator's cross-mint capacity, timeout, or mint failure prevents a fresh decision, the relay returns a specific transient link error and the configured client preserves the channel and retries with backoff.
 
-There is no client-requested relay refresh operation. Automatic first-link refresh is limited to configured trusted mint/unit pairs: each mint gets at most one actual attempt per cooldown regardless of outcome, concurrent same-mint links share one cancellation-safe attempt, cross-mint saturation fails fast, and mint I/O has a timeout. Existing stored channels relink from authoritative persisted funding without requiring the current cache or triggering refresh. Startup discovery still populates the cache, and channel close and relay drain swaps still refresh that mint into SQLite and the shared cache when a mint keyset error requires one bounded retry.
+There is no client-requested relay refresh operation. Automatic first-link refresh is limited to configured trusted mint/unit pairs: within one hosted relay, each mint gets at most one actual attempt per cooldown regardless of outcome, concurrent same-mint links share one cancellation-safe attempt, cross-mint saturation fails fast, and mint I/O has a timeout. Hosted relays share the wallet cache but have separate refresh coordinators and budgets. Existing stored channels relink from authoritative persisted funding without requiring the current cache or triggering refresh. Startup discovery still populates the cache. Close and drain operations have separate recovery state machines; both use cache-only selection, can warm an empty mint/unit cache, and allow at most one changed-output-keyset retry after a recognized keyset rejection.
 
 ## Payment Code Map
 
@@ -447,23 +447,29 @@ continues after individual failures, and exits non-zero if any close fails. Omit
 human output is a flat list with a `RELAY` column. Duration fields accept seconds
 as numbers or strings such as `3600s`, `60m`, `2h`, and `1d`.
 
-Single relay:
+Single selected relay (this process still exclusively owns the configured wallet):
 
 ```bash
 RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop1
 ```
 
-Second relay:
+All relays in this configuration, including the two-hop example above:
 
 ```bash
-RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop2
+RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml
 ```
 
-Multi-hop example (run each in its own terminal / process):
+Separate relay processes require separate wallet databases/configurations. Do not
+run `hop1` and `hop2` as separate processes against the shared `relay_wallet.db_path`
+shown above; the second process will correctly fail wallet ownership acquisition.
+
+Alternative two-process shape:
 
 ```bash
-RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop1
-RUST_LOG=info cargo run -p monad-relay -- run --config monad.yaml --relay hop2
+# terminal 1: config-hop1.yaml has its own relay_wallet.db_path
+RUST_LOG=info cargo run -p monad-relay -- run --config config-hop1.yaml --relay hop1
+# terminal 2: config-hop2.yaml has a different relay_wallet.db_path
+RUST_LOG=info cargo run -p monad-relay -- run --config config-hop2.yaml --relay hop2
 ```
 
 ### 3. Start the client

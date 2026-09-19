@@ -167,9 +167,10 @@ its expected loss from a dead session to roughly five seconds of service.
 
 Cashu value is stateful enough that a successful network request with a lost
 response must be treated as a normal failure mode. Both MONAD wallet sides use
-SQLite as their durable recovery source of truth. The key rule is simple: a
-mint operation is fully prepared and persisted before it is submitted, and a
-record is not marked complete until the resulting value is in local custody.
+SQLite as their durable recovery source of truth. Each mint operation must cross
+its documented durable boundary before submission and must not be marked complete
+before resulting value is in local custody. The exact boundary and recovery policy
+differ for client openings, relay drains, relay closes, and client refunds.
 
 On the relay side, each accepted `ChannelPayment` is validated and persisted as
 a monotonic channel-balance update. After a relay restart, a client can relink
@@ -192,9 +193,12 @@ The client has the same discipline. It atomically reserves channel-opening input
 and persists the exact prepared funding swap before submission. Live opening
 recovery first uses NUT-09; only a valid empty funding restore followed by an
 all-`UNSPENT` NUT-07 check may replay that same immutable request once. Startup
-and manual recovery never submit swaps: prepared attempts are cancelled, while a
-submitted attempt with that complete empty-restore and unspent-input evidence is
-marked `Abandoned` and atomically releases its reservation. Ambiguous, partial,
+and manual opening recovery never submit opening swaps: prepared attempts are
+cancelled, while a submitted attempt may be marked `Abandoned` only under
+exclusive wallet access, at least one hour after its latest authorized execution,
+with complete empty funding/change restores and exact all-`UNSPENT` input evidence.
+That is a risk-based release policy, not remote cancellation; a queued old mint
+request could still execute later. Ambiguous, partial,
 pending, spent, invalid, or unavailable evidence remains unresolved and retains
 the reservation. A narrowly recognized inactive-output-keyset rejection can
 produce one immutable successor attempt during live opening. For expired-channel
@@ -247,9 +251,6 @@ of a mature anonymity network:
 Most of this design is implemented and covered by unit, integration, and stress
 tests. Important work still includes:
 
-- Accepting Nostr-style bech32 `npub` encodings for relay public keys alongside
-  the current 32-byte x-only hexadecimal form. Both represent the same public
-  key material.
 - Maturing blinded-route configuration, publication, and operational tooling.
 - Improving user-facing wallet operations such as mint quotes, proof minting,
   and richer balance visibility.

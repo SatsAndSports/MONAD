@@ -376,7 +376,7 @@ Client to server (`ClientMessage`):
 - `GetSessionStatus` — request a fresh session status snapshot
 
 Server to client (`ServerMessage`):
-- `SessionStatus { ... }` — primary state synchronization message; sent immediately after control stream establishment and proactively whenever session state (balance, link, pricing) changes. Contains:
+- `SessionStatus { ... }` — primary state synchronization message; sent immediately after control stream establishment, in response to `GetSessionStatus`, and after accepted link/payment or eviction transitions. Fast-path byte accounting and repause do not independently push a snapshot. Contains:
   - `version`: Negotiated protocol version
   - `receiver_pubkey`: Server's secp256k1 key for Spilman
   - `advertisements`: Ordered `(Mint, Unit, Rates)` options whose keyset ID lists are relay-known preferences and may be empty
@@ -403,9 +403,9 @@ Relay keyset refresh is bounded trusted-mint maintenance, not a client control o
 - Automatic link refresh returns transient `LinkKeysetRefreshRateLimited`, `LinkKeysetRefreshBusy`, or `LinkKeysetRefreshFailed` errors when it cannot make a fresh decision. A fresh successful response that still does not contain the keyset yields permanent `LinkMintOrKeysetUnacceptable`.
 - Startup discovery still populates the cache. Close and drain swaps remain cache-first and refresh the mint on missing-cache warmup or when a mint keyset error requires a bounded retry.
 
-DoS resistance is part of the protocol behavior. The relay validates submitted mint/unit sizes and trusted policy before any network fetch, permits at most one actual attempt per mint per cooldown regardless of outcome, shares cancellation-safe in-flight results among concurrent same-mint links, fails fast when global cross-mint capacity is saturated, and wraps mint I/O in a timeout. Refresh I/O runs outside session accounting locks, so slow or failing mints do not block data-path accounting or unrelated control state.
+DoS resistance is part of the protocol behavior. Each hosted relay's coordinator validates submitted mint/unit sizes and trusted policy before any network fetch, permits at most one actual attempt per mint per cooldown regardless of outcome, shares cancellation-safe in-flight results among that relay's concurrent same-mint links, fails fast when its cross-mint capacity is saturated, and wraps mint I/O in a timeout. Hosted relays share the wallet cache but not one process-wide refresh budget. Refresh I/O runs outside session accounting locks, so slow or failing mints do not block data-path accounting or unrelated control state.
 
-Refresh does not invalidate old keysets by itself. The relay cache stores all keysets returned by configured mints, active and inactive, and trusted policy filters advertisements and channel acceptance at read time. Stored channels relink using persisted funding without requiring the current mint cache, while newly opened channels should use a currently active keyset once both client and relay have refreshed.
+Refresh does not invalidate old keysets by itself. The relay cache stores all keysets returned by configured mints, active and inactive, and trusted policy filters advertisements and first-time funding acceptance at read time. Stored channels relink and pay using persisted funding without requiring the current mint cache, while newly opened channels should use a currently active keyset once both client and relay have refreshed.
 
 ### Version Negotiation
 
@@ -443,7 +443,7 @@ This is implemented with integer-only arithmetic via a precomputed `lcm(in_rate,
 
 ### Chunk-Boundary Overshoot
 
-The balance can go negative between billing checks (a proxy chunk may push usage past the paid amount). When the relay detects negative balance, it pauses the session and sends a `SessionStatus`. The client can then send another payment to resume.
+The balance can go negative between billing checks (a proxy chunk may push usage past the paid amount). When the relay detects nonpositive balance, it pauses the session and wakes pause-aware proxy tasks. The client detects the need for more funding from its local counters or a later requested/transition-driven `SessionStatus`, then sends another payment to resume.
 
 ### Two Pricing Structures
 
@@ -584,14 +584,14 @@ Each Noise NK handshake produces a 32-byte **handshake hash** that is identical 
 - Deterministic: both initiator and responder derive the same value from the DH transcript
 - Unique: the client generates a fresh ephemeral key per connection
 - Not transmitted over the wire — derived locally from the shared transcript
-- Will be used for channel_id → session_id binding (enforcing one channel per session)
+- Used for channel-id to session ownership binding (enforcing one owning session per channel)
 
 MONAD integrates Cashu Spilman payment channels for per-session prepaid relay access. The design enforces channel exclusivity and uses delta-based accounting. Before any `ChannelLink` or `ChannelPayment` traffic can happen, the client and relay must already have negotiated a mutually supported Cashu Spilman channel protocol version and a nonempty mutual keyset-format set during the Noise bootstrap.
 
 #### 1. Server Advertisement
-The relay is configured with a map of `Mint -> Unit -> Rates`. In the `SessionStatus` message, it advertises these options to the client as a list of `KeysetAdvertisement` objects. Each option includes the `in_bytes_per_millisat` and `out_bytes_per_millisat` specific to that mint/unit choice.
+The relay is configured with trusted mint/unit options plus one session pricing policy. In the `SessionStatus` message, it advertises those options as `KeysetAdvertisement` objects; each currently carries the same session-wide `in_bytes_per_millisat` and `out_bytes_per_millisat` rates.
 
-The relay wallet manager owns a shared in-memory `SpilmanMintCache`. The cache stores all keysets returned by configured mints, active and inactive, for all units the mint reports. Trusted mint/unit policy filters what is advertised and what incoming channel funding/payment keysets are accepted; it does not mean the cache only stores trusted units. Channel close and relay drain swaps use the same shared cache and rely on a single refresh-and-retry path to refresh that mint into SQLite and memory if the mint rejects the first swap because of stale keyset state.
+The relay wallet manager owns a shared in-memory `SpilmanMintCache`. The cache stores all keysets returned by configured mints, active and inactive, for all units the mint reports. Trusted mint/unit policy filters advertisements and first-time funding acceptance; stored channels can relink and pay after a policy change. Close and drain use the same shared cache-selection mechanics but different durable recovery state machines. Each can warm an empty mint/unit cache and perform at most one changed-output-keyset retry after a recognized keyset rejection.
 
 #### 2. Channel Linking
 The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs. If the bootstrap did not negotiate a supported Cashu Spilman channel protocol version and keyset-format set, the relay rejects linking immediately.
@@ -601,7 +601,7 @@ Production hellos offer both `v1` (`00` keyset IDs) and `v2` (`01` keyset IDs). 
 Before persisting a new channel or changing ownership, `ChannelLink` checks its funding keyset version. Existing channels use authoritative stored funding, never caller-supplied replacement or omitted params. A mismatch yields `LinkKeysetVersionNotNegotiated`, releases the offending session's previous ownership, and ends its data/control streams after a bounded best-effort error send. Other MONAD sessions on the same QUIC connection remain usable. The client terminates its driver without invalidating the wallet channel.
 
 For a first-time channel on a negotiated keyset format, an unknown keyset is refreshable only when the submitted mint/unit is already trusted. Before mint I/O, the relay recomputes the channel identity and checks funding-proof structure that does not require mint key metadata. It then invokes the shared bounded coordinator and retries the immutable link once after a fresh successful result. A still-unknown keyset is permanently rejected. Cooldown, saturation, and refresh failure remain transient; the client retains its intended channel and backs off. Stored `Open` channels bypass this path and validate against persisted funding, while `Closing` and `Closed` channels remain unusable.
-- **One Session Per Channel**: The relay maintains a global registry of `ChannelId -> SessionId`.
+- **One Session Per Channel**: One live relay payment backend maintains a registry of `ChannelId -> SessionId` shared by that relay's sessions. Process/database ownership and durable channel ownership metadata are separate layers.
 - **Exclusivity**: If a channel is already linked to another session, the relay sends `ChannelEvicted` to the old session and links the channel to the new one.
 - **Stateless Session Start**: Every new Noise session starts with a `total_paid_millisats` of 0. Only *new* payments made within the current session count as credit.
 
@@ -627,7 +627,8 @@ The client uses that to learn:
 
 The client driver then computes the next requested cumulative balance from:
 
-- current `remaining_milli_sats`
+- the locally authorized payment total
+- the client's cleartext byte counters and immutable session pricing
 - target positive remaining balance
 - relay-reported `linked_channel.balance_raw`
 
@@ -665,8 +666,11 @@ enforce a portable maximum of 992 selected proof IDs.
 The journal is authoritative across restarts. Submitted attempts first recover
 their original funding/change outputs through NUT-09. If a valid funding restore
 is empty, one NUT-07 request checks every persisted input Y; only an all-`UNSPENT`
-response permits one replay of the byte-identical swap during live opening
-recovery only. Each immutable attempt has at most one replay execution. Replay
+response may authorize one replay of the byte-identical swap during live opening
+recovery only, subject to current execution authority and a wall-clock second
+strictly later than the previous authorization. The live path does not wait solely
+for that clock advance. Each immutable attempt has at most one authorized replay
+submission. Replay
 success finalizes normally; replay ambiguity or rejection performs one immediate
 exact restore and otherwise leaves the operation submitted and reserved. A replay
 rejection cannot authorize a keyset successor because it does not settle the
@@ -748,13 +752,15 @@ maintenance gate exclusively. Steady state downgrades it to shared mode. Omittin
 owns the complete configured wallet, preventing a second process from hosting a
 sibling identity against the same database.
 
-Each listener receives the same manager and cache but constructs payments with
+Each listener receives the same manager and cache but constructs and shares its
+own live payment backend with
 its own wallet name, receiver key, trusted mint/unit policy, pricing, and channel
 policy. A process-level `JoinSet` treats any listener exit as fatal, broadcasts
-shutdown to siblings, and awaits all listener, auto-close, connection, stream,
-session, control-stream, and keyset-refresh task trees before releasing wallet
-ownership. Refresh coordinator shutdown fences new refreshes and drains already
-owned refresh work after sessions and auto-close workers stop.
+shutdown to siblings, and awaits all listener, connection, stream, session,
+control-stream, keyset-refresh, and auto-close task trees before releasing wallet
+ownership. Within a listener, session cleanup is followed by refresh-coordinator
+drain; the wrapper then stops the auto-close worker and aborts-and-awaits it after
+the bounded shutdown grace period.
 
 Read-only wallet commands take the maintenance gate shared and open SQLite with
 read-only flags, without schema initialization. Mutating close/drain/recovery
@@ -784,60 +790,42 @@ If the relay itself decides to terminate the session while the control stream
 still exists, it can send `Error { code, message }` first. If the control stream is
 already gone, no final control error message is possible.
 
-#### 5. Session State Matrix
+#### 7. Session State Matrix
+
+Bootstrap version/capability negotiation occurs inside the two Noise handshake
+payloads. After Noise, the peers start H2, open `POST /control`, and the relay
+sends the initial `SessionStatus`; there is no post-H2 `Hello` message.
 
 ```text
-    +-----------+
-    |  Connect  |
-    +-----+-----+
-          |
-          v
-    +-----------------+
-    |   Noise + H2    |
-    |   Handshake     |
-    +--------+--------+
-             |
-             v
-    +--------+--------+
-    |   Send Hello    |
-    +--------+--------+
-             |
-             v
-    +-----------------+
-    | Receive         |
-    | SessionStatus   |
-    | (Pricing&Mints) |
-    +--------+--------+
-             |
-             v
-    +-----------------------------------------------------------------------+
-    |                         SESSION STATE MATRIX                          |
-    |                         ====================                          |
-    |                                                                       |
-    |                       UNLINKED                         LINKED         |
-    |               (No associated channel)          (Channel associated)   |
-    |               +-------------------------+  Link  +--------------------+|
-    |               |                         |------->|                    ||
-    |     PAUSED    |     Unlinked / Paused   |        |   Linked / Paused  ||
-    |   (Bal <= 0)  |  (Initial / Exhausted)  |<-------|   (Awaiting Pay)   ||
-    |               |                         | Evict  |                    ||
-    |               +------------+------------+        +----------+---------+|
-    |                  |         ^                        ^       |         |
-    |          FakePay |         | Drain            Drain |       | Payment |
-    |                  v         |                        |       v         |
-    |               +------------+------------+  Link  +----------+---------+|
-    |               |                         |------->|                    ||
-    |     ACTIVE    |     Unlinked / Active   |        |   Linked / Active  ||
-    |   (Bal > 0)   |     (The Evicted state) |<-------|   (Normal Flow)    ||
-    |               |                         | Evict  |                    ||
-    |               +-------------------------+        +--------------------+|
-    +-----------------------------------------------------------------------+
-             |
-             v
-       +-----------+
-       | Disconnect|
-       +-----------+
+Connect
+   |
+   v
+Noise bootstrap negotiation -> H2 -> POST /control -> initial SessionStatus
+   |
+   v
++-----------------------------------------------------------------------+
+|                         SESSION STATE MATRIX                          |
+|                                                                       |
+|                       UNLINKED                         LINKED          |
+|               +-------------------------+  Link  +--------------------+|
+|     PAUSED    |     Unlinked / Paused   |------->|   Linked / Paused  ||
+|   (Bal <= 0)  |  (Initial / Exhausted)  |<-------|   (Awaiting Pay)   ||
+|               +-------------------------+ Evict  +----------+---------+|
+|                         ^                                  | Payment   |
+|                         |                                  v           |
+|               +-------------------------+  Link  +----------+---------+|
+|     ACTIVE    |     Unlinked / Active   |------->|   Linked / Active  ||
+|   (Bal > 0)   |       (Evicted)         |<-------|   (Normal Flow)    ||
+|               +-------------------------+ Evict  +--------------------+|
++-----------------------------------------------------------------------+
+   |
+   v
+control detach -> ownership release and session teardown
 ```
+
+Usage can move either active state back to its corresponding paused state. That
+fast-path transition updates the pause watcher but does not itself send a
+`SessionStatus`.
 
 
 ## Blinded Routing
@@ -1175,7 +1163,11 @@ MONAD currently provides:
 - destination hiding from intermediate hops
 - multi-hop nesting
 
-MONAD does not currently provide Tor-style shared relay-to-relay traffic mixing. Each client maintains its own hop chain, so this is closer to a layered multi-hop paid proxy than a full anonymity network.
+MONAD does not provide Tor-style anonymity guarantees. Each client maintains its
+own logical Noise+H2 hop chain, although many such sessions can share pooled
+relay-to-relay QUIC connections and therefore some transport packets. There is no
+padding, batching, cover traffic, or anonymity-set guarantee, so this remains a
+layered multi-hop paid proxy rather than a full anonymity network.
 
 ## Current Transport Identity Model
 
@@ -1201,7 +1193,9 @@ The Ed25519 seed is retained only for QUIC/TLS certificate plumbing.
 
 ### Public-Key Representation
 
-The secp256k1 transport public key is a 33-byte compressed SEC1 point.
+The configured secp256k1 transport identity is a 32-byte x-only public key with
+implied even Y. Code that needs a full point reconstructs the corresponding
+33-byte compressed SEC1 point internally.
 
 So today:
 
@@ -1216,7 +1210,8 @@ layers secp attestation above that encrypted channel.
 
 ### Motivation
 
-The current nesting model creates a dedicated TCP connection between relays for each client chain.
+Plain TCP nesting creates a dedicated relay-to-relay connection for each client
+chain. Configured routes instead use pooled QUIC between hops.
 
 For example, if many clients route through the same pair of relays:
 
@@ -1226,7 +1221,8 @@ Client B -> Relay S -> Relay T -> ...
 Client C -> Relay S -> Relay T -> ...
 ```
 
-then today, S opens a separate TCP connection to T for each client.
+then a plain-TCP route opens a separate TCP connection from S to T for each
+client, while configured QUIC routes multiplex those sessions as streams.
 
 QUIC solves this by letting S maintain one long-lived QUIC connection to T and multiplex many client sessions as separate QUIC streams inside it:
 
@@ -1243,16 +1239,14 @@ One QUIC handshake is amortized across many clients. Stream creation is lightwei
 Why this is interesting:
 - fewer per-client relay-to-relay connections
 - lower handshake and connection setup overhead between relays
-- better traffic mixing between relays
 - small writes from multiple streams can be coalesced into encrypted QUIC packets
-- closer to the anonymity properties of a shared relay fabric
 
 ### Layering: QUIC Replaces TCP, Not Noise
 
 QUIC provides the encrypted transport between relays. It does **not** replace the Noise nesting that protects client-to-hop sessions.
 
-Consider a 2-hop route where client C connects through relay S to relay T using
-the current default TCP transport:
+Consider a 2-hop library/manual route where client C reaches relay S over TCP and
+then uses the configured QUIC connector to relay T:
 
 ```text
 C ---- TCP + Noise(S) + H2 ----> S ---- QUIC stream ----> T
@@ -1329,7 +1323,9 @@ A QUIC-capable relay has both:
 - an Ed25519 identity for QUIC certificate generation
 - a secp256k1 transport key whose public MONAD identity is a 32-byte x-only pubkey for TCP MONAD transport and secp-authenticated QUIC
 
-The `--quic` flag enables the QUIC listener; the QUIC certificate is generated from the `--quic-cert-seed` Ed25519 seed, while `--transport-key` supplies the shared secp transport key.
+Configured relay startup binds TCP and QUIC listeners from each YAML relay entry.
+`quic_cert_seed` supplies certificate-generation material and `transport_key`
+supplies the secp transport key; there is no separate runtime `--quic` enable flag.
 
 ### CONNECT Syntax for QUIC Hops
 
@@ -1447,4 +1443,5 @@ The full QUIC transport chain is implemented and tested:
 - client wallet funding UX is not yet fully wired: mint quotes, premint submission, richer balance inspection, and client close/sweep flows still need commands.
 - configured-client startup still fails fast before the first successful route connect; after a route has connected once, reconnects retry indefinitely with capped backoff while SOCKS stays alive.
 - QUIC connection pool entries are only evicted lazily (on failed stream open) plus transport idle timeout; there is no proactive stale-entry cleanup.
-- asymmetric pricing (rates other than 1/1) is not yet tested.
+- configured mint/unit advertisements currently share the relay session's pricing
+  rates rather than carrying independently configured rates per offer.
