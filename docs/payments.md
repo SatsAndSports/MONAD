@@ -72,7 +72,7 @@ MONAD owns:
 - mint HTTP calls and async runtime boundaries
 - keyset refresh and retry policy
 - loose proof reservations and proof import/release sequencing
-- MONAD channel metadata and opening-recovery rows
+- MONAD channel metadata and the authoritative opening attempt/execution journal
 - relay session ownership, eviction, pause/resume, and byte-accounting policy
 
 The intended shape is `prepare` / `validate`, then MONAD performs I/O and retry,
@@ -105,10 +105,22 @@ Consequences:
 - stored channels relink using persisted funding without requiring current keyset metadata.
 - channel close and relay drain swaps start from the shared cache and refresh that mint into SQLite and memory for missing-cache warmup or if the mint rejects the swap with a keyset error.
 
-There is no explicit client-requested relay refresh operation. Automatic link refresh permits one actual mint attempt per cooldown regardless of outcome and shares an in-flight attempt across sessions. A fresh response that still lacks the keyset is a permanent rejection. Cooldown, global saturation, timeout, and fetch failure produce transient link errors; the client keeps the intended channel and retries with backoff. Stored channel relinks use persisted funding and do not refresh. Startup discovery and the existing close/drain keyset-error refresh paths remain unchanged.
+There is no explicit client-requested relay refresh operation. Automatic link refresh permits one actual mint attempt per cooldown regardless of outcome and shares an in-flight attempt across sessions of that relay. A fresh response that still lacks the keyset is a permanent rejection. Cooldown, that relay coordinator's cross-mint saturation, timeout, and fetch failure produce transient link errors; the client keeps the intended channel and retries with backoff. Hosted relays share the wallet cache but construct separate refresh coordinators. Stored channel relinks use persisted funding and do not refresh. Startup discovery and close/drain refreshes do not use this first-link coordinator.
 
-This cache-first, single-refresh retry shape is the shared model for relay close
-and drain swaps.
+Close and drain share only the cache-selection mechanics: optional warmup when no
+mint/unit keyset is cached, cache-only preparation, and at most one retry when a
+recognized mint keyset rejection leads to a different active output keyset. An
+unchanged refreshed selection is not resubmitted, and an incomplete but nonempty
+cache is not promised to be repaired automatically. A cold operation can perform
+both a preflight warmup and a later rejection-triggered refresh.
+
+Their durable recovery models are intentionally different:
+
+| Operation | Durable boundary and recovery |
+| --- | --- |
+| Client opening | Exact immutable attempt plus execution authority; bounded identical live replay; one direct-rejection-only successor; exclusive aged abandonment. |
+| Relay drain | Exact swap/restore requests, output secrets, keyset metadata, and source-channel reservations are persisted. Ambiguous submission remains `Submitted`; `recover-drain` restores the persisted outputs and does not replay the swap. |
+| Relay close | The channel enters durable `Closing` before mint I/O. Resumption reconstructs close execution from stored closing authorization; it is not drain-style restoration of a journaled exact swap request. |
 
 ## Relay Channel Policy
 
@@ -130,7 +142,7 @@ Operators can inspect the current close-to-expiry set with
 They can close that set non-interactively with
 `monad-relay wallet --config monad.yaml --relay <name> close-expiring-channels`;
 add `--dry-run` to preview the candidates. The command attempts every candidate,
-prints each result as it completes, and exits non-zero if any close fails.
+prints the collected results after the sweep, and exits non-zero if any close fails.
 Omitting `--relay` / `--wallet-name` scans all relay identities and prints a flat
 list with a `RELAY` column.
 
@@ -143,21 +155,25 @@ relevant `(mint, unit)`. The client prepares an exact opening, then atomically
 reserves its loose inputs and journals that preparation before submission. A
 submitted attempt is immutable and ambiguous outcomes first use NUT-09. When a
 valid funding restore is empty, one NUT-07 request checks all persisted input Ys;
-only an all-`UNSPENT` response permits one replay of the identical swap request in
-live opening recovery. Replay success finalizes; replay ambiguity or rejection
+only an all-`UNSPENT` response may permit one replay of the identical swap request
+in live opening recovery. Authorization also requires current execution authority
+and a strictly later wall-clock second than the preceding authorized execution;
+the live path does not wait to manufacture that clock advance. Replay success finalizes; replay ambiguity or rejection
 gets one immediate exact restore and otherwise remains unresolved, and a replay
 rejection cannot create a keyset successor. Startup and manual `recover-openings`
 never submit swaps.
 They cancel prepared attempts and rejected attempts without a successor, finish
 finalizing attempts, and finalize submitted attempts only with complete restored
-funding/change. Empty, partial, invalid, or unavailable restore evidence keeps a
-submitted attempt unresolved and reserved. With exclusive wallet maintenance
+funding/change. Empty, partial, invalid, or unavailable restore evidence normally
+keeps a submitted attempt unresolved and reserved. With exclusive wallet maintenance
 access, recovery may abandon an attempt only 3600 seconds after its latest
 authorized submission/replay, when exact funding/change restores are empty and
 one complete NUT-07 response reports every exact input `UNSPENT`. Atomic release
 revalidates the state, timestamp, execution sequence, and exact reservation, so
 recent, clock-rollback, stale, or inconclusive evidence stays reserved. This policy is
-channel-opening-only, not a change to refunds, drains, or other swaps.
+channel-opening-only, not a change to refunds, drains, or other swaps. It is a
+risk-based release policy rather than mint cancellation: even complete evidence
+does not prove that an earlier remotely queued request cannot execute later.
 
 During a live opening, if the mint explicitly rejects code
 `12002` for an inactive output keyset, the client may refresh and persist one
