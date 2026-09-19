@@ -30,7 +30,7 @@ The current dependency baseline is:
 
 Refunds, relay closes, and relay drains have different durable boundaries and
 recovery policies. They must not be assumed to have inherited the opening
-journal's replay authority or abandonment rules.
+journal's replay authority or stale-input export rules.
 
 ## Current Guarantees
 
@@ -119,7 +119,7 @@ ownership and never submit opening swaps. Recovery:
 - cancels explicitly rejected attempts without a successor
 - completes idempotent local work for `Finalizing` attempts
 - finalizes `Submitted` attempts only from complete checked funding/change restore
-- otherwise retains the reservation unless the aged-abandonment policy applies
+- otherwise retains the reservation; eligible stale inputs can be exported without release
 
 One `ClientWalletManager` opens/migrates the logical wallet and runs this recovery
 once before starting managed clients. OS-backed runtime-owner and maintenance
@@ -145,23 +145,24 @@ paths and are released by the kernel after process death.
 
 ## Accepted Policy Risk
 
-### Aged Abandonment Is Not Remote Cancellation
+### Stale-Input Export Retains Custody
 
-Under exclusive startup/manual recovery, a submitted attempt may be abandoned
+Under exclusive wallet maintenance access, `export-stale-opening-inputs` may mark a
+submitted attempt `Exported`
 only when all of these are true:
 
 1. At least 3600 seconds have elapsed since its latest authorized submission or
    replay.
 2. Exact funding and change restores are valid and empty.
 3. One complete exact-input NUT-07 response reports every input `UNSPENT`.
-4. Atomic release revalidates attempt state, latest timestamp, latest execution
-   sequence, and exact reservation membership.
+4. The durable export transition revalidates attempt state, latest timestamp,
+   latest execution sequence, and exact reservation membership.
 
-This is an explicit availability/safety tradeoff. Mints do not offer cancellation
-for a possibly submitted swap. Empty restore and `UNSPENT` observations prove
-only that no remote effect was visible at those observation points; they do not
-prove an old queued request cannot execute later. Abandoned attempts are not
-normally revisited by opening recovery if such delayed execution later occurs.
+The proofs remain reserved after export. Mints do not offer cancellation for a
+possibly submitted swap, so empty restore and `UNSPENT` observations prove only that
+no remote effect was visible at those observation points. Recovery still accepts a
+delayed completion. It marks an exported attempt `ExternallySpent` only after all
+exact inputs are `SPENT` and a final exact restore is empty.
 
 Recent, clock-rollback, stale, partial, invalid, unavailable, pending, or spent
 evidence remains unresolved and reserved.
@@ -203,7 +204,7 @@ Existing MONAD or pinned-upstream tests cover:
 - successful HTTP followed by execution-record failure retaining uncertainty
 - replay rejection retaining reservation and creating no successor
 - cancellation and authorization races
-- one-hour age, clock rollback, and stale abandonment evidence
+- one-hour export age, clock rollback, and stale export evidence
 - exact idempotent completion and conflicting proof states
 - sequential local-finalization crash boundaries
 - input-fee target selection, metadata refresh, nonpositive-net filtering, and
@@ -217,7 +218,7 @@ underlying invariant is absent:
   journal/reservation state, including valid funding plus invalid change
 - delay the original request until after restore/checkstate and reject the replay,
   then demonstrate later recovery of the original completion
-- exercise the complete aged-abandonment orchestration with controlled mint
+- exercise the complete stale-input export orchestration with controlled mint
   restore/checkstate responses, not only storage-level evidence races
 - broaden multi-process and CLI lifecycle tests around ownership and mint-I/O
   exclusion
@@ -240,5 +241,5 @@ underlying invariant is absent:
   determine channel identity.
 - Do not silently replace smallest-first plain selection.
 - Do not treat relay-advertised keyset IDs as an exhaustive acceptance list.
-- Do not generalize opening replay or aged abandonment to other swap types without
+- Do not generalize opening replay or stale-input export to other swap types without
   a separate review.

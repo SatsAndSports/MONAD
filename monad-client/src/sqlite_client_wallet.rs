@@ -19,7 +19,7 @@ use crate::wallet::{
 use crate::wallet_lock::{ExclusiveWalletAccess, WalletLockIdentity};
 use cashu::nuts::{
     CheckStateRequest, CheckStateResponse, CurrencyUnit, Id, Proof, RestoreRequest,
-    RestoreResponse, SecretKey, State,
+    RestoreResponse, SecretKey, State, Token,
 };
 use cdk_spilman::{
     compute_funding_token_amount, parse_keyset_info_from_json, ClientChannelFunding,
@@ -191,7 +191,7 @@ enum OpeningRestoreOutcome {
 pub struct OpeningRecoveryReport {
     pub recovered_channel_ids: Vec<String>,
     pub cancelled_attempt_ids: Vec<String>,
-    pub abandoned_attempt_ids: Vec<String>,
+    pub externally_spent_attempt_ids: Vec<String>,
     pub unresolved: Vec<UnresolvedOpening>,
 }
 
@@ -207,7 +207,7 @@ impl OpeningRecoveryReport {
     pub fn is_empty(&self) -> bool {
         self.recovered_channel_ids.is_empty()
             && self.cancelled_attempt_ids.is_empty()
-            && self.abandoned_attempt_ids.is_empty()
+            && self.externally_spent_attempt_ids.is_empty()
             && self.unresolved.is_empty()
     }
 }
@@ -215,8 +215,26 @@ impl OpeningRecoveryReport {
 enum OpeningRecoveryOutcome {
     Recovered(String),
     Cancelled,
-    Abandoned,
+    ExternallySpent,
     Unresolved,
+}
+
+/// A bearer token exported from stale ambiguous opening inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedOpeningInputsToken {
+    pub mint_url: String,
+    pub unit: String,
+    pub amount_raw: u64,
+    pub proof_count: usize,
+    pub attempt_ids: Vec<String>,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactInputState {
+    AllUnspent,
+    AllSpent,
+    MixedOrPending,
 }
 
 const CREATE_CHANNELS_SQL: &str = r#"
@@ -826,11 +844,11 @@ impl SqliteClientWallet {
     ///
     /// Ambiguous failures leave loose proofs reserved and an upstream
     /// `OpeningFromSwap` row behind. This method first uses NUT-09 restore. If a
-    /// valid response has no funding or change outputs, an attempt at least one hour
-    /// past its latest authorized execution may be abandoned only after one complete
-    /// exact-input NUT-07 response reports every input `UNSPENT`. This method never
-    /// submits swaps or revisits abandoned attempts. Callers must hold exclusive
-    /// wallet-manager maintenance access for the entire pass.
+    /// valid response has no funding or change outputs, submitted attempts remain
+    /// reserved. Exported attempts whose inputs are all spent receive a final exact
+    /// restore check before being marked externally spent. This method never submits
+    /// swaps. Callers must hold exclusive wallet-manager maintenance access for the
+    /// entire pass.
     pub fn recover_pending_openings(
         &self,
         access: &ExclusiveWalletAccess<'_>,
@@ -858,17 +876,16 @@ impl SqliteClientWallet {
                 Ok(OpeningRecoveryOutcome::Cancelled) => report
                     .cancelled_attempt_ids
                     .push(attempt.attempt_id.clone()),
-                Ok(OpeningRecoveryOutcome::Abandoned) => report
-                    .abandoned_attempt_ids
+                Ok(OpeningRecoveryOutcome::ExternallySpent) => report
+                    .externally_spent_attempt_ids
                     .push(attempt.attempt_id.clone()),
                 Ok(OpeningRecoveryOutcome::Unresolved) => {
                     report.unresolved.push(UnresolvedOpening {
                         attempt_id: attempt.attempt_id.clone(),
                         state: attempt.state,
                         latest_submitted_at: attempt.latest_submitted_at,
-                        reason:
-                            "funding restore empty; submitted attempt retained without abandonment"
-                                .to_string(),
+                        reason: "funding restore empty; opening attempt remains reserved"
+                            .to_string(),
                     })
                 }
                 Err(error) => {
@@ -941,10 +958,6 @@ impl SqliteClientWallet {
                     })?;
                 }
             }
-            let abandonment_evidence = self
-                .loose_wallet
-                .opening_abandonment_evidence(&attempt.attempt_id)
-                .map_err(loose_proof_error)?;
             match self
                 .restore_journaled_opening(&prepared, networking)
                 .map_err(|error| {
@@ -960,27 +973,59 @@ impl SqliteClientWallet {
                     *completed
                 }
                 OpeningRestoreOutcome::FundingOutputsAbsent => {
-                    let Some(evidence) = abandonment_evidence else {
+                    if attempt.state != OpeningAttemptState::Exported {
                         return Ok(OpeningRecoveryOutcome::Unresolved);
-                    };
-                    let now = Self::now_seconds()?;
-                    if !prepared_inputs_are_all_unspent(&prepared, networking).map_err(|error| {
+                    }
+                    if prepared_input_state(&prepared, networking).map_err(|error| {
                         open_channel_error(error, &attempt.unit, attempt.funding_token_target_msats)
-                    })? {
+                    })? != ExactInputState::AllSpent
+                    {
                         return Ok(OpeningRecoveryOutcome::Unresolved);
                     }
-                    if self
-                        .loose_wallet
-                        .abandon_opening_attempt_if_evidence_current(
-                            &evidence,
-                            now,
-                            "aged empty exact restore with every exact input UNSPENT",
-                        )
-                        .map_err(loose_proof_error)?
-                    {
-                        return Ok(OpeningRecoveryOutcome::Abandoned);
+                    // Check the exact original outputs once more after the spent
+                    // observation before recording the external-spend outcome.
+                    match self
+                        .restore_journaled_opening(&prepared, networking)
+                        .map_err(|error| {
+                            open_channel_error(
+                                error,
+                                &attempt.unit,
+                                attempt.funding_token_target_msats,
+                            )
+                        })? {
+                        OpeningRestoreOutcome::Completed(completed) => {
+                            let json = serde_json::to_string(&completed).map_err(|e| {
+                                WalletError::Backend(format!("serialize recovered opening: {e}"))
+                            })?;
+                            self.loose_wallet
+                                .mark_opening_attempt_finalizing(&attempt.attempt_id, &json)
+                                .map_err(loose_proof_error)?;
+                            *completed
+                        }
+                        OpeningRestoreOutcome::FundingOutputsAbsent => {
+                            let Some(evidence) = self
+                                .loose_wallet
+                                .opening_export_evidence(
+                                    &attempt.attempt_id,
+                                    OpeningAttemptState::Exported,
+                                )
+                                .map_err(loose_proof_error)?
+                            else {
+                                return Ok(OpeningRecoveryOutcome::Unresolved);
+                            };
+                            if self
+                                .loose_wallet
+                                .mark_opening_attempt_externally_spent_if_evidence_current(
+                                    &evidence,
+                                    Self::now_seconds()?,
+                                )
+                                .map_err(loose_proof_error)?
+                            {
+                                return Ok(OpeningRecoveryOutcome::ExternallySpent);
+                            }
+                            return Ok(OpeningRecoveryOutcome::Unresolved);
+                        }
                     }
-                    return Ok(OpeningRecoveryOutcome::Unresolved);
                 }
             }
         };
@@ -1013,6 +1058,117 @@ impl SqliteClientWallet {
             attempt.expiry_timestamp,
         )?;
         Ok(OpeningRecoveryOutcome::Recovered(completed.channel_id))
+    }
+
+    /// Export bearer tokens for ambiguous opening inputs that have remained
+    /// unspent for at least one hour. Exported inputs remain reserved until the
+    /// opening recovers or later evidence records them as externally spent.
+    pub fn export_stale_opening_inputs(
+        &self,
+        access: &ExclusiveWalletAccess<'_>,
+    ) -> Result<Vec<ExportedOpeningInputsToken>, WalletError> {
+        if !access.authorizes(&self.wallet_lock_identity) {
+            return Err(WalletError::Backend(
+                "exclusive wallet maintenance access belongs to a different wallet".to_string(),
+            ));
+        }
+        let networking = OpeningRecoveryHttpNetworking::new().map_err(WalletError::Backend)?;
+        let mut grouped: HashMap<(String, String), (Vec<Proof>, Vec<String>)> = HashMap::new();
+        for attempt in self
+            .loose_wallet
+            .opening_attempts_for_recovery()
+            .map_err(loose_proof_error)?
+        {
+            if !matches!(
+                attempt.state,
+                OpeningAttemptState::Submitted | OpeningAttemptState::Exported
+            ) {
+                continue;
+            }
+            let prepared: PreparedOpenChannel =
+                serde_json::from_str(&attempt.prepared_open_json)
+                    .map_err(|e| WalletError::Backend(format!("decode opening attempt: {e}")))?;
+            let reserved_proofs = self
+                .loose_wallet
+                .proofs_for_reservation(&attempt.reservation_id)
+                .map_err(loose_proof_error)?;
+            verify_prepared_inputs_match_selected_proofs(
+                &prepared,
+                &attempt.selected_proof_ids,
+                &reserved_proofs,
+            )?;
+            if !matches!(
+                self.restore_journaled_opening(&prepared, &networking)
+                    .map_err(|error| {
+                        open_channel_error(error, &attempt.unit, attempt.funding_token_target_msats)
+                    })?,
+                OpeningRestoreOutcome::FundingOutputsAbsent
+            ) {
+                continue;
+            }
+            if prepared_input_state(&prepared, &networking).map_err(|error| {
+                open_channel_error(error, &attempt.unit, attempt.funding_token_target_msats)
+            })? != ExactInputState::AllUnspent
+            {
+                continue;
+            }
+            if attempt.state == OpeningAttemptState::Submitted {
+                let Some(evidence) = self
+                    .loose_wallet
+                    .opening_export_evidence(&attempt.attempt_id, OpeningAttemptState::Submitted)
+                    .map_err(loose_proof_error)?
+                else {
+                    continue;
+                };
+                if !self
+                    .loose_wallet
+                    .mark_opening_attempt_exported_if_evidence_current(
+                        &evidence,
+                        Self::now_seconds()?,
+                    )
+                    .map_err(loose_proof_error)?
+                {
+                    continue;
+                }
+            }
+            let proofs = reserved_proofs
+                .iter()
+                .map(|proof| serde_json::from_str::<Proof>(&proof.proof_json))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    WalletError::Backend(format!("decode reserved proof for export: {e}"))
+                })?;
+            let entry = grouped
+                .entry((attempt.mint_url.clone(), attempt.unit.clone()))
+                .or_insert_with(|| (Vec::new(), Vec::new()));
+            entry.0.extend(proofs);
+            entry.1.push(attempt.attempt_id);
+        }
+        let mut exports = grouped
+            .into_iter()
+            .map(|((mint_url, unit), (proofs, mut attempt_ids))| {
+                attempt_ids.sort();
+                let amount_raw = proofs.iter().map(|proof| proof.amount.to_u64()).sum();
+                let currency = unit.parse::<CurrencyUnit>().map_err(|e| {
+                    WalletError::Backend(format!("parse exported token unit '{unit}': {e}"))
+                })?;
+                let mint = mint_url.parse().map_err(|e| {
+                    WalletError::Backend(format!("parse exported token mint '{mint_url}': {e}"))
+                })?;
+                Ok(ExportedOpeningInputsToken {
+                    mint_url,
+                    unit,
+                    amount_raw,
+                    proof_count: proofs.len(),
+                    attempt_ids,
+                    token: Token::new(mint, proofs, None, currency).to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, WalletError>>()?;
+        exports.sort_by(|left, right| {
+            (&left.mint_url, &left.unit).cmp(&(&right.mint_url, &right.unit))
+        });
+        Ok(exports)
     }
 
     fn recover_or_replay_submitted_opening<N: OpeningRecoveryNetworking>(
@@ -3049,6 +3205,13 @@ fn prepared_inputs_are_all_unspent<N: OpeningRecoveryNetworking>(
     prepared: &PreparedOpenChannel,
     networking: &N,
 ) -> Result<bool, OpenChannelError> {
+    Ok(prepared_input_state(prepared, networking)? == ExactInputState::AllUnspent)
+}
+
+fn prepared_input_state<N: OpeningRecoveryNetworking>(
+    prepared: &PreparedOpenChannel,
+    networking: &N,
+) -> Result<ExactInputState, OpenChannelError> {
     let proofs: Vec<Proof> = serde_json::from_str(&prepared.opening.input_token).map_err(|e| {
         open_channel_stage_error(
             OpenChannelFailureStage::RestoreVerification,
@@ -3114,6 +3277,7 @@ fn prepared_inputs_are_all_unspent<N: OpeningRecoveryNetworking>(
         ));
     }
     let mut all_unspent = true;
+    let mut all_spent = true;
     for proof_state in response.states {
         if !requested.remove(&proof_state.y.to_string()) {
             return Err(open_channel_stage_error(
@@ -3123,6 +3287,7 @@ fn prepared_inputs_are_all_unspent<N: OpeningRecoveryNetworking>(
             ));
         }
         all_unspent &= proof_state.state == State::Unspent;
+        all_spent &= proof_state.state == State::Spent;
     }
     if !requested.is_empty() {
         return Err(open_channel_stage_error(
@@ -3131,7 +3296,13 @@ fn prepared_inputs_are_all_unspent<N: OpeningRecoveryNetworking>(
             "opening input state response omitted an input Y".to_string(),
         ));
     }
-    Ok(all_unspent)
+    Ok(if all_unspent {
+        ExactInputState::AllUnspent
+    } else if all_spent {
+        ExactInputState::AllSpent
+    } else {
+        ExactInputState::MixedOrPending
+    })
 }
 
 fn hex_to_session_id(hex: &str) -> Result<[u8; 32], WalletError> {
@@ -6082,7 +6253,7 @@ mod tests {
         report.cancelled_attempt_ids.sort();
         assert_eq!(report.cancelled_attempt_ids, vec!["prepared", "rejected"]);
         assert!(report.recovered_channel_ids.is_empty());
-        assert!(report.abandoned_attempt_ids.is_empty());
+        assert!(report.externally_spent_attempt_ids.is_empty());
         assert_eq!(report.unresolved.len(), 1);
         assert_eq!(report.unresolved[0].attempt_id, "submitted");
         assert!(report.unresolved[0]
@@ -6689,7 +6860,7 @@ mod tests {
         let wallet = SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret).unwrap();
         let recovered = wallet.recover_pending_openings_inner().unwrap();
         if !swap_reached_mint {
-            assert!(recovered.abandoned_attempt_ids.is_empty());
+            assert!(recovered.externally_spent_attempt_ids.is_empty());
             assert!(recovered.recovered_channel_ids.is_empty());
             assert_eq!(recovered.unresolved.len(), 1);
             assert_eq!(recovered.unresolved[0].attempt_id, channel_id);
@@ -6699,8 +6870,6 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(record.state, OpeningAttemptState::Submitted);
-            assert!(record.abandonment_reason.is_none());
-            assert!(record.abandoned_at.is_none());
             assert_eq!(
                 wallet
                     .loose_wallet()

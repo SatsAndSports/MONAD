@@ -219,7 +219,7 @@ where
         info!(
             recovered = recovered.recovered_channel_ids.len(),
             cancelled = recovered.cancelled_attempt_ids.len(),
-            abandoned = recovered.abandoned_attempt_ids.len(),
+            externally_spent = recovered.externally_spent_attempt_ids.len(),
             unresolved = recovered.unresolved.len(),
             "channel opening recovery outcomes"
         );
