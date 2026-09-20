@@ -214,18 +214,35 @@ Existing MONAD or pinned-upstream tests cover:
 - input-fee target selection, metadata refresh, nonpositive-net filtering, and
   the 992-input limit
 - wallet ownership exclusion and process-death lock release
+- two real prepared openings exported as one token, decoded exact proof union,
+  combined totals, retained reservations, and deterministic re-export
+- export orchestration rollback when the second attempt update fails, with an
+  independent mint group still exporting successfully
+- malformed direct responses followed by invalid restore evidence retaining exact
+  custody, then successful idempotent recovery after reopening the wallet
+- invalid funding and change restores through wallet recovery: malformed JSON,
+  count and identity mismatch, malformed signatures, and well-formed incorrect
+  signature points rejected by DLEQ verification; change cases receive valid funding
+- explicit scripted replay rejection followed by real-mint completion of the saved
+  original request and post-restart recovery of exactly one channel without a successor
+- post-restart recovery making zero swap calls through its injected networking
+  interface, with exact input spend and one-time change import
+- export human/JSON rendering and actual opening-maintenance CLI rejection under
+  startup and steady-state runtime ownership, followed by success after lock release
 
-The following are worthwhile orchestration-level additions, not evidence that the
-underlying invariant is absent:
+Remaining coverage limitations, not evidence that the underlying invariant is absent:
 
-- inject each invalid direct/restored response through MONAD and assert final
-  journal/reservation state, including valid funding plus invalid change
-- delay the original request until after restore/checkstate and reject the replay,
-  then demonstrate later recovery of the original completion
-- exercise the complete stale-input export orchestration with controlled mint
-  restore/checkstate responses, not only storage-level evidence races
-- broaden multi-process and CLI lifecycle tests around ownership and mint-I/O
-  exclusion
+- delayed-original completion uses a sequential scripted network scenario, not
+  synchronized concurrent execution inside the mint
+- the zero-swap assertion observes the recovery networking interface, not all HTTP
+  traffic independently at the mint
+- CLI ownership tests use absent/empty wallets and verify database preservation;
+  they do not directly count mint requests for a populated pending-opening wallet
+- the invalid direct-response test covers malformed JSON; the broader invalid
+  funding/change matrix exercises restore orchestration rather than every direct
+  response variant
+- dedicated mixed spent/unspent recovery tests remain deferred; conservative
+  handling of inconclusive evidence is unchanged
 
 ## Separate Follow-Up Areas
 
