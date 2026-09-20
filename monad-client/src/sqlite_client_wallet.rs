@@ -44,6 +44,36 @@ const CHANNEL_EXPIRY_SECONDS: u64 = 24 * 3600;
 const MINT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_CLIENT_ERROR_PREFIX: &str = "MONAD_HTTP_CLIENT_ERROR ";
 
+/// Structured HTTP rejection. Display deliberately omits the mint's untrusted body.
+pub struct RefundMintRejection {
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Debug for RefundMintRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::fmt::Display for RefundMintRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refund mint HTTP rejection ({})", self.status)
+    }
+}
+
+impl std::error::Error for RefundMintRejection {}
+
+impl RefundMintRejection {
+    fn inactive_output_keyset(&self) -> bool {
+        (400..500).contains(&self.status)
+            && serde_json::from_str::<serde_json::Value>(&self.body)
+                .ok()
+                .and_then(|v| v.get("code").and_then(|c| c.as_u64()))
+                == Some(12002)
+    }
+}
+
 static ACTIVE_OPENINGS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 struct ActiveOpeningGuard(String);
@@ -306,9 +336,26 @@ const CREATE_CHANNEL_RECOVERIES_SQL: &str = r#"
         recovered_amount_raw INTEGER,
         recovered_proof_count INTEGER,
         prepared_refund_json TEXT,
+        journal_version INTEGER NOT NULL DEFAULT 2 CHECK(journal_version = 2),
+        custody_db TEXT NOT NULL,
+        custody_wallet TEXT NOT NULL,
+        custody_sender TEXT NOT NULL,
+        completed_proofs_json TEXT,
         completed_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS monad_client_refund_executions (
+        execution_id INTEGER PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        prepared_json TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS monad_client_refund_predecessors (
+        channel_id TEXT PRIMARY KEY,
+        prepared_json TEXT NOT NULL,
+        rejection TEXT NOT NULL
     )
 "#;
 
@@ -380,7 +427,9 @@ impl ClientWalletInspection {
             .query_map([], row_to_channel_meta)
             .map_err(|e| WalletError::Backend(format!("query channels: {e}")))?;
         rows.map(|row| {
-            let meta = row.map_err(|e| WalletError::Backend(format!("decode channel row: {e}")))?;
+            let mut meta =
+                row.map_err(|e| WalletError::Backend(format!("decode channel row: {e}")))?;
+            apply_channel_recovery_state(&conn, &mut meta)?;
             let upstream = checked_upstream_info(&conn, &meta.channel_id)?;
             wallet_channel_from_meta(meta, Some(upstream))
         })
@@ -544,6 +593,7 @@ struct ChannelRecoveryRow {
 enum ChannelRecoveryStatus {
     Prepared,
     Submitting,
+    Finalizing,
     Completed,
 }
 
@@ -552,6 +602,7 @@ impl ChannelRecoveryStatus {
         match value {
             "prepared" => Ok(Self::Prepared),
             "submitting" => Ok(Self::Submitting),
+            "finalizing" => Ok(Self::Finalizing),
             "completed" => Ok(Self::Completed),
             other => Err(WalletError::Backend(format!(
                 "unknown channel recovery status: {other}"
@@ -604,11 +655,39 @@ impl SqliteClientWallet {
         channel_db
             .busy_timeout(Duration::from_secs(5))
             .map_err(|e| WalletError::Backend(format!("set channel db busy timeout: {e}")))?;
+        let old_schema: bool = channel_db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'monad_client_channel_recoveries') AND NOT EXISTS(SELECT 1 FROM pragma_table_info('monad_client_channel_recoveries') WHERE name = 'custody_db')",
+            [], |r| r.get(0),
+        ).map_err(|e| WalletError::Backend(format!("inspect refund schema: {e}")))?;
+        if old_schema {
+            let count: i64 = channel_db
+                .query_row(
+                    "SELECT COUNT(*) FROM monad_client_channel_recoveries",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| WalletError::Backend(format!("inspect legacy refunds: {e}")))?;
+            if count != 0 {
+                return Err(WalletError::Backend(
+                    "incompatible nonempty refund journal; no automatic migration".to_string(),
+                ));
+            }
+            channel_db
+                .execute_batch("DROP TABLE monad_client_channel_recoveries")
+                .map_err(|e| WalletError::Backend(format!("replace empty refund schema: {e}")))?;
+        }
         channel_db
             .execute_batch(&format!(
                 "{CREATE_CHANNELS_SQL};{CREATE_CHANNEL_RECOVERIES_SQL};"
             ))
             .map_err(|e| WalletError::Backend(format!("create channel metadata schema: {e}")))?;
+        let incompatible: bool = channel_db.query_row("SELECT EXISTS(SELECT 1 FROM monad_client_channel_recoveries WHERE journal_version != 2)", [], |r| r.get(0))
+            .map_err(|e| WalletError::Backend(format!("validate refund journal version: {e}")))?;
+        if incompatible {
+            return Err(WalletError::Backend(
+                "incompatible refund journal version".to_string(),
+            ));
+        }
         reject_and_remove_legacy_opening_recoveries(&channel_db)?;
         let opening_scope = std::fs::canonicalize(path)
             .unwrap_or_else(|_| path.to_path_buf())
@@ -647,19 +726,31 @@ impl SqliteClientWallet {
     /// funding-token state and any locally persisted refund attempt, then takes
     /// the safest next step and returns what happened.
     ///
-    /// State summary:
+    /// Requires matching exclusive maintenance access. Each invocation submits at
+    /// most once plus one exact replay per request. Only an initial, definitive
+    /// inactive-output rejection may produce one immutable successor.
     /// - no row / prepared + expired + unspent: persist and submit one refund
-    /// - submitting + expired: restore first, submit only if still unspent
-    /// - spent by relay close: restore deterministic sender close outputs
-    /// - spent by refund or unknown witness: report unknown without probing
+    /// - submitting: restore before clock/state checks; retry only after valid absence
+    /// - finalizing: finish local proof import and closure without mint IO
+    /// - spent with a submitted refund: final exact restore before discovery
+    /// - relay-close or unknown witness: checked deterministic sender discovery
     pub async fn recover_channel_funds<M>(
         &self,
+        access: &ExclusiveWalletAccess<'_>,
         channel_id: &str,
         mint_connection: &M,
     ) -> Result<ChannelFundRecoveryResult, WalletError>
     where
         M: MintConnection + ?Sized,
     {
+        if !access.authorizes(&self.wallet_lock_identity) {
+            return Err(WalletError::Backend(
+                "exclusive wallet maintenance access belongs to a different wallet".to_string(),
+            ));
+        }
+        let _singleflight =
+            enter_active_opening(&format!("refund:{}:{channel_id}", self.opening_scope))?;
+        self.validate_recovery_custody(channel_id)?;
         if let Some(completed) = self.completed_channel_recovery(channel_id)? {
             return Ok(completed);
         }
@@ -674,82 +765,182 @@ impl SqliteClientWallet {
         .ok_or(WalletError::NotFound)?;
         let established = EstablishedChannel::from_client_channel_funding(&funding)
             .map_err(|e| WalletError::Backend(format!("reconstruct channel funding: {e}")))?;
-        let now = Self::now_seconds()?;
-
-        let proof_state = established
-            .check_funding_token_state(mint_connection)
-            .await
-            .map_err(|e| WalletError::Backend(format!("check funding token state: {e}")))?;
-
-        if proof_state.state == State::Pending {
-            return Ok(ChannelFundRecoveryResult::FundingPending);
+        if established.params.sender_pubkey != self.sender_secret.public_key() {
+            return Err(WalletError::Backend(
+                "channel recovery sender mismatch".to_string(),
+            ));
         }
-
-        if proof_state.state == State::Unspent && now < established.params.expiry_timestamp {
-            return Ok(ChannelFundRecoveryResult::NotExpiredOrSpentYet {
-                expiry_timestamp: established.params.expiry_timestamp,
-                now,
-            });
-        }
-
         let recovery = self.load_channel_recovery_row(channel_id)?;
-
-        // If the channel is expired and we have already attempted to submit a
-        // refund, try to restore the prepared refund outputs first. The mint may
-        // have accepted the refund even though we lost the response.
-        if established.params.expiry_timestamp <= now {
-            if let Some(row) = recovery.as_ref() {
-                if row.status == ChannelRecoveryStatus::Submitting {
-                    if let Some(prepared) = self.prepared_refund_from_recovery_row(row)? {
-                        if let Ok(proofs) =
-                            EstablishedChannel::restore_prepared_sender_refund_outputs(
-                                &prepared,
-                                mint_connection,
-                                &established.params.keyset_info.active_keys,
-                            )
-                            .await
-                        {
+        if recovery
+            .as_ref()
+            .is_some_and(|r| r.status == ChannelRecoveryStatus::Finalizing)
+        {
+            let (kind, json): (String, String) = self.conn()?.query_row(
+                "SELECT kind, completed_proofs_json FROM monad_client_channel_recoveries WHERE channel_id = ?1",
+                [channel_id], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).map_err(|e| WalletError::Backend(format!("read finalizing recovery: {e}")))?;
+            let proofs = serde_json::from_str(&json)
+                .map_err(|e| WalletError::Backend(format!("decode completed proofs: {e}")))?;
+            return self.complete_channel_recovery(
+                channel_id,
+                &funding,
+                &kind,
+                proofs,
+                kind == "post_expiry_refund",
+            );
+        }
+        let mut prepared = recovery
+            .as_ref()
+            .map(|r| self.prepared_refund_from_recovery_row(r))
+            .transpose()?
+            .flatten();
+        if let Some(p) = &prepared {
+            p.verify(&established, &self.sender_secret)
+                .map_err(|e| WalletError::Backend(format!("verify refund: {e}")))?;
+        }
+        let mut restore_first = recovery
+            .as_ref()
+            .is_some_and(|r| r.status == ChannelRecoveryStatus::Submitting);
+        let mut executions = 0;
+        let mut refreshed_rejection = false;
+        loop {
+            if restore_first {
+                let p = prepared.as_ref().ok_or_else(|| {
+                    WalletError::Backend("submitted refund missing immutable request".to_string())
+                })?;
+                match established
+                    .restore_prepared_sender_refund_outputs(p, &self.sender_secret, mint_connection)
+                    .await
+                {
+                    Ok(Some(proofs)) => {
+                        return self.complete_channel_recovery(
+                            channel_id,
+                            &funding,
+                            "post_expiry_refund",
+                            proofs,
+                            true,
+                        )
+                    }
+                    Ok(None) => {}
+                    Err(_) => return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
+                        channel_id: channel_id.to_string(),
+                        reason:
+                            "refund restore failed or returned invalid outputs; request retained"
+                                .to_string(),
+                    }),
+                }
+            }
+            let proof_state = established
+                .check_funding_token_state(mint_connection)
+                .await
+                .map_err(|_| {
+                    WalletError::Backend(
+                        "check funding token state failed; refund journal retained".to_string(),
+                    )
+                })?;
+            if proof_state.state == State::Pending {
+                return Ok(ChannelFundRecoveryResult::FundingPending);
+            }
+            if proof_state.state == State::Spent {
+                // The original swap may complete between an empty restore and
+                // checkstate. One final exact restore closes that observation gap.
+                if restore_first {
+                    match established
+                        .restore_prepared_sender_refund_outputs(
+                            prepared.as_ref().unwrap(),
+                            &self.sender_secret,
+                            mint_connection,
+                        )
+                        .await
+                    {
+                        Ok(Some(proofs)) => {
                             return self.complete_channel_recovery(
                                 channel_id,
                                 &funding,
                                 "post_expiry_refund",
                                 proofs,
                                 true,
-                            );
+                            )
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
+                                channel_id: channel_id.to_string(),
+                                reason:
+                                    "final exact refund restore failed or returned invalid outputs"
+                                        .to_string(),
+                            })
                         }
                     }
                 }
-            }
-        }
-
-        if proof_state.state == State::Unspent {
-            // At this point the channel is expired, otherwise we returned above.
-            let prepared = match recovery {
-                Some(row) => match self.prepared_refund_from_recovery_row(&row)? {
-                    Some(prepared) => prepared,
-                    None => {
-                        self.prepare_and_persist_refund_recovery(channel_id, &established, now)?
+                // Witness cardinality is advisory: a valid close may include
+                // irrelevant signatures. Discovery still verifies every output.
+                let kind = EstablishedChannel::classify_funding_spend_witness(&proof_state);
+                let result = if kind != FundingSpendKind::PostExpiryRefund {
+                    self.try_relay_close_recovery(channel_id, &funding, mint_connection)
+                        .await?
+                } else {
+                    ChannelFundRecoveryResult::UnknownSpent
+                };
+                return Ok(
+                    if restore_first && result == ChannelFundRecoveryResult::UnknownSpent {
+                        ChannelFundRecoveryResult::RecoveryRetryLater {
+                        channel_id: channel_id.to_string(),
+                        reason: "spent funding with unresolved submitted refund; immutable request retained".to_string(),
                     }
-                },
-                None => self.prepare_and_persist_refund_recovery(channel_id, &established, now)?,
-            };
-
-            let is_submitting = self
-                .load_channel_recovery_row(channel_id)?
-                .map(|r| r.status == ChannelRecoveryStatus::Submitting)
-                .unwrap_or(false);
-            if !is_submitting {
-                self.mark_refund_recovery_submitting(channel_id)?;
+                    } else {
+                        result
+                    },
+                );
             }
-
-            // Safe to retry from `submitting + Unspent`: the funding input is
-            // mint-observable unspent and we reuse the same persisted refund.
-            match EstablishedChannel::submit_prepared_sender_refund(
-                &prepared,
-                mint_connection,
-                &established.params.keyset_info.active_keys,
-            )
-            .await
+            let now = Self::now_seconds()?;
+            if now <= established.params.expiry_timestamp {
+                return Ok(ChannelFundRecoveryResult::NotExpiredOrSpentYet {
+                    expiry_timestamp: established.params.expiry_timestamp,
+                    now,
+                });
+            }
+            if executions >= 2 {
+                return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
+                    channel_id: channel_id.to_string(),
+                    reason: "refund remains unresolved after bounded exact replay".to_string(),
+                });
+            }
+            if prepared.is_none() {
+                prepared = Some(self.prepare_and_persist_refund_recovery(
+                    channel_id,
+                    &established,
+                    now,
+                )?);
+            }
+            // Resume a durable initial rejection even if the previous invocation
+            // died during refresh. No ambiguous execution may precede this grant.
+            if !refreshed_rejection && self.refund_has_initial_rejection(channel_id)? {
+                refreshed_rejection = true;
+                let p = prepared.as_ref().unwrap();
+                let output = self.select_refund_output_keyset(&established, true)?;
+                if output.keyset_id != p.output_keyset.keyset_id {
+                    let successor = established
+                        .prepare_sender_refund_after_expiry(
+                            self.sender_secret.clone(),
+                            now,
+                            output,
+                            rand::random(),
+                        )
+                        .map_err(|e| {
+                            WalletError::Backend(format!("prepare successor refund: {e}"))
+                        })?;
+                    self.persist_refund_successor(channel_id, p, &successor)?;
+                    prepared = Some(successor);
+                    executions = 0;
+                }
+            }
+            let p = prepared.as_ref().unwrap();
+            let execution = self.record_refund_execution(channel_id, p)?;
+            executions += 1;
+            match established
+                .submit_prepared_sender_refund(p, &self.sender_secret, now, mint_connection)
+                .await
             {
                 Ok(proofs) => {
                     return self.complete_channel_recovery(
@@ -758,49 +949,23 @@ impl SqliteClientWallet {
                         "post_expiry_refund",
                         proofs,
                         true,
-                    );
-                }
-                Err(_) => {
-                    if let Ok(proofs) = EstablishedChannel::restore_prepared_sender_refund_outputs(
-                        &prepared,
-                        mint_connection,
-                        &established.params.keyset_info.active_keys,
                     )
-                    .await
+                }
+                Err(error) => {
+                    // Only a typed, direct initial rejection may authorize new outputs.
+                    // Pending execution records are uncertainty, including process death.
+                    if error
+                        .downcast_ref::<RefundMintRejection>()
+                        .is_some_and(|e| e.inactive_output_keyset())
+                        && self.refund_can_replace(channel_id, execution)?
                     {
-                        return self.complete_channel_recovery(
-                            channel_id,
-                            &funding,
-                            "post_expiry_refund",
-                            proofs,
-                            true,
-                        );
+                        self.conn()?.execute("UPDATE monad_client_refund_executions SET outcome = 'inactive_output_keyset' WHERE execution_id = ?1", [execution])
+                            .map_err(|e| WalletError::Backend(format!("record refund rejection: {e}")))?;
                     }
-                    return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
-                        channel_id: channel_id.to_string(),
-                        reason: "refund submit failed and prepared outputs could not be restored"
-                            .to_string(),
-                    });
+                    restore_first = true;
                 }
             }
         }
-
-        if proof_state.state == State::Spent {
-            match EstablishedChannel::classify_funding_spend_witness(&proof_state) {
-                FundingSpendKind::RelayClose => {
-                    // Only the relay-close witness path may probe deterministic
-                    // sender close outputs; refund/mystery spends stay unknown.
-                    return self
-                        .try_relay_close_recovery(channel_id, &funding, mint_connection)
-                        .await;
-                }
-                FundingSpendKind::PostExpiryRefund | FundingSpendKind::Unknown => {
-                    return Ok(ChannelFundRecoveryResult::UnknownSpent);
-                }
-            }
-        }
-
-        Ok(ChannelFundRecoveryResult::UnknownSpent)
     }
 
     async fn try_relay_close_recovery<M>(
@@ -822,7 +987,11 @@ impl SqliteClientWallet {
             Ok(proofs) if !proofs.is_empty() => {
                 self.complete_channel_recovery(channel_id, funding, "relay_close", proofs, false)
             }
-            _ => Ok(ChannelFundRecoveryResult::UnknownSpent),
+            Ok(_) => Ok(ChannelFundRecoveryResult::UnknownSpent),
+            Err(_) => Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
+                channel_id: channel_id.to_string(),
+                reason: "sender close discovery failed or returned invalid outputs".to_string(),
+            }),
         }
     }
 
@@ -1666,6 +1835,32 @@ impl SqliteClientWallet {
             .map_err(|e| WalletError::Backend(format!("decode prepared refund: {e}")))
     }
 
+    fn recovery_custody(&self) -> Result<(&str, &str, &str), WalletError> {
+        let db = self
+            .loose_wallet
+            .database_path()
+            .and_then(Path::to_str)
+            .ok_or_else(|| {
+                WalletError::Backend("custody database path is not valid UTF-8".to_string())
+            })?;
+        Ok((db, self.loose_wallet.wallet_name(), &self.sender_pubkey_hex))
+    }
+
+    fn validate_recovery_custody(&self, channel_id: &str) -> Result<(), WalletError> {
+        let stored: Option<(String, String, String)> = self.conn()?.query_row(
+            "SELECT custody_db, custody_wallet, custody_sender FROM monad_client_channel_recoveries WHERE channel_id = ?1",
+            [channel_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional().map_err(|e| WalletError::Backend(format!("read recovery custody: {e}")))?;
+        if let Some((db, wallet, sender)) = stored {
+            if (db.as_str(), wallet.as_str(), sender.as_str()) != self.recovery_custody()? {
+                return Err(WalletError::Backend(
+                    "channel recovery custody destination mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn completed_channel_recovery(
         &self,
         channel_id: &str,
@@ -1707,10 +1902,132 @@ impl SqliteClientWallet {
         now: u64,
     ) -> Result<PreparedSenderRefund, WalletError> {
         let prepared = established
-            .prepare_sender_refund_after_expiry(self.sender_secret.clone(), now)
+            .prepare_sender_refund_after_expiry(
+                self.sender_secret.clone(),
+                now,
+                self.select_refund_output_keyset(established, false)?,
+                rand::random(),
+            )
             .map_err(|e| WalletError::Backend(format!("prepare sender refund: {e}")))?;
         self.persist_refund_recovery_prepared(channel_id, &prepared)?;
         Ok(prepared)
+    }
+
+    fn select_refund_output_keyset(
+        &self,
+        established: &EstablishedChannel,
+        refresh: bool,
+    ) -> Result<cdk_spilman::KeysetInfo, WalletError> {
+        let bridge = self
+            .bridge
+            .lock()
+            .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+        let mint = &established.params.mint;
+        for pass in 0..2 {
+            if (refresh && pass == 0) || (!refresh && pass == 1) {
+                bridge.refresh_keysets_response(mint).map_err(|_| {
+                    WalletError::Backend("refresh refund output keysets failed".to_string())
+                })?;
+            }
+            let mut entries = bridge.cached_keysets_for_unit(mint, &established.params.unit);
+            entries.sort_by_key(|(id, _)| id.to_string());
+            if let Some((_, entry)) = entries.into_iter().find(|(_, entry)| entry.active) {
+                return parse_keyset_info_from_json(&entry.info_json).map_err(WalletError::Backend);
+            }
+            if refresh {
+                break;
+            }
+        }
+        Err(WalletError::Backend(
+            "no active same-unit refund output keyset".to_string(),
+        ))
+    }
+
+    fn record_refund_execution(
+        &self,
+        channel_id: &str,
+        prepared: &PreparedSenderRefund,
+    ) -> Result<i64, WalletError> {
+        let json = prepared
+            .to_json()
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let now = to_i64(Self::now_seconds()?)?;
+        let changed = tx.execute("UPDATE monad_client_channel_recoveries SET status = 'submitting', updated_at = ?3 WHERE channel_id = ?1 AND prepared_refund_json = ?2 AND status IN ('prepared', 'submitting')", params![channel_id, json, now])
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        if changed != 1 {
+            return Err(WalletError::Backend(
+                "refund execution phase conflict".to_string(),
+            ));
+        }
+        tx.execute("INSERT INTO monad_client_refund_executions(channel_id, prepared_json, outcome, created_at) VALUES (?1, ?2, 'uncertain', ?3)", params![channel_id, json, now])
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let id = tx.last_insert_rowid();
+        tx.commit()
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        Ok(id)
+    }
+
+    fn refund_can_replace(&self, channel_id: &str, execution: i64) -> Result<bool, WalletError> {
+        self.conn()?.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM monad_client_refund_executions WHERE channel_id = ?1 AND execution_id != ?2) AND NOT EXISTS(SELECT 1 FROM monad_client_refund_predecessors WHERE channel_id = ?1)",
+            params![channel_id, execution], |r| r.get(0),
+        ).map_err(|e| WalletError::Backend(e.to_string()))
+    }
+
+    fn refund_has_initial_rejection(&self, channel_id: &str) -> Result<bool, WalletError> {
+        self.conn()?.query_row(
+            "SELECT (SELECT COUNT(*) FROM monad_client_refund_executions WHERE channel_id = ?1) = 1 AND EXISTS(SELECT 1 FROM monad_client_refund_executions WHERE channel_id = ?1 AND outcome = 'inactive_output_keyset') AND NOT EXISTS(SELECT 1 FROM monad_client_refund_predecessors WHERE channel_id = ?1)",
+            [channel_id], |r| r.get(0),
+        ).map_err(|e| WalletError::Backend(e.to_string()))
+    }
+
+    fn persist_refund_successor(
+        &self,
+        channel_id: &str,
+        old: &PreparedSenderRefund,
+        new: &PreparedSenderRefund,
+    ) -> Result<(), WalletError> {
+        if old.output_keyset.keyset_id == new.output_keyset.keyset_id {
+            return Err(WalletError::Backend(
+                "refund successor requires a different output keyset".to_string(),
+            ));
+        }
+        let old = old
+            .to_json()
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let new = new
+            .to_json()
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let authorized: bool = tx.query_row(
+            "SELECT (SELECT COUNT(*) FROM monad_client_refund_executions WHERE channel_id = ?1) = 1 AND EXISTS(SELECT 1 FROM monad_client_refund_executions WHERE channel_id = ?1 AND prepared_json = ?2 AND outcome = 'inactive_output_keyset')",
+            params![channel_id, old], |r| r.get(0),
+        ).map_err(|e| WalletError::Backend(e.to_string()))?;
+        if !authorized {
+            return Err(WalletError::Backend(
+                "refund successor lacks definitive initial rejection".to_string(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO monad_client_refund_predecessors VALUES (?1, ?2, '12002')",
+            params![channel_id, old],
+        )
+        .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let changed = tx.execute("UPDATE monad_client_channel_recoveries SET prepared_refund_json = ?3, status = 'prepared', updated_at = ?4 WHERE channel_id = ?1 AND prepared_refund_json = ?2 AND status = 'submitting'", params![channel_id, old, new, to_i64(Self::now_seconds()?)?])
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        if changed != 1 {
+            return Err(WalletError::Backend(
+                "refund successor phase conflict".to_string(),
+            ));
+        }
+        tx.commit().map_err(|e| WalletError::Backend(e.to_string()))
     }
 
     fn persist_refund_recovery_prepared(
@@ -1718,6 +2035,8 @@ impl SqliteClientWallet {
         channel_id: &str,
         prepared: &PreparedSenderRefund,
     ) -> Result<(), WalletError> {
+        self.validate_recovery_custody(channel_id)?;
+        let (db, wallet, sender) = self.recovery_custody()?;
         let now = Self::now_seconds()?;
         let prepared_json = prepared
             .to_json()
@@ -1725,44 +2044,28 @@ impl SqliteClientWallet {
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO monad_client_channel_recoveries
-             (channel_id, kind, status, recovered_amount_raw, recovered_proof_count, prepared_refund_json, created_at, updated_at)
-             VALUES (?1, 'post_expiry_refund', 'prepared', NULL, NULL, ?2, ?3, ?3)
-             ON CONFLICT(channel_id) DO UPDATE SET
-                kind = 'post_expiry_refund',
-                status = CASE
-                    WHEN monad_client_channel_recoveries.status = 'completed' THEN monad_client_channel_recoveries.status
-                    WHEN monad_client_channel_recoveries.status = 'submitting' THEN monad_client_channel_recoveries.status
-                    ELSE 'prepared'
-                END,
-                prepared_refund_json = CASE
-                    WHEN monad_client_channel_recoveries.status = 'completed' THEN monad_client_channel_recoveries.prepared_refund_json
-                    ELSE excluded.prepared_refund_json
-                END,
-                updated_at = excluded.updated_at",
-            params![channel_id, prepared_json, to_i64(now)?],
+             (channel_id, kind, status, recovered_amount_raw, recovered_proof_count, prepared_refund_json, created_at, updated_at, custody_db, custody_wallet, custody_sender)
+             VALUES (?1, 'post_expiry_refund', 'prepared', NULL, NULL, ?2, ?3, ?3, ?4, ?5, ?6)
+              ON CONFLICT(channel_id) DO NOTHING",
+            params![channel_id, prepared_json, to_i64(now)?, db, wallet, sender],
         )
         .map_err(|e| WalletError::Backend(format!("insert channel recovery: {e}")))?;
+        let stored: String = conn.query_row("SELECT prepared_refund_json FROM monad_client_channel_recoveries WHERE channel_id = ?1", [channel_id], |r| r.get(0))
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        if stored != prepared_json {
+            return Err(WalletError::Backend(
+                "immutable refund request conflict".to_string(),
+            ));
+        }
         Ok(())
     }
 
+    #[cfg(test)]
     fn mark_refund_recovery_submitting(&self, channel_id: &str) -> Result<(), WalletError> {
-        let now = Self::now_seconds()?;
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO monad_client_channel_recoveries
-             (channel_id, kind, status, recovered_amount_raw, recovered_proof_count, prepared_refund_json, created_at, updated_at)
-             VALUES (?1, 'post_expiry_refund', 'submitting', NULL, NULL, NULL, ?2, ?2)
-             ON CONFLICT(channel_id) DO UPDATE SET
-                kind = 'post_expiry_refund',
-                status = CASE
-                    WHEN monad_client_channel_recoveries.status = 'completed' THEN monad_client_channel_recoveries.status
-                    ELSE 'submitting'
-                END,
-                updated_at = excluded.updated_at",
-            params![channel_id, to_i64(now)?],
-        )
-        .map_err(|e| WalletError::Backend(format!("mark refund submitting: {e}")))?;
-        Ok(())
+        let row = self.load_channel_recovery_row(channel_id)?.unwrap();
+        let prepared = self.prepared_refund_from_recovery_row(&row)?.unwrap();
+        self.record_refund_execution(channel_id, &prepared)
+            .map(|_| ())
     }
 
     fn complete_channel_recovery(
@@ -1773,6 +2076,23 @@ impl SqliteClientWallet {
         proofs: Vec<Proof>,
         full_refund: bool,
     ) -> Result<ChannelFundRecoveryResult, WalletError> {
+        self.validate_recovery_custody(channel_id)?;
+        let (db, wallet, sender) = self.recovery_custody()?;
+        let json =
+            serde_json::to_string(&proofs).map_err(|e| WalletError::Backend(e.to_string()))?;
+        let now = to_i64(Self::now_seconds()?)?;
+        {
+            let conn = self.conn()?;
+            conn.execute("INSERT INTO monad_client_channel_recoveries(channel_id, kind, status, completed_proofs_json, created_at, updated_at, custody_db, custody_wallet, custody_sender) VALUES (?1, ?2, 'finalizing', ?3, ?4, ?4, ?5, ?6, ?7) ON CONFLICT(channel_id) DO UPDATE SET kind = excluded.kind, status = 'finalizing', completed_proofs_json = excluded.completed_proofs_json WHERE monad_client_channel_recoveries.status IN ('prepared', 'submitting') AND monad_client_channel_recoveries.completed_proofs_json IS NULL", params![channel_id, kind, json, now, db, wallet, sender])
+                .map_err(|e| WalletError::Backend(format!("persist verified recovery proofs: {e}")))?;
+            let stored: (String, String) = conn.query_row("SELECT kind, completed_proofs_json FROM monad_client_channel_recoveries WHERE channel_id = ?1 AND status = 'finalizing'", [channel_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| WalletError::Backend(format!("check finalization: {e}")))?;
+            if stored != (kind.to_string(), json) {
+                return Err(WalletError::Backend(
+                    "immutable completed proofs conflict".to_string(),
+                ));
+            }
+        }
         let recovered_amount_raw = proofs.iter().try_fold(0u64, |total, proof| {
             total
                 .checked_add(u64::from(proof.amount))
@@ -1800,9 +2120,14 @@ impl SqliteClientWallet {
                 .bridge
                 .lock()
                 .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
-            bridge
-                .close_channel(channel_id)
-                .map_err(|e| WalletError::Backend(format!("mark upstream channel closed: {e}")))?;
+            let info = bridge
+                .get_channel_info(channel_id)
+                .ok_or(WalletError::NotFound)?;
+            if info.state != ClientChannelState::Closed {
+                bridge.close_channel(channel_id).map_err(|e| {
+                    WalletError::Backend(format!("mark upstream channel closed: {e}"))
+                })?;
+            }
         }
         self.mark_channel_metadata_closed(channel_id)?;
         self.mark_channel_recovery_completed(
@@ -1836,26 +2161,30 @@ impl SqliteClientWallet {
     ) -> Result<(), WalletError> {
         let now = Self::now_seconds()?;
         let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO monad_client_channel_recoveries
-             (channel_id, kind, status, recovered_amount_raw, recovered_proof_count, completed_at, created_at, updated_at)
-             VALUES (?1, ?2, 'completed', ?3, ?4, ?5, ?5, ?5)
-             ON CONFLICT(channel_id) DO UPDATE SET
-                kind = excluded.kind,
+        let changed = conn
+            .execute(
+                "UPDATE monad_client_channel_recoveries SET
                 status = 'completed',
-                recovered_amount_raw = excluded.recovered_amount_raw,
-                recovered_proof_count = excluded.recovered_proof_count,
-                completed_at = excluded.completed_at,
-                updated_at = excluded.updated_at",
-            params![
-                channel_id,
-                kind,
-                to_i64(recovered_amount_raw)?,
-                to_i64(recovered_proof_count as u64)?,
-                to_i64(now)?,
-            ],
-        )
-        .map_err(|e| WalletError::Backend(format!("mark channel recovery completed: {e}")))?;
+                recovered_amount_raw = ?3,
+                recovered_proof_count = ?4,
+                completed_at = ?5,
+                updated_at = ?5
+             WHERE channel_id = ?1 AND kind = ?2 AND status = 'finalizing'
+                AND completed_proofs_json IS NOT NULL",
+                params![
+                    channel_id,
+                    kind,
+                    to_i64(recovered_amount_raw)?,
+                    to_i64(recovered_proof_count as u64)?,
+                    to_i64(now)?,
+                ],
+            )
+            .map_err(|e| WalletError::Backend(format!("mark channel recovery completed: {e}")))?;
+        if changed != 1 {
+            return Err(WalletError::Backend(
+                "refund completion phase conflict".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -3042,7 +3371,8 @@ impl MonadWallet for SqliteClientWallet {
             .execute(
                 "UPDATE monad_client_channels
                  SET attached_session_id = ?2, updated_at = ?3
-                 WHERE channel_id = ?1 AND attached_session_id IS NULL",
+                 WHERE channel_id = ?1 AND attached_session_id IS NULL
+                 AND NOT EXISTS(SELECT 1 FROM monad_client_channel_recoveries WHERE channel_id = ?1)",
                 params![channel_id, session_hex, to_i64(now)?],
             )
             .map_err(|e| WalletError::Backend(format!("attach channel: {e}")))?;
@@ -3269,12 +3599,35 @@ impl SqliteClientWallet {
 
     fn meta_to_wallet_channel(
         &self,
-        _conn: &Connection,
-        meta: ChannelMeta,
+        conn: &Connection,
+        mut meta: ChannelMeta,
     ) -> Result<WalletChannel, WalletError> {
+        apply_channel_recovery_state(conn, &mut meta)?;
         let upstream = upstream_info(&self.bridge, &meta.channel_id);
         wallet_channel_from_meta(meta, upstream)
     }
+}
+
+fn apply_channel_recovery_state(
+    conn: &Connection,
+    meta: &mut ChannelMeta,
+) -> Result<(), WalletError> {
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM monad_client_channel_recoveries WHERE channel_id = ?1",
+            [&meta.channel_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| WalletError::Backend(format!("check pending recovery: {e}")))?;
+    if let Some(status) = status {
+        meta.state = if status == "completed" {
+            WalletChannelState::Closed
+        } else {
+            WalletChannelState::Closing
+        };
+    }
+    Ok(())
 }
 
 fn wallet_channel_from_meta(
@@ -4250,20 +4603,160 @@ mod tests {
         inner: DirectMintConnection,
     }
 
+    struct OfflineRefundMint;
+
+    #[async_trait::async_trait]
+    impl MintConnection for OfflineRefundMint {
+        async fn process_swap(
+            &self,
+            _: cashu::nuts::SwapRequest,
+        ) -> anyhow::Result<cashu::nuts::SwapResponse> {
+            panic!("unexpected swap IO")
+        }
+        async fn post_restore(&self, _: RestoreRequest) -> anyhow::Result<RestoreResponse> {
+            panic!("unexpected restore IO")
+        }
+        async fn check_state(
+            &self,
+            _: Vec<cashu::nuts::PublicKey>,
+        ) -> anyhow::Result<CheckStateResponse> {
+            panic!("unexpected state IO")
+        }
+    }
+
+    struct ScriptedRefundMint {
+        inner: DirectMintConnection,
+        requests: Mutex<Vec<String>>,
+        lose_response: bool,
+        reject_replay: bool,
+        invalid_restore: bool,
+        fail_state: bool,
+        fail_second_submit: bool,
+        complete_on_state: Mutex<Option<cashu::nuts::SwapRequest>>,
+        close_on_submit: Mutex<Option<cashu::nuts::SwapRequest>>,
+        empty_restore: bool,
+        restore_calls: AtomicUsize,
+        hide_funding_witness: bool,
+    }
+
+    struct BlockingRefundMint {
+        inner: DirectMintConnection,
+        entered: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl MintConnection for BlockingRefundMint {
+        async fn process_swap(
+            &self,
+            _: cashu::nuts::SwapRequest,
+        ) -> anyhow::Result<cashu::nuts::SwapResponse> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+        async fn post_restore(&self, request: RestoreRequest) -> anyhow::Result<RestoreResponse> {
+            self.inner.post_restore(request).await
+        }
+        async fn check_state(
+            &self,
+            ys: Vec<cashu::nuts::PublicKey>,
+        ) -> anyhow::Result<CheckStateResponse> {
+            self.inner.check_state(ys).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MintConnection for ScriptedRefundMint {
+        async fn process_swap(
+            &self,
+            request: cashu::nuts::SwapRequest,
+        ) -> anyhow::Result<cashu::nuts::SwapResponse> {
+            let count = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(serde_json::to_string(&request).unwrap());
+                requests.len()
+            };
+            if self.fail_second_submit && count == 2 {
+                anyhow::bail!("ambiguous successor submission");
+            }
+            if self.reject_replay {
+                if count == 1 {
+                    anyhow::bail!("ambiguous initial execution");
+                }
+                return Err(RefundMintRejection {
+                    status: 400,
+                    body: r#"{"code":12002,"detail":"inactive keyset"}"#.to_string(),
+                }
+                .into());
+            }
+            let close = self.close_on_submit.lock().unwrap().take();
+            if let Some(close) = close {
+                self.inner.process_swap(close).await?;
+            }
+            let result = self.inner.process_swap(request).await?;
+            if self.lose_response {
+                anyhow::bail!("lost successful response");
+            }
+            Ok(result)
+        }
+        async fn post_restore(&self, request: RestoreRequest) -> anyhow::Result<RestoreResponse> {
+            self.restore_calls.fetch_add(1, Ordering::SeqCst);
+            if self.empty_restore {
+                return Ok(RestoreResponse {
+                    outputs: vec![],
+                    signatures: vec![],
+                });
+            }
+            if self.invalid_restore {
+                return Ok(RestoreResponse {
+                    outputs: request.outputs,
+                    signatures: vec![],
+                });
+            }
+            self.inner.post_restore(request).await
+        }
+        async fn check_state(
+            &self,
+            ys: Vec<cashu::nuts::PublicKey>,
+        ) -> anyhow::Result<CheckStateResponse> {
+            if self.fail_state {
+                anyhow::bail!("state endpoint unavailable");
+            }
+            let pending = self.complete_on_state.lock().unwrap().take();
+            if let Some(request) = pending {
+                self.inner.process_swap(request).await?;
+            }
+            let mut response = self.inner.check_state(ys).await?;
+            if self.hide_funding_witness {
+                for state in &mut response.states {
+                    state.witness = None;
+                }
+            }
+            Ok(response)
+        }
+    }
+
     #[async_trait::async_trait]
     impl MintConnection for DirectMintConnection {
         async fn process_swap(
             &self,
             request: cashu::nuts::SwapRequest,
         ) -> anyhow::Result<cashu::nuts::SwapResponse> {
-            self.client
+            let response = self
+                .client
                 .post(format!("{}/v1/swap", self.mint_url))
                 .json(&request)
                 .send()
                 .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?
-                .error_for_status()
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(RefundMintRejection {
+                    status: status.as_u16(),
+                    body: response.text().await?,
+                }
+                .into());
+            }
+            response
                 .json()
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -4329,6 +4822,7 @@ mod tests {
     }
 
     struct OpenedTestChannel {
+        mint_helper: TestMintHelper,
         _temp: tempfile::TempDir,
         wallet: SqliteClientWallet,
         loose_db: PathBuf,
@@ -5350,8 +5844,10 @@ mod tests {
         let sender_secret = sender_secret_hex();
         let wallet = SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret).unwrap();
 
-        let receiver_pubkey =
-            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
+        let receiver_pubkey = SecretKey::from_hex(hex::encode([2; 32]))
+            .unwrap()
+            .public_key()
+            .to_hex();
         let offer = offer(&mint_url, &receiver_pubkey, &keyset_id);
         let reservation = wallet
             .loose_wallet()
@@ -5378,6 +5874,7 @@ mod tests {
             .unwrap();
 
         OpenedTestChannel {
+            mint_helper,
             _temp: temp,
             wallet,
             loose_db,
@@ -5397,6 +5894,929 @@ mod tests {
             mint_url: ctx.mint_url.clone(),
             client: reqwest::Client::new(),
         }
+    }
+
+    fn refund_test_locks(ctx: &OpenedTestChannel) -> crate::wallet_lock::ClientWalletLocks {
+        crate::wallet_lock::ClientWalletLocks::acquire(
+            &ctx.loose_db,
+            &ctx.channel_db,
+            crate::wallet_lock::WalletLockMode::Maintenance,
+        )
+        .unwrap()
+    }
+
+    fn scripted_refund_mint(ctx: &OpenedTestChannel) -> ScriptedRefundMint {
+        ScriptedRefundMint {
+            inner: direct_mint_connection(ctx),
+            requests: Mutex::new(vec![]),
+            lose_response: false,
+            reject_replay: false,
+            invalid_restore: false,
+            fail_state: false,
+            fail_second_submit: false,
+            complete_on_state: Mutex::new(None),
+            close_on_submit: Mutex::new(None),
+            empty_restore: false,
+            restore_calls: AtomicUsize::new(0),
+            hide_funding_witness: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_rotations_before_and_after_preparation_use_independent_output_keys() {
+        for prepare_before_rotation in [false, true] {
+            let ctx = open_short_expiry_test_channel(32, 1).await;
+            wait_until_expired(ctx.expiry_timestamp).await;
+            let funding = ctx
+                .wallet
+                .bridge
+                .lock()
+                .unwrap()
+                .get_channel_funding(&ctx.channel_id)
+                .unwrap();
+            let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
+            let old = if prepare_before_rotation {
+                Some(
+                    ctx.wallet
+                        .prepare_and_persist_refund_recovery(
+                            &ctx.channel_id,
+                            &established,
+                            SqliteClientWallet::now_seconds().unwrap(),
+                        )
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let rotated = rotate_sat_keyset(&ctx.mint_helper.mint(), 400)
+                .await
+                .unwrap();
+            if !prepare_before_rotation {
+                ctx.wallet
+                    .select_refund_output_keyset(&established, true)
+                    .unwrap();
+            }
+            let mut mint = scripted_refund_mint(&ctx);
+            mint.fail_second_submit = prepare_before_rotation;
+            let locks = refund_test_locks(&ctx);
+            let result = ctx
+                .wallet
+                .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+                .await
+                .unwrap();
+            assert!(matches!(
+                result,
+                ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
+            ));
+            let prepared = PreparedSenderRefund::from_json(
+                &prepared_refund_json(&ctx.wallet, &ctx.channel_id).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(prepared.output_keyset.keyset_id, rotated);
+            assert_eq!(
+                prepared
+                    .swap_request
+                    .inputs()
+                    .iter()
+                    .map(|p| (p.keyset_id, p.amount, p.secret.clone()))
+                    .collect::<Vec<_>>(),
+                established
+                    .funding_proofs
+                    .iter()
+                    .map(|p| (p.keyset_id, p.amount, p.secret.clone()))
+                    .collect::<Vec<_>>()
+            );
+            let predecessors: i64 = ctx
+                .wallet
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM monad_client_refund_predecessors",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(predecessors, i64::from(prepare_before_rotation));
+            assert_eq!(
+                mint.requests.lock().unwrap().len(),
+                if prepare_before_rotation { 3 } else { 1 }
+            );
+            if let Some(old) = old {
+                let requests = mint.requests.lock().unwrap();
+                assert_eq!(requests[1], requests[2]);
+                assert_ne!(old.derivation_context, prepared.derivation_context);
+                assert_eq!(old.output_amount_raw, prepared.output_amount_raw);
+                let stored: String = ctx
+                    .wallet
+                    .conn()
+                    .unwrap()
+                    .query_row(
+                        "SELECT prepared_json FROM monad_client_refund_predecessors",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(stored, old.to_json().unwrap());
+            }
+            let _ = ctx.shutdown_tx.send(());
+            ctx.mint_task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_lost_response_restores_without_second_submission() {
+        let ctx = open_short_expiry_test_channel(16, 1).await;
+        wait_until_expired(ctx.expiry_timestamp).await;
+        let mut mint = scripted_refund_mint(&ctx);
+        mint.lose_response = true;
+        let locks = refund_test_locks(&ctx);
+        let result = ctx
+            .wallet
+            .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
+        ));
+        assert_eq!(mint.requests.lock().unwrap().len(), 1);
+        let _ = ctx.shutdown_tx.send(());
+        ctx.mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_ambiguous_replay_rejection_never_creates_successor() {
+        let ctx = open_short_expiry_test_channel(16, 1).await;
+        wait_until_expired(ctx.expiry_timestamp).await;
+        let mut mint = scripted_refund_mint(&ctx);
+        mint.reject_replay = true;
+        let locks = refund_test_locks(&ctx);
+        for _ in 0..2 {
+            let result = ctx
+                .wallet
+                .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+                .await
+                .unwrap();
+            assert!(matches!(
+                result,
+                ChannelFundRecoveryResult::RecoveryRetryLater { .. }
+            ));
+        }
+        {
+            let requests = mint.requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert!(requests.iter().all(|r| r == &requests[0]));
+        }
+        {
+            let conn = ctx.wallet.conn().unwrap();
+            let successors: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM monad_client_refund_predecessors",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let uncertain: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM monad_client_refund_executions WHERE outcome = 'uncertain'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(successors, 0);
+            assert_eq!(uncertain, 4);
+        }
+        assert!(ctx
+            .wallet
+            .attach_channel_to_session(&ctx.channel_id, [1; 32])
+            .is_err());
+        let _ = ctx.shutdown_tx.send(());
+        ctx.mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_invalid_restore_blocks_replay_and_restores_before_state_errors() {
+        let ctx = open_short_expiry_test_channel(16, 1).await;
+        wait_until_expired(ctx.expiry_timestamp).await;
+        let funding = ctx
+            .wallet
+            .bridge
+            .lock()
+            .unwrap()
+            .get_channel_funding(&ctx.channel_id)
+            .unwrap();
+        let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
+        let prepared = ctx
+            .wallet
+            .prepare_and_persist_refund_recovery(
+                &ctx.channel_id,
+                &established,
+                SqliteClientWallet::now_seconds().unwrap(),
+            )
+            .unwrap();
+        ctx.wallet
+            .record_refund_execution(&ctx.channel_id, &prepared)
+            .unwrap();
+        let mut mint = scripted_refund_mint(&ctx);
+        mint.invalid_restore = true;
+        mint.fail_state = true;
+        let locks = refund_test_locks(&ctx);
+        let result = ctx
+            .wallet
+            .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ChannelFundRecoveryResult::RecoveryRetryLater { .. }
+        ));
+        assert!(mint.requests.lock().unwrap().is_empty());
+        established
+            .submit_prepared_sender_refund(
+                &prepared,
+                &ctx.wallet.sender_secret,
+                SqliteClientWallet::now_seconds().unwrap(),
+                &mint.inner,
+            )
+            .await
+            .unwrap();
+        rotate_sat_keyset(&ctx.mint_helper.mint(), 400)
+            .await
+            .unwrap();
+        mint.invalid_restore = false;
+        let reopened = reopen_wallet(&ctx);
+        let result = reopened
+            .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
+        ));
+        assert!(mint.requests.lock().unwrap().is_empty());
+        let _ = ctx.shutdown_tx.send(());
+        ctx.mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_requires_matching_authority_and_singleflight() {
+        let ctx = open_short_expiry_test_channel(16, 1).await;
+        let other = tempfile::tempdir().unwrap();
+        let wrong = crate::wallet_lock::ClientWalletLocks::acquire(
+            other.path().join("loose"),
+            other.path().join("channels"),
+            crate::wallet_lock::WalletLockMode::Maintenance,
+        )
+        .unwrap();
+        assert!(ctx
+            .wallet
+            .recover_channel_funds(
+                &wrong.exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &OfflineRefundMint
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different wallet"));
+        let locks = refund_test_locks(&ctx);
+        let guard = enter_active_opening(&format!(
+            "refund:{}:{}",
+            ctx.wallet.opening_scope, ctx.channel_id
+        ))
+        .unwrap();
+        assert!(matches!(
+            ctx.wallet
+                .recover_channel_funds(
+                    &locks.exclusive_access().unwrap(),
+                    &ctx.channel_id,
+                    &OfflineRefundMint
+                )
+                .await,
+            Err(WalletError::OpeningInProgress { .. })
+        ));
+        drop(guard);
+        wait_until_expired(ctx.expiry_timestamp).await;
+        let access = locks.exclusive_access().unwrap();
+        let mint = BlockingRefundMint {
+            inner: direct_mint_connection(&ctx),
+            entered: tokio::sync::Notify::new(),
+        };
+        let mut first = Box::pin(
+            ctx.wallet
+                .recover_channel_funds(&access, &ctx.channel_id, &mint),
+        );
+        tokio::select! {
+            _ = mint.entered.notified() => {},
+            result = &mut first => panic!("refund should block in submit: {result:?}"),
+        }
+        let reopened = reopen_wallet(&ctx);
+        assert!(matches!(
+            reopened
+                .recover_channel_funds(&access, &ctx.channel_id, &OfflineRefundMint)
+                .await,
+            Err(WalletError::OpeningInProgress { .. })
+        ));
+        drop(first);
+        let original = prepared_refund_json(&ctx.wallet, &ctx.channel_id).unwrap();
+        rotate_sat_keyset(&ctx.mint_helper.mint(), 0).await.unwrap();
+        let retry = scripted_refund_mint(&ctx);
+        let result = reopened
+            .recover_channel_funds(&access, &ctx.channel_id, &retry)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ChannelFundRecoveryResult::RecoveryRetryLater { .. }
+        ));
+        assert_eq!(
+            prepared_refund_json(&ctx.wallet, &ctx.channel_id).unwrap(),
+            original
+        );
+        assert_eq!(retry.requests.lock().unwrap().len(), 2);
+        assert!(!reopened
+            .refund_has_initial_rejection(&ctx.channel_id)
+            .unwrap());
+        let _ = ctx.shutdown_tx.send(());
+        ctx.mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_finalization_resumes_offline_at_local_database_boundaries() {
+        for trigger in [
+            "CREATE TRIGGER fail_finalize BEFORE UPDATE ON monad_client_channels WHEN NEW.state = 'closed' BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END",
+            "CREATE TRIGGER fail_finalize BEFORE UPDATE ON monad_client_channel_recoveries WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END",
+        ] {
+            let ctx = open_short_expiry_test_channel(16, 1).await;
+            wait_until_expired(ctx.expiry_timestamp).await;
+            ctx.wallet.conn().unwrap().execute_batch(trigger).unwrap();
+            let locks = refund_test_locks(&ctx);
+            let mint = scripted_refund_mint(&ctx);
+            assert!(ctx.wallet.recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint).await.is_err());
+            assert_eq!(recovery_row_status(&ctx.wallet, &ctx.channel_id), "finalizing");
+            assert_eq!(mint.requests.lock().unwrap().len(), 1);
+            let json: String = ctx.wallet.conn().unwrap().query_row("SELECT completed_proofs_json FROM monad_client_channel_recoveries WHERE channel_id = ?1", [&ctx.channel_id], |r| r.get(0)).unwrap();
+            ctx.wallet.conn().unwrap().execute_batch("DROP TRIGGER fail_finalize").unwrap();
+            let reopened = reopen_wallet(&ctx);
+            let result = reopened.recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &OfflineRefundMint).await.unwrap();
+            assert!(matches!(result, ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }));
+            let stored: String = reopened.conn().unwrap().query_row("SELECT completed_proofs_json FROM monad_client_channel_recoveries WHERE channel_id = ?1", [&ctx.channel_id], |r| r.get(0)).unwrap();
+            assert_eq!(stored, json);
+            assert!(matches!(reopened.recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &OfflineRefundMint).await.unwrap(), ChannelFundRecoveryResult::AlreadyRecovered { .. }));
+            let _ = ctx.shutdown_tx.send(());
+            ctx.mint_task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_successor_persistence_failure_retains_initial_rejection_authority() {
+        let ctx = open_short_expiry_test_channel(16, 1).await;
+        wait_until_expired(ctx.expiry_timestamp).await;
+        let funding = ctx
+            .wallet
+            .bridge
+            .lock()
+            .unwrap()
+            .get_channel_funding(&ctx.channel_id)
+            .unwrap();
+        let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
+        let prepared = ctx
+            .wallet
+            .prepare_and_persist_refund_recovery(
+                &ctx.channel_id,
+                &established,
+                SqliteClientWallet::now_seconds().unwrap(),
+            )
+            .unwrap();
+        rotate_sat_keyset(&ctx.mint_helper.mint(), 0).await.unwrap();
+        ctx.wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_successor BEFORE UPDATE ON monad_client_channel_recoveries WHEN NEW.status = 'prepared' AND OLD.status = 'submitting' BEGIN SELECT RAISE(ABORT, 'injected successor failure after predecessor insert'); END").unwrap();
+        let locks = refund_test_locks(&ctx);
+        let mint = scripted_refund_mint(&ctx);
+        assert!(ctx
+            .wallet
+            .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+            .await
+            .is_err());
+        assert_eq!(
+            prepared_refund_json(&ctx.wallet, &ctx.channel_id).unwrap(),
+            prepared.to_json().unwrap()
+        );
+        assert!(ctx
+            .wallet
+            .refund_has_initial_rejection(&ctx.channel_id)
+            .unwrap());
+        let predecessors: i64 = ctx
+            .wallet
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM monad_client_refund_predecessors",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(predecessors, 0);
+        ctx.wallet
+            .conn()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_successor")
+            .unwrap();
+        let reopened = reopen_wallet(&ctx);
+        let result = reopened
+            .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
+        ));
+        assert_eq!(mint.requests.lock().unwrap().len(), 2);
+        let _ = ctx.shutdown_tx.send(());
+        ctx.mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_completion_between_restore_and_state_gets_final_exact_restore() {
+        for hide_outputs in [false, true] {
+            let ctx = open_short_expiry_test_channel(16, 1).await;
+            wait_until_expired(ctx.expiry_timestamp).await;
+            let funding = ctx
+                .wallet
+                .bridge
+                .lock()
+                .unwrap()
+                .get_channel_funding(&ctx.channel_id)
+                .unwrap();
+            let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
+            let prepared = ctx
+                .wallet
+                .prepare_and_persist_refund_recovery(
+                    &ctx.channel_id,
+                    &established,
+                    SqliteClientWallet::now_seconds().unwrap(),
+                )
+                .unwrap();
+            ctx.wallet
+                .record_refund_execution(&ctx.channel_id, &prepared)
+                .unwrap();
+            let mut mint = scripted_refund_mint(&ctx);
+            *mint.complete_on_state.lock().unwrap() = Some(prepared.swap_request);
+            mint.empty_restore = hide_outputs;
+            mint.hide_funding_witness = !hide_outputs;
+            let result = ctx
+                .wallet
+                .recover_channel_funds(
+                    &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                    &ctx.channel_id,
+                    &mint,
+                )
+                .await
+                .unwrap();
+            if hide_outputs {
+                assert!(matches!(
+                    result,
+                    ChannelFundRecoveryResult::RecoveryRetryLater { .. }
+                ));
+                assert_eq!(
+                    recovery_row_status(&ctx.wallet, &ctx.channel_id),
+                    "submitting"
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
+                ));
+            }
+            assert_eq!(mint.restore_calls.load(Ordering::SeqCst), 2);
+            assert!(mint.requests.lock().unwrap().is_empty());
+            let _ = ctx.shutdown_tx.send(());
+            ctx.mint_task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checked_sender_discovery_handles_extra_close_signature_and_close_winning_submit_race()
+    {
+        for mode in ["closed", "race", "empty", "invalid", "network"] {
+            let ctx = open_short_expiry_test_channel(16, 1).await;
+            wait_until_expired(ctx.expiry_timestamp).await;
+            let funding = ctx
+                .wallet
+                .bridge
+                .lock()
+                .unwrap()
+                .get_channel_funding(&ctx.channel_id)
+                .unwrap();
+            let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
+            let commitment =
+                cdk_spilman::CommitmentOutputs::for_balance(5, &established.params).unwrap();
+            let mut close = commitment
+                .create_swap_request(established.funding_proofs.clone(), None)
+                .unwrap();
+            close
+                .sign_sig_all(
+                    established
+                        .params
+                        .get_sender_blinded_secret_key_for_stage1(&ctx.wallet.sender_secret)
+                        .unwrap(),
+                )
+                .unwrap();
+            close
+                .sign_sig_all(
+                    established
+                        .params
+                        .get_receiver_blinded_secret_key_for_stage1(
+                            &SecretKey::from_hex(hex::encode([2; 32])).unwrap(),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+            close.sign_sig_all(SecretKey::generate()).unwrap();
+            let mut mint = scripted_refund_mint(&ctx);
+            if mode == "race" {
+                *mint.close_on_submit.lock().unwrap() = Some(close);
+            } else {
+                mint.inner.process_swap(close).await.unwrap();
+            }
+            mint.empty_restore = mode == "empty";
+            mint.invalid_restore = mode == "invalid";
+            let locks = refund_test_locks(&ctx);
+            let access = locks.exclusive_access().unwrap();
+            let result = if mode == "network" {
+                ctx.wallet
+                    .recover_channel_funds(
+                        &access,
+                        &ctx.channel_id,
+                        &FailingRefundMintConnection {
+                            inner: direct_mint_connection(&ctx),
+                        },
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                ctx.wallet
+                    .recover_channel_funds(&access, &ctx.channel_id, &mint)
+                    .await
+                    .unwrap()
+            };
+            let state = established
+                .check_funding_token_state(&mint.inner)
+                .await
+                .unwrap();
+            assert_eq!(state.state, State::Spent);
+            assert_eq!(
+                EstablishedChannel::classify_funding_spend_witness(&state),
+                FundingSpendKind::Unknown
+            );
+            match mode {
+                "empty" => assert_eq!(result, ChannelFundRecoveryResult::UnknownSpent),
+                "invalid" | "network" => assert!(matches!(
+                    result,
+                    ChannelFundRecoveryResult::RecoveryRetryLater { .. }
+                )),
+                _ => {
+                    let ChannelFundRecoveryResult::RelayCloseRecovered {
+                        recovered_amount_raw,
+                        ..
+                    } = result
+                    else {
+                        panic!("expected checked sender discovery: {result:?}");
+                    };
+                    assert!(recovered_amount_raw > 0);
+                    if mode == "race" {
+                        assert_eq!(mint.requests.lock().unwrap().len(), 1);
+                        assert!(prepared_refund_json(&ctx.wallet, &ctx.channel_id).is_some());
+                        let count: i64 = ctx.wallet.conn().unwrap().query_row("SELECT COUNT(*) FROM monad_client_refund_executions WHERE outcome = 'uncertain'", [], |r| r.get(0)).unwrap();
+                        assert_eq!(count, 1);
+                    }
+                }
+            }
+            let _ = ctx.shutdown_tx.send(());
+            ctx.mint_task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_import_conflict_remains_finalizing_and_offline_retry_never_resurrects_spent() {
+        let ctx = open_short_expiry_test_channel(16, 1).await;
+        wait_until_expired(ctx.expiry_timestamp).await;
+        ctx.wallet.fail_next_recovered_proof_import_for_test();
+        let locks = refund_test_locks(&ctx);
+        let access = locks.exclusive_access().unwrap();
+        assert!(ctx
+            .wallet
+            .recover_channel_funds(&access, &ctx.channel_id, &direct_mint_connection(&ctx))
+            .await
+            .is_err());
+        let json: String = ctx.wallet.conn().unwrap().query_row("SELECT completed_proofs_json FROM monad_client_channel_recoveries WHERE channel_id = ?1", [&ctx.channel_id], |r| r.get(0)).unwrap();
+        let proofs: Vec<Proof> = serde_json::from_str(&json).unwrap();
+        let funding = ctx
+            .wallet
+            .bridge
+            .lock()
+            .unwrap()
+            .get_channel_funding(&ctx.channel_id)
+            .unwrap();
+        let original = proof_to_new_loose_proof(&proofs[0], &funding).unwrap();
+        ctx.wallet
+            .loose_wallet
+            .import_proofs(std::slice::from_ref(&original))
+            .unwrap();
+        let reservation = ctx
+            .wallet
+            .loose_wallet
+            .reserve_proofs(&ctx.mint_url, "sat", &[], original.amount_raw)
+            .unwrap();
+        ctx.wallet
+            .loose_wallet
+            .mark_reservation_spent(&reservation.reservation_id, "already-spent")
+            .unwrap();
+        // A conflicting existing bearer record must not be ignored, even spent.
+        let db = Connection::open(&ctx.loose_db).unwrap();
+        db.execute("UPDATE monad_client_loose_proofs SET amount_raw = amount_raw + 1 WHERE proof_id = ?1 AND wallet_name = 'alice'", [&original.proof_id]).unwrap();
+        let reopened = reopen_wallet(&ctx);
+        let error = reopened
+            .recover_channel_funds(&access, &ctx.channel_id, &OfflineRefundMint)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("immutable imported proof conflict"));
+        assert_eq!(
+            recovery_row_status(&ctx.wallet, &ctx.channel_id),
+            "finalizing"
+        );
+        db.execute("UPDATE monad_client_loose_proofs SET amount_raw = ?2 WHERE proof_id = ?1 AND wallet_name = 'alice'", params![original.proof_id, original.amount_raw]).unwrap();
+        assert!(matches!(
+            reopened
+                .recover_channel_funds(&access, &ctx.channel_id, &OfflineRefundMint)
+                .await
+                .unwrap(),
+            ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
+        ));
+        let state: String = db.query_row("SELECT state FROM monad_client_loose_proofs WHERE proof_id = ?1 AND wallet_name = 'alice'", [&original.proof_id], |r| r.get(0)).unwrap();
+        assert_eq!(state, "spent");
+        assert!(!reopened
+            .loose_wallet
+            .list_available_proofs(&ctx.mint_url, "sat", &[])
+            .unwrap()
+            .iter()
+            .any(|p| p.proof_id == original.proof_id));
+        let _ = ctx.shutdown_tx.send(());
+        ctx.mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_custody_binding_rejects_other_destinations_before_io_and_survives_aliases() {
+        let ctx = open_short_expiry_test_channel(16, 1).await;
+        wait_until_expired(ctx.expiry_timestamp).await;
+        ctx.wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_completed BEFORE UPDATE ON monad_client_channel_recoveries WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'failure after import'); END").unwrap();
+        let mint = scripted_refund_mint(&ctx);
+        assert!(ctx
+            .wallet
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            recovery_row_status(&ctx.wallet, &ctx.channel_id),
+            "finalizing"
+        );
+        let imported = ctx
+            .wallet
+            .loose_wallet
+            .list_available_proofs(&ctx.mint_url, "sat", &[])
+            .unwrap();
+        assert!(!imported.is_empty());
+        let other_db = ctx._temp.path().join("other-loose.sqlite");
+        for phase in ["finalizing", "completed"] {
+            for (db, name, secret) in [
+                (&ctx.loose_db, "bob", ctx.sender_secret.clone()),
+                (&other_db, "alice", ctx.sender_secret.clone()),
+                (&ctx.loose_db, "alice", hex::encode([42; 32])),
+            ] {
+                let wallet = SqliteClientWallet::open(
+                    LooseProofWallet::open(db, name).unwrap(),
+                    &ctx.channel_db,
+                    &secret,
+                )
+                .unwrap();
+                wallet.fail_next_recovered_proof_import_for_test();
+                let locks = crate::wallet_lock::ClientWalletLocks::acquire(
+                    db,
+                    &ctx.channel_db,
+                    crate::wallet_lock::WalletLockMode::Maintenance,
+                )
+                .unwrap();
+                let error = wallet
+                    .recover_channel_funds(
+                        &locks.exclusive_access().unwrap(),
+                        &ctx.channel_id,
+                        &OfflineRefundMint,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("custody destination mismatch"));
+                assert!(wallet
+                    .fail_next_recovered_proof_import
+                    .load(Ordering::SeqCst));
+                if name == "bob" || db == &other_db {
+                    assert!(wallet
+                        .loose_wallet
+                        .list_available_proofs(&ctx.mint_url, "sat", &[])
+                        .unwrap()
+                        .is_empty());
+                }
+            }
+            assert_eq!(recovery_row_status(&ctx.wallet, &ctx.channel_id), phase);
+            if phase == "finalizing" {
+                ctx.wallet
+                    .conn()
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER fail_completed")
+                    .unwrap();
+                let alias = ctx._temp.path().join("loose-alias.sqlite");
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&ctx.loose_db, &alias).unwrap();
+                #[cfg(not(unix))]
+                let alias = ctx.loose_db.clone();
+                let wallet = SqliteClientWallet::open(
+                    LooseProofWallet::open(&alias, "alice").unwrap(),
+                    &ctx.channel_db,
+                    &ctx.sender_secret,
+                )
+                .unwrap();
+                let locks = crate::wallet_lock::ClientWalletLocks::acquire(
+                    &alias,
+                    &ctx.channel_db,
+                    crate::wallet_lock::WalletLockMode::Maintenance,
+                )
+                .unwrap();
+                assert!(matches!(
+                    wallet
+                        .recover_channel_funds(
+                            &locks.exclusive_access().unwrap(),
+                            &ctx.channel_id,
+                            &OfflineRefundMint
+                        )
+                        .await
+                        .unwrap(),
+                    ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
+                ));
+                assert_eq!(
+                    wallet
+                        .loose_wallet
+                        .list_available_proofs(&ctx.mint_url, "sat", &[])
+                        .unwrap()
+                        .len(),
+                    imported.len()
+                );
+            }
+        }
+        let _ = ctx.shutdown_tx.send(());
+        ctx.mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_execution_rejection_and_finalizing_journal_failures_preserve_evidence() {
+        for boundary in ["execution", "rejection", "finalizing"] {
+            let ctx = open_short_expiry_test_channel(16, 1).await;
+            wait_until_expired(ctx.expiry_timestamp).await;
+            let funding = ctx
+                .wallet
+                .bridge
+                .lock()
+                .unwrap()
+                .get_channel_funding(&ctx.channel_id)
+                .unwrap();
+            let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
+            let prepared = ctx
+                .wallet
+                .prepare_and_persist_refund_recovery(
+                    &ctx.channel_id,
+                    &established,
+                    SqliteClientWallet::now_seconds().unwrap(),
+                )
+                .unwrap();
+            let trigger = match boundary {
+                "execution" => "CREATE TRIGGER fail_boundary BEFORE INSERT ON monad_client_refund_executions BEGIN SELECT RAISE(ABORT, 'execution insert failure'); END",
+                "rejection" => "CREATE TRIGGER fail_boundary BEFORE UPDATE ON monad_client_refund_executions BEGIN SELECT RAISE(ABORT, 'rejection record failure'); END",
+                _ => "CREATE TRIGGER fail_boundary BEFORE UPDATE ON monad_client_channel_recoveries WHEN NEW.status = 'finalizing' BEGIN SELECT RAISE(ABORT, 'verified proofs persistence failure'); END",
+            };
+            if boundary == "rejection" {
+                rotate_sat_keyset(&ctx.mint_helper.mint(), 0).await.unwrap();
+            }
+            ctx.wallet.conn().unwrap().execute_batch(trigger).unwrap();
+            let locks = refund_test_locks(&ctx);
+            let mint = scripted_refund_mint(&ctx);
+            assert!(ctx
+                .wallet
+                .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+                .await
+                .is_err());
+            let count: i64 = ctx.wallet.conn().unwrap().query_row("SELECT COUNT(*) FROM monad_client_refund_executions WHERE outcome = 'uncertain'", [], |r| r.get(0)).unwrap();
+            assert_eq!(
+                mint.requests.lock().unwrap().len(),
+                if boundary == "execution" { 0 } else { 1 }
+            );
+            assert_eq!(count, if boundary == "execution" { 0 } else { 1 });
+            assert_eq!(
+                recovery_row_status(&ctx.wallet, &ctx.channel_id),
+                if boundary == "execution" {
+                    "prepared"
+                } else {
+                    "submitting"
+                }
+            );
+            assert_eq!(
+                prepared_refund_json(&ctx.wallet, &ctx.channel_id).unwrap(),
+                prepared.to_json().unwrap()
+            );
+            assert!(ctx
+                .wallet
+                .loose_wallet
+                .list_available_proofs(&ctx.mint_url, "sat", &[])
+                .unwrap()
+                .is_empty());
+            ctx.wallet
+                .conn()
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_boundary")
+                .unwrap();
+            let reopened = reopen_wallet(&ctx);
+            let result = reopened
+                .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+                .await
+                .unwrap();
+            if boundary == "rejection" {
+                assert!(matches!(
+                    result,
+                    ChannelFundRecoveryResult::RecoveryRetryLater { .. }
+                ));
+                assert_eq!(mint.requests.lock().unwrap().len(), 3);
+                assert_eq!(
+                    prepared_refund_json(&ctx.wallet, &ctx.channel_id).unwrap(),
+                    prepared.to_json().unwrap()
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
+                ));
+                assert_eq!(mint.requests.lock().unwrap().len(), 1);
+            }
+            let _ = ctx.shutdown_tx.send(());
+            ctx.mint_task.await.unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn refund_rejection_requires_structured_direct_inactive_keyset_code() {
+        for (status, body, expected) in [
+            (400, r#"{"code":12002}"#, true),
+            (500, r#"{"code":12002}"#, false),
+            (200, r#"{"code":12002}"#, false),
+            (400, r#"{"code":12001}"#, false),
+            (400, r#"{"code":"12002"}"#, false),
+            (400, r#"{"detail":"12002"}"#, false),
+            (400, "upstream: {\"code\":12002}", false),
+        ] {
+            let rejection = RefundMintRejection {
+                status,
+                body: body.to_string(),
+            };
+            assert_eq!(rejection.inactive_output_keyset(), expected);
+            assert!(!format!("{rejection:?}").contains(body));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refund_nonempty_legacy_journal_is_rejected_without_deleting_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let channel_db = temp.path().join("channels.sqlite");
+        let conn = Connection::open(&channel_db).unwrap();
+        conn.execute_batch("CREATE TABLE monad_client_channel_recoveries(channel_id TEXT, prepared_refund_json TEXT); INSERT INTO monad_client_channel_recoveries VALUES ('original', 'immutable old data')").unwrap();
+        let loose = LooseProofWallet::open(temp.path().join("loose.sqlite"), "alice").unwrap();
+        let error = SqliteClientWallet::open(loose, &channel_db, &sender_secret_hex())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible nonempty refund journal"),
+            "{error}"
+        );
+        let original: String = conn
+            .query_row(
+                "SELECT prepared_refund_json FROM monad_client_channel_recoveries",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(original, "immutable old data");
     }
 
     async fn wait_until_expired(expiry_timestamp: u64) {
@@ -5537,7 +6957,11 @@ mod tests {
         let mint_connection = direct_mint_connection(&ctx);
         let result = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
 
@@ -5594,7 +7018,11 @@ mod tests {
 
         let rerun = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5628,16 +7056,20 @@ mod tests {
             .unwrap()
             .execute(
                 "INSERT INTO monad_client_channel_recoveries
-                 (channel_id, kind, status, recovered_amount_raw, recovered_proof_count, prepared_refund_json, created_at, updated_at)
-                 VALUES (?1, 'post_expiry_refund', 'bogus', NULL, NULL, NULL, ?2, ?2)",
-                params![ctx.channel_id, to_i64(now).unwrap()],
+                 (channel_id, kind, status, recovered_amount_raw, recovered_proof_count, prepared_refund_json, created_at, updated_at, custody_db, custody_wallet, custody_sender)
+                 VALUES (?1, 'post_expiry_refund', 'bogus', NULL, NULL, NULL, ?2, ?2, ?3, ?4, ?5)",
+                params![ctx.channel_id, to_i64(now).unwrap(), ctx.wallet.recovery_custody().unwrap().0, "alice", ctx.wallet.sender_pubkey_hex],
             )
             .unwrap();
 
         let mint_connection = direct_mint_connection(&ctx);
         let err = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap_err();
         assert!(err
@@ -5645,7 +7077,7 @@ mod tests {
             .contains("unknown channel recovery status: bogus"));
         assert_eq!(
             ctx.wallet.get_channel(&ctx.channel_id).unwrap().state,
-            WalletChannelState::Open
+            WalletChannelState::Closing
         );
 
         let _ = ctx.shutdown_tx.send(());
@@ -5664,16 +7096,23 @@ mod tests {
         let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
         let now = SqliteClientWallet::now_seconds().unwrap();
         let prepared = established
-            .prepare_sender_refund_after_expiry(ctx.wallet.sender_secret.clone(), now)
+            .prepare_sender_refund_after_expiry(
+                ctx.wallet.sender_secret.clone(),
+                now,
+                established.params.keyset_info.clone(),
+                rand::random(),
+            )
             .unwrap();
         let mint_connection = direct_mint_connection(&ctx);
-        let proofs = EstablishedChannel::submit_prepared_sender_refund(
-            &prepared,
-            &mint_connection,
-            &established.params.keyset_info.active_keys,
-        )
-        .await
-        .unwrap();
+        let proofs = established
+            .submit_prepared_sender_refund(
+                &prepared,
+                &ctx.wallet.sender_secret,
+                now,
+                &mint_connection,
+            )
+            .await
+            .unwrap();
         assert!(!proofs.is_empty());
         assert_eq!(recovery_row_count(&ctx.wallet, &ctx.channel_id), 0);
 
@@ -5689,7 +7128,11 @@ mod tests {
 
         let result = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
         assert_eq!(result, ChannelFundRecoveryResult::UnknownSpent);
@@ -5712,7 +7155,11 @@ mod tests {
         ctx.wallet.fail_next_recovered_proof_import_for_test();
         let err = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap_err();
         assert!(err
@@ -5720,22 +7167,27 @@ mod tests {
             .contains("injected recovered proof import failure"));
         assert_eq!(
             ctx.wallet.get_channel(&ctx.channel_id).unwrap().state,
-            WalletChannelState::Open
+            WalletChannelState::Closing
         );
         assert_eq!(
             completed_recovery_row_count(&ctx.wallet, &ctx.channel_id),
             0
         );
         assert!(prepared_refund_json(&ctx.wallet, &ctx.channel_id).is_some());
-        // The refund was prepared and marked submitting before the import failure.
+        // Verified proofs are durable before import, so retry needs no mint IO.
         assert_eq!(
             recovery_row_status(&ctx.wallet, &ctx.channel_id),
-            "submitting"
+            "finalizing"
         );
 
-        let retry = ctx
-            .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+        let mint_connection = OfflineRefundMint;
+        let reopened_wallet = reopen_wallet(&ctx);
+        let retry = reopened_wallet
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -5762,7 +7214,11 @@ mod tests {
 
         let result = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
 
@@ -5792,7 +7248,11 @@ mod tests {
 
         let result = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
 
@@ -5827,7 +7287,12 @@ mod tests {
         let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
         let now = SqliteClientWallet::now_seconds().unwrap();
         let prepared = established
-            .prepare_sender_refund_after_expiry(ctx.wallet.sender_secret.clone(), now)
+            .prepare_sender_refund_after_expiry(
+                ctx.wallet.sender_secret.clone(),
+                now,
+                established.params.keyset_info.clone(),
+                rand::random(),
+            )
             .unwrap();
         ctx.wallet
             .persist_refund_recovery_prepared(&ctx.channel_id, &prepared)
@@ -5841,13 +7306,15 @@ mod tests {
         );
 
         let mint_connection = direct_mint_connection(&ctx);
-        let submitted = EstablishedChannel::submit_prepared_sender_refund(
-            &prepared,
-            &mint_connection,
-            &established.params.keyset_info.active_keys,
-        )
-        .await
-        .unwrap();
+        let submitted = established
+            .submit_prepared_sender_refund(
+                &prepared,
+                &ctx.wallet.sender_secret,
+                now,
+                &mint_connection,
+            )
+            .await
+            .unwrap();
         assert!(!submitted.is_empty());
 
         // Mark the row as submitting to simulate a crash/loss after the refund
@@ -5859,7 +7326,11 @@ mod tests {
         let reopened_wallet = reopen_wallet(&ctx);
 
         let result = reopened_wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
 
@@ -5907,7 +7378,12 @@ mod tests {
         let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
         let now = SqliteClientWallet::now_seconds().unwrap();
         let prepared = established
-            .prepare_sender_refund_after_expiry(ctx.wallet.sender_secret.clone(), now)
+            .prepare_sender_refund_after_expiry(
+                ctx.wallet.sender_secret.clone(),
+                now,
+                established.params.keyset_info.clone(),
+                rand::random(),
+            )
             .unwrap();
         ctx.wallet
             .persist_refund_recovery_prepared(&ctx.channel_id, &prepared)
@@ -5926,7 +7402,11 @@ mod tests {
 
         let result = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
 
@@ -5984,7 +7464,12 @@ mod tests {
         let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
         let now = SqliteClientWallet::now_seconds().unwrap();
         let prepared = established
-            .prepare_sender_refund_after_expiry(ctx.wallet.sender_secret.clone(), now)
+            .prepare_sender_refund_after_expiry(
+                ctx.wallet.sender_secret.clone(),
+                now,
+                established.params.keyset_info.clone(),
+                rand::random(),
+            )
             .unwrap();
         ctx.wallet
             .persist_refund_recovery_prepared(&ctx.channel_id, &prepared)
@@ -5998,7 +7483,11 @@ mod tests {
         let mint_connection = direct_mint_connection(&ctx);
         let result = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
 
@@ -6040,16 +7529,20 @@ mod tests {
             .unwrap()
             .execute(
                 "INSERT INTO monad_client_channel_recoveries
-                 (channel_id, kind, status, recovered_amount_raw, recovered_proof_count, prepared_refund_json, created_at, updated_at)
-                 VALUES (?1, 'post_expiry_refund', 'submitting', NULL, NULL, NULL, ?2, ?2)",
-                params![ctx.channel_id, to_i64(now).unwrap()],
+                 (channel_id, kind, status, recovered_amount_raw, recovered_proof_count, prepared_refund_json, created_at, updated_at, custody_db, custody_wallet, custody_sender)
+                 VALUES (?1, 'post_expiry_refund', 'submitting', NULL, NULL, NULL, ?2, ?2, ?3, ?4, ?5)",
+                params![ctx.channel_id, to_i64(now).unwrap(), ctx.wallet.recovery_custody().unwrap().0, "alice", ctx.wallet.sender_pubkey_hex],
             )
             .unwrap();
 
         let mint_connection = direct_mint_connection(&ctx);
         let err = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap_err();
         assert!(err
@@ -6057,7 +7550,7 @@ mod tests {
             .contains("submitting refund recovery is missing prepared refund json"));
         assert_eq!(
             ctx.wallet.get_channel(&ctx.channel_id).unwrap().state,
-            WalletChannelState::Open
+            WalletChannelState::Closing
         );
         assert_eq!(
             recovery_row_status(&ctx.wallet, &ctx.channel_id),
@@ -6078,14 +7571,18 @@ mod tests {
 
         let result = ctx
             .wallet
-            .recover_channel_funds(&ctx.channel_id, &mint_connection)
+            .recover_channel_funds(
+                &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                &ctx.channel_id,
+                &mint_connection,
+            )
             .await
             .unwrap();
         let ChannelFundRecoveryResult::RecoveryRetryLater { channel_id, reason } = result else {
             panic!("expected retry-later recovery result, got {result:?}");
         };
         assert_eq!(channel_id, ctx.channel_id);
-        assert!(reason.contains("refund submit failed"));
+        assert!(reason.contains("refund restore failed"));
         assert_eq!(
             recovery_row_status(&ctx.wallet, &ctx.channel_id),
             "submitting"
@@ -6097,7 +7594,7 @@ mod tests {
         );
         assert_eq!(
             ctx.wallet.get_channel(&ctx.channel_id).unwrap().state,
-            WalletChannelState::Open
+            WalletChannelState::Closing
         );
 
         let _ = ctx.shutdown_tx.send(());

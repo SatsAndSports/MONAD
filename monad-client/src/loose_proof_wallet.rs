@@ -837,6 +837,10 @@ impl LooseProofWallet {
         self.db_path.as_deref()
     }
 
+    pub(crate) fn wallet_name(&self) -> &str {
+        &self.wallet_name
+    }
+
     pub fn store_mint_quote(&self, quote: NewMintQuote) -> Result<()> {
         validate_nonempty("quote_id", &quote.quote_id)?;
         validate_nonempty("mint_url", &quote.mint_url)?;
@@ -962,6 +966,30 @@ impl LooseProofWallet {
             validate_nonempty("unit", &proof.unit)?;
             validate_nonempty("keyset_id", &proof.keyset_id)?;
             validate_nonempty("proof_json", &proof.proof_json)?;
+            let existing = tx.query_row(
+                "SELECT mint_url, unit, keyset_id, amount_raw, proof_json FROM monad_client_loose_proofs WHERE wallet_name = ?1 AND proof_id = ?2",
+                params![self.wallet_name, proof.proof_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?)),
+            ).optional().map_err(|e| LooseProofWalletError::Backend(format!("check imported proof: {e}")))?;
+            if let Some((mint, unit, keyset, amount, json)) = existing {
+                let same_json = json == proof.proof_json
+                    || matches!(
+                        (serde_json::from_str::<serde_json::Value>(&json), serde_json::from_str::<serde_json::Value>(&proof.proof_json)),
+                        (Ok(a), Ok(b)) if a == b
+                    );
+                if mint != proof.mint_url
+                    || unit != proof.unit
+                    || keyset != proof.keyset_id
+                    || amount != to_i64(proof.amount_raw)?
+                    || !same_json
+                {
+                    return Err(LooseProofWalletError::Backend(
+                        "immutable imported proof conflict".to_string(),
+                    ));
+                }
+                // Idempotent import must never resurrect a reserved or spent proof.
+                continue;
+            }
             tx.execute(
                 "INSERT INTO monad_client_loose_proofs
                  (proof_id, wallet_name, mint_url, unit, keyset_id, amount_raw, proof_json, state,
@@ -5383,6 +5411,61 @@ mod tests {
             .unwrap();
         assert_eq!(proofs.len(), 1);
         assert_eq!(proofs[0].amount_raw, 1);
+    }
+
+    #[test]
+    fn proof_reimport_checks_immutable_data_and_preserves_custody() {
+        let wallet = wallet();
+        let original = proof("proof-a", 1, "keyset-a");
+        wallet
+            .import_proofs(std::slice::from_ref(&original))
+            .unwrap();
+        for state in ["available", "reserved", "spent"] {
+            wallet
+                .conn()
+                .unwrap()
+                .execute(
+                    "UPDATE monad_client_loose_proofs SET state = ?1 WHERE proof_id = 'proof-a'",
+                    [state],
+                )
+                .unwrap();
+            wallet
+                .import_proofs(std::slice::from_ref(&original))
+                .unwrap();
+            let stored: String = wallet
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM monad_client_loose_proofs WHERE proof_id = 'proof-a'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, state);
+            for field in 0..5 {
+                let mut conflict = proof("proof-a", 1, "keyset-a");
+                match field {
+                    0 => conflict.mint_url.push_str("/other"),
+                    1 => conflict.unit = "msat".to_string(),
+                    2 => conflict.keyset_id = "other".to_string(),
+                    3 => conflict.amount_raw += 1,
+                    _ => conflict.proof_json = "{}".to_string(),
+                }
+                assert!(wallet
+                    .import_proofs(&[proof("new", 1, "keyset-a"), conflict])
+                    .is_err());
+                let count: i64 = wallet
+                    .conn()
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM monad_client_loose_proofs WHERE proof_id = 'new'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+        }
     }
 
     #[test]

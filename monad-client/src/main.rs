@@ -123,39 +123,59 @@ struct HttpMintConnection {
     client: reqwest::Client,
 }
 
+impl HttpMintConnection {
+    async fn checked_response(response: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(monad_client::sqlite_client_wallet::RefundMintRejection {
+                status: status.as_u16(),
+                body: response.text().await?,
+            }
+            .into());
+        }
+        Ok(response)
+    }
+}
+
 #[async_trait]
 impl MintConnection for HttpMintConnection {
     async fn process_swap(&self, request: SwapRequest) -> anyhow::Result<SwapResponse> {
-        self.client
+        let response = self
+            .client
             .post(format!("{}/v1/swap", self.mint_url))
             .json(&request)
             .send()
+            .await?;
+        Self::checked_response(response)
             .await?
-            .error_for_status()?
             .json()
             .await
             .map_err(Into::into)
     }
 
     async fn post_restore(&self, request: RestoreRequest) -> anyhow::Result<RestoreResponse> {
-        self.client
+        let response = self
+            .client
             .post(format!("{}/v1/restore", self.mint_url))
             .json(&request)
             .send()
+            .await?;
+        Self::checked_response(response)
             .await?
-            .error_for_status()?
             .json()
             .await
             .map_err(Into::into)
     }
 
     async fn check_state(&self, ys: Vec<PublicKey>) -> anyhow::Result<CheckStateResponse> {
-        self.client
+        let response = self
+            .client
             .post(format!("{}/v1/checkstate", self.mint_url))
             .json(&CheckStateRequest { ys })
             .send()
+            .await?;
+        Self::checked_response(response)
             .await?
-            .error_for_status()?
             .json()
             .await
             .map_err(Into::into)
@@ -265,9 +285,13 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
             let channel = wallet.get_channel(&channel_id)?;
             let mint = HttpMintConnection {
                 mint_url: channel.mint_url.clone(),
-                client: reqwest::Client::new(),
+                client: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?,
             };
-            let result = wallet.recover_channel_funds(&channel_id, &mint).await?;
+            let result = wallet
+                .recover_channel_funds(&locks.exclusive_access()?, &channel_id, &mint)
+                .await?;
             if args.json {
                 print_json(&recovery_result_json(&result))?;
             } else {
@@ -723,6 +747,21 @@ mod tests {
     use monad_client::loose_proof_wallet::OpeningAttemptState;
     use monad_client::sqlite_client_wallet::{ExportedOpeningInputsToken, UnresolvedOpeningExport};
     use monad_common::secp_identity::SecpTransportKeypair;
+
+    #[tokio::test]
+    async fn mint_rejection_retains_structured_body_without_displaying_it() {
+        let body = r#"{"code":12002,"detail":"untrusted mint detail"}"#;
+        let response = http::Response::builder().status(400).body(body).unwrap();
+        let error = HttpMintConnection::checked_response(response.into())
+            .await
+            .unwrap_err();
+        let rejection = error
+            .downcast_ref::<monad_client::sqlite_client_wallet::RefundMintRejection>()
+            .unwrap();
+        assert_eq!(rejection.status, 400);
+        assert_eq!(rejection.body, body);
+        assert!(!format!("{error:?}").contains("untrusted mint detail"));
+    }
 
     const ZERO_SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
