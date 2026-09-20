@@ -164,6 +164,11 @@ monad-client wallet --config monad.yaml recover-openings
 monad-client wallet --config monad.yaml export-stale-opening-inputs
 ```
 
+`import-token` stores the token's existing bearer proofs without swapping them
+into fresh proofs. It does not invalidate other copies or establish exclusive
+ownership. Import only tokens you control, and do not continue using another copy
+from another wallet.
+
 Exports group inputs by mint/unit. Unchanged eligible proofs produce the same
 token encoding even when they span multiple input keysets; repeated output is not
 additional value and may contain proofs already present in an earlier export.

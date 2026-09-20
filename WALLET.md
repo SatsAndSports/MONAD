@@ -482,6 +482,11 @@ The current client admin/funding/recovery commands are:
 - `monad-client wallet --loose-db <path> --channel-db <path> --sender-secret-hex <hex> [--wallet-name default] recover-channel --channel-id <id>`
 - `monad-client wallet --loose-db <path> --channel-db <path> --sender-secret-hex <hex> [--wallet-name default] recover-openings`
 
+`import-token` is a trusted-custody operation: it stores the existing bearer proofs
+without swapping them into fresh wallet-only proofs. Import does not invalidate
+other copies of the token or prove exclusive ownership. Operators should import
+only tokens they control and stop using any other copies in another wallet.
+
 Use `--json` for machine-readable output.
 
 Future wallet/UX tasks live in `FOR_LATER.md`.
