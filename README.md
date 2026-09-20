@@ -702,3 +702,8 @@ This opens 16 bidirectional QUIC streams, sends 64KB of random data on each, rea
 - `DESIGN.md` for the high-level system design and tradeoffs
 - `ARCHITECTURE.md` for the protocol and layering model
 - `AGENTS.md` for repo-specific development guidance
+# Process Funds Lifecycle Tests
+
+`make test-funds-lifecycle` builds the client and relay CLIs and runs opt-in
+actual-process wallet lifecycle tests with a retained real CDK HTTP mint.
+See [coverage and private failure artifacts](monad-relay/tests/FUNDS_LIFECYCLE.md).
