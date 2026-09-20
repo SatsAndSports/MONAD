@@ -147,22 +147,26 @@ paths and are released by the kernel after process death.
 
 ### Stale-Input Export Retains Custody
 
-Under exclusive wallet maintenance access, `export-stale-opening-inputs` may mark a
-submitted attempt `Exported`
-only when all of these are true:
+Under exclusive wallet maintenance access, `export-stale-opening-inputs` may include
+a submitted or already-exported attempt in a mint/unit token only when all of these
+are true:
 
 1. At least 3600 seconds have elapsed since its latest authorized submission or
    replay.
 2. Exact funding and change restores are valid and empty.
 3. One complete exact-input NUT-07 response reports every input `UNSPENT`.
-4. The durable export transition revalidates attempt state, latest timestamp,
-   latest execution sequence, and exact reservation membership.
+4. The durable group transition revalidates every represented attempt's state,
+   latest timestamp, latest execution sequence, and exact reservation membership
+   atomically before the token is exposed.
 
 The proofs remain reserved after export. Mints do not offer cancellation for a
 possibly submitted swap, so empty restore and `UNSPENT` observations prove only that
-no remote effect was visible at those observation points. Recovery still accepts a
-delayed completion. It marks an exported attempt `ExternallySpent` only after all
-exact inputs are `SPENT` and a final exact restore is empty.
+no remote effect was visible at those observation points. Results are reported per
+group/attempt; one failure does not suppress independent tokens, and repeated runs
+may re-emit overlapping snapshots. Export does not finalize a restored completion
+and instead requires `recover-openings`. Recovery still accepts a delayed
+completion. It marks an exported attempt `ExternallySpent` only after all exact
+inputs are `SPENT` and a final exact restore is empty.
 
 Recent, clock-rollback, stale, partial, invalid, unavailable, pending, or spent
 evidence remains unresolved and reserved.

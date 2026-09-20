@@ -30,7 +30,7 @@ use cdk_spilman::{
     SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking, SqliteClientStorage,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -212,6 +212,7 @@ impl OpeningRecoveryReport {
     }
 }
 
+#[derive(Debug)]
 enum OpeningRecoveryOutcome {
     Recovered(String),
     Cancelled,
@@ -228,6 +229,33 @@ pub struct ExportedOpeningInputsToken {
     pub proof_count: usize,
     pub attempt_ids: Vec<String>,
     pub token: String,
+}
+
+/// Results of one stale-opening input export scan.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OpeningInputExportReport {
+    pub exports: Vec<ExportedOpeningInputsToken>,
+    pub unresolved: Vec<UnresolvedOpeningExport>,
+}
+
+impl OpeningInputExportReport {
+    pub fn is_empty(&self) -> bool {
+        self.exports.is_empty() && self.unresolved.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedOpeningExport {
+    pub attempt_id: String,
+    pub state: OpeningAttemptState,
+    pub reason: String,
+}
+
+struct OpeningExportCandidate {
+    attempt_id: String,
+    state: OpeningAttemptState,
+    evidence: crate::loose_proof_wallet::OpeningExportEvidence,
+    proofs: Vec<(String, Proof)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1066,14 +1094,23 @@ impl SqliteClientWallet {
     pub fn export_stale_opening_inputs(
         &self,
         access: &ExclusiveWalletAccess<'_>,
-    ) -> Result<Vec<ExportedOpeningInputsToken>, WalletError> {
+    ) -> Result<OpeningInputExportReport, WalletError> {
         if !access.authorizes(&self.wallet_lock_identity) {
             return Err(WalletError::Backend(
                 "exclusive wallet maintenance access belongs to a different wallet".to_string(),
             ));
         }
         let networking = OpeningRecoveryHttpNetworking::new().map_err(WalletError::Backend)?;
-        let mut grouped: HashMap<(String, String), (Vec<Proof>, Vec<String>)> = HashMap::new();
+        self.export_stale_opening_inputs_with_networking(&networking)
+    }
+
+    fn export_stale_opening_inputs_with_networking<N: OpeningRecoveryNetworking>(
+        &self,
+        networking: &N,
+    ) -> Result<OpeningInputExportReport, WalletError> {
+        let now = Self::now_seconds()?;
+        let mut report = OpeningInputExportReport::default();
+        let mut grouped = BTreeMap::new();
         for attempt in self
             .loose_wallet
             .opening_attempts_for_recovery()
@@ -1085,90 +1122,255 @@ impl SqliteClientWallet {
             ) {
                 continue;
             }
-            let prepared: PreparedOpenChannel =
-                serde_json::from_str(&attempt.prepared_open_json)
-                    .map_err(|e| WalletError::Backend(format!("decode opening attempt: {e}")))?;
-            let reserved_proofs = self
-                .loose_wallet
-                .proofs_for_reservation(&attempt.reservation_id)
-                .map_err(loose_proof_error)?;
-            verify_prepared_inputs_match_selected_proofs(
-                &prepared,
-                &attempt.selected_proof_ids,
-                &reserved_proofs,
-            )?;
-            if !matches!(
-                self.restore_journaled_opening(&prepared, &networking)
-                    .map_err(|error| {
-                        open_channel_error(error, &attempt.unit, attempt.funding_token_target_msats)
-                    })?,
-                OpeningRestoreOutcome::FundingOutputsAbsent
-            ) {
-                continue;
-            }
-            if prepared_input_state(&prepared, &networking).map_err(|error| {
-                open_channel_error(error, &attempt.unit, attempt.funding_token_target_msats)
-            })? != ExactInputState::AllUnspent
-            {
-                continue;
-            }
-            if attempt.state == OpeningAttemptState::Submitted {
-                let Some(evidence) = self
+            grouped
+                .entry((attempt.mint_url.clone(), attempt.unit.clone()))
+                .or_insert_with(Vec::new)
+                .push(attempt);
+        }
+        for ((mint_url, unit), attempts) in grouped {
+            let mut candidates = Vec::new();
+            for attempt in attempts {
+                let evidence = match self
                     .loose_wallet
-                    .opening_export_evidence(&attempt.attempt_id, OpeningAttemptState::Submitted)
-                    .map_err(loose_proof_error)?
-                else {
-                    continue;
-                };
-                if !self
-                    .loose_wallet
-                    .mark_opening_attempt_exported_if_evidence_current(
-                        &evidence,
-                        Self::now_seconds()?,
-                    )
-                    .map_err(loose_proof_error)?
+                    .opening_export_evidence(&attempt.attempt_id, attempt.state)
                 {
+                    Ok(Some(evidence)) => evidence,
+                    Ok(None) => {
+                        report.unresolved.push(UnresolvedOpeningExport {
+                            attempt_id: attempt.attempt_id,
+                            state: attempt.state,
+                            reason: "opening export evidence changed during the scan".to_string(),
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        report.unresolved.push(UnresolvedOpeningExport {
+                            attempt_id: attempt.attempt_id,
+                            state: attempt.state,
+                            reason: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                if attempt.state == OpeningAttemptState::Submitted && !evidence.is_aged_at(now) {
                     continue;
                 }
+                let prepared: PreparedOpenChannel =
+                    match serde_json::from_str(&attempt.prepared_open_json) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            report.unresolved.push(UnresolvedOpeningExport {
+                                attempt_id: attempt.attempt_id,
+                                state: attempt.state,
+                                reason: format!("decode opening attempt: {error}"),
+                            });
+                            continue;
+                        }
+                    };
+                let reserved_proofs = match self
+                    .loose_wallet
+                    .proofs_for_reservation(&attempt.reservation_id)
+                {
+                    Ok(proofs) => proofs,
+                    Err(error) => {
+                        report.unresolved.push(UnresolvedOpeningExport {
+                            attempt_id: attempt.attempt_id,
+                            state: attempt.state,
+                            reason: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                if let Err(error) = verify_prepared_inputs_match_selected_proofs(
+                    &prepared,
+                    &attempt.selected_proof_ids,
+                    &reserved_proofs,
+                ) {
+                    report.unresolved.push(UnresolvedOpeningExport {
+                        attempt_id: attempt.attempt_id,
+                        state: attempt.state,
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+                match self.restore_journaled_opening(&prepared, networking) {
+                    Ok(OpeningRestoreOutcome::FundingOutputsAbsent) => {}
+                    Ok(OpeningRestoreOutcome::Completed(_)) => {
+                        report.unresolved.push(UnresolvedOpeningExport {
+                            attempt_id: attempt.attempt_id,
+                            state: attempt.state,
+                            reason: "opening completion is restorable; run recover-openings"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        report.unresolved.push(UnresolvedOpeningExport {
+                            attempt_id: attempt.attempt_id,
+                            state: attempt.state,
+                            reason: open_channel_error(
+                                error,
+                                &attempt.unit,
+                                attempt.funding_token_target_msats,
+                            )
+                            .to_string(),
+                        });
+                        continue;
+                    }
+                }
+                match prepared_input_state(&prepared, networking) {
+                    Ok(ExactInputState::AllUnspent) => {}
+                    Ok(ExactInputState::AllSpent) => {
+                        report.unresolved.push(UnresolvedOpeningExport {
+                            attempt_id: attempt.attempt_id,
+                            state: attempt.state,
+                            reason: "exact inputs are spent; run recover-openings".to_string(),
+                        });
+                        continue;
+                    }
+                    Ok(ExactInputState::MixedOrPending) => {
+                        report.unresolved.push(UnresolvedOpeningExport {
+                            attempt_id: attempt.attempt_id,
+                            state: attempt.state,
+                            reason: "exact inputs are not all unspent".to_string(),
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        report.unresolved.push(UnresolvedOpeningExport {
+                            attempt_id: attempt.attempt_id,
+                            state: attempt.state,
+                            reason: open_channel_error(
+                                error,
+                                &attempt.unit,
+                                attempt.funding_token_target_msats,
+                            )
+                            .to_string(),
+                        });
+                        continue;
+                    }
+                }
+                let proofs = match reserved_proofs
+                    .iter()
+                    .map(|proof| {
+                        serde_json::from_str::<Proof>(&proof.proof_json)
+                            .map(|parsed| (proof.proof_id.clone(), parsed))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(proofs) => proofs,
+                    Err(error) => {
+                        report.unresolved.push(UnresolvedOpeningExport {
+                            attempt_id: attempt.attempt_id,
+                            state: attempt.state,
+                            reason: format!("decode reserved proof for export: {error}"),
+                        });
+                        continue;
+                    }
+                };
+                candidates.push(OpeningExportCandidate {
+                    attempt_id: attempt.attempt_id,
+                    state: attempt.state,
+                    evidence,
+                    proofs,
+                });
             }
-            let proofs = reserved_proofs
+            if candidates.is_empty() {
+                continue;
+            }
+            candidates.sort_by(|left, right| left.attempt_id.cmp(&right.attempt_id));
+            let attempt_ids = candidates
                 .iter()
-                .map(|proof| serde_json::from_str::<Proof>(&proof.proof_json))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| {
-                    WalletError::Backend(format!("decode reserved proof for export: {e}"))
-                })?;
-            let entry = grouped
-                .entry((attempt.mint_url.clone(), attempt.unit.clone()))
-                .or_insert_with(|| (Vec::new(), Vec::new()));
-            entry.0.extend(proofs);
-            entry.1.push(attempt.attempt_id);
-        }
-        let mut exports = grouped
-            .into_iter()
-            .map(|((mint_url, unit), (proofs, mut attempt_ids))| {
-                attempt_ids.sort();
-                let amount_raw = proofs.iter().map(|proof| proof.amount.to_u64()).sum();
-                let currency = unit.parse::<CurrencyUnit>().map_err(|e| {
-                    WalletError::Backend(format!("parse exported token unit '{unit}': {e}"))
-                })?;
-                let mint = mint_url.parse().map_err(|e| {
-                    WalletError::Backend(format!("parse exported token mint '{mint_url}': {e}"))
-                })?;
-                Ok(ExportedOpeningInputsToken {
+                .map(|candidate| candidate.attempt_id.clone())
+                .collect::<Vec<_>>();
+            let mut proofs = candidates
+                .iter_mut()
+                .flat_map(|candidate| std::mem::take(&mut candidate.proofs))
+                .collect::<Vec<_>>();
+            proofs.sort_by(|left, right| left.0.cmp(&right.0));
+            let proof_count = proofs.len();
+            let amount_raw = proofs.iter().try_fold(0u64, |total, (_, proof)| {
+                total.checked_add(proof.amount.to_u64())
+            });
+            let token = amount_raw
+                .ok_or_else(|| "exported proof amount overflow".to_string())
+                .and_then(|amount_raw| {
+                    let currency = unit
+                        .parse::<CurrencyUnit>()
+                        .map_err(|error| format!("parse exported token unit '{unit}': {error}"))?;
+                    let mint = mint_url.parse().map_err(|error| {
+                        format!("parse exported token mint '{mint_url}': {error}")
+                    })?;
+                    Ok((
+                        amount_raw,
+                        Token::new(
+                            mint,
+                            proofs.into_iter().map(|(_, proof)| proof).collect(),
+                            None,
+                            currency,
+                        )
+                        .to_string(),
+                    ))
+                });
+            let (amount_raw, token) =
+                match token {
+                    Ok(token) => token,
+                    Err(reason) => {
+                        report
+                            .unresolved
+                            .extend(candidates.into_iter().map(|candidate| {
+                                UnresolvedOpeningExport {
+                                    attempt_id: candidate.attempt_id,
+                                    state: candidate.state,
+                                    reason: reason.clone(),
+                                }
+                            }));
+                        continue;
+                    }
+                };
+            let evidences = candidates
+                .iter()
+                .map(|candidate| candidate.evidence.clone())
+                .collect::<Vec<_>>();
+            match self
+                .loose_wallet
+                .mark_opening_attempts_exported_if_evidence_current(&evidences, now)
+            {
+                Ok(true) => report.exports.push(ExportedOpeningInputsToken {
                     mint_url,
                     unit,
                     amount_raw,
-                    proof_count: proofs.len(),
+                    proof_count,
                     attempt_ids,
-                    token: Token::new(mint, proofs, None, currency).to_string(),
-                })
-            })
-            .collect::<Result<Vec<_>, WalletError>>()?;
-        exports.sort_by(|left, right| {
-            (&left.mint_url, &left.unit).cmp(&(&right.mint_url, &right.unit))
-        });
-        Ok(exports)
+                    token,
+                }),
+                Ok(false) => report
+                    .unresolved
+                    .extend(candidates.into_iter().map(|candidate| {
+                        UnresolvedOpeningExport {
+                            attempt_id: candidate.attempt_id,
+                            state: candidate.state,
+                            reason: "opening export evidence changed before the durable transition"
+                                .to_string(),
+                        }
+                    })),
+                Err(error) => report
+                    .unresolved
+                    .extend(
+                        candidates
+                            .into_iter()
+                            .map(|candidate| UnresolvedOpeningExport {
+                                attempt_id: candidate.attempt_id,
+                                state: candidate.state,
+                                reason: error.to_string(),
+                            }),
+                    ),
+            }
+        }
+        report
+            .unresolved
+            .sort_by(|left, right| left.attempt_id.cmp(&right.attempt_id));
+        Ok(report)
     }
 
     fn recover_or_replay_submitted_opening<N: OpeningRecoveryNetworking>(
@@ -4300,6 +4502,102 @@ mod tests {
         }
     }
 
+    struct CompleteBeforeFinalRestoreNetworking {
+        inner: OpeningRecoveryHttpNetworking,
+        swap_request_json: String,
+        restore_calls: AtomicUsize,
+    }
+
+    impl SpilmanClientNetworking for CompleteBeforeFinalRestoreNetworking {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+            panic!("opening recovery must never submit through its networking interface")
+        }
+
+        fn call_mint_restore(&self, mint_url: &str, request_json: &str) -> Result<String, String> {
+            let call = self.restore_calls.fetch_add(1, Ordering::SeqCst);
+            if call < 2 {
+                return Ok(r#"{"outputs":[],"signatures":[]}"#.to_string());
+            }
+            if call == 2 {
+                self.inner
+                    .call_mint_swap(mint_url, &self.swap_request_json)?;
+            }
+            self.inner.call_mint_restore(mint_url, request_json)
+        }
+
+        fn call_mint_keysets(&self, mint_url: &str) -> Result<String, String> {
+            self.inner.call_mint_keysets(mint_url)
+        }
+
+        fn call_mint_keys(&self, mint_url: &str, keyset_id: &str) -> Result<String, String> {
+            self.inner.call_mint_keys(mint_url, keyset_id)
+        }
+    }
+
+    impl OpeningRecoveryNetworking for CompleteBeforeFinalRestoreNetworking {
+        fn call_mint_check_state(&self, _: &str, request_json: &str) -> Result<String, String> {
+            let request: CheckStateRequest =
+                serde_json::from_str(request_json).map_err(|error| error.to_string())?;
+            serde_json::to_string(&CheckStateResponse {
+                states: request
+                    .ys
+                    .into_iter()
+                    .map(|y| cashu::nuts::ProofState {
+                        y,
+                        state: State::Spent,
+                        witness: None,
+                    })
+                    .collect(),
+            })
+            .map_err(|error| error.to_string())
+        }
+    }
+
+    struct FinalRestoreFailureNetworking {
+        restore_calls: AtomicUsize,
+    }
+
+    impl SpilmanClientNetworking for FinalRestoreFailureNetworking {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+            panic!("opening recovery must never submit a swap")
+        }
+
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
+            if self.restore_calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                Ok(r#"{"outputs":[],"signatures":[]}"#.to_string())
+            } else {
+                Err("injected final restore failure".to_string())
+            }
+        }
+
+        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+    }
+
+    impl OpeningRecoveryNetworking for FinalRestoreFailureNetworking {
+        fn call_mint_check_state(&self, _: &str, request_json: &str) -> Result<String, String> {
+            let request: CheckStateRequest =
+                serde_json::from_str(request_json).map_err(|error| error.to_string())?;
+            serde_json::to_string(&CheckStateResponse {
+                states: request
+                    .ys
+                    .into_iter()
+                    .map(|y| cashu::nuts::ProofState {
+                        y,
+                        state: State::Spent,
+                        witness: None,
+                    })
+                    .collect(),
+            })
+            .map_err(|error| error.to_string())
+        }
+    }
+
     struct FourSubmissionNetworking {
         inner: OpeningRecoveryHttpNetworking,
         swap_requests: Mutex<Vec<String>>,
@@ -6523,6 +6821,8 @@ mod tests {
         finalizing_boundary: Option<usize>,
         export_before_recovery: bool,
         externally_spent_after_export: bool,
+        complete_before_final_restore: bool,
+        include_broken_export_attempt: bool,
     ) {
         let port = free_loopback_port();
         let mint_url = format!("http://127.0.0.1:{port}");
@@ -6794,23 +7094,84 @@ mod tests {
             );
         }
         if export_before_recovery {
+            if include_broken_export_attempt {
+                let broken_mint = "http://broken.invalid";
+                let broken_proof_id = "broken-export-proof";
+                wallet
+                    .loose_wallet()
+                    .import_proofs(&[NewLooseProof {
+                        proof_id: broken_proof_id.to_string(),
+                        mint_url: broken_mint.to_string(),
+                        unit: unit.to_string(),
+                        keyset_id: keyset_id.clone(),
+                        amount_raw: 1,
+                        proof_json: loose_proofs[0].proof_json.clone(),
+                        source_quote_id: None,
+                        source_batch_id: None,
+                    }])
+                    .unwrap();
+                wallet
+                    .loose_wallet()
+                    .reserve_selected_proofs_with_opening_attempt(
+                        broken_mint,
+                        unit,
+                        &[broken_proof_id.to_string()],
+                        &NewOpeningAttempt {
+                            attempt_id: "broken-export-attempt".to_string(),
+                            opening_id: "broken-export-attempt".to_string(),
+                            predecessor_attempt_id: None,
+                            reservation_id: "broken-export-reservation".to_string(),
+                            receiver_pubkey: receiver_pubkey.clone(),
+                            mint_url: broken_mint.to_string(),
+                            unit: unit.to_string(),
+                            funding_token_target_msats: 1_000,
+                            expiry_timestamp,
+                            prepared_open_json: "not JSON".to_string(),
+                            selected_proof_ids: vec![broken_proof_id.to_string()],
+                        },
+                    )
+                    .unwrap();
+                let OpeningSubmissionClaim::Acquired(permit) = wallet
+                    .loose_wallet()
+                    .claim_opening_attempt_submission("broken-export-attempt")
+                    .unwrap()
+                else {
+                    panic!("broken attempt submission claim not acquired");
+                };
+                wallet
+                    .loose_wallet()
+                    .authorize_opening_submission_at(permit, 1)
+                    .unwrap();
+            }
             let locks =
                 ClientWalletLocks::acquire(&loose_db, &channel_db, WalletLockMode::Maintenance)
                     .unwrap();
-            let exports = wallet
+            let report = wallet
                 .export_stale_opening_inputs(&locks.exclusive_access().unwrap())
                 .unwrap();
-            assert_eq!(exports.len(), 1);
-            assert_eq!(exports[0].mint_url, mint_url);
-            assert_eq!(exports[0].unit, unit);
-            assert_eq!(exports[0].amount_raw, reservation.total_amount_raw);
-            assert_eq!(exports[0].proof_count, reservation.proofs.len());
-            assert_eq!(exports[0].attempt_ids, vec![channel_id.clone()]);
-            assert!(exports[0].token.parse::<Token>().is_ok());
+            assert_eq!(
+                report
+                    .unresolved
+                    .iter()
+                    .map(|unresolved| unresolved.attempt_id.as_str())
+                    .collect::<Vec<_>>(),
+                if include_broken_export_attempt {
+                    vec!["broken-export-attempt"]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert_eq!(report.exports.len(), 1);
+            assert_eq!(report.exports[0].mint_url, mint_url);
+            assert_eq!(report.exports[0].unit, unit);
+            assert_eq!(report.exports[0].amount_raw, reservation.total_amount_raw);
+            assert_eq!(report.exports[0].proof_count, reservation.proofs.len());
+            assert_eq!(report.exports[0].attempt_ids, vec![channel_id.clone()]);
+            assert!(report.exports[0].token.parse::<Token>().is_ok());
             let repeated = wallet
                 .export_stale_opening_inputs(&locks.exclusive_access().unwrap())
                 .unwrap();
-            assert_eq!(repeated, exports);
+            assert_eq!(repeated, report);
             assert_eq!(
                 wallet
                     .loose_wallet()
@@ -6828,12 +7189,101 @@ mod tests {
                 .all(|proof| proof.state == LooseProofState::Reserved));
             drop(locks);
 
-            if externally_spent_after_export {
-                let exported = wallet
+            let exported = wallet
+                .loose_wallet()
+                .opening_attempt(&channel_id)
+                .unwrap()
+                .unwrap();
+            let mut inconclusive_modes = vec![
+                CheckStateMode::States(vec![State::Unspent; reservation.proofs.len()]),
+                CheckStateMode::States(vec![State::Pending; reservation.proofs.len()]),
+                CheckStateMode::MissingLast,
+                CheckStateMode::DuplicateFirst,
+                CheckStateMode::NetworkError,
+            ];
+            if reservation.proofs.len() > 1 {
+                inconclusive_modes.push(CheckStateMode::States(
+                    (0..reservation.proofs.len())
+                        .map(|index| {
+                            if index == 0 {
+                                State::Spent
+                            } else {
+                                State::Unspent
+                            }
+                        })
+                        .collect(),
+                ));
+            }
+            for mode in inconclusive_modes {
+                let networking = StateCheckNetworking::new(mode);
+                assert!(matches!(
+                    wallet.recover_journaled_opening(&exported, &networking),
+                    Ok(OpeningRecoveryOutcome::Unresolved) | Err(_)
+                ));
+                assert_eq!(
+                    wallet
+                        .loose_wallet()
+                        .opening_attempt(&channel_id)
+                        .unwrap()
+                        .unwrap(),
+                    exported
+                );
+                assert!(wallet
+                    .loose_wallet()
+                    .proofs_for_reservation(&reservation.reservation_id)
+                    .unwrap()
+                    .iter()
+                    .all(|proof| proof.state == LooseProofState::Reserved));
+            }
+            let final_restore_failure = FinalRestoreFailureNetworking {
+                restore_calls: AtomicUsize::new(0),
+            };
+            assert!(wallet
+                .recover_journaled_opening(&exported, &final_restore_failure)
+                .is_err());
+            assert_eq!(
+                wallet
                     .loose_wallet()
                     .opening_attempt(&channel_id)
                     .unwrap()
-                    .unwrap();
+                    .unwrap(),
+                exported
+            );
+
+            if complete_before_final_restore {
+                let networking = CompleteBeforeFinalRestoreNetworking {
+                    inner: OpeningRecoveryHttpNetworking::new().unwrap(),
+                    swap_request_json: prepared.swap_request_json.clone(),
+                    restore_calls: AtomicUsize::new(0),
+                };
+                let outcome = wallet.recover_journaled_opening(&exported, &networking);
+                assert!(
+                    matches!(
+                        outcome,
+                        Ok(OpeningRecoveryOutcome::Recovered(ref recovered)) if recovered == &channel_id
+                    ),
+                    "unexpected recovery outcome: {outcome:?}"
+                );
+                assert!(networking.restore_calls.load(Ordering::SeqCst) >= 2);
+                assert_eq!(
+                    wallet
+                        .loose_wallet()
+                        .opening_attempt(&channel_id)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    OpeningAttemptState::Completed
+                );
+                assert_eq!(
+                    wallet.get_channel(&channel_id).unwrap().state,
+                    WalletChannelState::Open
+                );
+                let _ = shutdown_tx.send(());
+                mint_task.await.unwrap().unwrap();
+                return;
+            }
+
+            if externally_spent_after_export {
                 let networking = StateCheckNetworking::new(CheckStateMode::States(vec![
                     State::Spent;
                     reservation.proofs.len()
@@ -6873,6 +7323,27 @@ mod tests {
                 let status = swap_response.status();
                 let body = swap_response.text().await.unwrap_or_default();
                 panic!("swap failed with {status}: {body}");
+            }
+            if export_before_recovery {
+                let locks =
+                    ClientWalletLocks::acquire(&loose_db, &channel_db, WalletLockMode::Maintenance)
+                        .unwrap();
+                let report = wallet
+                    .export_stale_opening_inputs(&locks.exclusive_access().unwrap())
+                    .unwrap();
+                assert!(report.exports.is_empty());
+                assert_eq!(report.unresolved.len(), 1);
+                assert_eq!(report.unresolved[0].attempt_id, channel_id);
+                assert!(report.unresolved[0].reason.contains("run recover-openings"));
+                assert_eq!(
+                    wallet
+                        .loose_wallet()
+                        .opening_attempt(&channel_id)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    OpeningAttemptState::Exported
+                );
             }
         }
 
@@ -7004,29 +7475,47 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recovers_persisted_ambiguous_opening() {
-        assert_recovers_persisted_ambiguous_opening(true, None, false, false).await;
+        assert_recovers_persisted_ambiguous_opening(true, None, false, false, false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_recovery_keeps_empty_submitted_opening_reserved() {
-        assert_recovers_persisted_ambiguous_opening(false, None, false, false).await;
+        assert_recovers_persisted_ambiguous_opening(false, None, false, false, false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finalizing_opening_recovers_at_each_local_persistence_boundary() {
         for boundary in 0..=4 {
-            assert_recovers_persisted_ambiguous_opening(true, Some(boundary), false, false).await;
+            assert_recovers_persisted_ambiguous_opening(
+                true,
+                Some(boundary),
+                false,
+                false,
+                false,
+                false,
+            )
+            .await;
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_opening_export_reemits_token_and_delayed_completion_wins() {
-        assert_recovers_persisted_ambiguous_opening(true, None, true, false).await;
+        assert_recovers_persisted_ambiguous_opening(true, None, true, false, false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exported_opening_becomes_externally_spent_only_with_conclusive_evidence() {
-        assert_recovers_persisted_ambiguous_opening(false, None, true, true).await;
+        assert_recovers_persisted_ambiguous_opening(false, None, true, true, false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_restore_completion_wins_over_external_spend_evidence() {
+        assert_recovers_persisted_ambiguous_opening(false, None, true, false, true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_unresolved_export_group_does_not_suppress_an_independent_token() {
+        assert_recovers_persisted_ambiguous_opening(false, None, true, true, false, true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

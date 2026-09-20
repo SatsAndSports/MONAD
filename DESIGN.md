@@ -194,11 +194,15 @@ and persists the exact prepared funding swap before submission. Live opening
 recovery first uses NUT-09; only a valid empty funding restore followed by an
 all-`UNSPENT` NUT-07 check may replay that same immutable request once. Startup
 and manual opening recovery never submit opening swaps: prepared attempts are
-cancelled. Under exclusive wallet access, `export-stale-opening-inputs` may mark a
-submitted attempt `Exported` after one hour, complete empty funding/change restores,
-and exact all-`UNSPENT` input evidence, then emits its bearer token without
-releasing the reservation. A delayed completion still wins. An exported attempt is
-marked `ExternallySpent` only after all inputs are `SPENT` and a final empty restore.
+cancelled. Under exclusive wallet access, `export-stale-opening-inputs` may group
+eligible submitted or exported attempts by mint/unit after one hour, complete empty
+funding/change restores, and exact all-`UNSPENT` input evidence. It atomically
+revalidates and transitions every attempt in a group before emitting that group's
+bearer token without releasing reservations. Group failures are reported
+independently, and repeated runs may re-emit overlapping snapshots. Export only
+assesses and emits inputs: a restorable completion is left for `recover-openings`.
+A delayed completion still wins. An exported attempt is marked `ExternallySpent`
+only after all inputs are `SPENT` and a final empty restore.
 Ambiguous, partial, pending, invalid, or unavailable evidence remains unresolved
 and retains the reservation. A narrowly recognized inactive-output-keyset rejection can
 produce one immutable successor attempt during live opening. For expired-channel

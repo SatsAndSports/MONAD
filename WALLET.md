@@ -86,6 +86,17 @@ proof and channel wallets from top-level `client_wallet` YAML config. The
 token import, and recovery commands, while explicit DB/key flags remain available
 for manual or emergency access.
 
+Channel-opening recovery and stale-input export have separate responsibilities.
+`recover-openings` restores and finalizes delayed openings without submitting a
+swap. `export-stale-opening-inputs` only assesses and emits eligible bearer value:
+after one hour, empty exact restores, and all-`UNSPENT` exact inputs, it groups
+proofs by mint/unit and atomically marks every attempt represented by each token
+`Exported` before output. The command returns both successful exports and unresolved
+attempts; repeated exports may overlap while proofs remain reserved. A nonempty
+restore is never finalized by export and must be handled by `recover-openings`.
+Only recovery may later mark an exported attempt `ExternallySpent`, after all exact
+inputs are `SPENT` and a final exact restore remains empty.
+
 What is still missing is the rest of the user-facing wallet UX: mint quote/mint
 commands, richer balance inspection, an automatic established-channel fund
 recovery policy, and sweep/close flows for client-side value. Startup recovery of

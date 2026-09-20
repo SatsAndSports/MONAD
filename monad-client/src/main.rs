@@ -307,10 +307,10 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
             }
         }
         WalletCommand::ExportStaleOpeningInputs => {
-            let exports = wallet.export_stale_opening_inputs(&locks.exclusive_access()?)?;
+            let report = wallet.export_stale_opening_inputs(&locks.exclusive_access()?)?;
             if args.json {
                 print_json(&serde_json::json!({
-                    "exports": exports.into_iter().map(|entry| serde_json::json!({
+                    "exports": report.exports.into_iter().map(|entry| serde_json::json!({
                         "mint_url": entry.mint_url,
                         "unit": entry.unit,
                         "amount_raw": entry.amount_raw,
@@ -318,12 +318,19 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                         "attempt_ids": entry.attempt_ids,
                         "token": entry.token,
                     })).collect::<Vec<_>>(),
+                    "unresolved": report.unresolved.into_iter().map(|entry| serde_json::json!({
+                        "attempt_id": entry.attempt_id,
+                        "state": format!("{:?}", entry.state).to_ascii_lowercase(),
+                        "reason": entry.reason,
+                    })).collect::<Vec<_>>(),
                 }))?;
-            } else if exports.is_empty() {
+            } else if report.is_empty() {
                 println!("No stale opening inputs are currently exportable.");
             } else {
-                println!("WARNING: each token below is bearer value. Import or swap it promptly; MONAD keeps the original opening reserved until recovery resolves it.");
-                for entry in exports {
+                if !report.exports.is_empty() {
+                    println!("WARNING: each token below is bearer value. Import or swap it promptly; MONAD keeps the original opening reserved until recovery resolves it.");
+                }
+                for entry in report.exports {
                     println!();
                     println!("mint: {}", entry.mint_url);
                     println!("unit: {}", entry.unit);
@@ -331,6 +338,13 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                     println!("proof_count: {}", entry.proof_count);
                     println!("attempt_ids: {}", entry.attempt_ids.join(","));
                     println!("token: {}", entry.token);
+                }
+                for unresolved in report.unresolved {
+                    println!();
+                    println!(
+                        "Not exported: {} ({:?}): {}",
+                        unresolved.attempt_id, unresolved.state, unresolved.reason
+                    );
                 }
             }
         }

@@ -690,11 +690,17 @@ are cancelled; finalizing attempts finish local idempotent updates; submitted
 attempts with complete restored funding/change finalize. Empty, partial, invalid,
 or network-failed restore evidence normally remains unresolved and reserved. Under
 the manager's exclusive startup/maintenance lock, `export-stale-opening-inputs`
-may mark an eligible submitted attempt `Exported` after 3600 seconds, exact empty
-funding/change restore, and complete all-`UNSPENT` NUT-07 evidence, then prints its
-Cashu bearer token while retaining its reservation. Recovery still checks exported
-attempts: a delayed completion wins; all exact inputs `SPENT` plus a final empty
-restore atomically marks the attempt `ExternallySpent` and its proofs spent.
+may select eligible submitted or already-exported attempts after 3600 seconds,
+exact empty funding/change restore, and complete all-`UNSPENT` NUT-07 evidence.
+It groups proofs by mint/unit, deterministically constructs one Cashu token per
+group, then atomically revalidates and marks every represented attempt `Exported`
+before exposing that token. Independent group failures become unresolved report
+entries rather than suppressing successful groups. Repeated runs are overlapping
+best-effort snapshots and can re-emit still-reserved proofs. Export never applies a
+restored completion; it directs the operator to `recover-openings`. Recovery still
+checks exported attempts: a delayed completion wins; all exact inputs `SPENT` plus
+a final empty restore atomically marks the attempt `ExternallySpent` and its proofs
+spent.
 Incompatible nonempty opening journals are rejected and require export or reset
 before upgrading. Other swap policies are unchanged.
 The live exact-replay

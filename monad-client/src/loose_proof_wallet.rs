@@ -502,6 +502,13 @@ pub(crate) struct OpeningExportEvidence {
     state: OpeningAttemptState,
 }
 
+impl OpeningExportEvidence {
+    pub(crate) fn is_aged_at(&self, now: u64) -> bool {
+        now >= self.latest_submitted_at
+            && now - self.latest_submitted_at >= OPENING_EXPORT_MIN_AGE_SECONDS
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct OpeningSubmissionPermit {
     attempt_id: String,
@@ -2258,89 +2265,108 @@ impl LooseProofWallet {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_opening_attempt_exported_if_evidence_current(
         &self,
         evidence: &OpeningExportEvidence,
         now: u64,
     ) -> Result<bool> {
-        if evidence.state != OpeningAttemptState::Submitted {
+        self.mark_opening_attempts_exported_if_evidence_current(std::slice::from_ref(evidence), now)
+    }
+
+    pub(crate) fn mark_opening_attempts_exported_if_evidence_current(
+        &self,
+        evidences: &[OpeningExportEvidence],
+        now: u64,
+    ) -> Result<bool> {
+        if evidences.is_empty() {
             return Ok(false);
         }
-        if now < evidence.latest_submitted_at
-            || now - evidence.latest_submitted_at < OPENING_EXPORT_MIN_AGE_SECONDS
-        {
+        if evidences.iter().any(|evidence| {
+            !matches!(
+                evidence.state,
+                OpeningAttemptState::Submitted | OpeningAttemptState::Exported
+            ) || (evidence.state == OpeningAttemptState::Submitted && !evidence.is_aged_at(now))
+        }) {
             return Ok(false);
         }
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let selected_json = canonical_proof_ids_json(&evidence.selected_proof_ids)?;
-        let attempt_matches: bool = tx.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM monad_client_opening_attempts attempts
-                WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?3
-                  AND reservation_id = ?4 AND selected_proof_ids_json = ?5
-                  AND latest_submitted_at = ?6
-                  AND NOT EXISTS (
-                      SELECT 1 FROM monad_client_opening_attempts successor
-                      WHERE successor.wallet_name = attempts.wallet_name
-                        AND successor.predecessor_attempt_id = attempts.attempt_id)
-                  AND (SELECT COALESCE(MAX(execution_sequence), 0)
-                       FROM monad_client_opening_executions executions
-                       WHERE executions.wallet_name = attempts.wallet_name
-                         AND executions.attempt_id = attempts.attempt_id) = ?7)",
-            params![
-                self.wallet_name,
-                evidence.attempt_id,
-                OpeningAttemptState::Submitted.as_str(),
-                evidence.reservation_id,
-                selected_json,
-                to_i64(evidence.latest_submitted_at)?,
-                to_i64(evidence.execution_sequence)?,
-            ],
-            |row| row.get(0),
-        )?;
-        if !attempt_matches {
-            return Ok(false);
+        for evidence in evidences {
+            let selected_json = canonical_proof_ids_json(&evidence.selected_proof_ids)?;
+            let attempt_matches: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM monad_client_opening_attempts attempts
+                    WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?3
+                      AND reservation_id = ?4 AND selected_proof_ids_json = ?5
+                      AND latest_submitted_at = ?6
+                      AND NOT EXISTS (
+                          SELECT 1 FROM monad_client_opening_attempts successor
+                          WHERE successor.wallet_name = attempts.wallet_name
+                            AND successor.predecessor_attempt_id = attempts.attempt_id)
+                      AND (SELECT COALESCE(MAX(execution_sequence), 0)
+                           FROM monad_client_opening_executions executions
+                           WHERE executions.wallet_name = attempts.wallet_name
+                             AND executions.attempt_id = attempts.attempt_id) = ?7)",
+                params![
+                    self.wallet_name,
+                    evidence.attempt_id,
+                    evidence.state.as_str(),
+                    evidence.reservation_id,
+                    selected_json,
+                    to_i64(evidence.latest_submitted_at)?,
+                    to_i64(evidence.execution_sequence)?,
+                ],
+                |row| row.get(0),
+            )?;
+            if !attempt_matches {
+                return Ok(false);
+            }
+            let reservation_rows = tx
+                .prepare(
+                    "SELECT proof_id, state, spent_channel_id
+                     FROM monad_client_loose_proofs
+                     WHERE wallet_name = ?1 AND reserved_by = ?2",
+                )?
+                .query_map(params![self.wallet_name, evidence.reservation_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let reserved_ids = reservation_rows
+                .iter()
+                .map(|(proof_id, _, _)| proof_id.clone())
+                .collect::<Vec<_>>();
+            if canonical_proof_ids_json(&reserved_ids)? != selected_json
+                || reservation_rows.iter().any(|(_, state, spent_channel_id)| {
+                    state != LooseProofState::Reserved.as_str() || spent_channel_id.is_some()
+                })
+            {
+                return Ok(false);
+            }
         }
-        let reservation_rows = tx
-            .prepare(
-                "SELECT proof_id, state, spent_channel_id
-                 FROM monad_client_loose_proofs
-                 WHERE wallet_name = ?1 AND reserved_by = ?2",
-            )?
-            .query_map(params![self.wallet_name, evidence.reservation_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let reserved_ids = reservation_rows
+        for evidence in evidences
             .iter()
-            .map(|(proof_id, _, _)| proof_id.clone())
-            .collect::<Vec<_>>();
-        if canonical_proof_ids_json(&reserved_ids)? != selected_json
-            || reservation_rows.iter().any(|(_, state, spent_channel_id)| {
-                state != LooseProofState::Reserved.as_str() || spent_channel_id.is_some()
-            })
+            .filter(|evidence| evidence.state == OpeningAttemptState::Submitted)
         {
-            return Ok(false);
-        }
-        let changed = tx.execute(
-            "UPDATE monad_client_opening_attempts
-             SET state = 'exported', updated_at = ?4
-             WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'submitted'
-                AND latest_submitted_at = ?3",
-            params![
-                self.wallet_name,
-                evidence.attempt_id,
-                to_i64(evidence.latest_submitted_at)?,
-                to_i64(now)?,
-            ],
-        )?;
-        if changed != 1 {
-            return Ok(false);
+            let changed = tx.execute(
+                "UPDATE monad_client_opening_attempts
+                 SET state = 'exported', updated_at = ?4
+                 WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = 'submitted'
+                    AND latest_submitted_at = ?3",
+                params![
+                    self.wallet_name,
+                    evidence.attempt_id,
+                    to_i64(evidence.latest_submitted_at)?,
+                    to_i64(now)?,
+                ],
+            )?;
+            if changed != 1 {
+                return Ok(false);
+            }
         }
         tx.commit()?;
         Ok(true)
@@ -4029,6 +4055,124 @@ mod tests {
                 &evidence,
                 evidence.latest_submitted_at - 1,
             )
+            .unwrap());
+    }
+
+    #[test]
+    fn grouped_export_transition_is_atomic_and_idempotent() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[
+                proof("proof-a", 8, "keyset-a"),
+                proof("proof-b", 8, "keyset-a"),
+            ])
+            .unwrap();
+        for (attempt_id, reservation_id, proof_id) in [
+            ("channel-a", "reservation-a", "proof-a"),
+            ("channel-b", "reservation-b", "proof-b"),
+        ] {
+            wallet
+                .reserve_selected_proofs_with_opening_attempt(
+                    MINT,
+                    "sat",
+                    &[proof_id.to_string()],
+                    &opening_attempt(attempt_id, reservation_id, &[proof_id]),
+                )
+                .unwrap();
+            let authorized = claim_and_authorize(&wallet, attempt_id);
+            wallet
+                .finish_opening_execution(authorized, OpeningExecutionStatus::Uncertain, None)
+                .unwrap();
+        }
+
+        let first = wallet
+            .opening_export_evidence("channel-a", OpeningAttemptState::Submitted)
+            .unwrap()
+            .unwrap();
+        let stale_second = wallet
+            .opening_export_evidence("channel-b", OpeningAttemptState::Submitted)
+            .unwrap()
+            .unwrap();
+        let OpeningSubmissionClaim::Acquired(replay) =
+            wallet.claim_opening_attempt_replay("channel-b").unwrap()
+        else {
+            panic!("replay claim not acquired");
+        };
+        let replay = authorize_replay_after_latest(&wallet, replay);
+        wallet
+            .finish_opening_execution(replay, OpeningExecutionStatus::Uncertain, None)
+            .unwrap();
+        let now = wallet
+            .opening_attempt("channel-b")
+            .unwrap()
+            .unwrap()
+            .latest_submitted_at
+            .unwrap()
+            + OPENING_EXPORT_MIN_AGE_SECONDS;
+
+        assert!(
+            !wallet
+                .mark_opening_attempts_exported_if_evidence_current(
+                    &[first.clone(), stale_second],
+                    now,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            wallet.opening_attempt("channel-a").unwrap().unwrap().state,
+            OpeningAttemptState::Submitted
+        );
+        assert_eq!(
+            wallet.opening_attempt("channel-b").unwrap().unwrap().state,
+            OpeningAttemptState::Submitted
+        );
+
+        let second = wallet
+            .opening_export_evidence("channel-b", OpeningAttemptState::Submitted)
+            .unwrap()
+            .unwrap();
+        wallet
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_grouped_export
+                 BEFORE UPDATE ON monad_client_opening_attempts
+                 WHEN OLD.attempt_id = 'channel-b' AND NEW.state = 'exported'
+                 BEGIN SELECT RAISE(ABORT, 'injected grouped export failure'); END;",
+            )
+            .unwrap();
+        assert!(wallet
+            .mark_opening_attempts_exported_if_evidence_current(
+                &[first.clone(), second.clone()],
+                now,
+            )
+            .is_err());
+        assert_eq!(
+            wallet.opening_attempt("channel-a").unwrap().unwrap().state,
+            OpeningAttemptState::Submitted
+        );
+        assert_eq!(
+            wallet.opening_attempt("channel-b").unwrap().unwrap().state,
+            OpeningAttemptState::Submitted
+        );
+        wallet
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_grouped_export;")
+            .unwrap();
+        assert!(wallet
+            .mark_opening_attempts_exported_if_evidence_current(&[first.clone(), second], now,)
+            .unwrap());
+        let exported = ["channel-a", "channel-b"].map(|attempt_id| {
+            wallet
+                .opening_export_evidence(attempt_id, OpeningAttemptState::Exported)
+                .unwrap()
+                .unwrap()
+        });
+        assert!(wallet
+            .mark_opening_attempts_exported_if_evidence_current(&exported, now)
             .unwrap());
     }
 
