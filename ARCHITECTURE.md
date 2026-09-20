@@ -683,6 +683,21 @@ If the mint explicitly rejects an inactive output keyset with code `12002`, the
 client records that immutable predecessor, refreshes, and may create one successor
 using a changed active keyset. Transport and protocol ambiguity never authorizes a
 successor submission. Live ambiguous opens run bounded recovery once immediately.
+
+Opening and refund HTTP adapters share a body-discarding rejection type carrying
+only HTTP status and an optional numeric NUT-00 code. HTTP 4xx `12002` is rejection
+evidence, not successor authority: the separate opening and refund journals enforce
+their own initial-execution, ambiguity, and predecessor checks. Opening never
+reconstructs rejection evidence from formatted error strings.
+
+Exact NUT-09 output/signature matching and cryptographic completion use upstream's
+checked completion paths for both operations. MONAD only classifies empty paired
+arrays as absence and enforces opening's funding/change consistency. Structurally
+valid nonempty funding and change responses are fetched before upstream exact
+matching; partial, duplicate, unknown, or invalid signatures cannot finalize an
+opening. Journals, retry budgets, and the distinct relay-compatible funding versus
+unfiltered same-mint/unit refund keyset policies remain separate.
+
 The configured runtime manager runs one restore-only opening recovery pass
 before route provisioning, also exposed by manual `recover-openings`. This pass
 never submits swaps: prepared attempts and rejected attempts without a successor

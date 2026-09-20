@@ -18,8 +18,8 @@ use crate::wallet::{
 };
 use crate::wallet_lock::{ExclusiveWalletAccess, WalletLockIdentity};
 use cashu::nuts::{
-    CheckStateRequest, CheckStateResponse, CurrencyUnit, Id, Proof, RestoreRequest,
-    RestoreResponse, SecretKey, State, Token,
+    CheckStateRequest, CheckStateResponse, CurrencyUnit, Id, Proof, RestoreResponse, SecretKey,
+    State, Token,
 };
 use cdk_spilman::{
     compute_funding_token_amount, parse_keyset_info_from_json, ClientChannelFunding,
@@ -42,35 +42,44 @@ type ClientBridge =
 
 const CHANNEL_EXPIRY_SECONDS: u64 = 24 * 3600;
 const MINT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const HTTP_CLIENT_ERROR_PREFIX: &str = "MONAD_HTTP_CLIENT_ERROR ";
 
-/// Structured HTTP rejection. Display deliberately omits the mint's untrusted body.
-pub struct RefundMintRejection {
+/// Structured HTTP rejection retaining only status and numeric NUT-00 code,
+/// never the mint's untrusted body.
+pub struct MintHttpRejection {
     pub status: u16,
-    pub body: String,
+    pub code: Option<u64>,
 }
 
-impl std::fmt::Debug for RefundMintRejection {
+impl std::fmt::Debug for MintHttpRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }
 }
 
-impl std::fmt::Display for RefundMintRejection {
+impl std::fmt::Display for MintHttpRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "refund mint HTTP rejection ({})", self.status)
+        write!(
+            f,
+            "mint HTTP rejection ({}, NUT-00 code {:?})",
+            self.status, self.code
+        )
     }
 }
 
-impl std::error::Error for RefundMintRejection {}
+impl std::error::Error for MintHttpRejection {}
 
-impl RefundMintRejection {
-    fn inactive_output_keyset(&self) -> bool {
-        (400..500).contains(&self.status)
-            && serde_json::from_str::<serde_json::Value>(&self.body)
+impl MintHttpRejection {
+    pub fn from_body(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            code: serde_json::from_str::<serde_json::Value>(body)
                 .ok()
-                .and_then(|v| v.get("code").and_then(|c| c.as_u64()))
-                == Some(12002)
+                .and_then(|v| v.get("code").and_then(|c| c.as_u64())),
+        }
+    }
+
+    fn inactive_output_keyset(&self) -> bool {
+        (400..500).contains(&self.status) && self.code == Some(12002)
     }
 }
 
@@ -100,6 +109,12 @@ fn enter_active_opening(channel_id: &str) -> Result<ActiveOpeningGuard, WalletEr
 }
 
 trait OpeningRecoveryNetworking: SpilmanClientNetworking {
+    // String-only upstream failures carry no definitive HTTP rejection evidence.
+    fn call_opening_swap(&self, mint_url: &str, request: &str) -> anyhow::Result<String> {
+        self.call_mint_swap(mint_url, request)
+            .map_err(anyhow::Error::msg)
+    }
+
     fn call_mint_check_state(
         &self,
         mint_url: &str,
@@ -136,7 +151,7 @@ impl OpeningRecoveryHttpNetworking {
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    return Err(format!("GET {url}: {status} - {body}"));
+                    return Err(MintHttpRejection::from_body(status.as_u16(), &body).to_string());
                 }
                 response
                     .text()
@@ -146,7 +161,7 @@ impl OpeningRecoveryHttpNetworking {
         })
     }
 
-    fn blocking_post(&self, url: &str, body: &str) -> Result<String, String> {
+    fn blocking_post(&self, url: &str, body: &str) -> anyhow::Result<String> {
         let client = self.client.clone();
         let url = url.to_string();
         let body = body.to_string();
@@ -157,20 +172,13 @@ impl OpeningRecoveryHttpNetworking {
                     .header("Content-Type", "application/json")
                     .body(body)
                     .send()
-                    .await
-                    .map_err(|e| format!("POST {url} failed: {e}"))?;
+                    .await?;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    if status.is_client_error() {
-                        return Err(format!("{HTTP_CLIENT_ERROR_PREFIX}{status} - {body}"));
-                    }
-                    return Err(format!("POST {url}: {status} - {body}"));
+                    return Err(MintHttpRejection::from_body(status.as_u16(), &body).into());
                 }
-                response
-                    .text()
-                    .await
-                    .map_err(|e| format!("POST {url} read body: {e}"))
+                response.text().await.map_err(anyhow::Error::from)
             })
         })
     }
@@ -179,6 +187,7 @@ impl OpeningRecoveryHttpNetworking {
 impl SpilmanClientNetworking for OpeningRecoveryHttpNetworking {
     fn call_mint_swap(&self, mint_url: &str, swap_request_json: &str) -> Result<String, String> {
         self.blocking_post(&format!("{mint_url}/v1/swap"), swap_request_json)
+            .map_err(|e| e.to_string())
     }
 
     fn call_mint_restore(
@@ -187,6 +196,7 @@ impl SpilmanClientNetworking for OpeningRecoveryHttpNetworking {
         restore_request_json: &str,
     ) -> Result<String, String> {
         self.blocking_post(&format!("{mint_url}/v1/restore"), restore_request_json)
+            .map_err(|e| e.to_string())
     }
 
     fn call_mint_keysets(&self, mint_url: &str) -> Result<String, String> {
@@ -199,6 +209,10 @@ impl SpilmanClientNetworking for OpeningRecoveryHttpNetworking {
 }
 
 impl OpeningRecoveryNetworking for OpeningRecoveryHttpNetworking {
+    fn call_opening_swap(&self, mint_url: &str, request: &str) -> anyhow::Result<String> {
+        self.blocking_post(&format!("{mint_url}/v1/swap"), request)
+    }
+
     fn call_mint_check_state(
         &self,
         mint_url: &str,
@@ -208,6 +222,7 @@ impl OpeningRecoveryNetworking for OpeningRecoveryHttpNetworking {
             &format!("{mint_url}/v1/checkstate"),
             check_state_request_json,
         )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -955,7 +970,7 @@ impl SqliteClientWallet {
                     // Only a typed, direct initial rejection may authorize new outputs.
                     // Pending execution records are uncertainty, including process death.
                     if error
-                        .downcast_ref::<RefundMintRejection>()
+                        .downcast_ref::<MintHttpRejection>()
                         .is_some_and(|e| e.inactive_output_keyset())
                         && self.refund_can_replace(channel_id, execution)?
                     {
@@ -1668,18 +1683,13 @@ impl SqliteClientWallet {
                     e,
                 )
             })?;
-        let Some(funding_response) = validate_and_canonicalize_restore_response(
-            &recovery.funding_restore_request_json,
-            &funding_response,
-        )
-        .map_err(|e| {
+        if restore_response_is_absent(&funding_response).map_err(|e| {
             open_channel_stage_error(
                 OpenChannelFailureStage::RestoreVerification,
                 Some(prepared.channel_id.clone()),
                 format!("validate funding restore response: {e}"),
             )
-        })?
-        else {
+        })? {
             if let Some(request) = recovery.change_restore_request_json.as_deref() {
                 let response = networking
                     .call_mint_restore(&recovery.mint_url, request)
@@ -1690,16 +1700,13 @@ impl SqliteClientWallet {
                             e,
                         )
                     })?;
-                if validate_and_canonicalize_restore_response(request, &response)
-                    .map_err(|e| {
-                        open_channel_stage_error(
-                            OpenChannelFailureStage::RestoreVerification,
-                            Some(prepared.channel_id.clone()),
-                            format!("validate change restore response: {e}"),
-                        )
-                    })?
-                    .is_some()
-                {
+                if !restore_response_is_absent(&response).map_err(|e| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::RestoreVerification,
+                        Some(prepared.channel_id.clone()),
+                        format!("validate change restore response: {e}"),
+                    )
+                })? {
                     return Err(open_channel_stage_error(
                         OpenChannelFailureStage::RestoreVerification,
                         Some(prepared.channel_id.clone()),
@@ -1721,22 +1728,19 @@ impl SqliteClientWallet {
                             e,
                         )
                     })?;
-                let response = validate_and_canonicalize_restore_response(request, &response)
-                    .map_err(|e| {
-                        open_channel_stage_error(
-                            OpenChannelFailureStage::RestoreVerification,
-                            Some(prepared.channel_id.clone()),
-                            format!("validate change restore response: {e}"),
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        open_channel_stage_error(
-                            OpenChannelFailureStage::RestoreVerification,
-                            Some(prepared.channel_id.clone()),
-                            "funding outputs were restored but change outputs were absent"
-                                .to_string(),
-                        )
-                    })?;
+                if restore_response_is_absent(&response).map_err(|e| {
+                    open_channel_stage_error(
+                        OpenChannelFailureStage::RestoreVerification,
+                        Some(prepared.channel_id.clone()),
+                        format!("validate change restore response: {e}"),
+                    )
+                })? {
+                    return Err(open_channel_stage_error(
+                        OpenChannelFailureStage::RestoreVerification,
+                        Some(prepared.channel_id.clone()),
+                        "funding outputs were restored but change outputs were absent".to_string(),
+                    ));
+                }
                 Some(response)
             }
         };
@@ -2269,7 +2273,7 @@ impl SqliteClientWallet {
             .map_err(|e| WalletError::Backend(format!("system time before unix epoch: {e}")))
     }
 
-    fn submit_open_attempt_with_networking<N: SpilmanClientNetworking>(
+    fn submit_open_attempt_with_networking<N: OpeningRecoveryNetworking>(
         &self,
         attempt: &ClientOpenAttempt,
         networking: &N,
@@ -2449,7 +2453,7 @@ impl SqliteClientWallet {
         })
     }
 
-    fn submit_prepared_open<N: SpilmanClientNetworking>(
+    fn submit_prepared_open<N: OpeningRecoveryNetworking>(
         &self,
         prepared: PreparedOpenChannel,
         permit: OpeningSubmissionPermit,
@@ -2543,7 +2547,7 @@ impl SqliteClientWallet {
                 )
             })?;
         let swap_response_json = match networking
-            .call_mint_swap(&prepared.mint_url, &prepared.swap_request_json)
+            .call_opening_swap(&prepared.mint_url, &prepared.swap_request_json)
         {
             Ok(response) => {
                 self.loose_wallet
@@ -2562,8 +2566,10 @@ impl SqliteClientWallet {
                 response
             }
             Err(error) => {
-                let message = normalize_mint_error_string(error);
-                let definitive = is_definitive_keyset_rejection(&message);
+                let definitive = error
+                    .downcast_ref::<MintHttpRejection>()
+                    .is_some_and(MintHttpRejection::inactive_output_keyset);
+                let message = error.to_string();
                 let attempt_rejected = if definitive {
                     self.loose_wallet
                         .record_definitive_opening_rejection(authorized, 12_002, &message)
@@ -2931,7 +2937,16 @@ impl SqliteClientWallet {
             }
             Err(error)
                 if allow_keyset_successor
-                    && should_retry_open_after_keyset_rejection(&error, false) =>
+                    && !error.input_may_be_spent
+                    && error.stage == OpenChannelFailureStage::MintRejected
+                    && self
+                        .loose_wallet
+                        .opening_attempt(&attempt.prepared.channel_id)
+                        .map_err(loose_proof_error)?
+                        .is_some_and(|record| {
+                            record.state == OpeningAttemptState::Rejected
+                                && record.rejection_code == Some(12002)
+                        }) =>
             {
                 if let Err(refresh_error) = self.refresh_client_keysets(offer) {
                     let _ = self
@@ -3717,52 +3732,15 @@ fn channel_state_str(state: WalletChannelState) -> &'static str {
     }
 }
 
-fn validate_and_canonicalize_restore_response(
-    request_json: &str,
-    response_json: &str,
-) -> Result<Option<String>, String> {
-    let request: RestoreRequest =
-        serde_json::from_str(request_json).map_err(|e| format!("decode restore request: {e}"))?;
+// Only empty paired arrays establish absence. Exact matching, ordering and proof
+// verification belong to upstream checked completion for both opening and refund.
+fn restore_response_is_absent(response_json: &str) -> Result<bool, String> {
     let response: RestoreResponse =
         serde_json::from_str(response_json).map_err(|e| format!("decode restore response: {e}"))?;
     if response.outputs.len() != response.signatures.len() {
         return Err("restore response output/signature counts differ".to_string());
     }
-    if response.outputs.is_empty() {
-        return Ok(None);
-    }
-
-    let requested = request.outputs.iter().cloned().collect::<HashSet<_>>();
-    if requested.len() != request.outputs.len() {
-        return Err("restore request contains duplicate outputs".to_string());
-    }
-    let mut signatures_by_output = HashMap::with_capacity(response.outputs.len());
-    for (output, signature) in response.outputs.into_iter().zip(response.signatures) {
-        if !requested.contains(&output) {
-            return Err("restore response contains an unknown output".to_string());
-        }
-        if signatures_by_output.insert(output, signature).is_some() {
-            return Err("restore response contains a duplicate output".to_string());
-        }
-    }
-    if signatures_by_output.len() != request.outputs.len() {
-        return Err("restore response does not contain every requested output".to_string());
-    }
-    let signatures = request
-        .outputs
-        .iter()
-        .map(|output| {
-            signatures_by_output
-                .remove(output)
-                .ok_or_else(|| "restore response omitted a requested output".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    serde_json::to_string(&RestoreResponse {
-        outputs: request.outputs,
-        signatures,
-    })
-    .map(Some)
-    .map_err(|e| format!("serialize canonical restore response: {e}"))
+    Ok(response.outputs.is_empty())
 }
 
 fn prepared_inputs_are_all_unspent<N: OpeningRecoveryNetworking>(
@@ -4101,27 +4079,6 @@ fn open_channel_stage_error(
         input_may_be_spent,
         message,
     }
-}
-
-fn normalize_mint_error_string(raw: String) -> String {
-    serde_json::from_str::<serde_json::Value>(&raw)
-        .map(|value| value.to_string())
-        .unwrap_or(raw)
-}
-
-fn is_definitive_keyset_rejection(message: &str) -> bool {
-    let trimmed = message.trim_start();
-    let payload = if let Some(client_error) = trimmed.strip_prefix(HTTP_CLIENT_ERROR_PREFIX) {
-        client_error
-            .split_once(" - ")
-            .map(|(_, body)| body)
-            .unwrap_or(client_error)
-    } else if trimmed.starts_with('{') {
-        trimmed
-    } else {
-        return false;
-    };
-    cdk_spilman::extract_nut00_error_code(payload) == Some(12002)
 }
 
 struct ProofInputKeysetLookup {
@@ -4495,16 +4452,6 @@ fn open_channel_error(
     }
 }
 
-fn should_retry_open_after_keyset_rejection(
-    error: &OpenChannelError,
-    already_retried: bool,
-) -> bool {
-    !already_retried
-        && !error.input_may_be_spent
-        && error.stage == OpenChannelFailureStage::MintRejected
-        && is_definitive_keyset_rejection(&error.message)
-}
-
 fn map_create_payment_error(
     channel: &WalletChannel,
     error: String,
@@ -4576,14 +4523,14 @@ mod tests {
     use crate::loose_proof_wallet::{LooseProofState, NewLooseProof};
     use crate::proof_selection::input_fee_raw_from_ppk_sum;
     use crate::wallet_lock::{ClientWalletLocks, WalletLockMode};
+    use cashu::nuts::RestoreRequest;
     use cdk_spilman::{
         channel_parameters_get_channel_id,
         compute_channel_from_proofs_with_input_keysets_and_funding_amount,
         compute_channel_secret_from_hex, construct_proofs, create_funding_swap_with_plain_change,
         create_plain_blinded_messages, ClientChannelOpeningFromSwap, ClientKeysetCacheEntry,
-        ClientStorage, ConfigurableClientHost, FundingSpendKind, MemoryClientStorage,
-        OpenChannelError, OpenChannelFailureStage, Payment, ReqwestClientNetworking,
-        SpilmanClientBridge, SpilmanClientHost, SqliteClientStorage,
+        ClientStorage, ConfigurableClientHost, FundingSpendKind, MemoryClientStorage, Payment,
+        ReqwestClientNetworking, SpilmanClientBridge, SpilmanClientHost, SqliteClientStorage,
     };
     use cdk_spilman_test_mint::{
         rotate_sat_keyset, serve_existing_mint_with_shutdown, serve_mint_with_shutdown,
@@ -4682,9 +4629,9 @@ mod tests {
                 if count == 1 {
                     anyhow::bail!("ambiguous initial execution");
                 }
-                return Err(RefundMintRejection {
+                return Err(MintHttpRejection {
                     status: 400,
-                    body: r#"{"code":12002,"detail":"inactive keyset"}"#.to_string(),
+                    code: Some(12002),
                 }
                 .into());
             }
@@ -4750,11 +4697,9 @@ mod tests {
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             let status = response.status();
             if !status.is_success() {
-                return Err(RefundMintRejection {
-                    status: status.as_u16(),
-                    body: response.text().await?,
-                }
-                .into());
+                return Err(
+                    MintHttpRejection::from_body(status.as_u16(), &response.text().await?).into(),
+                );
             }
             response
                 .json()
@@ -4923,6 +4868,12 @@ mod tests {
 
         fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
             panic!("key lookup is not expected")
+        }
+    }
+
+    impl OpeningRecoveryNetworking for CountingSwapNetworking {
+        fn call_mint_check_state(&self, _: &str, _: &str) -> Result<String, String> {
+            panic!("state check is not expected")
         }
     }
 
@@ -5106,6 +5057,9 @@ mod tests {
         Json,
         Count,
         Identity,
+        Duplicate,
+        Partial,
+        Absent,
         Signature,
         IncorrectSignaturePoint,
     }
@@ -5114,6 +5068,7 @@ mod tests {
     enum OpeningOrchestrationScenario {
         RestoreOnly,
         InvalidDirectAndRestore,
+        LostResponseAndInvalidRestore,
         InvalidRestore {
             response_index: usize,
             mutation: InvalidRestore,
@@ -5128,8 +5083,8 @@ mod tests {
         restores: Mutex<usize>,
     }
 
-    impl SpilmanClientNetworking for ScriptedOpeningNetworking {
-        fn call_mint_swap(&self, mint_url: &str, request: &str) -> Result<String, String> {
+    impl ScriptedOpeningNetworking {
+        fn call_opening_swap(&self, mint_url: &str, request: &str) -> anyhow::Result<String> {
             let mut swaps = self.swaps.lock().unwrap();
             swaps.push(request.to_string());
             match self.scenario {
@@ -5140,25 +5095,40 @@ mod tests {
                         1 => {
                             // Replay authorization requires a strictly later wall-clock second.
                             std::thread::sleep(Duration::from_millis(1_100));
-                            Err("scripted original transport uncertainty".to_string())
+                            Err(anyhow::anyhow!("scripted original transport uncertainty"))
                         }
-                        2 => Err(
-                            r#"{"code":12002,"error":"scripted explicit replay rejection"}"#
-                                .to_string(),
-                        ),
+                        2 => Err(MintHttpRejection {
+                            status: 400,
+                            code: Some(12002),
+                        }
+                        .into()),
                         _ => panic!("unexpected successor or additional replay"),
                     }
                 }
-                OpeningOrchestrationScenario::InvalidDirectAndRestore => {
+                OpeningOrchestrationScenario::InvalidDirectAndRestore
+                | OpeningOrchestrationScenario::LostResponseAndInvalidRestore => {
                     assert_eq!(swaps.len(), 1);
-                    self.inner.call_mint_swap(mint_url, request)?;
+                    self.inner.call_opening_swap(mint_url, request)?;
+                    if matches!(
+                        self.scenario,
+                        OpeningOrchestrationScenario::LostResponseAndInvalidRestore
+                    ) {
+                        anyhow::bail!("lost successful opening response");
+                    }
                     Ok("invalid direct swap JSON".to_string())
                 }
                 OpeningOrchestrationScenario::RestoreOnly
-                | OpeningOrchestrationScenario::InvalidRestore { .. } => {
-                    Err("scripted guard: restore-only recovery must not submit".to_string())
-                }
+                | OpeningOrchestrationScenario::InvalidRestore { .. } => Err(anyhow::anyhow!(
+                    "scripted guard: restore-only recovery must not submit"
+                )),
             }
+        }
+    }
+
+    impl SpilmanClientNetworking for ScriptedOpeningNetworking {
+        fn call_mint_swap(&self, mint_url: &str, request: &str) -> Result<String, String> {
+            self.call_opening_swap(mint_url, request)
+                .map_err(|e| e.to_string())
         }
 
         fn call_mint_restore(&self, mint_url: &str, request: &str) -> Result<String, String> {
@@ -5166,8 +5136,17 @@ mod tests {
             let index = *calls;
             *calls += 1;
             let response = self.inner.call_mint_restore(mint_url, request)?;
+            if matches!(self.scenario, OpeningOrchestrationScenario::RestoreOnly) {
+                let mut response: RestoreResponse = serde_json::from_str(&response).unwrap();
+                response.outputs.reverse();
+                response.signatures.reverse();
+                return Ok(serde_json::to_string(&response).unwrap());
+            }
             let mutation = match self.scenario {
-                OpeningOrchestrationScenario::InvalidDirectAndRestore => Some(InvalidRestore::Json),
+                OpeningOrchestrationScenario::InvalidDirectAndRestore
+                | OpeningOrchestrationScenario::LostResponseAndInvalidRestore => {
+                    Some(InvalidRestore::Json)
+                }
                 OpeningOrchestrationScenario::InvalidRestore {
                     response_index,
                     mutation,
@@ -5190,6 +5169,24 @@ mod tests {
                     response["outputs"][0]["B_"] = serde_json::json!(
                         "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2"
                     )
+                }
+                InvalidRestore::Duplicate => {
+                    for field in ["outputs", "signatures"] {
+                        let values = response[field].as_array_mut().unwrap();
+                        assert!(values.len() > 1);
+                        values[1] = values[0].clone();
+                    }
+                }
+                InvalidRestore::Partial => {
+                    for field in ["outputs", "signatures"] {
+                        let values = response[field].as_array_mut().unwrap();
+                        assert!(values.len() > 1);
+                        values.pop();
+                    }
+                }
+                InvalidRestore::Absent => {
+                    response["outputs"] = serde_json::json!([]);
+                    response["signatures"] = serde_json::json!([]);
                 }
                 InvalidRestore::Signature => {
                     response["signatures"][0]["C_"] = serde_json::json!("invalid point")
@@ -5227,6 +5224,9 @@ mod tests {
     }
 
     impl OpeningRecoveryNetworking for ScriptedOpeningNetworking {
+        fn call_opening_swap(&self, mint_url: &str, request: &str) -> anyhow::Result<String> {
+            self.call_opening_swap(mint_url, request)
+        }
         fn call_mint_check_state(&self, mint_url: &str, request: &str) -> Result<String, String> {
             self.inner.call_mint_check_state(mint_url, request)
         }
@@ -5248,8 +5248,8 @@ mod tests {
         }
     }
 
-    impl SpilmanClientNetworking for FourSubmissionNetworking {
-        fn call_mint_swap(&self, mint_url: &str, request_json: &str) -> Result<String, String> {
+    impl FourSubmissionNetworking {
+        fn call_opening_swap(&self, mint_url: &str, request_json: &str) -> anyhow::Result<String> {
             let call_index = {
                 let mut requests = self.swap_requests.lock().unwrap();
                 requests.push(request_json.to_string());
@@ -5258,11 +5258,23 @@ mod tests {
             match call_index {
                 0 | 2 => {
                     std::thread::sleep(Duration::from_millis(1_100));
-                    Err("injected transport loss before mint submission".to_string())
+                    Err(anyhow::anyhow!(
+                        "injected transport loss before mint submission"
+                    ))
                 }
-                1 | 3 => self.inner.call_mint_swap(mint_url, request_json),
-                _ => Err(format!("unexpected swap submission {}", call_index + 1)),
+                1 | 3 => self.inner.call_opening_swap(mint_url, request_json),
+                _ => Err(anyhow::anyhow!(
+                    "unexpected swap submission {}",
+                    call_index + 1
+                )),
             }
+        }
+    }
+
+    impl SpilmanClientNetworking for FourSubmissionNetworking {
+        fn call_mint_swap(&self, mint_url: &str, request: &str) -> Result<String, String> {
+            self.call_opening_swap(mint_url, request)
+                .map_err(|e| e.to_string())
         }
 
         fn call_mint_restore(&self, mint_url: &str, request_json: &str) -> Result<String, String> {
@@ -5279,6 +5291,9 @@ mod tests {
     }
 
     impl OpeningRecoveryNetworking for FourSubmissionNetworking {
+        fn call_opening_swap(&self, mint_url: &str, request: &str) -> anyhow::Result<String> {
+            self.call_opening_swap(mint_url, request)
+        }
         fn call_mint_check_state(
             &self,
             mint_url: &str,
@@ -6774,7 +6789,7 @@ mod tests {
     }
 
     #[test]
-    fn refund_rejection_requires_structured_direct_inactive_keyset_code() {
+    fn mint_rejection_requires_structured_direct_inactive_keyset_code() {
         for (status, body, expected) in [
             (400, r#"{"code":12002}"#, true),
             (500, r#"{"code":12002}"#, false),
@@ -6783,13 +6798,76 @@ mod tests {
             (400, r#"{"code":"12002"}"#, false),
             (400, r#"{"detail":"12002"}"#, false),
             (400, "upstream: {\"code\":12002}", false),
+            (400, r#"{"code":12002.0}"#, false),
+            (400, r#"{"code":-12002}"#, false),
+            (400, r#"{"code":11001,"detail":"12002"}"#, false),
+            (400, r#"{"code":12002} trailing"#, false),
         ] {
-            let rejection = RefundMintRejection {
-                status,
-                body: body.to_string(),
-            };
+            let rejection = MintHttpRejection::from_body(status, body);
             assert_eq!(rejection.inactive_output_keyset(), expected);
             assert!(!format!("{rejection:?}").contains(body));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opening_http_rejection_preserves_only_status_and_numeric_code() {
+        for (status, body, code, definitive) in [
+            (
+                400,
+                r#"{"code":12002,"detail":"secret mint body"}"#,
+                Some(12002),
+                true,
+            ),
+            (
+                503,
+                r#"{"code":12002,"detail":"secret mint body"}"#,
+                Some(12002),
+                false,
+            ),
+            (
+                400,
+                r#"{"code":"12002","detail":"secret mint body"}"#,
+                None,
+                false,
+            ),
+            (400, "secret mint body with 12002", None, false),
+            (
+                400,
+                r#"{"code":12001,"detail":"secret mint body"}"#,
+                Some(12001),
+                false,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let app = axum::Router::new().route(
+                "/v1/swap",
+                axum::routing::post(move || async move {
+                    (http::StatusCode::from_u16(status).unwrap(), body)
+                }),
+            );
+            let (shutdown, stopped) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+            let networking = OpeningRecoveryHttpNetworking::new().unwrap();
+            let error = networking.call_opening_swap(&url, "{}").unwrap_err();
+            let rejection = error.downcast_ref::<MintHttpRejection>().unwrap();
+            assert_eq!(rejection.status, status);
+            assert_eq!(rejection.code, code);
+            assert_eq!(rejection.inactive_output_keyset(), definitive);
+            assert!(!format!("{error:?}").contains("secret mint body"));
+            assert!(!error.to_string().contains("secret mint body"));
+            // The string-only upstream interface does not recreate typed authority.
+            let string_error = networking.call_mint_swap(&url, "{}").unwrap_err();
+            assert!(!string_error.contains("secret mint body"));
+            shutdown.send(()).unwrap();
+            task.await.unwrap();
         }
     }
 
@@ -9589,7 +9667,7 @@ mod tests {
         let attempt = wallet
             .prepare_target_capacity_attempt(
                 &offer,
-                32,
+                31,
                 output_keyset,
                 SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
             )
@@ -9643,11 +9721,23 @@ mod tests {
                     }
                 ) {
                     assert!(error.to_string().to_lowercase().contains("dleq"), "{error}");
-                    // Both structurally valid responses are fetched before crypto verification.
-                    assert_eq!(*networking.restores.lock().unwrap(), 2);
-                } else {
-                    assert_eq!(*networking.restores.lock().unwrap(), response_index + 1);
                 }
+                // Well-formed pairs are matched by upstream checked completion,
+                // after both reads; malformed JSON/counts still fail immediately.
+                let expected_reads = if matches!(
+                    scenario,
+                    OpeningOrchestrationScenario::InvalidRestore {
+                        mutation: InvalidRestore::Json
+                            | InvalidRestore::Count
+                            | InvalidRestore::Signature,
+                        ..
+                    }
+                ) {
+                    response_index + 1
+                } else {
+                    2
+                };
+                assert_eq!(*networking.restores.lock().unwrap(), expected_reads);
                 assert_eq!(
                     wallet.loose_wallet().opening_attempt(id).unwrap().unwrap(),
                     before
@@ -9665,7 +9755,8 @@ mod tests {
                 let swaps = networking.swaps.lock().unwrap();
                 let executions = wallet.loose_wallet().opening_executions(id).unwrap();
                 match scenario {
-                    OpeningOrchestrationScenario::InvalidDirectAndRestore => {
+                    OpeningOrchestrationScenario::InvalidDirectAndRestore
+                    | OpeningOrchestrationScenario::LostResponseAndInvalidRestore => {
                         assert_eq!(swaps.len(), 1);
                         assert_eq!(*networking.restores.lock().unwrap(), 1);
                         assert_eq!(executions.len(), 1);
@@ -9864,12 +9955,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orchestration_lost_opening_response_and_invalid_restore_preserve_custody() {
+        assert_opening_orchestration_recovers(
+            OpeningOrchestrationScenario::LostResponseAndInvalidRestore,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn orchestration_invalid_funding_and_change_restores_preserve_journal() {
         for response_index in 0..=1 {
             for mutation in [
                 InvalidRestore::Json,
                 InvalidRestore::Count,
                 InvalidRestore::Identity,
+                InvalidRestore::Duplicate,
+                InvalidRestore::Partial,
+                InvalidRestore::Absent,
                 InvalidRestore::Signature,
                 InvalidRestore::IncorrectSignaturePoint,
             ] {
@@ -10288,61 +10390,15 @@ mod tests {
     }
 
     #[test]
-    fn open_retry_gate_allows_only_first_safe_keyset_rejection() {
-        let error = OpenChannelError {
-            stage: OpenChannelFailureStage::MintRejected,
-            channel_id: Some("channel".to_string()),
-            input_may_be_spent: false,
-            message: r#"{"code":12002,"detail":"keyset is inactive"}"#.to_string(),
-        };
-
-        assert!(should_retry_open_after_keyset_rejection(&error, false));
-        assert!(!should_retry_open_after_keyset_rejection(&error, true));
-    }
-
-    #[test]
-    fn keyset_rejection_requires_direct_or_http_client_error_payload() {
-        let payload = r#"{"code":12002,"detail":"keyset is inactive"}"#;
-        assert!(is_definitive_keyset_rejection(payload));
-        assert!(is_definitive_keyset_rejection(&format!(
-            "{HTTP_CLIENT_ERROR_PREFIX}400 Bad Request - {payload}"
-        )));
-        assert!(!is_definitive_keyset_rejection(&format!(
-            "POST http://mint/v1/swap: 500 Internal Server Error - {payload}"
-        )));
-    }
-
-    #[test]
-    fn open_retry_gate_rejects_ambiguous_or_non_keyset_errors() {
-        let ambiguous = OpenChannelError {
-            stage: OpenChannelFailureStage::SwapSubmitted,
-            channel_id: Some("channel".to_string()),
-            input_may_be_spent: true,
-            message: r#"{"code":12001,"detail":"keyset is not known"}"#.to_string(),
-        };
-        assert!(!should_retry_open_after_keyset_rejection(&ambiguous, false));
-
-        let non_keyset = OpenChannelError {
-            stage: OpenChannelFailureStage::MintRejected,
-            channel_id: Some("channel".to_string()),
-            input_may_be_spent: false,
-            message: r#"{"code":11001,"detail":"proofs already spent"}"#.to_string(),
-        };
-        assert!(!should_retry_open_after_keyset_rejection(
-            &non_keyset,
-            false
-        ));
-
-        let unknown_keyset = OpenChannelError {
-            stage: OpenChannelFailureStage::MintRejected,
-            channel_id: Some("channel".to_string()),
-            input_may_be_spent: false,
-            message: r#"{"code":12001,"detail":"keyset is not known"}"#.to_string(),
-        };
-        assert!(!should_retry_open_after_keyset_rejection(
-            &unknown_keyset,
-            false
-        ));
+    fn string_only_errors_are_not_typed_rejection_evidence() {
+        for message in [
+            r#"{"code":12002}"#,
+            r#"MONAD_HTTP_CLIENT_ERROR 400 Bad Request - {"code":12002}"#,
+            "mint HTTP rejection (400, NUT-00 code Some(12002))",
+        ] {
+            let error = anyhow::Error::msg(message);
+            assert!(error.downcast_ref::<MintHttpRejection>().is_none());
+        }
     }
 
     #[test]
@@ -10378,7 +10434,7 @@ mod tests {
     }
 
     #[test]
-    fn nut09_restore_validation_distinguishes_absence_and_canonicalizes_pairs() {
+    fn nut09_restore_absence_requires_empty_paired_arrays() {
         let keyset_id =
             test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
         let output_a = cashu::nuts::BlindedMessage::new(
@@ -10407,37 +10463,26 @@ mod tests {
             c: output_b.blinded_secret,
             dleq: None,
         };
-        let request = serde_json::to_string(&RestoreRequest {
-            outputs: vec![output_a.clone(), output_b.clone()],
-        })
-        .unwrap();
         let empty = serde_json::to_string(&RestoreResponse {
             outputs: vec![],
             signatures: vec![],
         })
         .unwrap();
-        assert_eq!(
-            validate_and_canonicalize_restore_response(&request, &empty).unwrap(),
-            None
-        );
+        assert!(restore_response_is_absent(&empty).unwrap());
 
         let reversed = serde_json::to_string(&RestoreResponse {
             outputs: vec![output_b.clone(), output_a.clone()],
             signatures: vec![signature_b.clone(), signature_a.clone()],
         })
         .unwrap();
-        let canonical: RestoreResponse = serde_json::from_str(
-            &validate_and_canonicalize_restore_response(&request, &reversed)
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(canonical.outputs, vec![output_a, output_b]);
-        assert_eq!(canonical.signatures, vec![signature_a, signature_b]);
+        assert!(!restore_response_is_absent(&reversed).unwrap());
+        for invalid in ["not JSON", "{}", r#"{"outputs":[]}"#] {
+            assert!(restore_response_is_absent(invalid).is_err());
+        }
     }
 
     #[test]
-    fn nut09_restore_validation_rejects_partial_or_mismatched_pairs() {
+    fn nut09_mismatched_pairs_are_not_absence() {
         let keyset_id =
             test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
         let output = cashu::nuts::BlindedMessage::new(
@@ -10447,32 +10492,14 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        let request = serde_json::to_string(&RestoreRequest {
-            outputs: vec![output.clone()],
-        })
-        .unwrap();
         let missing_signature = serde_json::to_string(&RestoreResponse {
             outputs: vec![output.clone()],
             signatures: vec![],
         })
         .unwrap();
-        assert!(validate_and_canonicalize_restore_response(&request, &missing_signature).is_err());
-
-        let partial_request = serde_json::to_string(&RestoreRequest {
-            outputs: vec![
-                output.clone(),
-                cashu::nuts::BlindedMessage::new(
-                    cashu::Amount::from(2),
-                    keyset_id,
-                    "03b287e320b3e35e9c0190626d6f0ad375b5f1f34c0f7c8f0b6be9f14c53c9d9d9"
-                        .parse()
-                        .unwrap(),
-                ),
-            ],
-        })
-        .unwrap();
-        let partial = serde_json::to_string(&RestoreResponse {
-            outputs: vec![output.clone()],
+        assert!(restore_response_is_absent(&missing_signature).is_err());
+        let missing_output = serde_json::to_string(&RestoreResponse {
+            outputs: vec![],
             signatures: vec![cashu::nuts::BlindSignature {
                 amount: cashu::Amount::from(1),
                 keyset_id,
@@ -10481,6 +10508,6 @@ mod tests {
             }],
         })
         .unwrap();
-        assert!(validate_and_canonicalize_restore_response(&partial_request, &partial).is_err());
+        assert!(restore_response_is_absent(&missing_output).is_err());
     }
 }
