@@ -214,8 +214,9 @@ Existing MONAD or pinned-upstream tests cover:
 - input-fee target selection, metadata refresh, nonpositive-net filtering, and
   the 992-input limit
 - wallet ownership exclusion and process-death lock release
-- two real prepared openings exported as one token, decoded exact proof union,
-  combined totals, retained reservations, and deterministic re-export
+- two real prepared openings with different input keysets exported as one token,
+  decoded exact proof union, combined totals, retained reservations, canonical
+  keyset-group ordering, and deterministic re-export
 - export orchestration rollback when the second attempt update fails, with an
   independent mint group still exporting successfully
 - malformed direct responses followed by invalid restore evidence retaining exact
@@ -227,8 +228,16 @@ Existing MONAD or pinned-upstream tests cover:
   original request and post-restart recovery of exactly one channel without a successor
 - post-restart recovery making zero swap calls through its injected networking
   interface, with exact input spend and one-time change import
+- real external spending of exported inputs into fresh ordinary outputs, followed
+  by reopened-wallet recovery reporting `ExternallySpent`, exact original rows
+  marked spent with reservations cleared, no imported channel/change, and a second
+  restart with empty recovery/export even after the test mint has stopped
 - export human/JSON rendering and actual opening-maintenance CLI rejection under
   startup and steady-state runtime ownership, followed by success after lock release
+- actual configured runtime with a pending opening and gated startup restore:
+  maintenance subprocesses are rejected during startup and post-startup route
+  setup, with no additional mint requests or logical SQLite changes; after graceful
+  shutdown, recovery reports the unresolved attempt and export succeeds
 
 Remaining coverage limitations, not evidence that the underlying invariant is absent:
 
@@ -236,8 +245,11 @@ Remaining coverage limitations, not evidence that the underlying invariant is ab
   synchronized concurrent execution inside the mint
 - the zero-swap assertion observes the recovery networking interface, not all HTTP
   traffic independently at the mint
-- CLI ownership tests use absent/empty wallets and verify database preservation;
-  they do not directly count mint requests for a populated pending-opening wallet
+- the configured-runtime ownership test holds route establishment pending against
+  a controlled UDP endpoint; it tests the wallet manager's real steady-state
+  lifetime, not a connected/funded SOCKS route. The runtime runs through its public
+  configured entry point in the test process, while maintenance commands run as
+  separate CLI processes
 - the invalid direct-response test covers malformed JSON; the broader invalid
   funding/change matrix exercises restore orchestration rather than every direct
   response variant
