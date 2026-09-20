@@ -9974,6 +9974,15 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sqlite_client_recovery_falls_back_to_relay_close_restore() {
+    sqlite_client_recovery_relay_close(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sqlite_client_pending_refund_preserves_history_when_relay_close_wins() {
+    sqlite_client_recovery_relay_close(true).await;
+}
+
+async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
     let mint_helper = TestMintHelper::new().await.unwrap();
     let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mint_addr = mint_listener.local_addr().unwrap();
@@ -10072,6 +10081,38 @@ async fn test_sqlite_client_recovery_falls_back_to_relay_close_restore() {
     let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
     assert!(!funded_status.paused);
 
+    let pending_request = if pending_refund {
+        let funding = SqliteClientStorage::open(channel_db.to_str().unwrap())
+            .unwrap()
+            .get_funding(&channel_id)
+            .unwrap();
+        let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
+        // Model a durable execution with a rolled-forward local clock, followed
+        // by clock correction and a relay close winning the atomic funding spend.
+        let prepared = established
+            .prepare_sender_refund_after_expiry(
+                cashu::nuts::SecretKey::from_hex(&sender_secret).unwrap(),
+                established.params.expiry_timestamp + 1,
+                established.params.keyset_info.clone(),
+                [42; 32],
+            )
+            .unwrap();
+        let json = prepared.to_json().unwrap();
+        let db = rusqlite::Connection::open(&channel_db).unwrap();
+        db.execute("INSERT INTO monad_client_channel_recoveries(channel_id, kind, status, prepared_refund_json, created_at, updated_at, custody_db, custody_wallet, custody_sender) VALUES (?1, 'post_expiry_refund', 'submitting', ?2, 1, 1, ?3, 'alice', ?4)", rusqlite::params![channel_id, json, monad_common::wallet_lock::normalize_path(&loose_db).unwrap().to_str().unwrap(), cashu::nuts::SecretKey::from_hex(&sender_secret).unwrap().public_key().to_hex()]).unwrap();
+        db.execute("INSERT INTO monad_client_refund_executions(channel_id, prepared_json, outcome, created_at) VALUES (?1, ?2, 'uncertain', 1)", rusqlite::params![channel_id, json]).unwrap();
+        assert_eq!(
+            wallet.get_channel(&channel_id).unwrap().state,
+            WalletChannelState::Closing
+        );
+        assert!(wallet
+            .attach_channel_to_session(&channel_id, *conn.session_id())
+            .is_err());
+        Some(json)
+    } else {
+        None
+    };
+
     let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
     let close_success = payments
         .close_channel(&channel_id, &mint_networking, &mint_networking)
@@ -10097,8 +10138,18 @@ async fn test_sqlite_client_recovery_falls_back_to_relay_close_restore() {
         FundingSpendKind::RelayClose
     );
 
+    let maintenance = monad_client::wallet_lock::ClientWalletLocks::acquire(
+        &loose_db,
+        &channel_db,
+        monad_client::wallet_lock::WalletLockMode::Maintenance,
+    )
+    .unwrap();
     let recovered = wallet
-        .recover_channel_funds(&channel_id, &mint_connection)
+        .recover_channel_funds(
+            &maintenance.exclusive_access().unwrap(),
+            &channel_id,
+            &mint_connection,
+        )
         .await
         .expect("client wallet should recover relay-close sender outputs");
     let ChannelFundRecoveryResult::RelayCloseRecovered {
@@ -10111,6 +10162,13 @@ async fn test_sqlite_client_recovery_falls_back_to_relay_close_restore() {
     };
     assert_eq!(recovered_amount_raw, close_success.sender_sum);
     assert!(recovered_proof_count > 0);
+    if let Some(pending_request) = pending_request {
+        let db = rusqlite::Connection::open(&channel_db).unwrap();
+        let preserved: String = db.query_row("SELECT prepared_refund_json FROM monad_client_channel_recoveries WHERE channel_id = ?1", [&channel_id], |r| r.get(0)).unwrap();
+        assert_eq!(preserved, pending_request);
+        let executions: i64 = db.query_row("SELECT COUNT(*) FROM monad_client_refund_executions WHERE channel_id = ?1 AND outcome = 'uncertain'", [&channel_id], |r| r.get(0)).unwrap();
+        assert_eq!(executions, 1);
+    }
     assert_eq!(
         wallet.get_channel(&channel_id).unwrap().state,
         WalletChannelState::Closed

@@ -309,143 +309,123 @@ Important boundaries:
 
 ## Channel Fund Recovery
 
-`SqliteClientWallet::recover_channel_funds(channel_id, mint_connection)` is the
-single library entrypoint for getting the client's money back from a channel.
-It handles every relevant channel state:
+`SqliteClientWallet::recover_channel_funds(access, channel_id, mint_connection)`
+requires matching `ExclusiveWalletAccess` for the normalized loose/channel DB
+pair. The CLI obtains it for `wallet recover-channel`; a running client excludes
+maintenance. Per-channel in-process singleflight also excludes overlapping calls
+across wallet handles. This explicit operation is separate from startup and manual
+opening recovery, which never submit opening swaps.
 
-- already recovered
-- unexpired and unspent
-- expired and unspent
-- refund submit may have reached the mint but response was lost
-- spent by client refund
-- spent by relay close
-- pending funding token
-- unknown spent state
+### Durable State
 
-The recovery source of truth is the mint-observable funding-token state plus
-locally persisted channel funding data; relay-provided close-balance hints are
-intentionally not used here.
+The v2 `monad_client_channel_recoveries` journal binds each recovery to its
+normalized loose-proof DB path, `wallet_name`, and sender public key. The binding
+is checked before mint I/O, proof import, or even returning `AlreadyRecovered`.
+Upstream funding supplies the channel identity and original inputs; recovered
+bearer value belongs in `LooseProofWallet`, not just channel metadata.
 
-Persisted state involved in recovery:
+| Status | Meaning |
+| --- | --- |
+| `prepared` | Exact signed refund and output material persisted before submission. |
+| `submitting` | Execution recorded before I/O; acceptance may be uncertain. |
+| `finalizing` | Verified complete proof payload persisted for local completion. |
+| `completed` | Proof import and upstream/MONAD closure finished; totals recorded. |
 
-- upstream `ClientChannelFunding` in the Spilman client storage
-- MONAD channel metadata in `monad_client_channels`
-- MONAD recovery progress in `monad_client_channel_recoveries`
-- recovered spendable proofs in `LooseProofWallet`
+`monad_client_refund_executions` retains each exact request and its outcome;
+`monad_client_refund_predecessors` retains the rejected request if a successor is
+authorized. These records survive even when relay close wins. Any noncompleted
+recovery row exposes the channel as `Closing`, excluding selection and attachment.
 
-Recovered proofs must end up in `LooseProofWallet`. Channel and recovery metadata
-records provenance and completion state, but it is not long-term proof custody.
-For post-expiry refunds, the recovery row stores the full prepared refund attempt
-before the mint swap is submitted. Recovery must use that persisted prepared
-attempt first, so safety does not depend on refund outputs being regenerated the
-same way forever.
+### Preparation And Replay
 
-The recovery row status has three active values:
+Refund outputs use an active same-mint/unit keyset from the client cache, sorted
+by ID, with refresh when none is available. Relay advertisements and negotiated
+session keyset formats do not filter this loose-proof recovery. Output keys are
+independent of the historical funding keyset; funding input fees still determine
+the net refund value.
 
-- `prepared`: a post-expiry refund has been prepared but not yet submitted
-- `submitting`: the prepared refund is in the ambiguous submit window; the mint
-  may or may not have accepted it
-- `completed`: recovery finished and proofs are in `LooseProofWallet`
+The upstream `prepare_sender_refund_after_expiry(sender_secret, now,
+output_keyset, derivation_context)` API returns an immutable `PreparedSenderRefund`:
+mint/unit/channel identity, historical output keys, exact signed swap, expected
+value, secrets and blindings, and derivation version/context. Version 1 derivation
+includes sender-private material, not just the channel secret known to the relay.
+MONAD supplies a fresh random context for each new request. Unknown derivation
+versions are rejected. Protect journal/backups as bearer-value material; never log
+prepared records, output secrets, blindings, sender secrets, or derivation preimages.
 
-The algorithm is:
+Recovery follows these boundaries:
 
-1. If the recovery row is already `completed`, return `AlreadyRecovered` without
-   contacting the mint.
-2. Load the persisted upstream channel funding for the channel id and reconstruct
-   the upstream `EstablishedChannel`.
-3. Check the funding-token state at the mint using NUT-07.
-4. If the funding token is `Pending`, return `FundingPending` without changing
-   local state.
-5. If the funding token is `Unspent` and the channel has not expired, return
-   `NotExpiredOrSpentYet` without changing local state.
-6. If the channel is expired and the local row is `submitting`, first try
-   restoring the persisted prepared refund outputs. If restore succeeds, import
-   proofs and mark recovery completed.
-7. If the funding token is `Unspent` and the channel has expired:
-   - if no prepared refund exists, prepare a full post-expiry sender refund and
-     persist it with status `prepared`
-   - mark the recovery row as `submitting` before making the network call
-   - submit the persisted prepared refund swap
-   - if submit succeeds, import the returned proofs and mark recovery completed
-   - if submit fails, try restoring the prepared refund outputs once
-   - if restore still fails, return `RecoveryRetryLater`
-8. If the funding token is `Spent`, classify the NUT-07 witness signature shape:
-   - two P2PK signatures means relay close; restore the sender's deterministic
-     close outputs
-   - one P2PK signature means post-expiry refund; if local restore did not
-     already complete it, return `UnknownSpent`
-   - unknown witness shape returns `UnknownSpent`
-9. Relay-close recovery is attempted only after the witness classifies the spend
-   as `RelayClose`.
-10. If relay-close sender-output restore succeeds, import those proofs into
-     `LooseProofWallet`, then close local channel state and mark the recovery row
-     completed with kind `relay_close`.
-11. If no recovery path can identify spendable outputs, return `UnknownSpent` and
-    leave the channel recoverable for a future attempt.
+1. A completed row returns locally. A `finalizing` row resumes proof import and
+   closure from its persisted verified payload without mint I/O.
+2. A `submitting` row verifies and restores the exact persisted outputs before
+   clock or funding-state checks. Invalid, partial, or unavailable restore evidence
+   is not absence and blocks replay. A valid complete restore finalizes.
+3. After valid absence, check funding state. `Pending` returns `FundingPending`;
+   unspent funding at or before expiry returns `NotExpiredOrSpentYet`. Expired,
+   unspent funding permits submission of the persisted request, preparing it first
+   if needed. Each execution atomically records `submitting` and an `uncertain`
+   execution before the network call.
+4. Each invocation allows at most two submissions per immutable request (one
+   submission plus one exact replay), with restore/state checks between them.
+   Later invocations may retry that same request; this is not a lifetime replay
+   limit and not the opening journal's wall-clock replay rule.
+5. Only a direct initial typed HTTP 4xx rejection with numeric JSON `code: 12002`,
+   no prior execution uncertainty, and no predecessor can authorize one durable
+   successor. Refresh must select a different active output keyset. Persist the
+   rejected predecessor and replacement atomically; the successor gets its own
+   per-invocation replay allowance but cannot create another successor. A timeout,
+   cancellation, lost response, or rejection after ambiguous execution never
+   authorizes new outputs. A durably recorded initial rejection can resume after
+   restart; failure to record it conservatively retains uncertainty.
 
-The NUT-07 witness classifier uses signature count to distinguish refund from
-relay close:
+The CLI mint adapter bounds each swap/restore/checkstate request to 15 seconds.
+It retains structured rejection bodies for classification but redacts them from
+error `Display`/`Debug`; arbitrary error text is not successor authority.
 
-- one P2PK signature on the spent funding proof -> post-expiry refund
-- two P2PK signatures on the spent funding proof -> relay close
+### Spent Funding And Finalization
 
-This is reliable because only the client can initiate the refund, and the refund
-path signs with the sender refund key only; the relay-close path carries both
-sender and receiver stage-1 signatures.
+NUT-07 checks exactly the first funding proof's Y and validates response count and
+identity. This representative check assumes supported generated close/refund
+transactions spend all funding proofs atomically; it is not a guarantee for
+arbitrary transactions. The first input carries the generated SIG_ALL witness.
+Signature count is advisory, not cryptographic settlement evidence: one normally
+indicates refund, two close, and extra/missing signatures can yield `Unknown`.
 
-The important durability ordering is:
+If funding becomes spent after an empty submitted-refund restore, recovery makes
+one final exact restore before discovery, covering completion between observations.
+Both `RelayClose` and `Unknown` permit checked deterministic sender-close discovery;
+a refund-shaped witness alone does not. Only verified nonempty discovered proofs
+complete relay-close recovery. An empty scan is `UnknownSpent`, not successful
+zero-value recovery. With an unresolved submitted refund, that unknown result
+becomes `RecoveryRetryLater` and retains the request; invalid or unavailable
+discovery also returns retry-later. Relay close-balance hints are not authority.
 
-1. persist the exact prepared refund attempt for an ambiguous local refund submit
-2. mark the attempt `submitting` before the network call
-3. perform the mint operation
-4. import recovered proofs into `LooseProofWallet`
-5. only after proof import succeeds, mark channel metadata closed and recovery
-   completed
+Verified proofs are persisted as `finalizing` before import. Import checks immutable
+proof data and is idempotent without resurrecting reserved or spent proofs. Only
+then are upstream state and MONAD metadata closed and recovery marked `completed`.
+These are separate database steps, not one cross-database transaction: failures
+resume from the persisted payload offline, including after import but before
+closure/completion.
 
-That ordering is required so a restart can safely retry. A channel must not be
-marked `Closed`, and a recovery row must not be marked `completed`, if recovered
-proof import fails.
+### Compatibility And Coverage
 
-Expected restart behavior:
+This is a testnet-breaking refund schema/API change, not a migration. A nonempty
+legacy refund journal or incompatible journal version is rejected; only an empty
+legacy recovery table is replaced automatically. Preserve funded databases and
+recovery records. Resetting disposable, operator-owned test databases is an
+explicit operator decision, never automatic deletion of incompatible wallet data.
 
-- restart before the refund marker exists: check funding state again and choose the
-  correct branch
-- restart after the prepared refund is persisted but before submit: the attempt is
-   still `prepared`, so the funding state branch will submit it
-- restart after `submitting` but before importing returned proofs: the marker
-  causes exact persisted refund-output restore to run before any other branch; if
-  the funding token remains `Unspent`, the same persisted refund is submitted
-  again
-- restart after importing proofs but before metadata completion: proof import is
-  idempotent, so rerunning recovery can import/observe the same proofs and finish
-  metadata updates
-- restart after completed metadata: the recovered value is already in
-  `LooseProofWallet`; future UX can treat the channel as closed
-
-Current direct MONAD tests cover:
-
-- `AlreadyRecovered` on rerun after success
-- unexpired unspent funding token returns `NotExpiredOrSpentYet`
-- expired unspent funding token recovers by post-expiry refund into
-  `LooseProofWallet`
-- the prepared refund attempt is persisted in the recovery row
-- existing persisted refund restores outputs after a simulated crash-after-submit
-  and wallet reopen
-- `submitting` plus `Unspent` retries the same persisted refund attempt
-- invalid recovery statuses and corrupted `submitting` rows are rejected
-- spent-by-refund without a local prepared attempt returns `UnknownSpent`
-- refund submit/restore failure returns `RecoveryRetryLater`
-- completed recovery records `post_expiry_refund`
-- recovered channels are marked `Closed` only on the successful path
-- proof-import failure leaves recovery incomplete and retryable
-- relay-side close followed by explicit client recovery returns `relay_close`
-  recovery and imports the sender-side proofs
-- NUT-07 witness classifier matches post-expiry refund and relay-close spends
-
-Additional tests should cover:
-
-- `FundingPending` returns without metadata changes, if a stable pending-state
-  fixture is available
+Current MONAD test cases exercise keyset rotation before/after preparation,
+successor exact replay, lost-response restore, ambiguous-replay rejection without
+successor, invalid restore blocking replay, authority/singleflight and cancellation,
+custody mismatch and path aliases, journal-write failures, offline finalization at
+metadata/completion boundaries, proof-import conflict and spent-proof preservation,
+the final-restore spent race, and checked close discovery with extra signatures,
+empty/invalid/network results, and close winning submission. The relay integration
+fixture also seeds a pending refund and verifies its history survives real relay
+close recovery; it is not a process-crash test. CLI tests check structured rejection
+retention/redaction, not a live HTTP timeout. These assertions do not establish
+exhaustive crash coverage or a dedicated `FundingPending` fixture.
 
 ## Current Runtime State
 
@@ -481,6 +461,11 @@ The current client admin/funding/recovery commands are:
 - `monad-client wallet --loose-db <path> --channel-db <path> --sender-secret-hex <hex> [--wallet-name default] import-token --token-file <path>`
 - `monad-client wallet --loose-db <path> --channel-db <path> --sender-secret-hex <hex> [--wallet-name default] recover-channel --channel-id <id>`
 - `monad-client wallet --loose-db <path> --channel-db <path> --sender-secret-hex <hex> [--wallet-name default] recover-openings`
+
+`import-token` is a trusted-custody operation: it stores the existing bearer proofs
+without swapping them into fresh wallet-only proofs. Import does not invalidate
+other copies of the token or prove exclusive ownership. Operators should import
+only tokens they control and stop using any other copies in another wallet.
 
 Use `--json` for machine-readable output.
 

@@ -22,9 +22,9 @@ rusqlite = "0.31"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
 cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cashu", default-features = false }
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "82533cc25f3588032b5f50aa57c310cd27576ed6", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "dd0eb5aeb94fe78e2a9c9294acd1fa6a5dfcb5ea", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
 
 [dev-dependencies]
 axum = "0.8.9"
 tempfile = "3"
-cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "82533cc25f3588032b5f50aa57c310cd27576ed6", package = "cdk-spilman-test-mint", default-features = false, features = ["http"] }
+cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "dd0eb5aeb94fe78e2a9c9294acd1fa6a5dfcb5ea", package = "cdk-spilman-test-mint", default-features = false, features = ["http"] }

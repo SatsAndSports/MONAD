@@ -93,6 +93,16 @@ cargo run -p monad-quic -- ...
 - configured-client route failures are handled at hop granularity: first-hop failure does a full reconnect, later-hop failure tries a suffix rebuild that preserves prefix sessions/channels, and suffix rebuild failure falls back to a full reconnect. Rebuilds are serialized; stale failures from the old route during an in-flight rebuild are ignored. Setup owns each H2/payment task until a successful handoff is synchronously acknowledged; cancellation or deadline cleanup aborts and awaits those tasks before channel detachment or retry. Active SOCKS/TCP streams are not migrated across rebuilds; they fail if their original route breaks, and new streams use the next published route. Route connects fail fast with bounded attempts before the first successful connect (loud startup misconfiguration), then retry indefinitely with capped backoff once a route has connected (transient failures, including wallet funding exhaustion, must not permanently kill the SOCKS listener).
 - relay-side byte accounting remains on the fast path under the per-session mutex rather than flowing through the control-session reducer.
 
+### Established-Channel Recovery
+
+- `SqliteClientWallet::recover_channel_funds(access, channel_id, mint_connection)` requires matching exclusive maintenance authority and per-channel singleflight; it is separate from startup/manual opening recovery.
+- Refund journal v2 binds normalized loose DB, `wallet_name`, and sender. It retains immutable preparation, execution history and any rejected predecessor through `prepared`, `submitting`, `finalizing`, and `completed`. Pending recovery exposes `Closing` and excludes reuse.
+- Restore submitted outputs before clock/state checks. Each invocation permits at most two submissions per immutable request, with restore/state gates. Only an initial structured HTTP 4xx `12002` without earlier uncertainty permits one durable changed-output-keyset successor; cancellation or ambiguous replay rejection cannot authorize one.
+- Refund output keys are independent of funding keys, selected cache-first for active same-mint/unit keys without relay/session filters. Upstream derivation version 1 includes sender-private material; prepared records and finalization payloads contain secrets. Never log them or derivation preimages. CLI mint requests use a 15-second timeout and body-redacted typed rejections.
+- First-proof NUT-07 assumes supported generated transactions atomically spend all funding inputs. Witness shape is advisory; `Unknown` permits checked sender-close discovery. A spent observation after empty submitted-refund restore gets a final exact restore. Empty close discovery is not success.
+- Persist verified proofs before import, then close upstream/MONAD state before completion. `finalizing` resumes offline; idempotent imports must reject immutable conflicts and never resurrect reserved/spent proofs.
+- This is a testnet-breaking schema/API change without migration: reject incompatible nonempty journals, never automatically delete wallet data. Resetting owned disposable test DBs requires an explicit operator decision. Detailed behavior and test scope live in `WALLET.md#channel-fund-recovery`.
+
 ### QUIC Transport
 
 - Relay-to-relay transport: QUIC (replaces TCP between hops, does not replace Noise)

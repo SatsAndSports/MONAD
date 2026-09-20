@@ -119,6 +119,7 @@ Their durable recovery models are intentionally different:
 | Operation | Durable boundary and recovery |
 | --- | --- |
 | Client opening | Exact immutable attempt plus execution authority; bounded identical live replay; one direct-rejection-only successor; exclusive stale-input bearer-token export. |
+| Client post-expiry refund | Custody-bound v2 journal and execution history; exact restore before bounded per-invocation replay; one initial structured `12002` successor without prior uncertainty; verified proofs persisted for offline finalization. |
 | Relay drain | Exact swap/restore requests, output secrets, keyset metadata, and source-channel reservations are persisted. Ambiguous submission remains `Submitted`; `recover-drain` restores the persisted outputs and does not replay the swap. |
 | Relay close | The channel enters durable `Closing` before mint I/O. Resumption reconstructs close execution from stored closing authorization; it is not drain-style restoration of a journaled exact swap request. |
 
@@ -219,6 +220,27 @@ persistence, and ambiguous submission failures stop the
 pass because the selected inputs may require recovery. If every offer is safely
 unavailable before initial session readiness, funding remains blocked; after
 readiness, the driver retries using its normal funding backoff.
+
+## Established-Channel Recovery
+
+The implementation is `SqliteClientWallet::recover_channel_funds(access,
+channel_id, mint_connection)`, not opening recovery or the session payment loop.
+`main.rs` supplies exclusive maintenance access and a 15-second-per-request HTTP
+adapter with typed, body-redacted mint rejections. Upstream `EstablishedChannel`
+and `PreparedSenderRefund` own preparation, sender-private versioned derivation,
+immutable-artifact verification, and checked swap/restore completion. MONAD owns
+the custody binding, execution/successor journal, cache selection, replay limits,
+and proof-first local finalization.
+
+Refund output selection uses active same-mint/unit cached keys, refreshing when
+none are available or after an authorized initial rejection; relay preferences
+and negotiated versions do not apply. It is independent of funding-key metadata.
+Pending journal rows exclude reuse as `Closing`. Funding witness shape is advisory;
+checked close discovery can recover an `Unknown` witness, while empty discovery
+cannot establish successful recovery. See
+[WALLET](../WALLET.md#channel-fund-recovery) for the state transitions, test scope,
+record secrecy, and testnet-breaking schema policy. Do not apply opening replay or
+export rules to refunds, or refund replay rules to relay close/drain.
 
 ## Funding Lifecycle
 

@@ -164,13 +164,19 @@ monad-client wallet --config monad.yaml recover-openings
 monad-client wallet --config monad.yaml export-stale-opening-inputs
 ```
 
+`import-token` stores the token's existing bearer proofs without swapping them
+into fresh proofs. It does not invalidate other copies or establish exclusive
+ownership. Import only tokens you control, and do not continue using another copy
+from another wallet.
+
 Exports group inputs by mint/unit. Unchanged eligible proofs produce the same
 token encoding even when they span multiple input keysets; repeated output is not
 additional value and may contain proofs already present in an earlier export.
 
 One in-process `ClientWalletManager` owns the configured loose-proof and channel
-databases. Startup opens/migrates and performs recovery exactly once before any
-client starts, then all client leaves share that wallet. A second runtime using
+databases. Startup opens/initializes supported schemas and performs opening
+recovery once before any client starts, then all client leaves share that wallet.
+A second runtime using
 either database fails immediately. `channels` and `proofs` use read-only SQLite
 access, require no sender secret in explicit-path mode, and may run while
 the runtime is active. Import and recovery commands require exclusive maintenance
@@ -179,7 +185,25 @@ created next to each normalized, deduplicated database path, including for
 inspection when absent; the containing directories must allow sidecar access.
 Existing database files with multiple hard links are rejected.
 
-They can also use explicit DB paths and sender key material for manual or emergency access:
+`recover-channel` explicitly recovers an established channel, unlike the startup
+opening-recovery pass. Stop the client runtime first and keep the same loose DB,
+`wallet_name`, channel DB, and sender key. Pending refunds remain `Closing` and
+cannot be reused. Rerun the command after a retry-later outcome: it restores the
+persisted request before bounded exact replay, rather than choosing fresh outputs
+after uncertainty. Verified proofs awaiting local import/closure can finish
+offline; completed recovery returns locally. Each CLI mint request has a 15-second
+timeout. An empty sender-close scan is not reported as successful recovery.
+
+Refund journal v2 is a **testnet-breaking change with no data migration**.
+Nonempty incompatible journals are rejected, not deleted; an empty legacy table
+can be replaced. Preserve funded databases and backups. Only explicitly reset
+disposable test databases you own, accepting loss of their local state; MONAD does
+not automatically reset wallets. Refund records contain secret output material,
+so do not publish database dumps or prepared requests. See
+[Channel Fund Recovery](WALLET.md#channel-fund-recovery) for recovery boundaries.
+
+Wallet commands can also use explicit DB paths and sender key material for manual
+or emergency access:
 
 ```bash
 monad-client wallet \
