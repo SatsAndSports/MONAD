@@ -10289,8 +10289,9 @@ async fn test_wallet_manager_close_channel_by_id() {
     let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
     assert!(!funded_status.paused);
 
-    // Close the channel through the wallet manager by channel id using the
-    // same reqwest-based networking path as the CLI.
+    // A fresh CLI manager has persisted channel state but no in-memory keys.
+    let wallet_manager = RelayWalletManager::open(&storage_path).unwrap();
+    assert!(wallet_manager.keyset_cache_snapshot().keysets.is_empty());
     let net = wallet_manager
         .mint_client_for_channel(&channel_id)
         .expect("wallet manager should build reqwest networking for channel");
