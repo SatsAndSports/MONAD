@@ -734,6 +734,37 @@ mutating commands require exclusive wallet maintenance access. Remaining wallet
 UX work is mostly mint quote/mint commands, richer balance inspection, and
 close/sweep flows.
 
+### Established-Channel Recovery
+
+`recover_channel_funds(access, channel_id, mint_connection)` requires matching
+exclusive maintenance authority plus per-channel singleflight. It is not the
+startup opening-recovery pass. Refund journal v2 binds the normalized loose DB,
+wallet name, and sender; noncompleted recoveries expose `Closing` and exclude
+channel reuse. Its `prepared` / `submitting` / `finalizing` / `completed` phases
+retain immutable requests, execution outcomes, a rejected predecessor if present,
+and verified finalization proofs.
+
+Refund output selection is cache-first for active same-mint/unit keys, independent
+of historical funding keys and without relay/session keyset filters. Upstream
+prepared-refund validation and checked response completion use persisted output
+keys. Versioned output derivation includes sender-private material; serialized
+records contain secrets and blindings and must not be logged.
+
+Submitted refunds restore before clock/state checks. Valid absence and expired,
+unspent funding permit at most one submission plus one exact replay per request
+per invocation. Only an initial structured `12002` rejection without earlier
+uncertainty permits one durable changed-keyset successor. A final exact restore
+after observing spent funding covers the restore/checkstate race. The first-proof
+state check assumes generated transactions atomically spend all funding inputs;
+witness cardinality is advisory. Checked sender-close discovery also accepts an
+`Unknown` witness, but an empty scan never completes recovery.
+
+Verified proofs persist before import, then upstream and MONAD closure precede
+completion. These separate local writes resume offline from `finalizing`; imports
+preserve reserved/spent custody. The v2 journal is testnet-breaking: incompatible
+nonempty journals are rejected with no migration or automatic wallet reset.
+See [WALLET](WALLET.md#channel-fund-recovery) for exact recovery and custody rules.
+
 ### Relay Wallet Layer
 
 Relay-side Spilman validation and durable channel state are now mediated by an

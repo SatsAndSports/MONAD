@@ -205,18 +205,24 @@ A delayed completion still wins. An exported attempt is marked `ExternallySpent`
 only after all inputs are `SPENT` and a final empty restore.
 Ambiguous, partial, pending, invalid, or unavailable evidence remains unresolved
 and retains the reservation. A narrowly recognized inactive-output-keyset rejection can
-produce one immutable successor attempt during live opening. For expired-channel
-refunds, it saves
-the exact prepared refund, marks it `submitting` before contacting the mint, and
-imports recovered proofs into the loose-proof wallet before marking the channel
-closed. Those imports are idempotent, so a restart at any point can repeat the
-safe recovery path. NUT-07 state checks and the funding proof's witness shape
-distinguish an expiry refund from a relay-initiated close. Client proof
-reservations also use `IMMEDIATE` SQLite transactions, preventing concurrent
-session drivers from selecting the same proofs.
+produce one immutable successor attempt during live opening. Client proof
+reservations use `IMMEDIATE` SQLite transactions, preventing concurrent session
+drivers from selecting the same proofs.
 
-See [Payments and Funding](docs/payments.md) for the complete state machines,
-recovery orderings, and wallet responsibilities.
+Established-channel recovery is separate, explicit maintenance. Refund journal
+v2 binds custody to the loose DB, wallet name, and sender, and preserves exact
+requests and execution history. Output keys can outlive mint rotation independently
+of funding keys; loose output derivation includes sender-private material because
+the relay also knows the channel secret. Ambiguity permits only bounded identical
+replay, never new outputs. One initial structured inactive-keyset rejection can
+authorize one durable successor. Verified proofs are journaled before import so
+local finalization can resume offline; pending recovery excludes channel reuse.
+Funding witness shape is only a hint: checked output restoration, including close
+discovery for an unknown witness, establishes recoverable value. An empty close
+scan is not proof of successful settlement.
+
+See [Payments and Funding](docs/payments.md) for the implementation map and
+[WALLET](WALLET.md#channel-fund-recovery) for established-channel recovery.
 
 ## Blinded Routes
 
