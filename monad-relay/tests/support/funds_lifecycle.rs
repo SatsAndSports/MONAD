@@ -29,15 +29,27 @@ const INITIAL: u64 = 16_384;
 struct Ledger {
     swaps: BTreeMap<Vec<String>, (SwapRequest, SwapResponse)>,
     requests: usize,
+    attempts: Vec<SwapRequest>,
     hold_success: bool,
     hold_request: bool,
+    discard_request: bool,
     offline: bool,
     http_requests: usize,
     rejections: usize,
     inactive_rejections: usize,
+    race_barrier: Option<Arc<tokio::sync::Barrier>>,
+    raced_requests: usize,
 }
 
 struct Process(Child);
+
+struct GateFinished(Arc<Notify>);
+
+impl Drop for GateFinished {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
 
 impl Process {
     fn spawn(binary: &Path, args: &[&str], config: &Path) -> Self {
@@ -73,8 +85,8 @@ impl Process {
         )
     }
 
-    async fn success(mut self) {
-        let status = tokio::time::timeout(DEADLINE, async {
+    async fn status(mut self) -> std::process::ExitStatus {
+        tokio::time::timeout(DEADLINE, async {
             loop {
                 if let Some(status) = self.0.try_wait().unwrap() {
                     break status;
@@ -83,7 +95,11 @@ impl Process {
             }
         })
         .await
-        .expect("maintenance CLI deadline");
+        .expect("maintenance CLI deadline")
+    }
+
+    async fn success(self) {
+        let status = self.status().await;
         assert!(
             status.success(),
             "maintenance CLI failed: {status}; output suppressed to protect secrets"
@@ -112,6 +128,7 @@ pub struct Fixture {
     target: std::net::SocketAddr,
     ledger: Arc<Mutex<Ledger>>,
     committed: Arc<Notify>,
+    gate_finished: Arc<Notify>,
     release: Arc<Semaphore>,
     tasks: JoinSet<()>,
     cycle: usize,
@@ -139,6 +156,7 @@ impl Fixture {
         let mint_url = format!("http://{}", listener.local_addr().unwrap());
         let ledger = Arc::new(Mutex::new(Ledger::default()));
         let committed = Arc::new(Notify::new());
+        let gate_finished = Arc::new(Notify::new());
         let release = Arc::new(Semaphore::new(0));
         let router = build_router(mint.mint())
             .await
@@ -146,10 +164,12 @@ impl Fixture {
             .layer(axum::middleware::from_fn({
                 let ledger = ledger.clone();
                 let committed = committed.clone();
+                let gate_finished = gate_finished.clone();
                 let release = release.clone();
                 move |request: Request, next: Next| {
                     let ledger = ledger.clone();
                     let committed = committed.clone();
+                    let gate_finished = gate_finished.clone();
                     let release = release.clone();
                     async move {
                         let offline = {
@@ -170,15 +190,39 @@ impl Fixture {
                         let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
                         let swap: SwapRequest = serde_json::from_slice(&bytes)
                             .expect("decode swap request (body redacted)");
-                        ledger.lock().unwrap().requests += 1;
+                        {
+                            let mut ledger = ledger.lock().unwrap();
+                            ledger.requests += 1;
+                            ledger.attempts.push(swap.clone());
+                        }
                         let hold = std::mem::take(&mut ledger.lock().unwrap().hold_request);
                         if hold {
+                            let _finished = GateFinished(gate_finished.clone());
                             committed.notify_one();
                             let permit = tokio::time::timeout(DEADLINE, release.acquire())
                                 .await
                                 .expect("request gate deadline")
                                 .unwrap();
                             permit.forget();
+                            if std::mem::take(&mut ledger.lock().unwrap().discard_request) {
+                                return axum::response::Response::builder()
+                                    .status(503)
+                                    .body(Body::empty())
+                                    .unwrap();
+                            }
+                        }
+                        let barrier = {
+                            let mut ledger = ledger.lock().unwrap();
+                            let barrier = ledger.race_barrier.clone();
+                            if barrier.is_some() {
+                                ledger.raced_requests += 1;
+                            }
+                            barrier
+                        };
+                        if let Some(barrier) = barrier {
+                            tokio::time::timeout(DEADLINE, barrier.wait())
+                                .await
+                                .expect("both race swaps must reach mint");
                         }
                         let response = next
                             .run(Request::from_parts(parts, Body::from(bytes)))
@@ -210,6 +254,7 @@ impl Fixture {
                             std::mem::take(&mut ledger.hold_success)
                         };
                         if hold {
+                            let _finished = GateFinished(gate_finished.clone());
                             committed.notify_one();
                             let permit = tokio::time::timeout(DEADLINE, release.acquire())
                                 .await
@@ -328,6 +373,7 @@ clients:
             target,
             ledger,
             committed,
+            gate_finished,
             release,
             tasks,
             cycle: 0,
@@ -336,6 +382,16 @@ clients:
 
     fn client(&self, args: &[&str]) -> Process {
         Process::spawn(&self.client_bin, args, &self.config)
+    }
+
+    async fn release_gate(&self) {
+        self.release.add_permits(1);
+        tokio::time::timeout(DEADLINE, self.gate_finished.notified())
+            .await
+            .expect("HTTP gate did not finish or cancel");
+        // Cancellation may precede permit consumption. Never leak that permit
+        // into the next crash boundary, which must block independently.
+        self.release.forget_permits(usize::MAX);
     }
     fn relay(&self, args: &[&str]) -> Process {
         let mut selected = vec![args[0], "--relay", "funds"];
@@ -406,7 +462,7 @@ clients:
                 .await
                 .expect("opening commit gate not reached");
             drop(client); // SIGKILL and wait, before any recovery opens the same files.
-            self.release.add_permits(1);
+            self.release_gate().await;
             let submitted = self.ledger.lock().unwrap().requests;
             self.client(&["wallet", "recover-openings"]).success().await;
             self.client(&["wallet", "recover-openings"]).success().await;
@@ -568,6 +624,58 @@ clients:
         eprintln!(
             "funds refund boundary={boundary:?} rotate={rotate} lost_response={lost_response}"
         );
+        let channel = self.open_expired().await;
+        let args = ["wallet", "recover-channel", "--channel-id", &channel];
+        if let Some(boundary) = boundary {
+            self.boundary_kill(&args, boundary).await;
+            self.offline_recover(&args).await;
+        } else {
+            let before = self.ledger.lock().unwrap().requests;
+            let rejections = self.ledger.lock().unwrap().inactive_rejections;
+            self.ledger.lock().unwrap().hold_request = rotate;
+            self.ledger.lock().unwrap().hold_success = lost_response;
+            let child = self.client(&args);
+            if rotate {
+                tokio::time::timeout(DEADLINE, self.committed.notified())
+                    .await
+                    .expect("refund request gate");
+                rotate_sat_keyset(&self.mint.mint(), 250).await.unwrap();
+                self.release_gate().await;
+            }
+            if lost_response {
+                tokio::time::timeout(DEADLINE, self.committed.notified())
+                    .await
+                    .expect("refund commit gate");
+                drop(child);
+                self.release_gate().await;
+                let submitted = self.ledger.lock().unwrap().requests;
+                self.client(&args).success().await;
+                assert_eq!(
+                    submitted,
+                    self.ledger.lock().unwrap().requests,
+                    "restore recovery resubmitted refund"
+                );
+            } else {
+                child.success().await;
+            }
+            if rotate {
+                let ledger = self.ledger.lock().unwrap();
+                assert_eq!(
+                    ledger.inactive_rejections,
+                    rejections + 1,
+                    "expected one direct 12002"
+                );
+                assert_eq!(
+                    ledger.requests,
+                    before + 2,
+                    "expected exactly one successor"
+                );
+            }
+        }
+        self.settle(&channel, true).await;
+    }
+
+    async fn open_expired(&self) -> String {
         let relay = self.relay(&["run"]);
         let client = Process::spawn_with_env(
             &self.client_bin,
@@ -599,57 +707,226 @@ clients:
         })
         .await
         .expect("signed channel did not expire on wall clock");
-        let args = ["wallet", "recover-channel", "--channel-id", &channel];
-        if let Some(boundary) = boundary {
-            self.boundary_kill(&args, boundary).await;
-            self.offline_recover(&args).await;
-        } else {
-            let before = self.ledger.lock().unwrap().requests;
-            let rejections = self.ledger.lock().unwrap().inactive_rejections;
-            self.ledger.lock().unwrap().hold_request = rotate;
-            self.ledger.lock().unwrap().hold_success = lost_response;
-            let child = self.client(&args);
-            if rotate {
-                tokio::time::timeout(DEADLINE, self.committed.notified())
-                    .await
-                    .expect("refund request gate");
-                rotate_sat_keyset(&self.mint.mint(), 250).await.unwrap();
-                self.release.add_permits(1);
-            }
-            if lost_response {
-                tokio::time::timeout(DEADLINE, self.committed.notified())
-                    .await
-                    .expect("refund commit gate");
-                drop(child);
-                self.release.add_permits(1);
-                let submitted = self.ledger.lock().unwrap().requests;
-                self.client(&args).success().await;
-                assert_eq!(
-                    submitted,
-                    self.ledger.lock().unwrap().requests,
-                    "restore recovery resubmitted refund"
-                );
+        channel
+    }
+
+    pub async fn opening_request(&mut self, rotate: bool, kill_before: bool) {
+        self.cycle += 1;
+        let relay = self.relay(&["run"]);
+        let before = self.ledger.lock().unwrap().requests;
+        let rejected = self.ledger.lock().unwrap().inactive_rejections;
+        self.ledger.lock().unwrap().hold_request = true;
+        self.ledger.lock().unwrap().hold_success = true;
+        let mut client = Some(self.client(&["run"]));
+        tokio::time::timeout(DEADLINE, self.committed.notified())
+            .await
+            .expect("opening request gate");
+        if kill_before {
+            drop(client.take());
+            self.ledger.lock().unwrap().discard_request = true;
+            self.release_gate().await;
+            self.client(&["wallet", "recover-openings"]).success().await;
+            self.client(&["wallet", "recover-openings"]).success().await;
+            assert_eq!(
+                self.ledger.lock().unwrap().requests,
+                before + 1,
+                "pending recovery submitted"
+            );
+            assert!(
+                self.ledger.lock().unwrap().swaps.is_empty(),
+                "discarded opening executed"
+            );
+            let reserved: u64 = self
+                .db("loose.db")
+                .query_row(
+                    "SELECT COUNT(*) FROM monad_client_loose_proofs WHERE state = 'reserved'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(reserved > 0, "ambiguous input reservation released");
+            drop(relay);
+            self.audit_custody(true).await;
+            return;
+        }
+        if rotate {
+            assert!(!kill_before, "direct rejection must reach live client");
+            rotate_sat_keyset(&self.mint.mint(), 350).await.unwrap();
+        }
+        self.release_gate().await;
+        tokio::time::timeout(DEADLINE, self.committed.notified())
+            .await
+            .expect("opening commit gate");
+        drop(client);
+        self.release_gate().await;
+        let submitted = self.ledger.lock().unwrap().requests;
+        self.client(&["wallet", "recover-openings"]).success().await;
+        self.client(&["wallet", "recover-openings"]).success().await;
+        assert_eq!(submitted, self.ledger.lock().unwrap().requests);
+        if rotate {
+            assert_eq!(submitted, before + 2);
+            assert_eq!(
+                self.ledger.lock().unwrap().inactive_rejections,
+                rejected + 1
+            );
+        }
+        let client = self.client(&["run"]);
+        self.roundtrip().await;
+        drop(client);
+        drop(relay);
+        self.settle(&self.active_channel(), false).await;
+    }
+
+    pub async fn race(&mut self, refund_wins: Option<bool>) {
+        self.cycle += 1;
+        eprintln!("funds race controlled_refund_winner={refund_wins:?}");
+        let channel = self.open_expired().await;
+        let before = self.ledger.lock().unwrap().swaps.len();
+        let refund_args = ["wallet", "recover-channel", "--channel-id", &channel];
+        let close_args = ["wallet", "close", "--channel-id", &channel];
+        let (close, refund) = if let Some(refund_first) = refund_wins {
+            self.ledger.lock().unwrap().hold_success = true;
+            let first = if refund_first {
+                self.client(&refund_args)
             } else {
-                child.success().await;
+                self.relay(&close_args)
+            };
+            tokio::time::timeout(DEADLINE, self.committed.notified())
+                .await
+                .expect("winner commit gate");
+            let second = if refund_first {
+                self.relay(&close_args)
+            } else {
+                self.client(&refund_args)
+            };
+            self.release_gate().await;
+            if refund_first {
+                (second, first)
+            } else {
+                (first, second)
             }
-            if rotate {
-                let ledger = self.ledger.lock().unwrap();
-                assert_eq!(
-                    ledger.inactive_rejections,
-                    rejections + 1,
-                    "expected one direct 12002"
-                );
-                assert_eq!(
-                    ledger.requests,
-                    before + 2,
-                    "expected exactly one successor"
-                );
-            }
+        } else {
+            self.ledger.lock().unwrap().race_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
+            (self.relay(&close_args), self.client(&refund_args))
+        };
+        let close_status = close.status().await;
+        refund.success().await;
+        if refund_wins.is_none() {
+            let mut ledger = self.ledger.lock().unwrap();
+            ledger.race_barrier = None;
+            assert_eq!(
+                ledger.raced_requests, 2,
+                "race did not overlap at mint execution"
+            );
+        }
+        assert_eq!(
+            self.ledger.lock().unwrap().swaps.len(),
+            before + 1,
+            "race must commit one spend"
+        );
+        if let Some(refund_first) = refund_wins {
+            assert_eq!(
+                close_status.success(),
+                !refund_first,
+                "wrong controlled winner"
+            );
+        }
+        self.settle(&channel, !close_status.success()).await;
+    }
+
+    pub async fn rotate(&self, ppk: u64) {
+        rotate_sat_keyset(&self.mint.mint(), ppk).await.unwrap();
+    }
+
+    pub async fn refund_request_crash(&mut self) {
+        self.cycle += 1;
+        let channel = self.open_expired().await;
+        let args = ["wallet", "recover-channel", "--channel-id", &channel];
+        let before = self.ledger.lock().unwrap().swaps.len();
+        let attempt_index = self.ledger.lock().unwrap().requests;
+        self.ledger.lock().unwrap().hold_request = true;
+        let child = self.client(&args);
+        tokio::time::timeout(DEADLINE, self.committed.notified())
+            .await
+            .expect("refund request gate");
+        drop(child);
+        self.ledger.lock().unwrap().discard_request = true;
+        self.release_gate().await;
+        self.client(&args).success().await;
+        assert_eq!(self.ledger.lock().unwrap().swaps.len(), before + 1);
+        {
+            let ledger = self.ledger.lock().unwrap();
+            assert_eq!(ledger.attempts.len(), attempt_index + 2);
+            let original = &ledger.attempts[attempt_index];
+            let resumed = &ledger.attempts[attempt_index + 1];
+            assert!(
+                original.outputs() == resumed.outputs(),
+                "refund replay changed prepared outputs"
+            );
+            let inputs = |swap: &SwapRequest| {
+                swap.inputs()
+                    .iter()
+                    .map(|p| (p.y().unwrap(), p.keyset_id, p.amount))
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                inputs(original) == inputs(resumed),
+                "refund replay changed inputs"
+            );
         }
         self.settle(&channel, true).await;
     }
 
+    pub async fn refund_rotation_before_prepare(&mut self) {
+        self.cycle += 1;
+        let channel = self.open_expired().await;
+        let output_keyset = rotate_sat_keyset(&self.mint.mint(), 450).await.unwrap();
+        self.settle(&channel, true).await;
+        let ledger = self.ledger.lock().unwrap();
+        assert!(
+            ledger.swaps.values().any(|(swap, _)| {
+                swap.outputs().iter().all(|p| p.keyset_id == output_keyset)
+                    && swap.inputs().iter().all(|p| p.keyset_id != output_keyset)
+            }),
+            "refund must use new output keys with old input fee keys"
+        );
+    }
+
+    pub async fn stress(&mut self, seed: u64, cycles: usize) {
+        assert!((1..=1000).contains(&cycles));
+        let mut random = seed;
+        for step in 0..cycles {
+            // Reserve a conservative capacity/fee margin; never top up the purse.
+            let balance: u64 = self.db("loose.db").query_row("SELECT COALESCE(SUM(amount_raw), 0) FROM monad_client_loose_proofs WHERE state = 'available'", [], |r| r.get(0)).unwrap();
+            if balance < 2048 {
+                eprintln!("funds stress seed={seed} stopped=capacity_fee_margin step={step} balance={balance}");
+                break;
+            }
+            random = random
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let choice = (random >> 32) % 6;
+            eprintln!("funds stress seed={seed} step={step} choice={choice}");
+            match choice {
+                0 => self.cycle(false).await,
+                1 => self.cycle(true).await,
+                2 => self.opening_boundary("opening-change").await,
+                3 => self.refund_case(None, false, true).await,
+                4 => self.opening_request(true, false).await,
+                _ => {
+                    self.rotate(100 + (random % 400)).await;
+                    self.cycle(false).await;
+                }
+            }
+        }
+        self.audit().await;
+    }
+
     async fn audit(&self) {
+        self.audit_custody(false).await;
+    }
+
+    async fn audit_custody(&self, include_reserved: bool) {
         let wallet = LooseProofWallet::open(
             self.dir.as_ref().unwrap().path().join("loose.db"),
             CONFIGURED_CLIENT_WALLET_NAME,
@@ -662,6 +939,17 @@ clients:
             .map(|p| serde_json::from_str::<Proof>(&p.proof_json).unwrap())
             .collect::<Vec<_>>();
         drop(wallet);
+        if include_reserved {
+            let conn = self.db("loose.db");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT proof_json FROM monad_client_loose_proofs WHERE state = 'reserved'",
+                )
+                .unwrap();
+            for row in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+                proofs.push(serde_json::from_str(&row.unwrap()).unwrap());
+            }
+        }
         let client_value: u64 = proofs.iter().map(|p| u64::from(p.amount)).sum();
         let conn = self.db("relay.db");
         let mut stmt = conn

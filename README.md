@@ -702,7 +702,7 @@ This opens 16 bidirectional QUIC streams, sends 64KB of random data on each, rea
 - `DESIGN.md` for the high-level system design and tradeoffs
 - `ARCHITECTURE.md` for the protocol and layering model
 - `AGENTS.md` for repo-specific development guidance
-# Process Funds Lifecycle Tests
+## Process Funds Lifecycle Tests
 
 `make test-funds-lifecycle` builds the client and relay CLIs and runs opt-in
 actual-process wallet lifecycle tests with a retained real CDK HTTP mint.
@@ -710,3 +710,7 @@ See [coverage and private failure artifacts](monad-relay/tests/FUNDS_LIFECYCLE.m
 `make test-funds-crashes` includes compile-gated fault injection and real-expiry
 refund tests. Its client binary is test-only; rebuild without features before use
 with real funds.
+
+`MONAD_FUNDS_SEED=20260921 MONAD_FUNDS_CYCLES=256 make stress-funds-lifecycle`
+runs reproducible crash/rotation cycles from one fixed purse, stopping at a
+conservative capacity/fee margin rather than replenishing funds.
