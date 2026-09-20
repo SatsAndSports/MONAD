@@ -890,14 +890,21 @@ impl SqliteClientWallet {
     }
 
     fn recover_pending_openings_inner(&self) -> Result<OpeningRecoveryReport, WalletError> {
+        let networking = OpeningRecoveryHttpNetworking::new().map_err(WalletError::Backend)?;
+        self.recover_pending_openings_with_networking(&networking)
+    }
+
+    fn recover_pending_openings_with_networking<N: OpeningRecoveryNetworking>(
+        &self,
+        networking: &N,
+    ) -> Result<OpeningRecoveryReport, WalletError> {
         let attempts = self
             .loose_wallet
             .opening_attempts_for_recovery()
             .map_err(loose_proof_error)?;
         let mut report = OpeningRecoveryReport::default();
-        let networking = OpeningRecoveryHttpNetworking::new().map_err(WalletError::Backend)?;
         for attempt in attempts {
-            match self.recover_journaled_opening(&attempt, &networking) {
+            match self.recover_journaled_opening(&attempt, networking) {
                 Ok(OpeningRecoveryOutcome::Recovered(channel_id)) => {
                     report.recovered_channel_ids.push(channel_id)
                 }
@@ -4598,6 +4605,137 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidRestore {
+        Json,
+        Count,
+        Identity,
+        Signature,
+        IncorrectSignaturePoint,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum OpeningOrchestrationScenario {
+        RestoreOnly,
+        InvalidDirectAndRestore,
+        InvalidRestore {
+            response_index: usize,
+            mutation: InvalidRestore,
+        },
+        RejectedReplayThenDelayedOriginal,
+    }
+
+    struct ScriptedOpeningNetworking {
+        inner: OpeningRecoveryHttpNetworking,
+        scenario: OpeningOrchestrationScenario,
+        swaps: Mutex<Vec<String>>,
+        restores: Mutex<usize>,
+    }
+
+    impl SpilmanClientNetworking for ScriptedOpeningNetworking {
+        fn call_mint_swap(&self, mint_url: &str, request: &str) -> Result<String, String> {
+            let mut swaps = self.swaps.lock().unwrap();
+            swaps.push(request.to_string());
+            match self.scenario {
+                OpeningOrchestrationScenario::RejectedReplayThenDelayedOriginal => {
+                    match swaps.len() {
+                        // Neither call reaches the mint. The test submits the saved original
+                        // later; this models uncertainty, not concurrent mint execution.
+                        1 => {
+                            // Replay authorization requires a strictly later wall-clock second.
+                            std::thread::sleep(Duration::from_millis(1_100));
+                            Err("scripted original transport uncertainty".to_string())
+                        }
+                        2 => Err(
+                            r#"{"code":12002,"error":"scripted explicit replay rejection"}"#
+                                .to_string(),
+                        ),
+                        _ => panic!("unexpected successor or additional replay"),
+                    }
+                }
+                OpeningOrchestrationScenario::InvalidDirectAndRestore => {
+                    assert_eq!(swaps.len(), 1);
+                    self.inner.call_mint_swap(mint_url, request)?;
+                    Ok("invalid direct swap JSON".to_string())
+                }
+                OpeningOrchestrationScenario::RestoreOnly
+                | OpeningOrchestrationScenario::InvalidRestore { .. } => {
+                    Err("scripted guard: restore-only recovery must not submit".to_string())
+                }
+            }
+        }
+
+        fn call_mint_restore(&self, mint_url: &str, request: &str) -> Result<String, String> {
+            let mut calls = self.restores.lock().unwrap();
+            let index = *calls;
+            *calls += 1;
+            let response = self.inner.call_mint_restore(mint_url, request)?;
+            let mutation = match self.scenario {
+                OpeningOrchestrationScenario::InvalidDirectAndRestore => Some(InvalidRestore::Json),
+                OpeningOrchestrationScenario::InvalidRestore {
+                    response_index,
+                    mutation,
+                } if response_index == index => Some(mutation),
+                _ => None,
+            };
+            let Some(mutation) = mutation else {
+                return Ok(response);
+            };
+            if matches!(mutation, InvalidRestore::Json) {
+                return Ok("invalid restore JSON".to_string());
+            }
+            let mut response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert!(!response["signatures"].as_array().unwrap().is_empty());
+            match mutation {
+                InvalidRestore::Count => {
+                    response["signatures"].as_array_mut().unwrap().pop();
+                }
+                InvalidRestore::Identity => {
+                    response["outputs"][0]["B_"] = serde_json::json!(
+                        "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2"
+                    )
+                }
+                InvalidRestore::Signature => {
+                    response["signatures"][0]["C_"] = serde_json::json!("invalid point")
+                }
+                InvalidRestore::IncorrectSignaturePoint => {
+                    let original: cashu::nuts::BlindSignature =
+                        serde_json::from_value(response["signatures"][0].clone()).unwrap();
+                    assert!(original.dleq.is_some(), "mint must supply DLEQ evidence");
+                    let point = response["signatures"][0]["C_"].as_str().unwrap();
+                    // Negation is another valid curve point, but the original DLEQ
+                    // evidence no longer proves this blinded signature.
+                    let negated = format!(
+                        "{}{}",
+                        if point.starts_with("02") { "03" } else { "02" },
+                        &point[2..]
+                    );
+                    response["signatures"][0]["C_"] = serde_json::json!(negated);
+                    let mutated: cashu::nuts::BlindSignature =
+                        serde_json::from_value(response["signatures"][0].clone()).unwrap();
+                    assert_ne!(mutated.c, original.c);
+                    assert_eq!(mutated.dleq, original.dleq);
+                }
+                InvalidRestore::Json => unreachable!(),
+            }
+            Ok(response.to_string())
+        }
+
+        fn call_mint_keysets(&self, mint_url: &str) -> Result<String, String> {
+            self.inner.call_mint_keysets(mint_url)
+        }
+
+        fn call_mint_keys(&self, mint_url: &str, keyset_id: &str) -> Result<String, String> {
+            self.inner.call_mint_keys(mint_url, keyset_id)
+        }
+    }
+
+    impl OpeningRecoveryNetworking for ScriptedOpeningNetworking {
+        fn call_mint_check_state(&self, mint_url: &str, request: &str) -> Result<String, String> {
+            self.inner.call_mint_check_state(mint_url, request)
+        }
+    }
+
     struct FourSubmissionNetworking {
         inner: OpeningRecoveryHttpNetworking,
         swap_requests: Mutex<Vec<String>>,
@@ -7516,6 +7654,575 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_unresolved_export_group_does_not_suppress_an_independent_token() {
         assert_recovers_persisted_ambiguous_opening(false, None, true, true, false, true).await;
+    }
+
+    async fn assert_grouped_stale_opening_export(fail_first_group: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let loose_db = temp.path().join("loose.sqlite");
+        let channel_db = temp.path().join("channels.sqlite");
+        let wallet = SqliteClientWallet::open(
+            LooseProofWallet::open(&loose_db, "alice").unwrap(),
+            &channel_db,
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        let client = reqwest::Client::new();
+        let mut mints = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..if fail_first_group { 2 } else { 1 } {
+            let helper = TestMintHelper::new().await.unwrap();
+            let mint = helper.mint();
+            let port = free_loopback_port();
+            let mint_url = format!("http://127.0.0.1:{port}");
+            let config = TestMintConfig::for_port(port);
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                serve_existing_mint_with_shutdown(mint, config, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+            });
+            wait_for_mint(&client, &mint_url).await;
+            mints.push((mint_url, helper));
+            servers.push((shutdown_tx, task));
+        }
+        // The failed group must precede the independent group in the export scan.
+        mints.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut groups = Vec::new();
+        for (group_index, (mint_url, helper)) in mints.iter().enumerate() {
+            let offer = offer(
+                mint_url,
+                "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+                &helper.keyset_id().to_string(),
+            );
+            wallet.ensure_offer_keysets_cached(&offer).unwrap();
+            let mut attempts = Vec::new();
+            for opening_index in 0..if group_index == 0 { 2 } else { 1 } {
+                let proofs = helper.mint_proofs(128).await.unwrap();
+                let batch = format!("group-{group_index}-opening-{opening_index}");
+                wallet
+                    .loose_wallet()
+                    .import_proofs(&loose_proofs_from_json(
+                        mint_url,
+                        "sat",
+                        &batch,
+                        &batch,
+                        &serde_json::to_string(&proofs).unwrap(),
+                    ))
+                    .unwrap();
+                let output_keyset = wallet
+                    .select_output_keyset_refreshing_client_first(&offer)
+                    .unwrap();
+                let attempt = wallet
+                    .prepare_target_capacity_attempt(
+                        &offer,
+                        32,
+                        output_keyset,
+                        SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+                    )
+                    .unwrap();
+                let OpeningSubmissionClaim::Acquired(permit) = wallet
+                    .loose_wallet()
+                    .claim_opening_attempt_submission(&attempt.prepared.channel_id)
+                    .unwrap()
+                else {
+                    panic!("submission claim not acquired");
+                };
+                // Journal an old authorized submission without sending the swap.
+                wallet
+                    .loose_wallet()
+                    .authorize_opening_submission_at(permit, 1)
+                    .unwrap();
+                attempts.push(
+                    wallet
+                        .loose_wallet()
+                        .opening_attempt(&attempt.prepared.channel_id)
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            attempts.sort_by(|left, right| left.attempt_id.cmp(&right.attempt_id));
+            groups.push(attempts);
+        }
+        if fail_first_group {
+            let conn = Connection::open(&loose_db).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER fail_second_grouped_export
+                 BEFORE UPDATE ON monad_client_opening_attempts
+                 WHEN OLD.attempt_id = '{}' AND NEW.state = 'exported'
+                   AND EXISTS (SELECT 1 FROM monad_client_opening_attempts
+                               WHERE attempt_id = '{}' AND state = 'exported')
+                 BEGIN SELECT RAISE(ABORT, 'injected second export update failure'); END;",
+                groups[0][1].attempt_id, groups[0][0].attempt_id,
+            ))
+            .unwrap();
+        }
+        let locks = ClientWalletLocks::acquire(&loose_db, &channel_db, WalletLockMode::Maintenance)
+            .unwrap();
+        let report = wallet
+            .export_stale_opening_inputs(&locks.exclusive_access().unwrap())
+            .unwrap();
+        assert_eq!(report.exports.len(), 1);
+        if fail_first_group {
+            assert_eq!(report.unresolved.len(), 2);
+            for (unresolved, original) in report.unresolved.iter().zip(&groups[0]) {
+                assert_eq!(unresolved.attempt_id, original.attempt_id);
+                assert_eq!(unresolved.state, OpeningAttemptState::Submitted);
+                assert!(unresolved
+                    .reason
+                    .contains("injected second export update failure"));
+            }
+        } else {
+            assert!(report.unresolved.is_empty());
+        }
+        let successful_group = usize::from(fail_first_group);
+        let exported = &report.exports[0];
+        assert_eq!(exported.mint_url, mints[successful_group].0);
+        assert_eq!(exported.unit, "sat");
+        assert_eq!(
+            exported.attempt_ids,
+            groups[successful_group]
+                .iter()
+                .map(|attempt| attempt.attempt_id.clone())
+                .collect::<Vec<_>>()
+        );
+        let mut expected_proofs = Vec::new();
+        for (group_index, attempts) in groups.iter().enumerate() {
+            for original in attempts {
+                let current = wallet
+                    .loose_wallet()
+                    .opening_attempt(&original.attempt_id)
+                    .unwrap()
+                    .unwrap();
+                if group_index == successful_group {
+                    assert_eq!(current.state, OpeningAttemptState::Exported);
+                } else {
+                    assert_eq!(
+                        &current, original,
+                        "failed group must roll back both updates"
+                    );
+                }
+                let reserved = wallet
+                    .loose_wallet()
+                    .proofs_for_reservation(&original.reservation_id)
+                    .unwrap();
+                assert_eq!(reserved.len(), original.selected_proof_ids.len());
+                assert!(!reserved.is_empty());
+                assert!(reserved
+                    .iter()
+                    .all(|proof| proof.state == LooseProofState::Reserved));
+                assert_eq!(
+                    reserved
+                        .iter()
+                        .map(|proof| &proof.proof_id)
+                        .collect::<HashSet<_>>(),
+                    original.selected_proof_ids.iter().collect::<HashSet<_>>()
+                );
+                if group_index == successful_group {
+                    expected_proofs.extend(
+                        reserved
+                            .iter()
+                            .map(|proof| serde_json::from_str::<Proof>(&proof.proof_json).unwrap()),
+                    );
+                }
+            }
+        }
+        let token: Token = exported.token.parse().unwrap();
+        assert_eq!(token.mint_url().unwrap().to_string(), exported.mint_url);
+        assert_eq!(token.unit(), Some(CurrencyUnit::Sat));
+        let keysets: cashu::nuts::KeysetResponse = client
+            .get(format!("{}/v1/keysets", exported.mint_url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut decoded = token.proofs(&keysets.keysets).unwrap();
+        decoded.sort_by_key(|proof| proof.secret.to_string());
+        expected_proofs.sort_by_key(|proof| proof.secret.to_string());
+        assert_eq!(decoded, expected_proofs);
+        assert_eq!(exported.proof_count, decoded.len());
+        assert_eq!(
+            exported.amount_raw,
+            decoded
+                .iter()
+                .map(|proof| proof.amount.to_u64())
+                .sum::<u64>()
+        );
+        assert_eq!(
+            wallet
+                .export_stale_opening_inputs(&locks.exclusive_access().unwrap())
+                .unwrap(),
+            report,
+            "reexport must preserve the exact token, attempt IDs and partial failure"
+        );
+        for (shutdown_tx, task) in servers {
+            let _ = shutdown_tx.send(());
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_opening_export_combines_two_valid_openings_in_one_token() {
+        assert_grouped_stale_opening_export(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_opening_export_rolls_back_second_update_and_exports_independent_group() {
+        assert_grouped_stale_opening_export(true).await;
+    }
+
+    async fn assert_opening_orchestration_recovers(scenario: OpeningOrchestrationScenario) {
+        let helper = TestMintHelper::new().await.unwrap();
+        let mint = helper.mint();
+        let keyset_id = helper.keyset_id().to_string();
+        let proofs = helper.mint_proofs(128).await.unwrap();
+        let port = free_loopback_port();
+        let mint_url = format!("http://127.0.0.1:{port}");
+        let config = TestMintConfig::for_port(port);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            serve_existing_mint_with_shutdown(mint, config, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        wait_for_mint(&reqwest::Client::new(), &mint_url).await;
+        let temp = tempfile::tempdir().unwrap();
+        let loose_db = temp.path().join("loose.sqlite");
+        let channel_db = temp.path().join("channels.sqlite");
+        let wallet = SqliteClientWallet::open(
+            LooseProofWallet::open(&loose_db, "alice").unwrap(),
+            &channel_db,
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        wallet
+            .loose_wallet()
+            .import_proofs(&loose_proofs_from_json(
+                &mint_url,
+                "sat",
+                "orchestration",
+                "orchestration",
+                &serde_json::to_string(&proofs).unwrap(),
+            ))
+            .unwrap();
+        let offer = offer(
+            &mint_url,
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+            &keyset_id,
+        );
+        wallet.ensure_offer_keysets_cached(&offer).unwrap();
+        let output_keyset = wallet
+            .select_output_keyset_refreshing_client_first(&offer)
+            .unwrap();
+        let attempt = wallet
+            .prepare_target_capacity_attempt(
+                &offer,
+                32,
+                output_keyset,
+                SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+            )
+            .unwrap();
+        let prepared = attempt.prepared.clone();
+        let id = &prepared.channel_id;
+        let reservation_id = attempt.reservation.reservation_id.clone();
+        let reserved = wallet
+            .loose_wallet()
+            .proofs_for_reservation(&reservation_id)
+            .unwrap();
+        assert!(!reserved.is_empty());
+        assert!(reserved
+            .iter()
+            .all(|proof| proof.state == LooseProofState::Reserved));
+        let expected_change = prepared.opening.change_amount_raw;
+        assert!(expected_change > 0);
+        let networking = ScriptedOpeningNetworking {
+            inner: OpeningRecoveryHttpNetworking::new().unwrap(),
+            scenario,
+            swaps: Mutex::new(Vec::new()),
+            restores: Mutex::new(0),
+        };
+        match scenario {
+            OpeningOrchestrationScenario::InvalidRestore { response_index, .. } => {
+                let OpeningSubmissionClaim::Acquired(permit) = wallet
+                    .loose_wallet()
+                    .claim_opening_attempt_submission(id)
+                    .unwrap()
+                else {
+                    panic!("submission claim not acquired");
+                };
+                wallet
+                    .loose_wallet()
+                    .authorize_opening_submission_at(permit, 1)
+                    .unwrap();
+                networking
+                    .inner
+                    .call_mint_swap(&mint_url, &prepared.swap_request_json)
+                    .unwrap();
+                let before = wallet.loose_wallet().opening_attempt(id).unwrap().unwrap();
+                let executions = wallet.loose_wallet().opening_executions(id).unwrap();
+                let error = wallet
+                    .recover_journaled_opening(&before, &networking)
+                    .expect_err(&format!("{scenario:?}"));
+                if matches!(
+                    scenario,
+                    OpeningOrchestrationScenario::InvalidRestore {
+                        mutation: InvalidRestore::IncorrectSignaturePoint,
+                        ..
+                    }
+                ) {
+                    assert!(error.to_string().to_lowercase().contains("dleq"), "{error}");
+                    // Both structurally valid responses are fetched before crypto verification.
+                    assert_eq!(*networking.restores.lock().unwrap(), 2);
+                } else {
+                    assert_eq!(*networking.restores.lock().unwrap(), response_index + 1);
+                }
+                assert_eq!(
+                    wallet.loose_wallet().opening_attempt(id).unwrap().unwrap(),
+                    before
+                );
+                assert_eq!(
+                    wallet.loose_wallet().opening_executions(id).unwrap(),
+                    executions
+                );
+                assert!(networking.swaps.lock().unwrap().is_empty());
+            }
+            _ => {
+                assert!(wallet
+                    .execute_open_attempt_with_networking(&offer, attempt, true, &networking)
+                    .is_err());
+                let swaps = networking.swaps.lock().unwrap();
+                let executions = wallet.loose_wallet().opening_executions(id).unwrap();
+                match scenario {
+                    OpeningOrchestrationScenario::InvalidDirectAndRestore => {
+                        assert_eq!(swaps.len(), 1);
+                        assert_eq!(*networking.restores.lock().unwrap(), 1);
+                        assert_eq!(executions.len(), 1);
+                    }
+                    OpeningOrchestrationScenario::RejectedReplayThenDelayedOriginal => {
+                        assert_eq!(swaps.len(), 2);
+                        assert_eq!(swaps[0], swaps[1]);
+                        assert_eq!(swaps[0], prepared.swap_request_json);
+                        assert_eq!(executions.len(), 2);
+                        assert_eq!(executions[0].kind, OpeningExecutionKind::Initial);
+                        assert_eq!(executions[0].status, OpeningExecutionStatus::Uncertain);
+                        assert_eq!(executions[1].kind, OpeningExecutionKind::Replay);
+                        assert_eq!(executions[1].status, OpeningExecutionStatus::Rejected);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let journal = wallet.loose_wallet().opening_attempt(id).unwrap().unwrap();
+        if matches!(
+            scenario,
+            OpeningOrchestrationScenario::InvalidDirectAndRestore
+        ) {
+            let executions = wallet.loose_wallet().opening_executions(id).unwrap();
+            assert!(wallet
+                .recover_journaled_opening(&journal, &networking)
+                .is_err());
+            assert_eq!(
+                wallet.loose_wallet().opening_attempt(id).unwrap().unwrap(),
+                journal
+            );
+            assert_eq!(
+                wallet.loose_wallet().opening_executions(id).unwrap(),
+                executions
+            );
+        }
+        assert_eq!(journal.state, OpeningAttemptState::Submitted);
+        assert_eq!(journal.rejection_code, None);
+        assert_eq!(
+            journal.prepared_open_json,
+            serde_json::to_string(&prepared).unwrap()
+        );
+        assert_eq!(
+            journal.selected_proof_ids.iter().collect::<HashSet<_>>(),
+            reserved
+                .iter()
+                .map(|proof| &proof.proof_id)
+                .collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .proofs_for_reservation(&reservation_id)
+                .unwrap(),
+            reserved
+        );
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .available_balance_raw(&mint_url, "sat", std::slice::from_ref(&keyset_id))
+                .unwrap(),
+            0
+        );
+        assert!(wallet.get_channel(id).is_err());
+        assert_eq!(
+            wallet
+                .channel_db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM monad_client_channels", [], |row| row
+                    .get::<_, u64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+
+        if matches!(
+            scenario,
+            OpeningOrchestrationScenario::RejectedReplayThenDelayedOriginal
+        ) {
+            // The keyset remains active. Only this delayed original is actually executed.
+            networking
+                .inner
+                .call_mint_swap(&mint_url, &prepared.swap_request_json)
+                .unwrap();
+        }
+        assert_eq!(
+            prepared_input_state(&prepared, &networking.inner).unwrap(),
+            ExactInputState::AllSpent
+        );
+        let executions = wallet.loose_wallet().opening_executions(id).unwrap();
+        drop(wallet);
+        let wallet = SqliteClientWallet::open(
+            LooseProofWallet::open(&loose_db, "alice").unwrap(),
+            &channel_db,
+            &sender_secret_hex(),
+        )
+        .unwrap();
+        assert_eq!(
+            wallet.loose_wallet().opening_attempt(id).unwrap().unwrap(),
+            journal
+        );
+        let restore_only = ScriptedOpeningNetworking {
+            inner: OpeningRecoveryHttpNetworking::new().unwrap(),
+            scenario: OpeningOrchestrationScenario::RestoreOnly,
+            swaps: Mutex::new(Vec::new()),
+            restores: Mutex::new(0),
+        };
+        let report = wallet
+            .recover_pending_openings_with_networking(&restore_only)
+            .unwrap();
+        assert!(restore_only.swaps.lock().unwrap().is_empty());
+        assert_eq!(*restore_only.restores.lock().unwrap(), 2);
+        assert_eq!(report.recovered_channel_ids, vec![id.clone()]);
+        assert!(report.unresolved.is_empty());
+        assert!(report.externally_spent_attempt_ids.is_empty());
+        assert_eq!(
+            wallet.get_channel(id).unwrap().state,
+            WalletChannelState::Open
+        );
+        let completed = wallet.loose_wallet().opening_attempt(id).unwrap().unwrap();
+        assert_eq!(completed.state, OpeningAttemptState::Completed);
+        let spent = wallet
+            .loose_wallet()
+            .proofs_for_reservation(&reservation_id)
+            .unwrap();
+        assert_eq!(spent.len(), reserved.len());
+        for (actual, original) in spent.iter().zip(&reserved) {
+            assert_eq!(actual.proof_id, original.proof_id);
+            assert_eq!(actual.proof_json, original.proof_json);
+            assert_eq!(actual.state, LooseProofState::Spent);
+        }
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .available_balance_raw(&mint_url, "sat", std::slice::from_ref(&keyset_id))
+                .unwrap(),
+            expected_change
+        );
+        assert!(wallet
+            .recover_pending_openings_with_networking(&restore_only)
+            .unwrap()
+            .is_empty());
+        assert!(restore_only.swaps.lock().unwrap().is_empty());
+        assert_eq!(*restore_only.restores.lock().unwrap(), 2);
+        assert_eq!(
+            wallet.loose_wallet().opening_attempt(id).unwrap().unwrap(),
+            completed
+        );
+        assert_eq!(
+            wallet.loose_wallet().opening_executions(id).unwrap(),
+            executions,
+            "startup/manual recovery must be restore-only"
+        );
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .proofs_for_reservation(&reservation_id)
+                .unwrap(),
+            spent
+        );
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .available_balance_raw(&mint_url, "sat", std::slice::from_ref(&keyset_id))
+                .unwrap(),
+            expected_change
+        );
+        assert_eq!(
+            wallet
+                .channel_db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM monad_client_channels", [], |row| row
+                    .get::<_, u64>(
+                    0
+                ))
+                .unwrap(),
+            1
+        );
+        assert_eq!(Connection::open(&loose_db).unwrap().query_row(
+            "SELECT COUNT(*) FROM monad_client_opening_attempts WHERE wallet_name = 'alice'",
+            [], |row| row.get::<_, u64>(0),
+        ).unwrap(), 1, "no successor attempt");
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orchestration_invalid_direct_and_restore_preserve_custody_until_valid_recovery() {
+        assert_opening_orchestration_recovers(
+            OpeningOrchestrationScenario::InvalidDirectAndRestore,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orchestration_invalid_funding_and_change_restores_preserve_journal() {
+        for response_index in 0..=1 {
+            for mutation in [
+                InvalidRestore::Json,
+                InvalidRestore::Count,
+                InvalidRestore::Identity,
+                InvalidRestore::Signature,
+                InvalidRestore::IncorrectSignaturePoint,
+            ] {
+                assert_opening_orchestration_recovers(
+                    OpeningOrchestrationScenario::InvalidRestore {
+                        response_index,
+                        mutation,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orchestration_scripted_replay_rejection_then_delayed_original_recovers_once() {
+        assert_opening_orchestration_recovers(
+            OpeningOrchestrationScenario::RejectedReplayThenDelayedOriginal,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
