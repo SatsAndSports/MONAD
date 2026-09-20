@@ -1584,7 +1584,7 @@ impl LooseProofWallet {
         self.authorize_opening_submission_at(permit, now_seconds()?)
     }
 
-    fn authorize_opening_submission_at(
+    pub(crate) fn authorize_opening_submission_at(
         &self,
         permit: OpeningSubmissionPermit,
         now: u64,
@@ -2041,7 +2041,7 @@ impl LooseProofWallet {
         let changed = conn.execute(
             "UPDATE monad_client_opening_attempts
              SET state = ?3, completed_open_json = ?4, updated_at = ?5
-             WHERE wallet_name = ?1 AND attempt_id = ?2 AND state = ?6",
+             WHERE wallet_name = ?1 AND attempt_id = ?2 AND state IN (?6, ?7)",
             params![
                 self.wallet_name,
                 attempt_id,
@@ -2049,6 +2049,7 @@ impl LooseProofWallet {
                 completed_open_json,
                 to_i64(now)?,
                 OpeningAttemptState::Submitted.as_str(),
+                OpeningAttemptState::Exported.as_str(),
             ],
         )?;
         if changed == 1 {

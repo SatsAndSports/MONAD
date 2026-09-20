@@ -4011,7 +4011,7 @@ mod tests {
     use crate::loose_proof_wallet::OpeningExecutionKind;
     use crate::loose_proof_wallet::{LooseProofState, NewLooseProof};
     use crate::proof_selection::input_fee_raw_from_ppk_sum;
-    use crate::wallet_lock::ClientWalletLocks;
+    use crate::wallet_lock::{ClientWalletLocks, WalletLockMode};
     use cdk_spilman::{
         channel_parameters_get_channel_id,
         compute_channel_from_proofs_with_input_keysets_and_funding_amount,
@@ -6521,6 +6521,8 @@ mod tests {
     async fn assert_recovers_persisted_ambiguous_opening(
         swap_reached_mint: bool,
         finalizing_boundary: Option<usize>,
+        export_before_recovery: bool,
+        externally_spent_after_export: bool,
     ) {
         let port = free_loopback_port();
         let mint_url = format!("http://127.0.0.1:{port}");
@@ -6731,7 +6733,7 @@ mod tests {
         };
         let _authorized = wallet
             .loose_wallet()
-            .authorize_opening_submission(permit)
+            .authorize_opening_submission_at(permit, 1)
             .unwrap();
         storage
             .save_opening_from_swap(&channel_id, opening)
@@ -6790,6 +6792,74 @@ mod tests {
                     .unwrap(),
                 record
             );
+        }
+        if export_before_recovery {
+            let locks =
+                ClientWalletLocks::acquire(&loose_db, &channel_db, WalletLockMode::Maintenance)
+                    .unwrap();
+            let exports = wallet
+                .export_stale_opening_inputs(&locks.exclusive_access().unwrap())
+                .unwrap();
+            assert_eq!(exports.len(), 1);
+            assert_eq!(exports[0].mint_url, mint_url);
+            assert_eq!(exports[0].unit, unit);
+            assert_eq!(exports[0].amount_raw, reservation.total_amount_raw);
+            assert_eq!(exports[0].proof_count, reservation.proofs.len());
+            assert_eq!(exports[0].attempt_ids, vec![channel_id.clone()]);
+            assert!(exports[0].token.parse::<Token>().is_ok());
+            let repeated = wallet
+                .export_stale_opening_inputs(&locks.exclusive_access().unwrap())
+                .unwrap();
+            assert_eq!(repeated, exports);
+            assert_eq!(
+                wallet
+                    .loose_wallet()
+                    .opening_attempt(&channel_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                OpeningAttemptState::Exported
+            );
+            assert!(wallet
+                .loose_wallet()
+                .proofs_for_reservation(&reservation.reservation_id)
+                .unwrap()
+                .iter()
+                .all(|proof| proof.state == LooseProofState::Reserved));
+            drop(locks);
+
+            if externally_spent_after_export {
+                let exported = wallet
+                    .loose_wallet()
+                    .opening_attempt(&channel_id)
+                    .unwrap()
+                    .unwrap();
+                let networking = StateCheckNetworking::new(CheckStateMode::States(vec![
+                    State::Spent;
+                    reservation.proofs.len()
+                ]));
+                assert!(matches!(
+                    wallet.recover_journaled_opening(&exported, &networking),
+                    Ok(OpeningRecoveryOutcome::ExternallySpent)
+                ));
+                assert_eq!(
+                    wallet
+                        .loose_wallet()
+                        .opening_attempt(&channel_id)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    OpeningAttemptState::ExternallySpent
+                );
+                assert!(wallet
+                    .loose_wallet()
+                    .proofs_for_reservation(&reservation.reservation_id)
+                    .unwrap()
+                    .is_empty());
+                let _ = shutdown_tx.send(());
+                mint_task.await.unwrap().unwrap();
+                return;
+            }
         }
         if swap_reached_mint {
             let swap_response = client
@@ -6934,19 +7004,29 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recovers_persisted_ambiguous_opening() {
-        assert_recovers_persisted_ambiguous_opening(true, None).await;
+        assert_recovers_persisted_ambiguous_opening(true, None, false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_recovery_keeps_empty_submitted_opening_reserved() {
-        assert_recovers_persisted_ambiguous_opening(false, None).await;
+        assert_recovers_persisted_ambiguous_opening(false, None, false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finalizing_opening_recovers_at_each_local_persistence_boundary() {
         for boundary in 0..=4 {
-            assert_recovers_persisted_ambiguous_opening(true, Some(boundary)).await;
+            assert_recovers_persisted_ambiguous_opening(true, Some(boundary), false, false).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_opening_export_reemits_token_and_delayed_completion_wins() {
+        assert_recovers_persisted_ambiguous_opening(true, None, true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exported_opening_becomes_externally_spent_only_with_conclusive_evidence() {
+        assert_recovers_persisted_ambiguous_opening(false, None, true, true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
