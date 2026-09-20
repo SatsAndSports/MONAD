@@ -127,11 +127,13 @@ impl HttpMintConnection {
     async fn checked_response(response: reqwest::Response) -> anyhow::Result<reqwest::Response> {
         let status = response.status();
         if !status.is_success() {
-            return Err(monad_client::sqlite_client_wallet::RefundMintRejection {
-                status: status.as_u16(),
-                body: response.text().await?,
-            }
-            .into());
+            return Err(
+                monad_client::sqlite_client_wallet::MintHttpRejection::from_body(
+                    status.as_u16(),
+                    &response.text().await?,
+                )
+                .into(),
+            );
         }
         Ok(response)
     }
@@ -749,17 +751,17 @@ mod tests {
     use monad_common::secp_identity::SecpTransportKeypair;
 
     #[tokio::test]
-    async fn mint_rejection_retains_structured_body_without_displaying_it() {
+    async fn mint_rejection_retains_only_status_and_numeric_code() {
         let body = r#"{"code":12002,"detail":"untrusted mint detail"}"#;
         let response = http::Response::builder().status(400).body(body).unwrap();
         let error = HttpMintConnection::checked_response(response.into())
             .await
             .unwrap_err();
         let rejection = error
-            .downcast_ref::<monad_client::sqlite_client_wallet::RefundMintRejection>()
+            .downcast_ref::<monad_client::sqlite_client_wallet::MintHttpRejection>()
             .unwrap();
         assert_eq!(rejection.status, 400);
-        assert_eq!(rejection.body, body);
+        assert_eq!(rejection.code, Some(12002));
         assert!(!format!("{error:?}").contains("untrusted mint detail"));
     }
 
