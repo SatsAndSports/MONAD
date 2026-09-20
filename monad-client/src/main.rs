@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use monad_client::loose_proof_wallet::{LooseProofSummary, LooseProofWallet, NewLooseProof};
 use monad_client::runtime::{run_configured_client_until_shutdown, CONFIGURED_CLIENT_WALLET_NAME};
 use monad_client::sqlite_client_wallet::{
-    ChannelFundRecoveryResult, ClientWalletInspection, SqliteClientWallet,
+    ChannelFundRecoveryResult, ClientWalletInspection, OpeningInputExportReport, SqliteClientWallet,
 };
 use monad_client::wallet::{MonadWallet, WalletChannel, WalletChannelState};
 use monad_client::wallet_lock::{ClientWalletLocks, WalletLockMode};
@@ -307,32 +307,60 @@ async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
             }
         }
         WalletCommand::ExportStaleOpeningInputs => {
-            let exports = wallet.export_stale_opening_inputs(&locks.exclusive_access()?)?;
-            if args.json {
-                print_json(&serde_json::json!({
-                    "exports": exports.into_iter().map(|entry| serde_json::json!({
-                        "mint_url": entry.mint_url,
-                        "unit": entry.unit,
-                        "amount_raw": entry.amount_raw,
-                        "proof_count": entry.proof_count,
-                        "attempt_ids": entry.attempt_ids,
-                        "token": entry.token,
-                    })).collect::<Vec<_>>(),
-                }))?;
-            } else if exports.is_empty() {
-                println!("No stale opening inputs are currently exportable.");
-            } else {
-                println!("WARNING: each token below is bearer value. Import or swap it promptly; MONAD keeps the original opening reserved until recovery resolves it.");
-                for entry in exports {
-                    println!();
-                    println!("mint: {}", entry.mint_url);
-                    println!("unit: {}", entry.unit);
-                    println!("amount_raw: {}", entry.amount_raw);
-                    println!("proof_count: {}", entry.proof_count);
-                    println!("attempt_ids: {}", entry.attempt_ids.join(","));
-                    println!("token: {}", entry.token);
-                }
-            }
+            let report = wallet.export_stale_opening_inputs(&locks.exclusive_access()?)?;
+            write_opening_export_report(&mut std::io::stdout().lock(), &report, args.json)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_opening_export_report(
+    out: &mut impl Write,
+    report: &OpeningInputExportReport,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        serde_json::to_writer_pretty(
+            &mut *out,
+            &serde_json::json!({
+                "exports": report.exports.iter().map(|entry| serde_json::json!({
+                    "mint_url": entry.mint_url,
+                    "unit": entry.unit,
+                    "amount_raw": entry.amount_raw,
+                    "proof_count": entry.proof_count,
+                    "attempt_ids": entry.attempt_ids,
+                    "token": entry.token,
+                })).collect::<Vec<_>>(),
+                "unresolved": report.unresolved.iter().map(|entry| serde_json::json!({
+                    "attempt_id": entry.attempt_id,
+                    "state": format!("{:?}", entry.state).to_ascii_lowercase(),
+                    "reason": entry.reason,
+                })).collect::<Vec<_>>(),
+            }),
+        )?;
+        writeln!(out)?;
+    } else if report.is_empty() {
+        writeln!(out, "No stale opening inputs are currently exportable.")?;
+    } else {
+        if !report.exports.is_empty() {
+            writeln!(out, "WARNING: each token below is bearer value. Import or swap it promptly; MONAD keeps the original opening reserved until recovery resolves it.")?;
+        }
+        for entry in &report.exports {
+            writeln!(out)?;
+            writeln!(out, "mint: {}", entry.mint_url)?;
+            writeln!(out, "unit: {}", entry.unit)?;
+            writeln!(out, "amount_raw: {}", entry.amount_raw)?;
+            writeln!(out, "proof_count: {}", entry.proof_count)?;
+            writeln!(out, "attempt_ids: {}", entry.attempt_ids.join(","))?;
+            writeln!(out, "token: {}", entry.token)?;
+        }
+        for unresolved in &report.unresolved {
+            writeln!(out)?;
+            writeln!(
+                out,
+                "Not exported: {} ({:?}): {}",
+                unresolved.attempt_id, unresolved.state, unresolved.reason
+            )?;
         }
     }
     Ok(())
@@ -692,9 +720,111 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use monad_client::loose_proof_wallet::OpeningAttemptState;
+    use monad_client::sqlite_client_wallet::{ExportedOpeningInputsToken, UnresolvedOpeningExport};
     use monad_common::secp_identity::SecpTransportKeypair;
 
     const ZERO_SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn opening_export_report() -> OpeningInputExportReport {
+        OpeningInputExportReport {
+            exports: vec![ExportedOpeningInputsToken {
+                mint_url: "https://mint.example".into(),
+                unit: "sat".into(),
+                amount_raw: 42,
+                proof_count: 2,
+                attempt_ids: vec!["attempt-a".into(), "attempt-b".into()],
+                token: "cashuB_exact-BearerToken_0123456789".into(),
+            }],
+            unresolved: vec![UnresolvedOpeningExport {
+                attempt_id: "attempt-c".into(),
+                state: OpeningAttemptState::Submitted,
+                reason: "mint said \"pending\"; inputs remain reserved".into(),
+            }],
+        }
+    }
+
+    fn render_opening_export(report: &OpeningInputExportReport, json: bool) -> String {
+        let mut output = Vec::new();
+        write_opening_export_report(&mut output, report, json).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn opening_export_render_mixed_report() {
+        assert_eq!(
+            render_opening_export(&opening_export_report(), false),
+            concat!(
+                "WARNING: each token below is bearer value. Import or swap it promptly; MONAD keeps the original opening reserved until recovery resolves it.\n",
+                "\nmint: https://mint.example\nunit: sat\namount_raw: 42\nproof_count: 2\n",
+                "attempt_ids: attempt-a,attempt-b\ntoken: cashuB_exact-BearerToken_0123456789\n",
+                "\nNot exported: attempt-c (Submitted): mint said \"pending\"; inputs remain reserved\n",
+            )
+        );
+    }
+
+    #[test]
+    fn opening_export_render_unresolved_only_without_bearer_warning() {
+        let mut report = opening_export_report();
+        report.exports.clear();
+        assert_eq!(
+            render_opening_export(&report, false),
+            "\nNot exported: attempt-c (Submitted): mint said \"pending\"; inputs remain reserved\n"
+        );
+    }
+
+    #[test]
+    fn opening_export_render_empty_report() {
+        let report = OpeningInputExportReport::default();
+        assert_eq!(
+            render_opening_export(&report, false),
+            "No stale opening inputs are currently exportable.\n"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&render_opening_export(&report, true))
+                .unwrap(),
+            serde_json::json!({"exports": [], "unresolved": []})
+        );
+    }
+
+    #[test]
+    fn opening_export_render_json_preserves_exact_tokens_and_reasons() {
+        let mut report = opening_export_report();
+        report.exports.push(ExportedOpeningInputsToken {
+            mint_url: "https://other-mint.example".into(),
+            unit: "msat".into(),
+            amount_raw: 1000,
+            proof_count: 1,
+            attempt_ids: vec!["attempt-d".into()],
+            token: "cashuB_other-EXACT_token".into(),
+        });
+        report.unresolved.push(UnresolvedOpeningExport {
+            attempt_id: "attempt-e".into(),
+            state: OpeningAttemptState::Exported,
+            reason: "restore unavailable\nretry later".into(),
+        });
+        let output = render_opening_export(&report, true);
+        assert!(output.ends_with('\n'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            serde_json::json!({
+                "exports": [
+                    {"mint_url": "https://mint.example", "unit": "sat", "amount_raw": 42,
+                     "proof_count": 2, "attempt_ids": ["attempt-a", "attempt-b"],
+                     "token": "cashuB_exact-BearerToken_0123456789"},
+                    {"mint_url": "https://other-mint.example", "unit": "msat", "amount_raw": 1000,
+                     "proof_count": 1, "attempt_ids": ["attempt-d"],
+                     "token": "cashuB_other-EXACT_token"}
+                ],
+                "unresolved": [
+                    {"attempt_id": "attempt-c", "state": "submitted",
+                     "reason": "mint said \"pending\"; inputs remain reserved"},
+                    {"attempt_id": "attempt-e", "state": "exported",
+                     "reason": "restore unavailable\nretry later"}
+                ]
+            })
+        );
+    }
 
     fn wallet_args(command: WalletCommand) -> WalletArgs {
         WalletArgs {

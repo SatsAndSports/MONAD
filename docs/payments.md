@@ -166,15 +166,19 @@ They cancel prepared attempts and rejected attempts without a successor, finish
 finalizing attempts, and finalize submitted attempts only with complete restored
 funding/change. Empty, partial, invalid, or unavailable restore evidence normally
 keeps a submitted attempt unresolved and reserved. With exclusive wallet maintenance
-access, `export-stale-opening-inputs` may mark an attempt `Exported` only 3600
-seconds after its latest authorized submission/replay, when exact funding/change
-restores are empty and one complete NUT-07 response reports every input `UNSPENT`.
-The durable transition precedes bearer-token output and does not release proofs.
-Recovery completes a delayed opening first; only exported attempts with every exact
-input `SPENT` and a final empty restore become `ExternallySpent`, atomically marking
-their proofs spent. Recent, clock-rollback, stale, or inconclusive evidence stays
-reserved. This policy is channel-opening-only, not a change to refunds, drains, or
-other swaps.
+access, `export-stale-opening-inputs` may include an attempt only 3600 seconds after
+its latest authorized submission/replay, when exact funding/change restores are
+empty and one complete NUT-07 response reports every input `UNSPENT`. Eligible
+attempts are grouped by mint/unit. For each token, one transaction revalidates and
+marks every represented attempt `Exported` before bearer-token output; proofs remain
+reserved. The report contains successful exports and per-attempt unresolved reasons,
+so an independent bad group cannot suppress a good one. Repeated runs may re-emit
+overlapping snapshots. Export does not finalize nonempty restores and instead
+directs the operator to `recover-openings`. Recovery completes a delayed opening
+first; only exported attempts with every exact input `SPENT` and a final empty
+restore become `ExternallySpent`, atomically marking their proofs spent. Recent,
+clock-rollback, stale, or inconclusive evidence stays reserved. This policy is
+channel-opening-only, not a change to refunds, drains, or other swaps.
 
 During a live opening, if the mint explicitly rejects code
 `12002` for an inactive output keyset, the client may refresh and persist one

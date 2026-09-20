@@ -147,22 +147,26 @@ paths and are released by the kernel after process death.
 
 ### Stale-Input Export Retains Custody
 
-Under exclusive wallet maintenance access, `export-stale-opening-inputs` may mark a
-submitted attempt `Exported`
-only when all of these are true:
+Under exclusive wallet maintenance access, `export-stale-opening-inputs` may include
+a submitted or already-exported attempt in a mint/unit token only when all of these
+are true:
 
 1. At least 3600 seconds have elapsed since its latest authorized submission or
    replay.
 2. Exact funding and change restores are valid and empty.
 3. One complete exact-input NUT-07 response reports every input `UNSPENT`.
-4. The durable export transition revalidates attempt state, latest timestamp,
-   latest execution sequence, and exact reservation membership.
+4. The durable group transition revalidates every represented attempt's state,
+   latest timestamp, latest execution sequence, and exact reservation membership
+   atomically before the token is exposed.
 
 The proofs remain reserved after export. Mints do not offer cancellation for a
 possibly submitted swap, so empty restore and `UNSPENT` observations prove only that
-no remote effect was visible at those observation points. Recovery still accepts a
-delayed completion. It marks an exported attempt `ExternallySpent` only after all
-exact inputs are `SPENT` and a final exact restore is empty.
+no remote effect was visible at those observation points. Results are reported per
+group/attempt; one failure does not suppress independent tokens, and repeated runs
+may re-emit overlapping snapshots. Export does not finalize a restored completion
+and instead requires `recover-openings`. Recovery still accepts a delayed
+completion. It marks an exported attempt `ExternallySpent` only after all exact
+inputs are `SPENT` and a final exact restore is empty.
 
 Recent, clock-rollback, stale, partial, invalid, unavailable, pending, or spent
 evidence remains unresolved and reserved.
@@ -210,18 +214,47 @@ Existing MONAD or pinned-upstream tests cover:
 - input-fee target selection, metadata refresh, nonpositive-net filtering, and
   the 992-input limit
 - wallet ownership exclusion and process-death lock release
+- two real prepared openings with different input keysets exported as one token,
+  decoded exact proof union, combined totals, retained reservations, canonical
+  keyset-group ordering, and deterministic re-export
+- export orchestration rollback when the second attempt update fails, with an
+  independent mint group still exporting successfully
+- malformed direct responses followed by invalid restore evidence retaining exact
+  custody, then successful idempotent recovery after reopening the wallet
+- invalid funding and change restores through wallet recovery: malformed JSON,
+  count and identity mismatch, malformed signatures, and well-formed incorrect
+  signature points rejected by DLEQ verification; change cases receive valid funding
+- explicit scripted replay rejection followed by real-mint completion of the saved
+  original request and post-restart recovery of exactly one channel without a successor
+- post-restart recovery making zero swap calls through its injected networking
+  interface, with exact input spend and one-time change import
+- real external spending of exported inputs into fresh ordinary outputs, followed
+  by reopened-wallet recovery reporting `ExternallySpent`, exact original rows
+  marked spent with reservations cleared, no imported channel/change, and a second
+  restart with empty recovery/export even after the test mint has stopped
+- export human/JSON rendering and actual opening-maintenance CLI rejection under
+  startup and steady-state runtime ownership, followed by success after lock release
+- actual configured runtime with a pending opening and gated startup restore:
+  maintenance subprocesses are rejected during startup and post-startup route
+  setup, with no additional mint requests or logical SQLite changes; after graceful
+  shutdown, recovery reports the unresolved attempt and export succeeds
 
-The following are worthwhile orchestration-level additions, not evidence that the
-underlying invariant is absent:
+Remaining coverage limitations, not evidence that the underlying invariant is absent:
 
-- inject each invalid direct/restored response through MONAD and assert final
-  journal/reservation state, including valid funding plus invalid change
-- delay the original request until after restore/checkstate and reject the replay,
-  then demonstrate later recovery of the original completion
-- exercise the complete stale-input export orchestration with controlled mint
-  restore/checkstate responses, not only storage-level evidence races
-- broaden multi-process and CLI lifecycle tests around ownership and mint-I/O
-  exclusion
+- delayed-original completion uses a sequential scripted network scenario, not
+  synchronized concurrent execution inside the mint
+- the zero-swap assertion observes the recovery networking interface, not all HTTP
+  traffic independently at the mint
+- the configured-runtime ownership test holds route establishment pending against
+  a controlled UDP endpoint; it tests the wallet manager's real steady-state
+  lifetime, not a connected/funded SOCKS route. The runtime runs through its public
+  configured entry point in the test process, while maintenance commands run as
+  separate CLI processes
+- the invalid direct-response test covers malformed JSON; the broader invalid
+  funding/change matrix exercises restore orchestration rather than every direct
+  response variant
+- dedicated mixed spent/unspent recovery tests remain deferred; conservative
+  handling of inconclusive evidence is unchanged
 
 ## Separate Follow-Up Areas
 
