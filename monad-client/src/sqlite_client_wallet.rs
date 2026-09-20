@@ -41,6 +41,45 @@ type ClientBridge =
     SpilmanClientBridge<ConfigurableClientHost<SqliteClientStorage>, ReqwestClientNetworking>;
 
 const CHANNEL_EXPIRY_SECONDS: u64 = 24 * 3600;
+
+#[cfg(feature = "funds-lifecycle-test")]
+mod lifecycle_test {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    pub fn boundary(name: &str) {
+        if std::env::var("MONAD_FUNDS_BOUNDARY").ok().as_deref() != Some(name) {
+            return;
+        }
+        let address: std::net::SocketAddr = std::env::var("MONAD_FUNDS_IPC")
+            .expect("test IPC address")
+            .parse()
+            .expect("test IPC socket");
+        assert!(address.ip().is_loopback());
+        let timeout = Duration::from_secs(45);
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&address, timeout).expect("test IPC connect");
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        stream.set_write_timeout(Some(timeout)).unwrap();
+        stream.write_all(name.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        let mut ack = [0];
+        stream
+            .read_exact(&mut ack)
+            .expect("test boundary acknowledgement");
+        assert_eq!(ack, [1]);
+    }
+
+    pub fn lifetime(default: u64) -> u64 {
+        std::env::var("MONAD_FUNDS_LIFETIME")
+            .map(|value| {
+                let seconds = value.parse::<u64>().expect("test lifetime");
+                assert!((5..=60).contains(&seconds));
+                seconds
+            })
+            .unwrap_or(default)
+    }
+}
 const MINT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Structured HTTP rejection retaining only status and numeric NUT-00 code,
@@ -1030,7 +1069,11 @@ impl SqliteClientWallet {
             ));
         }
         self.ensure_offer_keysets_cached(offer)?;
+        #[cfg(not(feature = "funds-lifecycle-test"))]
         let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
+        #[cfg(feature = "funds-lifecycle-test")]
+        let expiry_timestamp =
+            Self::now_seconds()? + lifecycle_test::lifetime(CHANNEL_EXPIRY_SECONDS);
         // Target-capacity provisioning computes the exact post-swap channel
         // capacity we want, selects loose proofs that can fund it after input
         // fees, and then asks the mint to swap those proofs into channel funding
@@ -2097,6 +2140,8 @@ impl SqliteClientWallet {
                 ));
             }
         }
+        #[cfg(feature = "funds-lifecycle-test")]
+        lifecycle_test::boundary("refund-finalizing");
         let recovered_amount_raw = proofs.iter().try_fold(0u64, |total, proof| {
             total
                 .checked_add(u64::from(proof.amount))
@@ -2119,6 +2164,8 @@ impl SqliteClientWallet {
         self.loose_wallet
             .import_proofs(&loose_proofs)
             .map_err(loose_proof_error)?;
+        #[cfg(feature = "funds-lifecycle-test")]
+        lifecycle_test::boundary("refund-import");
         {
             let bridge = self
                 .bridge
@@ -2133,7 +2180,11 @@ impl SqliteClientWallet {
                 })?;
             }
         }
+        #[cfg(feature = "funds-lifecycle-test")]
+        lifecycle_test::boundary("refund-upstream");
         self.mark_channel_metadata_closed(channel_id)?;
+        #[cfg(feature = "funds-lifecycle-test")]
+        lifecycle_test::boundary("refund-metadata");
         self.mark_channel_recovery_completed(
             channel_id,
             kind,
@@ -2647,6 +2698,8 @@ impl SqliteClientWallet {
                 })?;
         }
 
+        #[cfg(feature = "funds-lifecycle-test")]
+        lifecycle_test::boundary("opening-finalizing");
         {
             let bridge = self.bridge.lock().map_err(|_| {
                 open_channel_stage_error(
@@ -2658,6 +2711,8 @@ impl SqliteClientWallet {
             bridge.mark_completed_open(&completed)?;
         }
 
+        #[cfg(feature = "funds-lifecycle-test")]
+        lifecycle_test::boundary("opening-upstream");
         Ok(completed.result)
     }
 
@@ -2739,11 +2794,15 @@ impl SqliteClientWallet {
         self.loose_wallet
             .import_proofs(&change_proofs_to_loose_proofs(&open_result)?)
             .map_err(loose_proof_error)?;
+        #[cfg(feature = "funds-lifecycle-test")]
+        lifecycle_test::boundary("opening-change");
         self.store_open_channel_metadata(
             &open_result,
             &reservation.reservation_id,
             expiry_timestamp,
         )?;
+        #[cfg(feature = "funds-lifecycle-test")]
+        lifecycle_test::boundary("opening-metadata");
         self.loose_wallet
             .complete_opening_attempt_exact(&open_result.channel_id)
             .map_err(loose_proof_error)?;
@@ -3454,7 +3513,11 @@ impl MonadWallet for SqliteClientWallet {
     ) -> Result<String, WalletError> {
         let funding_token_target_raw = msats_to_raw_units(&offer.unit, funding_token_target_msats)
             .map_err(|error| preflight_offer_error(offer, error))?;
+        #[cfg(not(feature = "funds-lifecycle-test"))]
         let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
+        #[cfg(feature = "funds-lifecycle-test")]
+        let expiry_timestamp =
+            Self::now_seconds()? + lifecycle_test::lifetime(CHANNEL_EXPIRY_SECONDS);
         // Plain provisioning consumes strict smallest-first inputs until their
         // post-input-fee value covers the funding-token target. If the mint
         // rejects the first open because our cached output keyset is stale, the

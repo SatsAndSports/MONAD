@@ -707,3 +707,6 @@ This opens 16 bidirectional QUIC streams, sends 64KB of random data on each, rea
 `make test-funds-lifecycle` builds the client and relay CLIs and runs opt-in
 actual-process wallet lifecycle tests with a retained real CDK HTTP mint.
 See [coverage and private failure artifacts](monad-relay/tests/FUNDS_LIFECYCLE.md).
+`make test-funds-crashes` includes compile-gated fault injection and real-expiry
+refund tests. Its client binary is test-only; rebuild without features before use
+with real funds.

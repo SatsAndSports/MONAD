@@ -11,7 +11,13 @@ test-funds-lifecycle:
 	cargo build -p monad-client -p monad-relay --bins
 	MONAD_FUNDS_CLIENT_BIN=$(CURDIR)/target/debug/monad-client \
 	MONAD_FUNDS_RELAY_BIN=$(CURDIR)/target/debug/monad-relay \
-	cargo test -p monad-relay --test funds_lifecycle -- --ignored --nocapture
+	cargo test -p monad-relay --test funds_lifecycle -- --ignored --exact process_funds_lifecycle --nocapture
+
+test-funds-crashes:
+	cargo build -p monad-client -p monad-relay --bins --features monad-client/funds-lifecycle-test
+	MONAD_FUNDS_CLIENT_BIN=$(CURDIR)/target/debug/monad-client \
+	MONAD_FUNDS_RELAY_BIN=$(CURDIR)/target/debug/monad-relay \
+	cargo test -p monad-relay --test funds_lifecycle -- --ignored --nocapture --test-threads=1
 
 stress-tiny:
 	cargo test -p monad-relay --test stress -- --ignored stress_three_hop_quic_tiny --nocapture

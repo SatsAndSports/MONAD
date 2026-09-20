@@ -30,12 +30,21 @@ struct Ledger {
     swaps: BTreeMap<Vec<String>, (SwapRequest, SwapResponse)>,
     requests: usize,
     hold_success: bool,
+    hold_request: bool,
+    offline: bool,
+    http_requests: usize,
+    rejections: usize,
+    inactive_rejections: usize,
 }
 
 struct Process(Child);
 
 impl Process {
     fn spawn(binary: &Path, args: &[&str], config: &Path) -> Self {
+        Self::spawn_with_env(binary, args, config, &[])
+    }
+
+    fn spawn_with_env(binary: &Path, args: &[&str], config: &Path, env: &[(&str, &str)]) -> Self {
         eprintln!(
             "funds process {} {}",
             binary.file_name().unwrap().to_string_lossy(),
@@ -49,6 +58,10 @@ impl Process {
                 .args(&args[1..])
                 .env("RUST_LOG", "off")
                 .env("NO_PROXY", "*")
+                .env_remove("MONAD_FUNDS_BOUNDARY")
+                .env_remove("MONAD_FUNDS_IPC")
+                .env_remove("MONAD_FUNDS_LIFETIME")
+                .envs(env.iter().copied())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(
@@ -139,6 +152,17 @@ impl Fixture {
                     let committed = committed.clone();
                     let release = release.clone();
                     async move {
+                        let offline = {
+                            let mut ledger = ledger.lock().unwrap();
+                            ledger.http_requests += 1;
+                            ledger.offline
+                        };
+                        if offline {
+                            return axum::response::Response::builder()
+                                .status(503)
+                                .body(Body::empty())
+                                .unwrap();
+                        }
                         if request.uri().path() != "/v1/swap" {
                             return next.run(request).await;
                         }
@@ -147,11 +171,27 @@ impl Fixture {
                         let swap: SwapRequest = serde_json::from_slice(&bytes)
                             .expect("decode swap request (body redacted)");
                         ledger.lock().unwrap().requests += 1;
+                        let hold = std::mem::take(&mut ledger.lock().unwrap().hold_request);
+                        if hold {
+                            committed.notify_one();
+                            let permit = tokio::time::timeout(DEADLINE, release.acquire())
+                                .await
+                                .expect("request gate deadline")
+                                .unwrap();
+                            permit.forget();
+                        }
                         let response = next
                             .run(Request::from_parts(parts, Body::from(bytes)))
                             .await;
                         if !response.status().is_success() {
-                            return response;
+                            ledger.lock().unwrap().rejections += 1;
+                            let (parts, body) = response.into_parts();
+                            let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+                            let error: Value = serde_json::from_slice(&bytes).unwrap();
+                            if error["code"].as_u64() == Some(12002) {
+                                ledger.lock().unwrap().inactive_rejections += 1;
+                            }
+                            return axum::response::Response::from_parts(parts, Body::from(bytes));
                         }
                         let (parts, body) = response.into_parts();
                         let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
@@ -225,6 +265,8 @@ relays:
     quic_cert_seed: "{cert}"
     transport_key: "{transport}"
     listen: {relay}
+    channel_policy:
+      min_expiry: 1s
     trusted_mints:
       - url: {mint_url}
         units: [sat]
@@ -419,6 +461,192 @@ clients:
         .success()
         .await;
         self.audit().await;
+    }
+
+    fn active_channel(&self) -> String {
+        let channels = self
+            .db("channel.db")
+            .prepare("SELECT channel_id FROM monad_client_channels WHERE state != 'closed'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(channels.len(), 1);
+        channels.into_iter().next().unwrap()
+    }
+
+    async fn boundary_kill(&self, args: &[&str], boundary: &str) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let child = Process::spawn_with_env(
+            &self.client_bin,
+            args,
+            &self.config,
+            &[
+                ("MONAD_FUNDS_BOUNDARY", boundary),
+                ("MONAD_FUNDS_IPC", &addr),
+            ],
+        );
+        let mut stream = tokio::time::timeout(DEADLINE, async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut name = vec![0; boundary.len() + 1];
+            stream.read_exact(&mut name).await.unwrap();
+            assert!(
+                name == format!("{boundary}\n").as_bytes(),
+                "wrong durable boundary"
+            );
+            stream
+        })
+        .await
+        .expect("durable boundary not reached");
+        drop(child);
+        // The child was reaped before the blocked boundary could continue.
+        let _ = stream.write_all(&[1]).await;
+    }
+
+    async fn offline_recover(&self, args: &[&str]) {
+        let before = {
+            let mut ledger = self.ledger.lock().unwrap();
+            ledger.offline = true;
+            ledger.http_requests
+        };
+        self.client(args).success().await;
+        self.client(args).success().await;
+        let mut ledger = self.ledger.lock().unwrap();
+        assert_eq!(
+            ledger.http_requests, before,
+            "local finalization attempted mint IO"
+        );
+        ledger.offline = false;
+    }
+
+    async fn settle(&self, channel: &str, refund: bool) {
+        if !refund {
+            self.relay(&["wallet", "close", "--channel-id", channel])
+                .success()
+                .await;
+        }
+        self.client(&["wallet", "recover-channel", "--channel-id", channel])
+            .success()
+            .await;
+        let before = self.ledger.lock().unwrap().requests;
+        self.client(&["wallet", "recover-channel", "--channel-id", channel])
+            .success()
+            .await;
+        assert_eq!(before, self.ledger.lock().unwrap().requests);
+        if !refund {
+            self.relay(&[
+                "wallet",
+                "drain",
+                "--mint-url",
+                &self.mint_url,
+                "--unit",
+                "sat",
+            ])
+            .success()
+            .await;
+        }
+        self.audit().await;
+    }
+
+    pub async fn opening_boundary(&mut self, boundary: &str) {
+        self.cycle += 1;
+        eprintln!("funds boundary={boundary}");
+        let relay = self.relay(&["run"]);
+        self.boundary_kill(&["run"], boundary).await;
+        self.offline_recover(&["wallet", "recover-openings"]).await;
+        let client = self.client(&["run"]);
+        self.roundtrip().await;
+        drop(client);
+        drop(relay);
+        self.settle(&self.active_channel(), false).await;
+    }
+
+    pub async fn refund_case(&mut self, boundary: Option<&str>, rotate: bool, lost_response: bool) {
+        self.cycle += 1;
+        eprintln!(
+            "funds refund boundary={boundary:?} rotate={rotate} lost_response={lost_response}"
+        );
+        let relay = self.relay(&["run"]);
+        let client = Process::spawn_with_env(
+            &self.client_bin,
+            &["run"],
+            &self.config,
+            &[("MONAD_FUNDS_LIFETIME", "8")],
+        );
+        self.roundtrip().await;
+        drop(client);
+        drop(relay);
+        let channel = self.active_channel();
+        let expiry: u64 = self
+            .db("channel.db")
+            .query_row(
+                "SELECT expiry_timestamp FROM monad_client_channels WHERE channel_id = ?1",
+                [&channel],
+                |r| r.get(0),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            while std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                <= expiry
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("signed channel did not expire on wall clock");
+        let args = ["wallet", "recover-channel", "--channel-id", &channel];
+        if let Some(boundary) = boundary {
+            self.boundary_kill(&args, boundary).await;
+            self.offline_recover(&args).await;
+        } else {
+            let before = self.ledger.lock().unwrap().requests;
+            let rejections = self.ledger.lock().unwrap().inactive_rejections;
+            self.ledger.lock().unwrap().hold_request = rotate;
+            self.ledger.lock().unwrap().hold_success = lost_response;
+            let child = self.client(&args);
+            if rotate {
+                tokio::time::timeout(DEADLINE, self.committed.notified())
+                    .await
+                    .expect("refund request gate");
+                rotate_sat_keyset(&self.mint.mint(), 250).await.unwrap();
+                self.release.add_permits(1);
+            }
+            if lost_response {
+                tokio::time::timeout(DEADLINE, self.committed.notified())
+                    .await
+                    .expect("refund commit gate");
+                drop(child);
+                self.release.add_permits(1);
+                let submitted = self.ledger.lock().unwrap().requests;
+                self.client(&args).success().await;
+                assert_eq!(
+                    submitted,
+                    self.ledger.lock().unwrap().requests,
+                    "restore recovery resubmitted refund"
+                );
+            } else {
+                child.success().await;
+            }
+            if rotate {
+                let ledger = self.ledger.lock().unwrap();
+                assert_eq!(
+                    ledger.inactive_rejections,
+                    rejections + 1,
+                    "expected one direct 12002"
+                );
+                assert_eq!(
+                    ledger.requests,
+                    before + 2,
+                    "expected exactly one successor"
+                );
+            }
+        }
+        self.settle(&channel, true).await;
     }
 
     async fn audit(&self) {

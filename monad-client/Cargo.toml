@@ -3,6 +3,10 @@ name = "monad-client"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Fault-injection builds only. Never enable for a wallet holding real funds.
+funds-lifecycle-test = []
+
 [dependencies]
 monad-common = { path = "../monad-common" }
 monad-quic = { path = "../monad-quic" }
