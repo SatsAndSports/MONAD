@@ -164,6 +164,10 @@ monad-client wallet --config monad.yaml recover-openings
 monad-client wallet --config monad.yaml export-stale-opening-inputs
 ```
 
+Exports group inputs by mint/unit. Unchanged eligible proofs produce the same
+token encoding even when they span multiple input keysets; repeated output is not
+additional value and may contain proofs already present in an earlier export.
+
 One in-process `ClientWalletManager` owns the configured loose-proof and channel
 databases. Startup opens/migrates and performs recovery exactly once before any
 client starts, then all client leaves share that wallet. A second runtime using

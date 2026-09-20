@@ -695,7 +695,9 @@ exact empty funding/change restore, and complete all-`UNSPENT` NUT-07 evidence.
 It groups proofs by mint/unit, deterministically constructs one Cashu token per
 group, then atomically revalidates and marks every represented attempt `Exported`
 before exposing that token. Independent group failures become unresolved report
-entries rather than suppressing successful groups. Repeated runs are overlapping
+entries rather than suppressing successful groups. Token construction sorts both
+input proofs and the encoded keyset groups, including mixed-input-keyset exports.
+Repeated runs are overlapping
 best-effort snapshots and can re-emit still-reserved proofs. Export never applies a
 restored completion; it directs the operator to `recover-openings`. Recovery still
 checks exported attempts: a delayed completion wins; all exact inputs `SPENT` plus

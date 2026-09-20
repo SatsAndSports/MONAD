@@ -1308,16 +1308,18 @@ impl SqliteClientWallet {
                     let mint = mint_url.parse().map_err(|error| {
                         format!("parse exported token mint '{mint_url}': {error}")
                     })?;
-                    Ok((
-                        amount_raw,
-                        Token::new(
-                            mint,
-                            proofs.into_iter().map(|(_, proof)| proof).collect(),
-                            None,
-                            currency,
-                        )
-                        .to_string(),
-                    ))
+                    let mut token = Token::new(
+                        mint,
+                        proofs.into_iter().map(|(_, proof)| proof).collect(),
+                        None,
+                        currency,
+                    );
+                    if let Token::TokenV4(token) = &mut token {
+                        token
+                            .token
+                            .sort_by(|left, right| left.keyset_id.cmp(&right.keyset_id));
+                    }
+                    Ok((amount_raw, token.to_string()))
                 });
             let (amount_raw, token) =
                 match token {
@@ -7422,14 +7424,107 @@ mod tests {
             }
 
             if externally_spent_after_export {
-                let networking = StateCheckNetworking::new(CheckStateMode::States(vec![
-                    State::Spent;
-                    reservation.proofs.len()
-                ]));
-                assert!(matches!(
-                    wallet.recover_journaled_opening(&exported, &networking),
-                    Ok(OpeningRecoveryOutcome::ExternallySpent)
-                ));
+                // The partial-export fixture is independent of real external-spend recovery.
+                if include_broken_export_attempt {
+                    let _ = shutdown_tx.send(());
+                    mint_task.await.unwrap().unwrap();
+                    return;
+                }
+                let executions = wallet
+                    .loose_wallet()
+                    .opening_executions(&channel_id)
+                    .unwrap();
+                let original_rows = || {
+                    let conn = Connection::open(&loose_db).unwrap();
+                    proof_ids.iter().map(|proof_id| {
+                        conn.query_row(
+                            "SELECT proof_id, wallet_name, mint_url, unit, keyset_id, amount_raw,
+                                    proof_json, state, source_quote_id, source_batch_id,
+                                    reserved_by, spent_channel_id, created_at
+                             FROM monad_client_loose_proofs WHERE wallet_name = 'alice' AND proof_id = ?1",
+                            [proof_id],
+                            |row| (0..13).map(|index| row.get::<_, rusqlite::types::Value>(index)).collect::<Result<Vec<_>, _>>(),
+                        ).unwrap()
+                    }).collect::<Vec<_>>()
+                };
+                let mut expected_rows = original_rows();
+                for row in &mut expected_rows {
+                    assert_eq!(row[7], rusqlite::types::Value::Text("reserved".to_string()));
+                    assert_eq!(
+                        row[10],
+                        rusqlite::types::Value::Text(reservation.reservation_id.clone())
+                    );
+                    assert_eq!(row[11], rusqlite::types::Value::Null);
+                    row[7] = rusqlite::types::Value::Text("spent".to_string());
+                    row[10] = rusqlite::types::Value::Null;
+                }
+                // Spend the exported originals into unrelated ordinary outputs, not the
+                // prepared channel/change outputs that recovery would finalize.
+                let fresh: serde_json::Value = serde_json::from_str(
+                    &create_plain_blinded_messages(amount_raw - input_fee_raw, &keyset_info_json)
+                        .unwrap(),
+                )
+                .unwrap();
+                let prepared_request: serde_json::Value =
+                    serde_json::from_str(&prepared.swap_request_json).unwrap();
+                assert!(fresh["blinded_messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|output| {
+                        prepared_request["outputs"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|prepared| output["B_"] != prepared["B_"])
+                    }));
+                let response: serde_json::Value = client
+                    .post(format!("{mint_url}/v1/swap"))
+                    .json(&serde_json::json!({
+                        "inputs": serde_json::from_str::<serde_json::Value>(&input_proofs_json).unwrap(),
+                        "outputs": fresh["blinded_messages"],
+                    }))
+                    .send().await.unwrap().error_for_status().unwrap()
+                    .json().await.unwrap();
+                let fresh_proofs: Vec<Proof> = serde_json::from_str(
+                    &construct_proofs(
+                        &response["signatures"].to_string(),
+                        &fresh["secrets_with_blinding"].to_string(),
+                        &keyset_info_json,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    fresh_proofs
+                        .iter()
+                        .map(|proof| proof.amount.to_u64())
+                        .sum::<u64>(),
+                    amount_raw - input_fee_raw
+                );
+                drop(storage);
+                drop(wallet);
+                let wallet = SqliteClientWallet::open(
+                    LooseProofWallet::open(&loose_db, "alice").unwrap(),
+                    &channel_db,
+                    &sender_secret,
+                )
+                .unwrap();
+                let networking = ScriptedOpeningNetworking {
+                    inner: OpeningRecoveryHttpNetworking::new().unwrap(),
+                    scenario: OpeningOrchestrationScenario::RestoreOnly,
+                    swaps: Mutex::new(Vec::new()),
+                    restores: Mutex::new(0),
+                };
+                assert_eq!(
+                    wallet
+                        .recover_pending_openings_with_networking(&networking)
+                        .unwrap(),
+                    OpeningRecoveryReport {
+                        externally_spent_attempt_ids: vec![channel_id.clone()],
+                        ..Default::default()
+                    }
+                );
                 assert_eq!(
                     wallet
                         .loose_wallet()
@@ -7444,8 +7539,64 @@ mod tests {
                     .proofs_for_reservation(&reservation.reservation_id)
                     .unwrap()
                     .is_empty());
+                assert_eq!(original_rows(), expected_rows);
+                assert_eq!(
+                    wallet
+                        .loose_wallet()
+                        .opening_executions(&channel_id)
+                        .unwrap(),
+                    executions
+                );
+                assert_eq!(
+                    wallet
+                        .loose_wallet()
+                        .available_balance_raw(&mint_url, unit, std::slice::from_ref(&keyset_id))
+                        .unwrap(),
+                    0
+                );
+                assert!(wallet.get_channel(&channel_id).is_err());
+                let conn = Connection::open(&loose_db).unwrap();
+                let proof_count: usize = conn.query_row(
+                    "SELECT COUNT(*) FROM monad_client_loose_proofs WHERE wallet_name = 'alice'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(proof_count, proof_ids.len(), "no channel change imported");
+                drop(conn);
+                assert!(networking.swaps.lock().unwrap().is_empty());
+                let restores = *networking.restores.lock().unwrap();
+                assert!(restores > 0);
+                drop(wallet);
+                let wallet = SqliteClientWallet::open(
+                    LooseProofWallet::open(&loose_db, "alice").unwrap(),
+                    &channel_db,
+                    &sender_secret,
+                )
+                .unwrap();
+                // Shut down the mint as well: terminal scans must need no network.
                 let _ = shutdown_tx.send(());
                 mint_task.await.unwrap().unwrap();
+                assert!(wallet
+                    .recover_pending_openings_with_networking(&networking)
+                    .unwrap()
+                    .is_empty());
+                let locks =
+                    ClientWalletLocks::acquire(&loose_db, &channel_db, WalletLockMode::Maintenance)
+                        .unwrap();
+                let report = wallet
+                    .export_stale_opening_inputs(&locks.exclusive_access().unwrap())
+                    .unwrap();
+                assert!(report.exports.is_empty());
+                assert!(report.unresolved.is_empty());
+                assert!(networking.swaps.lock().unwrap().is_empty());
+                assert_eq!(*networking.restores.lock().unwrap(), restores);
+                assert_eq!(original_rows(), expected_rows);
+                assert_eq!(
+                    wallet
+                        .loose_wallet()
+                        .opening_executions(&channel_id)
+                        .unwrap(),
+                    executions
+                );
                 return;
             }
         }
@@ -7690,15 +7841,21 @@ mod tests {
         mints.sort_by(|left, right| left.0.cmp(&right.0));
         let mut groups = Vec::new();
         for (group_index, (mint_url, helper)) in mints.iter().enumerate() {
-            let offer = offer(
-                mint_url,
-                "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
-                &helper.keyset_id().to_string(),
-            );
-            wallet.ensure_offer_keysets_cached(&offer).unwrap();
             let mut attempts = Vec::new();
             for opening_index in 0..if group_index == 0 { 2 } else { 1 } {
+                let keyset_id = if opening_index == 0 {
+                    helper.keyset_id()
+                } else {
+                    rotate_sat_keyset(&helper.mint(), 0).await.unwrap()
+                };
+                let offer = offer(
+                    mint_url,
+                    "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+                    &keyset_id.to_string(),
+                );
+                wallet.ensure_offer_keysets_cached(&offer).unwrap();
                 let proofs = helper.mint_proofs(128).await.unwrap();
+                assert!(proofs.iter().all(|proof| proof.keyset_id == keyset_id));
                 let batch = format!("group-{group_index}-opening-{opening_index}");
                 wallet
                     .loose_wallet()
@@ -7828,6 +7985,19 @@ mod tests {
             }
         }
         let token: Token = exported.token.parse().unwrap();
+        let Token::TokenV4(v4) = &token else {
+            panic!("expected TokenV4 export");
+        };
+        let input_keysets = expected_proofs
+            .iter()
+            .map(|proof| proof.keyset_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(input_keysets.len(), if fail_first_group { 1 } else { 2 });
+        assert_eq!(v4.token.len(), input_keysets.len());
+        assert!(v4
+            .token
+            .windows(2)
+            .all(|groups| groups[0].keyset_id < groups[1].keyset_id));
         assert_eq!(token.mint_url().unwrap().to_string(), exported.mint_url);
         assert_eq!(token.unit(), Some(CurrencyUnit::Sat));
         let keysets: cashu::nuts::KeysetResponse = client
