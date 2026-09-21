@@ -250,7 +250,9 @@ The test suite currently covers:
   rotation and close/refund races. `make stress-funds-lifecycle` accepts
   `MONAD_FUNDS_SEED` and `MONAD_FUNDS_CYCLES` for bounded-purse repetitions.
   Crash/stress targets explicitly enable the client `funds-lifecycle-test` feature;
-  never use that binary with real funds, and rebuild without features afterward.
+  their CLIs are isolated in `target/funds-lifecycle/debug`, leaving normal
+  `target/debug` and `target/release` binaries untouched. Never use the isolated
+  instrumented client with real funds. No normal-binary rebuild is required afterward.
   Exact scope, accounting and secret artifact handling are documented in
   `monad-relay/tests/FUNDS_LIFECYCLE.md`.
 
