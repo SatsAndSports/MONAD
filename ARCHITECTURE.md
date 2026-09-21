@@ -28,6 +28,11 @@ offline finalization never rejects already-verified proofs using current time.
 Expiry errors (`12003`) do not authorize changed immutable requests. CDK may hide
 expired signatures in restore, so an empty restore is not proof of nonexecution.
 
+After close funding is observed non-unspent, the final exact restore pass checks
+every saved close attempt, including a rejected predecessor. A verified payout
+wins over conflicting-keyset responses from another saved attempt. Malformed or
+unavailable evidence remains unresolved and never becomes a zero-value close.
+
 MONAD is a multi-hop TCP tunneling system with three main layers:
 
 ```text

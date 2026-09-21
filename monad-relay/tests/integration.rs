@@ -1827,6 +1827,7 @@ impl DrainSwapNetworking for RejectSwap {
 }
 
 struct DrainTestContext {
+    mint: Arc<cdk::Mint>,
     mint_url: String,
     wallet_manager: RelayWalletManager,
     payments: Arc<SpilmanRelayPayments>,
@@ -1889,6 +1890,7 @@ impl DrainTestContext {
         };
 
         Self {
+            mint: mint_helper.mint(),
             mint_url,
             wallet_manager,
             payments,
@@ -11336,6 +11338,97 @@ async fn test_close_server_error_and_replay_rejection_preserve_exact_request() {
         .await
         .unwrap();
     assert!(completed.receiver_sum >= 450);
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_final_close_restore_checks_predecessor_then_successor_after_spent() {
+    use monad_relay::mint_recovery::RecoveryMintClient;
+    struct DelayedRestore<'a> {
+        inner: &'a RelayWalletMintClient,
+        mint: Arc<cdk::Mint>,
+        swaps: AtomicUsize,
+        spent: std::sync::atomic::AtomicBool,
+        final_ids: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl cdk_spilman::SpilmanAsyncMintClient for DelayedRestore<'_> {
+        async fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+            panic!("checked transport required")
+        }
+    }
+    #[async_trait::async_trait]
+    impl RecoveryMintClient for DelayedRestore<'_> {
+        async fn swap_checked(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+            if self.swaps.fetch_add(1, Ordering::SeqCst) == 0 {
+                cdk_spilman_test_mint::rotate_sat_keyset(&self.mint, 250).await?;
+            }
+            let _ = self.inner.swap_checked(mint, request).await?;
+            anyhow::bail!("lost committed close response")
+        }
+        async fn restore(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+            if !self.spent.load(Ordering::SeqCst) {
+                return Ok(r#"{"outputs":[],"signatures":[]}"#.to_string());
+            }
+            let request_json: serde_json::Value = serde_json::from_str(request)?;
+            self.final_ids.lock().unwrap().push(
+                request_json["outputs"][0]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            self.inner.restore(mint, request).await
+        }
+        async fn check_state(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+            let response = self.inner.check_state(mint, request).await?;
+            let state: cashu::nuts::CheckStateResponse = serde_json::from_str(&response)?;
+            self.spent.store(
+                state
+                    .states
+                    .iter()
+                    .all(|s| s.state == cashu::nuts::State::Spent),
+                Ordering::SeqCst,
+            );
+            Ok(response)
+        }
+    }
+    let ctx = DrainTestContext::new("final-close-restore").await;
+    let channel = create_paid_open_channel_with_expiry(
+        &ctx.payments,
+        &ctx.wallet,
+        &ctx.offer,
+        [34; 32],
+        450,
+        cashu::util::unix_time() + 86_400,
+    )
+    .await;
+    let inner = ctx.net_for(&channel);
+    let net = DelayedRestore {
+        inner: &inner,
+        mint: ctx.mint.clone(),
+        swaps: AtomicUsize::new(0),
+        spent: std::sync::atomic::AtomicBool::new(false),
+        final_ids: Mutex::new(Vec::new()),
+    };
+    let completed = ctx
+        .wallet_manager
+        .close_channel(&channel, &net)
+        .await
+        .unwrap();
+    assert!(completed.receiver_sum >= 450);
+    assert_eq!(net.swaps.load(Ordering::SeqCst), 2);
+    let ids = net.final_ids.lock().unwrap().clone();
+    assert_eq!(
+        ids.len(),
+        2,
+        "final restore must cover both immutable attempts"
+    );
+    assert_eq!(ids[0], ctx.offer.preferred_keyset_ids[0]);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(
+        ctx.payments.channel_state(&channel),
+        Some(ChannelState::Closed)
+    );
     ctx.shutdown();
 }
 

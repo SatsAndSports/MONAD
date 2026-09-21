@@ -315,19 +315,34 @@ impl SpilmanRelayPayments {
                 {
                     // A sender refund may have won. A spent observation is not
                     // proof of that outcome and never becomes a zero-value close.
-                    let response = mint
-                        .restore(
-                            &prepared.mint_url,
-                            &serde_json::json!({"outputs": prepared.swap_request["outputs"]})
-                                .to_string(),
-                        )
-                        .await
-                        .map_err(|_| error("final close restore failed; reservation retained"))?;
-                    if let Some(completed) = self
-                        .bridge
-                        .complete_prepared_close_restore(&response, prepared)?
-                    {
-                        journal.finalizing = Some(completed);
+                    // State may have changed during the first restore pass. Check
+                    // every saved request again, including rejected predecessors.
+                    let mut invalid_restore = false;
+                    for attempt in &journal.attempts {
+                        let prepared = &attempt.prepared;
+                        let response = mint
+                            .restore(
+                                &prepared.mint_url,
+                                &serde_json::json!({"outputs": prepared.swap_request["outputs"]})
+                                    .to_string(),
+                            )
+                            .await
+                            .map_err(|_| {
+                                error("final close restore failed; reservation retained")
+                            })?;
+                        match self
+                            .bridge
+                            .complete_prepared_close_restore(&response, prepared)
+                        {
+                            Ok(Some(completed)) => {
+                                journal.finalizing = Some(completed);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(_) => invalid_restore = true,
+                        }
+                    }
+                    if journal.finalizing.is_some() {
                         let next = serde_json::to_string(&journal)
                             .map_err(|_| error("serialize close finalization"))?;
                         storage
@@ -337,6 +352,9 @@ impl SpilmanRelayPayments {
                         #[cfg(feature = "funds-lifecycle-test")]
                         crate::lifecycle_test::boundary("close-finalizing");
                         continue;
+                    }
+                    if invalid_restore {
+                        return Err(error("invalid final close restore; outcome unresolved"));
                     }
                     return Err(error(
                         "close inputs not conclusively unspent; outcome unresolved",
