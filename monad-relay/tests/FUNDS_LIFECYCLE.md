@@ -33,6 +33,13 @@ oracle covers the later sender recovery and receiver drain. These cases exposed
 and now cover preservation of the signed nominal split across fee rotation and
 sender discovery under historical non-funding output keys.
 
+Receiver drain covers the same six durable boundaries, prepared-only recovery,
+HTTP request/response gates, and changed-output-keyset successor response loss.
+Finalizing and completed drain recovery is repeated in fresh offline CLIs and
+asserts zero attempted HTTP; terminal proofs remain solely in the relay DB.
+The close/refund race matrix also kills the winning close with its accepted
+response withheld while the sender attempts recovery.
+
 Opening boundaries cover durable finalizing, upstream saved, change imported,
 and metadata saved. Refund boundaries cover durable finalizing, loose-proof
 import, upstream closed, and metadata closed. Refund tests sign eight-second
@@ -95,12 +102,24 @@ warning; never upload it. Console events contain only operation names and totals
 - [x] Seeded bounded-purse stress and safe capacity/fee stop guard.
 - [x] Receiver close local journal boundary SIGKILL and offline finalization.
 - [x] Receiver close rejection/successor persistence and rotated response loss.
+- [x] Receiver drain journal SIGKILL, preparation recovery and offline completion.
+- [x] Receiver drain rejection/successor persistence and rotated response loss.
 
 ## Validation
 
-Receiver-close extension: `make test-funds-crashes` passes all eight process tests,
-including six close persistence boundaries and rotated accepted-response loss.
-Default `cargo test` passes 552 tests; strict all-target/all-features Clippy passes.
+Full relay-recovery stack validation:
+
+- Default and isolated all-feature `cargo test`: 556 passed each, no failures.
+- Strict all-target/all-features Clippy and formatting checks pass.
+- `make test-funds-crashes`: ten process tests passed, including six close and
+  six drain persistence boundaries, historical-key rotation/response loss,
+  offline finalization and close/refund races with a lost winning close response.
+- Expanded-schedule seeds 1, 2 and 3: 12 cycles each, all passed.
+- Expanded-schedule seed 20260921, 256-cycle limit: stopped at the capacity/fee
+  margin after 157 cycles in 568.95s, with 448 unique successful input sets.
+  Final custody was 1946 client sats + 13417 receiver sats + 1021 actual fee sats
+  = the original 16384 sats. No replenishment or relaxed oracle.
+
 The earlier baseline and stress results below predate this extension:
 
 - Full default `cargo test` and `cargo test --all-features`: each 547 passed,
@@ -117,7 +136,8 @@ The earlier baseline and stress results below predate this extension:
 
 The process tests use SQLite process-death durability, not physical power-loss
 durability. They do not cover an actual mint restart, external stale-input token
-export, every byte-level persistence interruption, or relay drain local
-finalization crash boundaries. Those are not implied by the boundary matrix.
+export or every byte-level persistence interruption. Those are not implied by
+the boundary matrix. The extended seeded schedule includes relay close/drain
+boundary crashes and successor response loss; old seed totals are historical.
 
 Stale export to an external wallet is explicitly out of scope.

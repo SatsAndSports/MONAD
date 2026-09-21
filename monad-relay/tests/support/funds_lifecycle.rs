@@ -763,6 +763,121 @@ clients:
         self.settle(&channel, true).await;
     }
 
+    pub async fn relay_drain_case(
+        &mut self,
+        boundary: Option<&str>,
+        rotate: bool,
+        lost_response: bool,
+    ) {
+        self.cycle += 1;
+        eprintln!(
+            "funds relay drain boundary={boundary:?} rotate={rotate} lost_response={lost_response}"
+        );
+        let relay = self.relay(&["run"]);
+        let client = self.client(&["run"]);
+        self.roundtrip().await;
+        drop(client);
+        drop(relay);
+        let channel = self.active_channel();
+        self.relay(&["wallet", "close", "--channel-id", &channel])
+            .success()
+            .await;
+        self.client(&["wallet", "recover-channel", "--channel-id", &channel])
+            .success()
+            .await;
+        let args = [
+            "wallet",
+            "drain",
+            "--mint-url",
+            &self.mint_url,
+            "--unit",
+            "sat",
+        ];
+        if let Some(boundary) = boundary {
+            let selected = [
+                "wallet",
+                "--relay",
+                "funds",
+                "drain",
+                "--mint-url",
+                &self.mint_url,
+                "--unit",
+                "sat",
+            ];
+            if rotate {
+                self.ledger.lock().unwrap().hold_request = true;
+                let rotation = async {
+                    tokio::time::timeout(DEADLINE, self.committed.notified())
+                        .await
+                        .expect("drain rejection request gate");
+                    rotate_sat_keyset(&self.mint.mint(), 200).await.unwrap();
+                    self.release_gate().await;
+                };
+                tokio::join!(
+                    self.binary_boundary_kill(&self.relay_bin, &selected, boundary),
+                    rotation
+                );
+            } else {
+                self.binary_boundary_kill(&self.relay_bin, &selected, boundary)
+                    .await;
+            }
+        } else {
+            self.ledger.lock().unwrap().hold_request = rotate;
+            self.ledger.lock().unwrap().hold_success = lost_response;
+            let child = self.relay(&args);
+            if rotate {
+                tokio::time::timeout(DEADLINE, self.committed.notified())
+                    .await
+                    .expect("drain request gate");
+                rotate_sat_keyset(&self.mint.mint(), 200).await.unwrap();
+                self.release_gate().await;
+            }
+            if lost_response {
+                tokio::time::timeout(DEADLINE, self.committed.notified())
+                    .await
+                    .expect("drain response gate");
+                drop(child);
+                self.release_gate().await;
+                rotate_sat_keyset(&self.mint.mint(), 350).await.unwrap();
+            } else {
+                child.success().await;
+            }
+        }
+        let id: String = self
+            .db("relay.db")
+            .query_row(
+                "SELECT drain_id FROM monad_relay_drained_channels WHERE channel_id=?1",
+                [&channel],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let recovery = ["wallet", "recover-drain", "--drain-id", &id];
+        let offline = matches!(boundary, Some("drain-finalizing" | "drain-completed"));
+        let before = {
+            let mut ledger = self.ledger.lock().unwrap();
+            ledger.offline = offline;
+            ledger.http_requests
+        };
+        self.relay(&recovery).success().await;
+        let first_requests = self.ledger.lock().unwrap().http_requests;
+        self.relay(&recovery).success().await;
+        {
+            let mut ledger = self.ledger.lock().unwrap();
+            assert_eq!(
+                ledger.http_requests, first_requests,
+                "completed drain recovery attempted HTTP"
+            );
+            if offline {
+                assert_eq!(
+                    ledger.http_requests, before,
+                    "offline drain finalization attempted HTTP"
+                );
+            }
+            ledger.offline = false;
+        }
+        self.audit().await;
+    }
+
     async fn open_expired(&self) -> String {
         let relay = self.relay(&["run"]);
         let client = Process::spawn_with_env(
@@ -922,6 +1037,30 @@ clients:
         self.settle(&channel, !close_status.success()).await;
     }
 
+    pub async fn close_winner_response_loss(&mut self) {
+        self.cycle += 1;
+        let channel = self.open_expired().await;
+        let before = self.ledger.lock().unwrap().swaps.len();
+        self.ledger.lock().unwrap().hold_success = true;
+        let close = self.relay(&["wallet", "close", "--channel-id", &channel]);
+        tokio::time::timeout(DEADLINE, self.committed.notified())
+            .await
+            .expect("close winner response gate");
+        let refund = self.client(&["wallet", "recover-channel", "--channel-id", &channel]);
+        drop(close);
+        self.release_gate().await;
+        refund.success().await;
+        self.relay(&["wallet", "close", "--channel-id", &channel])
+            .success()
+            .await;
+        assert_eq!(
+            self.ledger.lock().unwrap().swaps.len(),
+            before + 1,
+            "lost close response caused another funding spend"
+        );
+        self.settle(&channel, false).await;
+    }
+
     pub async fn rotate(&self, ppk: u64) {
         rotate_sat_keyset(&self.mint.mint(), ppk).await.unwrap();
     }
@@ -993,7 +1132,7 @@ clients:
             random = random
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            let choice = (random >> 32) % 6;
+            let choice = (random >> 32) % 10;
             eprintln!("funds stress seed={seed} step={step} choice={choice}");
             match choice {
                 0 => self.cycle(false).await,
@@ -1001,10 +1140,20 @@ clients:
                 2 => self.opening_boundary("opening-change").await,
                 3 => self.refund_case(None, false, true).await,
                 4 => self.opening_request(true, false).await,
-                _ => {
+                5 => {
                     self.rotate(100 + (random % 400)).await;
                     self.cycle(false).await;
                 }
+                6 => {
+                    self.relay_close_case(Some("close-finalizing"), false, false)
+                        .await
+                }
+                7 => self.relay_close_case(None, true, true).await,
+                8 => {
+                    self.relay_drain_case(Some("drain-prepared"), false, false)
+                        .await
+                }
+                _ => self.relay_drain_case(None, true, true).await,
             }
         }
         self.audit().await;

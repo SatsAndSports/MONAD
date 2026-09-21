@@ -4,6 +4,34 @@ mod support;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated fault-injection relay; make test-funds-crashes"]
+async fn process_relay_drain_journal_boundaries() {
+    let mut fixture = support::Fixture::start().await;
+    for boundary in [
+        "drain-prepared",
+        "drain-submitting",
+        "drain-finalizing",
+        "drain-completed",
+    ] {
+        fixture.relay_drain_case(Some(boundary), false, false).await;
+    }
+    for boundary in ["drain-rejected", "drain-successor"] {
+        fixture.relay_drain_case(Some(boundary), true, false).await;
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated fault-injection relay; make test-funds-crashes"]
+async fn process_relay_drain_response_loss_and_rotation() {
+    let mut fixture = support::Fixture::start().await;
+    fixture.relay_drain_case(None, false, true).await;
+    fixture.relay_drain_case(None, true, false).await;
+    fixture.relay_drain_case(None, true, true).await;
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated fault-injection relay; make test-funds-crashes"]
 async fn process_relay_close_journal_boundaries() {
     let mut fixture = support::Fixture::start().await;
     for boundary in [
@@ -93,6 +121,7 @@ async fn process_close_refund_races() {
     for winner in [Some(false), Some(true), None] {
         fixture.race(winner).await;
     }
+    fixture.close_winner_response_loss().await;
     fixture.finish().await;
 }
 
