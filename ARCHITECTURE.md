@@ -16,6 +16,18 @@ Process-kill tests cannot establish power-loss safety on hardware that lies abou
 sync completion. Backups require consistent SQLite snapshots of every wallet DB,
 not copies that omit live WAL state.
 
+Output selection treats activity and final expiry independently. A keyset is
+expired when `now > final_expiry`, matching the pinned CDK; absent expiry is
+unlimited and zero is expired at current wall time. New MONAD funding additionally
+requires final expiry strictly beyond the normal 24-hour lifetime plus a named
+24-hour recovery window. Close/drain/refund outputs have no relay advertisement
+or negotiated-format filter; funding keeps those policy filters. Cache warmup
+tests usable output selection, not merely same-unit metadata presence. Historical
+keys remain available for exact restore and sender denomination discovery, and
+offline finalization never rejects already-verified proofs using current time.
+Expiry errors (`12003`) do not authorize changed immutable requests. CDK may hide
+expired signatures in restore, so an empty restore is not proof of nonexecution.
+
 MONAD is a multi-hop TCP tunneling system with three main layers:
 
 ```text

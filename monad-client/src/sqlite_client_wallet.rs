@@ -41,6 +41,7 @@ type ClientBridge =
     SpilmanClientBridge<ConfigurableClientHost<SqliteClientStorage>, ReqwestClientNetworking>;
 
 const CHANNEL_EXPIRY_SECONDS: u64 = 24 * 3600;
+const FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS: u64 = 24 * 3600;
 
 #[cfg(feature = "funds-lifecycle-test")]
 mod lifecycle_test {
@@ -1973,15 +1974,21 @@ impl SqliteClientWallet {
             }
             let mut entries = bridge.cached_keysets_for_unit(mint, &established.params.unit);
             entries.sort_by_key(|(id, _)| id.to_string());
-            if let Some((_, entry)) = entries.into_iter().find(|(_, entry)| entry.active) {
-                return parse_keyset_info_from_json(&entry.info_json).map_err(WalletError::Backend);
+            let now = Self::now_seconds()?;
+            if let Some(info) = entries
+                .into_iter()
+                .filter(|(_, entry)| entry.active)
+                .filter_map(|(_, entry)| parse_keyset_info_from_json(&entry.info_json).ok())
+                .find(|info| info.is_unexpired_at(now))
+            {
+                return Ok(info);
             }
             if refresh {
                 break;
             }
         }
         Err(WalletError::Backend(
-            "no active same-unit refund output keyset".to_string(),
+            "no unexpired active same-unit refund output keyset".to_string(),
         ))
     }
 
@@ -4072,11 +4079,25 @@ where
     N: SpilmanClientNetworking,
 {
     let unit = parse_currency_unit(&offer.unit)?;
+    // Leave one normal channel lifetime for post-expiry recovery. This only
+    // selects new funding keys; historical restore never applies wall-clock expiry.
+    let funding_valid_until = SqliteClientWallet::now_seconds()?
+        .checked_add(CHANNEL_EXPIRY_SECONDS + FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS)
+        .ok_or_else(|| WalletError::Backend("funding keyset expiry overflow".to_string()))?;
     let active_ids = bridge.cached_active_keyset_ids(&offer.mint_url, &unit);
     let mut compatible_ids = active_ids
         .into_iter()
         .map(|id| id.to_string())
         .filter(|id| offer.keyset_is_compatible(id))
+        .filter(|id| {
+            cached_keyset_info_json(bridge, &offer.mint_url, id)
+                .ok()
+                .and_then(|json| parse_keyset_info_from_json(&json).ok())
+                .is_some_and(|info| {
+                    info.final_expiry
+                        .is_none_or(|expiry| expiry > funding_valid_until)
+                })
+        })
         .collect::<Vec<_>>();
     compatible_ids.sort();
 
@@ -7075,7 +7096,11 @@ mod tests {
                 "http://mint",
                 id,
                 ClientKeysetCacheEntry {
-                    info_json: "{}".to_string(),
+                    info_json: serde_json::json!({
+                        "keysetId": id.to_string(), "unit": unit.to_string(),
+                        "inputFeePpk": 0,
+                        "keys": {"1": SecretKey::from_hex("01".repeat(32)).unwrap().public_key().to_hex()}
+                    }).to_string(),
                     active,
                     unit,
                 },
@@ -10339,6 +10364,53 @@ mod tests {
 
         let selected = active_output_keyset_id_from_cache(&bridge, &offer).unwrap();
         assert_eq!(selected, OutputKeysetSelection::Selected(new.to_string()));
+    }
+
+    #[test]
+    fn funding_output_selection_requires_lifetime_and_recovery_window() {
+        let id = test_keyset_id(&"01".repeat(32));
+        let now = SqliteClientWallet::now_seconds().unwrap();
+        for (expiry, usable) in [
+            (None, true),
+            (Some(0), false),
+            (Some(now - 1), false),
+            (Some(now + CHANNEL_EXPIRY_SECONDS), false),
+            (
+                Some(now + CHANNEL_EXPIRY_SECONDS + FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS),
+                false,
+            ),
+            (
+                Some(now + CHANNEL_EXPIRY_SECONDS + FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS + 60),
+                true,
+            ),
+        ] {
+            let host = ConfigurableClientHost::new_in_memory();
+            host.set_keyset("http://mint", id, ClientKeysetCacheEntry {
+                unit: CurrencyUnit::Sat, active: true,
+                info_json: serde_json::json!({
+                    "keysetId": id.to_string(), "unit": "sat", "inputFeePpk": 0,
+                    "finalExpiry": expiry,
+                    "keys": {"1": SecretKey::from_hex("01".repeat(32)).unwrap().public_key().to_hex()}
+                }).to_string(),
+            }).unwrap();
+            let bridge = SpilmanClientBridge::new(host, NoopClientNetworking);
+            let offer = RelayPaymentOffer {
+                receiver_pubkey: "receiver".to_string(),
+                mint_url: "http://mint".to_string(),
+                unit: "sat".to_string(),
+                preferred_keyset_ids: vec![id.to_string()],
+                negotiated_keyset_versions: BTreeSet::from(["v1".to_string()]),
+                in_bytes_per_millisat: 1,
+                out_bytes_per_millisat: 1,
+            };
+            assert_eq!(
+                matches!(
+                    active_output_keyset_id_from_cache(&bridge, &offer).unwrap(),
+                    OutputKeysetSelection::Selected(_)
+                ),
+                usable
+            );
+        }
     }
 
     #[test]

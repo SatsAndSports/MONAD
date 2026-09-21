@@ -440,8 +440,8 @@ impl SpilmanRelayPayments {
         channel_id: &str,
         keyset_refresher: &R,
     ) -> Result<(), CloseError> {
-        let (mint_url, unit) = self.close_mint_unit(channel_id)?;
-        if !self.has_close_keysets(&mint_url, &unit) {
+        let (mint_url, _) = self.close_mint_unit(channel_id)?;
+        if self.select_close_output_keyset(channel_id).is_err() {
             keyset_refresher.refresh(&mint_url).await.map_err(|e| {
                 CloseError::storage_failed(format!("refresh keysets before close: {e}"))
             })?;
@@ -462,15 +462,6 @@ impl SpilmanRelayPayments {
             .ok_or_else(|| CloseError::storage_failed("missing funding mint"))?
             .to_string();
         Ok((mint_url, channel.unit.as_str().to_string()))
-    }
-
-    fn has_close_keysets(&self, mint_url: &str, unit: &str) -> bool {
-        self.mint_cache
-            .read()
-            .expect("spilman mint cache lock poisoned")
-            .keysets
-            .get(mint_url)
-            .is_some_and(|by_id| by_id.values().any(|keyset| keyset.unit == unit))
     }
 
     fn select_close_output_keyset(

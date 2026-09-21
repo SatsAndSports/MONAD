@@ -1434,7 +1434,10 @@ impl RelayWalletManager {
                 continue;
             }
             input_fee_ppk_by_keyset.insert(keyset_id.clone(), keyset.input_fee_ppk);
-            if keyset.active {
+            if keyset.active
+                && cdk_spilman::parse_keyset_info_from_json(&keyset.info_json)
+                    .is_ok_and(|info| info.is_unexpired_at(cashu::util::unix_time()))
+            {
                 active_output_keysets.push((keyset_id.clone(), keyset.info_json.clone()));
             }
         }
@@ -1451,16 +1454,7 @@ impl RelayWalletManager {
     }
 
     async fn ensure_drain_keysets_cached(&self, mint_url: &str, unit: &str) -> Result<(), String> {
-        let has_cached_keysets = {
-            let cache = self
-                .keyset_cache
-                .read()
-                .expect("relay wallet keyset cache lock poisoned");
-            cache
-                .keysets
-                .get(mint_url)
-                .is_some_and(|by_id| by_id.values().any(|keyset| keyset.unit == unit))
-        };
+        let has_cached_keysets = self.drain_keysets_from_shared_cache(mint_url, unit).is_ok();
         if !has_cached_keysets {
             self.refresh_all_keysets_for_mint_into_shared_cache(mint_url)
                 .await?;

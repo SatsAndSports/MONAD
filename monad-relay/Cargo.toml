@@ -29,14 +29,14 @@ dotenvy = "0.15"
 rusqlite = "0.31"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "9a0932447d7b291d378afe9fab4e58f8dae927da", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest"] }
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "d148f06894e9b5e7af8f4ebd20d1f13fae97b7f5", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest"] }
 cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cashu", default-features = false }
 
 [dev-dependencies]
 monad-client = { path = "../monad-client" }
 monad-quic = { path = "../monad-quic" }
 quinn = "0.11"
-cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "9a0932447d7b291d378afe9fab4e58f8dae927da", package = "cdk-spilman-test-mint", default-features = false, features = ["http"] }
+cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "d148f06894e9b5e7af8f4ebd20d1f13fae97b7f5", package = "cdk-spilman-test-mint", default-features = false, features = ["http"] }
 cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cdk", default-features = false, features = ["mint"] }
 axum = "0.8.9"
 tempfile = "3"

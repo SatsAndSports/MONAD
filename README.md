@@ -19,6 +19,12 @@ data may still be in WAL files). This is not atomic across separate databases an
 depends on the filesystem and hardware honoring sync requests. Read-only wallet
 inspection does not change database settings.
 
+New channel funding requires an active keyset with no final expiry, or with final
+expiry more than 48 hours away: the normal 24-hour channel lifetime plus a 24-hour
+recovery window. Close, drain, and refund output selection requires active,
+unexpired keys and refreshes the mint cache when none are usable. This does not
+extend a mint's expiry or guarantee recovery if the wallet stays offline past it.
+
 Implemented today:
 - `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, keeps a shared in-memory cache of configured mint keysets, and persists relay-side Spilman channel state in SQLite
 - `monad-client`: provides reusable route selection, the session payment driver, a SQLite-backed channel wallet, a loose-proof wallet, and multi-hop connection setup
