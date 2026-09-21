@@ -15,6 +15,7 @@ use cdk_spilman::{
     SpilmanAsyncKeysetRefresher, SpilmanAsyncMintClient,
 };
 use monad_common::config::RelayChannelPolicyConfig;
+use monad_common::wallet_lock::{WalletLockIdentity, WalletLockMode, WalletLocks};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -131,6 +132,7 @@ impl RelayWalletMintClient {
         let resp = self
             .client
             .post(url)
+            .timeout(std::time::Duration::from_secs(15))
             .header("Content-Type", "application/json")
             .body(body)
             .send()
@@ -153,6 +155,19 @@ impl RelayWalletMintClient {
 impl Default for RelayWalletMintClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mint_recovery::RecoveryMintClient for RelayWalletMintClient {
+    async fn swap_checked(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        crate::mint_recovery::post(&self.client, mint, "v1/swap", request).await
+    }
+    async fn restore(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        crate::mint_recovery::post(&self.client, mint, "v1/restore", request).await
+    }
+    async fn check_state(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        crate::mint_recovery::post(&self.client, mint, "v1/checkstate", request).await
     }
 }
 
@@ -205,15 +220,20 @@ pub struct RelayWalletIdentity {
     pub receiver_secret: SecretKey,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ChannelMetadataStore {
-    db_path: String,
+    pub(crate) db_path: String,
+    authority: Arc<Mutex<WalletLocks>>,
 }
 
 impl ChannelMetadataStore {
-    pub(crate) fn new(db_path: impl Into<String>) -> io::Result<Self> {
+    pub(crate) fn new(
+        db_path: impl Into<String>,
+        authority: Arc<Mutex<WalletLocks>>,
+    ) -> io::Result<Self> {
         let store = Self {
             db_path: db_path.into(),
+            authority,
         };
         store.init()?;
         Ok(store)
@@ -533,6 +553,40 @@ impl std::fmt::Debug for RelayWalletManager {
 impl RelayWalletManager {
     pub fn open(db_path: impl Into<String>) -> io::Result<Self> {
         let db_path = db_path.into();
+        let locks = WalletLocks::acquire(
+            [std::path::Path::new(&db_path)],
+            WalletLockMode::Maintenance,
+            "relay",
+        )?;
+        Self::open_with_locks(db_path, locks)
+    }
+
+    pub fn open_with_locks(db_path: impl Into<String>, locks: WalletLocks) -> io::Result<Self> {
+        let db_path = db_path.into();
+        let identity = WalletLockIdentity::new([std::path::Path::new(&db_path)])?;
+        if !locks.exclusive_access()?.authorizes(&identity) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "relay wallet authority does not match database",
+            ));
+        }
+        Self::open_with_authority(db_path, Arc::new(Mutex::new(locks)))
+    }
+
+    /// Reopen storage/cache under this manager's existing exclusive owner.
+    /// Does not grant an independent process maintenance authority.
+    pub fn reopen(&self) -> io::Result<Self> {
+        self.require_maintenance().map_err(io::Error::other)?;
+        Self::open_with_authority(
+            self.metadata.db_path.clone(),
+            self.metadata.authority.clone(),
+        )
+    }
+
+    fn open_with_authority(
+        db_path: String,
+        authority: Arc<Mutex<WalletLocks>>,
+    ) -> io::Result<Self> {
         let conn = Connection::open(&db_path)
             .map_err(|e| io::Error::other(format!("open relay wallet db: {e}")))?;
         conn.execute_batch(CREATE_IDENTITIES_TABLE_SQL)
@@ -545,7 +599,7 @@ impl RelayWalletManager {
             SqliteStorage::open(&db_path)
                 .map_err(|e| io::Error::other(format!("open relay wallet storage: {e}")))?,
         );
-        let metadata = Arc::new(ChannelMetadataStore::new(db_path.clone())?);
+        let metadata = Arc::new(ChannelMetadataStore::new(db_path.clone(), authority)?);
         let identities = Arc::new(Mutex::new(load_identities(&db_path)?));
         let keyset_cache = shared_spilman_mint_cache(SpilmanMintCache::default());
         let trusted_mint_units = Arc::new(RwLock::new(TrustedMintUnits::default()));
@@ -557,6 +611,31 @@ impl RelayWalletManager {
             keyset_cache,
             trusted_mint_units,
         })
+    }
+
+    pub fn enter_steady_state(&self) -> io::Result<()> {
+        let mut locks = self
+            .metadata
+            .authority
+            .lock()
+            .map_err(|_| io::Error::other("relay authority lock poisoned"))?;
+        if !locks.holds_runtime_owner() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "runtime wallet ownership required",
+            ));
+        }
+        locks.enter_steady_state()
+    }
+
+    fn require_maintenance(&self) -> Result<(), String> {
+        self.metadata
+            .authority
+            .lock()
+            .map_err(|_| "relay authority lock poisoned".to_string())?
+            .exclusive_access()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     pub fn register_identity(
@@ -897,7 +976,7 @@ impl RelayWalletManager {
     /// identity owns it.  If the channel is already `Closed`, returns a
     /// synthetic success.  If it is `Closing`, completes the close.  Otherwise
     /// initiates and executes a unilateral close against the channel's mint.
-    pub async fn close_channel<N: SpilmanAsyncMintClient + Sync>(
+    pub async fn close_channel<N: crate::mint_recovery::RecoveryMintClient>(
         &self,
         channel_id: &str,
         net: &N,
@@ -905,7 +984,7 @@ impl RelayWalletManager {
         let payments = self.payments_for_channel(channel_id).await?;
         // CLI managers start with an empty memory cache. Preparation needs output
         // keys before the swap-error refresh path can run. Completed closes stay offline.
-        if payments.channel_state(channel_id) != Some(ChannelState::Closed) {
+        if payments.channel_state(channel_id) == Some(ChannelState::Open) {
             let (_, mint_url, unit) =
                 self.channel_owner_and_mint(channel_id).map_err(|reason| {
                     CloseError::StorageFailed {
@@ -970,6 +1049,7 @@ impl RelayWalletManager {
         net: &N,
         limit: Option<usize>,
     ) -> Result<DrainSwapResult, String> {
+        self.require_maintenance()?;
         let candidates = self.closed_drain_candidates(relay_name, mint_url, unit, limit)?;
         if candidates.is_empty() {
             return Err("no closed channels available to drain".to_string());
@@ -1036,6 +1116,7 @@ impl RelayWalletManager {
         drain_id: &str,
         net: &N,
     ) -> Result<DrainSwapResult, String> {
+        self.require_maintenance()?;
         let drain = self.load_drain(drain_id)?;
         if drain.state == "Completed" {
             return self.completed_drain_result(drain, false);
@@ -2452,6 +2533,63 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0].name, "r1");
         assert_eq!(ids[1].name, "r2");
+    }
+
+    #[test]
+    fn wallet_authority_matches_database_and_outlives_manager_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relay.db");
+        let other = dir.path().join("other.db");
+        let locks =
+            WalletLocks::acquire([db.as_path()], WalletLockMode::Maintenance, "test").unwrap();
+        assert!(RelayWalletManager::open_with_locks(other.to_str().unwrap(), locks).is_err());
+        assert!(!other.exists());
+        let locks = WalletLocks::acquire([db.as_path()], WalletLockMode::Runtime, "test").unwrap();
+        let manager = RelayWalletManager::open_with_locks(db.to_str().unwrap(), locks).unwrap();
+        manager.enter_steady_state().unwrap();
+        assert!(manager.require_maintenance().is_err());
+        assert!(manager.reopen().is_err());
+        let channel_owner = manager.metadata.clone();
+        drop(manager);
+        assert!(RelayWalletManager::open(db.to_str().unwrap()).is_err());
+        drop(channel_owner);
+        assert!(RelayWalletManager::open(db.to_str().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_closing_authorization_is_not_reinterpreted_as_a_request() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let manager = RelayWalletManager::open(db.path().to_str().unwrap()).unwrap();
+        let key = SecretKey::generate();
+        manager.register_identity("relay", key.clone()).unwrap();
+        let store = ChannelStore::with_relay_metadata(
+            manager.storage.clone(),
+            manager.metadata.clone(),
+            "relay".to_string(),
+            key.public_key().to_hex(),
+        );
+        save_test_channel(&store, "channel", &key.public_key().to_hex(), 10, 5);
+        store
+            .mark_channel_closing(
+                "channel",
+                10,
+                PaymentProof {
+                    balance: 5,
+                    signature: "sig".to_string(),
+                },
+            )
+            .unwrap();
+        let error = manager
+            .close_channel("channel", &RelayWalletMintClient::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("lacks exact close journal"));
+        assert_eq!(store.channel_state("channel"), Some(ChannelState::Closing));
+        assert!(manager
+            .storage
+            .get_close_journal("channel")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

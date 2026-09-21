@@ -82,45 +82,7 @@ mod lifecycle_test {
 }
 const MINT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Structured HTTP rejection retaining only status and numeric NUT-00 code,
-/// never the mint's untrusted body.
-pub struct MintHttpRejection {
-    pub status: u16,
-    pub code: Option<u64>,
-}
-
-impl std::fmt::Debug for MintHttpRejection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
-    }
-}
-
-impl std::fmt::Display for MintHttpRejection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "mint HTTP rejection ({}, NUT-00 code {:?})",
-            self.status, self.code
-        )
-    }
-}
-
-impl std::error::Error for MintHttpRejection {}
-
-impl MintHttpRejection {
-    pub fn from_body(status: u16, body: &str) -> Self {
-        Self {
-            status,
-            code: serde_json::from_str::<serde_json::Value>(body)
-                .ok()
-                .and_then(|v| v.get("code").and_then(|c| c.as_u64())),
-        }
-    }
-
-    fn inactive_output_keyset(&self) -> bool {
-        (400..500).contains(&self.status) && self.code == Some(12002)
-    }
-}
+pub use monad_common::mint_error::MintHttpRejection;
 
 static ACTIVE_OPENINGS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -1031,13 +993,46 @@ impl SqliteClientWallet {
     where
         M: MintConnection + ?Sized,
     {
-        match EstablishedChannel::restore_sender_proofs_from_client_funding(
-            funding,
-            self.sender_secret.clone(),
-            mint_connection,
-        )
-        .await
-        {
+        let established = EstablishedChannel::from_client_channel_funding(funding)
+            .map_err(|_| WalletError::Backend("invalid persisted channel funding".to_string()))?;
+        let mut result = Err(anyhow::anyhow!("sender discovery not attempted"));
+        for refresh in [false, true] {
+            let keysets = {
+                let bridge = self
+                    .bridge
+                    .lock()
+                    .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+                if refresh
+                    && bridge
+                        .refresh_keysets_response(&established.params.mint)
+                        .is_err()
+                {
+                    break;
+                }
+                let mut keys = vec![established.params.keyset_info.clone()];
+                for (_, entry) in bridge
+                    .cached_keysets_for_unit(&established.params.mint, &established.params.unit)
+                {
+                    keys.push(parse_keyset_info_from_json(&entry.info_json).map_err(|_| {
+                        WalletError::Backend("invalid sender discovery keys".to_string())
+                    })?);
+                }
+                keys
+            };
+            result = cdk_spilman::SpilmanChannelSender::new(
+                self.sender_secret.clone(),
+                established.clone(),
+            )
+            .restore_sender_proofs_with_keysets(mint_connection, &keysets)
+            .await;
+            if !result
+                .as_ref()
+                .is_err_and(|e| e.is::<cdk_spilman::SenderCloseKeysetMissing>())
+            {
+                break;
+            }
+        }
+        match result {
             Ok(proofs) if !proofs.is_empty() => {
                 self.complete_channel_recovery(channel_id, funding, "relay_close", proofs, false)
             }

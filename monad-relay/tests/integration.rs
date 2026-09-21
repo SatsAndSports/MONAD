@@ -49,8 +49,8 @@ use monad_common::session::RelayConnection;
 
 use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
 use cdk_spilman::{
-    ChannelState, ClientStorage, ClosingData, ConfigurableClientHost, EstablishedChannel,
-    FundingSpendKind, MintConnection, SpilmanClientBridge, SqliteClientStorage,
+    ChannelState, ClientStorage, ConfigurableClientHost, EstablishedChannel, FundingSpendKind,
+    MintConnection, SpilmanClientBridge, SqliteClientStorage,
 };
 use cdk_spilman_test_mint::{
     build_router, build_test_mint, rotate_sat_keyset, InMemoryMintNetworking, TestMintConfig,
@@ -1422,6 +1422,72 @@ async fn test_expiring_channel_auto_close_worker_closes_near_expiry_channel() {
 
 struct DropAfterSwap<'a> {
     inner: &'a RelayWalletMintClient,
+}
+
+struct RecoveryTestMint(Arc<cdk::Mint>);
+
+struct PendingCloseMint<'a> {
+    inner: &'a RelayWalletMintClient,
+    entered: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl cdk_spilman::SpilmanAsyncMintClient for PendingCloseMint<'_> {
+    async fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+        panic!("unchecked close submission")
+    }
+}
+
+#[async_trait::async_trait]
+impl monad_relay::mint_recovery::RecoveryMintClient for PendingCloseMint<'_> {
+    async fn swap_checked(&self, _: &str, _: &str) -> anyhow::Result<String> {
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+    async fn restore(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        monad_relay::mint_recovery::RecoveryMintClient::restore(self.inner, mint, request).await
+    }
+    async fn check_state(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        monad_relay::mint_recovery::RecoveryMintClient::check_state(self.inner, mint, request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl cdk_spilman::SpilmanAsyncMintClient for RecoveryTestMint {
+    async fn call_mint_swap(&self, mint: &str, request: &str) -> Result<String, String> {
+        monad_relay::mint_recovery::RecoveryMintClient::swap_checked(self, mint, request)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl cdk_spilman::SpilmanAsyncKeysetRefresher for RecoveryTestMint {
+    async fn refresh(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl monad_relay::mint_recovery::RecoveryMintClient for RecoveryTestMint {
+    async fn swap_checked(&self, _: &str, request: &str) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(
+            &self
+                .0
+                .process_swap_request(serde_json::from_str(request)?)
+                .await?,
+        )?)
+    }
+    async fn restore(&self, _: &str, request: &str) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(
+            &self.0.restore(serde_json::from_str(request)?).await?,
+        )?)
+    }
+    async fn check_state(&self, _: &str, request: &str) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(
+            &self.0.check_state(&serde_json::from_str(request)?).await?,
+        )?)
+    }
 }
 
 impl DrainSwapNetworking for DropAfterSwap<'_> {
@@ -4957,6 +5023,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     // Phase B: graceful relay shutdown.
     let _ = shutdown_tx.send(());
     handle.await.unwrap().unwrap();
+    drop(_payments);
 
     // Phase C: restart the relay with the same SQLite file and identity. Use
     // a fresh port; graceful shutdown may leave the old socket in TIME_WAIT
@@ -5172,6 +5239,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
     handle.await.unwrap().unwrap();
 
     let disallowed_mint_cache = SpilmanMintCache::default();
+    drop(_payments);
     let disallowed_trusted_mint_units = BTreeMap::new();
     let (server_addr2, pubkey2, handle2, shutdown_tx2, _payments2) = start_persistent_relay(
         "127.0.0.1:0".parse().unwrap(),
@@ -6985,6 +7053,7 @@ clients:
     // Kill the relay. The client should detect the failure and enter reconnect.
     let _ = relay_shutdown_tx.send(());
     relay_handle.await.unwrap().unwrap();
+    drop(_payments);
 
     // Wait briefly for the client to notice and start reconnecting.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -7270,6 +7339,7 @@ struct ConfiguredRouteFixtureConfig {
 }
 
 struct ConfiguredRouteFixture {
+    wallet_manager: Arc<RelayWalletManager>,
     _temp_dir: tempfile::TempDir,
     config: MonadConfig,
     relay_names: Vec<String>,
@@ -7471,6 +7541,7 @@ relays:
 
         Self {
             _temp_dir: temp_dir,
+            wallet_manager,
             config,
             relay_names,
             _mint_helper: mint_helper,
@@ -7577,9 +7648,7 @@ async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
     let _ = failed_shutdown_tx.send(());
     failed_handle.await.unwrap().unwrap();
 
-    let wallet_manager = Arc::new(
-        RelayWalletManager::open(&fixture.config.relay_wallet.as_ref().unwrap().db_path).unwrap(),
-    );
+    let wallet_manager = Arc::new(fixture.wallet_manager.reopen().unwrap());
     let failed_relay_name = &fixture.relay_names[case.failed_hop_idx];
     let failed_relay_config = fixture
         .config
@@ -9544,8 +9613,7 @@ clients:
     let config = MonadConfig::load(&config_path).unwrap();
     let wallet_manager_1 =
         Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
-    let wallet_manager_2 =
-        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
+    let wallet_manager_2 = wallet_manager_1.clone();
     let (_relay_1_addr, _relay_1_pubkey, relay_1_handle, relay_1_shutdown_tx, _payments_1) =
         start_relay_from_config_bound(
             config.select_relay(Some("hop1")).unwrap(),
@@ -9779,9 +9847,10 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     assert_eq!(result, b"BEFORE CLOSE");
 
     // Close the channel through the relay, using the in-memory mint networking.
-    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let mint_networking = RecoveryTestMint(mint_helper.mint());
     let close_success = payments
-        .close_channel(&channel_id, &mint_networking, &mint_networking)
+        .close_channel_async(&channel_id, &mint_networking, &mint_networking)
+        .await
         .expect("relay should close the channel");
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
@@ -9951,9 +10020,10 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
         .unwrap();
     assert_eq!(before.state, cashu::nuts::State::Unspent);
 
-    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let mint_networking = RecoveryTestMint(mint_helper.mint());
     let close_success = payments
-        .close_channel(&channel_id, &mint_networking, &mint_networking)
+        .close_channel_async(&channel_id, &mint_networking, &mint_networking)
+        .await
         .expect("relay should close the channel");
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
@@ -10141,9 +10211,10 @@ async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
         None
     };
 
-    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let mint_networking = RecoveryTestMint(mint_helper.mint());
     let close_success = payments
-        .close_channel(&channel_id, &mint_networking, &mint_networking)
+        .close_channel_async(&channel_id, &mint_networking, &mint_networking)
+        .await
         .expect("relay should close the channel");
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
@@ -10317,8 +10388,8 @@ async fn test_wallet_manager_close_channel_by_id() {
     let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
     assert!(!funded_status.paused);
 
-    // A fresh CLI manager has persisted channel state but no in-memory keys.
-    let wallet_manager = RelayWalletManager::open(&storage_path).unwrap();
+    // A fresh storage/cache under the same exclusive owner has no memory keys.
+    let wallet_manager = wallet_manager.reopen().unwrap();
     assert!(wallet_manager.keyset_cache_snapshot().keysets.is_empty());
     let net = wallet_manager
         .mint_client_for_channel(&channel_id)
@@ -10448,26 +10519,43 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
     assert!(!funded_status.paused);
 
-    // Force the channel into durable Closing state without finishing the close.
+    // Cancel at the acknowledged pre-HTTP boundary, after the exact request and
+    // execution uncertainty have been durably committed.
     let storage = SqliteStorage::open(&storage_path).unwrap();
-    let latest_payment = storage
-        .get_balance(&channel_id)
-        .expect("storage should contain latest payment proof");
-    storage
-        .mark_closing(
-            &channel_id,
-            ClosingData {
-                expiry_timestamp: 0,
-                balance: latest_payment.balance,
-                signature: latest_payment.signature.clone(),
-            },
-        )
-        .expect("storage should persist Closing state");
-    assert_eq!(storage.get_state(&channel_id), ChannelState::Closing);
-
     let net = wallet_manager
         .mint_client_for_channel(&channel_id)
         .expect("wallet manager should build reqwest networking for channel");
+    let gate = PendingCloseMint {
+        inner: &net,
+        entered: tokio::sync::Notify::new(),
+    };
+    let mut closing = Box::pin(wallet_manager.close_channel(&channel_id, &gate));
+    tokio::select! {
+        _ = gate.entered.notified() => {},
+        result = &mut closing => panic!("close completed before gate: {result:?}"),
+    }
+    drop(closing);
+    assert_eq!(storage.get_state(&channel_id), ChannelState::Closing);
+    let saved = storage.get_close_journal(&channel_id).unwrap().unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["attempts"][0]["submissions"], 1);
+    assert_eq!(saved["payment"]["balance"], funded_balance_raw);
+    let late_payment = wallet
+        .build_channel_payment(
+            &channel_id,
+            &offer,
+            funded_balance_raw,
+            funded_balance_raw + 1,
+        )
+        .unwrap();
+    assert!(matches!(
+        payments.apply_channel_payment(&channel_id, &late_payment),
+        Err(monad_relay::payments::ChannelPaymentError::ChannelClosed)
+    ));
+    assert_eq!(
+        storage.get_balance(&channel_id).unwrap().balance,
+        funded_balance_raw
+    );
 
     let close_success = wallet_manager
         .close_channel(&channel_id, &net)
@@ -10898,7 +10986,6 @@ async fn test_wallet_manager_drain_restore_checks_output_identities() {
 async fn test_wallet_manager_drain_recovery_survives_manager_reopen() {
     let ctx = DrainTestContext::new("drain-reopen-relay").await;
     let channel_id = ctx.create_closed_channel([16u8; 32], 450).await;
-    let db_path = ctx._temp_db.path().to_str().unwrap().to_string();
     let net = ctx.net_for(&channel_id);
     let dropped = DropAfterSwap { inner: &net };
     let err = ctx
@@ -10911,7 +10998,7 @@ async fn test_wallet_manager_drain_recovery_survives_manager_reopen() {
         .drain_id
         .clone();
 
-    let reopened = RelayWalletManager::open(&db_path).unwrap();
+    let reopened = ctx.wallet_manager.reopen().unwrap();
     let reopened_net = reopened.mint_client_for_channel(&channel_id).unwrap();
     let recovered = reopened
         .recover_submitted_drain(&drain_id, &reopened_net)
@@ -11201,7 +11288,7 @@ async fn test_wallet_manager_drain_retry_refresh_failure_marks_failed_and_releas
         .and_then(|by_id| by_id.get(&old_keyset_id))
         .expect("old keyset cached")
         .clone();
-    let retry_manager = RelayWalletManager::open(&db_path).unwrap();
+    let retry_manager = ctx.wallet_manager.reopen().unwrap();
     retry_manager.install_keyset_cache(SpilmanMintCache {
         advertised: BTreeMap::from([(
             bad_mint_url.to_string(),

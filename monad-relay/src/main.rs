@@ -133,12 +133,15 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
         ));
     }
 
-    let mut wallet_locks = WalletLocks::acquire(
+    let wallet_locks = WalletLocks::acquire(
         [Path::new(&relay_wallet.db_path)],
         WalletLockMode::Runtime,
         "relay",
     )?;
-    let wallet_manager = Arc::new(RelayWalletManager::open(&relay_wallet.db_path)?);
+    let wallet_manager = Arc::new(RelayWalletManager::open_with_locks(
+        &relay_wallet.db_path,
+        wallet_locks,
+    )?);
 
     for (relay, _, _, receiver_secret, _, _) in &prepared {
         match (receiver_secret, wallet_manager.receiver_secret(&relay.name)) {
@@ -192,7 +195,7 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
         .refresh_trusted_mint_cache(&trusted_mint_units)
         .await
         .map_err(anyhow::Error::msg)?;
-    wallet_locks.enter_steady_state()?;
+    wallet_manager.enter_steady_state()?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut workers = JoinSet::new();

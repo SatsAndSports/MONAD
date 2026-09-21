@@ -124,6 +124,12 @@ for the remaining relay recovery limitations.
 
 Add `--json` to any wallet command for machine-readable output.
 
+Repeating `wallet close --channel-id <id>` resumes the exact persisted close.
+Verified local finalization works with the mint offline. Ambiguous or invalid
+evidence leaves the channel Closing; it never releases funds or reports a
+zero-value success. Legacy Closing records without exact journals are rejected,
+not migrated or deleted. See [relay close recovery](WALLET.md#relay-close-recovery).
+
 One runtime process exclusively owns `relay_wallet.db_path`. It holds exclusive
 maintenance access while opening/migrating the database, registering identities,
 and populating the startup keyset cache, then shared maintenance access while

@@ -838,6 +838,17 @@ completion is idempotent, conflicting proof payloads fail, and late failure cann
 release a completed drain's channels. These guards are not full-operation
 singleflight or an immutable execution-history journal.
 
+Receiver close uses a separate versioned exact-request journal. Storage freezes
+the accepted payment with Closing and the journal atomically, rejecting later
+payments. The request is authenticated against persisted funding/payment/receiver;
+each submission first records uncertainty. Recovery verifies exact historical
+restores and all input states before bounded replay. One initial typed 4xx/12002
+may authorize a retained-predecessor output-keyset successor, never an ambiguous
+replay rejection. Verified finalizing data precedes the atomic Closed/payout
+commit, allowing offline completion. Expiry does not invalidate the receiver's
+signed spending branch. Wallet ownership is retained by derived payment handles,
+with per-channel close singleflight plus durable journal CAS.
+
 #### 6. Session Teardown on Control Detach
 
 If the control stream detaches, the relay treats the session as fully ended.

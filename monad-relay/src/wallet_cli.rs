@@ -132,7 +132,7 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
         return run_read_only_wallet_command(&args, &wallet_db_path, &inspection);
     }
 
-    let manager = RelayWalletManager::open(&wallet_db_path)?;
+    let manager = RelayWalletManager::open_with_locks(&wallet_db_path, _locks)?;
     match args.command {
         WalletCommand::CloseExpiringChannels {
             wallet_name: ref name_opt,

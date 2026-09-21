@@ -4,6 +4,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod control_codec;
 pub mod h2stream;
+pub mod mint_error;
 pub mod noise_secp256k1;
 pub mod payment_units;
 pub mod protocol;

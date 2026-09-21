@@ -518,9 +518,46 @@ are stored in the relay DB. Repeating completion requires identical serialized
 proofs and preserves the original completion timestamp; a conflicting completion
 or late failure cannot overwrite those proofs or release their reservations.
 
-This is not yet full relay swap recovery: preparation-only recovery, checked
-immutable replay, typed rejection authority, retained keyset-retry predecessors,
-full-operation singleflight, and close request journaling remain unimplemented.
+Drain preparation-only recovery, checked immutable replay, typed rejection
+authority, retained keyset-retry predecessors, and full-operation singleflight
+remain separate outstanding work; the close guarantees below do not apply to
+the old drain retry path.
+
+### Relay Close Recovery
+
+Close journal version 1 binds the normalized relay DB path, wallet name, receiver,
+funding, accepted payment, exact mint requests, historical output metadata, and
+execution counts. Closing plus the first journal is an atomic payment CAS;
+payments accepted before that boundary must be in the frozen snapshot, and later
+payments are rejected. Old Closing records without exact journals and incompatible
+or corrupt journals fail closed, retaining the database without conversion.
+
+Each attempt records submission uncertainty before HTTP. Resumption restores
+saved outputs before selecting keys or replaying, validates amount/keyset/DLEQ,
+and requires exact all-input Unspent evidence before bounded immutable replay.
+At most two submissions occur per invocation. Only the first typed HTTP 4xx
+numeric `12002` rejection, with no earlier uncertainty, can authorize one changed
+output keyset; the rejected request and its evidence remain in the journal.
+Invalid restore responses never become absence. If deterministic predecessor and
+successor points overlap, only verification against a saved exact attempt can
+establish success. Unresolved spent/pending/unknown evidence retains Closing;
+it is never classified as a successful zero-value close or an arbitrary refund.
+
+Verified completion is persisted as finalizing before the journal, Closed state,
+and payout are atomically committed. Finalizing/completed resumes offline. Expiry
+enables a competing sender refund but does not invalidate the authorized close;
+the mint arbitrates the atomic spend. Output fee rotation does not change the
+signed nominal split. Client sender discovery keeps original channel derivation
+and verifies discovered proofs using same-unit historical output keys.
+
+The manager owns matching OS-backed authority for the lifetime of every derived
+payment handle. `open` acquires maintenance ownership; runtime and CLI entrypoints
+transfer their matching locks with `open_with_locks`. Runtime ownership permits
+auto-close, while drains require exclusive maintenance access. `reopen` creates
+fresh storage/cache under the same exclusive owner, not independent authority.
+Per-channel close singleflight and journal CAS protect concurrent operations.
+The former synchronous unchecked close API is removed; use the async recovery
+transport, whose typed errors retain status/code but never response bodies.
 
 Current relay mint policy rule:
 
