@@ -244,6 +244,16 @@ The test suite currently covers:
 
 ### Stress Harness Notes
 
+- `make test-funds-lifecycle` runs the actual-process funds baseline with a real
+  retained CDK HTTP mint and one fixed purse. `make test-funds-crashes` adds opening
+  and refund durable-boundary SIGKILL, HTTP request/response gates, real expiry,
+  rotation and close/refund races. `make stress-funds-lifecycle` accepts
+  `MONAD_FUNDS_SEED` and `MONAD_FUNDS_CYCLES` for bounded-purse repetitions.
+  Crash/stress targets explicitly enable the client `funds-lifecycle-test` feature;
+  never use that binary with real funds, and rebuild without features afterward.
+  Exact scope, accounting and secret artifact handling are documented in
+  `monad-relay/tests/FUNDS_LIFECYCLE.md`.
+
 - `monad-relay/tests/stress.rs` now supports transport-focused stress runs with:
   - huge per-hop prefunding to keep payment timing out of the critical path
   - `MONAD_STRESS_MAX_IN_FLIGHT_PER_CIRCUIT` to cap burst concurrency per circuit

@@ -402,6 +402,8 @@ Relay keyset refresh is bounded trusted-mint maintenance, not a client control o
 - The relay refreshes all keysets for that mint into the shared relay-wallet cache, not only the submitted channel's unit, because mint keyset endpoints are mint-scoped.
 - Automatic link refresh returns transient `LinkKeysetRefreshRateLimited`, `LinkKeysetRefreshBusy`, or `LinkKeysetRefreshFailed` errors when it cannot make a fresh decision. A fresh successful response that still does not contain the keyset yields permanent `LinkMintOrKeysetUnacceptable`.
 - Startup discovery still populates the cache. Close and drain swaps remain cache-first and refresh the mint on missing-cache warmup or when a mint keyset error requires a bounded retry.
+  Cold wallet CLI close also warms missing metadata before preparing outputs;
+  already-closed channels do not require that warmup.
 
 DoS resistance is part of the protocol behavior. Each hosted relay's coordinator validates submitted mint/unit sizes and trusted policy before any network fetch, permits at most one actual attempt per mint per cooldown regardless of outcome, shares cancellation-safe in-flight results among that relay's concurrent same-mint links, fails fast when its cross-mint capacity is saturated, and wraps mint I/O in a timeout. Hosted relays share the wallet cache but not one process-wide refresh budget. Refresh I/O runs outside session accounting locks, so slow or failing mints do not block data-path accounting or unrelated control state.
 

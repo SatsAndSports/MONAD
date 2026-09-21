@@ -903,6 +903,23 @@ impl RelayWalletManager {
         net: &N,
     ) -> Result<CloseSuccess, CloseError> {
         let payments = self.payments_for_channel(channel_id).await?;
+        // CLI managers start with an empty memory cache. Preparation needs output
+        // keys before the swap-error refresh path can run. Completed closes stay offline.
+        if payments.channel_state(channel_id) != Some(ChannelState::Closed) {
+            let (_, mint_url, unit) =
+                self.channel_owner_and_mint(channel_id).map_err(|reason| {
+                    CloseError::StorageFailed {
+                        reason,
+                        status: 500,
+                    }
+                })?;
+            self.ensure_drain_keysets_cached(&mint_url, &unit)
+                .await
+                .map_err(|reason| CloseError::StorageFailed {
+                    reason,
+                    status: 500,
+                })?;
+        }
         payments
             .close_channel_any_state_async(channel_id, net, self)
             .await
