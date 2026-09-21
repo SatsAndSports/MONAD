@@ -3,6 +3,34 @@
 mod support;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated fault-injection relay; make test-funds-crashes"]
+async fn process_relay_close_journal_boundaries() {
+    let mut fixture = support::Fixture::start().await;
+    for boundary in [
+        "close-prepared",
+        "close-submitting",
+        "close-finalizing",
+        "close-completed",
+    ] {
+        fixture.relay_close_case(Some(boundary), false, false).await;
+    }
+    for boundary in ["close-rejected", "close-successor"] {
+        fixture.relay_close_case(Some(boundary), true, false).await;
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated fault-injection relay; make test-funds-crashes"]
+async fn process_relay_close_response_loss_and_rotation() {
+    let mut fixture = support::Fixture::start().await;
+    fixture.relay_close_case(None, false, true).await;
+    fixture.relay_close_case(None, true, false).await;
+    fixture.relay_close_case(None, true, true).await;
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires explicitly built client and relay binaries; make test-funds-lifecycle"]
 async fn process_funds_lifecycle() {
     let mut fixture = support::Fixture::start().await;

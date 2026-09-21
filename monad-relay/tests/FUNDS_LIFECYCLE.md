@@ -8,20 +8,30 @@ opens their persisted databases. The parent holds no wallet handles across those
 transitions. The mint remains alive; mint durability and machine power loss are
 not covered.
 
-`make test-funds-crashes` additionally builds the client with the explicit
+`make test-funds-crashes` additionally builds client and relay with the explicit
 `funds-lifecycle-test` feature. Both it and `make stress-funds-lifecycle` build
 their CLIs in `target/funds-lifecycle/debug` and pass those absolute binary paths
 to the harness. Normal `target/debug` and `target/release` binaries are untouched;
 no normal-binary rebuild is required afterward. The baseline target continues to
 use normal builds. The test harness is also built in the isolated target directory,
-without the feature, since Cargo may rebuild the relay binary for integration tests.
-**Never use the isolated instrumented client binary
+with the relay feature, since Cargo may rebuild the relay binary for integration tests.
+**Never use the isolated instrumented binaries
 for real funds.** Normal builds contain neither the IPC hooks
 nor the lifetime environment override. The test build uses bounded loopback IPC:
 the child reports only a fixed durable-boundary name and blocks awaiting an
 acknowledgement. The parent kills and reaps it before allowing any continuation.
 Local finalization recovery runs with all mint HTTP requests rejected and asserts
 that no request was even attempted, twice, in separate CLI processes.
+
+Receiver close covers acknowledged SIGKILL at prepared, submitting, initial
+rejection, successor persistence, finalizing, and completed boundaries. HTTP
+gates cover accepted-response loss, output key rotation after preparation, and
+successor accepted-response loss followed by another rotation. Each resumes in a
+fresh CLI against the retained mint and same DB, with no parent wallet handle.
+Finalizing and completed cases assert zero attempted HTTP. The same strict purse
+oracle covers the later sender recovery and receiver drain. These cases exposed
+and now cover preservation of the signed nominal split across fee rotation and
+sender discovery under historical non-funding output keys.
 
 Opening boundaries cover durable finalizing, upstream saved, change imported,
 and metadata saved. Refund boundaries cover durable finalizing, loose-proof
@@ -83,8 +93,15 @@ warning; never upload it. Console events contain only operation names and totals
 - [x] Opening rotation and rotation before preparation.
 - [x] Controlled close/refund winners and concurrent mint-execution races.
 - [x] Seeded bounded-purse stress and safe capacity/fee stop guard.
+- [x] Receiver close local journal boundary SIGKILL and offline finalization.
+- [x] Receiver close rejection/successor persistence and rotated response loss.
 
 ## Validation
+
+Receiver-close extension: `make test-funds-crashes` passes all eight process tests,
+including six close persistence boundaries and rotated accepted-response loss.
+Default `cargo test` passes 552 tests; strict all-target/all-features Clippy passes.
+The earlier baseline and stress results below predate this extension:
 
 - Full default `cargo test` and `cargo test --all-features`: each 547 passed,
   no failures (opt-in process/stress tests run separately).
@@ -100,7 +117,7 @@ warning; never upload it. Console events contain only operation names and totals
 
 The process tests use SQLite process-death durability, not physical power-loss
 durability. They do not cover an actual mint restart, external stale-input token
-export, every byte-level persistence interruption, or relay drain/close local
+export, every byte-level persistence interruption, or relay drain local
 finalization crash boundaries. Those are not implied by the boundary matrix.
 
 Stale export to an external wallet is explicitly out of scope.

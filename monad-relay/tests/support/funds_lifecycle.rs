@@ -533,10 +533,15 @@ clients:
     }
 
     async fn boundary_kill(&self, args: &[&str], boundary: &str) {
+        self.binary_boundary_kill(&self.client_bin, args, boundary)
+            .await;
+    }
+
+    async fn binary_boundary_kill(&self, binary: &Path, args: &[&str], boundary: &str) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let child = Process::spawn_with_env(
-            &self.client_bin,
+            binary,
             args,
             &self.config,
             &[
@@ -617,6 +622,89 @@ clients:
         drop(client);
         drop(relay);
         self.settle(&self.active_channel(), false).await;
+    }
+
+    pub async fn relay_close_case(
+        &mut self,
+        boundary: Option<&str>,
+        rotate: bool,
+        lost_response: bool,
+    ) {
+        self.cycle += 1;
+        eprintln!(
+            "funds relay close boundary={boundary:?} rotate={rotate} lost_response={lost_response}"
+        );
+        let relay = self.relay(&["run"]);
+        let client = self.client(&["run"]);
+        self.roundtrip().await;
+        drop(client);
+        drop(relay);
+        let channel = self.active_channel();
+        let args = ["wallet", "close", "--channel-id", &channel];
+        if let Some(boundary) = boundary {
+            let selected = [
+                "wallet",
+                "--relay",
+                "funds",
+                "close",
+                "--channel-id",
+                &channel,
+            ];
+            if rotate {
+                self.ledger.lock().unwrap().hold_request = true;
+                let rotation = async {
+                    tokio::time::timeout(DEADLINE, self.committed.notified())
+                        .await
+                        .expect("close rejection request gate");
+                    rotate_sat_keyset(&self.mint.mint(), 250).await.unwrap();
+                    self.release_gate().await;
+                };
+                tokio::join!(
+                    self.binary_boundary_kill(&self.relay_bin, &selected, boundary),
+                    rotation
+                );
+            } else {
+                self.binary_boundary_kill(&self.relay_bin, &selected, boundary)
+                    .await;
+            }
+            if matches!(boundary, "close-finalizing" | "close-completed") {
+                let before = {
+                    let mut ledger = self.ledger.lock().unwrap();
+                    ledger.offline = true;
+                    ledger.http_requests
+                };
+                self.relay(&args).success().await;
+                self.relay(&args).success().await;
+                let mut ledger = self.ledger.lock().unwrap();
+                assert_eq!(
+                    ledger.http_requests, before,
+                    "offline close finalization contacted mint"
+                );
+                ledger.offline = false;
+            }
+        } else {
+            self.ledger.lock().unwrap().hold_request = rotate;
+            self.ledger.lock().unwrap().hold_success = lost_response;
+            let child = self.relay(&args);
+            if rotate {
+                tokio::time::timeout(DEADLINE, self.committed.notified())
+                    .await
+                    .expect("close request gate");
+                rotate_sat_keyset(&self.mint.mint(), 250).await.unwrap();
+                self.release_gate().await;
+            }
+            if lost_response {
+                tokio::time::timeout(DEADLINE, self.committed.notified())
+                    .await
+                    .expect("close response gate");
+                drop(child);
+                self.release_gate().await;
+                rotate_sat_keyset(&self.mint.mint(), 300).await.unwrap();
+            } else {
+                child.success().await;
+            }
+        }
+        self.settle(&channel, false).await;
     }
 
     pub async fn refund_case(&mut self, boundary: Option<&str>, rotate: bool, lost_response: bool) {
