@@ -511,17 +511,38 @@ Use `--json` for machine-readable output.
 
 Drain restore validates exact blinded output identities against persisted secrets
 and historical output keys, including amount/keyset/DLEQ checks. Reordered
-output/signature pairs are canonicalized. Empty, partial, duplicate, or unknown
-outputs leave the attempt `Submitted` and its channels reserved; they are not
-successful zero-value drains and do not authorize replay. Completed drain proofs
+output/signature pairs are canonicalized. Partial, duplicate, or unknown outputs
+leave the attempt and its channels reserved. Empty restore alone is not a
+successful zero-value drain and does not authorize replay. Completed drain proofs
 are stored in the relay DB. Repeating completion requires identical serialized
 proofs and preserves the original completion timestamp; a conflicting completion
 or late failure cannot overwrite those proofs or release their reservations.
 
-Drain preparation-only recovery, checked immutable replay, typed rejection
-authority, retained keyset-retry predecessors, and full-operation singleflight
-remain separate outstanding work; the close guarantees below do not apply to
-the old drain retry path.
+### Relay Drain Recovery
+
+Drain journal version 1 atomically reserves source channels with the first exact
+request. It binds the normalized database, wallet/receiver, mint/unit, closed
+input-proof snapshots, per-input-keyset fees, output secrets and historical keys.
+Every submitted request and the one permitted rejected predecessor remain in the
+journal. Submitted uncertainty is recorded before HTTP; only an initial typed
+HTTP 4xx numeric `12002` without prior uncertainty authorizes one changed-output
+successor. Untrusted string errors and replay rejections never release custody or
+authorize replacement. Non-keyset failures remain conservatively unresolved.
+
+`recover-drain` handles Prepared, Submitted, Finalizing, and Completed. Exact
+restore precedes replay and key selection. Empty restore alone proves neither
+success nor safe replay: every aggregated input must have exactly one matching
+Unspent state, otherwise a final exact restore is attempted and ambiguity remains
+reserved. Each invocation permits at most two submissions. Verified output proofs
+are saved as Finalizing, then atomically committed with the completed journal and
+terminal custody; resumed local completion rechecks proofs and makes no HTTP
+requests. Proofs stay in the relay DB, with no additional loose-wallet import.
+
+Exclusive wallet authority, per-drain singleflight, unique channel reservations,
+and journal CAS prevent concurrent recovery from replacing requests or terminal
+proofs. Incompatible nonempty old drain journals are rejected without migration,
+reinterpretation, or deletion. Read-only inspection remains available. Failed
+development fixtures require an explicit operator decision before any reset.
 
 ### Relay Close Recovery
 
@@ -531,6 +552,8 @@ execution counts. Closing plus the first journal is an atomic payment CAS;
 payments accepted before that boundary must be in the frozen snapshot, and later
 payments are rejected. Old Closing records without exact journals and incompatible
 or corrupt journals fail closed, retaining the database without conversion.
+Payment credits also use exact prior-authorization CAS, so a competing payment
+cannot turn a monotonic no-op into duplicate session credit.
 
 Each attempt records submission uncertainty before HTTP. Resumption restores
 saved outputs before selecting keys or replaying, validates amount/keyset/DLEQ,

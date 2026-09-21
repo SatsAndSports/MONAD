@@ -836,7 +836,14 @@ keys. Invalid or empty restore results preserve the submitted reservation.
 Terminal drain proof storage uses an atomic conditional update: repeated identical
 completion is idempotent, conflicting proof payloads fail, and late failure cannot
 release a completed drain's channels. These guards are not full-operation
-singleflight or an immutable execution-history journal.
+singleflight or an immutable execution-history journal on their own. The drain
+orchestrator now supplies both: a versioned identity/input/fee-bound journal is
+inserted atomically with channel reservations. Every request and submission count
+is retained; a single typed initial 4xx/12002 may authorize a retained-predecessor
+successor. Exact restore and all-input Unspent checks gate bounded replay.
+Verified Finalizing payloads permit offline completion, with terminal custody
+remaining in the relay DB. Matching exclusive maintenance authority and journal
+CAS protect the full operation, not just completion.
 
 Receiver close uses a separate versioned exact-request journal. Storage freezes
 the accepted payment with Closing and the journal atomically, rejecting later

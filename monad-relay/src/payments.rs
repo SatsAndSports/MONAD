@@ -670,15 +670,16 @@ impl RelayPayments for SpilmanRelayPayments {
             ));
         }
 
-        let (previous_balance, unit, state_kind) = {
+        let (previous_payment, unit, state_kind) = {
             let channel = self
                 .store
                 .get_channel(expected_channel_id)
                 .map_err(ChannelPaymentError::Internal)?
                 .ok_or(ChannelPaymentError::UnknownChannel)?;
-            (channel.latest_payment.balance, channel.unit, channel.state)
+            (channel.latest_payment, channel.unit, channel.state)
         };
 
+        let previous_balance = previous_payment.balance;
         if state_kind != ChannelState::Open {
             return Err(ChannelPaymentError::ChannelClosed);
         }
@@ -700,8 +701,10 @@ impl RelayPayments for SpilmanRelayPayments {
         // Record only after validation and monotonicity checks; the stored
         // balance is the relay-authoritative baseline for future payments.
         self.store
-            .record_payment(
+            .storage()
+            .compare_payment(
                 &payment.channel_id,
+                &previous_payment,
                 PaymentProof {
                     balance: validation.balance,
                     signature: validation.sender_signature.clone(),

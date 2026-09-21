@@ -116,11 +116,13 @@ monad-relay wallet --config monad.yaml --relay relay-a drain --mint-url https://
 monad-relay wallet --config monad.yaml --relay relay-a recover-drain --drain-id <drain-id>
 ```
 
-`recover-drain` verifies exact restored output identities and signatures. Empty or
-invalid restores retain the submitted attempt and channel reservations rather
-than reporting success. Completed proofs remain in the relay wallet DB; repeated
-completion cannot replace them with conflicting proofs. See [WALLET.md](WALLET.md)
-for the remaining relay recovery limitations.
+`recover-drain` resumes prepared, submitted, or locally finalizing attempts.
+It verifies exact restored outputs and permits bounded immutable replay only
+after checked all-input Unspent evidence. Invalid or ambiguous evidence retains
+reservations. Finalizing/completed recovery is offline; terminal proofs stay in
+the relay DB and cannot be replaced by conflicting completion. Incompatible old
+nonempty drain journals are rejected, never migrated or deleted. See
+[WALLET.md](WALLET.md#relay-drain-recovery) for the recovery policy.
 
 Add `--json` to any wallet command for machine-readable output.
 

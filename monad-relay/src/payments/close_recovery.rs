@@ -43,6 +43,15 @@ impl Drop for CloseFlight {
 }
 
 impl SpilmanRelayPayments {
+    pub(crate) fn validate_close_schema(json: &str) -> Result<(), String> {
+        let journal: CloseJournal = serde_json::from_str(json)
+            .map_err(|_| "incompatible close journal; database retained")?;
+        if journal.version != 1 || journal.attempts.is_empty() || journal.attempts.len() > 2 {
+            return Err("incompatible close journal version; database retained".to_string());
+        }
+        Ok(())
+    }
+
     pub(super) async fn recover_close<M: RecoveryMintClient, R: SpilmanAsyncKeysetRefresher>(
         &self,
         channel_id: &str,
@@ -266,6 +275,8 @@ impl SpilmanRelayPayments {
                         .advance_close(channel_id, &durable, &next, None)
                         .map_err(error)?;
                     durable = next;
+                    #[cfg(feature = "funds-lifecycle-test")]
+                    crate::lifecycle_test::boundary("close-finalizing");
                     continue;
                 }
                 // Deterministic predecessor/successor outputs may share blinded
@@ -323,6 +334,8 @@ impl SpilmanRelayPayments {
                             .advance_close(channel_id, &durable, &next, None)
                             .map_err(error)?;
                         durable = next;
+                        #[cfg(feature = "funds-lifecycle-test")]
+                        crate::lifecycle_test::boundary("close-finalizing");
                         continue;
                     }
                     return Err(error(
