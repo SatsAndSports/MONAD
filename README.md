@@ -116,6 +116,12 @@ monad-relay wallet --config monad.yaml --relay relay-a drain --mint-url https://
 monad-relay wallet --config monad.yaml --relay relay-a recover-drain --drain-id <drain-id>
 ```
 
+`recover-drain` verifies exact restored output identities and signatures. Empty or
+invalid restores retain the submitted attempt and channel reservations rather
+than reporting success. Completed proofs remain in the relay wallet DB; repeated
+completion cannot replace them with conflicting proofs. See [WALLET.md](WALLET.md)
+for the remaining relay recovery limitations.
+
 Add `--json` to any wallet command for machine-readable output.
 
 One runtime process exclusively owns `relay_wallet.db_path`. It holds exclusive

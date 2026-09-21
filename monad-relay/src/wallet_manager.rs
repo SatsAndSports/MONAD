@@ -9,10 +9,10 @@ use cdk_spilman::configurable_networking::{
     build_keyset_info_json, fetch_all_keysets_from_mint, MintKeysetWithKeys,
 };
 use cdk_spilman::{
-    complete_funding_swap, create_plain_blinded_messages, is_retryable_keyset_mint_error,
-    with_active_keyset_retry_async, ActiveKeysetSelection, ChannelFunding, ChannelState,
-    CloseError, CloseSuccess, KeysetRetryError, SelectedOutputKeyset, SpilmanAsyncKeysetRefresher,
-    SpilmanAsyncMintClient,
+    complete_funding_swap, complete_plain_change_restore, create_plain_blinded_messages,
+    is_retryable_keyset_mint_error, with_active_keyset_retry_async, ActiveKeysetSelection,
+    ChannelFunding, ChannelState, CloseError, CloseSuccess, KeysetRetryError, SelectedOutputKeyset,
+    SpilmanAsyncKeysetRefresher, SpilmanAsyncMintClient,
 };
 use monad_common::config::RelayChannelPolicyConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -1050,12 +1050,17 @@ impl RelayWalletManager {
         let restore_response = net
             .call_mint_restore(&drain.mint_url, &drain.restore_request_json)
             .await?;
-        let swap_response = wrap_restore_response_as_swap_response(&restore_response)?;
-        let output_proofs_json = complete_plain_drain_swap(
-            &swap_response,
+        let completed = complete_plain_change_restore(
+            &restore_response,
             &drain.output_secrets_json,
             &drain.output_keyset_info_json,
         )?;
+        let completed: serde_json::Value = serde_json::from_str(&completed)
+            .map_err(|_| "invalid completed drain restore".to_string())?;
+        let output_proofs_json = completed["change_proofs_json"]
+            .as_str()
+            .ok_or_else(|| "completed drain restore returned no proofs".to_string())?
+            .to_string();
         self.mark_drain_completed(drain_id, &output_proofs_json, now_seconds())?;
 
         let mut completed = drain;
@@ -1274,13 +1279,17 @@ impl RelayWalletManager {
     fn mark_drain_submitted(&self, drain_id: &str, submitted_at: u64) -> Result<(), String> {
         let conn = Connection::open(&self.metadata.db_path)
             .map_err(|e| format!("open relay wallet db: {e}"))?;
-        conn.execute(
-            "UPDATE monad_relay_drains
+        let changed = conn
+            .execute(
+                "UPDATE monad_relay_drains
              SET state = 'Submitted', submitted_at = ?2
              WHERE drain_id = ?1 AND state = 'Prepared'",
-            params![drain_id, i64_from_u64(submitted_at)?],
-        )
-        .map_err(|e| format!("mark drain submitted: {e}"))?;
+                params![drain_id, i64_from_u64(submitted_at)?],
+            )
+            .map_err(|e| format!("mark drain submitted: {e}"))?;
+        if changed != 1 {
+            return Err("drain submission state conflict".to_string());
+        }
         Ok(())
     }
 
@@ -1295,8 +1304,9 @@ impl RelayWalletManager {
     ) -> Result<(), String> {
         let conn = Connection::open(&self.metadata.db_path)
             .map_err(|e| format!("open relay wallet db: {e}"))?;
-        conn.execute(
-            "UPDATE monad_relay_drains
+        let changed = conn
+            .execute(
+                "UPDATE monad_relay_drains
              SET output_amount_raw = ?2,
                  swap_request_json = ?3,
                  restore_request_json = ?4,
@@ -1306,18 +1316,21 @@ impl RelayWalletManager {
                  submitted_at = ?8,
                  error = NULL
              WHERE drain_id = ?1 AND state = 'Submitted'",
-            params![
-                drain_id,
-                i64_from_u64(output_amount_raw)?,
-                prepared.swap_request_json,
-                prepared.restore_request_json,
-                prepared.output_secrets_json,
-                output_keyset_id,
-                output_keyset_info_json,
-                i64_from_u64(submitted_at)?,
-            ],
-        )
-        .map_err(|e| format!("update drain retry attempt: {e}"))?;
+                params![
+                    drain_id,
+                    i64_from_u64(output_amount_raw)?,
+                    prepared.swap_request_json,
+                    prepared.restore_request_json,
+                    prepared.output_secrets_json,
+                    output_keyset_id,
+                    output_keyset_info_json,
+                    i64_from_u64(submitted_at)?,
+                ],
+            )
+            .map_err(|e| format!("update drain retry attempt: {e}"))?;
+        if changed != 1 {
+            return Err("drain retry state conflict".to_string());
+        }
         Ok(())
     }
 
@@ -1343,13 +1356,17 @@ impl RelayWalletManager {
         let tx = conn
             .transaction()
             .map_err(|e| format!("begin failed drain transaction: {e}"))?;
-        tx.execute(
-            "UPDATE monad_relay_drains
+        let changed = tx
+            .execute(
+                "UPDATE monad_relay_drains
              SET state = 'Failed', error = ?2, failed_at = ?3
              WHERE drain_id = ?1 AND state IN ('Prepared', 'Submitted')",
-            params![drain_id, error, i64_from_u64(failed_at)?],
-        )
-        .map_err(|e| format!("mark drain failed: {e}"))?;
+                params![drain_id, error, i64_from_u64(failed_at)?],
+            )
+            .map_err(|e| format!("mark drain failed: {e}"))?;
+        if changed != 1 {
+            return Err("drain failure state conflict; reservations retained".to_string());
+        }
         tx.execute(
             "DELETE FROM monad_relay_drained_channels WHERE drain_id = ?1",
             params![drain_id],
@@ -1367,13 +1384,19 @@ impl RelayWalletManager {
     ) -> Result<(), String> {
         let conn = Connection::open(&self.metadata.db_path)
             .map_err(|e| format!("open relay wallet db: {e}"))?;
-        conn.execute(
-            "UPDATE monad_relay_drains
-             SET state = 'Completed', output_proofs_json = ?2, completed_at = ?3, error = NULL
-             WHERE drain_id = ?1 AND state IN ('Prepared', 'Submitted', 'Completed')",
-            params![drain_id, output_proofs_json, i64_from_u64(completed_at)?],
-        )
-        .map_err(|e| format!("mark drain completed: {e}"))?;
+        let changed = conn
+            .execute(
+                "UPDATE monad_relay_drains
+             SET state = 'Completed', output_proofs_json = ?2,
+                 completed_at = COALESCE(completed_at, ?3), error = NULL
+             WHERE drain_id = ?1 AND (state = 'Submitted'
+                 OR (state = 'Completed' AND output_proofs_json = ?2))",
+                params![drain_id, output_proofs_json, i64_from_u64(completed_at)?],
+            )
+            .map_err(|e| format!("mark drain completed: {e}"))?;
+        if changed != 1 {
+            return Err("drain completion state or immutable proof conflict".to_string());
+        }
         Ok(())
     }
 
@@ -1980,17 +2003,6 @@ fn complete_plain_drain_swap(
         .ok_or_else(|| "completed drain swap returned no funding_proofs_json".to_string())
 }
 
-fn wrap_restore_response_as_swap_response(restore_response_json: &str) -> Result<String, String> {
-    let restore: serde_json::Value = serde_json::from_str(restore_response_json)
-        .map_err(|e| format!("parse restore response: {e}"))?;
-    let signatures = restore
-        .get("signatures")
-        .cloned()
-        .ok_or_else(|| "restore response missing signatures".to_string())?;
-    serde_json::to_string(&serde_json::json!({ "signatures": signatures }))
-        .map_err(|e| format!("serialize restored swap response: {e}"))
-}
-
 fn is_explicit_drain_mint_rejection(error: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(error) else {
         return false;
@@ -2352,6 +2364,79 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn drain_terminal_proofs_are_immutable_and_conflicts_retain_reservations() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let manager = RelayWalletManager::open(db.path().to_str().unwrap()).unwrap();
+        let conn = Connection::open(db.path()).unwrap();
+        conn.execute(
+            "INSERT INTO monad_relay_drains (
+                drain_id, relay_name, mint_url, unit, state, input_amount_raw, output_amount_raw,
+                swap_request_json, restore_request_json, output_secrets_json,
+                output_keyset_id, output_keyset_info_json, created_at
+            ) VALUES ('drain', 'relay', 'mint', 'sat', 'Prepared', 1, 1, '{}', '{}', '[]', 'key', '{}', 1)", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO monad_relay_drained_channels VALUES ('channel', 'drain')",
+            [],
+        )
+        .unwrap();
+        assert!(manager.mark_drain_completed("drain", "first", 1).is_err());
+        assert!(manager.mark_drain_submitted("missing", 1).is_err());
+        manager.mark_drain_submitted("drain", 2).unwrap();
+        assert!(manager.mark_drain_submitted("drain", 3).is_err());
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                manager.mark_drain_completed("drain", "first", 4)
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                manager.mark_drain_completed("drain", "second", 4)
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(results.0.is_ok(), results.1.is_ok());
+        let winner = if results.0.is_ok() { "first" } else { "second" };
+        manager.mark_drain_completed("drain", winner, 5).unwrap();
+        assert!(manager
+            .update_prepared_drain_attempt(
+                "drain",
+                2,
+                &PreparedDrainSwap {
+                    swap_request_json: "replacement".to_string(),
+                    restore_request_json: "replacement".to_string(),
+                    output_secrets_json: "replacement".to_string(),
+                },
+                "replacement",
+                "replacement",
+                5,
+            )
+            .is_err());
+        assert!(manager
+            .mark_drain_failed_and_release("drain", "late rejection", 6)
+            .is_err());
+        assert!(manager
+            .mark_drain_failed_and_release("missing", "late rejection", 6)
+            .is_err());
+        let (proofs, timestamp): (String, u64) = conn.query_row(
+            "SELECT output_proofs_json, completed_at FROM monad_relay_drains WHERE drain_id = 'drain'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(proofs, winner);
+        assert_eq!(timestamp, 4);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM monad_relay_drained_channels",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]

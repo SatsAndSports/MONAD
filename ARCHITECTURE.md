@@ -830,6 +830,14 @@ state (`monad-relay wallet ...`) so operators can list identities, inspect
 stored channels, close a channel by `channel_id`, drain closed-channel receiver
 proofs, and recover submitted drain attempts using metadata stored in SQLite.
 
+Drain restore completion preserves NUT-09 output identities and uses the shared
+exact restore/signature validators with persisted output secrets and historical
+keys. Invalid or empty restore results preserve the submitted reservation.
+Terminal drain proof storage uses an atomic conditional update: repeated identical
+completion is idempotent, conflicting proof payloads fail, and late failure cannot
+release a completed drain's channels. These guards are not full-operation
+singleflight or an immutable execution-history journal.
+
 #### 6. Session Teardown on Control Detach
 
 If the control stream detaches, the relay treats the session as fully ended.

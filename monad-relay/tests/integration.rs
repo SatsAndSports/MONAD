@@ -1454,6 +1454,34 @@ struct CountingDrainNet<'a> {
     output_keysets_by_call: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
+struct MutatedDrainRestore<'a> {
+    inner: &'a RelayWalletMintClient,
+    mutate: fn(&mut serde_json::Value),
+}
+
+impl DrainSwapNetworking for MutatedDrainRestore<'_> {
+    fn call_mint_swap<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { panic!("restore must not submit a swap") })
+    }
+
+    fn call_mint_restore<'a>(
+        &'a self,
+        mint_url: &'a str,
+        request: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let response = self.inner.call_mint_restore(mint_url, request).await?;
+            let mut response = serde_json::from_str(&response).unwrap();
+            (self.mutate)(&mut response);
+            Ok(response.to_string())
+        })
+    }
+}
+
 impl DrainSwapNetworking for CountingDrainNet<'_> {
     fn call_mint_swap<'a>(
         &'a self,
@@ -10784,6 +10812,85 @@ async fn test_wallet_manager_recover_missing_drain_errors() {
         .await
         .unwrap_err();
     assert!(err.contains("not found"));
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_restore_checks_output_identities() {
+    let ctx = DrainTestContext::new("exact-restore-relay").await;
+    let channel_id = ctx.create_closed_channel([29u8; 32], 450).await;
+    let net = ctx.net_for(&channel_id);
+    ctx.wallet_manager
+        .drain_closed_channels_to_swap(
+            "exact-restore-relay",
+            &ctx.mint_url,
+            "sat",
+            &DropAfterSwap { inner: &net },
+            None,
+        )
+        .await
+        .unwrap_err();
+    let drain_id = ctx.wallet_manager.list_drains().unwrap()[0]
+        .drain_id
+        .clone();
+    let invalid: Vec<fn(&mut serde_json::Value)> = vec![
+        |v| {
+            v["outputs"] = serde_json::json!([]);
+        },
+        |v| {
+            v["outputs"][0] = v["outputs"][1].clone();
+        },
+        |v| {
+            v["outputs"][0]["amount"] = serde_json::json!(999);
+        },
+        |v| {
+            v["signatures"].as_array_mut().unwrap().pop();
+        },
+        |v| {
+            v["outputs"] = serde_json::json!([]);
+            v["signatures"] = serde_json::json!([]);
+        },
+    ];
+    for mutate in invalid {
+        let bad = MutatedDrainRestore {
+            inner: &net,
+            mutate,
+        };
+        assert!(ctx
+            .wallet_manager
+            .recover_submitted_drain(&drain_id, &bad)
+            .await
+            .is_err());
+        assert_eq!(
+            ctx.wallet_manager.list_drains().unwrap()[0].state,
+            "Submitted"
+        );
+        let reserved = ctx
+            .wallet_manager
+            .drain_closed_channels_to_swap("exact-restore-relay", &ctx.mint_url, "sat", &net, None)
+            .await
+            .unwrap_err();
+        assert!(reserved.contains("no closed channels"));
+    }
+    let reordered = MutatedDrainRestore {
+        inner: &net,
+        mutate: |v| {
+            v["outputs"].as_array_mut().unwrap().reverse();
+            v["signatures"].as_array_mut().unwrap().reverse();
+        },
+    };
+    let recovered = ctx
+        .wallet_manager
+        .recover_submitted_drain(&drain_id, &reordered)
+        .await
+        .unwrap();
+    assert_eq!(sum_proof_amounts(&recovered.output_proofs_json), 450);
+    let repeated = ctx
+        .wallet_manager
+        .recover_submitted_drain(&drain_id, &RejectSwap)
+        .await
+        .unwrap();
+    assert_eq!(recovered.output_proofs_json, repeated.output_proofs_json);
     ctx.shutdown();
 }
 

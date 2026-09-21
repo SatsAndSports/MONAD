@@ -509,6 +509,19 @@ These commands accept either:
 
 Use `--json` for machine-readable output.
 
+Drain restore validates exact blinded output identities against persisted secrets
+and historical output keys, including amount/keyset/DLEQ checks. Reordered
+output/signature pairs are canonicalized. Empty, partial, duplicate, or unknown
+outputs leave the attempt `Submitted` and its channels reserved; they are not
+successful zero-value drains and do not authorize replay. Completed drain proofs
+are stored in the relay DB. Repeating completion requires identical serialized
+proofs and preserves the original completion timestamp; a conflicting completion
+or late failure cannot overwrite those proofs or release their reservations.
+
+This is not yet full relay swap recovery: preparation-only recovery, checked
+immutable replay, typed rejection authority, retained keyset-retry predecessors,
+full-operation singleflight, and close request journaling remain unimplemented.
+
 Current relay mint policy rule:
 
 - the operator's current trusted mint policy comes from config at startup
