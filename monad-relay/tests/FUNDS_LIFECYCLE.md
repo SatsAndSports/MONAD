@@ -86,6 +86,9 @@ warning; never upload it. Console events contain only operation names and totals
 
 ## Validation
 
+Recorded snapshot from commit `fb488bd` (2026-09-21), which added these results;
+these totals are historical, not a claim of validation at the current revision.
+
 - Full default `cargo test` and `cargo test --all-features`: each 547 passed,
   no failures (opt-in process/stress tests run separately).
 - Strict `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
