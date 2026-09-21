@@ -4,6 +4,11 @@
 
 ### Terminal Refunds
 
+The focused persistent-mint crash test gates a completed HTTP close response
+before killing an actual file-backed CDK mint child. Restart reuses the same
+mint/signatory database and deterministic test keys; restoration and conservation
+are checked through HTTP, with no parent in-memory mint or response cache.
+
 `SenderRefundedAfterExpiry` is an upstream persistent channel state, distinct from
 normal `Closed` with no fabricated payout. The relay close journal v2 saves the
 full mint NUT-07 evidence in the same transaction as the terminal state before

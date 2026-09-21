@@ -141,3 +141,22 @@ the boundary matrix. The extended seeded schedule includes relay close/drain
 boundary crashes and successor response loss; old seed totals are historical.
 
 Stale export to an external wallet is explicitly out of scope.
+
+## Persistent Mint Restart
+
+`process_persistent_mint_restart_after_close_commit` is included in
+`make test-funds-crashes`. Unlike the retained in-memory mint used by the other
+scenarios, it launches an actual child process with a file-backed CDK mint and
+signatory database, fixed test keys, and unchanged fee/configuration on restart.
+The parent is only a forwarding HTTP gate and ledger, not a mint or response cache.
+After receiving the complete successful close response from the child, it withholds
+that response, kills/reaps the relay close process and mint process, and restarts
+the mint on the same port and database. A fresh relay restores the journaled close
+without resubmission; sender recovery and receiver drain follow. All final proof
+DLEQs, NUT-07 custody states, accepted-output restores, and exact fixed-purse
+conservation are checked against the restarted mint over HTTP.
+
+The bootstrap proof file has mode 0600 in the fixture's private temporary directory.
+Persistent-mint artifacts are removed on success and failure; child processes are
+killed and reaped before cleanup. The ordinary scenarios retain their existing
+failure-artifact behavior. No normal binary gains a persistent-test-mint mode.

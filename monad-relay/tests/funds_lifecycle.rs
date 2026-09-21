@@ -2,6 +2,19 @@
 #[path = "support/funds_lifecycle.rs"]
 mod support;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_mint_worker() {
+    support::persistent_mint_worker().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "actual persistent mint child restart; make test-funds-crashes"]
+async fn process_persistent_mint_restart_after_close_commit() {
+    let mut fixture = support::Fixture::start_with_persistent_mint(true).await;
+    fixture.persistent_mint_restart().await;
+    fixture.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated fault-injection relay; make test-funds-crashes"]
 async fn process_relay_drain_journal_boundaries() {

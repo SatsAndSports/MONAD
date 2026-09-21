@@ -6118,6 +6118,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refund_refreshes_real_expired_active_cached_keyset_before_first_submission() {
+        let ctx = open_short_expiry_test_channel(32, 1).await;
+        let funding = ctx
+            .wallet
+            .bridge
+            .lock()
+            .unwrap()
+            .get_channel_funding(&ctx.channel_id)
+            .unwrap();
+        let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
+        let expiry = SqliteClientWallet::now_seconds().unwrap() + 3;
+        let expiring = ctx
+            .mint_helper
+            .mint()
+            .rotate_keyset(
+                CurrencyUnit::Sat,
+                (0..32).map(|n| 1u64 << n).collect(),
+                400,
+                true,
+                Some(expiry),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.wallet
+                .select_refund_output_keyset(&established, true)
+                .unwrap()
+                .keyset_id,
+            expiring.id
+        );
+        let successor = rotate_sat_keyset(&ctx.mint_helper.mint(), 500)
+            .await
+            .unwrap();
+        wait_until_expired(expiry).await;
+        let selected = ctx
+            .wallet
+            .select_refund_output_keyset(&established, false)
+            .unwrap();
+        assert_eq!(selected.keyset_id, successor);
+        let mint = scripted_refund_mint(&ctx);
+        let locks = refund_test_locks(&ctx);
+        assert!(matches!(
+            ctx.wallet
+                .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+                .await
+                .unwrap(),
+            ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
+        ));
+        assert_eq!(
+            mint.requests.lock().unwrap().len(),
+            1,
+            "selection must avoid submitting to expired outputs"
+        );
+        let _ = ctx.shutdown_tx.send(());
+        ctx.mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refund_lost_response_restores_without_second_submission() {
         let ctx = open_short_expiry_test_channel(16, 1).await;
         wait_until_expired(ctx.expiry_timestamp).await;

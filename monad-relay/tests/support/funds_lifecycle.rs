@@ -24,6 +24,88 @@ use tokio::task::JoinSet;
 const DEADLINE: Duration = Duration::from_secs(45);
 const INITIAL: u64 = 16_384;
 
+pub async fn persistent_mint_worker() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(root) = std::env::var("MONAD_TEST_MINT_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let port = std::env::var("MONAD_TEST_MINT_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let config = cdk_spilman_test_mint::TestMintConfig {
+        base_url: std::env::var("MONAD_TEST_MINT_URL").unwrap(),
+        default_input_fee_ppk: 100,
+        ..cdk_spilman_test_mint::TestMintConfig::for_port(port)
+    };
+    let mint = Arc::new(
+        cdk_spilman_test_mint::build_persistent_test_mint(&config, &root.join("mint.db"))
+            .await
+            .unwrap(),
+    );
+    let bootstrap = root.join("initial-proofs.json");
+    if !bootstrap.exists() {
+        let proofs = cdk_spilman_test_mint::mint_test_proofs(&mint, INITIAL)
+            .await
+            .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(bootstrap)
+            .unwrap();
+        serde_json::to_writer(&file, &proofs).unwrap();
+        file.sync_all().unwrap();
+    }
+    cdk_spilman_test_mint::serve_existing_mint_with_shutdown(mint, config, std::future::pending())
+        .await
+        .unwrap();
+}
+
+async fn start_mint_child(root: &Path, port: u16, url: &str) -> Process {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "persistent_mint_worker", "--nocapture"])
+        .env("MONAD_TEST_MINT_ROOT", root)
+        .env("MONAD_TEST_MINT_PORT", port.to_string())
+        .env("MONAD_TEST_MINT_URL", url)
+        .env("RUST_LOG", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for unit in ["SAT", "MSAT", "USD"] {
+        command.env_remove(format!("TEST_MINT_FEE_PPK_{unit}"));
+        command.env_remove(format!("CDK_MINTD_INPUT_FEE_PPK_{unit}"));
+    }
+    let mut child = Process(command.spawn().unwrap());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .no_proxy()
+        .build()
+        .unwrap();
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "persistent mint worker exited"
+            );
+            if client
+                .get(format!("http://127.0.0.1:{port}/v1/keysets"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("persistent mint readiness");
+    child
+}
+
 // Never derive Debug: requests contain bearer secrets and signing witnesses.
 #[derive(Default)]
 struct Ledger {
@@ -110,15 +192,30 @@ impl Process {
         );
     }
 
-    async fn json(mut self) -> Value {
+    async fn json_status(mut self) -> (std::process::ExitStatus, Option<Value>) {
         let mut pipe = self.0.stdout.take().expect("JSON process stdout");
         let reader = tokio::task::spawn_blocking(move || {
             let mut bytes = Vec::new();
             std::io::Read::read_to_end(&mut pipe, &mut bytes).unwrap();
             bytes
         });
-        self.success().await;
-        serde_json::from_slice(&reader.await.unwrap()).expect("JSON CLI result")
+        let status = self.status().await;
+        let bytes = reader.await.unwrap();
+        let json = if bytes.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_slice(&bytes).expect("JSON CLI result"))
+        };
+        (status, json)
+    }
+
+    async fn json(self) -> Value {
+        let (status, json) = self.json_status().await;
+        assert!(
+            status.success(),
+            "JSON maintenance CLI failed: {status}; output redacted"
+        );
+        json.expect("JSON CLI result")
     }
 }
 
@@ -137,7 +234,9 @@ pub struct Fixture {
     config: PathBuf,
     client_bin: PathBuf,
     relay_bin: PathBuf,
-    mint: TestMintHelper,
+    mint: Option<TestMintHelper>,
+    mint_process: Option<Process>,
+    mint_port: Option<u16>,
     mint_url: String,
     socks: std::net::SocketAddr,
     target: std::net::SocketAddr,
@@ -151,6 +250,10 @@ pub struct Fixture {
 
 impl Fixture {
     pub async fn start() -> Self {
+        Self::start_with_persistent_mint(false).await
+    }
+
+    pub async fn start_with_persistent_mint(persistent: bool) -> Self {
         let client_bin = PathBuf::from(
             std::env::var("MONAD_FUNDS_CLIENT_BIN").expect("set MONAD_FUNDS_CLIENT_BIN via Make"),
         );
@@ -165,122 +268,159 @@ impl Fixture {
             .prefix("monad-funds-secret-")
             .tempdir()
             .unwrap();
-        let mint = TestMintHelper::new().await.unwrap();
-        rotate_sat_keyset(&mint.mint(), 100).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mint_url = format!("http://{}", listener.local_addr().unwrap());
+        let (mint, mint_process, mint_port, router) = if persistent {
+            let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let child = start_mint_child(dir.path(), port, &mint_url).await;
+            let client = reqwest::Client::builder()
+                .timeout(DEADLINE)
+                .no_proxy()
+                .build()
+                .unwrap();
+            let router = axum::Router::new().fallback(move |request: Request| {
+                let client = client.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+                    // No parent response cache: every request reaches the current child.
+                    let response = client
+                        .request(
+                            parts.method,
+                            format!("http://127.0.0.1:{port}{}", parts.uri),
+                        )
+                        .header("content-type", "application/json")
+                        .body(bytes)
+                        .send()
+                        .await
+                        .expect("mint child HTTP");
+                    let status = response.status();
+                    let bytes = response.bytes().await.unwrap();
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(bytes))
+                        .unwrap()
+                }
+            });
+            (None, Some(child), Some(port), router)
+        } else {
+            let mint = TestMintHelper::new().await.unwrap();
+            rotate_sat_keyset(&mint.mint(), 100).await.unwrap();
+            let router = build_router(mint.mint()).await.unwrap();
+            (Some(mint), None, None, router)
+        };
         let ledger = Arc::new(Mutex::new(Ledger::default()));
         let committed = Arc::new(Notify::new());
         let gate_finished = Arc::new(Notify::new());
         let release = Arc::new(Semaphore::new(0));
-        let router = build_router(mint.mint())
-            .await
-            .unwrap()
-            .layer(axum::middleware::from_fn({
+        let router = router.layer(axum::middleware::from_fn({
+            let ledger = ledger.clone();
+            let committed = committed.clone();
+            let gate_finished = gate_finished.clone();
+            let release = release.clone();
+            move |request: Request, next: Next| {
                 let ledger = ledger.clone();
                 let committed = committed.clone();
                 let gate_finished = gate_finished.clone();
                 let release = release.clone();
-                move |request: Request, next: Next| {
-                    let ledger = ledger.clone();
-                    let committed = committed.clone();
-                    let gate_finished = gate_finished.clone();
-                    let release = release.clone();
-                    async move {
-                        let offline = {
-                            let mut ledger = ledger.lock().unwrap();
-                            ledger.http_requests += 1;
-                            ledger.offline
-                        };
-                        if offline {
+                async move {
+                    let offline = {
+                        let mut ledger = ledger.lock().unwrap();
+                        ledger.http_requests += 1;
+                        ledger.offline
+                    };
+                    if offline {
+                        return axum::response::Response::builder()
+                            .status(503)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+                    if request.uri().path() != "/v1/swap" {
+                        return next.run(request).await;
+                    }
+                    let (parts, body) = request.into_parts();
+                    let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+                    let swap: SwapRequest = serde_json::from_slice(&bytes)
+                        .expect("decode swap request (body redacted)");
+                    {
+                        let mut ledger = ledger.lock().unwrap();
+                        ledger.requests += 1;
+                        ledger.attempts.push(swap.clone());
+                    }
+                    let hold = std::mem::take(&mut ledger.lock().unwrap().hold_request);
+                    if hold {
+                        let _finished = GateFinished(gate_finished.clone());
+                        committed.notify_one();
+                        let permit = tokio::time::timeout(DEADLINE, release.acquire())
+                            .await
+                            .expect("request gate deadline")
+                            .unwrap();
+                        permit.forget();
+                        if std::mem::take(&mut ledger.lock().unwrap().discard_request) {
                             return axum::response::Response::builder()
                                 .status(503)
                                 .body(Body::empty())
                                 .unwrap();
                         }
-                        if request.uri().path() != "/v1/swap" {
-                            return next.run(request).await;
+                    }
+                    let barrier = {
+                        let mut ledger = ledger.lock().unwrap();
+                        let barrier = ledger.race_barrier.clone();
+                        if barrier.is_some() {
+                            ledger.raced_requests += 1;
                         }
-                        let (parts, body) = request.into_parts();
-                        let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
-                        let swap: SwapRequest = serde_json::from_slice(&bytes)
-                            .expect("decode swap request (body redacted)");
-                        {
-                            let mut ledger = ledger.lock().unwrap();
-                            ledger.requests += 1;
-                            ledger.attempts.push(swap.clone());
-                        }
-                        let hold = std::mem::take(&mut ledger.lock().unwrap().hold_request);
-                        if hold {
-                            let _finished = GateFinished(gate_finished.clone());
-                            committed.notify_one();
-                            let permit = tokio::time::timeout(DEADLINE, release.acquire())
-                                .await
-                                .expect("request gate deadline")
-                                .unwrap();
-                            permit.forget();
-                            if std::mem::take(&mut ledger.lock().unwrap().discard_request) {
-                                return axum::response::Response::builder()
-                                    .status(503)
-                                    .body(Body::empty())
-                                    .unwrap();
-                            }
-                        }
-                        let barrier = {
-                            let mut ledger = ledger.lock().unwrap();
-                            let barrier = ledger.race_barrier.clone();
-                            if barrier.is_some() {
-                                ledger.raced_requests += 1;
-                            }
-                            barrier
-                        };
-                        if let Some(barrier) = barrier {
-                            tokio::time::timeout(DEADLINE, barrier.wait())
-                                .await
-                                .expect("both race swaps must reach mint");
-                        }
-                        let response = next
-                            .run(Request::from_parts(parts, Body::from(bytes)))
-                            .await;
-                        if !response.status().is_success() {
-                            ledger.lock().unwrap().rejections += 1;
-                            let (parts, body) = response.into_parts();
-                            let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
-                            let error: Value = serde_json::from_slice(&bytes).unwrap();
-                            if error["code"].as_u64() == Some(12002) {
-                                ledger.lock().unwrap().inactive_rejections += 1;
-                            }
-                            return axum::response::Response::from_parts(parts, Body::from(bytes));
-                        }
+                        barrier
+                    };
+                    if let Some(barrier) = barrier {
+                        tokio::time::timeout(DEADLINE, barrier.wait())
+                            .await
+                            .expect("both race swaps must reach mint");
+                    }
+                    let response = next
+                        .run(Request::from_parts(parts, Body::from(bytes)))
+                        .await;
+                    if !response.status().is_success() {
+                        ledger.lock().unwrap().rejections += 1;
                         let (parts, body) = response.into_parts();
                         let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
-                        let result: SwapResponse = serde_json::from_slice(&bytes)
-                            .expect("decode swap response (body redacted)");
-                        let mut ys = swap
-                            .inputs()
-                            .iter()
-                            .map(|p| p.y().unwrap().to_string())
-                            .collect::<Vec<_>>();
-                        ys.sort();
-                        let hold = {
-                            let mut ledger = ledger.lock().unwrap();
-                            // A cached successful replay is not another mint transaction.
-                            ledger.swaps.entry(ys).or_insert((swap, result));
-                            std::mem::take(&mut ledger.hold_success)
-                        };
-                        if hold {
-                            let _finished = GateFinished(gate_finished.clone());
-                            committed.notify_one();
-                            let permit = tokio::time::timeout(DEADLINE, release.acquire())
-                                .await
-                                .expect("HTTP crash gate deadline")
-                                .unwrap();
-                            permit.forget();
+                        let error: Value = serde_json::from_slice(&bytes).unwrap();
+                        if error["code"].as_u64() == Some(12002) {
+                            ledger.lock().unwrap().inactive_rejections += 1;
                         }
-                        axum::response::Response::from_parts(parts, Body::from(bytes))
+                        return axum::response::Response::from_parts(parts, Body::from(bytes));
                     }
+                    let (parts, body) = response.into_parts();
+                    let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+                    let result: SwapResponse = serde_json::from_slice(&bytes)
+                        .expect("decode swap response (body redacted)");
+                    let mut ys = swap
+                        .inputs()
+                        .iter()
+                        .map(|p| p.y().unwrap().to_string())
+                        .collect::<Vec<_>>();
+                    ys.sort();
+                    let hold = {
+                        let mut ledger = ledger.lock().unwrap();
+                        // A cached successful replay is not another mint transaction.
+                        ledger.swaps.entry(ys).or_insert((swap, result));
+                        std::mem::take(&mut ledger.hold_success)
+                    };
+                    if hold {
+                        let _finished = GateFinished(gate_finished.clone());
+                        committed.notify_one();
+                        let permit = tokio::time::timeout(DEADLINE, release.acquire())
+                            .await
+                            .expect("HTTP crash gate deadline")
+                            .unwrap();
+                        permit.forget();
+                    }
+                    axum::response::Response::from_parts(parts, Body::from(bytes))
                 }
-            }));
+            }
+        }));
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -350,10 +490,15 @@ clients:
         )
         .unwrap();
         // Only initial funding. Later cycles must live on recovered change/refunds.
-        let proofs = tokio::time::timeout(DEADLINE, mint.mint_proofs(INITIAL))
-            .await
-            .unwrap()
-            .unwrap();
+        let proofs: Vec<Proof> = if let Some(mint) = &mint {
+            tokio::time::timeout(DEADLINE, mint.mint_proofs(INITIAL))
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            serde_json::from_slice(&std::fs::read(dir.path().join("initial-proofs.json")).unwrap())
+                .expect("bootstrap proofs (redacted)")
+        };
         let wallet =
             LooseProofWallet::open(dir.path().join("loose.db"), CONFIGURED_CLIENT_WALLET_NAME)
                 .unwrap();
@@ -383,6 +528,8 @@ clients:
             client_bin,
             relay_bin,
             mint,
+            mint_process,
+            mint_port,
             mint_url,
             socks,
             target,
@@ -397,6 +544,77 @@ clients:
 
     fn client(&self, args: &[&str]) -> Process {
         Process::spawn(&self.client_bin, args, &self.config)
+    }
+
+    fn memory_mint(&self) -> Arc<cdk::Mint> {
+        self.mint
+            .as_ref()
+            .expect("rotation scenarios use memory fixture")
+            .mint()
+    }
+
+    async fn mint_post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> T {
+        reqwest::Client::builder()
+            .timeout(DEADLINE)
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}{path}", self.mint_url))
+            .json(body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .expect("mint response (redacted)")
+    }
+
+    pub async fn persistent_mint_restart(&mut self) {
+        self.cycle += 1;
+        assert!(self.mint.is_none(), "no parent in-memory mint allowed");
+        let relay = self.relay(&["run"]);
+        let client = self.client(&["run"]);
+        self.roundtrip().await;
+        drop(client);
+        drop(relay);
+        let channel = self.active_channel();
+        self.ledger.lock().unwrap().hold_success = true;
+        let close = self.relay(&["wallet", "close", "--channel-id", &channel]);
+        tokio::time::timeout(DEADLINE, self.committed.notified())
+            .await
+            .expect("committed close response gate");
+        // The gate has consumed the child's complete successful HTTP response.
+        // Killing and reaping removes its in-memory HTTP cache as well as the mint.
+        assert_eq!(self.ledger.lock().unwrap().swaps.len(), 2);
+        drop(close);
+        drop(self.mint_process.take());
+        self.release_gate().await;
+        self.mint_process = Some(
+            start_mint_child(
+                self.dir.as_ref().unwrap().path(),
+                self.mint_port.unwrap(),
+                &self.mint_url,
+            )
+            .await,
+        );
+        let before = self.ledger.lock().unwrap().requests;
+        let result = self
+            .relay(&["wallet", "--json", "close", "--channel-id", &channel])
+            .json()
+            .await;
+        assert_eq!(result["outcome"], "Closed");
+        assert_eq!(
+            self.ledger.lock().unwrap().requests,
+            before,
+            "restart recovery must restore, not resubmit"
+        );
+        self.settle(&channel, false).await;
     }
 
     async fn release_gate(&self) {
@@ -710,7 +928,7 @@ clients:
                     tokio::time::timeout(DEADLINE, self.committed.notified())
                         .await
                         .expect("close rejection request gate");
-                    rotate_sat_keyset(&self.mint.mint(), 250).await.unwrap();
+                    rotate_sat_keyset(&self.memory_mint(), 250).await.unwrap();
                     self.release_gate().await;
                 };
                 tokio::join!(
@@ -744,7 +962,7 @@ clients:
                 tokio::time::timeout(DEADLINE, self.committed.notified())
                     .await
                     .expect("close request gate");
-                rotate_sat_keyset(&self.mint.mint(), 250).await.unwrap();
+                rotate_sat_keyset(&self.memory_mint(), 250).await.unwrap();
                 self.release_gate().await;
             }
             if lost_response {
@@ -753,7 +971,7 @@ clients:
                     .expect("close response gate");
                 drop(child);
                 self.release_gate().await;
-                rotate_sat_keyset(&self.mint.mint(), 300).await.unwrap();
+                rotate_sat_keyset(&self.memory_mint(), 300).await.unwrap();
             } else {
                 child.success().await;
             }
@@ -781,7 +999,7 @@ clients:
                 tokio::time::timeout(DEADLINE, self.committed.notified())
                     .await
                     .expect("refund request gate");
-                rotate_sat_keyset(&self.mint.mint(), 250).await.unwrap();
+                rotate_sat_keyset(&self.memory_mint(), 250).await.unwrap();
                 self.release_gate().await;
             }
             if lost_response {
@@ -864,7 +1082,7 @@ clients:
                     tokio::time::timeout(DEADLINE, self.committed.notified())
                         .await
                         .expect("drain rejection request gate");
-                    rotate_sat_keyset(&self.mint.mint(), 200).await.unwrap();
+                    rotate_sat_keyset(&self.memory_mint(), 200).await.unwrap();
                     self.release_gate().await;
                 };
                 tokio::join!(
@@ -883,7 +1101,7 @@ clients:
                 tokio::time::timeout(DEADLINE, self.committed.notified())
                     .await
                     .expect("drain request gate");
-                rotate_sat_keyset(&self.mint.mint(), 200).await.unwrap();
+                rotate_sat_keyset(&self.memory_mint(), 200).await.unwrap();
                 self.release_gate().await;
             }
             if lost_response {
@@ -892,7 +1110,7 @@ clients:
                     .expect("drain response gate");
                 drop(child);
                 self.release_gate().await;
-                rotate_sat_keyset(&self.mint.mint(), 350).await.unwrap();
+                rotate_sat_keyset(&self.memory_mint(), 350).await.unwrap();
             } else {
                 child.success().await;
             }
@@ -1008,7 +1226,7 @@ clients:
         }
         if rotate {
             assert!(!kill_before, "direct rejection must reach live client");
-            rotate_sat_keyset(&self.mint.mint(), 350).await.unwrap();
+            rotate_sat_keyset(&self.memory_mint(), 350).await.unwrap();
         }
         self.release_gate().await;
         tokio::time::timeout(DEADLINE, self.committed.notified())
@@ -1066,12 +1284,7 @@ clients:
             self.ledger.lock().unwrap().race_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
             (self.relay(&close_args), self.client(&refund_args))
         };
-        let close_result = close.json().await;
-        let sender_refunded = match close_result["outcome"].as_str().unwrap() {
-            "Closed" => false,
-            "SenderRefundedAfterExpiry" => true,
-            _ => panic!("race did not resolve a typed terminal outcome"),
-        };
+        let (close_status, close_result) = close.json_status().await;
         refund.success().await;
         if refund_wins.is_none() {
             let mut ledger = self.ledger.lock().unwrap();
@@ -1081,6 +1294,18 @@ clients:
                 "race did not overlap at mint execution"
             );
         }
+        // Pending is valid during concurrent mint execution. Only after both
+        // processes finish can a fresh bounded recovery classify the winner.
+        let close_result = if close_status.success() {
+            close_result.unwrap()
+        } else {
+            self.relay(&close_args).json().await
+        };
+        let sender_refunded = match close_result["outcome"].as_str().unwrap() {
+            "Closed" => false,
+            "SenderRefundedAfterExpiry" => true,
+            _ => panic!("race did not resolve a typed terminal outcome"),
+        };
         assert_eq!(
             self.ledger.lock().unwrap().swaps.len(),
             before + 1,
@@ -1117,7 +1342,7 @@ clients:
     }
 
     pub async fn rotate(&self, ppk: u64) {
-        rotate_sat_keyset(&self.mint.mint(), ppk).await.unwrap();
+        rotate_sat_keyset(&self.memory_mint(), ppk).await.unwrap();
     }
 
     pub async fn refund_request_crash(&mut self) {
@@ -1162,7 +1387,7 @@ clients:
     pub async fn refund_rotation_before_prepare(&mut self) {
         self.cycle += 1;
         let channel = self.open_expired().await;
-        let output_keyset = rotate_sat_keyset(&self.mint.mint(), 450).await.unwrap();
+        let output_keyset = rotate_sat_keyset(&self.memory_mint(), 450).await.unwrap();
         self.settle(&channel, true).await;
         let ledger = self.ledger.lock().unwrap();
         assert!(
@@ -1256,19 +1481,25 @@ clients:
             proofs.len(),
             "duplicate final custody"
         );
-        let states = self
-            .mint
-            .mint()
-            .check_state(&CheckStateRequest { ys })
-            .await
-            .unwrap();
+        let states: cashu::nuts::CheckStateResponse = self
+            .mint_post("/v1/checkstate", &CheckStateRequest { ys })
+            .await;
         assert_eq!(states.states.len(), proofs.len());
         assert!(
             states.states.iter().all(|s| s.state == State::Unspent),
             "final custody includes spent/unknown proofs"
         );
         for proof in &proofs {
-            let keys = self.mint.mint().keyset_pubkeys(&proof.keyset_id).unwrap();
+            let keys: cashu::nuts::KeysResponse = reqwest::Client::new()
+                .get(format!("{}/v1/keys/{}", self.mint_url, proof.keyset_id))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
             proof
                 .verify_dleq(*keys.keysets[0].keys.get(&proof.amount).unwrap())
                 .expect("final proof DLEQ invalid");
@@ -1295,26 +1526,26 @@ clients:
         let mut total_fee = 0;
         let swaps = self.ledger.lock().unwrap().swaps.clone();
         for (swap, response) in swaps.values() {
-            let restored = self
-                .mint
-                .mint()
-                .restore(RestoreRequest {
-                    outputs: swap.outputs().to_vec(),
-                })
-                .await
-                .unwrap();
+            let restored: cashu::nuts::RestoreResponse = self
+                .mint_post(
+                    "/v1/restore",
+                    &RestoreRequest {
+                        outputs: swap.outputs().to_vec(),
+                    },
+                )
+                .await;
             assert!(
                 restored.signatures == response.signatures,
                 "accepted output restore mismatch"
             );
-            let states = self
-                .mint
-                .mint()
-                .check_state(&CheckStateRequest {
-                    ys: swap.inputs().iter().map(|p| p.y().unwrap()).collect(),
-                })
-                .await
-                .unwrap();
+            let states: cashu::nuts::CheckStateResponse = self
+                .mint_post(
+                    "/v1/checkstate",
+                    &CheckStateRequest {
+                        ys: swap.inputs().iter().map(|p| p.y().unwrap()).collect(),
+                    },
+                )
+                .await;
             assert_eq!(states.states.len(), swap.inputs().len());
             assert!(
                 states.states.iter().all(|s| s.state == State::Spent),
@@ -1350,13 +1581,20 @@ clients:
 
     pub async fn finish(mut self) {
         self.tasks.shutdown().await;
+        drop(self.mint_process.take());
         self.dir.take().unwrap().close().unwrap();
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        drop(self.mint_process.take());
         if let Some(dir) = self.dir.take() {
+            if self.mint_port.is_some() {
+                self.tasks.abort_all();
+                drop(dir);
+                return;
+            }
             eprintln!(
                 "SECRET wallet artifacts preserved after failure: {} (do not publish)",
                 dir.keep().display()
