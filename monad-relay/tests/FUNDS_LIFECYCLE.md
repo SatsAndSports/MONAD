@@ -9,8 +9,14 @@ transitions. The mint remains alive; mint durability and machine power loss are
 not covered.
 
 `make test-funds-crashes` additionally builds the client with the explicit
-`funds-lifecycle-test` feature. **Never use that binary for real funds.** Rebuild
-without features before normal use. Normal builds contain neither the IPC hooks
+`funds-lifecycle-test` feature. Both it and `make stress-funds-lifecycle` build
+their CLIs in `target/funds-lifecycle/debug` and pass those absolute binary paths
+to the harness. Normal `target/debug` and `target/release` binaries are untouched;
+no normal-binary rebuild is required afterward. The baseline target continues to
+use normal builds. The test harness is also built in the isolated target directory,
+without the feature, since Cargo may rebuild the relay binary for integration tests.
+**Never use the isolated instrumented client binary
+for real funds.** Normal builds contain neither the IPC hooks
 nor the lifetime environment override. The test build uses bounded loopback IPC:
 the child reports only a fixed durable-boundary name and blocks awaiting an
 acknowledgement. The parent kills and reaps it before allowing any continuation.
