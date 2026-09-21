@@ -18,6 +18,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod close_recovery;
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "outcome", content = "details")]
+pub enum CloseOutcome {
+    Closed(CloseSuccess),
+    SenderRefundedAfterExpiry {
+        channel_id: String,
+    },
+    /// Funding is spent, but which authorized branch won is unresolved.
+    /// The journal remains recoverable; no payout or terminal state is invented.
+    UnknownSpent {
+        channel_id: String,
+    },
+}
+
+impl CloseOutcome {
+    pub fn into_closed(self) -> Result<CloseSuccess, Self> {
+        match self {
+            Self::Closed(close) => Ok(close),
+            other => Err(other),
+        }
+    }
+}
+
 pub trait RelayPayments: Send + Sync + 'static {
     fn link_channel(
         &self,
@@ -417,7 +440,7 @@ impl SpilmanRelayPayments {
         channel_id: &str,
         mint_client: &M,
         keyset_refresher: &R,
-    ) -> Result<CloseSuccess, CloseError> {
+    ) -> Result<CloseOutcome, CloseError> {
         self.recover_close(channel_id, mint_client, keyset_refresher)
             .await
     }
@@ -430,7 +453,7 @@ impl SpilmanRelayPayments {
         channel_id: &str,
         mint_client: &M,
         keyset_refresher: &R,
-    ) -> Result<CloseSuccess, CloseError> {
+    ) -> Result<CloseOutcome, CloseError> {
         self.recover_close(channel_id, mint_client, keyset_refresher)
             .await
     }
@@ -484,7 +507,7 @@ impl SpilmanRelayPayments {
         channel_id: &str,
         mint_client: &M,
         keyset_refresher: &R,
-    ) -> Result<CloseSuccess, CloseError> {
+    ) -> Result<CloseOutcome, CloseError> {
         if self
             .store
             .storage()
@@ -509,14 +532,14 @@ impl SpilmanRelayPayments {
                     }
                 })?;
                 let total_value = data.receiver_sum + data.sender_sum;
-                Ok(CloseSuccess {
+                Ok(CloseOutcome::Closed(CloseSuccess {
                     channel_id: channel_id.to_string(),
                     total_value,
                     receiver_sum: data.receiver_sum,
                     sender_sum: data.sender_sum,
                     sender_proofs: data.sender_proofs_json,
                     already_closed: true,
-                })
+                }))
             }
             Some(ChannelState::Closing) => {
                 self.execute_close_for_closing_channel_async(

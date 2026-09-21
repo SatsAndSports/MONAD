@@ -19,6 +19,7 @@ struct CloseJournal {
     attempts: Vec<CloseAttempt>,
     finalizing: Option<CompletedClose>,
     completed: bool,
+    refunded: Option<CheckStateResponse>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,7 +47,7 @@ impl SpilmanRelayPayments {
     pub(crate) fn validate_close_schema(json: &str) -> Result<(), String> {
         let journal: CloseJournal = serde_json::from_str(json)
             .map_err(|_| "incompatible close journal; database retained")?;
-        if journal.version != 1 || journal.attempts.is_empty() || journal.attempts.len() > 2 {
+        if journal.version != 2 || journal.attempts.is_empty() || journal.attempts.len() > 2 {
             return Err("incompatible close journal version; database retained".to_string());
         }
         Ok(())
@@ -57,7 +58,7 @@ impl SpilmanRelayPayments {
         channel_id: &str,
         mint: &M,
         refresh: &R,
-    ) -> Result<CloseSuccess, CloseError> {
+    ) -> Result<CloseOutcome, CloseError> {
         let binding = self.store.journal_binding().map_err(error)?;
         let flight_key = format!(
             "{binding}:{}:{channel_id}",
@@ -100,7 +101,7 @@ impl SpilmanRelayPayments {
                     &self.receiver_secret.public_key(),
                 )?;
                 let journal = CloseJournal {
-                    version: 1,
+                    version: 2,
                     binding: binding.clone(),
                     receiver: self.receiver_secret.public_key().to_hex(),
                     funding,
@@ -112,6 +113,7 @@ impl SpilmanRelayPayments {
                     }],
                     finalizing: None,
                     completed: false,
+                    refunded: None,
                 };
                 let json = serde_json::to_string(&journal)
                     .map_err(|_| error("serialize close journal"))?;
@@ -132,7 +134,7 @@ impl SpilmanRelayPayments {
                 journal
             }
         };
-        if journal.version != 1
+        if journal.version != 2
             || journal.binding != binding
             || journal.receiver != self.receiver_secret.public_key().to_hex()
             || journal.attempts.is_empty()
@@ -169,6 +171,37 @@ impl SpilmanRelayPayments {
                 &journal.payment,
                 &self.receiver_secret.public_key(),
             )?;
+        }
+        let secret: [u8; 32] = hex::decode(&journal.funding.channel_secret_hex)
+            .map_err(|_| error("invalid channel secret"))?
+            .try_into()
+            .map_err(|_| error("invalid channel secret length"))?;
+        let params = cdk_spilman::ChannelParameters::from_json_with_channel_secret(
+            &journal.funding.params_json,
+            cdk_spilman::parse_keyset_info_from_json(&journal.funding.keyset_info_json)
+                .map_err(error)?,
+            secret,
+        )
+        .map_err(|_| error("invalid funding parameters"))?;
+        let channel = cdk_spilman::EstablishedChannel::new(
+            params,
+            serde_json::from_str(&journal.funding.funding_proofs_json)
+                .map_err(|_| error("invalid funding proofs"))?,
+        )
+        .map_err(|_| error("invalid funding"))?;
+        if let Some(evidence) = &journal.refunded {
+            if journal.completed
+                || journal.finalizing.is_some()
+                || storage.get_state(channel_id) != ChannelState::SenderRefundedAfterExpiry
+                || !channel
+                    .sender_refund_attested(evidence)
+                    .map_err(|_| error("invalid saved refund evidence"))?
+            {
+                return Err(error("terminal refund journal conflict"));
+            }
+            return Ok(CloseOutcome::SenderRefundedAfterExpiry {
+                channel_id: channel_id.to_string(),
+            });
         }
         if !journal.completed {
             let closing = storage
@@ -226,7 +259,7 @@ impl SpilmanRelayPayments {
                     {
                         return Err(error("completed journal payout conflict"));
                     }
-                    return Ok(result);
+                    return Ok(CloseOutcome::Closed(result));
                 }
                 journal.completed = true;
                 let next = serde_json::to_string(&journal)
@@ -236,7 +269,7 @@ impl SpilmanRelayPayments {
                     .map_err(error)?;
                 #[cfg(feature = "funds-lifecycle-test")]
                 crate::lifecycle_test::boundary("close-completed");
-                return Ok(result);
+                return Ok(CloseOutcome::Closed(result));
             }
             if journal.completed {
                 return Err(error("completed close journal lacks payout"));
@@ -356,9 +389,37 @@ impl SpilmanRelayPayments {
                     if invalid_restore {
                         return Err(error("invalid final close restore; outcome unresolved"));
                     }
-                    return Err(error(
-                        "close inputs not conclusively unspent; outcome unresolved",
-                    ));
+                    let all_spent = response.states.len() == ys.len()
+                        && ys.iter().all(|y| {
+                            response
+                                .states
+                                .iter()
+                                .filter(|s| s.y == *y && s.state == State::Spent)
+                                .count()
+                                == 1
+                        });
+                    if !all_spent {
+                        return Err(error(
+                            "close input state incomplete or pending; outcome unresolved",
+                        ));
+                    }
+                    if channel
+                        .sender_refund_attested(&response)
+                        .map_err(|_| error("invalid sender refund evidence; outcome unresolved"))?
+                    {
+                        journal.refunded = Some(response);
+                        let next = serde_json::to_string(&journal)
+                            .map_err(|_| error("serialize sender refund evidence"))?;
+                        storage
+                            .finish_sender_refund(channel_id, &durable, &next)
+                            .map_err(error)?;
+                        return Ok(CloseOutcome::SenderRefundedAfterExpiry {
+                            channel_id: channel_id.to_string(),
+                        });
+                    }
+                    return Ok(CloseOutcome::UnknownSpent {
+                        channel_id: channel_id.to_string(),
+                    });
                 }
             }
             let prepared = &journal.attempts[last].prepared;

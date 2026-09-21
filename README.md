@@ -12,6 +12,15 @@ It provides:
 
 ## Status
 
+Relay wallet close results are typed: `Closed` carries the normal receiver/sender
+payout split; `SenderRefundedAfterExpiry` means the sender spent the full funding
+minus mint fees via the refund branch and no receiver payout exists. Both are
+successful administrative terminal outcomes. `UnknownSpent` retains a recoverable
+journal because close versus refund remains unresolved; retry recovery later.
+`--json` exposes `outcome` and `details`. Batch close reports `resolved`, `unresolved`,
+and `failures` separately. Terminal refunds are excluded from autosweep and drain.
+Close journal v2 rejects incompatible journals without deleting wallet data.
+
 Wallet databases explicitly verify SQLite `synchronous=EXTRA` on each writable
 connection. Back up all client and relay wallet databases using SQLite's backup
 API or consistent SQLite snapshots, not raw copies of live `.db` files (committed

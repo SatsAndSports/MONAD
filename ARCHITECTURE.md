@@ -2,6 +2,25 @@
 
 ## Overview
 
+### Terminal Refunds
+
+`SenderRefundedAfterExpiry` is an upstream persistent channel state, distinct from
+normal `Closed` with no fabricated payout. The relay close journal v2 saves the
+full mint NUT-07 evidence in the same transaction as the terminal state before
+returning it. Every saved close attempt is restored before input-state checks and
+again after spent evidence, so an actual verified close payout takes precedence.
+Under the honest-mint, complete-witness assumption, exact all-spent funding-Y
+coverage and exactly one well-formed signature on the original first input attest
+the refund branch only after validating our generated 2-distinct-x-only-key close,
+1-key SIG_ALL refund conditions. This is mint attestation, not independent
+verification of the unavailable full spending request. Two signatures can be a
+refund plus an unrelated signature and remain ambiguous. `UnknownSpent` retains
+the journal and permits later invocations with bounded per-call replay, never a
+lifetime abandonment. Pending, partial, malformed, and network evidence cannot
+install a terminal state. Terminal reopen validates saved evidence locally and
+does no mint I/O. No payments, links, autosweep candidates, or drain payouts are
+available for terminal refunds; sender proof restoration remains independent.
+
 ### Wallet Durability
 
 Every writable file-backed wallet connection, including short-lived relay

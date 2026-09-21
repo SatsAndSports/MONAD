@@ -2,7 +2,7 @@ use crate::channel_store::ChannelStore;
 use crate::listener::{
     shared_spilman_mint_cache, SharedSpilmanMintCache, SpilmanMintCache, TrustedMintUnits,
 };
-use crate::payments::{RelayPayments, SpilmanRelayPayments};
+use crate::payments::{CloseOutcome, RelayPayments, SpilmanRelayPayments};
 use cashu::nuts::{BlindedMessage, Proof, SecretKey, SwapRequest};
 use cdk_spilman::configurable_host::{KeysetCacheEntry, SpilmanStorage, SqliteStorage};
 use cdk_spilman::configurable_networking::{
@@ -10,8 +10,7 @@ use cdk_spilman::configurable_networking::{
 };
 use cdk_spilman::{
     complete_funding_swap, complete_plain_change_restore, create_plain_blinded_messages,
-    ChannelFunding, ChannelState, CloseError, CloseSuccess, SpilmanAsyncKeysetRefresher,
-    SpilmanAsyncMintClient,
+    ChannelFunding, ChannelState, CloseError, SpilmanAsyncKeysetRefresher, SpilmanAsyncMintClient,
 };
 use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::wallet_lock::{WalletLockIdentity, WalletLockMode, WalletLocks};
@@ -520,6 +519,7 @@ impl RelayWalletInspection {
                     state: match state.as_str() {
                         "Closing" => ChannelState::Closing,
                         "Closed" => ChannelState::Closed,
+                        "SenderRefundedAfterExpiry" => ChannelState::SenderRefundedAfterExpiry,
                         _ => ChannelState::Open,
                     },
                     closing_json: row.get(6)?,
@@ -568,7 +568,10 @@ impl InspectionChannel {
     }
 
     fn expiring_summary(self, now: u64, cutoff: u64) -> io::Result<Option<ExpiringChannelSummary>> {
-        if self.state == ChannelState::Closed {
+        if matches!(
+            self.state,
+            ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry
+        ) {
             return Ok(None);
         }
         let funding = self.funding()?;
@@ -1027,7 +1030,10 @@ impl RelayWalletManager {
                 Some(c) => c,
                 None => continue,
             };
-            if channel.state == ChannelState::Closed {
+            if matches!(
+                channel.state,
+                ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry
+            ) {
                 continue;
             }
             let funding =
@@ -1039,7 +1045,7 @@ impl RelayWalletManager {
                     .as_ref()
                     .map(|closing| closing.expiry_timestamp)
                     .unwrap_or(funding.expiry_timestamp),
-                ChannelState::Closed => continue,
+                ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry => continue,
             };
             if expiry_timestamp > cutoff {
                 continue;
@@ -1099,7 +1105,7 @@ impl RelayWalletManager {
         &self,
         channel_id: &str,
         net: &N,
-    ) -> Result<CloseSuccess, CloseError> {
+    ) -> Result<CloseOutcome, CloseError> {
         let payments = self.payments_for_channel(channel_id).await?;
         // The close driver reads its journal before any cache warmup or mint IO.
         payments
@@ -1128,8 +1134,9 @@ impl RelayWalletManager {
         for channel in channels {
             match self.mint_client_for_channel(&channel.channel_id) {
                 Ok(net) => match self.close_channel(&channel.channel_id, &net).await {
+                    Ok(CloseOutcome::UnknownSpent { .. }) => result.unresolved.push(channel),
                     Ok(close) => result
-                        .closed
+                        .resolved
                         .push(CloseExpiringChannelSuccess { channel, close }),
                     Err(error) => result.failures.push(CloseExpiringChannelFailure {
                         error: close_error_summary(&error),
@@ -1838,8 +1845,9 @@ pub struct CloseExpiringChannelsResult {
     pub close_before_expiry_secs: u64,
     pub candidate_count: usize,
     pub candidates: Vec<ExpiringChannelSummary>,
-    pub closed: Vec<CloseExpiringChannelSuccess>,
+    pub resolved: Vec<CloseExpiringChannelSuccess>,
     pub failures: Vec<CloseExpiringChannelFailure>,
+    pub unresolved: Vec<ExpiringChannelSummary>,
 }
 
 impl CloseExpiringChannelsResult {
@@ -1849,8 +1857,9 @@ impl CloseExpiringChannelsResult {
             close_before_expiry_secs,
             candidate_count,
             candidates: Vec::new(),
-            closed: Vec::new(),
+            resolved: Vec::new(),
             failures: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
 
@@ -1860,8 +1869,9 @@ impl CloseExpiringChannelsResult {
             close_before_expiry_secs,
             candidate_count: candidates.len(),
             candidates,
-            closed: Vec::new(),
+            resolved: Vec::new(),
             failures: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
 }
@@ -1869,7 +1879,7 @@ impl CloseExpiringChannelsResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CloseExpiringChannelSuccess {
     pub channel: ExpiringChannelSummary,
-    pub close: CloseSuccess,
+    pub close: CloseOutcome,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2339,7 +2349,7 @@ mod tests {
             .await;
 
         assert_eq!(result.candidate_count, 1);
-        assert!(result.closed.is_empty());
+        assert!(result.resolved.is_empty());
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].channel.channel_id, "missing-channel");
         assert!(result.failures[0].error.contains("not found"));

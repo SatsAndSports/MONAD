@@ -75,7 +75,11 @@ impl Process {
                 .env_remove("MONAD_FUNDS_LIFETIME")
                 .envs(env.iter().copied())
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdout(if args.contains(&"--json") {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                })
                 .stderr(
                     std::fs::File::create(config.parent().unwrap().join("last-process.stderr"))
                         .unwrap(),
@@ -104,6 +108,17 @@ impl Process {
             status.success(),
             "maintenance CLI failed: {status}; output suppressed to protect secrets"
         );
+    }
+
+    async fn json(mut self) -> Value {
+        let mut pipe = self.0.stdout.take().expect("JSON process stdout");
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut pipe, &mut bytes).unwrap();
+            bytes
+        });
+        self.success().await;
+        serde_json::from_slice(&reader.await.unwrap()).expect("JSON CLI result")
     }
 }
 
@@ -608,6 +623,45 @@ clients:
             .success()
             .await;
         }
+        if refund {
+            let args = ["wallet", "--json", "close", "--channel-id", channel];
+            let result = self.relay(&args).json().await;
+            assert_eq!(result["outcome"], "SenderRefundedAfterExpiry");
+            let before = {
+                let mut ledger = self.ledger.lock().unwrap();
+                ledger.offline = true;
+                ledger.http_requests
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    self.relay(&args).json().await["outcome"],
+                    "SenderRefundedAfterExpiry"
+                );
+            }
+            let batch = self
+                .relay(&["wallet", "--json", "close-expiring-channels"])
+                .json()
+                .await;
+            assert_eq!(batch["candidate_count"], 0);
+            assert!(!self
+                .relay(&[
+                    "wallet",
+                    "drain",
+                    "--mint-url",
+                    &self.mint_url,
+                    "--unit",
+                    "sat"
+                ])
+                .status()
+                .await
+                .success());
+            let mut ledger = self.ledger.lock().unwrap();
+            assert_eq!(
+                ledger.http_requests, before,
+                "terminal operations performed mint IO"
+            );
+            ledger.offline = false;
+        }
         self.audit().await;
     }
 
@@ -986,7 +1040,7 @@ clients:
         let channel = self.open_expired().await;
         let before = self.ledger.lock().unwrap().swaps.len();
         let refund_args = ["wallet", "recover-channel", "--channel-id", &channel];
-        let close_args = ["wallet", "close", "--channel-id", &channel];
+        let close_args = ["wallet", "--json", "close", "--channel-id", &channel];
         let (close, refund) = if let Some(refund_first) = refund_wins {
             self.ledger.lock().unwrap().hold_success = true;
             let first = if refund_first {
@@ -1012,7 +1066,12 @@ clients:
             self.ledger.lock().unwrap().race_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
             (self.relay(&close_args), self.client(&refund_args))
         };
-        let close_status = close.status().await;
+        let close_result = close.json().await;
+        let sender_refunded = match close_result["outcome"].as_str().unwrap() {
+            "Closed" => false,
+            "SenderRefundedAfterExpiry" => true,
+            _ => panic!("race did not resolve a typed terminal outcome"),
+        };
         refund.success().await;
         if refund_wins.is_none() {
             let mut ledger = self.ledger.lock().unwrap();
@@ -1028,13 +1087,9 @@ clients:
             "race must commit one spend"
         );
         if let Some(refund_first) = refund_wins {
-            assert_eq!(
-                close_status.success(),
-                !refund_first,
-                "wrong controlled winner"
-            );
+            assert_eq!(sender_refunded, refund_first, "wrong controlled winner");
         }
-        self.settle(&channel, !close_status.success()).await;
+        self.settle(&channel, sender_refunded).await;
     }
 
     pub async fn close_winner_response_loss(&mut self) {

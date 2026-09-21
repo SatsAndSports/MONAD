@@ -1265,6 +1265,7 @@ async fn create_paid_closed_channel(
         .close_channel_async(&channel_id, &net, wallet_manager)
         .await
         .expect("relay should close test channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(close_success.receiver_sum >= funded_balance_raw);
     assert_closed_payout_at_least(payments, &channel_id, funded_balance_raw);
     channel_id
@@ -1839,6 +1840,17 @@ struct DrainTestContext {
 
 impl DrainTestContext {
     async fn new(relay_name: &str) -> Self {
+        Self::with_policy(
+            relay_name,
+            monad_common::config::RelayChannelPolicyConfig::default(),
+        )
+        .await
+    }
+
+    async fn with_policy(
+        relay_name: &str,
+        policy: monad_common::config::RelayChannelPolicyConfig,
+    ) -> Self {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mint_addr = mint_listener.local_addr().unwrap();
@@ -1869,7 +1881,7 @@ impl DrainTestContext {
             .unwrap();
         wallet_manager.install_keyset_cache(mint_cache.clone());
         let payments = wallet_manager
-            .spilman_payments_for(relay_name, mint_cache, trusted_mint_units)
+            .spilman_payments_for_with_policy(relay_name, mint_cache, trusted_mint_units, policy)
             .unwrap();
         let wallet = TestSigningWallet::new(
             mint_helper.mint(),
@@ -5758,6 +5770,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         .close_channel(&old_channel_id, &net)
         .await
         .expect("close should refresh stale keysets and retry");
+    let close_success = close_success.into_closed().unwrap();
     assert_eq!(close_success.receiver_sum, old_funded_balance_raw);
     assert_closed_payout_at_least(&payments, &old_channel_id, old_funded_balance_raw);
     let closed_data = payments
@@ -10019,6 +10032,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
         .close_channel_async(&channel_id, &mint_networking, &mint_networking)
         .await
         .expect("relay should close the channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
     assert_eq!(
@@ -10192,6 +10206,7 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
         .close_channel_async(&channel_id, &mint_networking, &mint_networking)
         .await
         .expect("relay should close the channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
 
@@ -10383,6 +10398,7 @@ async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
         .close_channel_async(&channel_id, &mint_networking, &mint_networking)
         .await
         .expect("relay should close the channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
 
@@ -10401,7 +10417,7 @@ async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
     assert_eq!(funding_state.state, cashu::nuts::State::Spent);
     assert_eq!(
         EstablishedChannel::classify_funding_spend_witness(&funding_state),
-        FundingSpendKind::RelayClose
+        FundingSpendKind::Unknown
     );
 
     let maintenance = monad_client::wallet_lock::ClientWalletLocks::acquire(
@@ -10565,6 +10581,7 @@ async fn test_wallet_manager_close_channel_by_id() {
         .close_channel(&channel_id, &net)
         .await
         .expect("wallet manager should close the channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
     assert_eq!(close_success.total_value, capacity_raw);
@@ -10737,6 +10754,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
         .close_channel(&channel_id, &net)
         .await
         .expect("wallet manager should complete close from Closing state");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
     assert_eq!(close_success.total_value, capacity_raw);
@@ -10750,6 +10768,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
         .close_channel(&channel_id, &net)
         .await
         .expect("second close on already-closed channel should succeed");
+    let second_close = second_close.into_closed().unwrap();
     assert!(second_close.already_closed);
     assert_eq!(second_close.receiver_sum, funded_balance_raw);
     assert_eq!(second_close.total_value, capacity_raw);
@@ -11337,8 +11356,183 @@ async fn test_close_server_error_and_replay_rejection_preserve_exact_request() {
         .close_channel(&channel, &net)
         .await
         .unwrap();
+    let completed = completed.into_closed().unwrap();
     assert!(completed.receiver_sum >= 450);
     ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_close_and_drain_refresh_inactive_or_missing_cached_output_metadata() {
+    for missing_metadata in [false, true] {
+        let ctx = DrainTestContext::new("usable-cache").await;
+        let channel = create_paid_open_channel_with_expiry(
+            &ctx.payments,
+            &ctx.wallet,
+            &ctx.offer,
+            [37; 32],
+            450,
+            cashu::util::unix_time() + 86_400,
+        )
+        .await;
+        for close in [true, false] {
+            let mut cache = ctx.wallet_manager.keyset_cache_snapshot();
+            for keyset in cache.keysets.get_mut(&ctx.mint_url).unwrap().values_mut() {
+                if missing_metadata {
+                    keyset.info_json = "{}".to_string();
+                } else {
+                    keyset.active = false;
+                }
+            }
+            ctx.wallet_manager.install_keyset_cache(cache);
+            let net = ctx.net_for(&channel);
+            if close {
+                assert!(
+                    ctx.wallet_manager
+                        .close_channel(&channel, &net)
+                        .await
+                        .unwrap()
+                        .into_closed()
+                        .unwrap()
+                        .receiver_sum
+                        >= 450
+                );
+            } else {
+                let drain = ctx
+                    .wallet_manager
+                    .drain_closed_channels_to_swap("usable-cache", &ctx.mint_url, "sat", &net, None)
+                    .await
+                    .unwrap();
+                assert!(sum_proof_amounts(&drain.output_proofs_json) > 0);
+            }
+            let cache = ctx.wallet_manager.keyset_cache_snapshot();
+            assert!(cache.keysets[&ctx.mint_url].values().any(|key| key.active
+                && cdk_spilman::parse_keyset_info_from_json(&key.info_json).is_ok()));
+        }
+        ctx.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sender_refund_terminal_and_extra_signature_remains_recoverable() {
+    use monad_relay::payments::CloseOutcome;
+    for extra in [false, true] {
+        let ctx = DrainTestContext::with_policy(
+            "refund-outcome",
+            monad_common::config::RelayChannelPolicyConfig {
+                min_expiry_secs: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let expiry = cashu::util::unix_time() + 6;
+        let channel_id = create_paid_open_channel_with_expiry(
+            &ctx.payments,
+            &ctx.wallet,
+            &ctx.offer,
+            [35; 32],
+            450,
+            expiry,
+        )
+        .await;
+        let channel = cdk_spilman::EstablishedChannel::from_client_channel_funding(
+            &ctx.wallet.client_channel_funding(&channel_id).unwrap(),
+        )
+        .unwrap();
+        while cashu::util::unix_time() <= expiry {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let prepared = channel
+            .prepare_sender_refund_after_expiry(
+                ctx.wallet.sender_secret(),
+                cashu::util::unix_time(),
+                channel.params.keyset_info.clone(),
+                [0; 32],
+            )
+            .unwrap();
+        let mut request = prepared.swap_request.clone();
+        if extra {
+            request
+                .sign_sig_all(cashu::nuts::SecretKey::generate())
+                .unwrap();
+        }
+        ctx.mint.process_swap_request(request).await.unwrap();
+        let net = ctx.net_for(&channel_id);
+        for _ in 0..2 {
+            let result = ctx
+                .wallet_manager
+                .close_channel(&channel_id, &net)
+                .await
+                .unwrap();
+            if extra {
+                assert!(matches!(result, CloseOutcome::UnknownSpent { .. }));
+                assert_eq!(
+                    ctx.payments.channel_state(&channel_id),
+                    Some(ChannelState::Closing)
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    CloseOutcome::SenderRefundedAfterExpiry { .. }
+                ));
+                assert_eq!(
+                    ctx.payments.channel_state(&channel_id),
+                    Some(ChannelState::SenderRefundedAfterExpiry)
+                );
+                assert!(ctx
+                    .wallet_manager
+                    .find_expiring_channels(None, cashu::util::unix_time(), 86_400)
+                    .unwrap()
+                    .is_empty());
+            }
+            assert!(ctx.payments.closed_data(&channel_id).is_none());
+        }
+        assert!(ctx
+            .wallet_manager
+            .drain_closed_channels_to_swap("refund-outcome", &ctx.mint_url, "sat", &net, None)
+            .await
+            .is_err());
+        assert!(ctx
+            .payments
+            .link_channel(
+                &supported_cashu_spilman_keyset_versions(),
+                [36; 32],
+                &ctx.wallet.build_raw_link_request(&channel_id).unwrap()
+            )
+            .is_err());
+        assert!(ctx
+            .payments
+            .apply_channel_payment(
+                &channel_id,
+                &serde_json::json!({"channel_id":channel_id,"balance":451,"signature":"invalid"})
+                    .to_string()
+            )
+            .is_err());
+        // Relay terminal classification does not consume or invalidate sender outputs.
+        let response = ctx
+            .mint
+            .restore(cashu::nuts::RestoreRequest {
+                outputs: prepared
+                    .outputs
+                    .iter()
+                    .map(|o| o.blinded_message.clone())
+                    .collect(),
+            })
+            .await
+            .unwrap();
+        let restored = channel
+            .complete_prepared_sender_refund_restore(
+                &prepared,
+                &ctx.wallet.sender_secret(),
+                response,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.iter().map(|p| u64::from(p.amount)).sum::<u64>(),
+            prepared.output_amount_raw
+        );
+        ctx.shutdown();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -11415,6 +11609,7 @@ async fn test_final_close_restore_checks_predecessor_then_successor_after_spent(
         .close_channel(&channel, &net)
         .await
         .unwrap();
+    let completed = completed.into_closed().unwrap();
     assert!(completed.receiver_sum >= 450);
     assert_eq!(net.swaps.load(Ordering::SeqCst), 2);
     let ids = net.final_ids.lock().unwrap().clone();
