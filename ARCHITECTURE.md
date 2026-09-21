@@ -2,6 +2,20 @@
 
 ## Overview
 
+### Wallet Durability
+
+Every writable file-backed wallet connection, including short-lived relay
+metadata/drain connections and the client loose-proof, metadata, refund, and
+upstream channel stores, applies and verifies SQLite `synchronous=EXTRA` before
+writes. The shared upstream helper retains durable journal modes and rejects
+OFF/MEMORY modes. EXTRA includes FULL's WAL commit sync and also syncs the
+directory after rollback-journal deletion. In-memory tests and read-only
+inspection are separate paths. This policy does not change transaction scope:
+cross-database recovery still requires the durable journals and idempotent import.
+Process-kill tests cannot establish power-loss safety on hardware that lies about
+sync completion. Backups require consistent SQLite snapshots of every wallet DB,
+not copies that omit live WAL state.
+
 MONAD is a multi-hop TCP tunneling system with three main layers:
 
 ```text

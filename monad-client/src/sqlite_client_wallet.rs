@@ -666,7 +666,7 @@ impl SqliteClientWallet {
             .map_err(|e| WalletError::Backend(format!("create bridge HTTP networking: {e}")))?;
         let bridge = SpilmanClientBridge::new(host, networking);
 
-        let channel_db = Connection::open(path)
+        let channel_db = cdk_spilman::sqlite_durability::open_wallet_database(path)
             .map_err(|e| WalletError::Backend(format!("open channel metadata database: {e}")))?;
         channel_db
             .busy_timeout(Duration::from_secs(5))

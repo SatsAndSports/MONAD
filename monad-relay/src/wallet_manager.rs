@@ -295,7 +295,7 @@ impl ChannelMetadataStore {
     }
 
     fn init(&self) -> io::Result<()> {
-        let conn = Connection::open(&self.db_path)
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.db_path)
             .map_err(|e| io::Error::other(format!("open relay wallet metadata db: {e}")))?;
         conn.execute_batch(CREATE_CHANNEL_META_TABLE_SQL)
             .map_err(|e| io::Error::other(format!("create relay wallet metadata table: {e}")))?;
@@ -308,7 +308,7 @@ impl ChannelMetadataStore {
         relay_name: &str,
         receiver_pubkey_hex: &str,
     ) -> Result<(), String> {
-        let conn = Connection::open(&self.db_path)
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.db_path)
             .map_err(|e| format!("open relay wallet metadata db: {e}"))?;
         conn.execute(
             "INSERT INTO monad_relay_channel_meta(channel_id, relay_name, receiver_pubkey_hex)
@@ -323,7 +323,7 @@ impl ChannelMetadataStore {
     }
 
     pub fn relay_name_for_channel(&self, channel_id: &str) -> io::Result<Option<String>> {
-        let conn = Connection::open(&self.db_path)
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.db_path)
             .map_err(|e| io::Error::other(format!("open relay wallet metadata db: {e}")))?;
         conn.query_row(
             "SELECT relay_name FROM monad_relay_channel_meta WHERE channel_id = ?1",
@@ -338,7 +338,7 @@ impl ChannelMetadataStore {
         &self,
         relay_name: Option<&str>,
     ) -> io::Result<Vec<(String, String, String)>> {
-        let conn = Connection::open(&self.db_path)
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.db_path)
             .map_err(|e| io::Error::other(format!("open relay wallet metadata db: {e}")))?;
         let mut out = Vec::new();
         if let Some(name) = relay_name {
@@ -642,7 +642,7 @@ impl RelayWalletManager {
         db_path: String,
         authority: Arc<Mutex<WalletLocks>>,
     ) -> io::Result<Self> {
-        let conn = Connection::open(&db_path)
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&db_path)
             .map_err(|e| io::Error::other(format!("open relay wallet db: {e}")))?;
         let exists = |name: &str| -> io::Result<bool> {
             conn.query_row(
@@ -1165,7 +1165,7 @@ impl RelayWalletManager {
     }
 
     pub fn list_drains(&self) -> Result<Vec<DrainSummary>, String> {
-        let conn = Connection::open(&self.metadata.db_path)
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.metadata.db_path)
             .map_err(|e| format!("open relay wallet db: {e}"))?;
         let mut stmt = conn
             .prepare(
@@ -1260,7 +1260,7 @@ impl RelayWalletManager {
             .metadata
             .list_channels(Some(relay_name))
             .map_err(|e| format!("list relay channels: {e}"))?;
-        let conn = Connection::open(&self.metadata.db_path)
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.metadata.db_path)
             .map_err(|e| format!("open relay wallet db: {e}"))?;
         let mut out = Vec::new();
         for (channel_id, _, _) in meta {
@@ -1305,7 +1305,7 @@ impl RelayWalletManager {
     }
 
     fn load_drain(&self, drain_id: &str) -> Result<StoredDrain, String> {
-        let conn = Connection::open(&self.metadata.db_path)
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.metadata.db_path)
             .map_err(|e| format!("open relay wallet db: {e}"))?;
         conn.query_row(
             "SELECT drain_id, relay_name, mint_url, unit, state, input_amount_raw,
@@ -1335,7 +1335,7 @@ impl RelayWalletManager {
     }
 
     fn drain_channel_ids(&self, drain_id: &str) -> Result<Vec<String>, String> {
-        let conn = Connection::open(&self.metadata.db_path)
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.metadata.db_path)
             .map_err(|e| format!("open relay wallet db: {e}"))?;
         let mut stmt = conn
             .prepare(
@@ -1950,7 +1950,7 @@ fn close_error_summary(error: &CloseError) -> String {
 }
 
 fn load_identities(db_path: &str) -> io::Result<HashMap<String, SecretKey>> {
-    let conn = Connection::open(db_path)
+    let conn = cdk_spilman::sqlite_durability::open_wallet_database(db_path)
         .map_err(|e| io::Error::other(format!("open relay wallet db: {e}")))?;
     let mut stmt = conn
         .prepare("SELECT relay_name, receiver_secret_hex FROM monad_relay_wallet_identities")
@@ -1983,7 +1983,7 @@ fn store_identity(
     receiver_pubkey_hex: &str,
     db_path: &str,
 ) -> io::Result<()> {
-    let conn = Connection::open(db_path)
+    let conn = cdk_spilman::sqlite_durability::open_wallet_database(db_path)
         .map_err(|e| io::Error::other(format!("open relay wallet db: {e}")))?;
     conn.execute(
         "INSERT INTO monad_relay_wallet_identities(relay_name, receiver_secret_hex, receiver_pubkey_hex)

@@ -141,7 +141,8 @@ impl RelayWalletManager {
             completed: false,
         };
         self.verify_drain_journal(&journal)?;
-        let mut conn = Connection::open(self.db_path()).map_err(|e| e.to_string())?;
+        let mut conn = cdk_spilman::sqlite_durability::open_wallet_database(self.db_path())
+            .map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let attempt = &journal.attempts[0];
         let keyset = cdk_spilman::parse_keyset_info_from_json(&attempt.keys)?;
@@ -322,7 +323,8 @@ impl RelayWalletManager {
 
     fn persist_exact_drain(&self, journal: &Journal, previous: &str) -> Result<String, String> {
         let next = encode(journal)?;
-        let mut conn = Connection::open(self.db_path()).map_err(|e| e.to_string())?;
+        let mut conn = cdk_spilman::sqlite_durability::open_wallet_database(self.db_path())
+            .map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let changed = tx.execute("UPDATE monad_relay_drain_journals SET journal_json=?3 WHERE drain_id=?1 AND journal_json=?2", params![journal.drain_id,previous,next]).map_err(|e| e.to_string())?;
         if changed != 1 {
@@ -359,7 +361,8 @@ impl RelayWalletManager {
             Some(flight) => flight,
             None => Flight::enter(format!("{}:{id}", self.drain_binding()?))?,
         };
-        let conn = Connection::open(self.db_path()).map_err(|e| e.to_string())?;
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(self.db_path())
+            .map_err(|e| e.to_string())?;
         let mut durable: String = conn
             .query_row(
                 "SELECT journal_json FROM monad_relay_drain_journals WHERE drain_id=?1",
@@ -404,7 +407,8 @@ impl RelayWalletManager {
         {
             return Err("drain metadata/journal conflict".to_string());
         }
-        let conn = Connection::open(self.db_path()).map_err(|e| e.to_string())?;
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(self.db_path())
+            .map_err(|e| e.to_string())?;
         for input in &journal.inputs {
             let owner: String = conn
                 .query_row(

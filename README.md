@@ -12,6 +12,13 @@ It provides:
 
 ## Status
 
+Wallet databases explicitly verify SQLite `synchronous=EXTRA` on each writable
+connection. Back up all client and relay wallet databases using SQLite's backup
+API or consistent SQLite snapshots, not raw copies of live `.db` files (committed
+data may still be in WAL files). This is not atomic across separate databases and
+depends on the filesystem and hardware honoring sync requests. Read-only wallet
+inspection does not change database settings.
+
 Implemented today:
 - `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, keeps a shared in-memory cache of configured mint keysets, and persists relay-side Spilman channel state in SQLite
 - `monad-client`: provides reusable route selection, the session payment driver, a SQLite-backed channel wallet, a loose-proof wallet, and multi-hop connection setup
