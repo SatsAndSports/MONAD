@@ -271,7 +271,7 @@ impl SessionState {
         payment_json: &str,
     ) -> Result<crate::payments::PaymentOutcome, crate::payments::ChannelPaymentError> {
         self.payments
-            .apply_channel_payment(expected_channel_id, payment_json)
+            .apply_channel_payment(self.session_id, expected_channel_id, payment_json)
     }
 
     pub(crate) fn notify_session_evicted(&self, target_session_id: &[u8; 32], channel_id: String) {

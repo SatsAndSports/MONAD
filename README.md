@@ -10,6 +10,11 @@ It provides:
 - recursive multi-hop nesting for onion-style routing
 - IPv4, IPv6, and hostname support
 
+Channel payment updates are accepted only while the sending session owns the
+channel and the relay's exact prior payment snapshot remains current. A rare
+ownership-handoff or close race returns `PAYMENT_CONFLICT` with no credit and
+rebuilds the affected session; MONAD never blindly retries the stale payment.
+
 ## Status
 
 Relay wallet close results are typed: `Closed` carries the normal receiver/sender

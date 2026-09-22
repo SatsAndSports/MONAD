@@ -1255,7 +1255,7 @@ async fn create_paid_closed_channel(
         .build_channel_payment(&channel_id, offer, 0, funded_balance_raw)
         .unwrap();
     payments
-        .apply_channel_payment(&channel_id, &payment_json)
+        .apply_channel_payment(session_id, &channel_id, &payment_json)
         .unwrap();
 
     let net = wallet_manager
@@ -1298,7 +1298,7 @@ async fn create_paid_open_channel_with_expiry(
         .build_channel_payment(&channel_id, offer, 0, funded_balance_raw)
         .unwrap();
     payments
-        .apply_channel_payment(&channel_id, &payment_json)
+        .apply_channel_payment(session_id, &channel_id, &payment_json)
         .unwrap();
     channel_id
 }
@@ -10753,7 +10753,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
         )
         .unwrap();
     assert!(matches!(
-        payments.apply_channel_payment(&channel_id, &late_payment),
+        payments.apply_channel_payment(*conn.session_id(), &channel_id, &late_payment),
         Err(monad_relay::payments::ChannelPaymentError::ChannelClosed)
     ));
     assert_eq!(
@@ -11057,7 +11057,7 @@ async fn test_wallet_manager_drain_swap_ignores_non_closed_channels() {
         .build_channel_payment(&channel_id, &ctx.offer, 0, 100)
         .unwrap();
     ctx.payments
-        .apply_channel_payment(&channel_id, &payment_json)
+        .apply_channel_payment([14u8; 32], &channel_id, &payment_json)
         .unwrap();
 
     let net = ctx.net_for(&channel_id);
@@ -11505,6 +11505,7 @@ async fn test_sender_refund_is_terminal_with_or_without_extra_signature() {
         assert!(ctx
             .payments
             .apply_channel_payment(
+                [35; 32],
                 &channel_id,
                 &serde_json::json!({"channel_id":channel_id,"balance":451,"signature":"invalid"})
                     .to_string()
