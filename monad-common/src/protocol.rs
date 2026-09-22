@@ -56,6 +56,7 @@ pub enum ServerErrorCode {
     PaymentUnknownChannel,
     PaymentInvalid,
     PaymentNoNewFunds,
+    PaymentConflict,
     InternalError,
 }
 

@@ -671,6 +671,12 @@ A session's ability to proxy data is determined by two orthogonal variables:
 
 #### 4. Incremental Payments (Delta Model)
 When the session balance runs low, the client sends a `ChannelPayment` with a signed balance update.
+The relay commits that update only if the sending session still owns the channel
+and the exact previously observed payment remains current. Ownership transfer is
+serialized with this payment CAS. A stale-session or payment-versus-close race
+returns `PAYMENT_CONFLICT` without granting credit; the client treats that result
+as fatal to the affected MONAD session so normal route rebuilding relinks from
+durable relay state rather than retrying an obsolete authorization.
 - **Credit Calculation**: The relay tracks the `max_balance_seen` for every channel ID.
 - **Delta**: `credit_millisats = (new_balance - max_balance_seen) * unit_multiplier`.
 

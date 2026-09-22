@@ -51,6 +51,7 @@ pub trait RelayPayments: Send + Sync + 'static {
 
     fn apply_channel_payment(
         &self,
+        session_id: [u8; 32],
         expected_channel_id: &str,
         payment_json: &str,
     ) -> Result<PaymentOutcome, ChannelPaymentError>;
@@ -154,6 +155,7 @@ pub enum ChannelPaymentError {
     InvalidPayment(String),
     NoNewFunds,
     ChannelClosed,
+    Conflict,
     Internal(String),
 }
 
@@ -165,6 +167,7 @@ impl fmt::Display for ChannelPaymentError {
             Self::InvalidPayment(s) => write!(f, "invalid payment: {s}"),
             Self::NoNewFunds => write!(f, "no new funds"),
             Self::ChannelClosed => write!(f, "channel closed"),
+            Self::Conflict => write!(f, "payment state conflict"),
             Self::Internal(s) => write!(f, "internal error: {s}"),
         }
     }
@@ -180,6 +183,7 @@ impl ChannelPaymentError {
             Self::InvalidPayment(_) => ServerErrorCode::PaymentInvalid,
             Self::NoNewFunds => ServerErrorCode::PaymentNoNewFunds,
             Self::ChannelClosed => ServerErrorCode::ChannelClosed,
+            Self::Conflict => ServerErrorCode::PaymentConflict,
             Self::Internal(_) => ServerErrorCode::InternalError,
         }
     }
@@ -670,6 +674,7 @@ impl RelayPayments for SpilmanRelayPayments {
 
     fn apply_channel_payment(
         &self,
+        session_id: [u8; 32],
         expected_channel_id: &str,
         payment_json: &str,
     ) -> Result<PaymentOutcome, ChannelPaymentError> {
@@ -715,16 +720,21 @@ impl RelayPayments for SpilmanRelayPayments {
         // Record only after validation and monotonicity checks; the stored
         // balance is the relay-authoritative baseline for future payments.
         self.store
-            .storage()
-            .compare_payment(
+            .compare_owned_payment(
                 &payment.channel_id,
+                session_id,
                 &previous_payment,
                 PaymentProof {
                     balance: validation.balance,
                     signature: validation.sender_signature.clone(),
                 },
             )
-            .map_err(ChannelPaymentError::Internal)?;
+            .map_err(|error| match error {
+                crate::channel_store::PaymentStoreError::Conflict => ChannelPaymentError::Conflict,
+                crate::channel_store::PaymentStoreError::Internal(message) => {
+                    ChannelPaymentError::Internal(message)
+                }
+            })?;
 
         let delta_raw = validation.balance - previous_balance;
         Ok(PaymentOutcome {
@@ -1295,6 +1305,7 @@ pub mod testing {
 
         fn apply_channel_payment(
             &self,
+            session_id: [u8; 32],
             expected_channel_id: &str,
             payment_json: &str,
         ) -> Result<PaymentOutcome, ChannelPaymentError> {
@@ -1322,6 +1333,10 @@ pub mod testing {
                 .channels
                 .get_mut(expected_channel_id)
                 .ok_or(ChannelPaymentError::UnknownChannel)?;
+
+            if record.owner != Some(session_id) {
+                return Err(ChannelPaymentError::Conflict);
+            }
 
             if parsed.closed || record.closed {
                 return Err(ChannelPaymentError::ChannelClosed);
@@ -1471,7 +1486,7 @@ pub mod testing {
             assert_eq!(err, LinkError::NonZeroLinkBalance);
 
             let err = payments
-                .apply_channel_payment("chan", &payment_json("chan", 2, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 2, None, None))
                 .unwrap_err();
             assert_eq!(err, ChannelPaymentError::UnknownChannel);
         }
@@ -1487,7 +1502,7 @@ pub mod testing {
                 )
                 .unwrap();
             payments
-                .apply_channel_payment("chan", &payment_json("chan", 7, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 7, None, None))
                 .unwrap();
 
             let err = payments
@@ -1508,8 +1523,17 @@ pub mod testing {
                 .unwrap();
             assert_eq!(outcome.evicted_session, Some(session(1)));
 
+            let err = payments
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 9, None, None))
+                .unwrap_err();
+            assert_eq!(err, ChannelPaymentError::Conflict);
+            assert_eq!(
+                payments.linked_channel_status("chan").unwrap().balance_raw,
+                7
+            );
+
             let payment = payments
-                .apply_channel_payment("chan", &payment_json("chan", 10, None, None))
+                .apply_channel_payment(session(2), "chan", &payment_json("chan", 10, None, None))
                 .unwrap();
             assert_eq!(payment.delta_millisats, 3);
         }
@@ -1590,7 +1614,7 @@ pub mod testing {
                 .unwrap();
 
             let err = payments
-                .apply_channel_payment("other", &payment_json("chan", 1, None, None))
+                .apply_channel_payment(session(1), "other", &payment_json("chan", 1, None, None))
                 .unwrap_err();
             assert_eq!(err, ChannelPaymentError::WrongChannel);
         }
@@ -1606,11 +1630,11 @@ pub mod testing {
                 )
                 .unwrap();
             payments
-                .apply_channel_payment("chan", &payment_json("chan", 5, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 5, None, None))
                 .unwrap();
 
             let err = payments
-                .apply_channel_payment("chan", &payment_json("chan", 5, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 5, None, None))
                 .unwrap_err();
             assert_eq!(err, ChannelPaymentError::NoNewFunds);
         }
@@ -1627,7 +1651,7 @@ pub mod testing {
                 .unwrap();
 
             let err = payments
-                .apply_channel_payment("chan", &payment_json_with_params("chan", 1))
+                .apply_channel_payment(session(1), "chan", &payment_json_with_params("chan", 1))
                 .unwrap_err();
             assert_eq!(
                 err,
@@ -1649,13 +1673,13 @@ pub mod testing {
                 .unwrap();
 
             let first = payments
-                .apply_channel_payment("chan", &payment_json("chan", 1, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 1, None, None))
                 .unwrap();
             let second = payments
-                .apply_channel_payment("chan", &payment_json("chan", 5, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 5, None, None))
                 .unwrap();
             let third = payments
-                .apply_channel_payment("chan", &payment_json("chan", 100, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 100, None, None))
                 .unwrap();
 
             assert_eq!(first.delta_millisats, 1);
@@ -1675,13 +1699,13 @@ pub mod testing {
                 .unwrap();
 
             let first = payments
-                .apply_channel_payment("chan", &payment_json("chan", 1, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 1, None, None))
                 .unwrap();
             let second = payments
-                .apply_channel_payment("chan", &payment_json("chan", 5, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 5, None, None))
                 .unwrap();
             let third = payments
-                .apply_channel_payment("chan", &payment_json("chan", 100, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_json("chan", 100, None, None))
                 .unwrap();
 
             assert_eq!(first.delta_millisats, 1_000);
@@ -1716,7 +1740,11 @@ pub mod testing {
                 )
                 .unwrap();
             let err = payments
-                .apply_channel_payment("chan", &payment_json("chan", u64::MAX, None, None))
+                .apply_channel_payment(
+                    session(1),
+                    "chan",
+                    &payment_json("chan", u64::MAX, None, None),
+                )
                 .unwrap_err();
             assert_eq!(
                 err,
@@ -1737,6 +1765,7 @@ pub mod testing {
 
             let err = payments
                 .apply_channel_payment(
+                    session(1),
                     "chan",
                     &payment_json_with_flag("chan", 1, None, None, "closed", true),
                 )

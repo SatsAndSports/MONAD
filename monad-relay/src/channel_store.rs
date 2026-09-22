@@ -30,6 +30,12 @@ pub(crate) struct StoredChannel {
     pub(crate) capacity_raw: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PaymentStoreError {
+    Conflict,
+    Internal(String),
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct OwnershipState {
     owners: HashMap<String, Option<[u8; 32]>>,
@@ -159,6 +165,42 @@ impl ChannelStore {
         self.storage.update_balance(channel_id, payment)
     }
 
+    /// Commit a payment only while this session still owns the channel and the
+    /// exact durable payment snapshot remains current. Ownership is held across
+    /// the storage CAS so a relink cannot overtake an accepted stale-session
+    /// payment.
+    pub(crate) fn compare_owned_payment(
+        &self,
+        channel_id: &str,
+        session_id: [u8; 32],
+        expected: &PaymentProof,
+        payment: PaymentProof,
+    ) -> Result<(), PaymentStoreError> {
+        let ownership = self.ownership_lock().map_err(PaymentStoreError::Internal)?;
+        if ownership.owners.get(channel_id).copied().flatten() != Some(session_id) {
+            return Err(PaymentStoreError::Conflict);
+        }
+
+        if let Err(write_error) = self.storage.compare_payment(channel_id, expected, payment) {
+            let current = self
+                .get_channel(channel_id)
+                .map_err(PaymentStoreError::Internal)?;
+            return match current {
+                Some(channel)
+                    if channel.state != ChannelState::Open
+                        || channel.latest_payment.balance != expected.balance
+                        || channel.latest_payment.signature != expected.signature =>
+                {
+                    Err(PaymentStoreError::Conflict)
+                }
+                _ => Err(PaymentStoreError::Internal(write_error)),
+            };
+        }
+
+        drop(ownership);
+        Ok(())
+    }
+
     /// Set the owner of a channel to `session_id`. Returns the previous owner
     /// if it was a different session (i.e. an eviction).
     pub(crate) fn set_channel_owner(
@@ -252,7 +294,7 @@ fn parse_channel_metadata(params_json: &str) -> Result<(ChannelUnit, u64), Strin
 mod tests {
     use super::*;
     use cdk_spilman::configurable_host::SqliteStorage;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     fn dummy_funding(channel_id: &str) -> ChannelFunding {
         ChannelFunding {
@@ -308,5 +350,271 @@ mod tests {
             assert_eq!(channel.unit, ChannelUnit::Sat);
             assert_eq!(channel.capacity_raw, 100);
         }
+    }
+
+    #[test]
+    fn sequential_payments_from_owner_commit_without_conflict() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = ChannelStore::new(storage);
+        let owner = [1; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.set_channel_owner("chan", owner).unwrap();
+
+        store
+            .compare_owned_payment("chan", owner, &payment_proof(0), payment_proof(5))
+            .unwrap();
+        store
+            .compare_owned_payment("chan", owner, &payment_proof(5), payment_proof(9))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_channel("chan")
+                .unwrap()
+                .unwrap()
+                .latest_payment
+                .balance,
+            9
+        );
+    }
+
+    #[test]
+    fn stale_owner_payment_conflicts_without_credit() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = ChannelStore::new(storage);
+        let old_owner = [1; 32];
+        let new_owner = [2; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.set_channel_owner("chan", old_owner).unwrap();
+        assert_eq!(
+            store.set_channel_owner("chan", new_owner).unwrap(),
+            Some(old_owner)
+        );
+
+        assert_eq!(
+            store.compare_owned_payment("chan", old_owner, &payment_proof(0), payment_proof(5),),
+            Err(PaymentStoreError::Conflict)
+        );
+        assert_eq!(
+            store
+                .get_channel("chan")
+                .unwrap()
+                .unwrap()
+                .latest_payment
+                .balance,
+            0
+        );
+    }
+
+    #[test]
+    fn competing_payment_snapshot_conflicts_without_duplicate_credit() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = ChannelStore::new(storage);
+        let owner = [1; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.set_channel_owner("chan", owner).unwrap();
+
+        store
+            .compare_owned_payment("chan", owner, &payment_proof(0), payment_proof(5))
+            .unwrap();
+        assert_eq!(
+            store.compare_owned_payment("chan", owner, &payment_proof(0), payment_proof(7)),
+            Err(PaymentStoreError::Conflict)
+        );
+        assert_eq!(
+            store
+                .get_channel("chan")
+                .unwrap()
+                .unwrap()
+                .latest_payment
+                .balance,
+            5
+        );
+    }
+
+    #[test]
+    fn concurrent_payments_commit_exactly_one_snapshot() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = Arc::new(ChannelStore::new(storage));
+        let owner = [1; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.set_channel_owner("chan", owner).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let attempts = [5, 7].map(|balance| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.compare_owned_payment(
+                    "chan",
+                    owner,
+                    &payment_proof(0),
+                    payment_proof(balance),
+                )
+            })
+        });
+        barrier.wait();
+        let results = attempts.map(|attempt| attempt.join().unwrap());
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(PaymentStoreError::Conflict))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            store
+                .get_channel("chan")
+                .unwrap()
+                .unwrap()
+                .latest_payment
+                .balance,
+            5 | 7
+        ));
+    }
+
+    #[test]
+    fn concurrent_ownership_handoff_linearizes_stale_payment() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = Arc::new(ChannelStore::new(storage));
+        let old_owner = [1; 32];
+        let new_owner = [2; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.set_channel_owner("chan", old_owner).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let payment = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.compare_owned_payment("chan", old_owner, &payment_proof(0), payment_proof(5))
+            })
+        };
+        let handoff = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.set_channel_owner("chan", new_owner)
+            })
+        };
+        barrier.wait();
+        let payment = payment.join().unwrap();
+        assert_eq!(handoff.join().unwrap().unwrap(), Some(old_owner));
+
+        let balance = store
+            .get_channel("chan")
+            .unwrap()
+            .unwrap()
+            .latest_payment
+            .balance;
+        match payment {
+            Ok(()) => assert_eq!(balance, 5),
+            Err(PaymentStoreError::Conflict) => assert_eq!(balance, 0),
+            Err(PaymentStoreError::Internal(error)) => panic!("unexpected storage error: {error}"),
+        }
+        assert_eq!(
+            store.compare_owned_payment(
+                "chan",
+                old_owner,
+                &payment_proof(balance),
+                payment_proof(balance + 1),
+            ),
+            Err(PaymentStoreError::Conflict)
+        );
+    }
+
+    #[test]
+    fn concurrent_close_and_payment_commit_exactly_one_snapshot() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = Arc::new(ChannelStore::new(storage.clone()));
+        let owner = [1; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.set_channel_owner("chan", owner).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let payment = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.compare_owned_payment("chan", owner, &payment_proof(0), payment_proof(5))
+            })
+        };
+        let close = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                storage.freeze_close(
+                    "chan",
+                    &payment_proof(0),
+                    ClosingData {
+                        expiry_timestamp: 123,
+                        balance: 0,
+                        signature: "sig".to_string(),
+                    },
+                    "{}",
+                )
+            })
+        };
+        barrier.wait();
+        let payment = payment.join().unwrap();
+        let close = close.join().unwrap();
+
+        assert_ne!(payment.is_ok(), close.is_ok());
+        let channel = store.get_channel("chan").unwrap().unwrap();
+        if payment.is_ok() {
+            assert_eq!(channel.state, ChannelState::Open);
+            assert_eq!(channel.latest_payment.balance, 5);
+        } else {
+            assert_eq!(payment, Err(PaymentStoreError::Conflict));
+            assert_eq!(channel.state, ChannelState::Closing);
+            assert_eq!(channel.latest_payment.balance, 0);
+        }
+    }
+
+    #[test]
+    fn payment_after_close_freeze_conflicts_without_credit() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = ChannelStore::new(storage);
+        let owner = [1; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.set_channel_owner("chan", owner).unwrap();
+        store
+            .mark_channel_closing("chan", 123, payment_proof(0))
+            .unwrap();
+
+        assert_eq!(
+            store.compare_owned_payment("chan", owner, &payment_proof(0), payment_proof(5)),
+            Err(PaymentStoreError::Conflict)
+        );
+        let channel = store.get_channel("chan").unwrap().unwrap();
+        assert_eq!(channel.latest_payment.balance, 0);
+        assert_eq!(channel.state, ChannelState::Closing);
     }
 }

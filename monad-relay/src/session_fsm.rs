@@ -259,6 +259,24 @@ mod tests {
     }
 
     #[test]
+    fn payment_conflict_emits_dedicated_error_without_credit() {
+        let current = state();
+        let (next, effects) = step(
+            current.clone(),
+            SessionEvent::PaymentValidationFinished(Err(ChannelPaymentError::Conflict)),
+            SessionPricing::new(1, 1),
+        );
+
+        assert_eq!(next, current);
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::SendControl(ServerMessage::Error { code, message })]
+                if *code == monad_common::protocol::ServerErrorCode::PaymentConflict
+                    && message == "payment state conflict"
+        ));
+    }
+
+    #[test]
     fn eviction_clears_link_and_emits_status() {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());

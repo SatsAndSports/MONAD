@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use monad_common::control_codec::{send_json_line, try_decode_json_line};
-use monad_common::protocol::{ClientMessage, ServerMessage};
+use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::session::SessionPricing;
 use std::io;
 use tokio::sync::oneshot;
@@ -17,6 +17,14 @@ use super::state::{
     apply_session_status, publish_pricing, publish_spilman_info, signal_ready, state_summary,
     DriverState, RelaySnapshot, SessionDriverConfig,
 };
+
+fn payment_conflict_error(code: &ServerErrorCode, hop_label: &str) -> Option<io::Error> {
+    (*code == ServerErrorCode::PaymentConflict).then(|| {
+        io::Error::other(format!(
+            "{hop_label} payment state conflict; rebuilding session"
+        ))
+    })
+}
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -191,6 +199,9 @@ pub(super) async fn run_session_driver(
                             if code == monad_common::protocol::ServerErrorCode::LinkKeysetVersionNotNegotiated {
                                 return Err(io::Error::new(io::ErrorKind::InvalidData, message));
                             }
+                            if let Some(error) = payment_conflict_error(&code, &config.hop_label) {
+                                return Err(error);
+                            }
                             apply_server_error(&config, &mut state, code).await;
                             false
                         }
@@ -240,6 +251,15 @@ pub(super) async fn run_session_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payment_conflict_terminates_session_for_route_rebuild() {
+        let error = payment_conflict_error(&ServerErrorCode::PaymentConflict, "hop 2/3")
+            .expect("payment conflict must be fatal to this session");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("rebuilding session"));
+        assert!(payment_conflict_error(&ServerErrorCode::PaymentNoNewFunds, "hop 2/3").is_none());
+    }
 
     #[test]
     fn heartbeat_waits_for_initial_server_message() {
