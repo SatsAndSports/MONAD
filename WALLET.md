@@ -379,8 +379,9 @@ Recovery follows these boundaries:
    restart; failure to record it conservatively retains uncertainty.
 
 The CLI mint adapter bounds each swap/restore/checkstate request to 15 seconds.
-It retains structured rejection bodies for classification but redacts them from
-error `Display`/`Debug`; arbitrary error text is not successor authority.
+`MintHttpRejection` retains only HTTP status and an optional numeric NUT-00 code;
+it discards the body, so untrusted body text is absent from `Display`/`Debug`.
+Arbitrary error text is not successor authority.
 
 ### Spent Funding And Finalization
 
@@ -424,8 +425,14 @@ the final-restore spent race, and checked close discovery with extra signatures,
 empty/invalid/network results, and close winning submission. The relay integration
 fixture also seeds a pending refund and verifies its history survives real relay
 close recovery; it is not a process-crash test. CLI tests check structured rejection
-retention/redaction, not a live HTTP timeout. These assertions do not establish
-exhaustive crash coverage or a dedicated `FundingPending` fixture.
+status/code retention and body redaction, not a live HTTP timeout. These assertions
+do not establish exhaustive crash coverage or a dedicated `FundingPending` fixture.
+
+The separate [process funds lifecycle suite](monad-relay/tests/FUNDS_LIFECYCLE.md)
+exercises real CLI process deaths at opening/refund durable boundaries, HTTP gates,
+rotation, and close/refund races. Its documented limits still apply: no mint restart,
+physical power loss, external stale-input export, or relay close/drain local
+finalization crash coverage. See that page for the recorded validation snapshot.
 
 ## Current Runtime State
 
@@ -461,6 +468,10 @@ The current client admin/funding/recovery commands are:
 - `monad-client wallet --loose-db <path> --channel-db <path> --sender-secret-hex <hex> [--wallet-name default] import-token --token-file <path>`
 - `monad-client wallet --loose-db <path> --channel-db <path> --sender-secret-hex <hex> [--wallet-name default] recover-channel --channel-id <id>`
 - `monad-client wallet --loose-db <path> --channel-db <path> --sender-secret-hex <hex> [--wallet-name default] recover-openings`
+
+`wallet export-stale-opening-inputs` is also available; see
+[Client Wallet](README.md#client-wallet) for usage, exclusive-access requirements,
+eligibility checks, and bearer-token handling.
 
 `import-token` is a trusted-custody operation: it stores the existing bearer proofs
 without swapping them into fresh wallet-only proofs. Import does not invalidate

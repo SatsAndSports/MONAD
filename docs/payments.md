@@ -80,6 +80,27 @@ then `complete` / `record` / `mark`. Avoid reintroducing upstream all-in-one
 helpers on the MONAD hot path unless the call site is intentionally a simple
 test or compatibility wrapper.
 
+### Client Recovery Ownership
+
+- `sqlite_client_wallet.rs` shares `MintHttpRejection` between opening and refund
+  adapters: only HTTP status and an optional numeric NUT-00 code survive parsing,
+  never the body. Typed HTTP 4xx `12002` is evidence, not permission to retry.
+- Upstream `cdk-spilman` owns exact restore output/signature matching and checked
+  cryptographic completion for both operations. MONAD's opening path classifies
+  empty paired arrays as absence and enforces funding/change consistency; it does
+  not duplicate upstream verification of nonempty responses.
+- `loose_proof_wallet.rs` owns opening attempts/executions in the loose-proof DB,
+  atomically coupled to reservations. Live replay needs journal execution authority
+  and the opening wall-clock gate; startup/manual recovery is restore-only.
+- `sqlite_client_wallet.rs` owns the separate custody-bound refund journal in the
+  channel DB. Recovery requires matching exclusive maintenance authority and
+  per-channel singleflight, with restore/state gates and per-invocation replay limits.
+
+These are shared evidence/verification primitives, not a generic recovery engine.
+Keep journals, successor authorization, retry budgets, and output-keyset policy
+operation-specific. See [Client Keyset Model](#client-keyset-model) and
+[Established-Channel Recovery](#established-channel-recovery) for the policies.
+
 ## Relay Keyset Model
 
 The relay wallet manager owns one shared in-memory `SpilmanMintCache` plus the
