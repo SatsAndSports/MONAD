@@ -101,7 +101,9 @@ warning; never upload it. Console events contain only operation names and totals
 Receiver-close extension: `make test-funds-crashes` passes all eight process tests,
 including six close persistence boundaries and rotated accepted-response loss.
 Default `cargo test` passes 552 tests; strict all-target/all-features Clippy passes.
-The earlier baseline and stress results below predate this extension:
+The baseline and stress results below were recorded at commit `fb488bd`
+(2026-09-21). They predate this extension and are not a claim of validation at
+the current revision:
 
 - Full default `cargo test` and `cargo test --all-features`: each 547 passed,
   no failures (opt-in process/stress tests run separately).
