@@ -120,7 +120,9 @@ Full relay-recovery stack validation:
   Final custody was 1946 client sats + 13417 receiver sats + 1021 actual fee sats
   = the original 16384 sats. No replenishment or relaxed oracle.
 
-The earlier baseline and stress results below predate this extension:
+The baseline and stress results below were recorded at commit `fb488bd`
+(2026-09-21). They predate this extension and are not a claim of validation at
+the current revision:
 
 - Full default `cargo test` and `cargo test --all-features`: each 547 passed,
   no failures (opt-in process/stress tests run separately).

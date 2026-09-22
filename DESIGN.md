@@ -2,6 +2,9 @@
 
 *Implementation status: September 6, 2026.*
 
+Most of this design is implemented and covered by unit, integration, and stress
+tests. See [Next Steps](#next-steps) for the remaining gaps and planned improvements.
+
 MONAD, the **Monetized Onion Network Access Daemon**, is a paid multi-hop TCP
 tunneling system. It is similar in broad shape to a VPN or Tor: applications
 use a local proxy, and the client can send their TCP connections through one or
