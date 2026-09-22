@@ -19,7 +19,11 @@ successful administrative terminal outcomes. `UnknownSpent` retains a recoverabl
 journal because close versus refund remains unresolved; retry recovery later.
 `--json` exposes `outcome` and `details`. Batch close reports `resolved`, `unresolved`,
 and `failures` separately. Terminal refunds are excluded from autosweep and drain.
-Close journal v2 rejects incompatible journals without deleting wallet data.
+Close journal v3 binds each durable relay-close attempt to its exact `SIG_ALL`
+message digest and blinded receiver key. Complete all-spent NUT-07 evidence is a
+sender refund only when no witness signature matches any authenticated attempt;
+extra unrelated signatures do not make that refund ambiguous. Incompatible
+journals are rejected without deleting wallet data.
 
 Wallet databases explicitly verify SQLite `synchronous=EXTRA` on each writable
 connection. Back up all client and relay wallet databases using SQLite's backup
