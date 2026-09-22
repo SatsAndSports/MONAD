@@ -541,7 +541,8 @@ fn log_expiring_channel_auto_close_result(result: &CloseExpiringChannelsResult, 
     }
     info!(
         candidates = result.candidate_count,
-        closed = result.closed.len(),
+        resolved = result.resolved.len(),
+        unresolved = result.unresolved.len(),
         failed = result.failures.len(),
         close_before_expiry_secs = result.close_before_expiry_secs,
         elapsed_ms = elapsed.as_millis(),

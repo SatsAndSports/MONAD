@@ -4,11 +4,11 @@
 //! channels, and closing channels.  Output is human-readable by default and
 //! JSON with `--json`.
 
+use crate::payments::CloseOutcome;
 use crate::wallet_manager::{
     ChannelSummary, CloseExpiringChannelsResult, DrainSummary, DrainSwapResult,
     ExpiringChannelSummary, RelayWalletInspection, RelayWalletManager,
 };
-use cdk_spilman::CloseSuccess;
 use clap::{Parser, Subcommand};
 use monad_common::config::{MonadConfig, RelayChannelPolicyConfig};
 use monad_common::wallet_lock::{WalletLockMode, WalletLocks};
@@ -132,7 +132,7 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
         return run_read_only_wallet_command(&args, &wallet_db_path, &inspection);
     }
 
-    let manager = RelayWalletManager::open(&wallet_db_path)?;
+    let manager = RelayWalletManager::open_with_locks(&wallet_db_path, _locks)?;
     match args.command {
         WalletCommand::CloseExpiringChannels {
             wallet_name: ref name_opt,
@@ -153,10 +153,10 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
                 print_close_expiring_results(&result);
                 print_close_expiring_summary(&result);
             }
-            if !result.failures.is_empty() {
+            if !result.failures.is_empty() || !result.unresolved.is_empty() {
                 return Err(anyhow::anyhow!(
                     "failed to close {} expiring channel(s)",
-                    result.failures.len()
+                    result.failures.len() + result.unresolved.len()
                 ));
             }
         }
@@ -168,14 +168,12 @@ pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
             if args.json {
                 print_json(&result)?;
             } else {
-                if result.already_closed {
-                    println!("channel {} is already closed", result.channel_id);
-                } else {
-                    println!("closed channel {}", result.channel_id);
-                }
-                println!("  total_value: {}", result.total_value);
-                println!("  receiver_sum: {}", result.receiver_sum);
-                println!("  sender_sum: {}", result.sender_sum);
+                print_close_outcome(&result);
+            }
+            if matches!(result, CloseOutcome::UnknownSpent { .. }) {
+                anyhow::bail!(
+                    "funding spent; close versus refund unresolved; journal retained for retry"
+                );
             }
         }
         WalletCommand::Drain {
@@ -517,29 +515,35 @@ fn print_close_expiring_header(candidate_count: usize, close_before_expiry_secs:
 }
 
 fn print_close_expiring_results(result: &CloseExpiringChannelsResult) {
-    for success in &result.closed {
+    for success in &result.resolved {
         print_close_expiring_success(&success.channel, &success.close);
     }
     for failure in &result.failures {
         print_close_expiring_failure(&failure.channel, &failure.error);
     }
+    for channel in &result.unresolved {
+        println!(
+            "  unresolved {} relay={}; retry recovery later",
+            channel.channel_id, channel.relay_name
+        );
+    }
 }
 
-fn print_close_expiring_success(channel: &ExpiringChannelSummary, close: &CloseSuccess) {
-    let status = if close.already_closed {
-        "already closed"
-    } else {
-        "closed"
-    };
+fn print_close_expiring_success(channel: &ExpiringChannelSummary, close: &CloseOutcome) {
     println!(
-        "  ok    {} relay={} {} expires_in={} receiver_sum={} sender_sum={}",
-        channel.channel_id,
+        "  relay={} expires_in={}",
         channel.relay_name,
-        status,
-        format_duration(channel.seconds_until_expiry),
-        close.receiver_sum,
-        close.sender_sum
+        format_duration(channel.seconds_until_expiry)
     );
+    print_close_outcome(close);
+}
+
+fn print_close_outcome(result: &CloseOutcome) {
+    match result {
+        CloseOutcome::Closed(close) => println!("Closed channel={} already_closed={} total_value={} receiver_sum={} sender_sum={}", close.channel_id, close.already_closed, close.total_value, close.receiver_sum, close.sender_sum),
+        CloseOutcome::SenderRefundedAfterExpiry { channel_id } => println!("SenderRefundedAfterExpiry channel={channel_id}; sender spent full funding minus mint fees; no receiver close payout"),
+        CloseOutcome::UnknownSpent { channel_id } => println!("UnknownSpent channel={channel_id}; close versus refund unresolved; retry recovery later"),
+    }
 }
 
 fn print_close_expiring_failure(channel: &ExpiringChannelSummary, error: &str) {
@@ -558,10 +562,11 @@ fn print_close_expiring_summary(result: &CloseExpiringChannelsResult) {
         return;
     }
     println!(
-        "Summary: candidates={} closed={} failed={}",
+        "Summary: candidates={} resolved={} failed={} unresolved={}",
         result.candidate_count,
-        result.closed.len(),
-        result.failures.len()
+        result.resolved.len(),
+        result.failures.len(),
+        result.unresolved.len()
     );
     if !result.failures.is_empty() {
         println!(

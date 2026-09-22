@@ -4,21 +4,42 @@ use crate::listener::{
 };
 use cashu::nuts::{CurrencyUnit, Id, PublicKey, SecretKey};
 use cdk_spilman::{
-    compute_channel_secret_from_hex,
-    configurable_host::{ClosedDataView, SpilmanStorage},
-    is_retryable_keyset_mint_error, sign_with_tweaked_key_util, with_active_keyset_retry,
-    with_active_keyset_retry_async, BridgeError, ChannelFunding, ChannelPolicy, ChannelState,
-    CloseError, CloseSuccess, ClosingData, KeysetRetryError, Payment, PaymentProof, PreparedClose,
-    SelectedOutputKeyset, SpilmanAsyncKeysetRefresher, SpilmanAsyncMintClient, SpilmanBridge,
-    SpilmanHost, SpilmanKeysetRefresher, SpilmanMintClient,
+    compute_channel_secret_from_hex, configurable_host::ClosedDataView, sign_with_tweaked_key_util,
+    BridgeError, ChannelFunding, ChannelPolicy, ChannelState, CloseError, CloseSuccess,
+    ClosingData, Payment, PaymentProof, PreparedClose, SelectedOutputKeyset,
+    SpilmanAsyncKeysetRefresher, SpilmanBridge, SpilmanHost,
 };
 use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod close_recovery;
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "outcome", content = "details")]
+pub enum CloseOutcome {
+    Closed(CloseSuccess),
+    SenderRefundedAfterExpiry {
+        channel_id: String,
+    },
+    /// Funding is spent, but which authorized branch won is unresolved.
+    /// The journal remains recoverable; no payout or terminal state is invented.
+    UnknownSpent {
+        channel_id: String,
+    },
+}
+
+impl CloseOutcome {
+    pub fn into_closed(self) -> Result<CloseSuccess, Self> {
+        match self {
+            Self::Closed(close) => Ok(close),
+            other => Err(other),
+        }
+    }
+}
 
 pub trait RelayPayments: Send + Sync + 'static {
     fn link_channel(
@@ -229,21 +250,6 @@ pub struct SpilmanRelayPayments {
 }
 
 impl SpilmanRelayPayments {
-    pub fn new(
-        receiver_secret: SecretKey,
-        mint_cache: SpilmanMintCache,
-        trusted_mint_units: TrustedMintUnits,
-        storage: Arc<dyn SpilmanStorage>,
-    ) -> Self {
-        Self::from_store(
-            receiver_secret,
-            shared_spilman_mint_cache(mint_cache),
-            trusted_mint_units,
-            RelayChannelPolicyConfig::default(),
-            ChannelStore::new(storage),
-        )
-    }
-
     pub(crate) fn from_store(
         receiver_secret: SecretKey,
         mint_cache: SharedSpilmanMintCache,
@@ -426,128 +432,30 @@ impl SpilmanRelayPayments {
         Ok(())
     }
 
-    pub fn close_channel<M: SpilmanMintClient, R: SpilmanKeysetRefresher>(
-        &self,
-        channel_id: &str,
-        mint_client: &M,
-        keyset_refresher: &R,
-    ) -> Result<CloseSuccess, CloseError> {
-        let transition = self
-            .bridge
-            .prepare_unilateral_close_transition(channel_id)
-            .map_err(CloseError::from_preparation_error)?;
-        // Mark Closing before mint I/O so a crash can replay close execution
-        // from persisted closing data instead of accepting more payments.
-        self.bridge.mark_prepared_close_closing(&transition)?;
-        self.execute_close_for_closing_channel(channel_id, mint_client, keyset_refresher)
-    }
-
-    pub async fn close_channel_async<M: SpilmanAsyncMintClient, R: SpilmanAsyncKeysetRefresher>(
-        &self,
-        channel_id: &str,
-        mint_client: &M,
-        keyset_refresher: &R,
-    ) -> Result<CloseSuccess, CloseError> {
-        let transition = self
-            .bridge
-            .prepare_unilateral_close_transition(channel_id)
-            .map_err(CloseError::from_preparation_error)?;
-        // Mark Closing before mint I/O so a crash can replay close execution
-        // from persisted closing data instead of accepting more payments.
-        self.bridge.mark_prepared_close_closing(&transition)?;
-        self.execute_close_for_closing_channel_async(channel_id, mint_client, keyset_refresher)
-            .await
-    }
-
-    fn execute_close_for_closing_channel<M: SpilmanMintClient, R: SpilmanKeysetRefresher>(
-        &self,
-        channel_id: &str,
-        mint_client: &M,
-        keyset_refresher: &R,
-    ) -> Result<CloseSuccess, CloseError> {
-        let first_rejection = std::sync::Mutex::new(None::<String>);
-        let retry_mint_url = std::sync::Mutex::new(None::<String>);
-
-        self.ensure_close_keysets_cached(channel_id, keyset_refresher)?;
-        let result = with_active_keyset_retry(
-            || self.select_close_output_keyset(channel_id),
-            |selected| {
-                self.bridge
-                    .prepare_close_for_closing_channel_with_output_keyset(channel_id, selected)
-                    .map_err(CloseError::from_preparation_error)
-            },
-            |prepared| {
-                mint_client.call_mint_swap(&prepared.mint_url, &prepared.swap_request.to_string())
-            },
-            |error| remember_retryable_close_rejection(error, &first_rejection),
-            || {
-                let mint_url = retry_mint_url.lock().ok().and_then(|guard| guard.clone());
-                if let Some(mint_url) = mint_url.as_deref() {
-                    let _ = keyset_refresher.refresh(mint_url);
-                }
-                Ok(())
-            },
-            |attempt, _error| record_close_retry_mint(attempt, &retry_mint_url),
-        );
-        let success = close_retry_result(result, first_rejection.into_inner().unwrap_or_default())?;
-        self.finalize_prepared_close(&success.value, &success.attempt)
-    }
-
-    async fn execute_close_for_closing_channel_async<
-        M: SpilmanAsyncMintClient,
+    pub async fn close_channel_async<
+        M: crate::mint_recovery::RecoveryMintClient,
         R: SpilmanAsyncKeysetRefresher,
     >(
         &self,
         channel_id: &str,
         mint_client: &M,
         keyset_refresher: &R,
-    ) -> Result<CloseSuccess, CloseError> {
-        let first_rejection = std::sync::Mutex::new(None::<String>);
-        let retry_mint_url = std::sync::Mutex::new(None::<String>);
-
-        self.ensure_close_keysets_cached_async(channel_id, keyset_refresher)
-            .await?;
-        let result = with_active_keyset_retry_async(
-            || self.select_close_output_keyset(channel_id),
-            |selected| {
-                self.bridge
-                    .prepare_close_for_closing_channel_with_output_keyset(channel_id, selected)
-                    .map_err(CloseError::from_preparation_error)
-            },
-            |prepared| async move {
-                mint_client
-                    .call_mint_swap(&prepared.mint_url, &prepared.swap_request.to_string())
-                    .await
-            },
-            |error| remember_retryable_close_rejection(error, &first_rejection),
-            || {
-                let mint_url = retry_mint_url.lock().ok().and_then(|guard| guard.clone());
-                async move {
-                    if let Some(mint_url) = mint_url {
-                        let _ = keyset_refresher.refresh(&mint_url).await;
-                    }
-                    Ok(())
-                }
-            },
-            |attempt, _error| record_close_retry_mint(attempt, &retry_mint_url),
-        )
-        .await;
-        let success = close_retry_result(result, first_rejection.into_inner().unwrap_or_default())?;
-        self.finalize_prepared_close(&success.value, &success.attempt)
+    ) -> Result<CloseOutcome, CloseError> {
+        self.recover_close(channel_id, mint_client, keyset_refresher)
+            .await
     }
 
-    fn ensure_close_keysets_cached<R: SpilmanKeysetRefresher>(
+    async fn execute_close_for_closing_channel_async<
+        M: crate::mint_recovery::RecoveryMintClient,
+        R: SpilmanAsyncKeysetRefresher,
+    >(
         &self,
         channel_id: &str,
+        mint_client: &M,
         keyset_refresher: &R,
-    ) -> Result<(), CloseError> {
-        let (mint_url, unit) = self.close_mint_unit(channel_id)?;
-        if !self.has_close_keysets(&mint_url, &unit) {
-            keyset_refresher.refresh(&mint_url).map_err(|e| {
-                CloseError::storage_failed(format!("refresh keysets before close: {e}"))
-            })?;
-        }
-        Ok(())
+    ) -> Result<CloseOutcome, CloseError> {
+        self.recover_close(channel_id, mint_client, keyset_refresher)
+            .await
     }
 
     async fn ensure_close_keysets_cached_async<R: SpilmanAsyncKeysetRefresher>(
@@ -555,8 +463,8 @@ impl SpilmanRelayPayments {
         channel_id: &str,
         keyset_refresher: &R,
     ) -> Result<(), CloseError> {
-        let (mint_url, unit) = self.close_mint_unit(channel_id)?;
-        if !self.has_close_keysets(&mint_url, &unit) {
+        let (mint_url, _) = self.close_mint_unit(channel_id)?;
+        if self.select_close_output_keyset(channel_id).is_err() {
             keyset_refresher.refresh(&mint_url).await.map_err(|e| {
                 CloseError::storage_failed(format!("refresh keysets before close: {e}"))
             })?;
@@ -579,15 +487,6 @@ impl SpilmanRelayPayments {
         Ok((mint_url, channel.unit.as_str().to_string()))
     }
 
-    fn has_close_keysets(&self, mint_url: &str, unit: &str) -> bool {
-        self.mint_cache
-            .read()
-            .expect("spilman mint cache lock poisoned")
-            .keysets
-            .get(mint_url)
-            .is_some_and(|by_id| by_id.values().any(|keyset| keyset.unit == unit))
-    }
-
     fn select_close_output_keyset(
         &self,
         channel_id: &str,
@@ -597,29 +496,29 @@ impl SpilmanRelayPayments {
             .map_err(CloseError::from_preparation_error)
     }
 
-    fn finalize_prepared_close(
-        &self,
-        response_json: &str,
-        prepared: &PreparedClose,
-    ) -> Result<CloseSuccess, CloseError> {
-        let completed = self
-            .bridge
-            .complete_prepared_close(response_json, prepared)?;
-        self.bridge.mark_completed_close(&completed)
-    }
-
     /// Close a channel regardless of whether it is currently Open or Closing.
     /// Already-closed channels return a synthetic [`CloseSuccess`] with
     /// `already_closed: true`.
     pub async fn close_channel_any_state_async<
-        M: SpilmanAsyncMintClient,
+        M: crate::mint_recovery::RecoveryMintClient,
         R: SpilmanAsyncKeysetRefresher,
     >(
         &self,
         channel_id: &str,
         mint_client: &M,
         keyset_refresher: &R,
-    ) -> Result<CloseSuccess, CloseError> {
+    ) -> Result<CloseOutcome, CloseError> {
+        if self
+            .store
+            .storage()
+            .get_close_journal(channel_id)
+            .map_err(CloseError::storage_failed)?
+            .is_some()
+        {
+            return self
+                .recover_close(channel_id, mint_client, keyset_refresher)
+                .await;
+        }
         match self.store.channel_state(channel_id) {
             Some(ChannelState::Closed) => {
                 let data = self.store.closed_data(channel_id).ok_or_else(|| {
@@ -633,14 +532,14 @@ impl SpilmanRelayPayments {
                     }
                 })?;
                 let total_value = data.receiver_sum + data.sender_sum;
-                Ok(CloseSuccess {
+                Ok(CloseOutcome::Closed(CloseSuccess {
                     channel_id: channel_id.to_string(),
                     total_value,
                     receiver_sum: data.receiver_sum,
                     sender_sum: data.sender_sum,
                     sender_proofs: data.sender_proofs_json,
                     already_closed: true,
-                })
+                }))
             }
             Some(ChannelState::Closing) => {
                 self.execute_close_for_closing_channel_async(
@@ -785,15 +684,16 @@ impl RelayPayments for SpilmanRelayPayments {
             ));
         }
 
-        let (previous_balance, unit, state_kind) = {
+        let (previous_payment, unit, state_kind) = {
             let channel = self
                 .store
                 .get_channel(expected_channel_id)
                 .map_err(ChannelPaymentError::Internal)?
                 .ok_or(ChannelPaymentError::UnknownChannel)?;
-            (channel.latest_payment.balance, channel.unit, channel.state)
+            (channel.latest_payment, channel.unit, channel.state)
         };
 
+        let previous_balance = previous_payment.balance;
         if state_kind != ChannelState::Open {
             return Err(ChannelPaymentError::ChannelClosed);
         }
@@ -815,8 +715,10 @@ impl RelayPayments for SpilmanRelayPayments {
         // Record only after validation and monotonicity checks; the stored
         // balance is the relay-authoritative baseline for future payments.
         self.store
-            .record_payment(
+            .storage()
+            .compare_payment(
                 &payment.channel_id,
+                &previous_payment,
                 PaymentProof {
                     balance: validation.balance,
                     signature: validation.sender_signature.clone(),
@@ -842,71 +744,6 @@ impl RelayPayments for SpilmanRelayPayments {
     fn channel_state(&self, channel_id: &str) -> Option<ChannelState> {
         self.store.channel_state(channel_id)
     }
-}
-
-fn remember_retryable_close_rejection(
-    error: &str,
-    first_rejection: &std::sync::Mutex<Option<String>>,
-) -> bool {
-    if is_retryable_keyset_mint_error(error) {
-        let Ok(mut first_rejection) = first_rejection.lock() else {
-            return false;
-        };
-        *first_rejection = Some(error.to_owned());
-        true
-    } else {
-        false
-    }
-}
-
-fn record_close_retry_mint(
-    attempt: &PreparedClose,
-    retry_mint_url: &std::sync::Mutex<Option<String>>,
-) -> Result<(), CloseError> {
-    *retry_mint_url
-        .lock()
-        .map_err(|_| CloseError::storage_failed("close retry lock poisoned"))? =
-        Some(attempt.mint_url.clone());
-    Ok(())
-}
-
-fn close_retry_result(
-    result: Result<
-        cdk_spilman::KeysetRetrySuccess<PreparedClose, String>,
-        KeysetRetryError<PreparedClose, CloseError, String>,
-    >,
-    first_rejection: Option<String>,
-) -> Result<cdk_spilman::KeysetRetrySuccess<PreparedClose, String>, CloseError> {
-    match result {
-        Ok(success) => Ok(success),
-        Err(KeysetRetryError::Select { error, .. })
-        | Err(KeysetRetryError::Prepare { error, .. })
-        | Err(KeysetRetryError::Refresh { error })
-        | Err(KeysetRetryError::Cleanup { error }) => Err(error),
-        Err(KeysetRetryError::Submit {
-            error,
-            retried: false,
-            ..
-        }) => Err(CloseError::mint_rejected(parse_mint_error_value(&error))),
-        Err(KeysetRetryError::Submit {
-            error,
-            retried: true,
-            ..
-        }) => {
-            let first = first_rejection.as_deref().unwrap_or(&error);
-            Err(CloseError::mint_rejected_after_retry(
-                parse_mint_error_value(first),
-                parse_mint_error_value(&error),
-            ))
-        }
-        Err(KeysetRetryError::RetryKeysetUnchanged { error, .. }) => {
-            Err(CloseError::mint_rejected(parse_mint_error_value(&error)))
-        }
-    }
-}
-
-fn parse_mint_error_value(raw: &str) -> serde_json::Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
 }
 
 pub(crate) fn keyset_version_is_negotiated(id: &Id, versions: &BTreeSet<String>) -> bool {

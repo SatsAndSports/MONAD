@@ -49,8 +49,8 @@ use monad_common::session::RelayConnection;
 
 use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
 use cdk_spilman::{
-    ChannelState, ClientStorage, ClosingData, ConfigurableClientHost, EstablishedChannel,
-    FundingSpendKind, MintConnection, SpilmanClientBridge, SqliteClientStorage,
+    ChannelState, ClientStorage, ConfigurableClientHost, EstablishedChannel, FundingSpendKind,
+    MintConnection, SpilmanClientBridge, SqliteClientStorage,
 };
 use cdk_spilman_test_mint::{
     build_router, build_test_mint, rotate_sat_keyset, InMemoryMintNetworking, TestMintConfig,
@@ -1265,6 +1265,7 @@ async fn create_paid_closed_channel(
         .close_channel_async(&channel_id, &net, wallet_manager)
         .await
         .expect("relay should close test channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(close_success.receiver_sum >= funded_balance_raw);
     assert_closed_payout_at_least(payments, &channel_id, funded_balance_raw);
     channel_id
@@ -1424,6 +1425,96 @@ struct DropAfterSwap<'a> {
     inner: &'a RelayWalletMintClient,
 }
 
+struct RecoveryTestMint(Arc<cdk::Mint>);
+
+struct PendingCloseMint<'a> {
+    inner: &'a RelayWalletMintClient,
+    entered: tokio::sync::Notify,
+}
+
+struct TypedCloseFailure<'a>(&'a RelayWalletMintClient, u16);
+#[async_trait::async_trait]
+impl cdk_spilman::SpilmanAsyncMintClient for TypedCloseFailure<'_> {
+    async fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+        panic!("checked close transport required")
+    }
+}
+#[async_trait::async_trait]
+impl monad_relay::mint_recovery::RecoveryMintClient for TypedCloseFailure<'_> {
+    async fn swap_checked(&self, _: &str, _: &str) -> anyhow::Result<String> {
+        Err(monad_common::mint_error::MintHttpRejection {
+            status: self.1,
+            code: Some(12002),
+        }
+        .into())
+    }
+    async fn restore(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        monad_relay::mint_recovery::RecoveryMintClient::restore(self.0, mint, request).await
+    }
+    async fn check_state(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        monad_relay::mint_recovery::RecoveryMintClient::check_state(self.0, mint, request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl cdk_spilman::SpilmanAsyncMintClient for PendingCloseMint<'_> {
+    async fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+        panic!("unchecked close submission")
+    }
+}
+
+#[async_trait::async_trait]
+impl monad_relay::mint_recovery::RecoveryMintClient for PendingCloseMint<'_> {
+    async fn swap_checked(&self, _: &str, _: &str) -> anyhow::Result<String> {
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+    async fn restore(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        monad_relay::mint_recovery::RecoveryMintClient::restore(self.inner, mint, request).await
+    }
+    async fn check_state(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        monad_relay::mint_recovery::RecoveryMintClient::check_state(self.inner, mint, request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl cdk_spilman::SpilmanAsyncMintClient for RecoveryTestMint {
+    async fn call_mint_swap(&self, mint: &str, request: &str) -> Result<String, String> {
+        monad_relay::mint_recovery::RecoveryMintClient::swap_checked(self, mint, request)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl cdk_spilman::SpilmanAsyncKeysetRefresher for RecoveryTestMint {
+    async fn refresh(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl monad_relay::mint_recovery::RecoveryMintClient for RecoveryTestMint {
+    async fn swap_checked(&self, _: &str, request: &str) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(
+            &self
+                .0
+                .process_swap_request(serde_json::from_str(request)?)
+                .await?,
+        )?)
+    }
+    async fn restore(&self, _: &str, request: &str) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(
+            &self.0.restore(serde_json::from_str(request)?).await?,
+        )?)
+    }
+    async fn check_state(&self, _: &str, request: &str) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(
+            &self.0.check_state(&serde_json::from_str(request)?).await?,
+        )?)
+    }
+}
+
 impl DrainSwapNetworking for DropAfterSwap<'_> {
     fn call_mint_swap<'a>(
         &'a self,
@@ -1441,10 +1532,10 @@ impl DrainSwapNetworking for DropAfterSwap<'_> {
 
     fn call_mint_restore<'a>(
         &'a self,
-        mint_url: &'a str,
-        restore_request_json: &'a str,
+        _mint_url: &'a str,
+        _restore_request_json: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
-        self.inner.call_mint_restore(mint_url, restore_request_json)
+        Box::pin(async { Err("simulated restore outage after response loss".to_string()) })
     }
 }
 
@@ -1454,7 +1545,54 @@ struct CountingDrainNet<'a> {
     output_keysets_by_call: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
+struct MutatedDrainRestore<'a> {
+    inner: &'a RelayWalletMintClient,
+    mutate: fn(&mut serde_json::Value),
+}
+
+impl DrainSwapNetworking for MutatedDrainRestore<'_> {
+    fn call_mint_swap<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { panic!("restore must not submit a swap") })
+    }
+
+    fn call_mint_restore<'a>(
+        &'a self,
+        mint_url: &'a str,
+        request: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let response = self.inner.call_mint_restore(mint_url, request).await?;
+            let mut response = serde_json::from_str(&response).unwrap();
+            (self.mutate)(&mut response);
+            Ok(response.to_string())
+        })
+    }
+}
+
 impl DrainSwapNetworking for CountingDrainNet<'_> {
+    fn checked_swap<'a>(
+        &'a self,
+        mint: &'a str,
+        request: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        self.swaps.fetch_add(1, Ordering::SeqCst);
+        self.output_keysets_by_call
+            .lock()
+            .unwrap()
+            .push(output_keyset_ids_from_swap_request(request));
+        self.inner.checked_swap(mint, request)
+    }
+    fn checked_state<'a>(
+        &'a self,
+        mint: &'a str,
+        request: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        self.inner.checked_state(mint, request)
+    }
     fn call_mint_swap<'a>(
         &'a self,
         mint_url: &'a str,
@@ -1529,6 +1667,30 @@ struct AlwaysKeysetRejectSwap {
 }
 
 impl DrainSwapNetworking for AlwaysKeysetRejectSwap {
+    fn checked_swap<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        self.swaps.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(monad_common::mint_error::MintHttpRejection {
+                status: 400,
+                code: Some(12002),
+            }
+            .into())
+        })
+    }
+    fn checked_state<'a>(
+        &'a self,
+        _: &'a str,
+        request: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let request: serde_json::Value = serde_json::from_str(request)?;
+            Ok(serde_json::json!({"states":request["Ys"].as_array().unwrap().iter().map(|y|serde_json::json!({"Y":y,"state":"UNSPENT"})).collect::<Vec<_>>()}).to_string())
+        })
+    }
     fn call_mint_swap<'a>(
         &'a self,
         _mint_url: &'a str,
@@ -1543,11 +1705,109 @@ impl DrainSwapNetworking for AlwaysKeysetRejectSwap {
         _mint_url: &'a str,
         _restore_request_json: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
-        Box::pin(async { Err("restore should not be called".to_string()) })
+        Box::pin(async { Ok(r#"{"outputs":[],"signatures":[]}"#.to_string()) })
     }
 }
 
 struct RejectSwap;
+
+struct PendingDrainSwap(tokio::sync::Notify);
+impl DrainSwapNetworking for PendingDrainSwap {
+    fn call_mint_swap<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.0.notify_one();
+            std::future::pending().await
+        })
+    }
+    fn call_mint_restore<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { panic!("concurrent recovery must not reach networking") })
+    }
+}
+
+struct TypedDrainFailure<'a>(&'a RelayWalletMintClient, u16);
+
+struct InvalidDrainState<'a>(&'a RelayWalletMintClient, u8);
+impl DrainSwapNetworking for InvalidDrainState<'_> {
+    fn call_mint_swap<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { panic!("invalid input evidence authorized replay") })
+    }
+    fn call_mint_restore<'a>(
+        &'a self,
+        mint: &'a str,
+        request: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        self.0.call_mint_restore(mint, request)
+    }
+    fn checked_state<'a>(
+        &'a self,
+        mint: &'a str,
+        request: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let response = self.0.checked_state(mint, request).await?;
+            let mut response: serde_json::Value = serde_json::from_str(&response)?;
+            let states = response["states"].as_array_mut().unwrap();
+            assert!(states.len() > 1, "fixture must aggregate multiple inputs");
+            match self.1 {
+                0 => {
+                    states.pop();
+                }
+                1 => states[1]["state"] = serde_json::json!("PENDING"),
+                2 => states[1]["state"] = serde_json::json!("SPENT"),
+                _ => states[1] = states[0].clone(),
+            }
+            Ok(response.to_string())
+        })
+    }
+}
+impl DrainSwapNetworking for TypedDrainFailure<'_> {
+    fn checked_swap<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(monad_common::mint_error::MintHttpRejection {
+                status: self.1,
+                code: Some(12002),
+            }
+            .into())
+        })
+    }
+    fn checked_state<'a>(
+        &'a self,
+        mint: &'a str,
+        request: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        self.0.checked_state(mint, request)
+    }
+    fn call_mint_swap<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { panic!("checked transport required") })
+    }
+    fn call_mint_restore<'a>(
+        &'a self,
+        mint: &'a str,
+        request: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        self.0.call_mint_restore(mint, request)
+    }
+}
 
 impl DrainSwapNetworking for RejectSwap {
     fn call_mint_swap<'a>(
@@ -1568,6 +1828,7 @@ impl DrainSwapNetworking for RejectSwap {
 }
 
 struct DrainTestContext {
+    mint: Arc<cdk::Mint>,
     mint_url: String,
     wallet_manager: RelayWalletManager,
     payments: Arc<SpilmanRelayPayments>,
@@ -1579,6 +1840,17 @@ struct DrainTestContext {
 
 impl DrainTestContext {
     async fn new(relay_name: &str) -> Self {
+        Self::with_policy(
+            relay_name,
+            monad_common::config::RelayChannelPolicyConfig::default(),
+        )
+        .await
+    }
+
+    async fn with_policy(
+        relay_name: &str,
+        policy: monad_common::config::RelayChannelPolicyConfig,
+    ) -> Self {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mint_addr = mint_listener.local_addr().unwrap();
@@ -1609,7 +1881,7 @@ impl DrainTestContext {
             .unwrap();
         wallet_manager.install_keyset_cache(mint_cache.clone());
         let payments = wallet_manager
-            .spilman_payments_for(relay_name, mint_cache, trusted_mint_units)
+            .spilman_payments_for_with_policy(relay_name, mint_cache, trusted_mint_units, policy)
             .unwrap();
         let wallet = TestSigningWallet::new(
             mint_helper.mint(),
@@ -1630,6 +1902,7 @@ impl DrainTestContext {
         };
 
         Self {
+            mint: mint_helper.mint(),
             mint_url,
             wallet_manager,
             payments,
@@ -4929,6 +5202,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     // Phase B: graceful relay shutdown.
     let _ = shutdown_tx.send(());
     handle.await.unwrap().unwrap();
+    drop(_payments);
 
     // Phase C: restart the relay with the same SQLite file and identity. Use
     // a fresh port; graceful shutdown may leave the old socket in TIME_WAIT
@@ -5144,6 +5418,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
     handle.await.unwrap().unwrap();
 
     let disallowed_mint_cache = SpilmanMintCache::default();
+    drop(_payments);
     let disallowed_trusted_mint_units = BTreeMap::new();
     let (server_addr2, pubkey2, handle2, shutdown_tx2, _payments2) = start_persistent_relay(
         "127.0.0.1:0".parse().unwrap(),
@@ -5495,6 +5770,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         .close_channel(&old_channel_id, &net)
         .await
         .expect("close should refresh stale keysets and retry");
+    let close_success = close_success.into_closed().unwrap();
     assert_eq!(close_success.receiver_sum, old_funded_balance_raw);
     assert_closed_payout_at_least(&payments, &old_channel_id, old_funded_balance_raw);
     let closed_data = payments
@@ -6957,6 +7233,7 @@ clients:
     // Kill the relay. The client should detect the failure and enter reconnect.
     let _ = relay_shutdown_tx.send(());
     relay_handle.await.unwrap().unwrap();
+    drop(_payments);
 
     // Wait briefly for the client to notice and start reconnecting.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -7242,6 +7519,7 @@ struct ConfiguredRouteFixtureConfig {
 }
 
 struct ConfiguredRouteFixture {
+    wallet_manager: Arc<RelayWalletManager>,
     _temp_dir: tempfile::TempDir,
     config: MonadConfig,
     relay_names: Vec<String>,
@@ -7443,6 +7721,7 @@ relays:
 
         Self {
             _temp_dir: temp_dir,
+            wallet_manager,
             config,
             relay_names,
             _mint_helper: mint_helper,
@@ -7549,9 +7828,7 @@ async fn run_configured_suffix_rebuild_case(case: ConfiguredSuffixRebuildCase) {
     let _ = failed_shutdown_tx.send(());
     failed_handle.await.unwrap().unwrap();
 
-    let wallet_manager = Arc::new(
-        RelayWalletManager::open(&fixture.config.relay_wallet.as_ref().unwrap().db_path).unwrap(),
-    );
+    let wallet_manager = Arc::new(fixture.wallet_manager.reopen().unwrap());
     let failed_relay_name = &fixture.relay_names[case.failed_hop_idx];
     let failed_relay_config = fixture
         .config
@@ -9516,8 +9793,7 @@ clients:
     let config = MonadConfig::load(&config_path).unwrap();
     let wallet_manager_1 =
         Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
-    let wallet_manager_2 =
-        Arc::new(RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap());
+    let wallet_manager_2 = wallet_manager_1.clone();
     let (_relay_1_addr, _relay_1_pubkey, relay_1_handle, relay_1_shutdown_tx, _payments_1) =
         start_relay_from_config_bound(
             config.select_relay(Some("hop1")).unwrap(),
@@ -9751,10 +10027,12 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     assert_eq!(result, b"BEFORE CLOSE");
 
     // Close the channel through the relay, using the in-memory mint networking.
-    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let mint_networking = RecoveryTestMint(mint_helper.mint());
     let close_success = payments
-        .close_channel(&channel_id, &mint_networking, &mint_networking)
+        .close_channel_async(&channel_id, &mint_networking, &mint_networking)
+        .await
         .expect("relay should close the channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
     assert_eq!(
@@ -9923,10 +10201,12 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
         .unwrap();
     assert_eq!(before.state, cashu::nuts::State::Unspent);
 
-    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let mint_networking = RecoveryTestMint(mint_helper.mint());
     let close_success = payments
-        .close_channel(&channel_id, &mint_networking, &mint_networking)
+        .close_channel_async(&channel_id, &mint_networking, &mint_networking)
+        .await
         .expect("relay should close the channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
 
@@ -10113,10 +10393,12 @@ async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
         None
     };
 
-    let mint_networking = InMemoryMintNetworking::new(mint_helper.mint());
+    let mint_networking = RecoveryTestMint(mint_helper.mint());
     let close_success = payments
-        .close_channel(&channel_id, &mint_networking, &mint_networking)
+        .close_channel_async(&channel_id, &mint_networking, &mint_networking)
+        .await
         .expect("relay should close the channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
 
@@ -10135,7 +10417,7 @@ async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
     assert_eq!(funding_state.state, cashu::nuts::State::Spent);
     assert_eq!(
         EstablishedChannel::classify_funding_spend_witness(&funding_state),
-        FundingSpendKind::RelayClose
+        FundingSpendKind::Unknown
     );
 
     let maintenance = monad_client::wallet_lock::ClientWalletLocks::acquire(
@@ -10289,8 +10571,8 @@ async fn test_wallet_manager_close_channel_by_id() {
     let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
     assert!(!funded_status.paused);
 
-    // A fresh CLI manager has persisted channel state but no in-memory keys.
-    let wallet_manager = RelayWalletManager::open(&storage_path).unwrap();
+    // A fresh storage/cache under the same exclusive owner has no memory keys.
+    let wallet_manager = wallet_manager.reopen().unwrap();
     assert!(wallet_manager.keyset_cache_snapshot().keysets.is_empty());
     let net = wallet_manager
         .mint_client_for_channel(&channel_id)
@@ -10299,6 +10581,7 @@ async fn test_wallet_manager_close_channel_by_id() {
         .close_channel(&channel_id, &net)
         .await
         .expect("wallet manager should close the channel");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
     assert_eq!(close_success.total_value, capacity_raw);
@@ -10420,31 +10703,58 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     let funded_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
     assert!(!funded_status.paused);
 
-    // Force the channel into durable Closing state without finishing the close.
+    // Cancel at the acknowledged pre-HTTP boundary, after the exact request and
+    // execution uncertainty have been durably committed.
     let storage = SqliteStorage::open(&storage_path).unwrap();
-    let latest_payment = storage
-        .get_balance(&channel_id)
-        .expect("storage should contain latest payment proof");
-    storage
-        .mark_closing(
-            &channel_id,
-            ClosingData {
-                expiry_timestamp: 0,
-                balance: latest_payment.balance,
-                signature: latest_payment.signature.clone(),
-            },
-        )
-        .expect("storage should persist Closing state");
-    assert_eq!(storage.get_state(&channel_id), ChannelState::Closing);
-
     let net = wallet_manager
         .mint_client_for_channel(&channel_id)
         .expect("wallet manager should build reqwest networking for channel");
+    let gate = PendingCloseMint {
+        inner: &net,
+        entered: tokio::sync::Notify::new(),
+    };
+    let mut closing = Box::pin(wallet_manager.close_channel(&channel_id, &gate));
+    tokio::select! {
+        _ = gate.entered.notified() => {},
+        result = &mut closing => panic!("close completed before gate: {}", result.is_ok()),
+    }
+    assert!(timeout(
+        Duration::from_secs(1),
+        wallet_manager.close_channel(&channel_id, &net)
+    )
+    .await
+    .unwrap()
+    .unwrap_err()
+    .to_string()
+    .contains("already active"));
+    drop(closing);
+    assert_eq!(storage.get_state(&channel_id), ChannelState::Closing);
+    let saved = storage.get_close_journal(&channel_id).unwrap().unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["attempts"][0]["submissions"], 1);
+    assert_eq!(saved["payment"]["balance"], funded_balance_raw);
+    let late_payment = wallet
+        .build_channel_payment(
+            &channel_id,
+            &offer,
+            funded_balance_raw,
+            funded_balance_raw + 1,
+        )
+        .unwrap();
+    assert!(matches!(
+        payments.apply_channel_payment(&channel_id, &late_payment),
+        Err(monad_relay::payments::ChannelPaymentError::ChannelClosed)
+    ));
+    assert_eq!(
+        storage.get_balance(&channel_id).unwrap().balance,
+        funded_balance_raw
+    );
 
     let close_success = wallet_manager
         .close_channel(&channel_id, &net)
         .await
         .expect("wallet manager should complete close from Closing state");
+    let close_success = close_success.into_closed().unwrap();
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
     assert_eq!(close_success.total_value, capacity_raw);
@@ -10458,6 +10768,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
         .close_channel(&channel_id, &net)
         .await
         .expect("second close on already-closed channel should succeed");
+    let second_close = second_close.into_closed().unwrap();
     assert!(second_close.already_closed);
     assert_eq!(second_close.receiver_sum, funded_balance_raw);
     assert_eq!(second_close.total_value, capacity_raw);
@@ -10788,10 +11099,538 @@ async fn test_wallet_manager_recover_missing_drain_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_drain_restore_checks_output_identities() {
+    let ctx = DrainTestContext::new("exact-restore-relay").await;
+    let channel_id = ctx.create_closed_channel([29u8; 32], 450).await;
+    let net = ctx.net_for(&channel_id);
+    ctx.wallet_manager
+        .drain_closed_channels_to_swap(
+            "exact-restore-relay",
+            &ctx.mint_url,
+            "sat",
+            &DropAfterSwap { inner: &net },
+            None,
+        )
+        .await
+        .unwrap_err();
+    let drain_id = ctx.wallet_manager.list_drains().unwrap()[0]
+        .drain_id
+        .clone();
+    let invalid: Vec<fn(&mut serde_json::Value)> = vec![
+        |v| {
+            v["outputs"] = serde_json::json!([]);
+        },
+        |v| {
+            v["outputs"][0] = v["outputs"][1].clone();
+        },
+        |v| {
+            v["outputs"][0]["amount"] = serde_json::json!(999);
+        },
+        |v| {
+            v["signatures"].as_array_mut().unwrap().pop();
+        },
+        |v| {
+            v["outputs"] = serde_json::json!([]);
+            v["signatures"] = serde_json::json!([]);
+        },
+    ];
+    for mutate in invalid {
+        let bad = MutatedDrainRestore {
+            inner: &net,
+            mutate,
+        };
+        assert!(ctx
+            .wallet_manager
+            .recover_submitted_drain(&drain_id, &bad)
+            .await
+            .is_err());
+        assert_eq!(
+            ctx.wallet_manager.list_drains().unwrap()[0].state,
+            "Submitted"
+        );
+        let reserved = ctx
+            .wallet_manager
+            .drain_closed_channels_to_swap("exact-restore-relay", &ctx.mint_url, "sat", &net, None)
+            .await
+            .unwrap_err();
+        assert!(reserved.contains("no closed channels"));
+    }
+    let reordered = MutatedDrainRestore {
+        inner: &net,
+        mutate: |v| {
+            v["outputs"].as_array_mut().unwrap().reverse();
+            v["signatures"].as_array_mut().unwrap().reverse();
+        },
+    };
+    let recovered = ctx
+        .wallet_manager
+        .recover_submitted_drain(&drain_id, &reordered)
+        .await
+        .unwrap();
+    assert_eq!(sum_proof_amounts(&recovered.output_proofs_json), 450);
+    let repeated = ctx
+        .wallet_manager
+        .recover_submitted_drain(&drain_id, &RejectSwap)
+        .await
+        .unwrap();
+    assert_eq!(recovered.output_proofs_json, repeated.output_proofs_json);
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drain_singleflight_and_cancellation_preserve_immutable_request() {
+    let ctx = DrainTestContext::new("drain-singleflight").await;
+    let channel = ctx.create_closed_channel([31; 32], 450).await;
+    let pending = PendingDrainSwap(tokio::sync::Notify::new());
+    let mut submit = Box::pin(ctx.wallet_manager.drain_closed_channels_to_swap(
+        "drain-singleflight",
+        &ctx.mint_url,
+        "sat",
+        &pending,
+        None,
+    ));
+    tokio::select! { _ = pending.0.notified() => {}, result = &mut submit => panic!("unexpected drain completion: {}", result.is_ok()) }
+    let id = ctx.wallet_manager.list_drains().unwrap()[0]
+        .drain_id
+        .clone();
+    assert!(ctx
+        .wallet_manager
+        .recover_submitted_drain(&id, &pending)
+        .await
+        .unwrap_err()
+        .contains("already active"));
+    assert!(ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-singleflight", &ctx.mint_url, "sat", &pending, None)
+        .await
+        .unwrap_err()
+        .contains("no closed channels"));
+    let conn = rusqlite::Connection::open(ctx._temp_db.path()).unwrap();
+    let before: String = conn
+        .query_row(
+            "SELECT swap_request_json FROM monad_relay_drains WHERE drain_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(submit);
+    let net = ctx.net_for(&channel);
+    for mode in 0..4 {
+        assert!(ctx
+            .wallet_manager
+            .recover_submitted_drain(&id, &InvalidDrainState(&net, mode))
+            .await
+            .is_err());
+    }
+    // A 12002 on replay after cancellation must never grant changed outputs.
+    assert!(ctx
+        .wallet_manager
+        .recover_submitted_drain(&id, &TypedDrainFailure(&net, 400))
+        .await
+        .is_err());
+    let history: String = conn
+        .query_row(
+            "SELECT journal_json FROM monad_relay_drain_journals WHERE drain_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let history: serde_json::Value = serde_json::from_str(&history).unwrap();
+    assert_eq!(history["attempts"].as_array().unwrap().len(), 1);
+    assert!(history["attempts"][0]["rejection"].is_null());
+    let recovered = ctx
+        .wallet_manager
+        .recover_submitted_drain(&id, &ctx.net_for(&channel))
+        .await
+        .unwrap();
+    assert_eq!(sum_proof_amounts(&recovered.output_proofs_json), 450);
+    let after: String = conn
+        .query_row(
+            "SELECT swap_request_json FROM monad_relay_drains WHERE drain_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        before == after,
+        "recovery changed the immutable drain request"
+    );
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drain_server_error_code_does_not_authorize_successor_or_release() {
+    let ctx = DrainTestContext::new("drain-http500").await;
+    let channel = ctx.create_closed_channel([32; 32], 450).await;
+    let net = ctx.net_for(&channel);
+    let failure = TypedDrainFailure(&net, 500);
+    assert!(ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-http500", &ctx.mint_url, "sat", &failure, None)
+        .await
+        .is_err());
+    let drains = ctx.wallet_manager.list_drains().unwrap();
+    assert_eq!(drains[0].state, "Submitted");
+    let conn = rusqlite::Connection::open(ctx._temp_db.path()).unwrap();
+    let journal: String = conn
+        .query_row(
+            "SELECT journal_json FROM monad_relay_drain_journals WHERE drain_id=?1",
+            [&drains[0].drain_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let journal: serde_json::Value = serde_json::from_str(&journal).unwrap();
+    assert_eq!(journal["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(journal["attempts"][0]["submissions"], 2);
+    assert!(journal["attempts"][0]["rejection"].is_null());
+    assert!(ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("drain-http500", &ctx.mint_url, "sat", &net, None)
+        .await
+        .unwrap_err()
+        .contains("no closed channels"));
+    ctx.wallet_manager
+        .recover_submitted_drain(&drains[0].drain_id, &net)
+        .await
+        .unwrap();
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_close_server_error_and_replay_rejection_preserve_exact_request() {
+    let ctx = DrainTestContext::new("close-error-history").await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let channel = create_paid_open_channel_with_expiry(
+        &ctx.payments,
+        &ctx.wallet,
+        &ctx.offer,
+        [33; 32],
+        450,
+        now + 86_400,
+    )
+    .await;
+    let net = ctx.net_for(&channel);
+    assert!(ctx
+        .wallet_manager
+        .close_channel(&channel, &TypedCloseFailure(&net, 500))
+        .await
+        .is_err());
+    let saved = ctx
+        .wallet_manager
+        .spilman_storage()
+        .get_close_journal(&channel)
+        .unwrap()
+        .unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(saved["attempts"][0]["submissions"], 2);
+    assert!(saved["attempts"][0]["initial_rejection"].is_null());
+    assert!(ctx
+        .wallet_manager
+        .close_channel(&channel, &TypedCloseFailure(&net, 400))
+        .await
+        .is_err());
+    let replay = ctx
+        .wallet_manager
+        .spilman_storage()
+        .get_close_journal(&channel)
+        .unwrap()
+        .unwrap();
+    let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+    assert_eq!(replay["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(replay["attempts"][0]["submissions"], 4);
+    assert!(replay["attempts"][0]["initial_rejection"].is_null());
+    assert!(
+        saved["attempts"][0]["prepared"] == replay["attempts"][0]["prepared"],
+        "close replay changed immutable preparation"
+    );
+    assert_eq!(
+        ctx.payments.channel_state(&channel),
+        Some(ChannelState::Closing)
+    );
+    let completed = ctx
+        .wallet_manager
+        .close_channel(&channel, &net)
+        .await
+        .unwrap();
+    let completed = completed.into_closed().unwrap();
+    assert!(completed.receiver_sum >= 450);
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_close_and_drain_refresh_inactive_or_missing_cached_output_metadata() {
+    for missing_metadata in [false, true] {
+        let ctx = DrainTestContext::new("usable-cache").await;
+        let channel = create_paid_open_channel_with_expiry(
+            &ctx.payments,
+            &ctx.wallet,
+            &ctx.offer,
+            [37; 32],
+            450,
+            cashu::util::unix_time() + 86_400,
+        )
+        .await;
+        for close in [true, false] {
+            let mut cache = ctx.wallet_manager.keyset_cache_snapshot();
+            for keyset in cache.keysets.get_mut(&ctx.mint_url).unwrap().values_mut() {
+                if missing_metadata {
+                    keyset.info_json = "{}".to_string();
+                } else {
+                    keyset.active = false;
+                }
+            }
+            ctx.wallet_manager.install_keyset_cache(cache);
+            let net = ctx.net_for(&channel);
+            if close {
+                assert!(
+                    ctx.wallet_manager
+                        .close_channel(&channel, &net)
+                        .await
+                        .unwrap()
+                        .into_closed()
+                        .unwrap()
+                        .receiver_sum
+                        >= 450
+                );
+            } else {
+                let drain = ctx
+                    .wallet_manager
+                    .drain_closed_channels_to_swap("usable-cache", &ctx.mint_url, "sat", &net, None)
+                    .await
+                    .unwrap();
+                assert!(sum_proof_amounts(&drain.output_proofs_json) > 0);
+            }
+            let cache = ctx.wallet_manager.keyset_cache_snapshot();
+            assert!(cache.keysets[&ctx.mint_url].values().any(|key| key.active
+                && cdk_spilman::parse_keyset_info_from_json(&key.info_json).is_ok()));
+        }
+        ctx.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sender_refund_terminal_and_extra_signature_remains_recoverable() {
+    use monad_relay::payments::CloseOutcome;
+    for extra in [false, true] {
+        let ctx = DrainTestContext::with_policy(
+            "refund-outcome",
+            monad_common::config::RelayChannelPolicyConfig {
+                min_expiry_secs: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let expiry = cashu::util::unix_time() + 6;
+        let channel_id = create_paid_open_channel_with_expiry(
+            &ctx.payments,
+            &ctx.wallet,
+            &ctx.offer,
+            [35; 32],
+            450,
+            expiry,
+        )
+        .await;
+        let channel = cdk_spilman::EstablishedChannel::from_client_channel_funding(
+            &ctx.wallet.client_channel_funding(&channel_id).unwrap(),
+        )
+        .unwrap();
+        while cashu::util::unix_time() <= expiry {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let prepared = channel
+            .prepare_sender_refund_after_expiry(
+                ctx.wallet.sender_secret(),
+                cashu::util::unix_time(),
+                channel.params.keyset_info.clone(),
+                [0; 32],
+            )
+            .unwrap();
+        let mut request = prepared.swap_request.clone();
+        if extra {
+            request
+                .sign_sig_all(cashu::nuts::SecretKey::generate())
+                .unwrap();
+        }
+        ctx.mint.process_swap_request(request).await.unwrap();
+        let net = ctx.net_for(&channel_id);
+        for _ in 0..2 {
+            let result = ctx
+                .wallet_manager
+                .close_channel(&channel_id, &net)
+                .await
+                .unwrap();
+            if extra {
+                assert!(matches!(result, CloseOutcome::UnknownSpent { .. }));
+                assert_eq!(
+                    ctx.payments.channel_state(&channel_id),
+                    Some(ChannelState::Closing)
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    CloseOutcome::SenderRefundedAfterExpiry { .. }
+                ));
+                assert_eq!(
+                    ctx.payments.channel_state(&channel_id),
+                    Some(ChannelState::SenderRefundedAfterExpiry)
+                );
+                assert!(ctx
+                    .wallet_manager
+                    .find_expiring_channels(None, cashu::util::unix_time(), 86_400)
+                    .unwrap()
+                    .is_empty());
+            }
+            assert!(ctx.payments.closed_data(&channel_id).is_none());
+        }
+        assert!(ctx
+            .wallet_manager
+            .drain_closed_channels_to_swap("refund-outcome", &ctx.mint_url, "sat", &net, None)
+            .await
+            .is_err());
+        assert!(ctx
+            .payments
+            .link_channel(
+                &supported_cashu_spilman_keyset_versions(),
+                [36; 32],
+                &ctx.wallet.build_raw_link_request(&channel_id).unwrap()
+            )
+            .is_err());
+        assert!(ctx
+            .payments
+            .apply_channel_payment(
+                &channel_id,
+                &serde_json::json!({"channel_id":channel_id,"balance":451,"signature":"invalid"})
+                    .to_string()
+            )
+            .is_err());
+        // Relay terminal classification does not consume or invalidate sender outputs.
+        let response = ctx
+            .mint
+            .restore(cashu::nuts::RestoreRequest {
+                outputs: prepared
+                    .outputs
+                    .iter()
+                    .map(|o| o.blinded_message.clone())
+                    .collect(),
+            })
+            .await
+            .unwrap();
+        let restored = channel
+            .complete_prepared_sender_refund_restore(
+                &prepared,
+                &ctx.wallet.sender_secret(),
+                response,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.iter().map(|p| u64::from(p.amount)).sum::<u64>(),
+            prepared.output_amount_raw
+        );
+        ctx.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_final_close_restore_checks_predecessor_then_successor_after_spent() {
+    use monad_relay::mint_recovery::RecoveryMintClient;
+    struct DelayedRestore<'a> {
+        inner: &'a RelayWalletMintClient,
+        mint: Arc<cdk::Mint>,
+        swaps: AtomicUsize,
+        spent: std::sync::atomic::AtomicBool,
+        final_ids: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl cdk_spilman::SpilmanAsyncMintClient for DelayedRestore<'_> {
+        async fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+            panic!("checked transport required")
+        }
+    }
+    #[async_trait::async_trait]
+    impl RecoveryMintClient for DelayedRestore<'_> {
+        async fn swap_checked(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+            if self.swaps.fetch_add(1, Ordering::SeqCst) == 0 {
+                cdk_spilman_test_mint::rotate_sat_keyset(&self.mint, 250).await?;
+            }
+            let _ = self.inner.swap_checked(mint, request).await?;
+            anyhow::bail!("lost committed close response")
+        }
+        async fn restore(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+            if !self.spent.load(Ordering::SeqCst) {
+                return Ok(r#"{"outputs":[],"signatures":[]}"#.to_string());
+            }
+            let request_json: serde_json::Value = serde_json::from_str(request)?;
+            self.final_ids.lock().unwrap().push(
+                request_json["outputs"][0]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            self.inner.restore(mint, request).await
+        }
+        async fn check_state(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+            let response = self.inner.check_state(mint, request).await?;
+            let state: cashu::nuts::CheckStateResponse = serde_json::from_str(&response)?;
+            self.spent.store(
+                state
+                    .states
+                    .iter()
+                    .all(|s| s.state == cashu::nuts::State::Spent),
+                Ordering::SeqCst,
+            );
+            Ok(response)
+        }
+    }
+    let ctx = DrainTestContext::new("final-close-restore").await;
+    let channel = create_paid_open_channel_with_expiry(
+        &ctx.payments,
+        &ctx.wallet,
+        &ctx.offer,
+        [34; 32],
+        450,
+        cashu::util::unix_time() + 86_400,
+    )
+    .await;
+    let inner = ctx.net_for(&channel);
+    let net = DelayedRestore {
+        inner: &inner,
+        mint: ctx.mint.clone(),
+        swaps: AtomicUsize::new(0),
+        spent: std::sync::atomic::AtomicBool::new(false),
+        final_ids: Mutex::new(Vec::new()),
+    };
+    let completed = ctx
+        .wallet_manager
+        .close_channel(&channel, &net)
+        .await
+        .unwrap();
+    let completed = completed.into_closed().unwrap();
+    assert!(completed.receiver_sum >= 450);
+    assert_eq!(net.swaps.load(Ordering::SeqCst), 2);
+    let ids = net.final_ids.lock().unwrap().clone();
+    assert_eq!(
+        ids.len(),
+        2,
+        "final restore must cover both immutable attempts"
+    );
+    assert_eq!(ids[0], ctx.offer.preferred_keyset_ids[0]);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(
+        ctx.payments.channel_state(&channel),
+        Some(ChannelState::Closed)
+    );
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wallet_manager_drain_recovery_survives_manager_reopen() {
     let ctx = DrainTestContext::new("drain-reopen-relay").await;
     let channel_id = ctx.create_closed_channel([16u8; 32], 450).await;
-    let db_path = ctx._temp_db.path().to_str().unwrap().to_string();
     let net = ctx.net_for(&channel_id);
     let dropped = DropAfterSwap { inner: &net };
     let err = ctx
@@ -10804,7 +11643,7 @@ async fn test_wallet_manager_drain_recovery_survives_manager_reopen() {
         .drain_id
         .clone();
 
-    let reopened = RelayWalletManager::open(&db_path).unwrap();
+    let reopened = ctx.wallet_manager.reopen().unwrap();
     let reopened_net = reopened.mint_client_for_channel(&channel_id).unwrap();
     let recovered = reopened
         .recover_submitted_drain(&drain_id, &reopened_net)
@@ -10818,7 +11657,7 @@ async fn test_wallet_manager_drain_recovery_survives_manager_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wallet_manager_drain_explicit_mint_rejection_marks_failed_and_releases_channels() {
+async fn test_wallet_manager_drain_untyped_rejection_retains_reservation_until_checked_recovery() {
     let ctx = DrainTestContext::new("drain-failed-relay").await;
     let channel_id = ctx.create_closed_channel([17u8; 32], 275).await;
     let err = ctx
@@ -10832,15 +11671,15 @@ async fn test_wallet_manager_drain_explicit_mint_rejection_marks_failed_and_rele
         )
         .await
         .unwrap_err();
-    assert!(err.contains("failed"));
+    assert!(err.contains("unresolved"));
     let drains = ctx.wallet_manager.list_drains().unwrap();
     assert_eq!(drains.len(), 1);
-    assert_eq!(drains[0].state, "Failed");
+    assert_eq!(drains[0].state, "Submitted");
 
     let net = ctx.net_for(&channel_id);
     let retry = ctx
         .wallet_manager
-        .drain_closed_channels_to_swap("drain-failed-relay", &ctx.mint_url, "sat", &net, None)
+        .recover_submitted_drain(&drains[0].drain_id, &net)
         .await
         .unwrap();
     assert_eq!(retry.channel_ids, vec![channel_id]);
@@ -10852,10 +11691,7 @@ async fn test_wallet_manager_drain_explicit_mint_rejection_marks_failed_and_rele
         .into_iter()
         .map(|d| d.state)
         .collect::<BTreeSet<_>>();
-    assert_eq!(
-        states,
-        BTreeSet::from(["Completed".to_string(), "Failed".to_string()])
-    );
+    assert_eq!(states, BTreeSet::from(["Completed".to_string()]));
     ctx.shutdown();
 }
 
@@ -10962,7 +11798,7 @@ async fn test_wallet_manager_drain_keyset_rejection_refreshes_reprepares_and_ret
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wallet_manager_drain_keyset_rejection_unchanged_keyset_marks_failed_and_releases() {
+async fn test_wallet_manager_drain_untyped_keyset_error_cannot_change_outputs() {
     let ctx = DrainTestContext::new("drain-keyset-retry-failed-relay").await;
     let channel_id = ctx.create_closed_channel([22u8; 32], 275).await;
     let scripted = KeysetThenRejectSwap {
@@ -10979,23 +11815,16 @@ async fn test_wallet_manager_drain_keyset_rejection_unchanged_keyset_marks_faile
         )
         .await
         .unwrap_err();
-    assert!(err.contains("failed"));
-    assert!(err.contains("retry keyset unchanged after refresh"));
+    assert!(err.contains("unresolved"));
     assert_eq!(scripted.swaps.load(Ordering::SeqCst), 1);
     let drains = ctx.wallet_manager.list_drains().unwrap();
     assert_eq!(drains.len(), 1);
-    assert_eq!(drains[0].state, "Failed");
+    assert_eq!(drains[0].state, "Submitted");
 
     let net = ctx.net_for(&channel_id);
     let retry = ctx
         .wallet_manager
-        .drain_closed_channels_to_swap(
-            "drain-keyset-retry-failed-relay",
-            &ctx.mint_url,
-            "sat",
-            &net,
-            None,
-        )
+        .recover_submitted_drain(&drains[0].drain_id, &net)
         .await
         .unwrap();
     assert_eq!(retry.channel_ids, vec![channel_id]);
@@ -11006,10 +11835,7 @@ async fn test_wallet_manager_drain_keyset_rejection_unchanged_keyset_marks_faile
         .into_iter()
         .map(|d| d.state)
         .collect::<BTreeSet<_>>();
-    assert_eq!(
-        states,
-        BTreeSet::from(["Completed".to_string(), "Failed".to_string()])
-    );
+    assert_eq!(states, BTreeSet::from(["Completed".to_string()]));
     ctx.shutdown();
 }
 
@@ -11031,12 +11857,11 @@ async fn test_wallet_manager_drain_repeated_keyset_rejection_skips_retry_when_ke
         )
         .await
         .unwrap_err();
-    assert!(err.contains("failed"));
-    assert!(err.contains("retry keyset unchanged after refresh"));
+    assert!(err.contains("keyset unchanged"));
     assert_eq!(scripted.swaps.load(Ordering::SeqCst), 1);
     let drains = ctx.wallet_manager.list_drains().unwrap();
     assert_eq!(drains.len(), 1);
-    assert_eq!(drains[0].state, "Failed");
+    assert_eq!(drains[0].state, "Submitted");
 
     let net = ctx.net_for(&channel_id);
     let retry = ctx
@@ -11049,13 +11874,13 @@ async fn test_wallet_manager_drain_repeated_keyset_rejection_skips_retry_when_ke
             None,
         )
         .await
-        .unwrap();
-    assert_eq!(retry.channel_ids, vec![channel_id]);
+        .unwrap_err();
+    assert!(retry.contains("no closed channels"));
     ctx.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wallet_manager_drain_retry_refresh_failure_marks_failed_and_releases() {
+async fn test_wallet_manager_drain_retry_refresh_failure_preserves_rejection_and_reservation() {
     let ctx = DrainTestContext::new("drain-refresh-failed-relay").await;
     let channel_id = ctx.create_closed_channel([26u8; 32], 275).await;
     let db_path = ctx._temp_db.path().to_str().unwrap().to_string();
@@ -11094,7 +11919,7 @@ async fn test_wallet_manager_drain_retry_refresh_failure_marks_failed_and_releas
         .and_then(|by_id| by_id.get(&old_keyset_id))
         .expect("old keyset cached")
         .clone();
-    let retry_manager = RelayWalletManager::open(&db_path).unwrap();
+    let retry_manager = ctx.wallet_manager.reopen().unwrap();
     retry_manager.install_keyset_cache(SpilmanMintCache {
         advertised: BTreeMap::from([(
             bad_mint_url.to_string(),
@@ -11119,11 +11944,11 @@ async fn test_wallet_manager_drain_retry_refresh_failure_marks_failed_and_releas
         )
         .await
         .unwrap_err();
-    assert!(err.contains("refresh keysets after keyset rejection"));
+    assert!(err.contains("fetch keysets"));
     assert_eq!(scripted.swaps.load(Ordering::SeqCst), 1);
     let drains = retry_manager.list_drains().unwrap();
     assert_eq!(drains.len(), 1);
-    assert_eq!(drains[0].state, "Failed");
+    assert_eq!(drains[0].state, "Submitted");
 
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute(
@@ -11144,8 +11969,8 @@ async fn test_wallet_manager_drain_retry_refresh_failure_marks_failed_and_releas
             None,
         )
         .await
-        .unwrap();
-    assert_eq!(retry.channel_ids, vec![channel_id]);
+        .unwrap_err();
+    assert!(retry.contains("no closed channels"));
     ctx.shutdown();
 }
 

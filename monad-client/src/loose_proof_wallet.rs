@@ -785,7 +785,7 @@ fn initialize_schema_with_migration_hook(
 impl LooseProofWallet {
     pub fn open(path: impl AsRef<Path>, wallet_name: impl Into<String>) -> Result<Self> {
         let db_path = crate::wallet_lock::normalize_path(path.as_ref())?;
-        let mut conn = Connection::open(path).map_err(|e| {
+        let mut conn = cdk_spilman::sqlite_durability::open_wallet_database(path).map_err(|e| {
             LooseProofWalletError::Backend(format!("open loose proof wallet db: {e}"))
         })?;
         conn.busy_timeout(std::time::Duration::from_secs(5))

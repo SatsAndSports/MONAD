@@ -12,6 +12,28 @@ It provides:
 
 ## Status
 
+Relay wallet close results are typed: `Closed` carries the normal receiver/sender
+payout split; `SenderRefundedAfterExpiry` means the sender spent the full funding
+minus mint fees via the refund branch and no receiver payout exists. Both are
+successful administrative terminal outcomes. `UnknownSpent` retains a recoverable
+journal because close versus refund remains unresolved; retry recovery later.
+`--json` exposes `outcome` and `details`. Batch close reports `resolved`, `unresolved`,
+and `failures` separately. Terminal refunds are excluded from autosweep and drain.
+Close journal v2 rejects incompatible journals without deleting wallet data.
+
+Wallet databases explicitly verify SQLite `synchronous=EXTRA` on each writable
+connection. Back up all client and relay wallet databases using SQLite's backup
+API or consistent SQLite snapshots, not raw copies of live `.db` files (committed
+data may still be in WAL files). This is not atomic across separate databases and
+depends on the filesystem and hardware honoring sync requests. Read-only wallet
+inspection does not change database settings.
+
+New channel funding requires an active keyset with no final expiry, or with final
+expiry more than 48 hours away: the normal 24-hour channel lifetime plus a 24-hour
+recovery window. Close, drain, and refund output selection requires active,
+unexpired keys and refreshes the mint cache when none are usable. This does not
+extend a mint's expiry or guarantee recovery if the wallet stays offline past it.
+
 Implemented today:
 - `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, keeps a shared in-memory cache of configured mint keysets, and persists relay-side Spilman channel state in SQLite
 - `monad-client`: provides reusable route selection, the session payment driver, a SQLite-backed channel wallet, a loose-proof wallet, and multi-hop connection setup
@@ -116,7 +138,21 @@ monad-relay wallet --config monad.yaml --relay relay-a drain --mint-url https://
 monad-relay wallet --config monad.yaml --relay relay-a recover-drain --drain-id <drain-id>
 ```
 
+`recover-drain` resumes prepared, submitted, or locally finalizing attempts.
+It verifies exact restored outputs and permits bounded immutable replay only
+after checked all-input Unspent evidence. Invalid or ambiguous evidence retains
+reservations. Finalizing/completed recovery is offline; terminal proofs stay in
+the relay DB and cannot be replaced by conflicting completion. Incompatible old
+nonempty drain journals are rejected, never migrated or deleted. See
+[WALLET.md](WALLET.md#relay-drain-recovery) for the recovery policy.
+
 Add `--json` to any wallet command for machine-readable output.
+
+Repeating `wallet close --channel-id <id>` resumes the exact persisted close.
+Verified local finalization works with the mint offline. Ambiguous or invalid
+evidence leaves the channel Closing; it never releases funds or reports a
+zero-value success. Legacy Closing records without exact journals are rejected,
+not migrated or deleted. See [relay close recovery](WALLET.md#relay-close-recovery).
 
 One runtime process exclusively owns `relay_wallet.db_path`. It holds exclusive
 maintenance access while opening/migrating the database, registering identities,

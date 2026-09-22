@@ -8,20 +8,37 @@ opens their persisted databases. The parent holds no wallet handles across those
 transitions. The mint remains alive; mint durability and machine power loss are
 not covered.
 
-`make test-funds-crashes` additionally builds the client with the explicit
+`make test-funds-crashes` additionally builds client and relay with the explicit
 `funds-lifecycle-test` feature. Both it and `make stress-funds-lifecycle` build
 their CLIs in `target/funds-lifecycle/debug` and pass those absolute binary paths
 to the harness. Normal `target/debug` and `target/release` binaries are untouched;
 no normal-binary rebuild is required afterward. The baseline target continues to
 use normal builds. The test harness is also built in the isolated target directory,
-without the feature, since Cargo may rebuild the relay binary for integration tests.
-**Never use the isolated instrumented client binary
+with the relay feature, since Cargo may rebuild the relay binary for integration tests.
+**Never use the isolated instrumented binaries
 for real funds.** Normal builds contain neither the IPC hooks
 nor the lifetime environment override. The test build uses bounded loopback IPC:
 the child reports only a fixed durable-boundary name and blocks awaiting an
 acknowledgement. The parent kills and reaps it before allowing any continuation.
 Local finalization recovery runs with all mint HTTP requests rejected and asserts
 that no request was even attempted, twice, in separate CLI processes.
+
+Receiver close covers acknowledged SIGKILL at prepared, submitting, initial
+rejection, successor persistence, finalizing, and completed boundaries. HTTP
+gates cover accepted-response loss, output key rotation after preparation, and
+successor accepted-response loss followed by another rotation. Each resumes in a
+fresh CLI against the retained mint and same DB, with no parent wallet handle.
+Finalizing and completed cases assert zero attempted HTTP. The same strict purse
+oracle covers the later sender recovery and receiver drain. These cases exposed
+and now cover preservation of the signed nominal split across fee rotation and
+sender discovery under historical non-funding output keys.
+
+Receiver drain covers the same six durable boundaries, prepared-only recovery,
+HTTP request/response gates, and changed-output-keyset successor response loss.
+Finalizing and completed drain recovery is repeated in fresh offline CLIs and
+asserts zero attempted HTTP; terminal proofs remain solely in the relay DB.
+The close/refund race matrix also kills the winning close with its accepted
+response withheld while the sender attempts recovery.
 
 Opening boundaries cover durable finalizing, upstream saved, change imported,
 and metadata saved. Refund boundaries cover durable finalizing, loose-proof
@@ -83,11 +100,29 @@ warning; never upload it. Console events contain only operation names and totals
 - [x] Opening rotation and rotation before preparation.
 - [x] Controlled close/refund winners and concurrent mint-execution races.
 - [x] Seeded bounded-purse stress and safe capacity/fee stop guard.
+- [x] Receiver close local journal boundary SIGKILL and offline finalization.
+- [x] Receiver close rejection/successor persistence and rotated response loss.
+- [x] Receiver drain journal SIGKILL, preparation recovery and offline completion.
+- [x] Receiver drain rejection/successor persistence and rotated response loss.
 
 ## Validation
 
-Recorded snapshot from commit `fb488bd` (2026-09-21), which added these results;
-these totals are historical, not a claim of validation at the current revision.
+Full relay-recovery stack validation:
+
+- Default and isolated all-feature `cargo test`: 556 passed each, no failures.
+- Strict all-target/all-features Clippy and formatting checks pass.
+- `make test-funds-crashes`: ten process tests passed, including six close and
+  six drain persistence boundaries, historical-key rotation/response loss,
+  offline finalization and close/refund races with a lost winning close response.
+- Expanded-schedule seeds 1, 2 and 3: 12 cycles each, all passed.
+- Expanded-schedule seed 20260921, 256-cycle limit: stopped at the capacity/fee
+  margin after 157 cycles in 568.95s, with 448 unique successful input sets.
+  Final custody was 1946 client sats + 13417 receiver sats + 1021 actual fee sats
+  = the original 16384 sats. No replenishment or relaxed oracle.
+
+The baseline and stress results below were recorded at commit `fb488bd`
+(2026-09-21). They predate this extension and are not a claim of validation at
+the current revision:
 
 - Full default `cargo test` and `cargo test --all-features`: each 547 passed,
   no failures (opt-in process/stress tests run separately).
@@ -103,7 +138,27 @@ these totals are historical, not a claim of validation at the current revision.
 
 The process tests use SQLite process-death durability, not physical power-loss
 durability. They do not cover an actual mint restart, external stale-input token
-export, every byte-level persistence interruption, or relay drain/close local
-finalization crash boundaries. Those are not implied by the boundary matrix.
+export or every byte-level persistence interruption. Those are not implied by
+the boundary matrix. The extended seeded schedule includes relay close/drain
+boundary crashes and successor response loss; old seed totals are historical.
 
 Stale export to an external wallet is explicitly out of scope.
+
+## Persistent Mint Restart
+
+`process_persistent_mint_restart_after_close_commit` is included in
+`make test-funds-crashes`. Unlike the retained in-memory mint used by the other
+scenarios, it launches an actual child process with a file-backed CDK mint and
+signatory database, fixed test keys, and unchanged fee/configuration on restart.
+The parent is only a forwarding HTTP gate and ledger, not a mint or response cache.
+After receiving the complete successful close response from the child, it withholds
+that response, kills/reaps the relay close process and mint process, and restarts
+the mint on the same port and database. A fresh relay restores the journaled close
+without resubmission; sender recovery and receiver drain follow. All final proof
+DLEQs, NUT-07 custody states, accepted-output restores, and exact fixed-purse
+conservation are checked against the restarted mint over HTTP.
+
+The bootstrap proof file has mode 0600 in the fixture's private temporary directory.
+Persistent-mint artifacts are removed on success and failure; child processes are
+killed and reaped before cleanup. The ordinary scenarios retain their existing
+failure-artifact behavior. No normal binary gains a persistent-test-mint mode.

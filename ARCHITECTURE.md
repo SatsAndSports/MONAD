@@ -2,6 +2,61 @@
 
 ## Overview
 
+### Terminal Refunds
+
+The focused persistent-mint crash test gates a completed HTTP close response
+before killing an actual file-backed CDK mint child. Restart reuses the same
+mint/signatory database and deterministic test keys; restoration and conservation
+are checked through HTTP, with no parent in-memory mint or response cache.
+
+`SenderRefundedAfterExpiry` is an upstream persistent channel state, distinct from
+normal `Closed` with no fabricated payout. The relay close journal v2 saves the
+full mint NUT-07 evidence in the same transaction as the terminal state before
+returning it. Every saved close attempt is restored before input-state checks and
+again after spent evidence, so an actual verified close payout takes precedence.
+Under the honest-mint, complete-witness assumption, exact all-spent funding-Y
+coverage and exactly one well-formed signature on the original first input attest
+the refund branch only after validating our generated 2-distinct-x-only-key close,
+1-key SIG_ALL refund conditions. This is mint attestation, not independent
+verification of the unavailable full spending request. Two signatures can be a
+refund plus an unrelated signature and remain ambiguous. `UnknownSpent` retains
+the journal and permits later invocations with bounded per-call replay, never a
+lifetime abandonment. Pending, partial, malformed, and network evidence cannot
+install a terminal state. Terminal reopen validates saved evidence locally and
+does no mint I/O. No payments, links, autosweep candidates, or drain payouts are
+available for terminal refunds; sender proof restoration remains independent.
+
+### Wallet Durability
+
+Every writable file-backed wallet connection, including short-lived relay
+metadata/drain connections and the client loose-proof, metadata, refund, and
+upstream channel stores, applies and verifies SQLite `synchronous=EXTRA` before
+writes. The shared upstream helper retains durable journal modes and rejects
+OFF/MEMORY modes. EXTRA includes FULL's WAL commit sync and also syncs the
+directory after rollback-journal deletion. In-memory tests and read-only
+inspection are separate paths. This policy does not change transaction scope:
+cross-database recovery still requires the durable journals and idempotent import.
+Process-kill tests cannot establish power-loss safety on hardware that lies about
+sync completion. Backups require consistent SQLite snapshots of every wallet DB,
+not copies that omit live WAL state.
+
+Output selection treats activity and final expiry independently. A keyset is
+expired when `now > final_expiry`, matching the pinned CDK; absent expiry is
+unlimited and zero is expired at current wall time. New MONAD funding additionally
+requires final expiry strictly beyond the normal 24-hour lifetime plus a named
+24-hour recovery window. Close/drain/refund outputs have no relay advertisement
+or negotiated-format filter; funding keeps those policy filters. Cache warmup
+tests usable output selection, not merely same-unit metadata presence. Historical
+keys remain available for exact restore and sender denomination discovery, and
+offline finalization never rejects already-verified proofs using current time.
+Expiry errors (`12003`) do not authorize changed immutable requests. CDK may hide
+expired signatures in restore, so an empty restore is not proof of nonexecution.
+
+After close funding is observed non-unspent, the final exact restore pass checks
+every saved close attempt, including a rejected predecessor. A verified payout
+wins over conflicting-keyset responses from another saved attempt. Malformed or
+unavailable evidence remains unresolved and never becomes a zero-value close.
+
 MONAD is a multi-hop TCP tunneling system with three main layers:
 
 ```text
@@ -833,6 +888,32 @@ The relay binary now also exposes wallet-admin commands over that same durable
 state (`monad-relay wallet ...`) so operators can list identities, inspect
 stored channels, close a channel by `channel_id`, drain closed-channel receiver
 proofs, and recover submitted drain attempts using metadata stored in SQLite.
+
+Drain restore completion preserves NUT-09 output identities and uses the shared
+exact restore/signature validators with persisted output secrets and historical
+keys. Invalid or empty restore results preserve the submitted reservation.
+Terminal drain proof storage uses an atomic conditional update: repeated identical
+completion is idempotent, conflicting proof payloads fail, and late failure cannot
+release a completed drain's channels. These guards are not full-operation
+singleflight or an immutable execution-history journal on their own. The drain
+orchestrator now supplies both: a versioned identity/input/fee-bound journal is
+inserted atomically with channel reservations. Every request and submission count
+is retained; a single typed initial 4xx/12002 may authorize a retained-predecessor
+successor. Exact restore and all-input Unspent checks gate bounded replay.
+Verified Finalizing payloads permit offline completion, with terminal custody
+remaining in the relay DB. Matching exclusive maintenance authority and journal
+CAS protect the full operation, not just completion.
+
+Receiver close uses a separate versioned exact-request journal. Storage freezes
+the accepted payment with Closing and the journal atomically, rejecting later
+payments. The request is authenticated against persisted funding/payment/receiver;
+each submission first records uncertainty. Recovery verifies exact historical
+restores and all input states before bounded replay. One initial typed 4xx/12002
+may authorize a retained-predecessor output-keyset successor, never an ambiguous
+replay rejection. Verified finalizing data precedes the atomic Closed/payout
+commit, allowing offline completion. Expiry does not invalidate the receiver's
+signed spending branch. Wallet ownership is retained by derived payment handles,
+with per-channel close singleflight plus durable journal CAS.
 
 #### 6. Session Teardown on Control Detach
 

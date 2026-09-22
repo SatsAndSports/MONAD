@@ -51,6 +51,24 @@ impl fmt::Debug for ChannelStore {
 }
 
 impl ChannelStore {
+    pub(crate) fn storage(&self) -> &dyn SpilmanStorage {
+        self.storage.as_ref()
+    }
+
+    pub(crate) fn journal_binding(&self) -> Result<String, String> {
+        let path = match self.metadata.as_ref() {
+            Some(metadata) => {
+                monad_common::wallet_lock::normalize_path(std::path::Path::new(&metadata.db_path))
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            None => return Err("close requires a wallet-owned channel store".to_string()),
+        };
+        serde_json::to_string(&(path, &self.relay_name, &self.receiver_pubkey_hex))
+            .map_err(|_| "serialize close journal binding".to_string())
+    }
+
     pub(crate) fn new(storage: Arc<dyn SpilmanStorage>) -> Self {
         Self {
             storage,
