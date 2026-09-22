@@ -45,14 +45,33 @@ not copies that omit live WAL state.
 Output selection treats activity and final expiry independently. A keyset is
 expired when `now > final_expiry`, matching the pinned CDK; absent expiry is
 unlimited and zero is expired at current wall time. New MONAD funding additionally
-requires final expiry strictly beyond the normal 24-hour lifetime plus a named
-24-hour recovery window. Close/drain/refund outputs have no relay advertisement
+requires `K >= C + W`, where `K` is the funding keyset's final expiry, `C` is the
+chosen immutable channel expiry, and `W` is the larger of the client's configured
+recovery window and the relay's advertised requirement. Both default to 24 hours.
+Absent `K` is allowed; explicit zero is rejected even when `W` is zero. Finite
+expiry checks use checked arithmetic and reject overflow; equality passes.
+Selection and safe changed-keyset successors use the same actual channel expiry,
+not a reconstructed wall-clock lifetime.
+
+Each wire `KeysetAdvertisement` includes `funding_keyset_recovery_window_secs`.
+The relay applies its configured window to both new links and stored relinks
+before channel persistence or ownership changes. Stored parameters and keyset
+metadata, not caller replacements, govern relinks. This is admission policy,
+not a new ongoing payment cutoff or a grandfathering rule. Discovery preserves
+`final_expiry` through upstream HTTP metadata, bridge JSON, shared caches, and
+SQLite persistence. V1 expiry metadata is not ID-bound; positive V2 expiry is
+part of the keyset ID commitment (absent and zero share a hash representation
+but have different admission semantics). Neither format is excluded.
+
+Close/drain/refund outputs have no funding recovery-window, relay advertisement
 or negotiated-format filter; funding keeps those policy filters. Cache warmup
 tests usable output selection, not merely same-unit metadata presence. Historical
 keys remain available for exact restore and sender denomination discovery, and
 offline finalization never rejects already-verified proofs using current time.
 Expiry errors (`12003`) do not authorize changed immutable requests. CDK may hide
 expired signatures in restore, so an empty restore is not proof of nonexecution.
+No keyset-expiry-driven proactive swaps or workers are introduced; the existing
+channel-expiry auto-close worker is unchanged. Warnings and UI are separate work.
 
 After close funding is observed non-unspent, the final exact restore pass checks
 every saved close attempt, including a rejected predecessor. A verified payout

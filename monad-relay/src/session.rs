@@ -318,6 +318,9 @@ impl SessionState {
                     })
                     .collect();
                 advertisements.push(KeysetAdvertisement {
+                    funding_keyset_recovery_window_secs: self
+                        .payments
+                        .funding_keyset_recovery_window_secs(),
                     mint_url: mint_url.clone(),
                     unit: unit.clone(),
                     keyset_ids,

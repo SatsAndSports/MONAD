@@ -97,6 +97,7 @@ mod tests {
         RelaySnapshot {
             receiver_pubkey: "receiver".to_string(),
             advertisements: vec![KeysetAdvertisement {
+                funding_keyset_recovery_window_secs: 86_400,
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
                 keyset_ids: vec!["0000000000000001".to_string()],
@@ -252,6 +253,7 @@ mod tests {
             "channel".to_string(),
             "0000000000000002".to_string(),
             crate::wallet::RelayPaymentOffer {
+                funding_keyset_recovery_window_secs: 86_400,
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "https://mint".to_string(),
                 unit: "sat".to_string(),
@@ -838,6 +840,7 @@ mod tests {
         let mut state = DriverState {
             intended_channel_id: Some("exhausted".to_string()),
             intended_offer: Some(crate::wallet::RelayPaymentOffer {
+                funding_keyset_recovery_window_secs: 86_400,
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
@@ -849,6 +852,7 @@ mod tests {
             relay_snapshot: Some(RelaySnapshot {
                 receiver_pubkey: "receiver".to_string(),
                 advertisements: vec![KeysetAdvertisement {
+                    funding_keyset_recovery_window_secs: 86_400,
                     mint_url: "https://mint".to_string(),
                     unit: "msat".to_string(),
                     keyset_ids: vec!["keyset-a".to_string()],

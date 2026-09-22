@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayPaymentOffer {
+    pub funding_keyset_recovery_window_secs: u64,
     pub receiver_pubkey: String,
     pub mint_url: String,
     pub unit: String,
@@ -29,6 +30,7 @@ impl RelayPaymentOffer {
     ) -> Self {
         Self {
             receiver_pubkey,
+            funding_keyset_recovery_window_secs: advertisement.funding_keyset_recovery_window_secs,
             mint_url: advertisement.mint_url.clone(),
             unit: advertisement.unit.clone(),
             preferred_keyset_ids: advertisement.keyset_ids.clone(),
@@ -828,6 +830,7 @@ mod tests {
 
     fn offer(unit: &str) -> RelayPaymentOffer {
         RelayPaymentOffer {
+            funding_keyset_recovery_window_secs: 86_400,
             receiver_pubkey: "receiver".to_string(),
             mint_url: "https://mint".to_string(),
             unit: unit.to_string(),

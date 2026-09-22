@@ -42,6 +42,10 @@ impl CloseOutcome {
 }
 
 pub trait RelayPayments: Send + Sync + 'static {
+    fn funding_keyset_recovery_window_secs(&self) -> u64 {
+        monad_common::keyset_expiry::DEFAULT_RECOVERY_WINDOW_SECS
+    }
+
     fn link_channel(
         &self,
         negotiated_versions: &BTreeSet<String>,
@@ -246,6 +250,7 @@ struct MonadHost {
 
 #[derive(Debug)]
 pub struct SpilmanRelayPayments {
+    funding_keyset_recovery_window_secs: u64,
     bridge: SpilmanBridge<MonadHost, PaymentContext>,
     store: ChannelStore,
     mint_cache: SharedSpilmanMintCache,
@@ -261,6 +266,8 @@ impl SpilmanRelayPayments {
         channel_policy: RelayChannelPolicyConfig,
         store: ChannelStore,
     ) -> Self {
+        let funding_keyset_recovery_window_secs =
+            channel_policy.funding_keyset_recovery_window_secs;
         let host = MonadHost {
             receiver_secret: receiver_secret.clone(),
             mint_cache: mint_cache.clone(),
@@ -270,6 +277,7 @@ impl SpilmanRelayPayments {
         };
         Self {
             bridge: SpilmanBridge::new(host),
+            funding_keyset_recovery_window_secs,
             store,
             mint_cache,
             trusted_mint_units,
@@ -567,6 +575,10 @@ impl SpilmanRelayPayments {
 }
 
 impl RelayPayments for SpilmanRelayPayments {
+    fn funding_keyset_recovery_window_secs(&self) -> u64 {
+        self.funding_keyset_recovery_window_secs
+    }
+
     fn link_channel(
         &self,
         negotiated_versions: &BTreeSet<String>,
@@ -605,7 +617,28 @@ impl RelayPayments for SpilmanRelayPayments {
             return Err(LinkError::KeysetVersionNotNegotiated);
         }
 
-        let capacity_raw = if stored.is_some() {
+        // Stored channel parameters and funding metadata are authoritative on
+        // relink. Admission must fail before persistence or ownership changes.
+        let check_funding_expiry = |info_json: &str| {
+            let info = cdk_spilman::parse_keyset_info_from_json(info_json)
+                .map_err(|e| LinkError::InvalidChannel(format!("invalid funding keyset: {e}")))?;
+            let expiry = params["expiry_timestamp"]
+                .as_u64()
+                .ok_or_else(|| LinkError::InvalidChannel("missing expiry_timestamp".to_string()))?;
+            if !monad_common::keyset_expiry::funding_keyset_covers_channel(
+                info.final_expiry,
+                expiry,
+                self.funding_keyset_recovery_window_secs,
+            ) {
+                return Err(LinkError::InvalidChannel(
+                    "funding keyset expires before channel recovery window ends".to_string(),
+                ));
+            }
+            Ok(())
+        };
+
+        let capacity_raw = if let Some(channel) = &stored {
+            check_funding_expiry(&channel.funding.keyset_info_json)?;
             // Relink validates the zero-balance registration signature without
             // mutating the relay-authoritative latest accepted balance.
             self.bridge
@@ -648,6 +681,9 @@ impl RelayPayments for SpilmanRelayPayments {
                         map_link_bridge_error(error)
                     })?;
             let capacity = validated.capacity;
+            // Check the exact metadata validated by the bridge, not a separate
+            // cache snapshot that could race a concurrent mint refresh.
+            check_funding_expiry(&validated.funding.keyset_info_json)?;
             self.bridge.record_validated_new_channel(&validated);
             capacity
         };

@@ -614,6 +614,7 @@ mod tests {
 
     fn advertisement(mint_url: &str) -> KeysetAdvertisement {
         KeysetAdvertisement {
+            funding_keyset_recovery_window_secs: 86_400,
             mint_url: mint_url.to_string(),
             unit: "sat".to_string(),
             keyset_ids: Vec::new(),

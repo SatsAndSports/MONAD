@@ -320,6 +320,7 @@ pub async fn discover_spilman_mint_cache_with_storage(
                         &keyset.unit,
                         &keyset.keys,
                         keyset.input_fee_ppk,
+                        keyset.final_expiry,
                     ),
                 },
             );

@@ -20,6 +20,7 @@ pub type MintUnitKeysets = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 /// format; the relay validates and refreshes its cache when that channel links.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeysetAdvertisement {
+    pub funding_keyset_recovery_window_secs: u64,
     pub mint_url: String,
     pub unit: String,
     pub keyset_ids: Vec<String>,

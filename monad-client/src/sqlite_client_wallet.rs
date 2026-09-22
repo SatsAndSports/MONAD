@@ -41,7 +41,8 @@ type ClientBridge =
     SpilmanClientBridge<ConfigurableClientHost<SqliteClientStorage>, ReqwestClientNetworking>;
 
 const CHANNEL_EXPIRY_SECONDS: u64 = 24 * 3600;
-const FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS: u64 = 24 * 3600;
+const FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS: u64 =
+    monad_common::keyset_expiry::DEFAULT_RECOVERY_WINDOW_SECS;
 
 #[cfg(feature = "funds-lifecycle-test")]
 mod lifecycle_test {
@@ -381,6 +382,7 @@ const CREATE_CHANNEL_RECOVERIES_SQL: &str = r#"
 /// `LooseProofWallet` holds bearer proofs; this layer manages Spilman channel
 /// metadata and payment signing via `cdk-spilman`.
 pub struct SqliteClientWallet {
+    funding_keyset_recovery_window_secs: u64,
     loose_wallet: LooseProofWallet,
     bridge: Mutex<ClientBridge>,
     sender_secret: SecretKey,
@@ -713,6 +715,7 @@ impl SqliteClientWallet {
 
         Ok(Self {
             loose_wallet,
+            funding_keyset_recovery_window_secs: FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS,
             bridge: Mutex::new(bridge),
             sender_secret,
             sender_pubkey_hex,
@@ -722,6 +725,12 @@ impl SqliteClientWallet {
             #[cfg(test)]
             fail_next_recovered_proof_import: AtomicBool::new(false),
         })
+    }
+
+    /// Configure the admission window for newly funded channels.
+    pub fn with_funding_keyset_recovery_window(mut self, seconds: u64) -> Self {
+        self.funding_keyset_recovery_window_secs = seconds;
+        self
     }
 
     /// Access the underlying loose-proof wallet.
@@ -1081,7 +1090,8 @@ impl SqliteClientWallet {
         // stale before swap submission, the retry helper centralizes the safe
         // mint-rejection policy: refresh keysets, reselect, skip retry if refresh
         // still selects the same id, otherwise reprepare and submit once.
-        let output_keyset = self.select_output_keyset_refreshing_client_first(offer)?;
+        let output_keyset =
+            self.select_output_keyset_refreshing_client_first(offer, expiry_timestamp)?;
         let attempt = self.prepare_target_capacity_attempt(
             offer,
             target_capacity_raw,
@@ -3015,15 +3025,16 @@ impl SqliteClientWallet {
                         .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
                     return Err(refresh_error);
                 }
-                let output_keyset = match self.select_output_keyset_from_cache(offer) {
-                    Ok(output_keyset) => output_keyset,
-                    Err(select_error) => {
-                        let _ = self
-                            .loose_wallet
-                            .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
-                        return Err(select_error);
-                    }
-                };
+                let output_keyset =
+                    match self.select_output_keyset_from_cache(offer, attempt.expiry_timestamp) {
+                        Ok(output_keyset) => output_keyset,
+                        Err(select_error) => {
+                            let _ = self
+                                .loose_wallet
+                                .cancel_rejected_opening_attempt(&attempt.prepared.channel_id);
+                            return Err(select_error);
+                        }
+                    };
                 let OutputKeysetSelection::Selected(output_keyset) = output_keyset else {
                     self.loose_wallet
                         .cancel_rejected_opening_attempt(&attempt.prepared.channel_id)
@@ -3227,8 +3238,9 @@ impl SqliteClientWallet {
     fn select_output_keyset_refreshing_client_first(
         &self,
         offer: &RelayPaymentOffer,
+        expiry_timestamp: u64,
     ) -> Result<SelectedOutputKeyset, WalletError> {
-        match self.select_output_keyset_from_cache(offer)? {
+        match self.select_output_keyset_from_cache(offer, expiry_timestamp)? {
             OutputKeysetSelection::Selected(output_keyset)
                 if offer.preferred_keyset_ids.is_empty()
                     || offer
@@ -3246,7 +3258,7 @@ impl SqliteClientWallet {
         }
 
         self.refresh_client_keysets(offer)?;
-        match self.select_output_keyset_from_cache(offer)? {
+        match self.select_output_keyset_from_cache(offer, expiry_timestamp)? {
             OutputKeysetSelection::Selected(output_keyset) => Ok(output_keyset),
             OutputKeysetSelection::NoCompatibleActiveKeyset => {
                 Err(WalletError::NoCompatibleActiveKeyset {
@@ -3260,12 +3272,18 @@ impl SqliteClientWallet {
     fn select_output_keyset_from_cache(
         &self,
         offer: &RelayPaymentOffer,
+        expiry_timestamp: u64,
     ) -> Result<OutputKeysetSelection<SelectedOutputKeyset>, WalletError> {
         let bridge = self
             .bridge
             .lock()
             .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
-        let output_keyset_id = match active_output_keyset_id_from_cache(&bridge, offer)? {
+        let output_keyset_id = match active_output_keyset_id_from_cache(
+            &bridge,
+            offer,
+            expiry_timestamp,
+            self.funding_keyset_recovery_window_secs,
+        )? {
             OutputKeysetSelection::Selected(output_keyset_id) => output_keyset_id,
             OutputKeysetSelection::NoCompatibleActiveKeyset => {
                 return Ok(OutputKeysetSelection::NoCompatibleActiveKeyset);
@@ -3571,7 +3589,7 @@ impl MonadWallet for SqliteClientWallet {
             }
         })?;
         let output_keyset = self
-            .select_output_keyset_refreshing_client_first(offer)
+            .select_output_keyset_refreshing_client_first(offer, expiry_timestamp)
             .map_err(|error| WalletError::ProvisioningOfferUnavailable {
                 mint_url: offer.mint_url.clone(),
                 unit: offer.unit.clone(),
@@ -4073,17 +4091,15 @@ fn loose_proof_error(error: LooseProofWalletError) -> WalletError {
 fn active_output_keyset_id_from_cache<H, N>(
     bridge: &SpilmanClientBridge<H, N>,
     offer: &RelayPaymentOffer,
+    expiry_timestamp: u64,
+    recovery_window_secs: u64,
 ) -> Result<OutputKeysetSelection<String>, WalletError>
 where
     H: SpilmanClientHost,
     N: SpilmanClientNetworking,
 {
     let unit = parse_currency_unit(&offer.unit)?;
-    // Leave one normal channel lifetime for post-expiry recovery. This only
-    // selects new funding keys; historical restore never applies wall-clock expiry.
-    let funding_valid_until = SqliteClientWallet::now_seconds()?
-        .checked_add(CHANNEL_EXPIRY_SECONDS + FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS)
-        .ok_or_else(|| WalletError::Backend("funding keyset expiry overflow".to_string()))?;
+    let recovery_window_secs = recovery_window_secs.max(offer.funding_keyset_recovery_window_secs);
     let active_ids = bridge.cached_active_keyset_ids(&offer.mint_url, &unit);
     let mut compatible_ids = active_ids
         .into_iter()
@@ -4094,8 +4110,11 @@ where
                 .ok()
                 .and_then(|json| parse_keyset_info_from_json(&json).ok())
                 .is_some_and(|info| {
-                    info.final_expiry
-                        .is_none_or(|expiry| expiry > funding_valid_until)
+                    monad_common::keyset_expiry::funding_keyset_covers_channel(
+                        info.final_expiry,
+                        expiry_timestamp,
+                        recovery_window_secs,
+                    )
                 })
         })
         .collect::<Vec<_>>();
@@ -5673,6 +5692,7 @@ mod tests {
 
     fn offer(mint_url: &str, receiver_pubkey: &str, keyset_id: &str) -> RelayPaymentOffer {
         RelayPaymentOffer {
+            funding_keyset_recovery_window_secs: 86_400,
             receiver_pubkey: receiver_pubkey.to_string(),
             mint_url: mint_url.to_string(),
             unit: "sat".to_string(),
@@ -8522,6 +8542,7 @@ mod tests {
             expiry_timestamp: 123_456,
         };
         let offer = RelayPaymentOffer {
+            funding_keyset_recovery_window_secs: 86_400,
             receiver_pubkey: "receiver".to_string(),
             mint_url: prepared.mint_url.clone(),
             unit: "sat".to_string(),
@@ -9584,7 +9605,10 @@ mod tests {
                     ))
                     .unwrap();
                 let output_keyset = wallet
-                    .select_output_keyset_refreshing_client_first(&offer)
+                    .select_output_keyset_refreshing_client_first(
+                        &offer,
+                        SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+                    )
                     .unwrap();
                 let attempt = wallet
                     .prepare_target_capacity_attempt(
@@ -9803,7 +9827,10 @@ mod tests {
         );
         wallet.ensure_offer_keysets_cached(&offer).unwrap();
         let output_keyset = wallet
-            .select_output_keyset_refreshing_client_first(&offer)
+            .select_output_keyset_refreshing_client_first(
+                &offer,
+                SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+            )
             .unwrap();
         let attempt = wallet
             .prepare_target_capacity_attempt(
@@ -10176,7 +10203,10 @@ mod tests {
 
         wallet.ensure_offer_keysets_cached(&offer).unwrap();
         let output_keyset = wallet
-            .select_output_keyset_refreshing_client_first(&offer)
+            .select_output_keyset_refreshing_client_first(
+                &offer,
+                SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+            )
             .unwrap();
         let attempt = wallet
             .prepare_target_capacity_attempt(
@@ -10331,7 +10361,10 @@ mod tests {
 
         let first_offer = offer(&mint_url, receiver_pubkey, &first_keyset_id);
         let selected = wallet
-            .select_output_keyset_refreshing_client_first(&first_offer)
+            .select_output_keyset_refreshing_client_first(
+                &first_offer,
+                SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+            )
             .unwrap();
         assert_eq!(selected.id, first_keyset_id);
 
@@ -10340,12 +10373,104 @@ mod tests {
         // cached active keyset. The refresh reveals the preferred active ID.
         let second_offer = offer(&mint_url, receiver_pubkey, &second_keyset_id);
         let selected = wallet
-            .select_output_keyset_refreshing_client_first(&second_offer)
+            .select_output_keyset_refreshing_client_first(
+                &second_offer,
+                SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+            )
             .unwrap();
         assert_eq!(selected.id, second_keyset_id);
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expiring_v2_funding_selection_uses_immutable_expiry_and_both_windows() {
+        let helper = TestMintHelper::new().await.unwrap();
+        let mint = helper.mint();
+        // Deliberately not now + the default lifetime: selection must use this
+        // immutable expiry even if discovery or a retry takes time.
+        let expiry = SqliteClientWallet::now_seconds().unwrap() + 7_200;
+        let final_expiry = expiry + 86_400;
+        let id = mint
+            .rotate_keyset(
+                CurrencyUnit::Sat,
+                (0..32).map(|i| 1u64 << i).collect(),
+                0,
+                true,
+                Some(final_expiry),
+            )
+            .await
+            .unwrap()
+            .id;
+        let port = free_loopback_port();
+        let url = format!("http://127.0.0.1:{port}");
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            serve_existing_mint_with_shutdown(mint, TestMintConfig::for_port(port), async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        wait_for_mint(&reqwest::Client::new(), &url).await;
+        let temp = tempfile::tempdir().unwrap();
+        let open = || {
+            SqliteClientWallet::open(
+                LooseProofWallet::open(temp.path().join("loose.sqlite"), "alice").unwrap(),
+                temp.path().join("channels.sqlite"),
+                &sender_secret_hex(),
+            )
+            .unwrap()
+        };
+        let wallet = open();
+        let mut offer = offer(
+            &url,
+            &SecretKey::generate().public_key().to_hex(),
+            &id.to_string(),
+        );
+        let selected = wallet
+            .select_output_keyset_refreshing_client_first(&offer, expiry)
+            .unwrap();
+        assert_eq!(selected.id, id.to_string());
+        assert_eq!(
+            parse_keyset_info_from_json(&selected.info_json)
+                .unwrap()
+                .final_expiry,
+            Some(final_expiry)
+        );
+        drop(wallet);
+        // Reopen and select offline from persisted client metadata.
+        let wallet = open();
+        assert!(matches!(
+            wallet
+                .select_output_keyset_from_cache(&offer, expiry)
+                .unwrap(),
+            OutputKeysetSelection::Selected(_)
+        ));
+        assert!(matches!(
+            wallet
+                .select_output_keyset_from_cache(&offer, expiry + 1)
+                .unwrap(),
+            OutputKeysetSelection::NoCompatibleActiveKeyset
+        ));
+        offer.funding_keyset_recovery_window_secs = 86_401;
+        assert!(matches!(
+            wallet
+                .select_output_keyset_from_cache(&offer, expiry)
+                .unwrap(),
+            OutputKeysetSelection::NoCompatibleActiveKeyset
+        ));
+        offer.funding_keyset_recovery_window_secs = 0;
+        let wallet = wallet.with_funding_keyset_recovery_window(86_401);
+        assert!(matches!(
+            wallet
+                .select_output_keyset_from_cache(&offer, expiry)
+                .unwrap(),
+            OutputKeysetSelection::NoCompatibleActiveKeyset
+        ));
+        stop.send(()).unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10384,7 +10509,10 @@ mod tests {
 
         let first_offer = offer(&mint_url, receiver_pubkey, &unknown_keyset_id);
         let selected = wallet
-            .select_output_keyset_refreshing_client_first(&first_offer)
+            .select_output_keyset_refreshing_client_first(
+                &first_offer,
+                SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+            )
             .unwrap();
         let cached_keysets = wallet
             .bridge
@@ -10407,6 +10535,7 @@ mod tests {
         let new =
             test_keyset_id("0202020202020202020202020202020202020202020202020202020202020202");
         let offer = RelayPaymentOffer {
+            funding_keyset_recovery_window_secs: 86_400,
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),
@@ -10420,7 +10549,7 @@ mod tests {
             (new, CurrencyUnit::Sat, true),
         ]);
 
-        let selected = active_output_keyset_id_from_cache(&bridge, &offer).unwrap();
+        let selected = active_output_keyset_id_from_cache(&bridge, &offer, 100, 86_400).unwrap();
         assert_eq!(selected, OutputKeysetSelection::Selected(new.to_string()));
     }
 
@@ -10435,7 +10564,7 @@ mod tests {
             (Some(now + CHANNEL_EXPIRY_SECONDS), false),
             (
                 Some(now + CHANNEL_EXPIRY_SECONDS + FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS),
-                false,
+                true,
             ),
             (
                 Some(now + CHANNEL_EXPIRY_SECONDS + FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS + 60),
@@ -10453,6 +10582,7 @@ mod tests {
             }).unwrap();
             let bridge = SpilmanClientBridge::new(host, NoopClientNetworking);
             let offer = RelayPaymentOffer {
+                funding_keyset_recovery_window_secs: 86_400,
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "http://mint".to_string(),
                 unit: "sat".to_string(),
@@ -10463,7 +10593,13 @@ mod tests {
             };
             assert_eq!(
                 matches!(
-                    active_output_keyset_id_from_cache(&bridge, &offer).unwrap(),
+                    active_output_keyset_id_from_cache(
+                        &bridge,
+                        &offer,
+                        now + CHANNEL_EXPIRY_SECONDS,
+                        FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS
+                    )
+                    .unwrap(),
                     OutputKeysetSelection::Selected(_)
                 ),
                 usable
@@ -10478,6 +10614,7 @@ mod tests {
         let other_unit =
             test_keyset_id("0202020202020202020202020202020202020202020202020202020202020202");
         let offer = RelayPaymentOffer {
+            funding_keyset_recovery_window_secs: 86_400,
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),
@@ -10491,7 +10628,7 @@ mod tests {
             (other_unit, CurrencyUnit::Msat, true),
         ]);
 
-        let selected = active_output_keyset_id_from_cache(&bridge, &offer).unwrap();
+        let selected = active_output_keyset_id_from_cache(&bridge, &offer, 100, 86_400).unwrap();
         assert_eq!(selected, OutputKeysetSelection::NoCompatibleActiveKeyset);
     }
 
