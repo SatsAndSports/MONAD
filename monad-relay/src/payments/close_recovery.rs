@@ -1,7 +1,7 @@
 use super::*;
 use crate::mint_recovery::RecoveryMintClient;
 use cashu::nuts::{CheckStateResponse, Proof, State, SwapRequest};
-use cdk_spilman::CompletedClose;
+use cdk_spilman::{CompletedClose, FundingSpendKind};
 use monad_common::mint_error::MintHttpRejection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -47,7 +47,7 @@ impl SpilmanRelayPayments {
     pub(crate) fn validate_close_schema(json: &str) -> Result<(), String> {
         let journal: CloseJournal = serde_json::from_str(json)
             .map_err(|_| "incompatible close journal; database retained")?;
-        if journal.version != 2 || journal.attempts.is_empty() || journal.attempts.len() > 2 {
+        if journal.version != 3 || journal.attempts.is_empty() || journal.attempts.len() > 2 {
             return Err("incompatible close journal version; database retained".to_string());
         }
         Ok(())
@@ -101,7 +101,7 @@ impl SpilmanRelayPayments {
                     &self.receiver_secret.public_key(),
                 )?;
                 let journal = CloseJournal {
-                    version: 2,
+                    version: 3,
                     binding: binding.clone(),
                     receiver: self.receiver_secret.public_key().to_hex(),
                     funding,
@@ -134,7 +134,7 @@ impl SpilmanRelayPayments {
                 journal
             }
         };
-        if journal.version != 2
+        if journal.version != 3
             || journal.binding != binding
             || journal.receiver != self.receiver_secret.public_key().to_hex()
             || journal.attempts.is_empty()
@@ -193,9 +193,13 @@ impl SpilmanRelayPayments {
             if journal.completed
                 || journal.finalizing.is_some()
                 || storage.get_state(channel_id) != ChannelState::SenderRefundedAfterExpiry
-                || !channel
-                    .sender_refund_attested(evidence)
+                || channel
+                    .classify_funding_spend_against_prepared_closes(
+                        evidence,
+                        journal.attempts.iter().map(|attempt| &attempt.prepared),
+                    )
                     .map_err(|_| error("invalid saved refund evidence"))?
+                    != FundingSpendKind::PostExpiryRefund
             {
                 return Err(error("terminal refund journal conflict"));
             }
@@ -404,8 +408,12 @@ impl SpilmanRelayPayments {
                         ));
                     }
                     if channel
-                        .sender_refund_attested(&response)
-                        .map_err(|_| error("invalid sender refund evidence; outcome unresolved"))?
+                        .classify_funding_spend_against_prepared_closes(
+                            &response,
+                            journal.attempts.iter().map(|attempt| &attempt.prepared),
+                        )
+                        .map_err(|_| error("invalid funding spend evidence; outcome unresolved"))?
+                        == FundingSpendKind::PostExpiryRefund
                     {
                         journal.refunded = Some(response);
                         let next = serde_json::to_string(&journal)
