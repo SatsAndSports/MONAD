@@ -10731,8 +10731,19 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     assert_eq!(storage.get_state(&channel_id), ChannelState::Closing);
     let saved = storage.get_close_journal(&channel_id).unwrap().unwrap();
     let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["version"], 3);
     assert_eq!(saved["attempts"][0]["submissions"], 1);
     assert_eq!(saved["payment"]["balance"], funded_balance_raw);
+    assert_eq!(
+        saved["attempts"][0]["prepared"]["sig_all_message_hash"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(saved["attempts"][0]["prepared"]["blinded_receiver_pubkey"]
+        .as_str()
+        .is_some_and(|key| !key.is_empty()));
     let late_payment = wallet
         .build_channel_payment(
             &channel_id,
@@ -11413,7 +11424,7 @@ async fn test_close_and_drain_refresh_inactive_or_missing_cached_output_metadata
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_sender_refund_terminal_and_extra_signature_remains_recoverable() {
+async fn test_sender_refund_is_terminal_with_or_without_extra_signature() {
     use monad_relay::payments::CloseOutcome;
     for extra in [false, true] {
         let ctx = DrainTestContext::with_policy(
@@ -11463,27 +11474,19 @@ async fn test_sender_refund_terminal_and_extra_signature_remains_recoverable() {
                 .close_channel(&channel_id, &net)
                 .await
                 .unwrap();
-            if extra {
-                assert!(matches!(result, CloseOutcome::UnknownSpent { .. }));
-                assert_eq!(
-                    ctx.payments.channel_state(&channel_id),
-                    Some(ChannelState::Closing)
-                );
-            } else {
-                assert!(matches!(
-                    result,
-                    CloseOutcome::SenderRefundedAfterExpiry { .. }
-                ));
-                assert_eq!(
-                    ctx.payments.channel_state(&channel_id),
-                    Some(ChannelState::SenderRefundedAfterExpiry)
-                );
-                assert!(ctx
-                    .wallet_manager
-                    .find_expiring_channels(None, cashu::util::unix_time(), 86_400)
-                    .unwrap()
-                    .is_empty());
-            }
+            assert!(matches!(
+                result,
+                CloseOutcome::SenderRefundedAfterExpiry { .. }
+            ));
+            assert_eq!(
+                ctx.payments.channel_state(&channel_id),
+                Some(ChannelState::SenderRefundedAfterExpiry)
+            );
+            assert!(ctx
+                .wallet_manager
+                .find_expiring_channels(None, cashu::util::unix_time(), 86_400)
+                .unwrap()
+                .is_empty());
             assert!(ctx.payments.closed_data(&channel_id).is_none());
         }
         assert!(ctx
