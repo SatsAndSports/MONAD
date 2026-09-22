@@ -770,8 +770,12 @@ restored completion; it directs the operator to `recover-openings`. Recovery sti
 checks exported attempts: a delayed completion wins; all exact inputs `SPENT` plus
 a final empty restore atomically marks the attempt `ExternallySpent` and its proofs
 spent.
-Incompatible nonempty opening journals are rejected and require export or reset
-before upgrading. Other swap policies are unchanged.
+Incompatible nonempty opening journals are rejected; there is no migration or
+automatic wallet reset. Preserve funded databases and recovery records. The current
+`export-stale-opening-inputs` command does not read incompatible older journals;
+any pre-upgrade export requires tooling compatible with that older schema.
+Resetting disposable, operator-owned test databases is an explicit operator
+decision. Other swap policies are unchanged.
 The live exact-replay
 allowance is independent per immutable attempt, so a keyset successor receives
 its own allowance without authorizing a second successor.
