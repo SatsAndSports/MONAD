@@ -297,6 +297,12 @@ pub struct RelayWalletConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientWalletConfig {
+    #[serde(
+        default = "default_funding_keyset_recovery_window_secs",
+        rename = "funding_keyset_recovery_window",
+        deserialize_with = "deserialize_duration_secs"
+    )]
+    pub funding_keyset_recovery_window_secs: u64,
     pub loose_db_path: String,
     pub channel_db_path: String,
     pub sender_secret_hex: String,
@@ -396,6 +402,12 @@ pub struct TrustedMintConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RelayChannelPolicyConfig {
     #[serde(
+        default = "default_funding_keyset_recovery_window_secs",
+        rename = "funding_keyset_recovery_window",
+        deserialize_with = "deserialize_duration_secs"
+    )]
+    pub funding_keyset_recovery_window_secs: u64,
+    #[serde(
         default = "default_min_channel_expiry_secs",
         rename = "min_expiry",
         deserialize_with = "deserialize_duration_secs"
@@ -420,12 +432,34 @@ pub struct RelayChannelPolicyConfig {
 impl Default for RelayChannelPolicyConfig {
     fn default() -> Self {
         Self {
+            funding_keyset_recovery_window_secs: default_funding_keyset_recovery_window_secs(),
             min_expiry_secs: default_min_channel_expiry_secs(),
             min_capacity_msats: default_min_channel_capacity_msats(),
             max_amount_per_output_msats: None,
             expiring_channels: RelayExpiringChannelsConfig::default(),
         }
     }
+}
+
+fn default_funding_keyset_recovery_window_secs() -> u64 {
+    crate::keyset_expiry::DEFAULT_RECOVERY_WINDOW_SECS
+}
+
+#[cfg(test)]
+#[test]
+fn funding_keyset_recovery_window_config() {
+    let relay: RelayChannelPolicyConfig = serde_yaml::from_str("{}").unwrap();
+    assert_eq!(relay.funding_keyset_recovery_window_secs, 86_400);
+    let relay: RelayChannelPolicyConfig =
+        serde_yaml::from_str("funding_keyset_recovery_window: 2d").unwrap();
+    assert_eq!(relay.funding_keyset_recovery_window_secs, 172_800);
+    let client: ClientWalletConfig = serde_yaml::from_str(
+        "loose_db_path: loose\nchannel_db_path: channels\nsender_secret_hex: secret",
+    )
+    .unwrap();
+    assert_eq!(client.funding_keyset_recovery_window_secs, 86_400);
+    let client: ClientWalletConfig = serde_yaml::from_str("loose_db_path: loose\nchannel_db_path: channels\nsender_secret_hex: secret\nfunding_keyset_recovery_window: 0s").unwrap();
+    assert_eq!(client.funding_keyset_recovery_window_secs, 0);
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1595,6 +1595,7 @@ pub(crate) fn merge_keysets_into_cache(
                     &keyset.unit,
                     &keyset.keys,
                     keyset.input_fee_ppk,
+                    keyset.final_expiry,
                 ),
             },
         );
@@ -1636,6 +1637,7 @@ pub(crate) fn cache_relay_keysets(
                     &keyset.unit,
                     &keyset.keys,
                     keyset.input_fee_ppk,
+                    keyset.final_expiry,
                 ),
                 active: keyset.active,
                 unit: keyset.unit.clone(),

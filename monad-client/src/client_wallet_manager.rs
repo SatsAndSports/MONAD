@@ -20,11 +20,14 @@ impl ClientWalletManager {
         )?;
         let loose_wallet =
             LooseProofWallet::open(&config.loose_db_path, CONFIGURED_CLIENT_WALLET_NAME)?;
-        let wallet = Arc::new(SqliteClientWallet::open(
-            loose_wallet,
-            &config.channel_db_path,
-            &config.sender_secret_hex,
-        )?);
+        let wallet = Arc::new(
+            SqliteClientWallet::open(
+                loose_wallet,
+                &config.channel_db_path,
+                &config.sender_secret_hex,
+            )?
+            .with_funding_keyset_recovery_window(config.funding_keyset_recovery_window_secs),
+        );
         let recovery = wallet.recover_pending_openings(&locks.exclusive_access()?)?;
         locks.enter_steady_state()?;
         Ok((
@@ -49,6 +52,7 @@ mod tests {
     async fn manager_owns_one_wallet_and_recovery_pass() {
         let dir = tempfile::tempdir().unwrap();
         let config = ClientWalletConfig {
+            funding_keyset_recovery_window_secs: 86_400,
             loose_db_path: dir.path().join("loose.db").display().to_string(),
             channel_db_path: dir.path().join("channels.db").display().to_string(),
             sender_secret_hex: hex::encode([7u8; 32]),

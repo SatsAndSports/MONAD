@@ -38,10 +38,23 @@ depends on the filesystem and hardware honoring sync requests. Read-only wallet
 inspection does not change database settings.
 
 New channel funding requires an active keyset with no final expiry, or with final
-expiry more than 48 hours away: the normal 24-hour channel lifetime plus a 24-hour
-recovery window. Close, drain, and refund output selection requires active,
+expiry at least the channel's actual expiry plus a recovery window. Both
+`client_wallet.funding_keyset_recovery_window` and each relay's
+`channel_policy.funding_keyset_recovery_window` default to `24h`; the client uses
+the larger of its own setting and the relay's advertised requirement. With the
+normal 24-hour channel lifetime, this reserves at least 48 hours from creation.
+Durations accept values such as `12h`, `2d`, or `0s` (no additional buffer).
+Equality passes; a keyset explicitly reporting expiry zero is never eligible.
+The relay enforces its window on new links and stored relinks before changing
+ownership, so increasing the setting can reject previously accepted channels.
+This does not impose a new cutoff on payments in an already-linked session.
+
+Close, drain, and refund output selection still requires active,
 unexpired keys and refreshes the mint cache when none are usable. This does not
 extend a mint's expiry or guarantee recovery if the wallet stays offline past it.
+There are no new proactive keyset swaps or background workers; existing channel
+auto-close behavior is unchanged. V1 expiry is mint-provided metadata, not bound
+to the keyset ID; positive V2 expiry is ID-bound. Both formats remain supported.
 
 Implemented today:
 - `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, keeps a shared in-memory cache of configured mint keysets, and persists relay-side Spilman channel state in SQLite
@@ -84,6 +97,7 @@ client_wallet:
   channel_funding_token_target_msats: 1000000
   target_topup_buffer_msats: 10000000
   minimum_topup_msats: 0
+  funding_keyset_recovery_window: 24h
 
 management:
   listen: 127.0.0.1:9090
@@ -101,6 +115,7 @@ relays:
       in_bytes_per_millisat: 1
       out_bytes_per_millisat: 1
     channel_policy:
+      funding_keyset_recovery_window: 24h
       min_expiry: 1h
       min_capacity: 1msat
       max_amount_per_output: null

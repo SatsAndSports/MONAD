@@ -217,6 +217,7 @@ async fn configured_runtime_excludes_opening_maintenance_during_startup_and_stea
         management: None,
         relays: vec![],
         client_wallet: Some(ClientWalletConfig {
+            funding_keyset_recovery_window_secs: 86_400,
             loose_db_path: loose_path.display().to_string(),
             channel_db_path: channel_path.display().to_string(),
             sender_secret_hex: "01".repeat(32),
