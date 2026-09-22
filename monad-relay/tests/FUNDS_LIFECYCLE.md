@@ -1,5 +1,11 @@
 # Process Funds Lifecycle
 
+Release-pinned CDK, Nutmix and Nutshell HTTP/keyset and actual MONAD process
+characterization is documented separately in
+[`characterization/REPORT.md`](characterization/REPORT.md). It records failures
+as well as successful recovery; ordinary swap compatibility is not treated as
+proof of full signed-channel behavior.
+
 Run `make test-funds-lifecycle`. This explicitly builds the real client and relay
 CLIs before running the ignored integration target. The parent owns a real CDK
 HTTP mint and an echo target; each client, relay, and maintenance invocation is a

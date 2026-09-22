@@ -238,6 +238,7 @@ pub struct Fixture {
     mint_process: Option<Process>,
     mint_port: Option<u16>,
     mint_url: String,
+    external_url: Option<String>,
     socks: std::net::SocketAddr,
     target: std::net::SocketAddr,
     ledger: Arc<Mutex<Ledger>>,
@@ -254,6 +255,19 @@ impl Fixture {
     }
 
     pub async fn start_with_persistent_mint(persistent: bool) -> Self {
+        Self::start_mint(persistent, None).await
+    }
+
+    #[allow(dead_code)] // Used only by the separate opt-in external characterization target.
+    pub async fn start_external(url: String, proofs: PathBuf) -> Self {
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "disposable loopback mint only"
+        );
+        Self::start_mint(false, Some((url, proofs))).await
+    }
+
+    async fn start_mint(persistent: bool, external: Option<(String, PathBuf)>) -> Self {
         let client_bin = PathBuf::from(
             std::env::var("MONAD_FUNDS_CLIENT_BIN").expect("set MONAD_FUNDS_CLIENT_BIN via Make"),
         );
@@ -270,7 +284,62 @@ impl Fixture {
             .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mint_url = format!("http://{}", listener.local_addr().unwrap());
-        let (mint, mint_process, mint_port, router) = if persistent {
+        let (mint, mint_process, mint_port, router) = if let Some((url, proofs)) = &external {
+            std::fs::copy(proofs, dir.path().join("initial-proofs.json")).unwrap();
+            let url = url.clone();
+            let client = reqwest::Client::builder()
+                .timeout(DEADLINE)
+                .no_proxy()
+                .build()
+                .unwrap();
+            let router = axum::Router::new().fallback(move |request: Request| {
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+                    let checked_swap = if parts.uri.path() == "/v1/swap" {
+                        let swap = serde_json::from_slice::<SwapRequest>(&bytes).expect("swap body redacted");
+                        let states: cashu::nuts::CheckStateResponse = client.post(format!("{url}/v1/checkstate"))
+                            .json(&CheckStateRequest { ys: swap.inputs().iter().map(|p| p.y().unwrap()).collect() })
+                            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+                        let restored: cashu::nuts::RestoreResponse = client.post(format!("{url}/v1/restore"))
+                            .json(&RestoreRequest { outputs: swap.outputs().to_vec() })
+                            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+                        Some((swap, states, restored))
+                    } else { None };
+                    let response = client.request(parts.method, format!("{url}{}", parts.uri))
+                        .header("content-type", "application/json").body(bytes).send().await.unwrap();
+                    let status = response.status();
+                    let bytes = response.bytes().await.unwrap();
+                    if !status.is_success() {
+                        if let Some((swap, before_states, before_restore)) = checked_swap {
+                            let states: cashu::nuts::CheckStateResponse = client.post(format!("{url}/v1/checkstate"))
+                                .json(&CheckStateRequest { ys: swap.inputs().iter().map(|p| p.y().unwrap()).collect() })
+                                .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+                            assert_eq!(states.states.len(), swap.inputs().len());
+                            assert!(serde_json::to_value(&states).unwrap() == serde_json::to_value(&before_states).unwrap(),
+                                "rejection changed input states (proofs redacted)");
+                            let restored: cashu::nuts::RestoreResponse = client.post(format!("{url}/v1/restore"))
+                                .json(&RestoreRequest { outputs: swap.outputs().to_vec() })
+                                .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+                            assert!(serde_json::to_value(&restored).unwrap() == serde_json::to_value(&before_restore).unwrap(),
+                                "rejection changed restore outputs (proofs redacted)");
+                            let error: Value = serde_json::from_slice(&bytes).expect("error body redacted");
+                            if matches!(error["code"].as_u64(), Some(12001 | 12002)) {
+                                assert!(states.states.iter().all(|s| s.state == State::Unspent));
+                                assert!(restored.outputs.is_empty() && restored.signatures.is_empty());
+                                eprintln!("external rejection status={} code={} all_inputs_unspent={} restore_outputs=0",
+                                    status.as_u16(), error["code"], states.states.len());
+                            }
+                        }
+                    }
+                    axum::response::Response::builder().status(status)
+                        .header("content-type", "application/json").body(Body::from(bytes)).unwrap()
+                }
+            });
+            (None, None, None, router)
+        } else if persistent {
             let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = reservation.local_addr().unwrap().port();
             drop(reservation);
@@ -531,6 +600,7 @@ clients:
             mint_process,
             mint_port,
             mint_url,
+            external_url: external.map(|(url, _)| url),
             socks,
             target,
             ledger,
@@ -928,7 +998,7 @@ clients:
                     tokio::time::timeout(DEADLINE, self.committed.notified())
                         .await
                         .expect("close rejection request gate");
-                    rotate_sat_keyset(&self.memory_mint(), 250).await.unwrap();
+                    self.rotate(250).await;
                     self.release_gate().await;
                 };
                 tokio::join!(
@@ -962,7 +1032,7 @@ clients:
                 tokio::time::timeout(DEADLINE, self.committed.notified())
                     .await
                     .expect("close request gate");
-                rotate_sat_keyset(&self.memory_mint(), 250).await.unwrap();
+                self.rotate(250).await;
                 self.release_gate().await;
             }
             if lost_response {
@@ -971,7 +1041,7 @@ clients:
                     .expect("close response gate");
                 drop(child);
                 self.release_gate().await;
-                rotate_sat_keyset(&self.memory_mint(), 300).await.unwrap();
+                self.rotate(300).await;
             } else {
                 child.success().await;
             }
@@ -999,7 +1069,7 @@ clients:
                 tokio::time::timeout(DEADLINE, self.committed.notified())
                     .await
                     .expect("refund request gate");
-                rotate_sat_keyset(&self.memory_mint(), 250).await.unwrap();
+                self.rotate(250).await;
                 self.release_gate().await;
             }
             if lost_response {
@@ -1008,6 +1078,9 @@ clients:
                     .expect("refund commit gate");
                 drop(child);
                 self.release_gate().await;
+                if self.external_url.is_some() {
+                    self.rotate(300).await;
+                }
                 let submitted = self.ledger.lock().unwrap().requests;
                 self.client(&args).success().await;
                 assert_eq!(
@@ -1082,7 +1155,7 @@ clients:
                     tokio::time::timeout(DEADLINE, self.committed.notified())
                         .await
                         .expect("drain rejection request gate");
-                    rotate_sat_keyset(&self.memory_mint(), 200).await.unwrap();
+                    self.rotate(200).await;
                     self.release_gate().await;
                 };
                 tokio::join!(
@@ -1101,7 +1174,7 @@ clients:
                 tokio::time::timeout(DEADLINE, self.committed.notified())
                     .await
                     .expect("drain request gate");
-                rotate_sat_keyset(&self.memory_mint(), 200).await.unwrap();
+                self.rotate(200).await;
                 self.release_gate().await;
             }
             if lost_response {
@@ -1110,7 +1183,7 @@ clients:
                     .expect("drain response gate");
                 drop(child);
                 self.release_gate().await;
-                rotate_sat_keyset(&self.memory_mint(), 350).await.unwrap();
+                self.rotate(350).await;
             } else {
                 child.success().await;
             }
@@ -1226,7 +1299,7 @@ clients:
         }
         if rotate {
             assert!(!kill_before, "direct rejection must reach live client");
-            rotate_sat_keyset(&self.memory_mint(), 350).await.unwrap();
+            self.rotate(350).await;
         }
         self.release_gate().await;
         tokio::time::timeout(DEADLINE, self.committed.notified())
@@ -1234,6 +1307,9 @@ clients:
             .expect("opening commit gate");
         drop(client);
         self.release_gate().await;
+        if self.external_url.is_some() {
+            self.rotate(400).await;
+        }
         let submitted = self.ledger.lock().unwrap().requests;
         self.client(&["wallet", "recover-openings"]).success().await;
         self.client(&["wallet", "recover-openings"]).success().await;
@@ -1342,7 +1418,24 @@ clients:
     }
 
     pub async fn rotate(&self, ppk: u64) {
-        rotate_sat_keyset(&self.memory_mint(), ppk).await.unwrap();
+        if let Some(url) = &self.external_url {
+            // External adapters deliberately keep fees at zero; the CDK process
+            // baseline separately covers fee changes and purse conservation.
+            reqwest::Client::builder()
+                .timeout(DEADLINE)
+                .no_proxy()
+                .build()
+                .unwrap()
+                .post(format!("{url}/_test/rotate"))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        } else {
+            rotate_sat_keyset(&self.memory_mint(), ppk).await.unwrap();
+        }
     }
 
     pub async fn refund_request_crash(&mut self) {
