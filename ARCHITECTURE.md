@@ -1,5 +1,28 @@
 # MONAD Architecture
 
+## Runtime admission control
+
+A relay's session registry owns its runtime admission policy alongside registered
+session cancellation tokens. A short synchronous admission lock orders policy
+changes with session registration, channel validation/acceptance, and CONNECT
+publication. It is never held across an await or for the lifetime of a tunnel.
+CONNECT checks policy both before target setup and before publishing success;
+setup already in flight may finish but cannot publish while admission is off.
+
+Listener-owned TCP and QUIC stream futures run inside a cancellation generation.
+Disable cancels that generation, covering pending Noise/H2 handshakes as well as
+registered sessions. A drop guard tracks completion, and `wait_disabled` waits for
+both these owned futures and session registrations to drain. Re-enable is rejected
+until cleanup finishes and then installs a fresh cancellation generation. QUIC
+transport connections may remain pooled/idle; they cannot admit new MONAD work
+while disabled. Runtime-owned Quinn protocol drivers retain their existing lifetime.
+
+New-channel admission checks relay-known stored state before invoking the normal
+link validator. Stored relinks still undergo normal signature, receiver, funding,
+expiry, and negotiated-version validation. Management does not bypass wallet
+ownership or recovery rules. These controls are a library foundation; process IPC
+and HTTP/SSE aggregation are separate implementation stages.
+
 ## Overview
 
 ### Terminal Refunds

@@ -82,6 +82,7 @@ pub struct PaymentOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkError {
+    AdmissionDisabled,
     InvalidPayment(String),
     InvalidChannel(String),
     MintOrKeysetNotAcceptable,
@@ -102,6 +103,7 @@ pub enum LinkError {
 impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AdmissionDisabled => write!(f, "relay is not accepting new channels"),
             Self::InvalidPayment(s) => write!(f, "invalid payment: {s}"),
             Self::InvalidChannel(s) => write!(f, "invalid channel: {s}"),
             Self::MintOrKeysetNotAcceptable => write!(f, "mint or keyset not acceptable"),
@@ -130,6 +132,7 @@ impl std::error::Error for LinkError {}
 impl LinkError {
     pub(crate) fn code(&self) -> ServerErrorCode {
         match self {
+            Self::AdmissionDisabled => ServerErrorCode::LinkAdmissionDisabled,
             Self::InvalidPayment(_) => ServerErrorCode::LinkInvalidPayment,
             Self::InvalidChannel(_) => ServerErrorCode::LinkInvalidChannel,
             Self::MintOrKeysetNotAcceptable | Self::UnknownTrustedKeyset { .. } => {

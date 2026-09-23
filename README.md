@@ -1,5 +1,28 @@
 # MONAD
 
+### Runtime management foundations
+
+Relay embedders can pass a per-relay `Arc<SessionRegistry>` to
+`run_with_wallet_manager_registry_and_shutdown` and update `RelayControls` while
+the relay runs. All controls default to enabled. These are process-local overrides,
+not YAML edits; the HTTP management service is being implemented separately.
+
+- `accept_new_channels = false` rejects first-time channel links, while stored
+  channels can relink and receive payments.
+- `accept_new_tunnels = false` rejects new CONNECT requests with HTTP 503,
+  including onward QUIC tunnels. Established tunnels continue.
+- `accept_new_sessions = false` rejects new sessions, including streams on an
+  existing QUIC connection. Existing sessions continue.
+- `enabled = false` cancels pending handshakes and active sessions. Await
+  `wait_disabled()` for application cleanup before re-enabling. The three admission
+  settings are preserved. Payment channels are not automatically closed by disable;
+  any separately configured expiry auto-close policy remains in effect.
+
+The listener stays bound while disabled so the same instance can be re-enabled.
+Normal defaults retain existing behavior. New-channel refusal uses the new
+`LinkAdmissionDisabled` control error; clients using an older exhaustive wire-error
+enum need a coordinated update before using this control.
+
 MONAD is a multi-hop, VPN-like TCP tunneling system built in Rust.
 
 It provides:

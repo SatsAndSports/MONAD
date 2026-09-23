@@ -423,7 +423,8 @@ async fn start_monad_relay_with_test_payments() -> (
 
 #[tokio::test]
 async fn test_listener_finish_quiesces_tcp_and_quic_descendants() {
-    for abrupt in [false, true] {
+    for finish in ["graceful", "abort", "disable"] {
+        let abrupt = finish == "abort";
         let identity = QuicCertIdentity::generate().unwrap();
         let key = SecpTransportKeypair::generate();
         let pubkey = key.pubkey();
@@ -491,6 +492,75 @@ async fn test_listener_finish_quiesces_tcp_and_quic_descendants() {
             targets.push(listener.accept().await.unwrap().0);
             streams.push((send, recv, data_send, response.into_body()));
             channels.push(channel.channel_id);
+        }
+        if finish == "disable" {
+            use monad_relay::session_registry::RelayControls;
+            registry
+                .set_controls(RelayControls {
+                    accept_new_channels: false,
+                    accept_new_sessions: false,
+                    accept_new_tunnels: false,
+                    ..Default::default()
+                })
+                .unwrap();
+            // Wind-down must preserve existing TCP/QUIC session tunnels.
+            for ((_, _, send, _), target) in streams.iter_mut().zip(&mut targets) {
+                send.send_data(Bytes::from_static(b"still alive"), false)
+                    .unwrap();
+                let mut bytes = [0; 11];
+                timeout(Duration::from_secs(2), target.read_exact(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&bytes, b"still alive");
+            }
+            for conn in &connections {
+                let mut h2 = conn.clone_send_request().await;
+                let (response, _) = h2
+                    .send_request(
+                        Request::builder()
+                            .method(Method::CONNECT)
+                            .uri("127.0.0.1:1")
+                            .body(())
+                            .unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    response.await.unwrap().status(),
+                    http::StatusCode::SERVICE_UNAVAILABLE
+                );
+            }
+            registry
+                .set_controls(RelayControls {
+                    enabled: false,
+                    ..registry.controls()
+                })
+                .unwrap();
+            timeout(Duration::from_secs(2), registry.wait_disabled())
+                .await
+                .unwrap()
+                .unwrap();
+            for (conn, channel) in connections.iter().zip(&channels) {
+                assert!(!registry.terminate(conn.session_id()));
+                assert_eq!(payments.owner_of(channel), None);
+            }
+            registry
+                .set_controls(RelayControls {
+                    enabled: true,
+                    ..registry.controls()
+                })
+                .unwrap();
+            assert!(!registry.controls().accept_new_tunnels);
+            registry.set_controls(Default::default()).unwrap();
+            for conn in [
+                connect_client_tcp(addr, &pubkey).await,
+                connect_client_quic_secp(addr, &pubkey).await,
+            ] {
+                let (mut send, mut recv) = conn.open_control().await.unwrap();
+                control_handshake(&mut send, &mut recv).await;
+                conn.close().await;
+            }
         }
         if abrupt {
             root.abort();

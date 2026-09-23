@@ -383,6 +383,30 @@ pub async fn run_with_wallet_manager_and_shutdown<S>(
 where
     S: Future<Output = ()> + Send,
 {
+    run_with_wallet_manager_registry_and_shutdown(
+        listener,
+        quic_endpoint,
+        config,
+        wallet_manager,
+        Arc::new(SessionRegistry::new()),
+        shutdown,
+    )
+    .await
+}
+
+/// Run with a caller-owned, per-relay registry for live admission and disable.
+/// The caller must not share the registry between separately controlled relays.
+pub async fn run_with_wallet_manager_registry_and_shutdown<S>(
+    listener: TcpListener,
+    quic_endpoint: Option<quinn::Endpoint>,
+    config: Arc<ServerConfig>,
+    wallet_manager: Arc<RelayWalletManager>,
+    session_registry: Arc<SessionRegistry>,
+    shutdown: S,
+) -> io::Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
     let discovered_spilman_mint_cache = wallet_manager.keyset_cache();
     let keyset_refresh = Arc::new(RelayKeysetRefreshCoordinator::new(
         wallet_manager.clone(),
@@ -439,7 +463,7 @@ where
         payments,
         discovered_spilman_mint_cache,
         RelayRuntimeServices {
-            session_registry: Arc::new(SessionRegistry::new()),
+            session_registry,
             keyset_refresh: Some(keyset_refresh.clone()),
         },
         async move {
@@ -637,6 +661,8 @@ where
                 let services = services.clone();
 
                 sessions.push(std::panic::AssertUnwindSafe(async move {
+                    let registry = services.session_registry.clone();
+                    registry.run_admitted(async move {
                     let (send_cipher, recv_cipher, session_id, bootstrap_accept) =
                         match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_accept_builder(
                             &mut tcp_stream,
@@ -696,6 +722,7 @@ where
                     }
 
                     info!("connection with {peer_addr} closed (TCP)");
+                    }).await;
                 }).catch_unwind().boxed());
             }
             Some(incoming) = async {
@@ -746,6 +773,8 @@ where
                                 let authenticated = authenticated.clone();
                                 let conn = conn.clone();
                                 stream_tasks.push(std::panic::AssertUnwindSafe(async move {
+                                    let registry = services.session_registry.clone();
+                                    registry.run_admitted(async move {
                                     let mut send = send;
                                     let mut recv = recv;
                                     let mut kind = [0u8; 1];
@@ -847,6 +876,7 @@ where
                                     }
 
                                     info!("QUIC stream {stream_id:?} from {remote} closed");
+                                    }).await;
                                 }).catch_unwind().boxed());
                             }
                             Err(quinn::ConnectionError::ApplicationClosed(_))
