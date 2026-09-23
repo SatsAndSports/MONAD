@@ -41,7 +41,7 @@ cleanup interleaving through the production eviction path.
 | Client control | All writes, including heartbeat, use the existing 15-second send deadline | Zero-window test with virtual time requires timeout rather than a hung driver |
 | Relay listener | Direct connection/stream futures with child panic isolation; explicit finish drains Quinn | Live TCP and QUIC children lose registry/channel ownership before root completion; targets see EOF; explicit finish permits TCP/UDP rebind |
 | Auto-close worker | Directly owned future, shutdown checks between candidates and cancels active sweep | Mint swap-response gate: graceful/abrupt root cancellation leaves no worker, retains Closing journal, leaves next candidate Open, and journal recovery completes the payout |
-| Shared and relay proxy | Hard errors cancel the opposite direction; EOF still drains | H2 reset with a stalled application formerly timed out; fixed test terminates and still permits replies after EOF |
+| Shared and relay proxy | Hard errors cancel the opposite direction; EOF still drains. The shared proxy independently observes H2 reset while application writes are blocked, including after local EOF | Idle-reset and blocked-write gates cover reset/connection loss; normal EOF still drains buffered data |
 | Echo server | Direct connection/stream futures; tests now use production server | Root abort closes a live echo stream; 1000-stream and large-payload tests pass |
 
 ## Contract Boundaries
@@ -59,9 +59,12 @@ cleanup interleaving through the production eviction path.
 - No wallet schema, funding/keyset policy, reservation, or ambiguous journal is
   discarded by these changes. Shared pools and cache refresh work intentionally
   retain their service-level lifetimes.
-- Independent subagent review was unavailable: this session exposes no delegation
-  tool. Changes were self-reviewed; exhaustive transport/failure Cartesian testing
-  and abrupt OS-socket reclamation are not claimed.
+- Initial tranches were self-reviewed. The parent subsequently coordinated two
+  independent reviews: the relay reviewer reported no correctness findings and
+  noted coverage/performance gaps; the client reviewer identified the P2
+  blocked-write reset issue recorded below and no other client findings.
+  Exhaustive transport/failure Cartesian testing, abrupt OS-socket reclamation,
+  and independent re-review of the correction are not claimed here.
 
 ## Watcher/Pool Validation
 
@@ -120,9 +123,9 @@ above. No background cleanup framework or production fault knobs were added.
   1234 ms, 7 channel records (bound 21).
 - Both stress commands used `ulimit -n 65536`. Relay validation logs are in
   `/tmp/opencode/monad-relay-teardown-*.log`; `*-final.log` contains the final
-  full test and Clippy results. No independent subagent review was available.
+  full test and Clippy results. These runs preceded the independent parent reviews.
 
-## Final Validation
+## Pre-Review Validation
 
 - `cargo test -- --test-threads=4`: **613 passed, 20 ignored, zero failures**.
   Payment-conflict wire, first-hop rebuild, and middle-hop suffix tests all pass.
@@ -139,3 +142,67 @@ above. No background cleanup framework or production fault knobs were added.
   312 respectively. Logs: `/tmp/opencode/monad-teardown-complete-*.log`.
 - All work remains local; no PR/push. The original eleven untracked artifacts and
   `AGENTS.md` remain unchanged.
+
+## Independent Review Correction
+
+The client's P2 finding was reproduced before the fix: an H2 peer sends 64 bytes
+into an application socket with capacity 8, a gate confirms `poll_write` returned
+Pending, and the peer then resets the stream. The existing `try_join!` never saw
+the reset because both copy directions were blocked outside H2; the regression
+timed out. The earlier idle-reset test did not cover this state.
+
+The send-side future now polls `SendStream::poll_reset` independently while
+waiting for application data. H2 capacity waits already observe reset/failure.
+After local EOF, the send-side future continues observing resets until a oneshot
+confirms the receive-side write/shutdown drain finished. There is no spawned
+watcher, shared send lock, polling loop, or timing heuristic.
+
+The regression covers explicit peer reset, peer-driver loss, and local H2-driver
+abort (the route-close transport action), each before and after local EOF. A
+normal-EOF case confirms that blocked buffered data still drains successfully.
+These are selected lifecycle interleavings, not exhaustive failure coverage.
+
+## Review Correction Validation
+
+- `cargo test -- --test-threads=4`: **614 passed, 20 ignored, zero failures**.
+- Strict `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  formatting, and diff checks pass. Both focused shared-proxy tests pass.
+- Logs: `/tmp/opencode/monad-teardown-review-tests.log` and
+  `/tmp/opencode/monad-teardown-review-clippy.log`.
+
+The transport run used the existing configurable harness with the stable-five-
+hop recipe's topology, ten times its streams per circuit, and bounded in-flight
+work. The extreme recipe requests 2.5 million streams with much higher
+concurrency; inspection found 30 GiB RAM, about 17 GiB available, and 21 GiB swap
+already in use, so the bounded run was selected instead. Exact command:
+
+```bash
+ulimit -n 65536 && \
+NO_COLOR=1 RUST_LOG=error \
+MONAD_STRESS_PAYMENT_MODE=transport \
+MONAD_STRESS_CHANNEL_CAPACITY_MSATS=1000000000000 \
+MONAD_STRESS_RELAYS=10 \
+MONAD_STRESS_CIRCUITS=200 \
+MONAD_STRESS_HOPS=5 \
+MONAD_STRESS_STREAMS=250 \
+MONAD_STRESS_MAX_IN_FLIGHT_PER_CIRCUIT=25 \
+MONAD_STRESS_TARGETS=100 \
+MONAD_STRESS_PAYLOAD_BYTES=3000 \
+cargo test -p monad-relay --test stress -- \
+  --ignored --exact stress_three_hop_quic_configurable --nocapture
+```
+
+Results: 200/200 circuits, 1,000 sessions, and 50,000/50,000 streams successful;
+`failures=0`, `control_errors=0`, `channel_link_failures=0`, `pause_events=0`,
+`channel_relinks_total=0`, `topups_total=0`. Sent and received bytes were
+150,000,000 each (300,000,000 total). Elapsed time including setup was 119.925 s;
+reported aggregate bidirectional cleartext throughput was 2.39 MiB/s. Average
+per-circuit setup/data times were 6,057.35/102,047.40 ms. Log:
+`/tmp/opencode/monad-teardown-review-transport.log`.
+
+This is one passing workload on the current implementation, not a before/after
+benchmark. Direct futures still serialize synchronous CPU-heavy handshake and
+payment work within each listener task. Ten listeners can execute independently,
+and this transport-focused harness uses mocked huge prefunding, not sustained
+real payment verification. CPU-heavy single-listener performance and baseline
+throughput/latency equivalence were not measured.

@@ -789,6 +789,8 @@ drivers can retain the UDP socket briefly while draining. Interrupted auto-close
 work leaves its durable close journal available for recovery on restart.
 Proxy EOF preserves normal half-close and permits a reply after the request
 ends; a reset or other hard I/O error cancels the opposite copy direction.
+The client proxy observes H2 resets even when application writes are blocked,
+including after the application's send half has closed.
 
 ## QUIC Echo Tool
 

@@ -1410,8 +1410,19 @@ connection. Control cancellation similarly covers bootstrap and message writes.
 Hard I/O failures use fallible joins to cancel the opposite copy direction;
 normal EOF remains a half-close, not whole-tunnel cancellation. This applies to
 both the shared client proxy and the relay's accounted proxy.
+The shared proxy also observes H2 reset/connection failure through the send
+handle while waiting for application reads. After local EOF it keeps that
+observation alive until the receive-side drain finishes. A blocked application
+write therefore cannot hide a reset simply by preventing `RecvStream` polling;
+normal EOF still permits buffered data to drain.
 Per-tunnel accounting drop guards close counters and log byte totals on normal
 completion, cancellation, and unwinding.
+
+Direct ownership does not provide CPU parallelism within a listener: synchronous
+handshake/payment work shares that listener task with its other futures. Separate
+listeners can run in parallel. The bounded five-hop transport stress recorded in
+`docs/teardown-audit.md` characterizes this implementation, not a before/after
+performance comparison or an exhaustive CPU-heavy payment workload.
 
 The expiring-channel auto-close loop is a directly owned future, not a spawned
 worker whose handle can detach on wrapper cancellation. Shutdown stops admission
