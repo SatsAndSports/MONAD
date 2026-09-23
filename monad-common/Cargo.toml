@@ -19,6 +19,7 @@ http = "1"
 ring = "0.17"
 sha2 = "0.10"
 bech32 = "0.11"
+base64 = "0.22"
 k256 = { version = "0.13", features = ["arithmetic", "ecdh", "schnorr"] }
 rand_core = "0.6"
 noise-protocol = "0.2"

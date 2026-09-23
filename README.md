@@ -129,8 +129,7 @@ clients:
   - name: local
     socks: 127.10.0.1:1080
     route:
-      - addr: 127.10.0.11:9050
-        pubkey: "${MONAD_RELAY_A_TRANSPORT_PUBKEY}"
+      - "${MONAD_RELAY_A_TRANSPORT_PUBKEY}::127.10.0.11:9050"
 ```
 
 Environment variables are substituted from the process environment or from a `.env` file in the same directory as the config.  Defaults are supported: `${VAR:-default}`.
@@ -523,10 +522,8 @@ clients:
   - name: local
     socks: 127.10.0.1:1080
     route:
-      - addr: 127.10.0.11:9051
-        pubkey: "${HOP1_SECP_PUBKEY}"
-      - addr: 127.10.0.12:9052
-        pubkey: "${HOP2_SECP_PUBKEY}"
+      - "${HOP1_SECP_PUBKEY}::127.10.0.11:9051"
+      - "${HOP2_SECP_PUBKEY}::127.10.0.12:9052"
 ```
 
 The pricing fields are required for every relay entry and must be greater than zero.
@@ -598,8 +595,7 @@ clients:
   - name: local
     socks: 127.0.0.1:1080
     route:
-      - addr: 127.0.0.1:9050
-        pubkey: "<SERVER_SECP256K1_PUBKEY>"
+      - "<SERVER_SECP256K1_PUBKEY>::127.0.0.1:9050"
 ```
 
 Three-hop route:
@@ -609,12 +605,9 @@ clients:
   - name: local
     socks: 127.0.0.1:1080
     route:
-      - addr: 127.0.0.1:9051
-        pubkey: "<HOP1_SECP_PUB>"
-      - addr: 127.0.0.1:9052
-        pubkey: "<HOP2_SECP_PUB>"
-      - addr: 127.0.0.1:9053
-        pubkey: "<HOP3_SECP_PUB>"
+      - "<HOP1_SECP_PUB>::127.0.0.1:9051"
+      - "<HOP2_SECP_PUB>::127.0.0.1:9052"
+      - "<HOP3_SECP_PUB>::127.0.0.1:9053"
 ```
 
 Each configured client listens locally as a SOCKS5 proxy at its
@@ -629,11 +622,53 @@ clients:
   - name: local
     socks: 127.0.0.1:1080
     route:
-      - addr: 127.0.0.1:9051
-        pubkey: "<HOP1_SECP_PUB>"
-      - addr: 127.0.0.1:9052
-        pubkey: "<HOP2_SECP_PUB>"
+      - "<HOP1_SECP_PUB>::127.0.0.1:9051"
+      - "<HOP2_SECP_PUB>::127.0.0.1:9052"
 ```
+
+Route entries are compact strings, not `addr` / `pubkey` maps:
+
+- Clear: `<key>::<address>`.
+- Blinded: `<tweaked-key>:B:<versioned-data>`.
+- Keys accept the existing `npub` encoding or 64 hex characters representing an
+  x-only secp256k1 public key. `mpub` is not an alias. Serialization emits hex.
+- Clear addresses accept DNS names, IPv4, and IPv6. Omitted ports use **9050**,
+  matching the documented relay listener examples; relay `listen` remains explicit.
+  Use `[2001:db8::1]:9051` for IPv6 with a port. Bare `2001:db8::1` and `[::1]`
+  use 9050; a bare IPv6 final component is never interpreted as a port.
+- The first hop must be clear. Each later blinded entry is decrypted by its
+  immediately preceding relay; the key before `:B:` identifies the **hidden
+  target's tweaked identity**, not the introduction relay.
+
+For example, this syntactically valid clear hop uses the secp256k1 generator key
+(replace it with your relay's actual key):
+
+```yaml
+route:
+  - "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798::localhost"
+```
+
+Construct a blinded suffix offline using only the real public keys and addresses:
+
+```bash
+monad-client blind-route \
+  "${INTRO_PUBKEY}::intro.example:9050" \
+  "${HIDDEN_B_PUBKEY}::[2001:db8::2]:9050" \
+  "${HIDDEN_C_PUBKEY}::hidden.example:9050"
+```
+
+This prints a directly usable YAML `route:` block: one clear introduction hop
+followed by blinded strings. All inputs must be clear hop strings; every hop
+after the first is hidden. No wallet, private key, or network access is needed.
+Run construction on a trusted machine: input arguments reveal the real route
+to local process inspection and shell history. The generated blobs are opaque
+unpadded base64url, with an explicit version **0** envelope. They are not
+compressed or re-encrypted. Unknown versions, noncanonical base64url, invalid
+points, truncation, trailing bytes, and ciphertext outside 50..=1024 bytes are
+rejected. See [Blinded Routing](ARCHITECTURE.md#blinded-routing) for the layout.
+
+This is a breaking early-alpha YAML change: convert old maps to strings. It
+does not migrate or modify persisted wallets, nor change the transport protocol.
 
 For non-first hops, the previous relay connects via QUIC instead of TCP. The
 configured client uses secp256k1 transport identities for QUIC hop

@@ -1,26 +1,22 @@
 use crate::route::{Route, RouteHop};
-use monad_common::config::ClientConfig;
-use monad_common::secp_identity::Secp256k1Pubkey;
+use monad_common::config::{ClientConfig, ClientRouteHopConfig};
 use std::io;
 
 pub fn route_from_client_config(client: &ClientConfig) -> io::Result<Route> {
     let hops = client
         .route
         .iter()
-        .map(|hop| {
-            let pubkey = Secp256k1Pubkey::parse_config_pubkey(&hop.pubkey).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid pubkey for route hop {}: {e}", hop.addr),
-                )
-            })?;
-            Ok(RouteHop::Cleartext {
+        .map(|hop| match hop {
+            ClientRouteHopConfig::Cleartext(hop) => RouteHop::Cleartext {
                 addr: hop.addr.clone(),
-                pubkey,
+                pubkey: hop.pubkey,
                 use_quic: true,
-            })
+            },
+            ClientRouteHopConfig::Blinded(descriptor) => RouteHop::Blinded {
+                descriptor: descriptor.clone(),
+            },
         })
-        .collect::<io::Result<Vec<_>>>()?;
+        .collect();
 
     Route::new(hops)
 }
@@ -28,7 +24,6 @@ pub fn route_from_client_config(client: &ClientConfig) -> io::Result<Route> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monad_common::config::ClientRouteHopConfig;
     use monad_common::secp_identity::SecpTransportKeypair;
 
     #[test]
@@ -40,10 +35,7 @@ mod tests {
         let client = ClientConfig {
             name: "local".to_string(),
             socks: "127.10.0.1:1080".to_string(),
-            route: vec![ClientRouteHopConfig {
-                addr: "127.10.0.11:9050".to_string(),
-                pubkey,
-            }],
+            route: vec![format!("{pubkey}::127.10.0.11").parse().unwrap()],
         };
 
         let route = route_from_client_config(&client).unwrap();
@@ -53,5 +45,24 @@ mod tests {
         };
         assert_eq!(addr, "127.10.0.11:9050");
         assert!(*use_quic);
+    }
+
+    #[test]
+    fn config_rejects_empty_and_blinded_first_routes() {
+        let mut client: ClientConfig =
+            serde_yaml::from_str("name: local\nsocks: localhost:1080\nroute: []").unwrap();
+        assert!(route_from_client_config(&client).is_err());
+        let key = SecpTransportKeypair::from_secret_bytes(&[7; 32])
+            .unwrap()
+            .pubkey();
+        let descriptor = monad_common::blinded_hop::build_blinded_hop_descriptor(
+            key.to_compressed_bytes(),
+            "localhost:9050",
+            key,
+        )
+        .unwrap();
+        client.route.push(ClientRouteHopConfig::Blinded(descriptor));
+        let err = route_from_client_config(&client).unwrap_err();
+        assert!(err.to_string().contains("first hop must be cleartext"));
     }
 }

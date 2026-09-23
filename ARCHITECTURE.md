@@ -1002,6 +1002,47 @@ fast-path transition updates the pause watcher but does not itself send a
 
 ## Blinded Routing
 
+### Compact Route Configuration
+
+Configured route lists serialize the existing `PathNode` model as strings:
+`<key>::<clear-address>` or `<key>:B:<data>`. Keys reuse the standard `npub` /
+64-hex x-only parser and serialize as lowercase hex. Clear addresses are
+normalized to explicit ports (9050 when omitted); IPv6 uses brackets in the
+normalized authority. The first hop is clear, and each blinded node retains
+the same predecessor/hidden-target semantics as the low-level path constructor.
+The configured runtime maps these nodes to the existing QUIC `RouteHop`s;
+library TCP routes and all Noise/H2 nesting remain unchanged.
+Library callers use `FromStr`, Serde, or fallible `PathNode::to_compact_string()`;
+encoding validates hand-built nodes too, rather than using an infallible
+`Display` implementation for publicly constructible, potentially oversized data.
+
+The blinded key outside the blob is the hidden target's tweaked x-only key.
+The canonical unpadded base64url blob decodes to this version-0 binary envelope:
+
+| Bytes | Meaning |
+| --- | --- |
+| 0 | Envelope version, exactly `0` |
+| 1..=33 | Full compressed ephemeral secp256k1 ECDH point, including 02/03 parity |
+| 34..=35 | Ciphertext length, unsigned 16-bit big-endian |
+| 36.. | Exactly that many ciphertext bytes, including the existing AEAD tag |
+
+Ciphertext is bounded to 50..=1024 bytes (the minimum is a 32-byte tweak,
+one parity byte, one nonempty address byte, and a 16-byte tag). The maximum
+decoded envelope is 1060 bytes, or 1414 unpadded base64url characters. The parser
+bounds encoded input before allocation and rejects unknown versions, invalid
+points, noncanonical encoding, truncation and trailing bytes. The hidden address,
+tweak and tweak parity remain inside the existing authenticated ciphertext;
+the client cannot validate that plaintext. No extra address or introduction
+key is needed in the envelope because the preceding route entry supplies the
+introduction session. Consecutive blinded hops still encrypt to the real
+predecessor identity, as required by the relay resolver.
+
+This is a configuration/publication envelope version, independent of the
+bootstrap version, `blinded_connect_v1`, `tweaked_noise_v1`, and the existing
+blinded AEAD domain labels. No CONNECT headers or cryptography change.
+`monad-client blind-route` uses `build_path` offline and serializes its nodes
+directly into a YAML route block; it needs only public clear hop inputs.
+
 MONAD's normal routing model assumes the client knows every hop's real
 `addr:port` and published secp256k1 x-only public key up front. A blinded route changes
  that model: the client only knows the public **introduction hop**, then learns
@@ -1548,10 +1589,8 @@ clients:
   - name: local
     socks: 127.0.0.1:1080
     route:
-      - addr: 10.0.0.1:9050
-        pubkey: "<S_pubkey>"
-      - addr: 10.0.0.2:9050
-        pubkey: "<T_pubkey>"
+      - "<S_pubkey>::10.0.0.1:9050"
+      - "<T_pubkey>::10.0.0.2:9050"
 ```
 
 The client:

@@ -30,6 +30,13 @@ enum Command {
 
     /// Local client wallet administration and recovery commands.
     Wallet(WalletArgs),
+
+    /// Build an offline blinded route from public clear hop strings; hide every hop after the first.
+    BlindRoute {
+        /// Ordered <npub-or-hex>::<address> hops, starting with the introduction relay.
+        #[arg(required = true, num_args = 2..)]
+        hops: Vec<String>,
+    },
 }
 
 #[derive(Parser)]
@@ -197,7 +204,48 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Run(args) => run_configured_client(args).await,
         Command::Wallet(args) => run_wallet_command(args).await,
+        Command::BlindRoute { hops } => {
+            print!("{}", blinded_route_yaml(&hops)?);
+            Ok(())
+        }
     }
+}
+
+fn blinded_route_yaml(hops: &[String]) -> anyhow::Result<String> {
+    use monad_common::blinded_hop::{build_path, PathHop, PathHopMode, PathNode};
+    anyhow::ensure!(
+        hops.len() >= 2,
+        "a blinded route requires at least two clear hops"
+    );
+    let mut clear = Vec::with_capacity(hops.len());
+    for (i, input) in hops.iter().enumerate() {
+        let hop = input
+            .parse::<PathNode>()
+            .map_err(|e| anyhow::anyhow!("route hop {}: {e}", i + 1))?;
+        let PathNode::Cleartext(hop) = hop else {
+            anyhow::bail!(
+                "route hop {}: construction requires a real clear hop",
+                i + 1
+            );
+        };
+        clear.push(hop);
+    }
+    let path = build_path(
+        &clear
+            .iter()
+            .enumerate()
+            .map(|(i, hop)| PathHop {
+                addr: &hop.addr,
+                pubkey: hop.pubkey,
+                mode: if i == 0 {
+                    PathHopMode::Cleartext
+                } else {
+                    PathHopMode::Blinded
+                },
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(format!("route:\n{}", serde_yaml::to_string(&path.hops)?))
 }
 
 async fn run_configured_client(args: RunArgs) -> anyhow::Result<()> {
@@ -901,8 +949,7 @@ clients:
   - name: local
     socks: 127.0.0.1:1080
     route:
-      - addr: 127.0.0.1:9050
-        pubkey: "{pubkey}"
+      - "{pubkey}::127.0.0.1:9050"
 "#,
                 loose_db.display(),
                 channel_db.display()

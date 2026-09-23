@@ -665,8 +665,7 @@ clients:
   - name: funds
     socks: {socks}
     route:
-      - addr: {relay}
-        pubkey: "{pubkey}"
+      - "{pubkey}::{relay}"
 "#,
                 root = dir.path().display(),
                 sender = "01".repeat(32),

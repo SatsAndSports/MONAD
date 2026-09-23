@@ -7092,8 +7092,7 @@ clients:
   - name: local
     socks: {}
     route:
-      - addr: {}
-        pubkey: "{}"
+      - "{}::{}"
 "#,
         relay_db_path.display(),
         loose_db_path.display(),
@@ -7105,8 +7104,8 @@ clients:
         relay_listen,
         mint_url,
         socks_listen,
-        relay_listen,
         transport_key.pubkey().to_hex(),
+        relay_listen,
     );
     fs::write(&config_path, yaml).unwrap();
 
@@ -7313,8 +7312,7 @@ clients:
   - name: local
     socks: {}
     route:
-      - addr: {}
-        pubkey: "{}"
+      - "{}::{}"
 "#,
         relay_db_path.display(),
         loose_db_path.display(),
@@ -7326,8 +7324,8 @@ clients:
         relay_listen,
         mint_url,
         socks_listen,
-        relay_listen,
         transport_key.pubkey().to_hex(),
+        relay_listen,
     );
     fs::write(&config_path, yaml).unwrap();
 
@@ -7906,11 +7904,10 @@ impl ConfiguredRouteFixture {
                 mint_url,
             ));
             route_yaml.push_str(&format!(
-                r#"      - addr: {}
-        pubkey: "{}"
+                r#"      - "{}::{}"
 "#,
-                relay_listens[idx],
                 transport_keys[idx].pubkey().to_hex(),
+                relay_listens[idx],
             ));
         }
 
@@ -8863,11 +8860,10 @@ impl ConfiguredChaosFixture {
                 mint_url,
             ));
             route_yaml.push_str(&format!(
-                r#"      - addr: {}
-        pubkey: "{}"
+                r#"      - "{}::{}"
 "#,
-                relay_listens[idx],
                 transport_keys[idx].pubkey().to_hex(),
+                relay_listens[idx],
             ));
         }
 
@@ -9905,6 +9901,15 @@ async fn chaos_configured_client_restarts() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shared_yaml_config_drives_two_hop_client_socks_over_quic() {
+    shared_yaml_two_hop_client_socks(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shared_yaml_config_drives_blinded_client_socks_over_quic() {
+    shared_yaml_two_hop_client_socks(true).await;
+}
+
+async fn shared_yaml_two_hop_client_socks(blinded: bool) {
     use std::fs;
 
     let upper_listener = TcpListener::bind("127.10.2.10:0").await.unwrap();
@@ -9982,6 +9987,20 @@ async fn test_shared_yaml_config_drives_two_hop_client_socks_over_quic() {
         .local_addr()
         .unwrap();
 
+    let second_hop = if blinded {
+        monad_common::blinded_hop::PathNode::Blinded(
+            build_blinded_hop_descriptor(
+                transport_key_1.pubkey().to_compressed_bytes(),
+                &relay_2_listen.to_string(),
+                transport_key_2.pubkey(),
+            )
+            .unwrap(),
+        )
+        .to_compact_string()
+        .unwrap()
+    } else {
+        format!("{}::{relay_2_listen}", transport_key_2.pubkey())
+    };
     let yaml = format!(
         r#"
 relay_wallet:
@@ -10019,10 +10038,8 @@ clients:
   - name: local
     socks: {}
     route:
-      - addr: {}
-        pubkey: "{}"
-      - addr: {}
-        pubkey: "{}"
+      - "{}::{}"
+      - "{second_hop}"
 "#,
         relay_db_path.display(),
         loose_db_path.display(),
@@ -10039,10 +10056,8 @@ clients:
         relay_2_listen,
         mint_url,
         socks_listen,
-        relay_1_listen,
         transport_key_1.pubkey().to_hex(),
-        relay_2_listen,
-        transport_key_2.pubkey().to_hex(),
+        relay_1_listen,
     );
     fs::write(&config_path, yaml).unwrap();
 
@@ -14069,16 +14084,17 @@ async fn test_connector_two_consecutive_blinded_hops() {
     )
     .unwrap();
 
-    let route = Route::new(vec![
-        cleartext_route_hop(intro_addr.to_string(), intro_pubkey, true),
-        RouteHop::Blinded {
-            descriptor: descriptor_ab,
-        },
-        RouteHop::Blinded {
-            descriptor: descriptor_bc,
-        },
-    ])
+    let hops = vec![
+        format!("{intro_pubkey}::{intro_addr}").parse().unwrap(),
+        monad_common::blinded_hop::PathNode::Blinded(descriptor_ab),
+        monad_common::blinded_hop::PathNode::Blinded(descriptor_bc),
+    ];
+    let client: monad_common::config::ClientConfig = serde_yaml::from_str(&format!(
+        "name: blinded\nsocks: 127.0.0.1:1080\nroute:\n{}",
+        serde_yaml::to_string(&hops).unwrap()
+    ))
     .unwrap();
+    let route = monad_client::config_runtime::route_from_client_config(&client).unwrap();
     let route_conn = connector::connect_route(&route).await.unwrap();
     let conn = route_conn.final_connection_arc();
     fund_session(&conn, TEST_SESSION_PAYMENT).await;

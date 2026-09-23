@@ -5,6 +5,7 @@
 //! need for the old Ed25519/X25519 compatibility bridge or its rejection
 //! sampling.
 
+mod compact;
 mod math;
 mod path;
 mod payload;

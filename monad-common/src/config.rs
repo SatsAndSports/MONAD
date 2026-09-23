@@ -9,8 +9,6 @@ use serde::{de, Deserialize, Deserializer};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
-use crate::secp_identity::Secp256k1Pubkey;
-
 /// Top-level MONAD configuration file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MonadConfig {
@@ -267,21 +265,8 @@ impl MonadConfig {
             if client.route.is_empty() {
                 anyhow::bail!("client '{}' route must not be empty", client.name);
             }
-            for (hop_idx, hop) in client.route.iter().enumerate() {
-                if hop.addr.trim().is_empty() {
-                    anyhow::bail!(
-                        "client '{}' route hop {} addr must not be empty",
-                        client.name,
-                        hop_idx + 1
-                    );
-                }
-                Secp256k1Pubkey::parse_config_pubkey(&hop.pubkey).map_err(|e| {
-                    anyhow::anyhow!(
-                        "client '{}' route hop {} pubkey is invalid: {e}",
-                        client.name,
-                        hop_idx + 1
-                    )
-                })?;
+            if matches!(client.route.first(), Some(ClientRouteHopConfig::Blinded(_))) {
+                anyhow::bail!("client '{}' route hop 1 must be cleartext", client.name);
             }
         }
 
@@ -513,11 +498,7 @@ pub struct ClientConfig {
     pub route: Vec<ClientRouteHopConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ClientRouteHopConfig {
-    pub addr: String,
-    pub pubkey: String,
-}
+pub use crate::blinded_hop::PathNode as ClientRouteHopConfig;
 
 fn default_channel_funding_token_target_msats() -> u64 {
     1_000_000
@@ -774,8 +755,7 @@ clients:
   - name: c1
     socks: 127.0.0.1:1080
     route:
-      - addr: 127.10.0.11:9050
-        pubkey: "{pubkey}"
+      - "{pubkey}::127.10.0.11:9050"
 "#
         )
     }
@@ -865,7 +845,10 @@ clients:
                 .interval_secs,
             3_600
         );
-        assert_eq!(config.clients[0].route[0].addr, "127.10.0.11:9050");
+        assert_eq!(
+            config.clients[0].route[0].to_compact_string().unwrap(),
+            format!("{}::127.10.0.11:9050", sample_pubkey_hex(7))
+        );
     }
 
     #[test]
@@ -1095,13 +1078,13 @@ relays:
 
     #[test]
     fn invalid_route_pubkey_is_rejected() {
-        let yaml = minimal_config_yaml().replace(
-            &format!("pubkey: \"{}\"", sample_pubkey_hex(7)),
-            "pubkey: \"not-a-pubkey\"",
-        );
-        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("route hop 1 pubkey is invalid"));
+        let yaml =
+            minimal_config_yaml().replace(&format!("{}::", sample_pubkey_hex(7)), "not-a-pubkey::");
+        let err = serde_yaml::from_str::<MonadConfig>(&yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("clients[0].route[0]"), "{err}");
+        assert!(err.contains("route hop key"));
     }
 
     #[test]
@@ -1153,8 +1136,7 @@ clients:
   - name: c1
     socks: 127.0.0.1:1080
     route:
-      - addr: 127.10.0.11:9050
-        pubkey: "{}"
+      - "{}::127.10.0.11:9050"
 "#,
             sample_pubkey_hex(7)
         );
