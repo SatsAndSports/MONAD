@@ -63,8 +63,11 @@ cleanup interleaving through the production eviction path.
   independent reviews: the relay reviewer reported no correctness findings and
   noted coverage/performance gaps; the client reviewer identified the P2
   blocked-write reset issue recorded below and no other client findings.
-  Exhaustive transport/failure Cartesian testing, abrupt OS-socket reclamation,
-  and independent re-review of the correction are not claimed here.
+  The client reviewer subsequently re-reviewed correction `6b86a2a`, confirmed
+  independent reset observation and preserved half-close behavior, and found no
+  new actionable defects. This was source review, not another test run.
+  Exhaustive transport/failure Cartesian testing and abrupt OS-socket
+  reclamation are not claimed here.
 
 ## Watcher/Pool Validation
 
