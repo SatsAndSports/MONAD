@@ -8,6 +8,7 @@ observation log; child logs and test proofs never leave the private temp directo
 import argparse
 import contextlib
 import copy
+import ipaddress
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import tempfile
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -32,7 +34,26 @@ PINS = {
     "nutshell": "a9749146c6bd7f9ab75375a050e9ba795cee301c",
     "nutmix": "7a2329480b7119d5c2e9e16936462a6e7886e91c",
 }
-HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+
+def loopback_url(url):
+    assert url.startswith("http://") and not any(c.isspace() for c in url)
+    parsed = urllib.parse.urlsplit(url)
+    assert parsed.scheme == "http" and parsed.hostname
+    assert parsed.username is None and parsed.password is None
+    assert not parsed.query and not parsed.fragment
+    assert "?" not in url and "#" not in url
+    assert parsed.path in ("", "/")
+    assert parsed.port is None or 0 < parsed.port < 65536
+    assert ipaddress.ip_address(parsed.hostname).is_loopback
 
 
 def emit(**record):
@@ -40,6 +61,7 @@ def emit(**record):
 
 
 def request(url, path, payload=None):
+    loopback_url(url)
     data = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(url + path, data, {"Content-Type": "application/json"})
     try:
@@ -64,13 +86,24 @@ def port():
 
 
 def stop(child):
-    if child.poll() is None:
+    # The leader can exit while a descendant still owns sockets or DB locks.
+    try:
         os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        child.wait(timeout=10)
+        return
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        child.poll()  # Reap the leader independently of its process group.
         try:
-            child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        with contextlib.suppress(ProcessLookupError):
             os.killpg(child.pid, signal.SIGKILL)
-            child.wait()
+    child.wait(timeout=10)
 
 
 @contextlib.contextmanager
@@ -151,8 +184,8 @@ def server(name, root, args):
                     XDG_CONFIG_HOME=str(root),
                     GIN_MODE="release",
                 )
-                cmd = [str(args.nutmix / "monad-characterization")]
-                cwd = args.nutmix
+                cmd = [str(args.nutmix_build / "monad-characterization")]
+                cwd = args.nutmix_build
             else:
                 cmd = [
                     str(args.cdk_binary),
@@ -178,15 +211,18 @@ def server(name, root, args):
             emit(mint=name, event="ready", url=url, pid=child.pid)
             yield url
         finally:
-            if child is not None:
-                stop(child)
-            if container is not None:
-                subprocess.run(
-                    ["docker", "rm", "-f", "-v", container],
-                    stdout=log,
-                    stderr=log,
-                    check=True,
-                )
+            try:
+                if child is not None:
+                    stop(child)
+            finally:
+                if container is not None:
+                    subprocess.run(
+                        ["docker", "rm", "-f", "-v", container],
+                        stdout=log,
+                        stderr=log,
+                        check=True,
+                        timeout=30,
+                    )
             emit(mint=name, event="cleaned")
 
 
@@ -275,7 +311,7 @@ def restore(url, messages, signatures=None):
     return returned
 
 
-def rejected(name, case, url, inputs, messages):
+def rejected(name, case, url, inputs, messages, inactive_code):
     status, body = request(url, "/v1/swap", {"inputs": inputs, "outputs": messages})
     assert 400 <= status < 600, f"{case}: unexpectedly accepted"
     states(url, inputs, "UNSPENT")
@@ -302,7 +338,7 @@ def rejected(name, case, url, inputs, messages):
         "nutmix": {
             "unknown_output": 12001,
             "unknown_input": 12001,
-            "inactive_output_after_rotation": 12001,
+            "inactive_output_after_rotation": inactive_code,
         },
         "nutshell": {
             "unknown_output": 11000,
@@ -315,7 +351,7 @@ def rejected(name, case, url, inputs, messages):
     ), "pinned observation changed"
 
 
-def characterize(name, url):
+def characterize(name, url, inactive_code=12001):
     inputs = mint(url, [8, 8])
     old = inputs[0]["id"]
     messages, private = outputs(old, [16])
@@ -333,11 +369,11 @@ def characterize(name, url):
     unknown = "00" + "ab" * 7
     assert all(k["id"] != unknown for k in ok(url, "/v1/keysets")["keysets"])
     messages, _ = outputs(unknown, [16])
-    rejected(name, "unknown_output", url, inputs, messages)
+    rejected(name, "unknown_output", url, inputs, messages, inactive_code)
     messages, _ = outputs(old, [16])
     bad_inputs = copy.deepcopy(inputs)
     bad_inputs[0]["id"] = unknown
-    rejected(name, "unknown_input", url, bad_inputs, messages)
+    rejected(name, "unknown_input", url, bad_inputs, messages, inactive_code)
     # The exact output request is prepared before a real administrative rotation.
     ok(url, "/_test/rotate", {})
     new = active(url)["id"]
@@ -345,7 +381,9 @@ def characterize(name, url):
     assert any(
         k["id"] == old and not k["active"] for k in ok(url, "/v1/keysets")["keysets"]
     )
-    rejected(name, "inactive_output_after_rotation", url, inputs, messages)
+    rejected(
+        name, "inactive_output_after_rotation", url, inputs, messages, inactive_code
+    )
     messages, private = outputs(new, [16])
     response = ok(url, "/v1/swap", {"inputs": inputs, "outputs": messages})
     states(url, inputs, "SPENT")
@@ -368,7 +406,7 @@ def characterize(name, url):
     )
 
 
-def lifecycle(name, case, url, root, binary):
+def lifecycle(name, case, url, root, args):
     proofs = root / f"{name}-bootstrap.json"
     proofs.write_text(json.dumps(mint(url, [16384])))
     env = dict(
@@ -376,14 +414,14 @@ def lifecycle(name, case, url, root, binary):
         MONAD_CHARACTERIZATION_URL=url,
         MONAD_CHARACTERIZATION_CASE=case,
         MONAD_CHARACTERIZATION_PROOFS=str(proofs),
-        MONAD_FUNDS_CLIENT_BIN=str(REPO / "target/funds-lifecycle/debug/monad-client"),
-        MONAD_FUNDS_RELAY_BIN=str(REPO / "target/funds-lifecycle/debug/monad-relay"),
+        MONAD_FUNDS_CLIENT_BIN=str(args.client_binary),
+        MONAD_FUNDS_RELAY_BIN=str(args.relay_binary),
     )
     log_path = root / f"{name}-{case}.log"
     with log_path.open("wb") as log:
         child = subprocess.Popen(
             [
-                str(binary),
+                str(args.lifecycle_binary),
                 "--ignored",
                 "--exact",
                 "external_mint_signed_lifecycle",
@@ -421,10 +459,27 @@ def lifecycle(name, case, url, root, binary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--nutshell", type=Path, required=True)
-    parser.add_argument("--nutmix", type=Path, required=True)
-    parser.add_argument("--cdk-binary", type=Path, required=True)
+    parser.add_argument("--nutshell", type=Path)
+    parser.add_argument("--nutmix", type=Path)
+    parser.add_argument("--nutmix-revision", default=PINS["nutmix"])
+    parser.add_argument("--nutmix-inactive-code", type=int, choices=[12001, 12002])
+    parser.add_argument("--cdk-binary", type=Path)
     parser.add_argument("--lifecycle-binary", type=Path)
+    parser.add_argument(
+        "--client-binary",
+        type=Path,
+        default=REPO / "target/funds-lifecycle/debug/monad-client",
+    )
+    parser.add_argument(
+        "--relay-binary",
+        type=Path,
+        default=REPO / "target/funds-lifecycle/debug/monad-relay",
+    )
+    parser.add_argument(
+        "--temp-dir",
+        type=Path,
+        help="private artifacts parent (default: system temp directory)",
+    )
     parser.add_argument(
         "--cases",
         nargs="+",
@@ -450,46 +505,100 @@ def main():
         choices=["cdk", "nutmix", "nutshell"],
     )
     args = parser.parse_args()
+    if not __debug__:
+        parser.error("run without Python optimization; assertions are the test oracle")
     os.umask(0o077)
+    if "cdk" in args.mints and args.cdk_binary is None:
+        parser.error("--cdk-binary is required for CDK")
+    if "nutmix" in args.mints:
+        if not re.fullmatch(r"[0-9a-f]{40}", args.nutmix_revision):
+            parser.error("--nutmix-revision must be a full immutable SHA")
+        if args.nutmix_revision == PINS["nutmix"]:
+            if args.nutmix_inactive_code not in (None, 12001):
+                parser.error("release Nutmix expectations cannot be changed")
+            args.nutmix_inactive_code = 12001
+        elif args.nutmix_inactive_code is None:
+            parser.error("candidate revisions require explicit --nutmix-inactive-code")
+    for name in (
+        "cdk_binary",
+        "lifecycle_binary",
+        "client_binary",
+        "relay_binary",
+        "nutshell",
+        "nutmix",
+        "temp_dir",
+    ):
+        if getattr(args, name) is not None:
+            setattr(args, name, getattr(args, name).resolve())
     for name, sha in PINS.items():
+        if name not in args.mints:
+            continue
         checkout = getattr(args, name)
+        if checkout is None:
+            parser.error(f"--{name} is required for the selected backend")
+        if name == "nutmix":
+            sha = args.nutmix_revision
         actual = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
         ).strip()
-        assert actual == sha, f"{name}: not the pinned release"
+        assert actual == sha, f"{name}: not the configured immutable revision"
         subprocess.run(
             ["git", "diff", "--quiet", "HEAD", "--"], cwd=checkout, check=True
         )
-    if "nutmix" in args.mints:
-        adapter = args.nutmix / "cmd" / "monad-characterization"
-        adapter.mkdir(exist_ok=True)
-        shutil.copyfile(HERE / "nutmix_adapter.go", adapter / "main.go")
-        subprocess.run(
-            [
-                "go",
-                "build",
-                "-o",
-                "monad-characterization",
-                "./cmd/monad-characterization",
-            ],
-            cwd=args.nutmix,
-            check=True,
-            timeout=600,
-        )
     root = Path(
-        tempfile.mkdtemp(prefix="monad-mint-characterization-", dir="/tmp/opencode")
+        tempfile.mkdtemp(prefix="monad-mint-characterization-", dir=args.temp_dir)
     )
-    failed = False
+    failed = True
     try:
+        if "nutmix" in args.mints:
+            # Clone tracked content only. Never overwrite supplied untracked packages.
+            args.nutmix_build = root / "nutmix-source"
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--no-hardlinks",
+                    "--no-checkout",
+                    str(args.nutmix.resolve()),
+                    str(args.nutmix_build),
+                ],
+                check=True,
+                timeout=120,
+            )
+            subprocess.run(
+                ["git", "checkout", "--detach", args.nutmix_revision],
+                cwd=args.nutmix_build,
+                check=True,
+                timeout=120,
+            )
+            adapter = args.nutmix_build / "cmd" / "monad-characterization"
+            adapter.mkdir()  # Refuse a collision with tracked upstream source.
+            shutil.copyfile(HERE / "nutmix_adapter.go", adapter / "main.go")
+            subprocess.run(
+                [
+                    "go",
+                    "build",
+                    "-o",
+                    "monad-characterization",
+                    "./cmd/monad-characterization",
+                ],
+                cwd=args.nutmix_build,
+                check=True,
+                timeout=600,
+            )
+            emit(
+                mint="nutmix",
+                revision=args.nutmix_revision,
+                inactive_code=args.nutmix_inactive_code,
+            )
+        failed = False
         for name in args.mints:
             try:
                 with server(name, root, args) as url:
-                    characterize(name, url)
+                    characterize(name, url, args.nutmix_inactive_code)
                     if args.lifecycle_binary:
                         for case in args.cases:
-                            failed |= not lifecycle(
-                                name, case, url, root, args.lifecycle_binary
-                            )
+                            failed |= not lifecycle(name, case, url, root, args)
             except Exception as error:
                 failed = True
                 # Do not print exception arguments: libraries may embed proof data.

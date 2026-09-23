@@ -9,6 +9,8 @@ async fn external_mint_signed_lifecycle() {
     let url = std::env::var("MONAD_CHARACTERIZATION_URL").unwrap();
     let proofs = std::env::var("MONAD_CHARACTERIZATION_PROOFS").unwrap();
     let mut fixture = support::Fixture::start_external(url, proofs.into()).await;
+    fixture.postcommit_rotation = true;
+    fixture.scenario_rotation_fee = Some(0);
     match std::env::var("MONAD_CHARACTERIZATION_CASE")
         .as_deref()
         .unwrap_or("baseline")

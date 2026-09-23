@@ -15,11 +15,13 @@ were changed. All funds are disposable fake-Lightning funds.
 | Nutshell | `0.21.0`, `a9749146c6bd7f9ab75375a050e9ba795cee301c` |
 | Nutmix database | Docker `postgres:16.8`, disposable anonymous volume |
 
-Nutmix and Nutshell were fresh shallow clones under `/tmp/opencode`; no other
-mint clones were used. The runner verifies their SHAs and rejects tracked source
-changes. No development-head version was substituted.
+The release runs used fresh pinned Nutmix and Nutshell clones. The runner verifies
+selected backend SHAs and rejects tracked source changes. Nutmix is built in an
+owned disposable clone containing only the configured revision and our adapter;
+supplied checkouts, including their untracked packages, are never modified.
+Candidate results below are separate from the unchanged release expectations.
 
-Rechecked on 2026-09-23: Nutmix `master` points to the same
+At original publication on 2026-09-23, Nutmix `master` pointed to the same
 `7a2329480b7119d5c2e9e16936462a6e7886e91c` SHA as `v0.7.0`.
 GitHub's `v0.7.0...master` comparison is **identical**, with zero commits ahead
 or behind. This is source/revision equivalence, not an additional matrix run.
@@ -129,50 +131,121 @@ mint: all inputs UNSPENT and zero exact restored outputs (one funding proof for
 opening/close/refund; three inputs for drain). Rejected probes against already
 spent funding, encountered during later discovery, instead check unchanged
 pre/post state and restore evidence. The proxy does not turn such probes into
-transport failures. The runner also rejects a nominally successful test process
-if its log contains a worker panic.
+transport failures. Handler assertion failures, panics and cancellation latch a
+fixture-owned failure; parent custody audits and scenario completion assert this
+oracle and require no checks still running. The runner's worker-panic log scan
+is defense in depth, not the correctness oracle. Rust custody checks match every
+requested Y and exact restored B_/ID/amount and paired C_/ID/amount, ignoring only
+optional DLEQ/witness representation. Final proof DLEQ verification is unchanged.
 
 These are **positive signed MONAD interoperability results**, beyond ordinary
 swaps. They are not an exhaustive certification of mint spending-condition
 enforcement: invalid/missing witnesses, malicious splits, and all signature modes
 were not tested in this characterization.
 
+## Nutmix Candidate
+
+[Issue 259](https://github.com/lescuer97/nutmix/issues/259) is addressed by the
+separate upstream [PR 260](https://github.com/lescuer97/nutmix/pull/260), still open
+when checked. No Nutmix or MONAD production fix is included in this MONAD PR.
+
+| Revision | Meaning | Ordinary observations | MONAD lifecycle |
+| --- | --- | --- | --- |
+| `7a2329480b7119d5c2e9e16936462a6e7886e91c` | Original v0.7.0 release | 6/6, inactive output 12001 | 5/12, seven actual failures |
+| `ef7017157adc78ceb3bf16a03ee78e2060338792` | Upstream production fix | 6/6, inactive output 12002 | 12/12 historical private validation |
+| `88cdfb3363f24ae504ed42d3d39487b892dfd251` | Later signer-test consolidation, identical production code | 6/6, inactive output 12002 | 12/12 rerun with this runner's explicit configuration |
+
+The historical `ef70171` run used MONAD `e6b9678` and a private validation wrapper.
+That wrapper is neither imported nor needed here. The new `88cdfb3` run uses the
+tracked runner directly with full SHA and expected-code arguments. All seven
+candidate rotation cases observed HTTP 400/12002, exact requested inputs UNSPENT
+and empty restore before the permitted successor. Unknown input/output remain
+HTTP 400/12001; accepted restores match after another rotation. Every candidate
+process exits zero without worker panics. The release matrix remains 29/36 and
+returns nonzero, not an expected-failure success or a skip.
+
 ## Reproduction
 
-Requirements: Rust workspace dependencies, Docker, Go, Poetry/Python, available
+Requirements: Rust workspace dependencies, Docker, Go, Poetry/Python, jq, available
 loopback ports, and network access to fetch pinned dependencies. Run from MONAD's
 root; the clone commands are first-time setup and do not overwrite existing clones.
 
 ```bash
 MONAD="$PWD"
-ls /tmp/opencode
-git clone --depth 1 --branch v0.7.0 https://github.com/lescuer97/nutmix.git /tmp/opencode/monad-characterize-nutmix
-git clone --depth 1 --branch 0.21.0 https://github.com/cashubtc/nutshell.git /tmp/opencode/monad-characterize-nutshell
-poetry -C /tmp/opencode/monad-characterize-nutshell install --with dev
+WORK="$(mktemp -d)"
+git clone --depth 1 --branch v0.7.0 https://github.com/lescuer97/nutmix.git "$WORK/nutmix"
+git clone --depth 1 --branch 0.21.0 https://github.com/cashubtc/nutshell.git "$WORK/nutshell"
+poetry -C "$WORK/nutshell" install --with dev
 cargo build -p monad-client -p monad-relay --bins --features monad-client/funds-lifecycle-test,monad-relay/funds-lifecycle-test --target-dir target/funds-lifecycle
-cargo test -p monad-relay --test mint_characterization --target-dir target/funds-lifecycle --no-run
-cargo test -p monad-relay --features funds-lifecycle-test --test mint_external_lifecycle --target-dir target/funds-lifecycle --no-run
+set -o pipefail
+CDK_BIN="$(cargo test -p monad-relay --features funds-lifecycle-test --test mint_characterization --target-dir target/funds-lifecycle --no-run --message-format=json | jq -r 'select(.target.name == "mint_characterization" and .executable != null) | .executable')"
+LIFECYCLE_BIN="$(cargo test -p monad-relay --features funds-lifecycle-test --test mint_external_lifecycle --target-dir target/funds-lifecycle --no-run --message-format=json | jq -r 'select(.target.name == "mint_external_lifecycle" and .executable != null) | .executable')"
 ```
 
-Use the executable paths printed by the last two commands. For the recorded build:
+Cargo selects the executable paths, including platform/build-dependent hashes.
+All backends use Nutshell's pinned Python crypto helpers for ordinary proof
+blinding/unblinding, even when the Nutshell server is not selected. Install that
+environment once; `--nutshell` itself is required only when running that backend.
+Run the release matrix (expected exit 1 because of the seven Nutmix failures):
 
 ```bash
-poetry -C /tmp/opencode/monad-characterize-nutshell run python "$MONAD/monad-relay/tests/characterization/run.py" \
-  --nutshell /tmp/opencode/monad-characterize-nutshell \
-  --nutmix /tmp/opencode/monad-characterize-nutmix \
-  --cdk-binary "$MONAD/target/funds-lifecycle/debug/deps/mint_characterization-a5c2cf29f4c0925c" \
-  --lifecycle-binary "$MONAD/target/funds-lifecycle/debug/deps/mint_external_lifecycle-bd34300e44b0897a"
+poetry -C "$WORK/nutshell" run python "$MONAD/monad-relay/tests/characterization/run.py" \
+  --nutshell "$WORK/nutshell" --nutmix "$WORK/nutmix" \
+  --cdk-binary "$CDK_BIN" --lifecycle-binary "$LIFECYCLE_BIN"
 ```
+
+To reproduce the separately pinned candidate without changing release defaults:
+
+```bash
+git clone https://github.com/SatsAndSports/nutmix.git "$WORK/nutmix-candidate"
+git -C "$WORK/nutmix-candidate" checkout --detach 88cdfb3363f24ae504ed42d3d39487b892dfd251
+poetry -C "$WORK/nutshell" run python "$MONAD/monad-relay/tests/characterization/run.py" \
+  --mints nutmix --nutmix "$WORK/nutmix-candidate" \
+  --nutmix-revision 88cdfb3363f24ae504ed42d3d39487b892dfd251 \
+  --nutmix-inactive-code 12002 --lifecycle-binary "$LIFECYCLE_BIN"
+poetry -C "$WORK/nutshell" run python -m unittest discover \
+  -s "$MONAD/monad-relay/tests/characterization" -p test_run.py
+```
+
+The runner requires a full 40-hex candidate SHA, exact checkout HEAD, clean tracked
+source, and an explicit candidate inactive-output expectation. Release expectations
+cannot be overridden. Only selected mint backends are checked/built. Override
+`--client-binary` and `--relay-binary` for alternate isolated CLI builds; defaults
+are repo-relative `target/funds-lifecycle/debug/monad-{client,relay}`. `--temp-dir`
+overrides the private artifact parent; otherwise the system temp directory is used.
 
 Omit `--lifecycle-binary` for the ordinary matrix only. `--mints nutshell` or
 `--cases refund-loss refund-rotation` narrows the matrix without changing tests.
-The runner builds the retained Go adapter inside the fresh Nutmix clone. Adapters
+The runner builds the retained Go adapter inside its own disposable clone. Adapters
 expose loopback-only `POST /_test/rotate`, invoking CDK `rotate_sat_keyset`, Nutmix
 `Signer.RotateKeyset`, or Nutshell `ledger.rotate_next_keyset`. Cashu endpoints
-remain upstream implementations. External adapters deliberately keep fees zero;
-the separate CDK baseline tests nonzero fees and fee changes.
+remain upstream implementations. External scenarios explicitly select zero-fee
+rotation and post-commit rotation before opening/refund restore. Calling the
+external fixture's rotation API with a nonzero fee fails, rather than silently
+ignoring it. Every lifecycle rotation verifies old IDs inactive, different active
+IDs and the requested fee through `/v1/keysets`. The separate CDK crash suite
+preserves its existing nonzero-fee scenarios and tests fee changes.
+Only parsed HTTP loopback IP origins without credentials, paths, queries or
+fragments are accepted; fixture HTTP clients disable redirects. Never use public
+mints or real funds.
 
 ## Validation And Limits
+
+Cleanup reruns on 2026-09-23 (historical results below retained for provenance):
+
+- Full `cargo test`: **581 passed, 0 failed, 20 ignored**; six additional executions
+  are the three shared harness regressions included in both integration targets.
+- `make test-funds-crashes`: **11 passed, 0 failed** after fixture cleanup.
+- Full release ordinary matrix: **18 observations**; process matrix **CDK 12/12,
+  Nutmix 5/12, Nutshell 12/12**, overall exit **1** for seven Nutmix failures.
+- Candidate `88cdfb3`: **6 ordinary observations, 12/12 lifecycle**, exit **0**,
+  using explicit tracked-runner configuration, not a source-replacement wrapper.
+- Strict workspace/all-target/all-feature Clippy; Rust fmt/diff checks; Python
+  Ruff lint/format and three Python harness tests; Go adapter build, test (no Go
+  test files) and vet. Rust regressions cover detached failure propagation, URL
+  validation, wrong-Y responses, restore output identity and optional DLEQ.
+
+Original implementation/publication validation:
 
 - `cargo test`: **575 passed, 0 failed, 20 ignored**, including the two new opt-in targets.
 - `make test-funds-crashes`: **11 passed, 0 failed**, rerun after fixture changes,
@@ -211,7 +284,10 @@ test is not evidence of Nutmix/Nutshell restart durability.
 ## Cleanup
 
 Every launched mint and process-test child is tracked, terminated and reaped;
-each runner-owned PostgreSQL container and anonymous volume is removed explicitly.
+process groups are terminated even after their leader exits, with a bounded TERM
+grace period followed by KILL for surviving descendants. The Python regression
+exercises an exited leader with a TERM-ignoring descendant.
+Each runner-owned PostgreSQL container and anonymous volume is removed explicitly.
 No global Docker cleanup is used. Successful private runner directories are
 deleted. Failure directories and failed MONAD wallet fixtures are private and
 retained for local investigation only; **never publish or commit them**. The runner

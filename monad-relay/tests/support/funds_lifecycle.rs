@@ -24,6 +24,114 @@ use tokio::task::JoinSet;
 const DEADLINE: Duration = Duration::from_secs(45);
 const INITIAL: u64 = 16_384;
 
+fn loopback_url(url: &str) -> bool {
+    url.starts_with("http://")
+        && !url.chars().any(char::is_whitespace)
+        && !url[7..].split('/').next().unwrap_or("").contains('@')
+        && reqwest::Url::parse(url).is_ok_and(|u| {
+            u.scheme() == "http"
+                && u.username().is_empty()
+                && u.password().is_none()
+                && u.query().is_none()
+                && u.fragment().is_none()
+                && u.path() == "/"
+                && u.host_str().is_some_and(|host| {
+                    host.trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+                })
+        })
+}
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(DEADLINE)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+// An unwinding or cancelled handler must fail the parent, even if Axum survives it.
+struct ProxyCheck {
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    complete: bool,
+}
+
+impl Drop for ProxyCheck {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.pending
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn check_states(proofs: &[Proof], states: &cashu::nuts::CheckStateResponse, state: Option<State>) {
+    let expected = proofs
+        .iter()
+        .map(|p| p.y().unwrap())
+        .collect::<BTreeSet<_>>();
+    let actual = states.states.iter().map(|s| s.y).collect::<BTreeSet<_>>();
+    assert!(
+        expected == actual && states.states.len() == expected.len(),
+        "checkstate Y identity mismatch (redacted)"
+    );
+    if let Some(state) = state {
+        assert!(
+            states.states.iter().all(|s| s.state == state),
+            "checkstate state mismatch (redacted)"
+        );
+    }
+}
+
+fn check_restore(
+    swap: &SwapRequest,
+    response: &SwapResponse,
+    restored: &cashu::nuts::RestoreResponse,
+) {
+    assert!(
+        swap.outputs().len() == response.signatures.len(),
+        "unpaired accepted signatures (redacted)"
+    );
+    assert!(
+        restored.outputs.len() == restored.signatures.len(),
+        "unpaired restored signatures (redacted)"
+    );
+    // Optional DLEQ/witness representation is not output identity. Final custody
+    // still performs cryptographic DLEQ verification below.
+    let fields = |value: Value, names: &[&str]| -> Vec<Vec<Value>> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| names.iter().map(|name| item[*name].clone()).collect())
+            .collect()
+    };
+    assert!(
+        fields(
+            serde_json::to_value(swap.outputs()).unwrap(),
+            &["B_", "id", "amount"]
+        ) == fields(
+            serde_json::to_value(&restored.outputs).unwrap(),
+            &["B_", "id", "amount"]
+        ),
+        "restore output identity mismatch (redacted)"
+    );
+    assert!(
+        fields(
+            serde_json::to_value(&response.signatures).unwrap(),
+            &["C_", "id", "amount"]
+        ) == fields(
+            serde_json::to_value(&restored.signatures).unwrap(),
+            &["C_", "id", "amount"]
+        ),
+        "restore signature identity mismatch (redacted)"
+    );
+}
+
 pub async fn persistent_mint_worker() {
     use std::os::unix::fs::OpenOptionsExt;
     let Ok(root) = std::env::var("MONAD_TEST_MINT_ROOT") else {
@@ -82,6 +190,7 @@ async fn start_mint_child(root: &Path, port: u16, url: &str) -> Process {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
     tokio::time::timeout(DEADLINE, async {
@@ -239,6 +348,11 @@ pub struct Fixture {
     mint_port: Option<u16>,
     mint_url: String,
     external_url: Option<String>,
+    proxy_failed: Arc<std::sync::atomic::AtomicBool>,
+    proxy_pending: Arc<std::sync::atomic::AtomicUsize>,
+    // Opening/refund loss only; close/drain already rotate after lost responses.
+    pub postcommit_rotation: bool,
+    pub scenario_rotation_fee: Option<u64>,
     socks: std::net::SocketAddr,
     target: std::net::SocketAddr,
     ledger: Arc<Mutex<Ledger>>,
@@ -260,10 +374,7 @@ impl Fixture {
 
     #[allow(dead_code)] // Used only by the separate opt-in external characterization target.
     pub async fn start_external(url: String, proofs: PathBuf) -> Self {
-        assert!(
-            url.starts_with("http://127.0.0.1:"),
-            "disposable loopback mint only"
-        );
+        assert!(loopback_url(&url), "disposable loopback mint only");
         Self::start_mint(false, Some((url, proofs))).await
     }
 
@@ -284,18 +395,22 @@ impl Fixture {
             .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mint_url = format!("http://{}", listener.local_addr().unwrap());
+        let proxy_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let proxy_pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (mint, mint_process, mint_port, router) = if let Some((url, proofs)) = &external {
             std::fs::copy(proofs, dir.path().join("initial-proofs.json")).unwrap();
             let url = url.clone();
-            let client = reqwest::Client::builder()
-                .timeout(DEADLINE)
-                .no_proxy()
-                .build()
-                .unwrap();
+            let client = http_client();
+            let failed = proxy_failed.clone();
+            let pending = proxy_pending.clone();
             let router = axum::Router::new().fallback(move |request: Request| {
                 let client = client.clone();
                 let url = url.clone();
+                let failed = failed.clone();
+                let pending = pending.clone();
                 async move {
+                    pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut check = ProxyCheck { failed, pending, complete: false };
                     let (parts, body) = request.into_parts();
                     let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
                     let checked_swap = if parts.uri.path() == "/v1/swap" {
@@ -306,6 +421,7 @@ impl Fixture {
                         let restored: cashu::nuts::RestoreResponse = client.post(format!("{url}/v1/restore"))
                             .json(&RestoreRequest { outputs: swap.outputs().to_vec() })
                             .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+                        check_states(swap.inputs(), &states, None);
                         Some((swap, states, restored))
                     } else { None };
                     let response = client.request(parts.method, format!("{url}{}", parts.uri))
@@ -317,7 +433,7 @@ impl Fixture {
                             let states: cashu::nuts::CheckStateResponse = client.post(format!("{url}/v1/checkstate"))
                                 .json(&CheckStateRequest { ys: swap.inputs().iter().map(|p| p.y().unwrap()).collect() })
                                 .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
-                            assert_eq!(states.states.len(), swap.inputs().len());
+                            check_states(swap.inputs(), &states, None);
                             assert!(serde_json::to_value(&states).unwrap() == serde_json::to_value(&before_states).unwrap(),
                                 "rejection changed input states (proofs redacted)");
                             let restored: cashu::nuts::RestoreResponse = client.post(format!("{url}/v1/restore"))
@@ -334,8 +450,10 @@ impl Fixture {
                             }
                         }
                     }
-                    axum::response::Response::builder().status(status)
-                        .header("content-type", "application/json").body(Body::from(bytes)).unwrap()
+                    let response = axum::response::Response::builder().status(status)
+                        .header("content-type", "application/json").body(Body::from(bytes)).unwrap();
+                    check.complete = true;
+                    response
                 }
             });
             (None, None, None, router)
@@ -347,6 +465,7 @@ impl Fixture {
             let client = reqwest::Client::builder()
                 .timeout(DEADLINE)
                 .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap();
             let router = axum::Router::new().fallback(move |request: Request| {
@@ -601,6 +720,10 @@ clients:
             mint_port,
             mint_url,
             external_url: external.map(|(url, _)| url),
+            proxy_failed,
+            proxy_pending,
+            postcommit_rotation: false,
+            scenario_rotation_fee: None,
             socks,
             target,
             ledger,
@@ -628,11 +751,7 @@ clients:
         path: &str,
         body: &impl serde::Serialize,
     ) -> T {
-        reqwest::Client::builder()
-            .timeout(DEADLINE)
-            .no_proxy()
-            .build()
-            .unwrap()
+        http_client()
             .post(format!("{}{path}", self.mint_url))
             .json(body)
             .send()
@@ -998,7 +1117,7 @@ clients:
                     tokio::time::timeout(DEADLINE, self.committed.notified())
                         .await
                         .expect("close rejection request gate");
-                    self.rotate(250).await;
+                    self.rotate(self.scenario_rotation_fee.unwrap_or(250)).await;
                     self.release_gate().await;
                 };
                 tokio::join!(
@@ -1032,7 +1151,7 @@ clients:
                 tokio::time::timeout(DEADLINE, self.committed.notified())
                     .await
                     .expect("close request gate");
-                self.rotate(250).await;
+                self.rotate(self.scenario_rotation_fee.unwrap_or(250)).await;
                 self.release_gate().await;
             }
             if lost_response {
@@ -1041,7 +1160,7 @@ clients:
                     .expect("close response gate");
                 drop(child);
                 self.release_gate().await;
-                self.rotate(300).await;
+                self.rotate(self.scenario_rotation_fee.unwrap_or(300)).await;
             } else {
                 child.success().await;
             }
@@ -1069,7 +1188,7 @@ clients:
                 tokio::time::timeout(DEADLINE, self.committed.notified())
                     .await
                     .expect("refund request gate");
-                self.rotate(250).await;
+                self.rotate(self.scenario_rotation_fee.unwrap_or(250)).await;
                 self.release_gate().await;
             }
             if lost_response {
@@ -1078,8 +1197,8 @@ clients:
                     .expect("refund commit gate");
                 drop(child);
                 self.release_gate().await;
-                if self.external_url.is_some() {
-                    self.rotate(300).await;
+                if self.postcommit_rotation {
+                    self.rotate(self.scenario_rotation_fee.unwrap_or(300)).await;
                 }
                 let submitted = self.ledger.lock().unwrap().requests;
                 self.client(&args).success().await;
@@ -1155,7 +1274,7 @@ clients:
                     tokio::time::timeout(DEADLINE, self.committed.notified())
                         .await
                         .expect("drain rejection request gate");
-                    self.rotate(200).await;
+                    self.rotate(self.scenario_rotation_fee.unwrap_or(200)).await;
                     self.release_gate().await;
                 };
                 tokio::join!(
@@ -1174,7 +1293,7 @@ clients:
                 tokio::time::timeout(DEADLINE, self.committed.notified())
                     .await
                     .expect("drain request gate");
-                self.rotate(200).await;
+                self.rotate(self.scenario_rotation_fee.unwrap_or(200)).await;
                 self.release_gate().await;
             }
             if lost_response {
@@ -1183,7 +1302,7 @@ clients:
                     .expect("drain response gate");
                 drop(child);
                 self.release_gate().await;
-                self.rotate(350).await;
+                self.rotate(self.scenario_rotation_fee.unwrap_or(350)).await;
             } else {
                 child.success().await;
             }
@@ -1299,7 +1418,7 @@ clients:
         }
         if rotate {
             assert!(!kill_before, "direct rejection must reach live client");
-            self.rotate(350).await;
+            self.rotate(self.scenario_rotation_fee.unwrap_or(350)).await;
         }
         self.release_gate().await;
         tokio::time::timeout(DEADLINE, self.committed.notified())
@@ -1307,8 +1426,8 @@ clients:
             .expect("opening commit gate");
         drop(client);
         self.release_gate().await;
-        if self.external_url.is_some() {
-            self.rotate(400).await;
+        if self.postcommit_rotation {
+            self.rotate(self.scenario_rotation_fee.unwrap_or(400)).await;
         }
         let submitted = self.ledger.lock().unwrap().requests;
         self.client(&["wallet", "recover-openings"]).success().await;
@@ -1419,13 +1538,19 @@ clients:
 
     pub async fn rotate(&self, ppk: u64) {
         if let Some(url) = &self.external_url {
-            // External adapters deliberately keep fees at zero; the CDK process
-            // baseline separately covers fee changes and purse conservation.
-            reqwest::Client::builder()
-                .timeout(DEADLINE)
-                .no_proxy()
-                .build()
+            assert_eq!(ppk, 0, "external adapters do not support fee changes");
+            let client = http_client();
+            let before: Value = client
+                .get(format!("{url}/v1/keysets"))
+                .send()
+                .await
                 .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            client
                 .post(format!("{url}/_test/rotate"))
                 .json(&serde_json::json!({}))
                 .send()
@@ -1433,6 +1558,50 @@ clients:
                 .unwrap()
                 .error_for_status()
                 .unwrap();
+            let after: Value = client
+                .get(format!("{url}/v1/keysets"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let active = |v: &Value| {
+                v["keysets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|k| k["unit"] == "sat" && k["active"] == true)
+                    .map(|k| k["id"].as_str().unwrap().to_owned())
+                    .collect::<BTreeSet<_>>()
+            };
+            let old = active(&before);
+            let new = active(&after);
+            assert!(
+                !old.is_empty() && !new.is_empty() && old.is_disjoint(&new),
+                "rotation did not replace active keys"
+            );
+            for id in old {
+                assert!(
+                    after["keysets"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|k| k["id"] == id && k["active"] == false),
+                    "old keyset not retained inactive"
+                );
+            }
+            assert!(
+                after["keysets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|k| k["unit"] == "sat" && k["active"] == true)
+                    .all(|k| k["input_fee_ppk"].as_u64().unwrap_or(0) == ppk),
+                "rotation fee mismatch"
+            );
         } else {
             rotate_sat_keyset(&self.memory_mint(), ppk).await.unwrap();
         }
@@ -1537,6 +1706,7 @@ clients:
     }
 
     async fn audit_custody(&self, include_reserved: bool) {
+        self.assert_proxy_checks();
         let wallet = LooseProofWallet::open(
             self.dir.as_ref().unwrap().path().join("loose.db"),
             CONFIGURED_CLIENT_WALLET_NAME,
@@ -1577,13 +1747,9 @@ clients:
         let states: cashu::nuts::CheckStateResponse = self
             .mint_post("/v1/checkstate", &CheckStateRequest { ys })
             .await;
-        assert_eq!(states.states.len(), proofs.len());
-        assert!(
-            states.states.iter().all(|s| s.state == State::Unspent),
-            "final custody includes spent/unknown proofs"
-        );
+        check_states(&proofs, &states, Some(State::Unspent));
         for proof in &proofs {
-            let keys: cashu::nuts::KeysResponse = reqwest::Client::new()
+            let keys: cashu::nuts::KeysResponse = http_client()
                 .get(format!("{}/v1/keys/{}", self.mint_url, proof.keyset_id))
                 .send()
                 .await
@@ -1597,7 +1763,7 @@ clients:
                 .verify_dleq(*keys.keysets[0].keys.get(&proof.amount).unwrap())
                 .expect("final proof DLEQ invalid");
         }
-        let metadata: Value = reqwest::Client::new()
+        let metadata: Value = http_client()
             .get(format!("{}/v1/keysets", self.mint_url))
             .send()
             .await
@@ -1627,10 +1793,7 @@ clients:
                     },
                 )
                 .await;
-            assert!(
-                restored.signatures == response.signatures,
-                "accepted output restore mismatch"
-            );
+            check_restore(swap, response, &restored);
             let states: cashu::nuts::CheckStateResponse = self
                 .mint_post(
                     "/v1/checkstate",
@@ -1639,11 +1802,7 @@ clients:
                     },
                 )
                 .await;
-            assert_eq!(states.states.len(), swap.inputs().len());
-            assert!(
-                states.states.iter().all(|s| s.state == State::Spent),
-                "accepted inputs not spent"
-            );
+            check_states(swap.inputs(), &states, Some(State::Spent));
             let fee = swap
                 .inputs()
                 .iter()
@@ -1674,8 +1833,21 @@ clients:
 
     pub async fn finish(mut self) {
         self.tasks.shutdown().await;
+        self.assert_proxy_checks();
         drop(self.mint_process.take());
         self.dir.take().unwrap().close().unwrap();
+    }
+
+    fn assert_proxy_checks(&self) {
+        assert_eq!(
+            self.proxy_pending.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "external proxy oracle still running"
+        );
+        assert!(
+            !self.proxy_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "external proxy oracle failed or was cancelled (details private)"
+        );
     }
 }
 
@@ -1693,5 +1865,85 @@ impl Drop for Fixture {
                 dir.keep().display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+
+    #[test]
+    fn only_http_loopback_origins() {
+        for url in ["http://127.0.0.1:1234", "http://[::1]:1234"] {
+            assert!(loopback_url(url));
+        }
+        for url in [
+            "http://127.0.0.1:1234@evil.example",
+            "http://user@127.0.0.1:1234",
+            "http://@127.0.0.1:1234",
+            " http://127.0.0.1",
+            "http:127.0.0.1",
+            "https://127.0.0.1",
+            "http://localhost",
+            "http://192.0.2.1",
+            "http://[::2]",
+            "http://127.0.0.1/path",
+            "http://127.0.0.1?x",
+            "http://127.0.0.1?",
+            "http://127.0.0.1#x",
+            "http://127.0.0.1:invalid",
+            "not a URL",
+        ] {
+            assert!(!loopback_url(url), "accepted {url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_handler_failure_reaches_parent() {
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_failed = failed.clone();
+        assert!(tokio::spawn(async move {
+            let _check = ProxyCheck {
+                failed: child_failed,
+                pending: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                complete: false,
+            };
+            panic!("injected oracle failure");
+        })
+        .await
+        .is_err());
+        assert!(failed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn identities_not_counts_and_optional_dleq() {
+        let point = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let proof: Proof = serde_json::from_value(
+            serde_json::json!({"amount":1,"id":"00ababababababab","secret":"test","C":point}),
+        )
+        .unwrap();
+        let states =
+            serde_json::from_value(serde_json::json!({"states":[{"Y":point,"state":"UNSPENT"}]}))
+                .unwrap();
+        assert!(
+            std::panic::catch_unwind(|| check_states(&[proof], &states, Some(State::Unspent)))
+                .is_err()
+        );
+        let output = serde_json::json!({"amount":1,"id":"00ababababababab","B_":point});
+        let signature = serde_json::json!({"amount":1,"id":"00ababababababab","C_":point});
+        let swap: SwapRequest =
+            serde_json::from_value(serde_json::json!({"inputs":[],"outputs":[output.clone()]}))
+                .unwrap();
+        let mut signed_with_dleq = signature.clone();
+        signed_with_dleq["dleq"] = serde_json::json!({"e":"01".repeat(32),"s":"02".repeat(32)});
+        let response: SwapResponse =
+            serde_json::from_value(serde_json::json!({"signatures":[signed_with_dleq]})).unwrap();
+        let mut restored: cashu::nuts::RestoreResponse = serde_json::from_value(
+            serde_json::json!({"outputs":[output],"signatures":[signature]}),
+        )
+        .unwrap();
+        check_restore(&swap, &response, &restored);
+        restored.outputs[0].amount = 2.into();
+        assert!(std::panic::catch_unwind(|| check_restore(&swap, &response, &restored)).is_err());
     }
 }
