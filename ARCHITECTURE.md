@@ -365,6 +365,15 @@ a broken middle hop also causes downstream sessions to end.
 Route rebuilds are serialized. Once a rebuild starts, old-route watchers are
 dropped; additional stale failures from that old route are ignored. The rebuilt
 route installs fresh watchers after it is published.
+`RelayConnection::wait_for_failure` owns its watch futures directly rather than
+spawning tasks. Dropping the wait releases every cloned receiver synchronously,
+including those for a surviving prefix. An already-true value or a closed sender
+is a failure; neither requires a subsequent watch notification.
+
+Shared QUIC pools intentionally outlive individual sessions. Failed cached-stream
+opens evict only the same Quinn connection identity, and abandoned pending waits
+evict only the same watch channel. A stale waiter must not remove a replacement
+entry merely because it is also `Ready` or `Pending`.
 
 Route (re)connect retry policy is split by lifecycle: before the first
 successful connect the client fails fast after a bounded number of attempts so

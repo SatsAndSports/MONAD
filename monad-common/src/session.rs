@@ -493,6 +493,33 @@ async fn wait_for_watcher_failure(watchers: Vec<(usize, watch::Receiver<bool>)>)
     .await
 }
 
+impl Drop for RelayConnection {
+    fn drop(&mut self) {
+        // Fallback only: callers needing quiescence must await close().
+        for handle in self
+            .task_handles
+            .get_mut()
+            .unwrap()
+            .iter()
+            .chain(self.driver_handles.get_mut().unwrap().iter())
+        {
+            handle.abort();
+        }
+    }
+}
+
+fn is_expected_h2_teardown_error(error: &h2::Error) -> bool {
+    let message = error.to_string();
+    message.contains("sending stopped by peer")
+        || message.contains("broken pipe")
+        || message.contains("h2 send stream closed")
+        || message.contains("h2 recv error: h2 send stream closed")
+        || message.contains("h2 recv error: stream closed because of a broken pipe")
+        || message.contains("stream closed because of a broken pipe")
+        || message.contains("error 0")
+        || message.contains("connection closed")
+}
+
 #[cfg(test)]
 mod failure_watcher_tests {
     use super::wait_for_watcher_failure;
@@ -525,31 +552,4 @@ mod failure_watcher_tests {
             assert_eq!(tx.receiver_count(), 1);
         }
     }
-}
-
-impl Drop for RelayConnection {
-    fn drop(&mut self) {
-        // Fallback only: callers needing quiescence must await close().
-        for handle in self
-            .task_handles
-            .get_mut()
-            .unwrap()
-            .iter()
-            .chain(self.driver_handles.get_mut().unwrap().iter())
-        {
-            handle.abort();
-        }
-    }
-}
-
-fn is_expected_h2_teardown_error(error: &h2::Error) -> bool {
-    let message = error.to_string();
-    message.contains("sending stopped by peer")
-        || message.contains("broken pipe")
-        || message.contains("h2 send stream closed")
-        || message.contains("h2 recv error: h2 send stream closed")
-        || message.contains("h2 recv error: stream closed because of a broken pipe")
-        || message.contains("stream closed because of a broken pipe")
-        || message.contains("error 0")
-        || message.contains("connection closed")
 }

@@ -695,6 +695,8 @@ ignored until the rebuilt route is active. Route (re)connects fail fast after a
 few attempts before the first successful connect, so startup misconfiguration is
 loud; once a route has connected, reconnects retry indefinitely with capped
 backoff, and the client recovers when the route (or a refilled wallet) allows.
+Loss of a hop's payment-driver failure sender is also treated as a hop failure,
+including when the driver exits without sending its final notification.
 
 The configured client connects directly to the first hop via QUIC, then runs
 the same Noise+H2 session on top using the secp QUIC path.
