@@ -1,13 +1,14 @@
+use super::types::{validate_route_address, MAX_BLINDED_CIPHERTEXT_BYTES};
 use super::{BlindedHopDescriptor, BlindedHopMessage, CleartextHop, PathNode};
 use crate::secp_identity::Secp256k1Pubkey;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{fmt, net::Ipv6Addr, str::FromStr};
+use std::{fmt, str::FromStr};
 
 // 32-byte tweak + parity + nonempty address + 16-byte AEAD tag.
 const MIN_CIPHERTEXT: usize = 50;
 // Bounds configuration decoding and keeps the hex CONNECT headers small.
-const MAX_CIPHERTEXT: usize = 1024;
+const MAX_CIPHERTEXT: usize = MAX_BLINDED_CIPHERTEXT_BYTES;
 const HEADER_LEN: usize = 1 + 33 + 2;
 const MAX_ENCODED: usize = ((HEADER_LEN + MAX_CIPHERTEXT) * 4).div_ceil(3);
 
@@ -15,65 +16,17 @@ impl FromStr for PathNode {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.len() > 64 + 3 + MAX_ENCODED || value.chars().any(char::is_whitespace) {
-            return Err("route hop is oversized or contains whitespace".into());
-        }
         let (key, rest) = value
             .split_once(':')
             .ok_or("route hop requires <key>::<address> or <key>:B:<data>")?;
         let pubkey = Secp256k1Pubkey::parse_config_pubkey(key)
             .map_err(|_| "route hop key must be a valid npub or 64-hex x-only secp256k1 key")?;
         if let Some(address) = rest.strip_prefix(':') {
-            let (host, port, ipv6) = if let Some(bracketed) = address.strip_prefix('[') {
-                let (host, suffix) = bracketed
-                    .split_once(']')
-                    .ok_or("route hop IPv6 address is missing ]")?;
-                host.parse::<Ipv6Addr>()
-                    .map_err(|_| "route hop has invalid bracketed IPv6 address")?;
-                let port = if suffix.is_empty() {
-                    "9050"
-                } else {
-                    suffix
-                        .strip_prefix(':')
-                        .ok_or("route hop has invalid IPv6 port suffix")?
-                };
-                (host, port, true)
-            } else if address.parse::<Ipv6Addr>().is_ok() {
-                (address, "9050", true)
-            } else {
-                let (host, port) = address.split_once(':').unwrap_or((address, "9050"));
-                if host.contains('.')
-                    && host.bytes().all(|c| c.is_ascii_digit() || c == b'.')
-                    && host.parse::<std::net::Ipv4Addr>().is_err()
-                {
-                    return Err("route hop has invalid IPv4 address".into());
-                }
-                let name = host.strip_suffix('.').unwrap_or(host);
-                if name.is_empty()
-                    || name.len() > 253
-                    || !name.split('.').all(|label| {
-                        !label.is_empty()
-                            && label.len() <= 63
-                            && label.as_bytes()[0].is_ascii_alphanumeric()
-                            && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                            && label
-                                .bytes()
-                                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-                    })
-                {
-                    return Err("route hop requires an IP address or DNS hostname".into());
-                }
-                (host, port, false)
-            };
-            let port = port.parse::<u16>().ok().filter(|p| *p != 0)
-                .filter(|_| !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()))
-                .ok_or("route hop port must be between 1 and 65535; bracket IPv6 when specifying a port")?;
-            let addr = if ipv6 {
-                format!("[{host}]:{port}")
-            } else {
-                format!("{host}:{port}")
-            };
-            return Ok(Self::Cleartext(CleartextHop { addr, pubkey }));
+            validate_route_address(address).map_err(|error| error.to_string())?;
+            return Ok(Self::Cleartext(CleartextHop {
+                addr: address.to_owned(),
+                pubkey,
+            }));
         }
         let encoded = rest
             .strip_prefix("B:")
@@ -175,44 +128,34 @@ mod tests {
     }
 
     #[test]
-    fn clear_keys_addresses_and_yaml_roundtrip() {
+    fn clear_keys_and_opaque_addresses_roundtrip_losslessly() {
         let pubkey = key(7).pubkey();
-        let fqdn = format!(
-            "{}.{}.{}.{}.",
-            "a".repeat(63),
-            "b".repeat(63),
-            "c".repeat(63),
-            "d".repeat(61)
-        );
-        assert!(format!("{pubkey}::{fqdn}").parse::<PathNode>().is_ok());
         let npub = bech32::encode::<bech32::Bech32>(
             bech32::Hrp::parse("npub").unwrap(),
             pubkey.as_bytes(),
         )
         .unwrap();
         for encoding in [pubkey.to_hex(), pubkey.to_hex().to_uppercase(), npub] {
-            for (input, expected) in [
-                ("127.0.0.1", "127.0.0.1:9050"),
-                ("127.0.0.1:443", "127.0.0.1:443"),
-                ("relay.example", "relay.example:9050"),
-                ("relay.example.:65535", "relay.example.:65535"),
-                ("localhost:1", "localhost:1"),
-                ("::1", "[::1]:9050"),
-                ("[::1]", "[::1]:9050"),
-                ("[2001:db8::1]:443", "[2001:db8::1]:443"),
-                ("2001:db8::1:443", "[2001:db8::1:443]:9050"),
+            for input in [
+                "127.0.0.1",
+                "relay.example:00080",
+                "::1",
+                "[::1]",
+                "[2001:db8::1]:443",
+                "opaque:scheme:value",
+                "  relay path\t\n雪  ",
             ] {
                 let hop: PathNode = format!("{encoding}::{input}").parse().unwrap();
                 assert_eq!(
                     hop,
                     PathNode::Cleartext(CleartextHop {
-                        addr: expected.into(),
+                        addr: input.into(),
                         pubkey
                     })
                 );
                 assert_eq!(
                     hop.to_compact_string().unwrap(),
-                    format!("{pubkey}::{expected}")
+                    format!("{pubkey}::{input}")
                 );
                 let yaml = serde_yaml::to_string(&hop).unwrap();
                 assert_eq!(serde_yaml::from_str::<PathNode>(&yaml).unwrap(), hop);
@@ -221,32 +164,9 @@ mod tests {
     }
 
     #[test]
-    fn malformed_clear_hops_are_rejected() {
+    fn clear_hops_only_enforce_basic_representation_constraints() {
         let pubkey = key(7).pubkey();
-        for address in [
-            "",
-            ":1",
-            "host:",
-            "host:0",
-            "host:65536",
-            "host:-1",
-            "host:+1",
-            "host:1:2",
-            "host/path",
-            "user@host",
-            "host?x",
-            "[::1",
-            "[::1]oops",
-            "[::1]:",
-            "[127.0.0.1]:1",
-            "[::gg]:1",
-            "bad..name",
-            "-bad",
-            "bad_",
-            "999.0.0.1",
-            "host\n",
-            "host\0",
-        ] {
+        for address in ["", "host\0"] {
             assert!(
                 format!("{pubkey}::{address}").parse::<PathNode>().is_err(),
                 "{address:?}"
@@ -273,9 +193,12 @@ mod tests {
             serde_yaml::from_str::<PathNode>(&format!("addr: localhost\npubkey: {pubkey}\n"))
                 .is_err()
         );
-        assert!(format!("{pubkey}::{}", "a".repeat(254))
-            .parse::<PathNode>()
-            .is_err());
+        assert!(format!(
+            "{pubkey}::{}",
+            "a".repeat(super::super::types::MAX_ROUTE_ADDRESS_BYTES + 1)
+        )
+        .parse::<PathNode>()
+        .is_err());
     }
 
     #[test]
@@ -284,7 +207,7 @@ mod tests {
         let hidden = key(8);
         let descriptor = build_blinded_hop_descriptor(
             intro.pubkey().to_compressed_bytes(),
-            "[::1]:9050",
+            "opaque:下一跳 [::1] no-port",
             hidden.pubkey(),
         )
         .unwrap();
@@ -297,7 +220,7 @@ mod tests {
         };
         let resolved = resolve_blinded_hop_for_intro(&intro, &parsed).unwrap();
         assert_eq!(resolved.next_hop_real_pubkey, hidden.pubkey());
-        assert_eq!(resolved.next_hop_addr, "[::1]:9050");
+        assert_eq!(resolved.next_hop_addr, "opaque:下一跳 [::1] no-port");
         let npub = bech32::encode::<bech32::Bech32>(
             bech32::Hrp::parse("npub").unwrap(),
             descriptor.tweaked_pubkey.as_bytes(),
@@ -328,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn hand_built_nodes_serialize_without_panicking_on_invalid_fields() {
+    fn hand_built_nodes_serialize_without_rewriting_opaque_addresses() {
         let descriptor = build_blinded_hop_descriptor(
             key(7).pubkey().to_compressed_bytes(),
             "localhost:9050",
@@ -349,15 +272,15 @@ mod tests {
             addr: "localhost".into(),
             pubkey: key(7).pubkey(),
         });
-        assert!(clear
-            .to_compact_string()
-            .unwrap()
-            .ends_with("::localhost:9050"));
-        let invalid = PathNode::Cleartext(CleartextHop {
+        assert!(clear.to_compact_string().unwrap().ends_with("::localhost"));
+        let opaque = PathNode::Cleartext(CleartextHop {
             addr: "bad:address".into(),
             pubkey: key(7).pubkey(),
         });
-        assert!(serde_yaml::to_string(&invalid).is_err());
+        assert_eq!(
+            serde_yaml::from_str::<PathNode>(&serde_yaml::to_string(&opaque).unwrap()).unwrap(),
+            opaque
+        );
     }
 
     #[test]

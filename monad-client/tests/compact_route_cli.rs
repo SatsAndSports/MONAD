@@ -10,7 +10,7 @@ fn offline_cli_emits_usable_yaml_and_preserves_real_predecessors() {
         .map(|seed| SecpTransportKeypair::from_secret_bytes(&[seed; 32]).unwrap())
         .collect();
     let inputs = [
-        format!("{}::localhost", keys[0].pubkey()),
+        format!("{}::localhost:09050", keys[0].pubkey()),
         format!("{}::[::1]:9051", keys[1].pubkey()),
         format!("{}::127.0.0.1:9052", keys[2].pubkey()),
     ];
@@ -33,7 +33,7 @@ fn offline_cli_emits_usable_yaml_and_preserves_real_predecessors() {
     let route = route_from_client_config(&client).unwrap();
     assert_eq!(route.hops().len(), 3);
     assert!(route.hops().iter().all(|hop| hop.requires_quic()));
-    assert_eq!(route.hops()[0].cleartext_addr(), Some("localhost:9050"));
+    assert_eq!(route.hops()[0].cleartext_addr(), Some("localhost:09050"));
     for i in 1..3 {
         let PathNode::Blinded(descriptor) = &client.route[i] else {
             panic!("expected blinded suffix")

@@ -35,7 +35,7 @@ mod tests {
         let client = ClientConfig {
             name: "local".to_string(),
             socks: "127.10.0.1:1080".to_string(),
-            route: vec![format!("{pubkey}::127.10.0.11").parse().unwrap()],
+            route: vec![format!("{pubkey}::127.10.0.11:9050").parse().unwrap()],
         };
 
         let route = route_from_client_config(&client).unwrap();

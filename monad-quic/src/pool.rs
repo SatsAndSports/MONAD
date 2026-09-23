@@ -1,6 +1,7 @@
 use crate::auth::authenticate_connection;
 use crate::client::{build_client_config_for_auth, ClientAuthMode};
 use crate::stream::{open_monad_stream_with_kind, QuicStream, STREAM_KIND_SECP_NOISE};
+use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::secp_identity::Secp256k1Pubkey;
 use std::collections::HashMap;
 use std::io;
@@ -74,6 +75,7 @@ impl QuicPool {
         auth: ClientAuthMode,
         stream_kind: u8,
     ) -> io::Result<QuicStream> {
+        validate_network_endpoint(target_addr)?;
         loop {
             let key = PoolKey {
                 target_addr: target_addr.to_string(),

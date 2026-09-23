@@ -21,6 +21,7 @@ use http::{Method, Request, Response, StatusCode};
 use monad_common::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
 use monad_common::blinded_hop::resolve_blinded_hop_for_intro;
 use monad_common::control_codec::{send_json_line, try_decode_json_line};
+use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerErrorCode, ServerMessage};
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::{clamp_i128_to_i64, SessionPricing};
@@ -544,6 +545,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
             }
         };
 
+        if let Err(e) = validate_network_endpoint(&resolved.next_hop_addr) {
+            warn!(
+                "invalid decrypted blinded next-hop endpoint {}: {e}",
+                resolved.next_hop_addr
+            );
+            let resp = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(())
+                .unwrap();
+            let _ = respond.send_response(resp, true);
+            return;
+        }
+
         let pool = match &self.quic_pool {
             Some(p) => p.clone(),
             None => {
@@ -674,6 +688,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
 
                             if authority.is_empty() {
                                 warn!("CONNECT request missing authority");
+                                let resp = Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .body(())
+                                    .unwrap();
+                                let _ = respond.send_response(resp, true);
+                                continue;
+                            }
+
+                            if let Err(e) = validate_network_endpoint(&authority) {
+                                warn!("invalid CONNECT endpoint {authority:?}: {e}");
                                 let resp = Response::builder()
                                     .status(StatusCode::BAD_REQUEST)
                                     .body(())

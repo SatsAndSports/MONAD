@@ -1,5 +1,7 @@
 use super::math::{compressed_bytes, public_key_from_bytes};
-use super::types::{BlindedHopError, BlindedHopMessage, BlindedHopPlaintext, HopTweak};
+use super::types::{
+    validate_route_address, BlindedHopError, BlindedHopMessage, BlindedHopPlaintext, HopTweak,
+};
 use crate::secp_identity::SecpTransportKeypair;
 use k256::{ecdh, SecretKey};
 use rand_core::OsRng;
@@ -21,16 +23,7 @@ impl hkdf::KeyType for AeadKeyLen {
 pub(super) fn encode_blinded_hop_plaintext(
     plaintext: &BlindedHopPlaintext,
 ) -> Result<Vec<u8>, BlindedHopError> {
-    if plaintext.next_hop_addr.is_empty() {
-        return Err(BlindedHopError::InvalidPayload(
-            "next hop address must not be empty",
-        ));
-    }
-    if plaintext.next_hop_addr.as_bytes().contains(&0) {
-        return Err(BlindedHopError::InvalidPayload(
-            "blinded hop address contains interior null",
-        ));
-    }
+    validate_route_address(&plaintext.next_hop_addr)?;
 
     let mut out = Vec::with_capacity(33 + plaintext.next_hop_addr.len());
     out.extend_from_slice(plaintext.next_hop_tweak.as_bytes());
@@ -61,20 +54,10 @@ pub(super) fn decode_blinded_hop_plaintext(
         }
     };
     let addr_bytes = &bytes[33..];
-    if addr_bytes.is_empty() {
-        return Err(BlindedHopError::InvalidPayload(
-            "next hop address must not be empty",
-        ));
-    }
-    if addr_bytes.contains(&0) {
-        return Err(BlindedHopError::InvalidPayload(
-            "blinded hop address contains interior null",
-        ));
-    }
-
     let next_hop_addr = std::str::from_utf8(addr_bytes)
         .map_err(BlindedHopError::InvalidUtf8)?
         .to_owned();
+    validate_route_address(&next_hop_addr)?;
     Ok(BlindedHopPlaintext {
         next_hop_addr,
         next_hop_tweak: HopTweak::from_bytes(tweak),

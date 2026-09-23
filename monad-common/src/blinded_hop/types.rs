@@ -3,6 +3,29 @@ use k256::elliptic_curve::ff::Field;
 use k256::Scalar;
 use rand_core::OsRng;
 
+pub(crate) const MAX_BLINDED_CIPHERTEXT_BYTES: usize = 1024;
+// Ciphertext contains a 33-byte payload prefix and a 16-byte AEAD tag.
+pub(crate) const MAX_ROUTE_ADDRESS_BYTES: usize = MAX_BLINDED_CIPHERTEXT_BYTES - 49;
+
+pub(crate) fn validate_route_address(addr: &str) -> Result<(), BlindedHopError> {
+    if addr.is_empty() {
+        return Err(BlindedHopError::InvalidPayload(
+            "next hop address must not be empty",
+        ));
+    }
+    if addr.as_bytes().contains(&0) {
+        return Err(BlindedHopError::InvalidPayload(
+            "blinded hop address contains interior null",
+        ));
+    }
+    if addr.len() > MAX_ROUTE_ADDRESS_BYTES {
+        return Err(BlindedHopError::InvalidPayload(
+            "route address exceeds 975 bytes",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BlindedHopError {
     #[error("invalid blinded path: {0}")]

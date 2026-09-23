@@ -1,4 +1,5 @@
 use super::payload::encrypt_blinded_hop_for_intro;
+use super::types::validate_route_address;
 use super::types::{
     BlindedHopDescriptor, BlindedHopError, BlindedHopPlaintext, CleartextHop, HopTweak, Path,
     PathHop, PathHopMode, PathNode,
@@ -61,6 +62,7 @@ pub fn build_path(hops: &[PathHop<'_>]) -> Result<Path, BlindedHopError> {
 
     let mut path = Vec::with_capacity(hops.len());
     for (i, hop) in hops.iter().enumerate() {
+        validate_route_address(hop.addr)?;
         match hop.mode {
             PathHopMode::Cleartext => path.push(PathNode::Cleartext(CleartextHop {
                 addr: hop.addr.to_owned(),
