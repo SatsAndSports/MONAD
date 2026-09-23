@@ -23,6 +23,27 @@ expiry, and negotiated-version validation. Management does not bypass wallet
 ownership or recovery rules. These controls are a library foundation; process IPC
 and HTTP/SSE aggregation are separate implementation stages.
 
+### Client funding controls
+
+One client management handle tracks live payment drivers by Noise session ID.
+Each driver owns a registration lease; cleanup removes it, preventing commands for
+old sessions from authorizing work on replacement routes. The existing funding loop
+still selects stored channels first and remains the sole caller of provisioning.
+A one-shot request is consumed at the provisioning boundary; it is never a reusable
+credit. Switching automatic provisioning on also consumes any pending manual request.
+
+The setup supervisor observes only the hop currently awaiting funded readiness.
+Time deliberately spent at its manual-funding gate is excluded from the setup
+budget. Other network work retains the remaining budget. Cancellation drops the
+setup caller and then awaits the existing setup supervisor before runtime disable
+is declared complete, preserving blocking wallet work and attachment authority.
+The same cleanup applies to cancellation during suffix rebuild.
+
+Configured-client enable/disable is owned by the leaf supervisor. Disable wakes
+its connection manager, closes the active route, and drains SOCKS work; enable
+cannot supersede an in-progress disable. Listeners remain bound between generations.
+Runtime switches are not persisted to YAML or wallet databases.
+
 ## Overview
 
 ### Terminal Refunds

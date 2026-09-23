@@ -133,6 +133,9 @@ pub(super) async fn run_session_driver(
                             open_connects,
                             total_connects,
                         } => {
+                            if let Some((_, hop)) = &config.management {
+                                hop.status(linked_channel.clone(), paused, total_paid_millisats, remaining_milli_sats);
+                            }
                             let pricing = SessionPricing::new(active_in_rate, active_out_rate);
                             validate_session_pricing(&mut state.established_pricing, pricing)?;
                             let due_now = pricing.amount_due_millisats(session_total_in, session_total_out);

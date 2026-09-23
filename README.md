@@ -23,6 +23,25 @@ Normal defaults retain existing behavior. New-channel refusal uses the new
 `LinkAdmissionDisabled` control error; clients using an older exhaustive wire-error
 enum need a coordinated update before using this control.
 
+Client embedders can supply one `Arc<ClientManagement>` per configured client to
+`run_configured_client_managed`, or attach a handle to a `ConnectorRuntime` with
+`with_management`. `set_automatic_provisioning(false)` permits existing-channel
+reuse and payments but makes an unfunded hop wait. `hops()` exposes partial-route
+sessions; `provision_once(session_id)` authorizes one normal provisioning attempt
+for a waiting hop using the configured funding budget. Duplicate pending requests
+and stale session IDs are rejected. This does not toggle automatic provisioning.
+
+Configured-client `set_enabled(false)` stops route/SOCKS work; `is_running()` stays
+true during cleanup. Re-enable is rejected until cleanup finishes. The SOCKS socket
+stays bound, and connections received while disabled are immediately dropped.
+The connector-only handle exposes funding controls; lifecycle enable/disable is
+implemented by the configured-client runtime owner.
+
+Deliberate manual-funding waits do not consume the route setup timeout; network
+setup, mint request, and heartbeat deadlines still apply. A relay's new-channel
+refusal retains the already-funded channel and retries its link every five seconds
+instead of opening replacements. Transport failures still use normal route rebuilds.
+
 MONAD is a multi-hop, VPN-like TCP tunneling system built in Rust.
 
 It provides:

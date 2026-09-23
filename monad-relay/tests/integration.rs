@@ -422,6 +422,212 @@ async fn start_monad_relay_with_test_payments() -> (
 }
 
 #[tokio::test]
+async fn test_managed_client_exhaustion_waits_then_resumes_same_session() {
+    use monad_client::connector::{connect_route_with_runtime, ConnectorRuntime};
+    use monad_client::management::ClientManagement;
+    use monad_client::route::{Route, RouteHop};
+    use monad_client::session_driver::PaymentPolicy;
+    use monad_client::wallet::{MockWallet, MonadWallet};
+    let (addr, pubkey) = start_monad_relay_with_pricing(1, 1).await;
+    let route = Route::new(vec![RouteHop::Cleartext {
+        addr: addr.to_string(),
+        pubkey,
+        use_quic: false,
+    }])
+    .unwrap();
+    let wallet = Arc::new(MockWallet::new());
+    let management = Arc::new(ClientManagement::default());
+    let runtime = ConnectorRuntime::with_payment_policy(
+        Some(wallet.clone()),
+        PaymentPolicy {
+            channel_funding_token_target_msats: 10_000,
+            target_topup_buffer_msats: 10_000,
+            minimum_topup_msats: 0,
+        },
+    )
+    .unwrap()
+    .with_management(management.clone());
+    let conn = connect_route_with_runtime(&route, &runtime).await.unwrap();
+    management.set_automatic_provisioning(false);
+    let session = management.hops()[0].session_id.clone();
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let echo = tokio::spawn(async move {
+        let (mut peer, _) = target.accept().await.unwrap();
+        let mut bytes = [0; 8192];
+        loop {
+            let count = peer.read(&mut bytes).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            peer.write_all(&bytes[..count]).await.unwrap();
+        }
+    });
+    let mut tunnel = conn
+        .final_connection_arc()
+        .open_tunnel(&target_addr.to_string())
+        .await
+        .unwrap();
+    tunnel.write_all(&vec![7; 6000]).await.unwrap();
+    let mut changes = management.changes();
+    // Drain concurrently: the inbound accounting can cross the zero boundary.
+    let mut response = vec![0; 6000];
+    let transfer = async {
+        tunnel.read_exact(&mut response).await.unwrap();
+    };
+    let fund = async {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                changes.borrow_and_update();
+                if management
+                    .hops()
+                    .iter()
+                    .any(|h| h.waiting_for_manual_funding)
+                {
+                    break;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(wallet.list_channels().unwrap().len(), 1);
+        assert_eq!(management.hops()[0].session_id, session);
+        management.provision_once(&session).unwrap();
+    };
+    timeout(Duration::from_secs(5), async {
+        tokio::join!(transfer, fund);
+    })
+    .await
+    .unwrap();
+    assert_eq!(response, vec![7; 6000]);
+    tunnel.write_all(b"resumed").await.unwrap();
+    let mut response = [0; 7];
+    timeout(Duration::from_secs(5), tunnel.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&response, b"resumed");
+    assert_eq!(management.hops()[0].session_id, session);
+    assert_eq!(wallet.list_channels().unwrap().len(), 2);
+    drop(tunnel);
+    conn.close().await;
+    timeout(Duration::from_secs(2), echo)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_managed_client_funds_partial_route_manually_and_reuses_channels() {
+    use monad_client::connector::{connect_route_with_runtime, ConnectorRuntime};
+    use monad_client::management::ClientManagement;
+    use monad_client::route::{Route, RouteHop};
+    use monad_client::session_driver::PaymentPolicy;
+    use monad_client::wallet::{MockWallet, MonadWallet};
+
+    let mut hops = Vec::new();
+    for _ in 0..2 {
+        let (addr, pubkey) = start_monad_relay().await;
+        hops.push(RouteHop::Cleartext {
+            addr: addr.to_string(),
+            pubkey,
+            use_quic: false,
+        });
+    }
+    let route = Route::new(hops).unwrap();
+    let wallet = Arc::new(MockWallet::new());
+    let management = Arc::new(ClientManagement::default());
+    management.set_automatic_provisioning(false);
+    let runtime = ConnectorRuntime::with_payment_policy(
+        Some(wallet.clone()),
+        PaymentPolicy {
+            channel_funding_token_target_msats: 1_000_000,
+            target_topup_buffer_msats: 100_000,
+            minimum_topup_msats: 10_000,
+        },
+    )
+    .unwrap()
+    .with_management(management.clone())
+    .with_setup_timeout(Duration::from_secs(1));
+    let child_runtime = runtime.clone();
+    let child_route = route.clone();
+    let task =
+        tokio::spawn(async move { connect_route_with_runtime(&child_route, &child_runtime).await });
+    let mut changes = management.changes();
+    for index in 0..2 {
+        let waiting = timeout(Duration::from_secs(5), async {
+            loop {
+                changes.borrow_and_update();
+                if let Some(hop) = management
+                    .hops()
+                    .into_iter()
+                    .find(|h| h.waiting_for_manual_funding)
+                {
+                    break hop;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(waiting.label.starts_with(&format!("hop {}/2", index + 1)));
+        assert_eq!(wallet.list_channels().unwrap().len(), index);
+        // Intentionally exceed the network-setup budget while the human funding
+        // gate is active. This is a deadline assertion, not synchronization.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !task.is_finished(),
+            "manual wait exhausted network setup deadline"
+        );
+        management.provision_once(&waiting.session_id).unwrap();
+        assert!(management.provision_once(&waiting.session_id).is_err());
+        // Wait until the driver consumes this hop's manual request before
+        // looking for the next hop, avoiding reuse of the same snapshot.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                changes.borrow_and_update();
+                if !management
+                    .hops()
+                    .iter()
+                    .any(|h| h.session_id == waiting.session_id && h.waiting_for_manual_funding)
+                {
+                    break;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let conn = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(wallet.list_channels().unwrap().len(), 2);
+    let old_sessions = management.hops();
+    conn.close().await;
+    assert!(management.hops().is_empty());
+    for hop in old_sessions {
+        assert!(management.provision_once(&hop.session_id).is_err());
+    }
+    let conn = timeout(
+        Duration::from_secs(5),
+        connect_route_with_runtime(&route, &runtime),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        wallet.list_channels().unwrap().len(),
+        2,
+        "relink must not provision"
+    );
+    conn.close().await;
+}
+
+#[tokio::test]
 async fn test_listener_finish_quiesces_tcp_and_quic_descendants() {
     for finish in ["graceful", "abort", "disable"] {
         let abrupt = finish == "abort";

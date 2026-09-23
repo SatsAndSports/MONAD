@@ -4,8 +4,9 @@
 
 Deliver a tested localhost HTTP command/snapshot API and SSE monitoring stream,
 aggregating separately running configured clients and relays through Unix sockets.
-No browser UI is required. Work is split into three intended PRs: runtime controls,
-local process interfaces, and HTTP/SSE aggregation with end-to-end validation.
+No browser UI is required. Work is split into four intended PRs: relay controls,
+client controls, local process interfaces, and HTTP/SSE aggregation with end-to-end
+validation.
 
 ## Runtime contract
 

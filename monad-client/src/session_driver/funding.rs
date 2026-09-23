@@ -312,6 +312,11 @@ pub(super) async fn maybe_ensure_linked_channel(
                 else {
                     return Ok(());
                 };
+                if let Some((owner, hop)) = &config.management {
+                    if !hop.begin_provisioning(owner) {
+                        return Ok(());
+                    }
+                }
                 let selected = provision_from_advertisements(
                     &receiver_pubkey,
                     &advertisements,
@@ -330,10 +335,19 @@ pub(super) async fn maybe_ensure_linked_channel(
                         )
                     },
                 );
+                if let Some((_, hop)) = &config.management {
+                    hop.provisioning_finished();
+                }
                 let (channel_id, offer) = match selected {
                     Ok(Some(selected)) => selected,
                     Ok(None) => return Ok(()),
                     Err(error) if provisioning_offer_is_unavailable(&error) => {
+                        if let Some((owner, hop)) = &config.management {
+                            if !owner.controls().automatic_provisioning {
+                                hop.safe_provisioning_failure();
+                                return Ok(());
+                            }
+                        }
                         if state.ready_signaled {
                             warn!(
                                 "{} deferring funding after advertised offers were unavailable: {} | {}",
@@ -572,6 +586,17 @@ pub(super) async fn apply_server_error(
     code: ServerErrorCode,
 ) {
     clear_control_op(state);
+
+    if code == ServerErrorCode::LinkAdmissionDisabled {
+        // Retain the funded channel and retry its link at a bounded cadence.
+        // Admission policy never authorizes provisioning a replacement.
+        state.funding_retry_not_before = Some(Instant::now() + Duration::from_secs(5));
+        if let Some((owner, hop)) = &config.management {
+            hop.relay_admission_refused(owner);
+        }
+        publish_spilman_info(config, state).await;
+        return;
+    }
 
     if defer_link_after_refresh_error(state, &code, Instant::now()) {
         publish_spilman_info(config, state).await;
