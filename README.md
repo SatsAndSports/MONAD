@@ -773,6 +773,12 @@ Both client and relay handle `Ctrl+C` gracefully:
 - shut down H2 connections cleanly
 - emit `SecpNoiseStream` wire-byte totals
 
+Relay session teardown also ends paused tunnels and tunnels blocked on target
+writes or H2 flow control. Relay CONNECT setup runs concurrently with the control
+stream and has a 10-second deadline (including the blinded-hop tweak preamble).
+Setup failure or timeout returns HTTP 502; a session that becomes paused before
+the tunnel is published receives HTTP 402 instead of a late successful CONNECT.
+
 ## QUIC Echo Tool
 
 The `monad-quic` crate also includes a standalone QUIC echo server/client for transport testing and experimentation. The main MONAD client and relay now use shared code from this crate for QUIC support.

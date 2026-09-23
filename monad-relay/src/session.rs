@@ -16,6 +16,7 @@ use crate::session_fsm::{
 };
 use crate::session_registry::SessionRegistry;
 use bytes::Bytes;
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use h2::{server, RecvStream};
 use http::{Method, Request, Response, StatusCode};
 use monad_common::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
@@ -35,7 +36,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex};
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -136,6 +136,7 @@ pub(crate) struct SessionState {
     termination: CancellationToken,
     session_id: [u8; 32],
     payments: Arc<dyn RelayPayments>,
+    owned_channels: Arc<std::sync::Mutex<BTreeSet<String>>>,
     session_registry: Arc<SessionRegistry>,
     transport_key: SecpTransportKeypair,
     receiver_pubkey_hex: String,
@@ -176,6 +177,7 @@ impl SessionState {
             termination,
             session_id,
             payments: config.payments.clone(),
+            owned_channels: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             session_registry: config.session_registry.clone(),
             transport_key: config.transport_key.clone(),
             receiver_pubkey_hex: config.receiver_pubkey_hex.clone(),
@@ -218,13 +220,19 @@ impl SessionState {
         {
             return Err(crate::payments::LinkError::UnsupportedCashuSpilmanProtocolVersion);
         }
-        self.payments.link_channel(
+        let outcome = self.payments.link_channel(
             self.cashu_spilman_keyset_versions
                 .as_ref()
                 .expect("checked above"),
             self.session_id,
             payment_json,
-        )
+        )?;
+        // Record the side effect before another await can cancel the reducer.
+        self.owned_channels
+            .lock()
+            .unwrap()
+            .insert(outcome.channel_id.clone());
+        Ok(outcome)
     }
 
     pub(crate) async fn link_channel_with_keyset_refresh(
@@ -285,6 +293,16 @@ impl SessionState {
     pub(crate) fn release_channel_ownership(&self, channel_id: &str) {
         self.payments
             .release_channel_ownership(self.session_id, channel_id);
+        self.owned_channels.lock().unwrap().remove(channel_id);
+    }
+
+    fn cleanup(&self) {
+        self.terminate();
+        for channel_id in std::mem::take(&mut *self.owned_channels.lock().unwrap()) {
+            self.payments
+                .release_channel_ownership(self.session_id, &channel_id);
+        }
+        self.session_registry.deregister_session(&self.session_id);
     }
 
     pub(crate) fn update_pause_watch(&self, paused: bool) {
@@ -433,6 +451,21 @@ pub struct RelaySession<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     state: SessionState,
 }
 
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Drop for RelaySession<S> {
+    fn drop(&mut self) {
+        // run() owns child futures, not detached tasks. Its locals have already
+        // dropped before self, so no child can re-acquire authority after cleanup.
+        self.state.cleanup();
+    }
+}
+
+struct ConnectHandler {
+    state: SessionState,
+    quic_pool: Option<QuicPool>,
+}
+
+const CONNECT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct RelaySessionConfig {
     pub payments: Arc<dyn RelayPayments>,
@@ -474,12 +507,142 @@ where
     })
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
-    /// Spawn a CONNECT tunnel once the upstream connection has been established.
+impl ConnectHandler {
+    async fn handle_connect(
+        self,
+        request: Request<RecvStream>,
+        mut respond: server::SendResponse<Bytes>,
+    ) {
+        if self.state.is_paused().await {
+            let resp = Response::builder()
+                .status(StatusCode::PAYMENT_REQUIRED)
+                .body(())
+                .unwrap();
+            let _ = respond.send_response(resp, true);
+            return;
+        }
+        let authority = request
+            .uri()
+            .authority()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| request.uri().to_string());
+        if authority == BLINDED_HOP_CONNECT_AUTHORITY {
+            self.handle_blinded_connect(&mut respond, request).await;
+            return;
+        }
+        if let Err(e) = validate_network_endpoint(&authority) {
+            warn!("invalid CONNECT endpoint {authority:?}: {e}");
+            let resp = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(())
+                .unwrap();
+            let _ = respond.send_response(resp, true);
+            return;
+        }
+        let quic_pubkey = request
+            .headers()
+            .get(QUIC_SECP256K1_PUBKEY_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(Secp256k1Pubkey::from_hex);
+        if let Some(pubkey) = quic_pubkey {
+            let pubkey = match pubkey {
+                Ok(pubkey) => pubkey,
+                Err(e) => {
+                    warn!("invalid secp256k1 public key in quic-secp256k1-pubkey header: {e}");
+                    let resp = Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(resp, true);
+                    return;
+                }
+            };
+            let Some(pool) = &self.quic_pool else {
+                warn!("CONNECT with quic-secp256k1-pubkey but QUIC pool is not available");
+                let resp = Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(())
+                    .unwrap();
+                let _ = respond.send_response(resp, true);
+                return;
+            };
+            info!("CONNECT {authority} (via QUIC secp256k1 auth)");
+            let target = tokio::time::timeout(
+                CONNECT_SETUP_TIMEOUT,
+                pool.open_stream_with_kind(
+                    &authority,
+                    ClientAuthMode::Secp256k1(pubkey),
+                    STREAM_KIND_SECP_NOISE,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "CONNECT setup timed out",
+                ))
+            });
+            match target {
+                Ok(stream) => {
+                    if let Err(e) = self
+                        .proxy_tunnel(
+                            &mut respond,
+                            request,
+                            stream,
+                            &authority,
+                            &format!("quic:{authority}"),
+                        )
+                        .await
+                    {
+                        error!("h2 send response error: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to connect via QUIC to {authority}: {e}");
+                    let resp = Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(resp, true);
+                }
+            }
+        } else {
+            info!("CONNECT {authority}");
+            let target =
+                tokio::time::timeout(CONNECT_SETUP_TIMEOUT, TcpStream::connect(&authority))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "CONNECT setup timed out",
+                        ))
+                    });
+            match target {
+                Ok(stream) => {
+                    if let Err(e) = self
+                        .proxy_tunnel(&mut respond, request, stream, &authority, &authority)
+                        .await
+                    {
+                        error!("h2 send response error: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to connect to {authority}: {e}");
+                    let resp = Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(resp, true);
+                }
+            }
+        }
+    }
+
+    /// Run a CONNECT tunnel once the upstream connection has been established.
     ///
     /// Sends the `200 OK` response, bumps the session connect counters, logs the
-    /// tunnel opening, and spawns the proxied byte-pipe task.
-    async fn spawn_tunnel<T>(
+    /// tunnel opening, and drives the byte pipe in the session-owned future.
+    async fn proxy_tunnel<T>(
         &self,
         respond: &mut server::SendResponse<Bytes>,
         request: Request<RecvStream>,
@@ -490,11 +653,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let paused = self.state.is_paused().await;
+        if self.state.is_terminated() {
+            respond.send_reset(h2::Reason::CANCEL);
+            return Ok(());
+        }
+        if paused {
+            let resp = Response::builder()
+                .status(StatusCode::PAYMENT_REQUIRED)
+                .body(())
+                .unwrap();
+            respond.send_response(resp, true)?;
+            return Ok(());
+        }
         let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
         let h2_send = respond.send_response(resp, false)?;
         let (_, h2_recv) = request.into_parts();
         let state = self.state.clone();
-        let session_id = self.session_id;
+        let session_id = self.state.session_id;
         let (open_connects, total_connects) = state.connect_opened();
         info!(
             "CONNECT opened: {authority} ({label}) | session_id={} open_connects={} total_connects={}",
@@ -504,13 +680,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
         );
         let authority = authority.to_string();
         let label = label.to_string();
-        tokio::spawn(async move {
-            if let Err(e) =
-                proxy::proxy_bidirectional_accounted(h2_send, h2_recv, target, &label, state).await
-            {
-                error!("tunnel to {authority} ({label}) error: {e}");
-            }
-        });
+        if let Err(e) =
+            proxy::proxy_bidirectional_accounted(h2_send, h2_recv, target, &label, state).await
+        {
+            error!("tunnel to {authority} ({label}) error: {e}");
+        }
         Ok(())
     }
 
@@ -576,42 +750,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
             resolved.next_hop_addr
         );
 
-        match pool
-            .open_stream_with_kind(
-                &resolved.next_hop_addr,
-                ClientAuthMode::Secp256k1(resolved.next_hop_real_pubkey),
-                STREAM_KIND_TWEAKED_NOISE,
-            )
+        let setup = async {
+            let mut stream = pool
+                .open_stream_with_kind(
+                    &resolved.next_hop_addr,
+                    ClientAuthMode::Secp256k1(resolved.next_hop_real_pubkey),
+                    STREAM_KIND_TWEAKED_NOISE,
+                )
+                .await?;
+            stream.write_all(&resolved.tweak).await?;
+            stream.flush().await?;
+            Ok::<_, io::Error>(stream)
+        };
+        match tokio::time::timeout(CONNECT_SETUP_TIMEOUT, setup)
             .await
-        {
-            Ok(mut quic_stream) => {
-                if let Err(e) = quic_stream.write_all(&resolved.tweak).await {
-                    warn!(
-                        "failed to write blinded QUIC tweak preamble to {}: {e}",
-                        resolved.next_hop_addr
-                    );
-                    let resp = Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(())
-                        .unwrap();
-                    let _ = respond.send_response(resp, true);
-                    return;
-                }
-                if let Err(e) = quic_stream.flush().await {
-                    warn!(
-                        "failed to flush blinded QUIC tweak preamble to {}: {e}",
-                        resolved.next_hop_addr
-                    );
-                    let resp = Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(())
-                        .unwrap();
-                    let _ = respond.send_response(resp, true);
-                    return;
-                }
-
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "CONNECT setup timed out",
+                ))
+            }) {
+            Ok(quic_stream) => {
                 if let Err(e) = self
-                    .spawn_tunnel(
+                    .proxy_tunnel(
                         respond,
                         request,
                         quic_stream,
@@ -636,14 +797,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
             }
         }
     }
+}
 
-    /// Run the accept loop: accept H2 streams and dispatch them to handlers.
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
+    /// Run the accept loop and all control, setup, and data futures together.
     pub async fn run(mut self) -> io::Result<()> {
         let termination = self.state.termination_token();
-        let mut control_tasks = JoinSet::new();
+        let mut children: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
         loop {
             let result = tokio::select! {
+                biased;
                 _ = termination.cancelled() => break,
+                Some(()) = children.next(), if !children.is_empty() => continue,
                 result = self.h2_conn.accept() => result,
             };
 
@@ -667,140 +832,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
 
                     match (&method, uri.path()) {
                         (&Method::CONNECT, _) => {
-                            if self.state.is_paused().await {
-                                let resp = Response::builder()
-                                    .status(StatusCode::PAYMENT_REQUIRED)
-                                    .body(())
-                                    .unwrap();
-                                let _ = respond.send_response(resp, true);
-                                continue;
-                            }
-
-                            let authority = uri
-                                .authority()
-                                .map(|a| a.to_string())
-                                .unwrap_or_else(|| uri.to_string());
-
-                            if authority == BLINDED_HOP_CONNECT_AUTHORITY {
-                                self.handle_blinded_connect(&mut respond, request).await;
-                                continue;
-                            }
-
-                            if authority.is_empty() {
-                                warn!("CONNECT request missing authority");
-                                let resp = Response::builder()
-                                    .status(StatusCode::BAD_REQUEST)
-                                    .body(())
-                                    .unwrap();
-                                let _ = respond.send_response(resp, true);
-                                continue;
-                            }
-
-                            if let Err(e) = validate_network_endpoint(&authority) {
-                                warn!("invalid CONNECT endpoint {authority:?}: {e}");
-                                let resp = Response::builder()
-                                    .status(StatusCode::BAD_REQUEST)
-                                    .body(())
-                                    .unwrap();
-                                let _ = respond.send_response(resp, true);
-                                continue;
-                            }
-
-                            let quic_secp256k1_pubkey_header = request
-                                .headers()
-                                .get(QUIC_SECP256K1_PUBKEY_HEADER)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.to_string());
-                            if let Some(pubkey_hex) = quic_secp256k1_pubkey_header {
-                                info!("CONNECT {authority} (via QUIC secp256k1 auth)");
-
-                                let pubkey = match Secp256k1Pubkey::from_hex(&pubkey_hex) {
-                                    Ok(pubkey) => pubkey,
-                                    Err(e) => {
-                                        warn!("invalid secp256k1 public key in quic-secp256k1-pubkey header: {e}");
-                                        let resp = Response::builder()
-                                            .status(StatusCode::BAD_REQUEST)
-                                            .body(())
-                                            .unwrap();
-                                        let _ = respond.send_response(resp, true);
-                                        continue;
-                                    }
-                                };
-
-                                let pool = match &self.quic_pool {
-                                    Some(p) => p.clone(),
-                                    None => {
-                                        warn!(
-                                            "CONNECT with quic-secp256k1-pubkey but QUIC pool is not available"
-                                        );
-                                        let resp = Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .body(())
-                                            .unwrap();
-                                        let _ = respond.send_response(resp, true);
-                                        continue;
-                                    }
-                                };
-
-                                match pool
-                                    .open_stream_with_kind(
-                                        &authority,
-                                        ClientAuthMode::Secp256k1(pubkey),
-                                        STREAM_KIND_SECP_NOISE,
-                                    )
-                                    .await
-                                {
-                                    Ok(quic_stream) => {
-                                        if let Err(e) = self
-                                            .spawn_tunnel(
-                                                &mut respond,
-                                                request,
-                                                quic_stream,
-                                                &authority,
-                                                &format!("quic:{authority}"),
-                                            )
-                                            .await
-                                        {
-                                            error!("h2 send response error: {e}");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to connect via QUIC to {authority}: {e}");
-                                        let resp = Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .body(())
-                                            .unwrap();
-                                        let _ = respond.send_response(resp, true);
-                                    }
-                                }
-                            } else {
-                                info!("CONNECT {authority}");
-
-                                match TcpStream::connect(&authority).await {
-                                    Ok(tcp_stream) => {
-                                        if let Err(e) = self
-                                            .spawn_tunnel(
-                                                &mut respond,
-                                                request,
-                                                tcp_stream,
-                                                &authority,
-                                                &authority,
-                                            )
-                                            .await
-                                        {
-                                            error!("h2 send response error: {e}");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to connect to {authority}: {e}");
-                                        let resp = Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .body(())
-                                            .unwrap();
-                                        let _ = respond.send_response(resp, true);
-                                    }
-                                }
-                            }
+                            let handler = ConnectHandler {
+                                state: self.state.clone(),
+                                quic_pool: self.quic_pool.clone(),
+                            };
+                            children.push(Box::pin(handler.handle_connect(request, respond)));
                         }
                         (&Method::POST, "/control") => {
                             let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -818,7 +854,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                 Ok(h2_send) => {
                                     let (_, h2_recv) = request.into_parts();
                                     let state = self.state.clone();
-                                    control_tasks.spawn(async move {
+                                    children.push(Box::pin(async move {
                                         if let Err(e) =
                                             handle_control_stream(h2_send, h2_recv, state, event_rx)
                                                 .await
@@ -831,7 +867,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                                                 error!("control channel error: {e}");
                                             }
                                         }
-                                    });
+                                    }));
                                 }
                                 Err(e) => {
                                     error!("h2 send response error for control: {e}");
@@ -860,6 +896,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
             }
         }
 
+        // Drop every child synchronously before releasing session authority.
+        // No join is necessary: none of these futures runs in another task.
+        drop(children);
         if self.state.billing.lock().await.state.terminated {
             // Flush queued control errors without letting a peer delay teardown indefinitely.
             self.h2_conn.graceful_shutdown();
@@ -869,16 +908,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
             )
             .await;
         }
-        self.state
-            .session_registry
-            .deregister_session(&self.session_id);
-        while let Some(result) = control_tasks.join_next().await {
-            if let Err(error) = result {
-                if !error.is_cancelled() {
-                    error!("control stream task failed while draining: {error}");
-                }
-            }
-        }
+        self.state.cleanup();
         info!("H2 connection closed");
         Ok(())
     }
@@ -918,112 +948,118 @@ async fn handle_control_stream(
     mut events: mpsc::UnboundedReceiver<ServerMessage>,
 ) -> io::Result<()> {
     info!("control channel opened");
+    let termination = state.termination_token();
 
     let result = async {
-    let mut buf = Vec::new();
-    // Bootstrap stays outside the explicit steady-state session FSM. After the
-    // pre-H2 Noise bootstrap selected the session protocol, we immediately send
-    // the initial SessionStatus before entering the reducer-driven control loop.
-    let initial_status = state.session_status_message().await;
-    send_control_message(&mut h2_send, &initial_status).await?;
+        let mut buf = Vec::new();
+        // Bootstrap stays outside the explicit steady-state session FSM. After the
+        // pre-H2 Noise bootstrap selected the session protocol, we immediately send
+        // the initial SessionStatus before entering the reducer-driven control loop.
+        let initial_status = state.session_status_message().await;
+        send_control_message(&mut h2_send, &initial_status).await?;
 
-    let mut terminate_session = false;
+        let mut terminate_session = false;
 
-    loop {
-        tokio::select! {
-            maybe_event = events.recv() => {
-                match maybe_event {
-                    Some(message) => {
-                        if let ServerMessage::ChannelEvicted { channel_id } = message {
-                            terminate_session = process_session_event(
-                                &state,
-                                SessionEvent::ChannelEvicted { channel_id },
-                                &mut h2_send,
-                            )
-                            .await?;
-                            if terminate_session {
-                                break;
+        loop {
+            tokio::select! {
+                maybe_event = events.recv() => {
+                    match maybe_event {
+                        Some(message) => {
+                            if let ServerMessage::ChannelEvicted { channel_id } = message {
+                                terminate_session = process_session_event(
+                                    &state,
+                                    SessionEvent::ChannelEvicted { channel_id },
+                                    &mut h2_send,
+                                )
+                                .await?;
+                                if terminate_session {
+                                    break;
+                                }
+                            } else {
+                                send_control_message(&mut h2_send, &message).await?;
                             }
-                        } else {
-                            send_control_message(&mut h2_send, &message).await?;
+                        }
+                        None => break,
+                    }
+                }
+                maybe_chunk = h2_recv.data() => {
+                    match maybe_chunk {
+                        Some(Ok(data)) => {
+                            let len = data.len();
+                            let _ = h2_recv.flow_control().release_capacity(len);
+                            buf.extend_from_slice(&data);
+
+                            loop {
+                                let message = match try_decode_json_line::<ClientMessage>(&mut buf) {
+                                    Ok(Some(message)) => message,
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        warn!("control: invalid message: {e}");
+                                        let err_msg = ServerMessage::Error {
+                                            code: ServerErrorCode::ControlInvalidMessage,
+                                            message: format!("invalid message: {e}"),
+                                        };
+                                        send_control_message(&mut h2_send, &err_msg).await?;
+                                        continue;
+                                    }
+                                };
+
+                                match message {
+                                    ClientMessage::GetSessionStatus => {
+                                        terminate_session = process_session_event(
+                                            &state,
+                                            SessionEvent::ClientGetSessionStatus,
+                                            &mut h2_send,
+                                        )
+                                        .await?;
+                                    }
+                                    ClientMessage::ChannelLink { payment_json } => {
+                                        terminate_session = process_session_event(
+                                            &state,
+                                            SessionEvent::ClientChannelLink { payment_json },
+                                            &mut h2_send,
+                                        )
+                                        .await?;
+                                    }
+                                    ClientMessage::ChannelPayment { payment_json } => {
+                                        terminate_session = process_session_event(
+                                            &state,
+                                            SessionEvent::ClientChannelPayment { payment_json },
+                                            &mut h2_send,
+                                        )
+                                        .await?;
+                                    }
+                                }
+
+                                if terminate_session {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            debug!("control h2 recv error: {e}");
+                            break;
+                        }
+                        None => {
+                            debug!("control channel closed by client");
+                            break;
                         }
                     }
-                    None => break,
                 }
             }
-            maybe_chunk = h2_recv.data() => {
-                match maybe_chunk {
-                    Some(Ok(data)) => {
-                        let len = data.len();
-                        let _ = h2_recv.flow_control().release_capacity(len);
-                        buf.extend_from_slice(&data);
 
-                        loop {
-                            let message = match try_decode_json_line::<ClientMessage>(&mut buf) {
-                                Ok(Some(message)) => message,
-                                Ok(None) => break,
-                                Err(e) => {
-                                    warn!("control: invalid message: {e}");
-                                    let err_msg = ServerMessage::Error {
-                                        code: ServerErrorCode::ControlInvalidMessage,
-                                        message: format!("invalid message: {e}"),
-                                    };
-                                    send_control_message(&mut h2_send, &err_msg).await?;
-                                    continue;
-                                }
-                            };
-
-                            match message {
-                                ClientMessage::GetSessionStatus => {
-                                    terminate_session = process_session_event(
-                                        &state,
-                                        SessionEvent::ClientGetSessionStatus,
-                                        &mut h2_send,
-                                    )
-                                    .await?;
-                                }
-                                ClientMessage::ChannelLink { payment_json } => {
-                                    terminate_session = process_session_event(
-                                        &state,
-                                        SessionEvent::ClientChannelLink { payment_json },
-                                        &mut h2_send,
-                                    )
-                                    .await?;
-                                }
-                                ClientMessage::ChannelPayment { payment_json } => {
-                                    terminate_session = process_session_event(
-                                        &state,
-                                        SessionEvent::ClientChannelPayment { payment_json },
-                                        &mut h2_send,
-                                    )
-                                    .await?;
-                                }
-                            }
-
-                            if terminate_session {
-                                break;
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        debug!("control h2 recv error: {e}");
-                        break;
-                    }
-                    None => {
-                        debug!("control channel closed by client");
-                        break;
-                    }
-                }
+            if terminate_session {
+                break;
             }
         }
 
-        if terminate_session {
-            break;
-        }
-    }
-
-    Ok(())
-    }.await;
+        Ok(())
+    };
+    let result = tokio::select! {
+        biased;
+        _ = termination.cancelled() => Ok(()),
+        result = result => result,
+    };
 
     // Cleanup must run even when a control write or reducer effect fails.
     let _ = process_session_event(&state, SessionEvent::ControlDetached, &mut h2_send).await;
@@ -1097,6 +1133,465 @@ mod tests {
             },
         );
         (state, payments)
+    }
+
+    #[tokio::test]
+    async fn abort_session_releases_registry_channel_and_paused_target() {
+        use tokio::io::AsyncReadExt;
+        use tokio::time::{timeout, Duration};
+
+        for finish in ["abort", "panic", "transport loss", "terminate"] {
+            let (state, payments) = test_state();
+            let link = state
+                .link_channel(
+                    r#"{"channel_id":"abort-owned","balance":0,"capacity":100,"unit":"msat"}"#,
+                )
+                .unwrap();
+            state.billing.lock().await.state.linked_channel_id = Some(link.channel_id);
+            state.billing.lock().await.state.paused = false;
+            state.update_pause_watch(false);
+            let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+            let client_driver = tokio::spawn(client_conn);
+            let server = h2::server::handshake(server_io).await.unwrap();
+            let session = RelaySession {
+                h2_conn: server,
+                quic_pool: None,
+                session_id: state.session_id,
+                state: state.clone(),
+            };
+            let (panic_tx, panic_rx) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                tokio::select! {
+                    result = session.run() => result,
+                    _ = panic_rx => panic!("gated session owner panic"),
+                }
+            });
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .uri(target.local_addr().unwrap().to_string())
+                .body(())
+                .unwrap();
+            let (response, _send) = client.send_request(request, false).unwrap();
+            let response = timeout(Duration::from_secs(2), response)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let (mut target, _) = target.accept().await.unwrap();
+            state.billing.lock().await.state.paused = true;
+            state.update_pause_watch(true);
+            match finish {
+                "abort" => task.abort(),
+                "panic" => {
+                    panic_tx.send(()).unwrap();
+                }
+                "transport loss" => client_driver.abort(),
+                "terminate" => state.terminate(),
+                _ => unreachable!(),
+            }
+            let result = timeout(Duration::from_secs(2), task).await.unwrap();
+            match finish {
+                "abort" => assert!(result.unwrap_err().is_cancelled()),
+                "panic" => assert!(result.unwrap_err().is_panic()),
+                _ => result.unwrap().unwrap(),
+            }
+            assert!(
+                !state.session_registry.terminate(&state.session_id),
+                "aborted session is still registered"
+            );
+            assert_eq!(payments.owner_of("abort-owned"), None);
+            assert_eq!(state.counters.snapshot(), (0, 1));
+            let mut byte = [0];
+            assert_eq!(
+                timeout(Duration::from_secs(2), target.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            client_driver.abort();
+            let _ = client_driver.await;
+        }
+    }
+
+    #[test]
+    fn cleanup_covers_link_before_reducer_and_preserves_replacement_owner() {
+        let (state, payments) = test_state();
+        let payment = r#"{"channel_id":"owned","balance":0,"capacity":100,"unit":"msat"}"#;
+        state.link_channel(payment).unwrap();
+        // The reducer has not yet recorded the successful validation result.
+        assert_eq!(payments.owner_of("owned"), Some(state.session_id));
+        state.cleanup();
+        assert_eq!(payments.owner_of("owned"), None);
+
+        let (state, payments) = test_state();
+        state.link_channel(payment).unwrap();
+        payments
+            .link_channel(&supported_cashu_spilman_keyset_versions(), [2; 32], payment)
+            .unwrap();
+        state.cleanup();
+        state.cleanup();
+        assert_eq!(payments.owner_of("owned"), Some([2; 32]));
+    }
+
+    async fn test_h2_streams(
+        window: u32,
+    ) -> (
+        h2::SendStream<Bytes>,
+        h2::RecvStream,
+        h2::SendStream<Bytes>,
+        h2::RecvStream,
+        tokio::task::JoinSet<()>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (mut client, connection) = h2::client::Builder::new()
+            .initial_window_size(window)
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .unwrap();
+        let mut drivers = tokio::task::JoinSet::new();
+        drivers.spawn(async move {
+            let _ = connection.await;
+        });
+        let (response, client_send) = client
+            .send_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("https://monad/control")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let mut server = h2::server::handshake(server_io).await.unwrap();
+        let (request, mut respond) = server.accept().await.unwrap().unwrap();
+        let send = respond.send_response(Response::new(()), false).unwrap();
+        drivers.spawn(async move { while server.accept().await.is_some() {} });
+        let recv = response.await.unwrap().into_body();
+        (send, request.into_body(), client_send, recv, drivers)
+    }
+
+    #[derive(Clone, Copy)]
+    enum BlockedOperation {
+        Write,
+        Shutdown,
+        H2Capacity,
+    }
+
+    struct BlockedTarget {
+        operation: BlockedOperation,
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for BlockedTarget {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncRead for BlockedTarget {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if matches!(self.operation, BlockedOperation::H2Capacity) {
+                if let Some(entered) = self.entered.take() {
+                    buf.put_slice(b"x");
+                    let _ = entered.send(());
+                    return std::task::Poll::Ready(Ok(()));
+                }
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for BlockedTarget {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if matches!(self.operation, BlockedOperation::Write) {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+            }
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if matches!(self.operation, BlockedOperation::Shutdown) {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_cancels_blocked_proxy_operations() {
+        use tokio::time::{timeout, Duration};
+        for operation in [
+            BlockedOperation::Write,
+            BlockedOperation::Shutdown,
+            BlockedOperation::H2Capacity,
+        ] {
+            let (state, _) = test_state();
+            state.update_pause_watch(false);
+            state.connect_opened();
+            let (send, recv, mut client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
+            let (entered, entered_rx) = tokio::sync::oneshot::channel();
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let target = BlockedTarget {
+                operation,
+                entered: Some(entered),
+                dropped: dropped.clone(),
+            };
+            match operation {
+                BlockedOperation::Write => client_send
+                    .send_data(Bytes::from_static(b"x"), false)
+                    .unwrap(),
+                BlockedOperation::Shutdown => client_send.send_data(Bytes::new(), true).unwrap(),
+                BlockedOperation::H2Capacity => {}
+            }
+            let mut proxy = Box::pin(proxy::proxy_bidirectional_accounted(
+                send,
+                recv,
+                target,
+                "blocked",
+                state.clone(),
+            ));
+            timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    result = &mut proxy => panic!("proxy completed before gate: {result:?}"),
+                    result = entered_rx => result.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            state.terminate();
+            timeout(Duration::from_secs(2), &mut proxy)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(state.counters.snapshot(), (0, 1));
+            drivers.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_cancels_zero_window_control_bootstrap() {
+        use std::future::Future;
+        use std::task::Poll;
+        let (state, payments) = test_state();
+        let link = state
+            .link_channel(r#"{"channel_id":"owned","balance":0,"capacity":100,"unit":"msat"}"#)
+            .unwrap();
+        state.billing.lock().await.state.linked_channel_id = Some(link.channel_id);
+        let (send, recv, _client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.attach_control(tx).await.unwrap();
+        let mut control = Box::pin(handle_control_stream(send, recv, state.clone(), rx));
+        std::future::poll_fn(|cx| {
+            assert!(control.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        state.terminate();
+        tokio::time::timeout(std::time::Duration::from_secs(2), control)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(payments.owner_of("owned"), None);
+        assert!(!state.control.lock().await.control_attached);
+        drivers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_connect_keeps_h2_progressing_until_cancel_or_deadline() {
+        use tokio::time::{timeout, Duration};
+        for wait_for_deadline in [false, true] {
+            let (state, _) = test_state();
+            state.billing.lock().await.state.paused = false;
+            state.update_pause_watch(false);
+            // A bound UDP socket that observes but never answers QUIC Initials is
+            // a deterministic setup gate, not an unroutable-host timing assumption.
+            let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+            let client_driver = tokio::spawn(client_conn);
+            let server = h2::server::handshake(server_io).await.unwrap();
+            let session = RelaySession {
+                h2_conn: server,
+                quic_pool: Some(QuicPool::new().unwrap()),
+                session_id: state.session_id,
+                state: state.clone(),
+            };
+            let task = tokio::spawn(session.run());
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .uri(blackhole.local_addr().unwrap().to_string())
+                .header(
+                    QUIC_SECP256K1_PUBKEY_HEADER,
+                    state.transport_key.pubkey().to_hex(),
+                )
+                .body(())
+                .unwrap();
+            let (pending_response, _send) = client.send_request(request, false).unwrap();
+            let mut pending_response = Some(pending_response);
+            let mut packet = [0; 2048];
+            timeout(Duration::from_secs(2), blackhole.recv_from(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://monad/control")
+                .body(())
+                .unwrap();
+            let (control_response, _control_send) = client.send_request(request, false).unwrap();
+            let mut control = timeout(Duration::from_secs(2), control_response)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_body();
+            let status = timeout(Duration::from_secs(2), control.data())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(std::str::from_utf8(&status)
+                .unwrap()
+                .contains("SessionStatus"));
+            if wait_for_deadline {
+                let response = timeout(
+                    CONNECT_SETUP_TIMEOUT + Duration::from_secs(2),
+                    pending_response.take().unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            }
+            state.terminate();
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Some(pending_response) = pending_response {
+                assert!(timeout(Duration::from_secs(2), pending_response)
+                    .await
+                    .unwrap()
+                    .is_err());
+            }
+            assert_eq!(state.counters.snapshot(), (0, 0));
+            assert!(!state.session_registry.terminate(&state.session_id));
+            client_driver.abort();
+            let _ = client_driver.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_preserves_reply_after_request_half_close() {
+        use tokio::io::AsyncReadExt;
+        let (state, _) = test_state();
+        state.billing.lock().await.state.total_paid_millisats = 1000;
+        state.update_pause_watch(false);
+        state.connect_opened();
+        let (send, recv, mut client_send, mut client_recv, mut drivers) =
+            test_h2_streams(65535).await;
+        let (target, mut peer) = tokio::io::duplex(64);
+        client_send
+            .send_data(Bytes::from_static(b"request"), true)
+            .unwrap();
+        let proxy =
+            proxy::proxy_bidirectional_accounted(send, recv, target, "half-close", state.clone());
+        let target = async {
+            let mut request = Vec::new();
+            peer.read_to_end(&mut request).await.unwrap();
+            assert_eq!(request, b"request");
+            peer.write_all(b"reply after EOF").await.unwrap();
+            peer.shutdown().await.unwrap();
+        };
+        let client = async {
+            let mut reply = Vec::new();
+            while let Some(chunk) = client_recv.data().await {
+                reply.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(reply, b"reply after EOF");
+        };
+        let (result, (), ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(proxy, target, client)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(state.counters.snapshot(), (0, 1));
+        drivers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn connect_publication_rechecks_pause_and_termination() {
+        for terminate in [false, true] {
+            let (state, _) = test_state();
+            if terminate {
+                state.terminate();
+            }
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+            let mut drivers = tokio::task::JoinSet::new();
+            drivers.spawn(async move {
+                let _ = connection.await;
+            });
+            let (response, _send) = client
+                .send_request(
+                    Request::builder()
+                        .method(Method::CONNECT)
+                        .uri("target:80")
+                        .body(())
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut respond) = server.accept().await.unwrap().unwrap();
+            drivers.spawn(async move { while server.accept().await.is_some() {} });
+            let (target, mut peer) = tokio::io::duplex(16);
+            let handler = ConnectHandler {
+                state: state.clone(),
+                quic_pool: None,
+            };
+            handler
+                .proxy_tunnel(&mut respond, request, target, "target:80", "gated")
+                .await
+                .unwrap();
+            let response = response.await;
+            if terminate {
+                assert!(response.is_err());
+            } else {
+                assert_eq!(response.unwrap().status(), StatusCode::PAYMENT_REQUIRED);
+            }
+            assert_eq!(state.counters.snapshot(), (0, 0));
+            use tokio::io::AsyncReadExt;
+            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+            drivers.shutdown().await;
+        }
     }
 
     #[tokio::test]

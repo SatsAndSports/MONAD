@@ -1363,6 +1363,31 @@ Both client and relay use graceful shutdown:
 - close H2 connections cleanly
 - allow `NoiseStream` drop hooks to emit wire-byte accounting logs
 
+Within one relay `RelaySession`, control handling, outbound CONNECT setup, and
+data proxies are directly owned futures in a `FuturesUnordered`, polled alongside
+the H2 accept driver. They are not separately spawned tasks. Dropping or unwinding
+the session future synchronously drops those children; awaiting an aborted
+session task therefore establishes quiescence of its control/setup/data futures.
+This is deliberately different from a `JoinSet` drop, which only requests abort
+of independently scheduled tasks. It does not strengthen the listener's separate
+connection-task ownership contract.
+
+Successful link validation records ownership synchronously before the reducer's
+next await. Session drop cancels the termination token, conditionally releases
+all still-recorded channel ownership for that session ID, and deregisters the
+session. Cleanup is idempotent and cannot release a replacement owner's channel.
+No journal state or durable funding reservations are discarded.
+
+CONNECT setup has a 10-second budget for TCP, QUIC, or blinded QUIC (including
+tweak write/flush), without blocking H2 acceptance or control progress. Setup
+completion rechecks pause/termination before sending 200. Session cancellation
+drops pending setup, so it cannot publish a tunnel later. Proxy cancellation
+covers the complete bidirectional operation, including blocked writes, shutdown,
+and H2 capacity waits; ordinary EOF still preserves the opposite half of the
+connection. Control cancellation similarly covers bootstrap and message writes.
+Per-tunnel accounting drop guards close counters and log byte totals on normal
+completion, cancellation, and unwinding.
+
 ## Byte Accounting
 
 ### Per-tunnel plaintext accounting

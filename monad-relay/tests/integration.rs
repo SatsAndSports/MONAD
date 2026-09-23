@@ -4336,9 +4336,11 @@ async fn test_control_detach_ends_active_and_future_streams() {
     drop(control_recv);
 
     let tunnel_ended = timeout(Duration::from_secs(2), async {
-        match h2_recv.data().await {
-            Some(Ok(_)) => Ok::<(), &'static str>(()),
-            Some(Err(_)) | None => Err("ended"),
+        while let Some(chunk) = h2_recv.data().await {
+            match chunk {
+                Ok(data) => assert!(data.is_empty(), "data arrived after control detach"),
+                Err(_) => break,
+            }
         }
     })
     .await;
