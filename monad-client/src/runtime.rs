@@ -916,10 +916,7 @@ mod tests {
             .map(|name| ClientConfig {
                 name: (*name).to_string(),
                 socks: "127.0.0.1:0".to_string(),
-                route: vec![monad_common::config::ClientRouteHopConfig {
-                    addr: "127.0.0.1:1".to_string(),
-                    pubkey: secret.clone(),
-                }],
+                route: vec![format!("{secret}::127.0.0.1:1").parse().unwrap()],
             })
             .collect();
         MonadConfig {

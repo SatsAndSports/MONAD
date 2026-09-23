@@ -15,7 +15,7 @@ use monad_client::runtime::{
     run_configured_client_until_shutdown_with_options, ConfiguredClientRuntimeOptions,
     SharedRouteRuntimeStats, CONFIGURED_CLIENT_WALLET_NAME,
 };
-use monad_common::config::{ClientConfig, ClientRouteHopConfig, ClientWalletConfig, MonadConfig};
+use monad_common::config::{ClientConfig, ClientWalletConfig, MonadConfig};
 use rusqlite::{types::Value, Connection, OpenFlags};
 use tokio::sync::{oneshot, Notify, Semaphore};
 
@@ -228,15 +228,16 @@ async fn configured_runtime_excludes_opening_maintenance_during_startup_and_stea
         clients: vec![ClientConfig {
             name: "locking-test".into(),
             socks: "127.0.0.1:0".into(),
-            route: vec![ClientRouteHopConfig {
-                addr: blackhole.local_addr().unwrap().to_string(),
-                pubkey: monad_common::secp_identity::SecpTransportKeypair::from_secret_bytes(
-                    &[7; 32],
-                )
-                .unwrap()
-                .pubkey()
-                .to_hex(),
-            }],
+            route: vec![format!(
+                "{}::{}",
+                monad_common::secp_identity::SecpTransportKeypair::from_secret_bytes(&[7; 32])
+                    .unwrap()
+                    .pubkey()
+                    .to_hex(),
+                blackhole.local_addr().unwrap(),
+            )
+            .parse()
+            .unwrap()],
         }],
     };
     let stats = SharedRouteRuntimeStats::default();
