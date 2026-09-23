@@ -1130,8 +1130,25 @@ impl RelayWalletManager {
         channels: Vec<ExpiringChannelSummary>,
         close_before_expiry_secs: u64,
     ) -> CloseExpiringChannelsResult {
+        self.close_expiring_channel_candidates_until_shutdown(
+            channels,
+            close_before_expiry_secs,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn close_expiring_channel_candidates_until_shutdown(
+        &self,
+        channels: Vec<ExpiringChannelSummary>,
+        close_before_expiry_secs: u64,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> CloseExpiringChannelsResult {
         let mut result = CloseExpiringChannelsResult::new(close_before_expiry_secs, channels.len());
         for channel in channels {
+            if shutdown.is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err()) {
+                break;
+            }
             match self.mint_client_for_channel(&channel.channel_id) {
                 Ok(net) => match self.close_channel(&channel.channel_id, &net).await {
                     Ok(CloseOutcome::UnknownSpent { .. }) => result.unresolved.push(channel),

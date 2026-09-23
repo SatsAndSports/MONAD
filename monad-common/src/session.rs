@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::sync::{oneshot, watch, RwLock};
+use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
@@ -333,7 +333,7 @@ impl RelayConnection {
         !self.failure_watchers.lock().unwrap().is_empty()
     }
 
-    /// Wait until at least one registered failure watcher signals true.
+    /// Wait until a registered failure watcher signals true or loses its sender.
     /// Returns immediately with `None` if there are no watchers.
     pub async fn wait_for_failure(&self) -> Option<usize> {
         let watchers: Vec<_> = {
@@ -344,25 +344,7 @@ impl RelayConnection {
             return None;
         }
 
-        let (tx, rx) = oneshot::channel();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-        for (hop_idx, mut watcher) in watchers {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    if watcher.changed().await.is_err() {
-                        return;
-                    }
-                    if *watcher.borrow() {
-                        if let Some(tx) = tx.lock().unwrap().take() {
-                            let _ = tx.send(hop_idx);
-                        }
-                        return;
-                    }
-                }
-            });
-        }
-        rx.await.ok()
+        Some(wait_for_watcher_failure(watchers).await)
     }
 
     /// Move all background driver/task handles from another relay connection
@@ -482,6 +464,35 @@ impl RelayConnection {
     }
 }
 
+async fn wait_for_watcher_failure(watchers: Vec<(usize, watch::Receiver<bool>)>) -> usize {
+    use std::future::Future;
+    use std::task::Poll;
+
+    // These futures belong to the caller: suffix rebuild cancellation must not
+    // leave tasks watching the surviving prefix. Sender loss also means failure.
+    let mut waits: Vec<_> = watchers
+        .into_iter()
+        .map(|(hop, mut rx)| {
+            Box::pin(async move {
+                loop {
+                    if *rx.borrow_and_update() || rx.changed().await.is_err() {
+                        return hop;
+                    }
+                }
+            })
+        })
+        .collect();
+    std::future::poll_fn(|cx| {
+        for wait in &mut waits {
+            if let Poll::Ready(hop) = wait.as_mut().poll(cx) {
+                return Poll::Ready(hop);
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 impl Drop for RelayConnection {
     fn drop(&mut self) {
         // Fallback only: callers needing quiescence must await close().
@@ -507,4 +518,38 @@ fn is_expected_h2_teardown_error(error: &h2::Error) -> bool {
         || message.contains("stream closed because of a broken pipe")
         || message.contains("error 0")
         || message.contains("connection closed")
+}
+
+#[cfg(test)]
+mod failure_watcher_tests {
+    use super::wait_for_watcher_failure;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn already_failed_and_closed_watchers_are_failures() {
+        let (_tx, rx) = watch::channel(true);
+        assert_eq!(wait_for_watcher_failure(vec![(3, rx)]).await, 3);
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+        assert_eq!(wait_for_watcher_failure(vec![(7, rx)]).await, 7);
+    }
+
+    #[tokio::test]
+    async fn cancelling_wait_releases_all_prefix_watchers() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let (tx, rx) = watch::channel(false);
+        for _ in 0..32 {
+            let mut wait = Box::pin(wait_for_watcher_failure(vec![(0, rx.clone())]));
+            std::future::poll_fn(|cx| {
+                assert!(wait.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(tx.receiver_count(), 2);
+            drop(wait);
+            assert_eq!(tx.receiver_count(), 1);
+        }
+    }
 }

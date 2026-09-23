@@ -7,6 +7,7 @@ use crate::connector::{
 use crate::session_driver::PaymentPolicy;
 use crate::wallet::{MonadWallet, WalletChannelState};
 use crate::{socks, tunnel};
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use monad_common::config::{ClientConfig, MonadConfig};
 use monad_common::session::RelayConnection;
 use std::future::Future;
@@ -605,7 +606,10 @@ fn detach_channels_for_sessions(
                         .is_some_and(|session_id| session_ids.contains(&session_id))
                 {
                     stats.matched += 1;
-                    if let Err(err) = wallet.force_detach_channel(&channel.channel_id) {
+                    if let Err(err) = wallet.detach_channel_from_session(
+                        &channel.channel_id,
+                        channel.attached_session_id.expect("matched session"),
+                    ) {
                         stats.failed += 1;
                         warn!(
                             channel_id = %channel.channel_id,
@@ -629,8 +633,12 @@ pub async fn run_socks_listener(
     conn_rx: watch::Receiver<Option<Arc<RelayConnection>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    let mut connections = JoinSet::new();
+    let mut connections: FuturesUnordered<BoxFuture<'static, std::thread::Result<()>>> =
+        FuturesUnordered::new();
     let result = loop {
+        if *shutdown_rx.borrow() {
+            break Ok(());
+        }
         // Wait for either an incoming SOCKS connection or an explicit shutdown
         // signal so the listener task can exit promptly.
         tokio::select! {
@@ -642,30 +650,31 @@ pub async fn run_socks_listener(
                 let conn_rx = conn_rx.clone();
                 let shutdown_rx = shutdown_rx.clone();
 
-                connections.spawn(async move {
+                connections.push(std::panic::AssertUnwindSafe(async move {
                     let result = async {
+                        // A stalled handshake must not pin a route generation.
+                        let target = socks::socks5_handshake(&mut stream).await?;
                         let conn = match wait_for_active_route(conn_rx, shutdown_rx).await {
                             Some(conn) => conn,
                             None => {
-                                socks::reject_socks5_connect_unavailable(&mut stream).await?;
+                                socks::send_reply(&mut stream, 0x05, "0.0.0.0", 0).await?;
                                 warn!(
                                     "SOCKS client {peer_addr} rejected: route is reconnecting"
                                 );
                                 return Ok(());
                             }
                         };
-                        let target = socks::socks5_handshake(&mut stream).await?;
                         tunnel::open_tunnel(&conn, &target.authority, &mut stream).await
                     }
                     .await;
                     if let Err(err) = result {
                         warn!("SOCKS client {peer_addr} failed: {err}");
                     }
-                });
+                }).catch_unwind().boxed());
             }
-            Some(result) = connections.join_next(), if !connections.is_empty() => {
-                if let Err(error) = result {
-                    warn!("SOCKS connection task failed: {error}");
+            Some(result) = connections.next(), if !connections.is_empty() => {
+                if result.is_err() {
+                    warn!("SOCKS connection future panicked");
                 }
             }
             changed = shutdown_rx.changed() => {
@@ -675,8 +684,7 @@ pub async fn run_socks_listener(
             }
         }
     };
-    connections.abort_all();
-    while connections.join_next().await.is_some() {}
+    drop(connections);
     result
 }
 
@@ -716,6 +724,43 @@ async fn wait_for_active_route(
 mod tests {
     use super::*;
     use crate::wallet::{MockWallet, WalletChannel};
+
+    #[tokio::test]
+    async fn stalled_socks_handshake_does_not_pin_route_and_drops_with_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (io, _peer) = tokio::io::duplex(4096);
+        let (mut conn, driver) = RelayConnection::from_transport_stream(io, [1; 32])
+            .await
+            .unwrap();
+        conn.add_driver(driver);
+        let conn = Arc::new(conn);
+        let (_route_tx, route_rx) = watch::channel(Some(conn.clone()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut socket = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let root = tokio::spawn(run_socks_listener(listener, route_rx, stop_rx));
+        socket.write_all(&[5, 1, 0]).await.unwrap();
+        let mut reply = [0; 2];
+        socket.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [5, 0]);
+        assert_eq!(
+            Arc::strong_count(&conn),
+            2,
+            "stalled handshake retained route"
+        );
+        root.abort();
+        assert!(root.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), socket.read(&mut reply))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        conn.close().await;
+    }
 
     #[test]
     fn route_runtime_stats_start_at_zero() {

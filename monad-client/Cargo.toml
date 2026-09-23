@@ -12,6 +12,7 @@ monad-common = { path = "../monad-common" }
 monad-quic = { path = "../monad-quic" }
 quinn = "0.11"
 h2 = "0.4"
+futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -30,6 +31,7 @@ cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package 
 cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "7eeb3ca54c76ed16b9522ea2a196dfe520d14dc0", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 axum = "0.8.9"
 tempfile = "3"
 cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "7eeb3ca54c76ed16b9522ea2a196dfe520d14dc0", package = "cdk-spilman-test-mint", default-features = false, features = ["http"] }

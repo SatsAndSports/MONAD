@@ -365,6 +365,32 @@ a broken middle hop also causes downstream sessions to end.
 Route rebuilds are serialized. Once a rebuild starts, old-route watchers are
 dropped; additional stale failures from that old route are ignored. The rebuilt
 route installs fresh watchers after it is published.
+`RelayConnection::wait_for_failure` owns its watch futures directly rather than
+spawning tasks. Dropping the wait releases every cloned receiver synchronously,
+including those for a surviving prefix. An already-true value or a closed sender
+is a failure; neither requires a subsequent watch notification.
+
+Shared QUIC pools intentionally outlive individual sessions. Failed cached-stream
+opens evict only the same Quinn connection identity, and abandoned pending waits
+evict only the same watch channel. A stale waiter must not remove a replacement
+entry merely because it is also `Ready` or `Pending`.
+
+Runtime wallet lock ownership follows the shared `SqliteClientWallet`, not just
+the configured-client manager's stack frame. Payment tasks and cancellation-stable
+setup supervisors retain that wallet while they can mutate it. A blocked
+`block_in_place` call therefore retains authority even after its caller requests
+abort. Dropping a configured runtime requests child cancellation; it does not
+claim synchronous completion of those blocking calls. Explicit shutdown awaits
+normal child cleanup. Each payment driver has a drop guard that conditionally
+detaches all channels owned by its session after the driver's work ends, including
+attachments not yet reflected in `intended_channel_id`. Cleanup never clears a
+sibling/replacement session's attachment or an ambiguous journal reservation.
+
+Route failure waits own their per-connection futures directly. SOCKS handshakes
+run before acquiring the current route, so stalled handshakes cannot pin old
+route generations. SOCKS connection futures are owned directly by the listener.
+All client control writes, including heartbeat requests, have the existing
+15-second heartbeat timeout as their send deadline.
 
 Route (re)connect retry policy is split by lifecycle: before the first
 successful connect the client fails fast after a bounded number of attempts so
@@ -1354,6 +1380,57 @@ Both client and relay use graceful shutdown:
 - close H2 connections cleanly
 - allow `NoiseStream` drop hooks to emit wire-byte accounting logs
 
+Within one relay `RelaySession`, control handling, outbound CONNECT setup, and
+data proxies are directly owned futures in a `FuturesUnordered`, polled alongside
+the H2 accept driver. They are not separately spawned tasks. Dropping or unwinding
+the session future synchronously drops those children; awaiting an aborted
+session task therefore establishes quiescence of its control/setup/data futures.
+This is deliberately different from a `JoinSet` drop, which only requests abort
+of independently scheduled tasks. The relay listener and its QUIC connections
+also directly own their connection/stream futures, with panic isolation at each
+child boundary. Root cancellation drops the MONAD descendants synchronously.
+Explicit listener finish additionally closes and drains Quinn with `wait_idle`.
+Abrupt cancellation cannot await Quinn's runtime-owned protocol drivers; they
+may temporarily retain the UDP socket while draining, even though no MONAD
+session, proxy, or channel ownership remains.
+
+Successful link validation records ownership synchronously before the reducer's
+next await. Session drop cancels the termination token, conditionally releases
+all still-recorded channel ownership for that session ID, and deregisters the
+session. Cleanup is idempotent and cannot release a replacement owner's channel.
+No journal state or durable funding reservations are discarded.
+
+CONNECT setup has a 10-second budget for TCP, QUIC, or blinded QUIC (including
+tweak write/flush), without blocking H2 acceptance or control progress. Setup
+completion rechecks pause/termination before sending 200. Session cancellation
+drops pending setup, so it cannot publish a tunnel later. Proxy cancellation
+covers the complete bidirectional operation, including blocked writes, shutdown,
+and H2 capacity waits; ordinary EOF still preserves the opposite half of the
+connection. Control cancellation similarly covers bootstrap and message writes.
+Hard I/O failures use fallible joins to cancel the opposite copy direction;
+normal EOF remains a half-close, not whole-tunnel cancellation. This applies to
+both the shared client proxy and the relay's accounted proxy.
+The shared proxy also observes H2 reset/connection failure through the send
+handle while waiting for application reads. After local EOF it keeps that
+observation alive until the receive-side drain finishes. A blocked application
+write therefore cannot hide a reset simply by preventing `RecvStream` polling;
+normal EOF still permits buffered data to drain.
+Per-tunnel accounting drop guards close counters and log byte totals on normal
+completion, cancellation, and unwinding.
+
+Direct ownership does not provide CPU parallelism within a listener: synchronous
+handshake/payment work shares that listener task with its other futures. Separate
+listeners can run in parallel. The bounded five-hop transport stress recorded in
+`docs/teardown-audit.md` characterizes this implementation, not a before/after
+performance comparison or an exhaustive CPU-heavy payment workload.
+
+The expiring-channel auto-close loop is a directly owned future, not a spawned
+worker whose handle can detach on wrapper cancellation. Shutdown stops admission
+between candidates and cancels the active sweep. An interrupted close retains
+its durable journal and is recovered by the existing restore/replay rules; no
+reservation or ambiguous execution is treated as successfully completed merely
+because its task was cancelled.
+
 ## Byte Accounting
 
 ### Per-tunnel plaintext accounting
@@ -1646,7 +1723,12 @@ These values are generous for testing. Production tuning will depend on expected
 
 MONAD deliberately uses no QUIC keep-alives: idle connections are meant to die and be re-established on demand (the pool evicts a dead connection on the next failed stream open and reconnects fresh). Both sides set a 20s QUIC idle timeout, which also bounds silent peer-death detection at the transport layer. Above QUIC, the client's session heartbeat (status request after 5s idle, 15s timeout) provides MONAD-level detection of an unresponsive session, so active sessions keep their transport warm without transport-level keep-alives.
 
-Relay QUIC stream sessions are tracked under the accepting connection task with a per-connection `JoinSet`. Graceful shutdown waits for active connection tasks, while abrupt task cancellation drops the connection's stream task tree. This keeps stream sessions from outliving their connection and prevents detached stream tasks from holding the QUIC endpoint socket open after an ungraceful relay loss.
+Relay connection and stream sessions are directly owned futures beneath the
+listener. Graceful shutdown drains them or drops them at its deadline; abrupt
+cancellation synchronously drops all MONAD descendants. Quinn's internal protocol
+drivers have a separate draining lifetime, as described in the shutdown model.
+The standalone echo server uses the same direct ownership pattern and its tests
+exercise the production echo implementation, including root cancellation.
 
 ### What Has Been Integrated
 

@@ -2418,6 +2418,7 @@ dependencies = [
  "cdk-spilman",
  "cdk-spilman-test-mint",
  "clap",
+ "futures-util",
  "h2",
  "hex",
  "http",
@@ -2468,6 +2469,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "hex",
  "monad-common",
  "pem",
@@ -2495,6 +2497,7 @@ dependencies = [
  "cdk-spilman-test-mint",
  "clap",
  "dotenvy",
+ "futures-util",
  "h2",
  "hex",
  "http",

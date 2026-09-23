@@ -695,6 +695,13 @@ ignored until the rebuilt route is active. Route (re)connects fail fast after a
 few attempts before the first successful connect, so startup misconfiguration is
 loud; once a route has connected, reconnects retry indefinitely with capped
 backoff, and the client recovers when the route (or a refilled wallet) allows.
+Loss of a hop's payment-driver failure sender is also treated as a hop failure,
+including when the driver exits without sending its final notification.
+Closing a funded connection releases only its own wallet attachments, including
+cancelled link sends. Runtime wallet locks remain held by outstanding wallet
+handles until their work actually finishes; aborting a blocking mint call does
+not prematurely make the wallet available for maintenance. Control writes use
+the existing 15-second heartbeat timeout instead of waiting forever for H2 capacity.
 
 The configured client connects directly to the first hop via QUIC, then runs
 the same Noise+H2 session on top using the secp QUIC path.
@@ -771,9 +778,27 @@ Both client and relay handle `Ctrl+C` gracefully:
 - shut down H2 connections cleanly
 - emit `SecpNoiseStream` wire-byte totals
 
+Relay session teardown also ends paused tunnels and tunnels blocked on target
+writes or H2 flow control. Relay CONNECT setup runs concurrently with the control
+stream and has a 10-second deadline (including the blinded-hop tweak preamble).
+Setup failure or timeout returns HTTP 502; a session that becomes paused before
+the tunnel is published receives HTTP 402 instead of a late successful CONNECT.
+Explicit relay shutdown drains QUIC connections before returning. Abrupt task
+cancellation drops MONAD sessions immediately, but Quinn's internal protocol
+drivers can retain the UDP socket briefly while draining. Interrupted auto-close
+work leaves its durable close journal available for recovery on restart.
+Proxy EOF preserves normal half-close and permits a reply after the request
+ends; a reset or other hard I/O error cancels the opposite copy direction.
+The client proxy observes H2 resets even when application writes are blocked,
+including after the application's send half has closed.
+
 ## QUIC Echo Tool
 
 The `monad-quic` crate also includes a standalone QUIC echo server/client for transport testing and experimentation. The main MONAD client and relay now use shared code from this crate for QUIC support.
+The echo server owns its connection and stream futures. Library callers can use
+`monad_quic::server::run_server_endpoint` with an already-bound endpoint; closing
+that endpoint stops and drains the service, while dropping the server future
+cancels its application-level children.
 
 ### Generate a keypair
 

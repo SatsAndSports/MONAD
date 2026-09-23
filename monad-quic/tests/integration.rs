@@ -16,25 +16,7 @@ async fn start_echo_server() -> Result<(Endpoint, SocketAddr, String)> {
     // Spawn the accept loop
     let ep = endpoint.clone();
     tokio::spawn(async move {
-        while let Some(incoming) = ep.accept().await {
-            tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; 64 * 1024];
-                        while let Ok(Some(n)) = recv.read(&mut buf).await {
-                            if send.write_all(&buf[..n]).await.is_err() {
-                                return;
-                            }
-                        }
-                        let _ = send.finish();
-                    });
-                }
-            });
-        }
+        monad_quic::server::run_server_endpoint(ep).await.unwrap();
     });
 
     Ok((endpoint, listen_addr, km.pin_hex))
@@ -106,6 +88,33 @@ async fn echo_one_stream(
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_echo_root_abort_drops_live_stream() {
+    let km = monad_quic::keygen::generate().unwrap();
+    let config = monad_quic::server::build_server_config(&km.cert_pem, &km.key_pem).unwrap();
+    let endpoint = Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    let root = tokio::spawn(monad_quic::server::run_server_endpoint(endpoint));
+    let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(
+        monad_quic::client::build_client_config(hex::decode(km.pin_hex).unwrap()).unwrap(),
+    );
+    let conn = client.connect(addr, "monad-relay").unwrap().await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"gate").await.unwrap();
+    let mut echo = [0; 4];
+    recv.read_exact(&mut echo).await.unwrap();
+    assert_eq!(&echo, b"gate");
+    root.abort();
+    assert!(root.await.unwrap_err().is_cancelled());
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), recv.read(&mut echo))
+        .await
+        .unwrap();
+    assert!(!matches!(result, Ok(Some(_))));
+    client.close(0u32.into(), b"done");
+    client.wait_idle().await;
+}
 
 #[tokio::test]
 async fn test_basic_echo_4_streams() {

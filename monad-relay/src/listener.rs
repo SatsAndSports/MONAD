@@ -9,6 +9,7 @@ use crate::wallet_manager::{cache_relay_keysets, CloseExpiringChannelsResult, Re
 use cashu::nuts::Id;
 use cdk_spilman::configurable_host::SpilmanStorage;
 use cdk_spilman::configurable_networking::{build_keyset_info_json, fetch_all_keysets_from_mint};
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use monad_common::blinded_hop::derive_tweaked_responder_secret;
 use monad_common::bootstrap::{
     initial_server_accept_v1, select_cashu_spilman_protocol_keyset_versions, select_pricing_policy,
@@ -34,7 +35,6 @@ use std::sync::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
@@ -407,22 +407,32 @@ where
         spilman_storage_path: config.spilman_storage_path.clone(),
         channel_policy: config.channel_policy.clone(),
     });
-    let auto_close_worker = spawn_expiring_channel_auto_close_worker(
-        wallet_manager,
-        config.relay_wallet_name.clone(),
-        config
-            .channel_policy
-            .expiring_channels
-            .close_before_expiry_secs,
-        config.channel_policy.expiring_channels.auto_close.enabled,
-        config
-            .channel_policy
-            .expiring_channels
-            .auto_close
-            .interval_secs,
-    );
+    let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+    let enabled = config.channel_policy.expiring_channels.auto_close.enabled;
+    let worker_config = config.clone();
+    let auto_close_worker = async move {
+        if enabled {
+            run_expiring_channel_auto_close_worker(
+                wallet_manager,
+                worker_config.relay_wallet_name.clone(),
+                worker_config
+                    .channel_policy
+                    .expiring_channels
+                    .close_before_expiry_secs,
+                worker_config
+                    .channel_policy
+                    .expiring_channels
+                    .auto_close
+                    .interval_secs,
+                worker_shutdown_rx,
+            )
+            .await;
+        }
+    };
+    tokio::pin!(auto_close_worker);
+    let stop_worker = worker_shutdown_tx.clone();
 
-    let result = run_with_payments_and_registry_and_shutdown(
+    let server = run_with_payments_and_registry_and_shutdown(
         listener,
         quic_endpoint,
         config,
@@ -432,57 +442,21 @@ where
             session_registry: Arc::new(SessionRegistry::new()),
             keyset_refresh: Some(keyset_refresh.clone()),
         },
-        shutdown,
-    )
-    .await;
-
-    stop_expiring_channel_auto_close_worker(auto_close_worker).await;
-    result
-}
-
-fn spawn_expiring_channel_auto_close_worker(
-    wallet_manager: Arc<RelayWalletManager>,
-    relay_name: String,
-    close_before_expiry_secs: u64,
-    enabled: bool,
-    interval_secs: u64,
-) -> Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)> {
-    if !enabled {
-        return None;
-    }
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run_expiring_channel_auto_close_worker(
-        wallet_manager,
-        relay_name,
-        close_before_expiry_secs,
-        interval_secs,
-        shutdown_rx,
-    ));
-    Some((shutdown_tx, handle))
-}
-
-async fn stop_expiring_channel_auto_close_worker(
-    worker: Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
-) {
-    let Some((shutdown_tx, mut handle)) = worker else {
-        return;
+        async move {
+            shutdown.await;
+            let _ = stop_worker.send(true);
+        },
+    );
+    tokio::pin!(server);
+    let (result, worker_finished) = tokio::select! {
+        result = &mut server => (result, false),
+        () = &mut auto_close_worker => (server.await, true),
     };
-    let _ = shutdown_tx.send(true);
-    match tokio::time::timeout(Duration::from_secs(5), &mut handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!(error = %e, "expiring-channel auto-close worker panicked"),
-        Err(_) => {
-            error!("timed out waiting for expiring-channel auto-close worker to stop");
-            handle.abort();
-            match handle.await {
-                Ok(()) => {}
-                Err(e) if e.is_cancelled() => {}
-                Err(e) => {
-                    error!(error = %e, "expiring-channel auto-close worker failed while aborting")
-                }
-            }
-        }
+    let _ = worker_shutdown_tx.send(true);
+    if !worker_finished {
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut auto_close_worker).await;
     }
+    result
 }
 
 async fn run_expiring_channel_auto_close_worker(
@@ -499,15 +473,34 @@ async fn run_expiring_channel_auto_close_worker(
         "expiring-channel auto-close worker started"
     );
     loop {
-        if *shutdown.borrow() {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
             break;
         }
 
         let started = Instant::now();
-        match wallet_manager
-            .close_expiring_channels(Some(&relay_name), now_seconds(), close_before_expiry_secs)
-            .await
-        {
+        let sweep_shutdown = shutdown.clone();
+        let sweep = async {
+            let channels = wallet_manager.find_expiring_channels(
+                Some(&relay_name),
+                now_seconds(),
+                close_before_expiry_secs,
+            )?;
+            Ok::<_, io::Error>(
+                wallet_manager
+                    .close_expiring_channel_candidates_until_shutdown(
+                        channels,
+                        close_before_expiry_secs,
+                        Some(&sweep_shutdown),
+                    )
+                    .await,
+            )
+        };
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            result = sweep => result,
+        };
+        match result {
             Ok(result) => log_expiring_channel_auto_close_result(&result, started.elapsed()),
             Err(e) => {
                 error!(relay = %relay_name, error = %e, "expiring-channel auto-close sweep failed")
@@ -620,7 +613,8 @@ where
     let local_addr = listener.local_addr()?;
     info!("listening on {local_addr}");
 
-    let mut sessions = JoinSet::new();
+    let mut sessions: FuturesUnordered<BoxFuture<'static, std::thread::Result<()>>> =
+        FuturesUnordered::new();
 
     // Create the QUIC connection pool for outbound CONNECT quic: forwarding.
     // This is separate from the QUIC endpoint (which handles inbound connections).
@@ -642,7 +636,7 @@ where
                 let payments = payments.clone();
                 let services = services.clone();
 
-                sessions.spawn(async move {
+                sessions.push(std::panic::AssertUnwindSafe(async move {
                     let (send_cipher, recv_cipher, session_id, bootstrap_accept) =
                         match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_accept_builder(
                             &mut tcp_stream,
@@ -702,14 +696,7 @@ where
                     }
 
                     info!("connection with {peer_addr} closed (TCP)");
-                });
-
-                // Reap any finished sessions (non-blocking)
-                while let Some(result) = sessions.try_join_next() {
-                    if let Err(e) = result {
-                        error!("session task panicked: {e}");
-                    }
-                }
+                }).catch_unwind().boxed());
             }
             Some(incoming) = async {
                 match &quic_endpoint {
@@ -724,7 +711,7 @@ where
                 let payments = payments.clone();
                 let services = services.clone();
 
-                sessions.spawn(async move {
+                sessions.push(std::panic::AssertUnwindSafe(async move {
                     // Complete the QUIC connection handshake
                     let conn = match incoming.await {
                         Ok(c) => c,
@@ -739,12 +726,9 @@ where
 
                     // Accept bidirectional streams from this QUIC connection.
                     // Each stream is an independent secp Noise+H2 session.
-                    // Stream tasks are tracked in a per-connection JoinSet so
-                    // cancelling this task (shutdown, abrupt kill) also cancels
-                    // its stream sessions: JoinSet aborts on drop. Detached
-                    // stream tasks would leak connections and hold the endpoint
-                    // socket open.
-                    let mut stream_tasks = JoinSet::new();
+                    // Direct futures drop synchronously with this connection,
+                    // unlike JoinSet drop which only requests task cancellation.
+                    let mut stream_tasks: FuturesUnordered<BoxFuture<'static, std::thread::Result<()>>> = FuturesUnordered::new();
                     loop {
                         tokio::select! {
                             accept_result = conn.accept_bi() => {
@@ -761,7 +745,7 @@ where
                                 let services = services.clone();
                                 let authenticated = authenticated.clone();
                                 let conn = conn.clone();
-                                stream_tasks.spawn(async move {
+                                stream_tasks.push(std::panic::AssertUnwindSafe(async move {
                                     let mut send = send;
                                     let mut recv = recv;
                                     let mut kind = [0u8; 1];
@@ -863,7 +847,7 @@ where
                                     }
 
                                     info!("QUIC stream {stream_id:?} from {remote} closed");
-                                });
+                                }).catch_unwind().boxed());
                             }
                             Err(quinn::ConnectionError::ApplicationClosed(_))
                             | Err(quinn::ConnectionError::ConnectionClosed(_))
@@ -881,20 +865,17 @@ where
                             }
                                 }
                         }
-                        Some(result) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
-                            if let Err(e) = result {
-                                error!(%remote, "QUIC stream task panicked: {e}");
+                        Some(result) = stream_tasks.next(), if !stream_tasks.is_empty() => {
+                            if result.is_err() {
+                                error!(%remote, "QUIC stream future panicked");
                             }
                         }
                     }
                 }
-                });
-
-                while let Some(result) = sessions.try_join_next() {
-                    if let Err(e) = result {
-                        error!("session task panicked: {e}");
-                    }
-                }
+                }).catch_unwind().boxed());
+            }
+            Some(result) = sessions.next(), if !sessions.is_empty() => {
+                if result.is_err() { error!("session future panicked"); }
             }
             _ = &mut shutdown => {
                 info!("shutting down (signal)...");
@@ -913,10 +894,10 @@ where
 
         loop {
             tokio::select! {
-                result = sessions.join_next() => {
+                result = sessions.next() => {
                     match result {
                         Some(Ok(())) => {}
-                        Some(Err(e)) => error!("session task panicked: {e}"),
+                        Some(Err(_)) => error!("session future panicked"),
                         None => {
                             info!("all sessions finished");
                             break;
@@ -926,14 +907,7 @@ where
                 _ = &mut timeout => {
                     let remaining = sessions.len();
                     info!("shutdown timeout, aborting {remaining} remaining session(s)");
-                    sessions.abort_all();
-                    while let Some(result) = sessions.join_next().await {
-                        if let Err(e) = result {
-                            if !e.is_cancelled() {
-                                error!("session task failed while aborting: {e}");
-                            }
-                        }
-                    }
+                    sessions.clear();
                     break;
                 }
             }
@@ -942,6 +916,7 @@ where
 
     if let Some(ep) = quic_endpoint {
         ep.close(0u32.into(), b"shutdown");
+        ep.wait_idle().await;
     }
 
     if let Some(keyset_refresh) = services.keyset_refresh {

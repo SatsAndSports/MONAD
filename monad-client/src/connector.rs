@@ -9,6 +9,7 @@ use crate::route::{Route, RouteHop};
 use crate::session_driver;
 use crate::session_driver::PaymentPolicy;
 use crate::wallet::{MockWallet, MonadWallet};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use monad_common::blinded_connect::BlindedConnectRequest;
 use monad_common::bootstrap::BootstrapCapabilities;
 use monad_common::network_endpoint::validate_network_endpoint;
@@ -22,7 +23,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::task::JoinSet;
 use tracing::info;
 
 /// Reuse this runtime (or a clone) across retries to wait for cancelled setup
@@ -251,18 +251,11 @@ impl RouteConnection {
                 return None;
             }
 
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
-            let mut tasks = JoinSet::new();
-            for conn in conns {
-                let tx = tx.clone();
-                tasks.spawn(async move {
-                    if let Some(hop_idx) = conn.wait_for_failure().await {
-                        let _ = tx.send(hop_idx);
-                    }
-                });
-            }
-
-            let mut min_hop = rx.recv().await?;
+            let mut waits: FuturesUnordered<_> = conns
+                .into_iter()
+                .map(|conn| async move { conn.wait_for_failure().await })
+                .collect();
+            let mut min_hop = waits.next().await.flatten()?;
 
             // A middle-hop failure often cascades into downstream session
             // failures. Debounce briefly and rebuild from the lowest failed hop.
@@ -272,18 +265,16 @@ impl RouteConnection {
                 if remaining.is_zero() {
                     break;
                 }
-                match tokio::time::timeout(remaining, rx.recv()).await {
-                    Ok(Some(hop_idx)) => {
+                match tokio::time::timeout(remaining, waits.next()).await {
+                    Ok(Some(Some(hop_idx))) => {
                         if hop_idx < min_hop {
                             min_hop = hop_idx;
                         }
                     }
-                    Ok(None) | Err(_) => break,
+                    Ok(None | Some(None)) | Err(_) => break,
                 }
             }
 
-            // The remaining watcher tasks are aborted when the JoinSet drops.
-            drop(tasks);
             Some(min_hop)
         }
     }
@@ -768,7 +759,7 @@ fn close_failed_funded_connection(conn: &RelayConnection, runtime: &ConnectorRun
         .iter()
         .filter(|channel| channel.attached_session_id == Some(session_id))
     {
-        if let Err(err) = wallet.force_detach_channel(&channel.channel_id) {
+        if let Err(err) = wallet.detach_channel_from_session(&channel.channel_id, session_id) {
             tracing::warn!(
                 "failed to detach channel {} from failed route session: {err}",
                 channel.channel_id

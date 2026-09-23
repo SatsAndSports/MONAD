@@ -12,6 +12,24 @@ use tracing::{debug, info};
 
 pub use monad_common::proxy::proxy_bidirectional;
 
+struct TunnelAccounting<'a> {
+    state: &'a SessionState,
+    label: &'a str,
+    outbound: u64,
+    inbound: u64,
+}
+
+impl Drop for TunnelAccounting<'_> {
+    fn drop(&mut self) {
+        let (open_connects, total_connects) = self.state.connect_closed();
+        info!(
+            "tunnel closed: {} | session_id={} open_connects={} total_connects={} outbound={} inbound={} total={}",
+            self.label, hex::encode(self.state.session_id()), open_connects, total_connects,
+            self.outbound, self.inbound, self.outbound.saturating_add(self.inbound)
+        );
+    }
+}
+
 async fn wait_until_unpaused_or_terminated(
     paused_rx: &mut watch::Receiver<bool>,
     termination: &CancellationToken,
@@ -60,9 +78,15 @@ where
     let mut paused_rx_b = state.pause_receiver();
     let termination_a = state.termination_token();
     let termination_b = state.termination_token();
+    let termination = state.termination_token();
+    let mut accounting = TunnelAccounting {
+        state: &state,
+        label,
+        outbound: 0,
+        inbound: 0,
+    };
 
     let h2_to_target = async {
-        let mut tunnel_outbound = 0u64;
         loop {
             wait_until_unpaused_or_terminated(&mut paused_rx_a, &termination_a).await?;
 
@@ -75,7 +99,7 @@ where
                     let _ = h2_recv.flow_control().release_capacity(len);
 
                     target_write.write_all(&data).await?;
-                    tunnel_outbound = tunnel_outbound.saturating_add(len as u64);
+                    accounting.outbound = accounting.outbound.saturating_add(len as u64);
 
                     let paused = state.note_outbound_bytes(len).await;
                     if paused {
@@ -92,13 +116,12 @@ where
             }
         }
 
-        let _ = target_write.shutdown().await;
-        Ok::<u64, io::Error>(tunnel_outbound)
+        target_write.shutdown().await?;
+        Ok::<(), io::Error>(())
     };
 
     let target_to_h2 = async {
         let mut buf = vec![0u8; 16384];
-        let mut tunnel_inbound = 0u64;
         loop {
             wait_until_unpaused_or_terminated(&mut paused_rx_b, &termination_b).await?;
 
@@ -118,7 +141,7 @@ where
                     h2_send
                         .send_data(data, false)
                         .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
-                    tunnel_inbound = tunnel_inbound.saturating_add(n as u64);
+                    accounting.inbound = accounting.inbound.saturating_add(n as u64);
 
                     let paused = state.note_inbound_bytes(n).await;
                     if paused {
@@ -131,31 +154,22 @@ where
             }
         }
 
-        let _ = h2_send.send_data(Bytes::new(), true);
-        Ok::<u64, io::Error>(tunnel_inbound)
+        h2_send
+            .send_data(Bytes::new(), true)
+            .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
+        Ok::<(), io::Error>(())
     };
 
-    let (left, right) = tokio::join!(h2_to_target, target_to_h2);
-    let tunnel_outbound = left.as_ref().ok().copied().unwrap_or(0);
-    let tunnel_inbound = right.as_ref().ok().copied().unwrap_or(0);
-    if let Err(e) = left {
-        debug!("proxy {label} h2->target ended with error: {e}");
+    // Cancellation covers writes, shutdown, and H2 capacity as well as reads.
+    // Normal EOF still waits for the other direction (TCP half-close).
+    let result = tokio::select! {
+        biased;
+        _ = termination.cancelled() => return Ok(()),
+        result = async { tokio::try_join!(h2_to_target, target_to_h2) } => result,
+    };
+    if let Err(e) = &result {
+        debug!("proxy {label} ended with error: {e}");
     }
-    if let Err(e) = right {
-        debug!("proxy {label} target->h2 ended with error: {e}");
-    }
 
-    let (open_connects, total_connects) = state.connect_closed();
-
-    info!(
-        "tunnel closed: {label} | session_id={} open_connects={} total_connects={} outbound={} inbound={} total={}",
-        hex::encode(state.session_id()),
-        open_connects,
-        total_connects,
-        tunnel_outbound,
-        tunnel_inbound,
-        tunnel_outbound + tunnel_inbound
-    );
-
-    Ok(())
+    result.map(|_| ())
 }
