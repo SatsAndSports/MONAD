@@ -1006,10 +1006,13 @@ fast-path transition updates the pause watcher but does not itself send a
 
 Configured route lists serialize the existing `PathNode` model as strings:
 `<key>::<clear-address>` or `<key>:B:<data>`. Keys reuse the standard `npub` /
-64-hex x-only parser and serialize as lowercase hex. Clear addresses are
-normalized to explicit ports (9050 when omitted); IPv6 uses brackets in the
-normalized authority. The first hop is clear, and each blinded node retains
-the same predecessor/hidden-target semantics as the low-level path constructor.
+64-hex x-only parser and serialize as lowercase hex. Clear addresses are opaque,
+length-delimited UTF-8 strings: parsing, Serde, serialization, and offline path
+construction preserve them byte-for-byte without endpoint parsing, bracket
+insertion, normalization, or a default port. They are nonempty, NUL-free, and
+bounded to 975 bytes so the same value can fit in a blinded payload. The first
+hop is clear, and each blinded node retains the same predecessor/hidden-target
+semantics as the low-level path constructor.
 The configured runtime maps these nodes to the existing QUIC `RouteHop`s;
 library TCP routes and all Noise/H2 nesting remain unchanged.
 Library callers use `FromStr`, Serde, or fallible `PathNode::to_compact_string()`;
@@ -1042,6 +1045,14 @@ bootstrap version, `blinded_connect_v1`, `tweaked_noise_v1`, and the existing
 blinded AEAD domain labels. No CONNECT headers or cryptography change.
 `monad-client blind-route` uses `build_path` offline and serializes its nodes
 directly into a YAML route block; it needs only public clear hop inputs.
+
+Endpoint semantics apply only when an address is dispatched by the current
+TCP/QUIC transports. At that boundary MONAD requires DNS or IPv4 `host:port`, or
+bracketed IPv6 `[address]:port`, with an explicit numeric port in 1..=65535.
+This check covers first-hop connections, ordinary nested CONNECT forwarding,
+relay TCP/QUIC egress, and decrypted blinded next-hop addresses. The special
+blinded CONNECT descriptor authority is not treated as a network endpoint; its
+decrypted address is validated instead.
 
 MONAD's normal routing model assumes the client knows every hop's real
 `addr:port` and published secp256k1 x-only public key up front. A blinded route changes

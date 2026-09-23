@@ -11,6 +11,7 @@ use crate::session_driver::PaymentPolicy;
 use crate::wallet::{MockWallet, MonadWallet};
 use monad_common::blinded_connect::BlindedConnectRequest;
 use monad_common::bootstrap::BootstrapCapabilities;
+use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::noise_secp256k1;
 use monad_common::secp_identity::Secp256k1Pubkey;
 use monad_common::session::RelayConnection;
@@ -494,6 +495,7 @@ async fn build_route(
             "the first hop must be cleartext",
         ));
     };
+    validate_network_endpoint(addr)?;
 
     let funded = if *use_quic {
         info!("connecting to first hop via QUIC: {addr}");
@@ -861,6 +863,23 @@ mod tests {
         let err = ensure_next_hop_capabilities(&route, 0, &capabilities).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("cannot forward"));
+    }
+
+    #[tokio::test]
+    async fn first_hop_rejects_portless_address_before_network_dispatch() {
+        let route = Route::new(vec![RouteHop::Cleartext {
+            addr: "localhost".to_string(),
+            pubkey: sample_pubkey(1),
+            use_quic: true,
+        }])
+        .unwrap();
+
+        let error = match connect_route(&route).await {
+            Ok(_) => panic!("portless route unexpectedly reached network dispatch"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("explicit numeric port"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

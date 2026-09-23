@@ -632,10 +632,12 @@ Route entries are compact strings, not `addr` / `pubkey` maps:
 - Blinded: `<tweaked-key>:B:<versioned-data>`.
 - Keys accept the existing `npub` encoding or 64 hex characters representing an
   x-only secp256k1 public key. `mpub` is not an alias. Serialization emits hex.
-- Clear addresses accept DNS names, IPv4, and IPv6. Omitted ports use **9050**,
-  matching the documented relay listener examples; relay `listen` remains explicit.
-  Use `[2001:db8::1]:9051` for IPv6 with a port. Bare `2001:db8::1` and `[::1]`
-  use 9050; a bare IPv6 final component is never interpreted as a port.
+- Clear address strings are opaque route data and round-trip without parsing,
+  normalization, bracket insertion, or a default port. They must be nonempty,
+  NUL-free UTF-8 of at most 975 bytes.
+- Current TCP and QUIC dispatch requires an explicit numeric nonzero port. Use
+  `relay.example:9050`, `127.0.0.1:9050`, or `[2001:db8::1]:9050`; portless and
+  bare IPv6 strings remain representable but fail before network dispatch.
 - The first hop must be clear. Each later blinded entry is decrypted by its
   immediately preceding relay; the key before `:B:` identifies the **hidden
   target's tweaked identity**, not the introduction relay.
@@ -645,7 +647,7 @@ For example, this syntactically valid clear hop uses the secp256k1 generator key
 
 ```yaml
 route:
-  - "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798::localhost"
+  - "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798::localhost:9050"
 ```
 
 Construct a blinded suffix offline using only the real public keys and addresses:

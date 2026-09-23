@@ -3,6 +3,7 @@
 
 use crate::socks;
 use http::{Method, Request, Uri};
+use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::proxy::proxy_bidirectional_from_client;
 use monad_common::session::RelayConnection;
 use std::io;
@@ -19,6 +20,7 @@ pub async fn open_tunnel(
     target_authority: &str,
     local_stream: &mut TcpStream,
 ) -> io::Result<()> {
+    validate_network_endpoint(target_authority)?;
     info!("opening tunnel to {target_authority}");
     let mut h2_client = conn.clone_send_request().await;
 

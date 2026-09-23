@@ -439,6 +439,9 @@ impl RelayConnection {
         target_authority: &str,
         extra_headers: &[(&'static str, String)],
     ) -> io::Result<H2ConnectStream> {
+        if target_authority != BLINDED_HOP_CONNECT_AUTHORITY {
+            crate::network_endpoint::validate_network_endpoint(target_authority)?;
+        }
         let mut h2_client = self.clone_send_request().await;
 
         let uri: Uri = target_authority
