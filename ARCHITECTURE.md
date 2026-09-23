@@ -696,6 +696,11 @@ serialized with this payment CAS. A stale-session or payment-versus-close race
 returns `PAYMENT_CONFLICT` without granting credit; the client treats that result
 as fatal to the affected MONAD session so normal route rebuilding relinks from
 durable relay state rather than retrying an obsolete authorization.
+The [payment-conflict integration tests](monad-relay/tests/PAYMENT_CONFLICT.md)
+exercise this path with real signed payments and an ownership loss at the payment
+boundary, including prefix preservation during a middle-hop suffix rebuild.
+The fault injection exists only in the integration-test payment adapter, not in
+the production relay or client.
 - **Credit Calculation**: The relay tracks the `max_balance_seen` for every channel ID.
 - **Delta**: `credit_millisats = (new_balance - max_balance_seen) * unit_multiplier`.
 

@@ -13,6 +13,8 @@
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
 mod common;
+#[path = "common/payment_conflict.rs"]
+mod payment_conflict;
 
 use bytes::Bytes;
 use h2::client;
@@ -785,6 +787,7 @@ async fn start_relay_from_config(
         trusted_mint_units,
         transport_key,
         identity,
+        None,
     )
     .await
     .map(|(handle, shutdown_tx, payments)| (addr, pubkey, handle, shutdown_tx, payments))
@@ -796,6 +799,31 @@ async fn start_relay_from_config_bound(
     mint_cache: SpilmanMintCache,
     listener: TcpListener,
     quic_endpoint: quinn::Endpoint,
+) -> io::Result<(
+    SocketAddr,
+    Secp256k1Pubkey,
+    tokio::task::JoinHandle<io::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+    Arc<SpilmanRelayPayments>,
+)> {
+    start_relay_from_config_bound_observed(
+        relay_config,
+        wallet_manager,
+        mint_cache,
+        listener,
+        quic_endpoint,
+        None,
+    )
+    .await
+}
+
+async fn start_relay_from_config_bound_observed(
+    relay_config: &RelayConfig,
+    wallet_manager: Arc<RelayWalletManager>,
+    mint_cache: SpilmanMintCache,
+    listener: TcpListener,
+    quic_endpoint: quinn::Endpoint,
+    payment_observer: Option<Arc<payment_conflict::PaymentObserver>>,
 ) -> io::Result<(
     SocketAddr,
     Secp256k1Pubkey,
@@ -836,6 +864,7 @@ async fn start_relay_from_config_bound(
         trusted_mint_units,
         transport_key,
         identity,
+        payment_observer,
     )
     .await
     .map(|(handle, shutdown_tx, payments)| (addr, pubkey, handle, shutdown_tx, payments))
@@ -962,6 +991,7 @@ async fn start_relay_from_bound_listener_internal(
     trusted_mint_units: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     transport_key: SecpTransportKeypair,
     identity: monad_common::quic_cert_identity::QuicCertIdentity,
+    payment_observer: Option<Arc<payment_conflict::PaymentObserver>>,
 ) -> io::Result<(
     tokio::task::JoinHandle<io::Result<()>>,
     tokio::sync::oneshot::Sender<()>,
@@ -986,9 +1016,16 @@ async fn start_relay_from_bound_listener_internal(
         &relay_config.name,
         relay_config.channel_policy.clone(),
     )?;
-    let payments_for_spawn: Arc<dyn RelayPayments> = payments.clone();
-    let mint_cache = wallet_manager.keyset_cache();
     let session_registry = Arc::new(SessionRegistry::new());
+    let payments_for_spawn: Arc<dyn RelayPayments> = match payment_observer {
+        Some(observer) => Arc::new(payment_conflict::ObservedPayments {
+            inner: payments.clone(),
+            observer,
+            registry: session_registry.clone(),
+        }),
+        None => payments.clone(),
+    };
+    let mint_cache = wallet_manager.keyset_cache();
     let keyset_refresh = Some(Arc::new(RelayKeysetRefreshCoordinator::new(
         wallet_manager,
         config.trusted_mint_units.clone(),
@@ -7741,6 +7778,13 @@ struct ConfiguredRouteFixture {
 
 impl ConfiguredRouteFixture {
     async fn start(fixture_config: ConfiguredRouteFixtureConfig) -> Self {
+        Self::start_observed(fixture_config, None).await
+    }
+
+    async fn start_observed(
+        fixture_config: ConfiguredRouteFixtureConfig,
+        payment_observer: Option<Arc<payment_conflict::PaymentObserver>>,
+    ) -> Self {
         use std::fs;
 
         assert!(
@@ -7902,7 +7946,13 @@ relays:
 
         drop(socks_listener);
 
-        let config = MonadConfig::load(&config_path).unwrap();
+        let mut config = MonadConfig::load(&config_path).unwrap();
+        if payment_observer.is_some() {
+            for relay in &mut config.relays {
+                relay.pricing.in_bytes_per_millisat = 1;
+                relay.pricing.out_bytes_per_millisat = 1;
+            }
+        }
         let wallet_manager = Arc::new(
             RelayWalletManager::open(&config.relay_wallet.as_ref().unwrap().db_path).unwrap(),
         );
@@ -7910,15 +7960,17 @@ relays:
         let mut relay_shutdown_txs = Vec::new();
         for (relay_name, (listener, quic_endpoint)) in relay_names.iter().zip(relay_bindings) {
             let relay_config = config.select_relay(Some(relay_name)).unwrap();
-            let (_server, _pubkey, handle, shutdown_tx, _payments) = start_relay_from_config_bound(
-                relay_config,
-                wallet_manager.clone(),
-                mint_cache.clone(),
-                listener,
-                quic_endpoint,
-            )
-            .await
-            .unwrap();
+            let (_server, _pubkey, handle, shutdown_tx, _payments) =
+                start_relay_from_config_bound_observed(
+                    relay_config,
+                    wallet_manager.clone(),
+                    mint_cache.clone(),
+                    listener,
+                    quic_endpoint,
+                    payment_observer.clone(),
+                )
+                .await
+                .unwrap();
             relay_handles.push(handle);
             relay_shutdown_txs.push(shutdown_tx);
         }

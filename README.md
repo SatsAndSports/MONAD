@@ -331,6 +331,16 @@ You can also just use `cargo run`, which builds automatically if needed.
 cargo test
 ```
 
+Focused real-control-stream payment-conflict recovery coverage:
+
+```bash
+cargo test -p monad-relay --test integration payment_conflict
+```
+
+These non-ignored tests cover first-hop full reconnects and middle-hop suffix
+rebuilds with persisted wallets. See [payment-conflict validation](monad-relay/tests/PAYMENT_CONFLICT.md)
+for injection scope, assertions, and recorded payment/chaos stress results.
+
 ## Developer Workflow
 
 The repo pins its Rust toolchain and formatting config so local runs and CI stay
