@@ -42,6 +42,12 @@ enum PoolEntry {
     Ready { conn: quinn::Connection },
 }
 
+impl PoolEntry {
+    fn is_pending_channel(&self, rx: &watch::Receiver<ConnResult>) -> bool {
+        matches!(self, Self::Pending { rx: current } if current.same_channel(rx))
+    }
+}
+
 #[derive(Clone)]
 pub struct QuicPool {
     inner: Arc<Mutex<HashMap<PoolKey, PoolEntry>>>,
@@ -112,7 +118,9 @@ impl QuicPool {
                             "cached QUIC connection to {target_addr} is dead ({e}), removing and retrying"
                         );
                             let mut pool = self.inner.lock().await;
-                            if matches!(pool.get(&key), Some(PoolEntry::Ready { .. })) {
+                            if matches!(pool.get(&key), Some(PoolEntry::Ready { conn: current })
+                                if current.stable_id() == conn.stable_id())
+                            {
                                 pool.remove(&key);
                             }
                             continue;
@@ -126,7 +134,10 @@ impl QuicPool {
                                 "QUIC connection task to {target_addr} dropped without result, removing and retrying"
                             );
                             let mut pool = self.inner.lock().await;
-                            if matches!(pool.get(&key), Some(PoolEntry::Pending { .. })) {
+                            if pool
+                                .get(&key)
+                                .is_some_and(|entry| entry.is_pending_channel(&rx))
+                            {
                                 pool.remove(&key);
                             }
                             break;
@@ -224,4 +235,20 @@ enum Action {
         key: PoolKey,
         tx: watch::Sender<ConnResult>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_pending_waiter_does_not_match_replacement() {
+        let (old_tx, old_rx) = watch::channel(None);
+        let (_new_tx, new_rx) = watch::channel(None);
+        let original = PoolEntry::Pending { rx: old_rx.clone() };
+        assert!(original.is_pending_channel(&old_rx));
+        drop(old_tx);
+        let replacement = PoolEntry::Pending { rx: new_rx };
+        assert!(!replacement.is_pending_channel(&old_rx));
+    }
 }
