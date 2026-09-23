@@ -1,6 +1,7 @@
 # Structured Teardown Audit (#26)
 
-This is a partial implementation record, not a claim that #26 is complete.
+Implementation and validation record for the #26 teardown scope. Runtime-owned
+Quinn draining and non-cancellable blocking work have explicit boundaries below.
 Baseline: `3a0e96c` (merged PR #74). Branch: `fix/structured-teardown`.
 
 ## Ownership Contract
@@ -24,25 +25,43 @@ are recovery state, not leaks, and teardown must not release their reservations.
 | Relay session | CONNECT setup | Concurrent setup with a 10-second deadline; publication rechecks pause/termination | UDP-gated pending QUIC setup permits control bootstrap, cancels without publication, and returns 502 at deadline; publication tests require 402/reset |
 | Relay proxy/control | Blocked I/O and counters | Whole-operation cancellation; drop accounting; unchanged normal half-close | Gated target write/shutdown, zero H2 window, zero-window control bootstrap, reply after request EOF |
 
-The watcher and pool defects were confirmed by code inspection. The new tests
-were run after implementation, not as recorded failing-before/fixed-after runs.
-The pool test does not yet exercise a concurrent Ready replacement race through
-real connections.
+The original watcher and pending-pool defects were confirmed by code inspection;
+their first tests were run after implementation. Follow-up Ready-pool coverage
+uses two real Quinn connections and a deterministic replacement-before-failed-
+cleanup interleaving through the production eviction path.
 
-## Outstanding Work
+## Follow-Up Implementation
 
-| Owner | Resource | Outstanding requirement |
+| Owner | Change | Evidence |
 | --- | --- | --- |
-| Relay listener | QUIC stream descendants | Distinguish JoinSet drop-abort from awaited descendant quiescence and verify listener rebind |
-| Client route/runtime | Attachments and wallet authority | Close children before scoped detachment; cover attach bookkeeping and top-level cancellation windows |
-| Client setup supervisor | Blocking wallet operations | Retain manager authority until blocking work finishes, including wrapper cancellation |
-| Auto-close worker | Active sweep and durable journal | Stop selecting candidates on shutdown; own active work and preserve journal recovery |
-| SOCKS and heartbeat | Handshake/proxy/control-send waits | Reproduce ownership or liveness gaps before changing policy |
-| QUIC echo tooling | Spawned children | Complete lower-priority ownership review |
+| Runtime wallet | Runtime filesystem locks live in the shared wallet, not only the manager | Gated blocking child plus manager drop and abort formerly allowed reopen; now authority stays held until the child exits |
+| Payment driver | Drop guard scans session-owned attachments and conditionally detaches; retries also use conditional detach | Explicit connection close formerly left its channel attached; fixed close permits reuse; pre-intended and sibling/replacement ownership tests |
+| Route watcher | Direct per-connection futures, no outer spawned watchers | Existing failed-hop/debounce/setup cancellation tests pass |
+| SOCKS listener | Direct connection futures; select route after handshake | Greeting gate proves a stalled handshake does not acquire an old route; abort closes the socket |
+| Client control | All writes, including heartbeat, use the existing 15-second send deadline | Zero-window test with virtual time requires timeout rather than a hung driver |
+| Relay listener | Direct connection/stream futures with child panic isolation; explicit finish drains Quinn | Live TCP and QUIC children lose registry/channel ownership before root completion; targets see EOF; explicit finish permits TCP/UDP rebind |
+| Auto-close worker | Directly owned future, shutdown checks between candidates and cancels active sweep | Mint swap-response gate: graceful/abrupt root cancellation leaves no worker, retains Closing journal, leaves next candidate Open, and journal recovery completes the payout |
+| Shared and relay proxy | Hard errors cancel the opposite direction; EOF still drains | H2 reset with a stalled application formerly timed out; fixed test terminates and still permits replies after EOF |
+| Echo server | Direct connection/stream futures; tests now use production server | Root abort closes a live echo stream; 1000-stream and large-payload tests pass |
 
-These rows are requirements/candidates from the approved scope, not newly
-reproduced defects. No independent subagent review was possible because the
-session's available tools do not include delegation or agent-session resumption.
+## Contract Boundaries
+
+- Explicit close/finish awaits task cleanup where tasks are used. Directly owned
+  futures require no join; drop synchronously removes their application work.
+- Aborting a configured runtime requests task cancellation, not forced termination
+  of `block_in_place`. Shared wallet handles retain authority while operations or
+  setup supervisors can still mutate the wallet. Shutdown completion and dropping
+  the last outstanding wallet handle are different boundaries.
+- Abrupt relay/echo cancellation cannot await Quinn's runtime-owned protocol
+  drivers. They can temporarily retain UDP sockets after all MONAD descendants
+  and ownership are gone. Explicit relay finish uses `wait_idle` and the rebind
+  regression passes without retry sleeps.
+- No wallet schema, funding/keyset policy, reservation, or ambiguous journal is
+  discarded by these changes. Shared pools and cache refresh work intentionally
+  retain their service-level lifetimes.
+- Independent subagent review was unavailable: this session exposes no delegation
+  tool. Changes were self-reviewed; exhaustive transport/failure Cartesian testing
+  and abrupt OS-socket reclamation are not claimed.
 
 ## Watcher/Pool Validation
 
@@ -81,10 +100,8 @@ The original eleven untracked artifacts and `AGENTS.md` were not changed.
 - The existing active/future-stream control-detach integration test now rejects
   unexpected data and requires EOF or reset rather than accepting any read.
 
-The relay tranche does not yet establish listener-root descendant quiescence,
-worker cancellation safety, or client wallet authority retention. The direct
-relay-child approach needs no background cleanup supervisor or production fault
-knobs. Shared pool/cache work intentionally retains its existing lifetime.
+The later listener/client tranche establishes the additional contracts recorded
+above. No background cleanup framework or production fault knobs were added.
 
 ## Relay Validation
 
@@ -104,3 +121,21 @@ knobs. Shared pool/cache work intentionally retains its existing lifetime.
 - Both stress commands used `ulimit -n 65536`. Relay validation logs are in
   `/tmp/opencode/monad-relay-teardown-*.log`; `*-final.log` contains the final
   full test and Clippy results. No independent subagent review was available.
+
+## Final Validation
+
+- `cargo test -- --test-threads=4`: **613 passed, 20 ignored, zero failures**.
+  Payment-conflict wire, first-hop rebuild, and middle-hop suffix tests all pass.
+- Strict workspace/all-targets/all-features Clippy, formatting, and diff checks
+  pass. Focused client, listener, auto-close, proxy, pool, and production echo
+  tests were run separately as well as in the full suite.
+- Default graceful chaos: seed `5570757306307527496`, 7 restarts, 6 successful
+  suffix rebuilds, zero suffix failures/fallbacks, 5740/5823 successful probes,
+  maximum recovery 940 ms, 3 channel records (bound 6).
+- Default abrupt chaos: same seed, 26 restarts, 19 successful suffix rebuilds,
+  zero suffix failures/fallbacks, 3080/3392 successful probes, maximum recovery
+  1140 ms, 7 channel records (bound 24).
+- Both runs used `ulimit -n 65536`; allowed failed in-flight probes were 83 and
+  312 respectively. Logs: `/tmp/opencode/monad-teardown-complete-*.log`.
+- All work remains local; no PR/push. The original eleven untracked artifacts and
+  `AGENTS.md` remain unchanged.

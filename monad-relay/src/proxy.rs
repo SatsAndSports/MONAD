@@ -116,7 +116,7 @@ where
             }
         }
 
-        let _ = target_write.shutdown().await;
+        target_write.shutdown().await?;
         Ok::<(), io::Error>(())
     };
 
@@ -154,23 +154,22 @@ where
             }
         }
 
-        let _ = h2_send.send_data(Bytes::new(), true);
+        h2_send
+            .send_data(Bytes::new(), true)
+            .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
         Ok::<(), io::Error>(())
     };
 
     // Cancellation covers writes, shutdown, and H2 capacity as well as reads.
     // Normal EOF still waits for the other direction (TCP half-close).
-    let (left, right) = tokio::select! {
+    let result = tokio::select! {
         biased;
         _ = termination.cancelled() => return Ok(()),
-        results = async { tokio::join!(h2_to_target, target_to_h2) } => results,
+        result = async { tokio::try_join!(h2_to_target, target_to_h2) } => result,
     };
-    if let Err(e) = left {
-        debug!("proxy {label} h2->target ended with error: {e}");
-    }
-    if let Err(e) = right {
-        debug!("proxy {label} target->h2 ended with error: {e}");
+    if let Err(e) = &result {
+        debug!("proxy {label} ended with error: {e}");
     }
 
-    Ok(())
+    result.map(|_| ())
 }

@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result};
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use quinn::Endpoint;
 use rustls::pki_types::pem::PemObject;
 use tracing::{error, info, warn};
@@ -26,17 +27,36 @@ pub async fn run_server(listen: SocketAddr, cert_pem: &str, key_pem: &str) -> Re
 
     let endpoint = Endpoint::server(server_config, listen)?;
     info!(%listen, "QUIC server listening");
+    run_server_endpoint(endpoint).await
+}
 
-    while let Some(incoming) = endpoint.accept().await {
+/// Run echo service on an already-bound endpoint. Closing the endpoint ends the
+/// service; dropping this future synchronously drops its connection/stream work.
+pub async fn run_server_endpoint(endpoint: Endpoint) -> Result<()> {
+    let mut connections: FuturesUnordered<BoxFuture<'static, std::thread::Result<()>>> =
+        FuturesUnordered::new();
+    loop {
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => match incoming { Some(incoming) => incoming, None => break },
+            Some(result) = connections.next(), if !connections.is_empty() => {
+                if result.is_err() { error!("echo connection panicked"); }
+                continue;
+            }
+        };
         let remote = incoming.remote_address();
         info!(%remote, "incoming connection");
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming).await {
-                error!(%remote, error = %e, "connection failed");
-            }
-        });
+        connections.push(
+            std::panic::AssertUnwindSafe(async move {
+                if let Err(e) = handle_connection(incoming).await {
+                    error!(%remote, error = %e, "connection failed");
+                }
+            })
+            .catch_unwind()
+            .boxed(),
+        );
     }
-
+    drop(connections);
+    endpoint.wait_idle().await;
     Ok(())
 }
 
@@ -45,17 +65,29 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
     let remote = conn.remote_address();
     info!(%remote, "connection established");
 
+    let mut streams: FuturesUnordered<BoxFuture<'static, std::thread::Result<()>>> =
+        FuturesUnordered::new();
     loop {
-        let stream = conn.accept_bi().await;
+        let stream = tokio::select! {
+            stream = conn.accept_bi() => stream,
+            Some(result) = streams.next(), if !streams.is_empty() => {
+                if result.is_err() { error!("echo stream panicked"); }
+                continue;
+            }
+        };
         match stream {
             Ok((send, recv)) => {
                 let stream_id = send.id();
                 info!(%remote, ?stream_id, "accepted bidirectional stream");
-                tokio::spawn(async move {
-                    if let Err(e) = handle_stream(send, recv).await {
-                        error!(?stream_id, error = %e, "stream failed");
-                    }
-                });
+                streams.push(
+                    std::panic::AssertUnwindSafe(async move {
+                        if let Err(e) = handle_stream(send, recv).await {
+                            error!(?stream_id, error = %e, "stream failed");
+                        }
+                    })
+                    .catch_unwind()
+                    .boxed(),
+                );
             }
             Err(quinn::ConnectionError::ApplicationClosed(_))
             | Err(quinn::ConnectionError::ConnectionClosed(_))

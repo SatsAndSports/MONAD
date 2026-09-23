@@ -137,12 +137,12 @@ where
 
                     if let Err(e) = target_write.write_all(&data).await {
                         debug!("target write error: {e}");
-                        break;
+                        return Err(e);
                     }
                 }
                 Some(Err(e)) => {
                     debug!("h2 recv error: {e}");
-                    break;
+                    return Err(io::Error::other(format!("h2 recv error: {e}")));
                 }
                 None => {
                     // H2 stream closed (peer done sending)
@@ -151,7 +151,8 @@ where
                 }
             }
         }
-        let _ = target_write.shutdown().await;
+        target_write.shutdown().await?;
+        Ok::<(), io::Error>(())
     };
 
     // Target read -> H2 send (data from target going to H2 peer)
@@ -180,29 +181,30 @@ where
                     h2_send.reserve_capacity(data.len());
                     if let Err(e) = wait_for_send_capacity(h2_send).await {
                         debug!("{e}");
-                        break;
+                        return Err(e);
                     }
 
                     if let Err(e) = h2_send.send_data(data, false) {
                         debug!("h2 send error: {e}");
-                        break;
+                        return Err(io::Error::other(format!("h2 send error: {e}")));
                     }
                 }
                 Err(e) => {
                     debug!("target read error: {e}");
-                    break;
+                    return Err(e);
                 }
             }
         }
         // Send empty frame with END_STREAM to signal we're done
-        let _ = h2_send.send_data(Bytes::new(), true);
+        h2_send
+            .send_data(Bytes::new(), true)
+            .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
+        Ok::<(), io::Error>(())
     };
 
-    // Run both directions to completion. We use join (not select) because
-    // when one side finishes sending, we still need the other to drain.
-    // The shutdown of the write half causes the peer to see EOF, which
-    // eventually causes the other direction to complete naturally.
-    tokio::join!(h2_to_target, target_to_h2);
+    // EOF preserves half-close; a hard error cancels the other direction rather
+    // than retaining a stalled application socket forever after H2 reset.
+    let result = tokio::try_join!(h2_to_target, target_to_h2);
 
     let (outbound, inbound) = if target_is_client {
         (
@@ -220,5 +222,86 @@ where
         outbound + inbound
     );
 
-    Ok(())
+    result.map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fatal_reset_cancels_other_direction_but_eof_preserves_reply() {
+        use std::future::Future;
+        use std::task::Poll;
+        for reset in [true, false] {
+            let (client, server) = tokio::io::duplex(4096);
+            let (mut client, driver) = h2::client::handshake(client).await.unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(async move {
+                let _ = driver.await;
+            });
+            let (response, send) = client
+                .send_request(
+                    http::Request::builder()
+                        .method("CONNECT")
+                        .uri("target:80")
+                        .body(())
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            let mut server = h2::server::handshake(server).await.unwrap();
+            let (request, mut respond) = server.accept().await.unwrap().unwrap();
+            let mut server_recv = request.into_body();
+            let mut server_send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            tasks.spawn(async move { while server.accept().await.is_some() {} });
+            let recv = response.await.unwrap().into_body();
+            let (target, mut app) = tokio::io::duplex(64);
+            let mut proxy = Box::pin(proxy_bidirectional_from_client(
+                send, recv, target, "test", None,
+            ));
+            if reset {
+                std::future::poll_fn(|cx| {
+                    assert!(proxy.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                server_send.send_reset(h2::Reason::CANCEL);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), proxy)
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
+            } else {
+                let remote = async {
+                    let mut request = Vec::new();
+                    while let Some(chunk) = server_recv.data().await {
+                        request.extend_from_slice(&chunk.unwrap());
+                    }
+                    assert_eq!(request, b"request");
+                    server_send
+                        .send_data(Bytes::from_static(b"reply after EOF"), true)
+                        .unwrap();
+                };
+                let local = async {
+                    app.write_all(b"request").await.unwrap();
+                    app.shutdown().await.unwrap();
+                    let mut reply = Vec::new();
+                    app.read_to_end(&mut reply).await.unwrap();
+                    assert_eq!(reply, b"reply after EOF");
+                };
+                let (result, (), ()) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        tokio::join!(proxy, remote, local)
+                    })
+                    .await
+                    .unwrap();
+                result.unwrap();
+            }
+            tasks.shutdown().await;
+        }
+    }
 }

@@ -1407,6 +1407,9 @@ drops pending setup, so it cannot publish a tunnel later. Proxy cancellation
 covers the complete bidirectional operation, including blocked writes, shutdown,
 and H2 capacity waits; ordinary EOF still preserves the opposite half of the
 connection. Control cancellation similarly covers bootstrap and message writes.
+Hard I/O failures use fallible joins to cancel the opposite copy direction;
+normal EOF remains a half-close, not whole-tunnel cancellation. This applies to
+both the shared client proxy and the relay's accounted proxy.
 Per-tunnel accounting drop guards close counters and log byte totals on normal
 completion, cancellation, and unwinding.
 
@@ -1709,7 +1712,12 @@ These values are generous for testing. Production tuning will depend on expected
 
 MONAD deliberately uses no QUIC keep-alives: idle connections are meant to die and be re-established on demand (the pool evicts a dead connection on the next failed stream open and reconnects fresh). Both sides set a 20s QUIC idle timeout, which also bounds silent peer-death detection at the transport layer. Above QUIC, the client's session heartbeat (status request after 5s idle, 15s timeout) provides MONAD-level detection of an unresponsive session, so active sessions keep their transport warm without transport-level keep-alives.
 
-Relay QUIC stream sessions are tracked under the accepting connection task with a per-connection `JoinSet`. Graceful shutdown waits for active connection tasks, while abrupt task cancellation drops the connection's stream task tree. This keeps stream sessions from outliving their connection and prevents detached stream tasks from holding the QUIC endpoint socket open after an ungraceful relay loss.
+Relay connection and stream sessions are directly owned futures beneath the
+listener. Graceful shutdown drains them or drops them at its deadline; abrupt
+cancellation synchronously drops all MONAD descendants. Quinn's internal protocol
+drivers have a separate draining lifetime, as described in the shutdown model.
+The standalone echo server uses the same direct ownership pattern and its tests
+exercise the production echo implementation, including root cancellation.
 
 ### What Has Been Integrated
 

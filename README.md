@@ -787,10 +787,16 @@ Explicit relay shutdown drains QUIC connections before returning. Abrupt task
 cancellation drops MONAD sessions immediately, but Quinn's internal protocol
 drivers can retain the UDP socket briefly while draining. Interrupted auto-close
 work leaves its durable close journal available for recovery on restart.
+Proxy EOF preserves normal half-close and permits a reply after the request
+ends; a reset or other hard I/O error cancels the opposite copy direction.
 
 ## QUIC Echo Tool
 
 The `monad-quic` crate also includes a standalone QUIC echo server/client for transport testing and experimentation. The main MONAD client and relay now use shared code from this crate for QUIC support.
+The echo server owns its connection and stream futures. Library callers can use
+`monad_quic::server::run_server_endpoint` with an already-bound endpoint; closing
+that endpoint stops and drains the service, while dropping the server future
+cancels its application-level children.
 
 ### Generate a keypair
 

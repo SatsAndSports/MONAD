@@ -117,12 +117,7 @@ impl QuicPool {
                             info!(
                             "cached QUIC connection to {target_addr} is dead ({e}), removing and retrying"
                         );
-                            let mut pool = self.inner.lock().await;
-                            if matches!(pool.get(&key), Some(PoolEntry::Ready { conn: current })
-                                if current.stable_id() == conn.stable_id())
-                            {
-                                pool.remove(&key);
-                            }
+                            self.remove_failed_connection(&key, &conn).await;
                             continue;
                         }
                     }
@@ -223,6 +218,14 @@ impl QuicPool {
 
         Ok(conn)
     }
+
+    async fn remove_failed_connection(&self, key: &PoolKey, failed: &quinn::Connection) {
+        let mut pool = self.inner.lock().await;
+        if matches!(pool.get(key), Some(PoolEntry::Ready { conn }) if conn.stable_id() == failed.stable_id())
+        {
+            pool.remove(key);
+        }
+    }
 }
 
 enum Action {
@@ -240,6 +243,60 @@ enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_ready_failure_cannot_evict_real_replacement_connection() {
+        let km = crate::keygen::generate().unwrap();
+        let endpoint = quinn::Endpoint::server(
+            crate::server::build_server_config(&km.cert_pem, &km.key_pem).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let pool = QuicPool::new().unwrap();
+        let client_config =
+            crate::client::build_client_config(hex::decode(km.pin_hex).unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let mut pairs = Vec::new();
+        for _ in 0..2 {
+            let client = pool
+                .endpoint
+                .connect_with(client_config.clone(), addr, "monad-relay")
+                .unwrap();
+            let (client, server) =
+                tokio::join!(client, async { endpoint.accept().await.unwrap().await });
+            pairs.push((client.unwrap(), server.unwrap()));
+        }
+        let key = PoolKey {
+            target_addr: addr.to_string(),
+            auth: PoolAuthKey::Secp256k1(
+                monad_common::secp_identity::SecpTransportKeypair::generate().pubkey(),
+            ),
+        };
+        let old = pairs[0].0.clone();
+        let replacement = pairs[1].0.clone();
+        // Hold the stale caller's connection across replacement, then complete
+        // its failed open and run the exact production eviction path.
+        pool.inner.lock().await.insert(
+            key.clone(),
+            PoolEntry::Ready {
+                conn: replacement.clone(),
+            },
+        );
+        old.close(0u32.into(), b"old generation");
+        assert!(open_monad_stream_with_kind(&old, STREAM_KIND_SECP_NOISE)
+            .await
+            .is_err());
+        pool.remove_failed_connection(&key, &old).await;
+        assert!(
+            matches!(pool.inner.lock().await.get(&key), Some(PoolEntry::Ready { conn }) if conn.stable_id() == replacement.stable_id())
+        );
+        pool.remove_failed_connection(&key, &replacement).await;
+        assert!(!pool.inner.lock().await.contains_key(&key));
+        endpoint.close(0u32.into(), b"done");
+        pool.endpoint.close(0u32.into(), b"done");
+        endpoint.wait_idle().await;
+        pool.endpoint.wait_idle().await;
+    }
 
     #[test]
     fn stale_pending_waiter_does_not_match_replacement() {
