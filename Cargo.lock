@@ -2418,6 +2418,7 @@ dependencies = [
  "cdk-spilman",
  "cdk-spilman-test-mint",
  "clap",
+ "futures-util",
  "h2",
  "hex",
  "http",

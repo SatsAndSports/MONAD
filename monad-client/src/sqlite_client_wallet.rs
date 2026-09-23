@@ -392,6 +392,9 @@ pub struct SqliteClientWallet {
     channel_db: Mutex<Connection>,
     #[cfg(test)]
     fail_next_recovered_proof_import: AtomicBool,
+    // Last field: runtime authority outlives all wallet resources and every Arc
+    // held by payment/setup tasks, including non-cancellable blocking calls.
+    runtime_locks: Option<crate::wallet_lock::ClientWalletLocks>,
 }
 
 /// Read-only channel/proof inspection without sender signing material or schema writes.
@@ -724,7 +727,17 @@ impl SqliteClientWallet {
             channel_db: Mutex::new(channel_db),
             #[cfg(test)]
             fail_next_recovered_proof_import: AtomicBool::new(false),
+            runtime_locks: None,
         })
+    }
+
+    /// Retain runtime authority for the lifetime of all shared wallet handles.
+    pub(crate) fn with_runtime_locks(
+        mut self,
+        locks: crate::wallet_lock::ClientWalletLocks,
+    ) -> Self {
+        self.runtime_locks = Some(locks);
+        self
     }
 
     /// Configure the admission window for newly funded channels.

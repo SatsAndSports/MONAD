@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use monad_common::control_codec::{send_json_line, try_decode_json_line};
+use monad_common::control_codec::try_decode_json_line;
 use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::session::SessionPricing;
 use std::io;
@@ -27,7 +27,7 @@ fn payment_conflict_error(code: &ServerErrorCode, hop_label: &str) -> Option<io:
 }
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_TICK: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
@@ -224,7 +224,7 @@ pub(super) async fn run_session_driver(
                 match heartbeat.on_tick(Instant::now()) {
                     HeartbeatAction::None => {}
                     HeartbeatAction::SendStatusRequest => {
-                        send_json_line(&mut h2_send, &ClientMessage::GetSessionStatus).await?;
+                        super::funding::send_control_message(&mut h2_send, &ClientMessage::GetSessionStatus).await?;
                     }
                     HeartbeatAction::TimedOut => {
                     return Err(io::Error::new(
@@ -251,6 +251,49 @@ pub(super) async fn run_session_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn zero_window_control_send_obeys_heartbeat_deadline() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client, connection) = h2::client::handshake(client).await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let _ = connection.await;
+        });
+        let (response, mut send) = client
+            .send_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://monad/control")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let mut server = h2::server::Builder::new()
+            .initial_window_size(0)
+            .handshake::<_, Bytes>(server)
+            .await
+            .unwrap();
+        let (_request, mut respond) = server.accept().await.unwrap().unwrap();
+        let _send = respond
+            .send_response(http::Response::new(()), false)
+            .unwrap();
+        tasks.spawn(async move { while server.accept().await.is_some() {} });
+        let _response = response.await.unwrap();
+        time::pause();
+        let start = Instant::now();
+        let error = super::super::funding::send_control_message(
+            &mut send,
+            &ClientMessage::GetSessionStatus,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= HEARTBEAT_TIMEOUT);
+        assert!(start.elapsed() <= HEARTBEAT_TIMEOUT + Duration::from_millis(2));
+        tasks.shutdown().await;
+    }
 
     #[test]
     fn payment_conflict_terminates_session_for_route_rebuild() {

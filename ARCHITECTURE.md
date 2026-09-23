@@ -375,6 +375,23 @@ opens evict only the same Quinn connection identity, and abandoned pending waits
 evict only the same watch channel. A stale waiter must not remove a replacement
 entry merely because it is also `Ready` or `Pending`.
 
+Runtime wallet lock ownership follows the shared `SqliteClientWallet`, not just
+the configured-client manager's stack frame. Payment tasks and cancellation-stable
+setup supervisors retain that wallet while they can mutate it. A blocked
+`block_in_place` call therefore retains authority even after its caller requests
+abort. Dropping a configured runtime requests child cancellation; it does not
+claim synchronous completion of those blocking calls. Explicit shutdown awaits
+normal child cleanup. Each payment driver has a drop guard that conditionally
+detaches all channels owned by its session after the driver's work ends, including
+attachments not yet reflected in `intended_channel_id`. Cleanup never clears a
+sibling/replacement session's attachment or an ambiguous journal reservation.
+
+Route failure waits own their per-connection futures directly. SOCKS handshakes
+run before acquiring the current route, so stalled handshakes cannot pin old
+route generations. SOCKS connection futures are owned directly by the listener.
+All client control writes, including heartbeat requests, have the existing
+15-second heartbeat timeout as their send deadline.
+
 Route (re)connect retry policy is split by lifecycle: before the first
 successful connect the client fails fast after a bounded number of attempts so
 startup misconfiguration is loud; once a route has connected, reconnects retry

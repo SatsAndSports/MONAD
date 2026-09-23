@@ -697,6 +697,11 @@ loud; once a route has connected, reconnects retry indefinitely with capped
 backoff, and the client recovers when the route (or a refilled wallet) allows.
 Loss of a hop's payment-driver failure sender is also treated as a hop failure,
 including when the driver exits without sending its final notification.
+Closing a funded connection releases only its own wallet attachments, including
+cancelled link sends. Runtime wallet locks remain held by outstanding wallet
+handles until their work actually finishes; aborting a blocking mint call does
+not prematurely make the wallet available for maintenance. Control writes use
+the existing 15-second heartbeat timeout instead of waiting forever for H2 capacity.
 
 The configured client connects directly to the first hop via QUIC, then runs
 the same Noise+H2 session on top using the secp QUIC path.

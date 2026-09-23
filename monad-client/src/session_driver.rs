@@ -7,6 +7,35 @@ use tracing::warn;
 
 use crate::wallet::MonadWallet;
 
+struct SessionAttachments {
+    wallet: Arc<dyn MonadWallet>,
+    session_id: [u8; 32],
+}
+
+impl Drop for SessionAttachments {
+    fn drop(&mut self) {
+        // The driver is the only writer for this session. Its synchronous wallet
+        // calls have finished before drop, even if abort arrived in block_in_place.
+        // Scan by owner rather than intended_channel_id: attach precedes sending
+        // ChannelLink, which can be cancelled before intended bookkeeping.
+        match self.wallet.list_channels() {
+            Ok(channels) => {
+                for channel in channels {
+                    if channel.attached_session_id == Some(self.session_id) {
+                        if let Err(error) = self
+                            .wallet
+                            .detach_channel_from_session(&channel.channel_id, self.session_id)
+                        {
+                            warn!(channel_id = %channel.channel_id, %error, "session attachment cleanup failed");
+                        }
+                    }
+                }
+            }
+            Err(error) => warn!(%error, "session attachment cleanup could not list channels"),
+        }
+    }
+}
+
 mod funding;
 mod payment;
 mod runtime;
@@ -54,7 +83,12 @@ pub async fn start_session_payment_driver(
         payment_policy,
     };
 
+    let attachments = SessionAttachments {
+        wallet: config.wallet.clone(),
+        session_id: *conn.session_id(),
+    };
     let handle = tokio::spawn(async move {
+        let _attachments = attachments;
         let result = run_session_driver(control_send, control_recv, ready_tx, config).await;
         if let Err(e) = result {
             warn!("session payment driver ended with error: {e}");
@@ -118,106 +152,162 @@ mod tests {
         use crate::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
         use monad_common::control_codec::{send_json_line, try_decode_json_line};
         use monad_common::protocol::{ClientMessage, ServerMessage};
-        let wallet = Arc::new(MockWallet::new());
-        wallet
-            .insert_channel(WalletChannel {
-                channel_id: "channel".to_string(),
-                state: WalletChannelState::Open,
-                receiver_pubkey: "receiver".to_string(),
-                mint_url: "https://mint".to_string(),
-                unit: "msat".to_string(),
-                keyset_id: "0000000000000001".to_string(),
-                attached_session_id: None,
-                capacity_msats: 1000,
-                current_signed_balance_msats: 0,
-                expiry_timestamp: u64::MAX,
-            })
-            .unwrap();
-        let (client, server) = tokio::io::duplex(4096);
-        let (stop, stopped) = oneshot::channel::<()>();
-        let server_task = tokio::spawn(async move {
-            let mut server = h2::server::handshake(server).await.unwrap();
-            let (request, mut respond) = server.accept().await.unwrap().unwrap();
-            let mut recv = request.into_body();
-            let mut send = respond
-                .send_response(http::Response::new(()), false)
-                .unwrap();
-            let driver = tokio::spawn(async move { while server.accept().await.is_some() {} });
-            send_json_line(
-                &mut send,
-                &ServerMessage::SessionStatus {
+        for abort in [false, true] {
+            let wallet = Arc::new(MockWallet::new());
+            wallet
+                .insert_channel(WalletChannel {
+                    channel_id: "channel".to_string(),
+                    state: WalletChannelState::Open,
                     receiver_pubkey: "receiver".to_string(),
-                    advertisements: snapshot(true).advertisements,
-                    linked_channel: None,
-                    active_in_rate: 1,
-                    active_out_rate: 1,
-                    session_total_in: 0,
-                    session_total_out: 0,
-                    total_paid_millisats: 0,
-                    remaining_milli_sats: 0,
-                    paused: true,
-                    open_connects: 0,
-                    total_connects: 0,
-                },
-            )
-            .await
-            .unwrap();
-            let mut buf = Vec::new();
-            loop {
-                let data = recv.data().await.unwrap().unwrap();
-                recv.flow_control().release_capacity(data.len()).unwrap();
-                buf.extend_from_slice(&data);
-                if let Some(message) = try_decode_json_line::<ClientMessage>(&mut buf).unwrap() {
-                    assert!(matches!(message, ClientMessage::ChannelLink { .. }));
-                    break;
-                }
-            }
-            send_json_line(
-                &mut send,
-                &ServerMessage::Error {
-                    code: ServerErrorCode::LinkKeysetVersionNotNegotiated,
-                    message: "unnegotiated funding".to_string(),
-                },
-            )
-            .await
-            .unwrap();
-            // Keep the stream open: termination must be caused by the error, not EOF.
-            let _ = stopped.await;
-            driver.abort();
-            let _ = driver.await;
-        });
-        let (mut conn, driver) =
-            monad_common::session::RelayConnection::from_transport_stream(client, [1; 32])
+                    mint_url: "https://mint".to_string(),
+                    unit: "msat".to_string(),
+                    keyset_id: "0000000000000001".to_string(),
+                    attached_session_id: None,
+                    capacity_msats: 1000,
+                    current_signed_balance_msats: 0,
+                    expiry_timestamp: u64::MAX,
+                })
+                .unwrap();
+            let (client, server) = tokio::io::duplex(4096);
+            let (stop, stopped) = oneshot::channel::<()>();
+            let (linked, linked_rx) = oneshot::channel();
+            let server_task = tokio::spawn(async move {
+                let mut server = h2::server::handshake(server).await.unwrap();
+                let (request, mut respond) = server.accept().await.unwrap().unwrap();
+                let mut recv = request.into_body();
+                let mut send = respond
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                let driver = tokio::spawn(async move { while server.accept().await.is_some() {} });
+                send_json_line(
+                    &mut send,
+                    &ServerMessage::SessionStatus {
+                        receiver_pubkey: "receiver".to_string(),
+                        advertisements: snapshot(true).advertisements,
+                        linked_channel: None,
+                        active_in_rate: 1,
+                        active_out_rate: 1,
+                        session_total_in: 0,
+                        session_total_out: 0,
+                        total_paid_millisats: 0,
+                        remaining_milli_sats: 0,
+                        paused: true,
+                        open_connects: 0,
+                        total_connects: 0,
+                    },
+                )
                 .await
                 .unwrap();
-        conn.set_cashu_spilman_keyset_versions(Some(std::collections::BTreeSet::from([
-            "v1".to_string()
-        ])))
-        .await;
-        conn.add_driver(driver);
-        let (handle, ready, failed) = super::start_session_payment_driver(
-            &conn,
-            wallet.clone(),
-            "fatal test",
-            PaymentPolicy::default(),
-        )
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), handle)
+                let mut buf = Vec::new();
+                loop {
+                    let data = recv.data().await.unwrap().unwrap();
+                    recv.flow_control().release_capacity(data.len()).unwrap();
+                    buf.extend_from_slice(&data);
+                    if let Some(message) = try_decode_json_line::<ClientMessage>(&mut buf).unwrap()
+                    {
+                        assert!(matches!(message, ClientMessage::ChannelLink { .. }));
+                        break;
+                    }
+                }
+                linked.send(()).unwrap();
+                if !abort {
+                    send_json_line(
+                        &mut send,
+                        &ServerMessage::Error {
+                            code: ServerErrorCode::LinkKeysetVersionNotNegotiated,
+                            message: "unnegotiated funding".to_string(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                // Keep the stream open: termination must be caused by the error, not EOF.
+                let _ = stopped.await;
+                driver.abort();
+                let _ = driver.await;
+            });
+            let (mut conn, driver) =
+                monad_common::session::RelayConnection::from_transport_stream(client, [1; 32])
+                    .await
+                    .unwrap();
+            conn.set_cashu_spilman_keyset_versions(Some(std::collections::BTreeSet::from([
+                "v1".to_string()
+            ])))
+            .await;
+            conn.add_driver(driver);
+            let (handle, ready, failed) = super::start_session_payment_driver(
+                &conn,
+                wallet.clone(),
+                "fatal test",
+                PaymentPolicy::default(),
+            )
             .await
-            .unwrap()
             .unwrap();
-        assert!(*failed.borrow());
-        assert!(ready.await.is_err());
-        let channel = wallet.get_channel("channel").unwrap();
-        assert_eq!(channel.state, WalletChannelState::Open);
-        assert_eq!(channel.attached_session_id, None);
-        wallet
-            .attach_channel_to_session("channel", [2; 32])
-            .unwrap();
-        let _ = stop.send(());
-        server_task.await.unwrap();
-        conn.shutdown().await;
+            linked_rx.await.unwrap();
+            if abort {
+                conn.add_task(handle);
+                conn.close().await;
+            } else {
+                tokio::time::timeout(Duration::from_secs(2), handle)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(*failed.borrow());
+            }
+            assert!(ready.await.is_err());
+            let channel = wallet.get_channel("channel").unwrap();
+            assert_eq!(channel.state, WalletChannelState::Open);
+            assert_eq!(channel.attached_session_id, None);
+            wallet
+                .attach_channel_to_session("channel", [2; 32])
+                .unwrap();
+            let _ = stop.send(());
+            server_task.await.unwrap();
+            conn.shutdown().await;
+        }
+    }
+
+    #[test]
+    fn attachment_guard_covers_pre_intended_window_and_preserves_siblings() {
+        use crate::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
+        let wallet = Arc::new(MockWallet::new());
+        for (id, owner) in [("ours", [1; 32]), ("sibling", [2; 32])] {
+            wallet
+                .insert_channel(WalletChannel {
+                    channel_id: id.to_string(),
+                    state: WalletChannelState::Open,
+                    receiver_pubkey: "receiver".to_string(),
+                    mint_url: "https://mint".to_string(),
+                    unit: "msat".to_string(),
+                    keyset_id: "0000000000000001".to_string(),
+                    attached_session_id: Some(owner),
+                    capacity_msats: 1000,
+                    current_signed_balance_msats: 0,
+                    expiry_timestamp: u64::MAX,
+                })
+                .unwrap();
+        }
+        drop(super::SessionAttachments {
+            wallet: wallet.clone(),
+            session_id: [1; 32],
+        });
+        assert_eq!(
+            wallet.get_channel("ours").unwrap().attached_session_id,
+            None
+        );
+        assert_eq!(
+            wallet.get_channel("sibling").unwrap().attached_session_id,
+            Some([2; 32])
+        );
+        wallet.attach_channel_to_session("ours", [3; 32]).unwrap();
+        drop(super::SessionAttachments {
+            wallet: wallet.clone(),
+            session_id: [1; 32],
+        });
+        assert_eq!(
+            wallet.get_channel("ours").unwrap().attached_session_id,
+            Some([3; 32])
+        );
     }
 
     #[test]

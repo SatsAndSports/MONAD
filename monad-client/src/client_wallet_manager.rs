@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 pub struct ClientWalletManager {
     wallet: Arc<SqliteClientWallet>,
-    _locks: ClientWalletLocks,
 }
 
 impl ClientWalletManager {
@@ -20,20 +19,17 @@ impl ClientWalletManager {
         )?;
         let loose_wallet =
             LooseProofWallet::open(&config.loose_db_path, CONFIGURED_CLIENT_WALLET_NAME)?;
-        let wallet = Arc::new(
-            SqliteClientWallet::open(
-                loose_wallet,
-                &config.channel_db_path,
-                &config.sender_secret_hex,
-            )?
-            .with_funding_keyset_recovery_window(config.funding_keyset_recovery_window_secs),
-        );
+        let wallet = SqliteClientWallet::open(
+            loose_wallet,
+            &config.channel_db_path,
+            &config.sender_secret_hex,
+        )?
+        .with_funding_keyset_recovery_window(config.funding_keyset_recovery_window_secs);
         let recovery = wallet.recover_pending_openings(&locks.exclusive_access()?)?;
         locks.enter_steady_state()?;
         Ok((
             Self {
-                wallet,
-                _locks: locks,
+                wallet: Arc::new(wallet.with_runtime_locks(locks)),
             },
             recovery,
         ))
@@ -67,5 +63,25 @@ mod tests {
         let second = manager.wallet();
         assert!(Arc::ptr_eq(&first, &second));
         assert!(ClientWalletManager::open(&config).is_err());
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let child = tokio::spawn(async move {
+            tokio::task::block_in_place(|| {
+                let _wallet = first;
+                entered.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+        });
+        entered_rx.await.unwrap();
+        drop(second);
+        drop(manager);
+        child.abort();
+        assert!(
+            ClientWalletManager::open(&config).is_err(),
+            "blocking child lost wallet authority before it finished"
+        );
+        release.send(()).unwrap();
+        let _ = child.await;
+        assert!(ClientWalletManager::open(&config).is_ok());
     }
 }

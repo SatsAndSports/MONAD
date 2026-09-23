@@ -28,7 +28,17 @@ pub(super) async fn send_control_message(
     h2_send: &mut h2::SendStream<Bytes>,
     message: &ClientMessage,
 ) -> io::Result<()> {
-    send_json_line(h2_send, message).await
+    tokio::time::timeout(
+        super::runtime::HEARTBEAT_TIMEOUT,
+        send_json_line(h2_send, message),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "control send exceeded heartbeat timeout",
+        )
+    })?
 }
 
 fn choose_channel_and_offer(
