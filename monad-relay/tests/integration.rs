@@ -421,6 +421,115 @@ async fn start_monad_relay_with_test_payments() -> (
     (addr, pubkey, payments)
 }
 
+#[tokio::test]
+async fn test_listener_finish_quiesces_tcp_and_quic_descendants() {
+    for abrupt in [false, true] {
+        let identity = QuicCertIdentity::generate().unwrap();
+        let key = SecpTransportKeypair::generate();
+        let pubkey = key.pubkey();
+        let km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+        let quic = monad_quic::server::build_server_config(&km.cert_pem, &km.key_pem).unwrap();
+        let (listener, endpoint, addr) =
+            bind_tcp_and_quic_on_same_port("127.0.0.1:0".parse().unwrap(), quic)
+                .await
+                .unwrap();
+        let config = Arc::new(ServerConfig {
+            identity,
+            transport_key: Some(key),
+            receiver_pubkey_hex: "receiver".to_string(),
+            trusted_mint_units: synthetic_trusted_mint_units(),
+            in_bytes_per_millisat: 1,
+            out_bytes_per_millisat: 1,
+            bootstrap_capabilities: None,
+            relay_wallet_name: "teardown".to_string(),
+            spilman_storage_path: String::new(),
+            channel_policy: Default::default(),
+        });
+        let registry = Arc::new(SessionRegistry::new());
+        let payments = Arc::new(InMemoryRelayPayments::new());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let root = tokio::spawn(run_with_payments_and_registry_and_shutdown(
+            listener,
+            Some(endpoint),
+            config,
+            payments.clone(),
+            shared_spilman_mint_cache(synthetic_test_mint_cache()),
+            RelayRuntimeServices::new(registry.clone()),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        let connections = [
+            connect_client_tcp(addr, &pubkey).await,
+            connect_client_quic_secp(addr, &pubkey).await,
+        ];
+        let mut streams = Vec::new();
+        let mut targets = Vec::new();
+        let mut channels = Vec::new();
+        for conn in &connections {
+            let (mut send, mut recv) = conn.open_control().await.unwrap();
+            control_handshake(&mut send, &mut recv).await;
+            let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+            channel.link(&mut send, &mut recv).await;
+            channel
+                .pay(&mut send, &mut recv, TEST_SESSION_PAYMENT)
+                .await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut h2 = conn.clone_send_request().await;
+            let (response, data_send) = h2
+                .send_request(
+                    Request::builder()
+                        .method(Method::CONNECT)
+                        .uri(listener.local_addr().unwrap().to_string())
+                        .body(())
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            let response = response.await.unwrap();
+            assert!(response.status().is_success());
+            targets.push(listener.accept().await.unwrap().0);
+            streams.push((send, recv, data_send, response.into_body()));
+            channels.push(channel.channel_id);
+        }
+        if abrupt {
+            root.abort();
+            assert!(root.await.unwrap_err().is_cancelled());
+            drop(stop);
+        } else {
+            stop.send(()).unwrap();
+            timeout(Duration::from_secs(8), root)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        // No polling/sleeps: root completion must already have released ownership.
+        for (conn, channel) in connections.iter().zip(&channels) {
+            assert!(!registry.terminate(conn.session_id()));
+            assert_eq!(payments.owner_of(channel), None);
+        }
+        for mut target in targets {
+            assert_eq!(
+                timeout(Duration::from_secs(2), target.read(&mut [0]))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+        }
+        let _tcp = std::net::TcpListener::bind(addr).unwrap();
+        if !abrupt {
+            // Explicit finish drains Quinn too. Abort quiesces MONAD children,
+            // but Quinn's runtime-owned protocol drivers may still be draining.
+            let _udp = std::net::UdpSocket::bind(addr).unwrap();
+        }
+        for conn in connections {
+            conn.close().await;
+        }
+    }
+}
+
 /// Spin up a MONAD relay with explicit Spilman advertisement config.
 async fn start_monad_relay_with_spilman(
     trusted_mint_units: BTreeMap<String, BTreeSet<String>>,
@@ -1342,11 +1451,47 @@ async fn create_paid_open_channel_with_expiry(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_expiring_channel_auto_close_worker_closes_near_expiry_channel() {
+    assert_auto_close_worker_lifecycle(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_auto_close_cancellation_retains_recoverable_journal_without_worker() {
+    for abrupt in [false, true] {
+        assert_auto_close_worker_lifecycle(Some(abrupt)).await;
+    }
+}
+
+async fn assert_auto_close_worker_lifecycle(cancel: Option<bool>) {
     let mint_helper = TestMintHelper::new().await.unwrap();
     let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mint_addr = mint_listener.local_addr().unwrap();
     let mint_url = format!("http://127.0.0.1:{}", mint_addr.port());
-    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (swap_done, swap_done_rx) = tokio::sync::oneshot::channel();
+    let swap_done = Arc::new(std::sync::Mutex::new(Some(swap_done)));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gate_release = release.clone();
+    let mint_router =
+        build_router(mint_helper.mint())
+            .await
+            .unwrap()
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let swap_done = swap_done.clone();
+                    let release = gate_release.clone();
+                    async move {
+                        let gate = cancel.is_some() && request.uri().path() == "/v1/swap";
+                        let response = next.run(request).await;
+                        if gate {
+                            let done = swap_done.lock().unwrap().take();
+                            if let Some(done) = done {
+                                let _ = done.send(());
+                                release.notified().await;
+                            }
+                        }
+                        response
+                    }
+                },
+            ));
     let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         axum::serve(mint_listener, mint_router)
@@ -1412,6 +1557,22 @@ async fn test_expiring_channel_auto_close_worker_closes_near_expiry_channel() {
     .await;
     assert!(payments.closed_data(&channel_id).is_none());
 
+    let untouched_channel = if cancel.is_some() {
+        Some(
+            create_paid_open_channel_with_expiry(
+                &payments,
+                &wallet,
+                &offer,
+                [32; 32],
+                funded_balance_raw,
+                now + 11_000,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let identity = QuicCertIdentity::generate().unwrap();
     let transport_key = SecpTransportKeypair::generate();
@@ -1436,11 +1597,59 @@ async fn test_expiring_channel_auto_close_worker_closes_near_expiry_channel() {
         listener,
         None,
         config,
-        wallet_manager,
+        wallet_manager.clone(),
         async {
             let _ = shutdown_rx.await;
         },
     ));
+
+    if let Some(abrupt) = cancel {
+        timeout(Duration::from_secs(10), swap_done_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        if abrupt {
+            handle.abort();
+            assert!(handle.await.unwrap_err().is_cancelled());
+            drop(shutdown_tx);
+        } else {
+            shutdown_tx.send(()).unwrap();
+            timeout(Duration::from_secs(2), handle)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            Arc::strong_count(&wallet_manager),
+            1,
+            "auto-close worker survived its owner"
+        );
+        assert_eq!(
+            wallet_manager
+                .spilman_storage()
+                .get_state(untouched_channel.as_ref().unwrap()),
+            ChannelState::Open
+        );
+        assert_eq!(
+            wallet_manager.spilman_storage().get_state(&channel_id),
+            ChannelState::Closing
+        );
+        assert!(wallet_manager
+            .spilman_storage()
+            .get_close_journal(&channel_id)
+            .unwrap()
+            .is_some());
+        release.notify_one();
+        let net = wallet_manager.mint_client_for_channel(&channel_id).unwrap();
+        wallet_manager
+            .close_channel(&channel_id, &net)
+            .await
+            .unwrap();
+        assert_closed_payout_at_least(&payments, &channel_id, funded_balance_raw);
+        let _ = mint_shutdown_tx.send(());
+        return;
+    }
 
     timeout(Duration::from_secs(10), async {
         loop {

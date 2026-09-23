@@ -1386,8 +1386,13 @@ the H2 accept driver. They are not separately spawned tasks. Dropping or unwindi
 the session future synchronously drops those children; awaiting an aborted
 session task therefore establishes quiescence of its control/setup/data futures.
 This is deliberately different from a `JoinSet` drop, which only requests abort
-of independently scheduled tasks. It does not strengthen the listener's separate
-connection-task ownership contract.
+of independently scheduled tasks. The relay listener and its QUIC connections
+also directly own their connection/stream futures, with panic isolation at each
+child boundary. Root cancellation drops the MONAD descendants synchronously.
+Explicit listener finish additionally closes and drains Quinn with `wait_idle`.
+Abrupt cancellation cannot await Quinn's runtime-owned protocol drivers; they
+may temporarily retain the UDP socket while draining, even though no MONAD
+session, proxy, or channel ownership remains.
 
 Successful link validation records ownership synchronously before the reducer's
 next await. Session drop cancels the termination token, conditionally releases
@@ -1404,6 +1409,13 @@ and H2 capacity waits; ordinary EOF still preserves the opposite half of the
 connection. Control cancellation similarly covers bootstrap and message writes.
 Per-tunnel accounting drop guards close counters and log byte totals on normal
 completion, cancellation, and unwinding.
+
+The expiring-channel auto-close loop is a directly owned future, not a spawned
+worker whose handle can detach on wrapper cancellation. Shutdown stops admission
+between candidates and cancels the active sweep. An interrupted close retains
+its durable journal and is recovered by the existing restore/replay rules; no
+reservation or ambiguous execution is treated as successfully completed merely
+because its task was cancelled.
 
 ## Byte Accounting
 

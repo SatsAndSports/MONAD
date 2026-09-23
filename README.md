@@ -783,6 +783,10 @@ writes or H2 flow control. Relay CONNECT setup runs concurrently with the contro
 stream and has a 10-second deadline (including the blinded-hop tweak preamble).
 Setup failure or timeout returns HTTP 502; a session that becomes paused before
 the tunnel is published receives HTTP 402 instead of a late successful CONNECT.
+Explicit relay shutdown drains QUIC connections before returning. Abrupt task
+cancellation drops MONAD sessions immediately, but Quinn's internal protocol
+drivers can retain the UDP socket briefly while draining. Interrupted auto-close
+work leaves its durable close journal available for recovery on restart.
 
 ## QUIC Echo Tool
 
