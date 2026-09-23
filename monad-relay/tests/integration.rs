@@ -14694,3 +14694,5 @@ async fn test_quic_first_hop_then_tcp() {
     drop(h2);
     conn.shutdown().await;
 }
+#[path = "common/management_api.rs"]
+mod management_api;

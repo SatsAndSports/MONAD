@@ -3,6 +3,7 @@ pub mod config_runtime;
 pub mod connector;
 pub mod loose_proof_wallet;
 pub mod management;
+pub mod management_api;
 pub mod proof_selection;
 pub mod route;
 pub mod runtime;

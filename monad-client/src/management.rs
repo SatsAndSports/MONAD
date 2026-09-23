@@ -31,6 +31,8 @@ pub struct HopSnapshot {
     pub total_paid_msats: u64,
     pub remaining_msats: i64,
     pub funding_error: Option<String>,
+    pub inbound_bytes: u64,
+    pub outbound_bytes: u64,
 }
 
 /// A handle belongs to one configured client, not to its shared wallet.
@@ -40,6 +42,7 @@ pub struct ClientManagement {
     hops: Mutex<BTreeMap<String, Arc<HopManagement>>>,
     changed: watch::Sender<u64>,
     running: Mutex<bool>,
+    pub events: monad_management::events::EventLog,
 }
 
 impl Default for ClientManagement {
@@ -49,6 +52,7 @@ impl Default for ClientManagement {
             hops: Mutex::new(BTreeMap::new()),
             changed: watch::channel(0).0,
             running: Mutex::new(false),
+            events: Default::default(),
         }
     }
 }
@@ -104,7 +108,7 @@ impl ClientManagement {
         self.changed.subscribe()
     }
 
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         self.changed.send_modify(|v| *v = v.wrapping_add(1));
     }
 
@@ -113,7 +117,13 @@ impl ClientManagement {
             .lock()
             .unwrap()
             .values()
-            .map(|h| h.state.lock().unwrap().snapshot.clone())
+            .map(|h| {
+                let mut snapshot = h.state.lock().unwrap().snapshot.clone();
+                let (inbound, outbound) = h.counters.lock().unwrap().snapshot();
+                snapshot.inbound_bytes = inbound;
+                snapshot.outbound_bytes = outbound;
+                snapshot
+            })
             .collect()
     }
 
@@ -137,6 +147,7 @@ impl ClientManagement {
             return Err("session is not waiting for manual funding");
         }
         state.manual_requested = true;
+        state.snapshot.funding_error = None;
         drop(state);
         drop(hops);
         drop(controls);
@@ -154,6 +165,7 @@ impl ClientManagement {
     pub(crate) fn register(self: &Arc<Self>, session_id: [u8; 32], label: &str) -> HopLease {
         let id = hex::encode(session_id);
         let hop = Arc::new(HopManagement {
+            counters: Default::default(),
             state: Mutex::new(HopState {
                 snapshot: HopSnapshot {
                     session_id: id.clone(),
@@ -166,6 +178,8 @@ impl ClientManagement {
                     total_paid_msats: 0,
                     remaining_msats: 0,
                     funding_error: None,
+                    inbound_bytes: 0,
+                    outbound_bytes: 0,
                 },
                 manual_requested: false,
             }),
@@ -189,6 +203,7 @@ struct HopState {
 #[derive(Debug)]
 pub(crate) struct HopManagement {
     state: Mutex<HopState>,
+    pub(crate) counters: Mutex<monad_common::proxy::CleartextByteCounters>,
 }
 
 pub(crate) struct HopLease {

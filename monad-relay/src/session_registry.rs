@@ -35,6 +35,7 @@ struct Admission {
 struct RegisteredSession {
     terminate: CancellationToken,
     control_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
+    monitor: Option<crate::session::SessionMonitor>,
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +43,7 @@ pub struct SessionRegistry {
     inner: Mutex<HashMap<[u8; 32], RegisteredSession>>,
     admission: Mutex<Admission>,
     drained: Notify,
+    pub events: monad_management::events::EventLog,
 }
 
 impl SessionRegistry {
@@ -63,6 +65,7 @@ impl SessionRegistry {
                 RegisteredSession {
                     terminate,
                     control_tx: None,
+                    monitor: None,
                 },
             );
         }
@@ -77,6 +80,33 @@ impl SessionRegistry {
 
     pub fn controls(&self) -> RelayControls {
         self.admission.lock().unwrap().controls
+    }
+
+    pub(crate) fn monitor(&self, id: [u8; 32], monitor: crate::session::SessionMonitor) {
+        if let Some(session) = self.inner.lock().unwrap().get_mut(&id) {
+            session.monitor = Some(monitor);
+        }
+    }
+
+    pub async fn snapshots(&self) -> Vec<serde_json::Value> {
+        let monitors: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, s)| s.monitor.clone().map(|m| (*id, m)))
+            .collect();
+        let mut result = Vec::new();
+        for (id, monitor) in monitors {
+            result.push(monitor.snapshot(id).await);
+        }
+        result
+    }
+
+    pub fn is_disabling(&self) -> bool {
+        let admission = self.admission.lock().unwrap();
+        !admission.controls.enabled
+            && (admission.active_runs != 0 || !self.inner.lock().unwrap().is_empty())
     }
 
     /// Atomically replace runtime policy. False `enabled` requests cancellation;

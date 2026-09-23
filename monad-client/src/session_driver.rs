@@ -89,6 +89,9 @@ pub async fn start_managed_session_payment_driver(
     let lease = management
         .as_ref()
         .map(|m| m.register(*conn.session_id(), hop_label));
+    if let Some(lease) = &lease {
+        *lease.hop.counters.lock().unwrap() = conn.cleartext_byte_counters();
+    }
     let config = SessionDriverConfig {
         wallet,
         conn: RelayConnectionHandles::from(conn),

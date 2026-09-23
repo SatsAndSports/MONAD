@@ -133,8 +133,17 @@ pub(super) async fn run_session_driver(
                             open_connects,
                             total_connects,
                         } => {
-                            if let Some((_, hop)) = &config.management {
+                            if let Some((owner, hop)) = &config.management {
+                                let previous = state.relay_snapshot.as_ref().map(|s| s.total_paid_millisats).unwrap_or(0);
+                                if total_paid_millisats > previous {
+                                    owner.events.record("payment_observed", serde_json::json!({
+                                        "session_id": hex::encode(config.conn.session_id),
+                                        "delta_msats": total_paid_millisats - previous,
+                                        "total_paid_msats": total_paid_millisats,
+                                    }));
+                                }
                                 hop.status(linked_channel.clone(), paused, total_paid_millisats, remaining_milli_sats);
+                                owner.notify();
                             }
                             let pricing = SessionPricing::new(active_in_rate, active_out_rate);
                             validate_session_pricing(&mut state.established_pricing, pricing)?;

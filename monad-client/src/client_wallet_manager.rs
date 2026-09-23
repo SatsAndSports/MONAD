@@ -38,6 +38,10 @@ impl ClientWalletManager {
     pub fn wallet(&self) -> Arc<dyn MonadWallet> {
         self.wallet.clone()
     }
+
+    pub(crate) fn managed_wallet(&self) -> Arc<SqliteClientWallet> {
+        self.wallet.clone()
+    }
 }
 
 #[cfg(test)]

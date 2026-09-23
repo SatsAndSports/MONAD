@@ -2,6 +2,18 @@
 
 ## Runtime admission control
 
+The `monad-management` crate supplies HTTP-over-Unix process endpoints and bounded,
+process-owned command execution. Runtime backends expose sanitized snapshots and
+typed runtime actions. Generation-bound request IDs make retries idempotent during
+a process lifetime. The HTTP caller does not own an accepted money operation;
+the process executor does. Process shutdown cancels its futures using the existing
+journaled wallet recovery semantics. No management transport retries a mint request.
+
+Snapshot-only registry handles retain billing/counter objects without retaining a
+session owner or forming a registry cycle. Wallet inventories are cached separately
+from traffic counters. Discrete payment events enter a bounded in-memory ring after
+acceptance, never an unbounded channel to a slow observer.
+
 A relay's session registry owns its runtime admission policy alongside registered
 session cancellation tokens. A short synchronous admission lock orders policy
 changes with session registration, channel validation/acceptance, and CONNECT

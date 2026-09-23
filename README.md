@@ -2,6 +2,10 @@
 
 ### Runtime management foundations
 
+Configured client and relay processes now optionally expose Unix-socket management
+endpoints. See [the headless API reference](docs/management-api.md) for configuration,
+commands, operation tracking, and monitoring semantics.
+
 Relay embedders can pass a per-relay `Arc<SessionRegistry>` to
 `run_with_wallet_manager_registry_and_shutdown` and update `RelayControls` while
 the relay runs. All controls default to enabled. These are process-local overrides,

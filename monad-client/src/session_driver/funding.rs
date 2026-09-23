@@ -340,11 +340,20 @@ pub(super) async fn maybe_ensure_linked_channel(
                 }
                 let (channel_id, offer) = match selected {
                     Ok(Some(selected)) => selected,
-                    Ok(None) => return Ok(()),
+                    Ok(None) => {
+                        if let Some((owner, hop)) = &config.management {
+                            if !owner.controls().automatic_provisioning {
+                                hop.safe_provisioning_failure();
+                                owner.notify();
+                            }
+                        }
+                        return Ok(());
+                    }
                     Err(error) if provisioning_offer_is_unavailable(&error) => {
                         if let Some((owner, hop)) = &config.management {
                             if !owner.controls().automatic_provisioning {
                                 hop.safe_provisioning_failure();
+                                owner.notify();
                                 return Ok(());
                             }
                         }

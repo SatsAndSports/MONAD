@@ -342,6 +342,17 @@ pub struct ManagementConfig {
     pub listen: String,
     #[serde(default)]
     pub auth_token: Option<String>,
+    #[serde(default)]
+    pub relay_socket: Option<String>,
+    #[serde(default)]
+    pub client_socket: Option<String>,
+    /// Named process Unix sockets consumed by the HTTP aggregator.
+    #[serde(default)]
+    pub processes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub manual_funding_clients: BTreeSet<String>,
+    #[serde(default)]
+    pub disabled_clients: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

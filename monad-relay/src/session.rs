@@ -147,6 +147,28 @@ pub(crate) struct SessionState {
     cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
 }
 
+/// Snapshot-only handles have no back-reference to the registry/session owner.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionMonitor {
+    billing: Arc<Mutex<BillingState>>,
+    counters: Arc<SessionCounters>,
+}
+
+impl SessionMonitor {
+    pub(crate) async fn snapshot(&self, id: [u8; 32]) -> serde_json::Value {
+        let billing = self.billing.lock().await;
+        let (active, total) = self.counters.snapshot();
+        serde_json::json!({
+            "session_id": hex::encode(id), "inbound_bytes": billing.state.session_total_in,
+            "outbound_bytes": billing.state.session_total_out,
+            "total_paid_msats": billing.state.total_paid_millisats,
+            "remaining_msats": billing.remaining_milli_sats().to_string(),
+            "paused": billing.state.paused, "linked_channel_id": billing.state.linked_channel_id,
+            "active_tunnels": active, "total_tunnels": total,
+        })
+    }
+}
+
 impl SessionState {
     // Lifecycle and shared handles.
 
@@ -156,7 +178,7 @@ impl SessionState {
         config
             .session_registry
             .register_session(session_id, termination.clone());
-        Self {
+        let state = Self {
             billing: Arc::new(Mutex::new(BillingState {
                 state: ServerSessionState {
                     session_total_in: 0,
@@ -186,7 +208,15 @@ impl SessionState {
             keyset_refresh: config.keyset_refresh.clone(),
             cashu_spilman_protocol_version: config.cashu_spilman_protocol_version.clone(),
             cashu_spilman_keyset_versions: config.cashu_spilman_keyset_versions.clone(),
-        }
+        };
+        config.session_registry.monitor(
+            session_id,
+            SessionMonitor {
+                billing: state.billing.clone(),
+                counters: state.counters.clone(),
+            },
+        );
+        state
     }
 
     pub(crate) fn session_id(&self) -> [u8; 32] {
@@ -295,8 +325,19 @@ impl SessionState {
         expected_channel_id: &str,
         payment_json: &str,
     ) -> Result<crate::payments::PaymentOutcome, crate::payments::ChannelPaymentError> {
-        self.payments
-            .apply_channel_payment(self.session_id, expected_channel_id, payment_json)
+        let result = self.payments.apply_channel_payment(
+            self.session_id,
+            expected_channel_id,
+            payment_json,
+        )?;
+        self.session_registry.events.record(
+            "payment_accepted",
+            serde_json::json!({
+                "session_id": hex::encode(self.session_id), "channel_id": result.channel_id,
+                "delta_msats": result.delta_millisats,
+            }),
+        );
+        Ok(result)
     }
 
     pub(crate) fn notify_session_evicted(&self, target_session_id: &[u8; 32], channel_id: String) {

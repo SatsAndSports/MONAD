@@ -208,7 +208,7 @@ pub async fn run_configured_client_managed<S>(
     client_name: Option<&str>,
     stats: SharedRouteRuntimeStats,
     options: ConfiguredClientRuntimeOptions,
-    management: std::collections::BTreeMap<String, Arc<crate::management::ClientManagement>>,
+    mut management: std::collections::BTreeMap<String, Arc<crate::management::ClientManagement>>,
     shutdown: S,
 ) -> anyhow::Result<()>
 where
@@ -250,6 +250,42 @@ where
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
+    for prepared in &prepared_clients {
+        let controls = management.entry(prepared.client.name.clone()).or_default();
+        if let Some(settings) = &config.management {
+            if settings
+                .manual_funding_clients
+                .contains(&prepared.client.name)
+            {
+                controls.set_automatic_provisioning(false);
+            }
+            if settings.disabled_clients.contains(&prepared.client.name) {
+                controls.set_enabled(false).map_err(anyhow::Error::msg)?;
+            }
+        }
+    }
+    if let Some(path) = config
+        .management
+        .as_ref()
+        .and_then(|m| m.client_socket.clone())
+    {
+        let backend = Arc::new(crate::management_api::ClientBackend::new(
+            management.clone(),
+            manager.managed_wallet(),
+        ));
+        let mut stopped = shutdown_rx.clone();
+        tasks.spawn(async move {
+            monad_management::serve_unix(path.into(), backend, async move {
+                while !*stopped.borrow() {
+                    if stopped.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .map_err(Into::into)
+        });
+    }
     for prepared in prepared_clients {
         let controls = management
             .get(&prepared.client.name)
