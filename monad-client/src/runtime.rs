@@ -1289,6 +1289,7 @@ mod tests {
             })
             .collect();
         MonadConfig {
+            test_mints: Vec::new(),
             relay_wallet: None,
             client_wallet: None,
             management: None,

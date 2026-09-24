@@ -1,5 +1,31 @@
 # MONAD Architecture
 
+## Managed test-mint process
+
+`monad-test-mint` is an optional standalone host for the YAML `test_mints` entries.
+It uses the pinned CDK mint/signatory and fake Lightning processors, with one active
+v2 keyset per configured SAT/MSAT unit. Each mint has a separate database and random
+persisted signing seed; multiple mints share only the process management interface.
+The existing aggregator treats it as another Unix-socket-backed process.
+
+A MONAD manifest records the mint's name, seed, unit set and initial fees atomically
+in its database before CDK initialization. Startup holds exclusive ownership, reads
+persisted active keyset metadata, and configures CDK with the existing fees/amounts.
+This is essential because CDK otherwise rotates automatically on a fee mismatch.
+YAML fees are initialization defaults, not desired-state reconciliation. Unrecognized
+nonempty databases and changed unit sets are rejected without destructive cleanup.
+
+Rotation uses CDK's transactional keyset operation and in-memory publication path,
+serialized per mint. It never edits active flags directly or pushes cache updates to
+clients/relays. Normal Cashu discovery and MONAD keyset-refresh paths observe changes.
+Fee validation retains the Spilman 0–999 ppk range in either unit. Public snapshots
+and events contain only keyset metadata; signing material stays inside the database.
+
+The runtime supervisor owns HTTP servers and awaits CDK worker shutdown before
+releasing database locks. Caller cancellation signals that supervisor rather than
+aborting cleanup. Normal process shutdown is awaited; crash restart restores mint
+state but does not replay management commands. See `docs/test-mints.md`.
+
 ## Runtime admission control
 
 Administrative refusal uses the shared `Rejection { code, message }` model.

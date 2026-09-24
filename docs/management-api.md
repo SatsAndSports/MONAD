@@ -13,7 +13,8 @@ cargo run -p monad-management -- --config monad.yaml
 The aggregator binds `management.listen` (a numeric IPv4/IPv6 loopback address).
 It serves JSON and SSE only; no webpage is included yet. By default it discovers
 the configured `relay_socket` as process `relays` and `client_socket` as process
-`clients`. For more processes, explicitly name all their sockets:
+`clients`. An optional `test_mint_socket` is discovered as `test-mints`. For more
+processes, explicitly name all their sockets:
 
 ```yaml
 management:
@@ -166,6 +167,16 @@ Close results distinguish `closed`, `sender_refunded`, and `unresolved_spent`.
 The last is not successful settlement. No proof payloads are returned. A close
 failure requires inspecting/recovering the stored channel, not blindly spending
 again. Snapshot expiry records include absolute expiry and seconds remaining.
+
+### Test-mint actions
+
+Optional [managed CDK test mints](test-mints.md) expose `rotate_keyset` with arguments
+`{"unit":"sat","input_fee_ppk":400}` (or `msat`). Rates must be integers in 0–999.
+One active keyset is maintained per configured unit; rotation does not affect the
+other unit. The result identifies the previous/new keysets and fee. Their process
+snapshot uses `kind: "test_mints"`, and `keyset_rotated` events use the normal SSE
+stream. Keysets and fees persist across restart; operation IDs retain the existing
+process-generation semantics.
 
 ## Monitoring semantics
 

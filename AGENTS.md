@@ -52,6 +52,14 @@ cargo run -p monad-quic -- ...
   - Ed25519 self-signed cert generation
   - QUIC echo server with pinned-key auth
   - QUIC echo client with custom `ServerCertVerifier`
+- `monad-management`
+  - shared process HTTP-over-Unix command/snapshot service plus localhost HTTP/SSE aggregator
+- `monad-test-mint`
+  - standalone configured CDK test-mint host (`run --config ... [--mint ...]`)
+  - optional YAML `test_mints`; SAT/MSAT unit-specific keyset rotation through `management.test_mint_socket`
+  - persistent per-mint random seed and initial unit/fee manifest in the mint DB; do not log/export the seed
+  - YAML fees initialize fresh units only; restart must use persisted active fees/amounts to avoid CDK's automatic mismatch rotation
+  - input fee range 0–999 ppk for Spilman compatibility; fake Lightning only; details in `docs/test-mints.md`
 
 ## Current Protocol Model
 

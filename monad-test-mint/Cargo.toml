@@ -1,0 +1,31 @@
+[package]
+name = "monad-test-mint"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+monad-common = { path = "../monad-common" }
+monad-management = { path = "../monad-management" }
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = "0.31"
+rand = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", default-features = false, features = ["mint"] }
+cdk-common = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", default-features = false }
+cdk-axum = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", default-features = false }
+cdk-fake-wallet = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1" }
+cdk-sqlite = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", default-features = false, features = ["mint"] }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+monad-client = { path = "../monad-client" }
+monad-relay = { path = "../monad-relay" }
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "7eeb3ca54c76ed16b9522ea2a196dfe520d14dc0", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
