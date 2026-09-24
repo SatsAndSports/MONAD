@@ -26,6 +26,8 @@ pub struct MonadConfig {
 
     #[serde(default)]
     pub clients: Vec<ClientConfig>,
+    #[serde(default)]
+    pub test_mints: Vec<TestMintConfig>,
 }
 
 impl MonadConfig {
@@ -110,8 +112,8 @@ impl MonadConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.relays.is_empty() && self.clients.is_empty() {
-            anyhow::bail!("config must contain at least one relay or client");
+        if self.relays.is_empty() && self.clients.is_empty() && self.test_mints.is_empty() {
+            anyhow::bail!("config must contain at least one relay, client, or test mint");
         }
 
         if !self.relays.is_empty() && self.relay_wallet.is_none() {
@@ -270,6 +272,34 @@ impl MonadConfig {
             }
         }
 
+        let mut mint_names = HashSet::new();
+        let mut mint_databases = HashSet::new();
+        let mut mint_listeners = HashSet::new();
+        for mint in &self.test_mints {
+            mint.validate()?;
+            if self
+                .relay_wallet
+                .as_ref()
+                .is_some_and(|wallet| wallet.db_path == mint.db_path)
+                || self.client_wallet.as_ref().is_some_and(|wallet| {
+                    wallet.loose_db_path == mint.db_path || wallet.channel_db_path == mint.db_path
+                })
+            {
+                anyhow::bail!(
+                    "test mint databases must be separate from client and relay wallet databases"
+                );
+            }
+            if !mint_names.insert(&mint.name) {
+                anyhow::bail!("duplicate test mint name '{}'", mint.name);
+            }
+            if !mint_databases.insert(&mint.db_path) {
+                anyhow::bail!("test mints must use distinct databases");
+            }
+            let addr: std::net::SocketAddr = mint.listen.parse()?;
+            if addr.port() != 0 && !mint_listeners.insert(addr) {
+                anyhow::bail!("test mints must use distinct listen addresses");
+            }
+        }
         if let Some(management) = &self.management {
             for name in management
                 .manual_funding_clients
@@ -285,10 +315,18 @@ impl MonadConfig {
             {
                 anyhow::bail!("management relay_socket and client_socket must be distinct");
             }
+            if let Some(socket) = &management.test_mint_socket {
+                if management.relay_socket.as_ref() == Some(socket)
+                    || management.client_socket.as_ref() == Some(socket)
+                {
+                    anyhow::bail!("management test_mint_socket must be distinct from client and relay sockets");
+                }
+            }
             for path in management
                 .relay_socket
                 .iter()
                 .chain(&management.client_socket)
+                .chain(&management.test_mint_socket)
                 .chain(management.processes.values())
             {
                 if !Path::new(path).is_absolute() {
@@ -372,6 +410,8 @@ pub struct ManagementConfig {
     pub relay_socket: Option<String>,
     #[serde(default)]
     pub client_socket: Option<String>,
+    #[serde(default)]
+    pub test_mint_socket: Option<String>,
     /// Named process Unix sockets consumed by the HTTP aggregator.
     #[serde(default)]
     pub processes: BTreeMap<String, String>,
@@ -379,6 +419,68 @@ pub struct ManagementConfig {
     pub manual_funding_clients: BTreeSet<String>,
     #[serde(default)]
     pub disabled_clients: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestMintUnit {
+    Sat,
+    Msat,
+}
+
+impl TestMintUnit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sat => "sat",
+            Self::Msat => "msat",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestMintUnitConfig {
+    pub input_fee_ppk: u64,
+}
+
+impl TestMintUnitConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.input_fee_ppk > 999 {
+            anyhow::bail!("input_fee_ppk must be in 0..=999 for Spilman channel compatibility");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestMintConfig {
+    pub name: String,
+    pub listen: String,
+    pub db_path: String,
+    pub units: BTreeMap<TestMintUnit, TestMintUnitConfig>,
+}
+
+impl TestMintConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.name.trim().is_empty() || self.db_path.trim().is_empty() {
+            anyhow::bail!("test mint name and db_path must be nonempty");
+        }
+        let addr: std::net::SocketAddr = self
+            .listen
+            .parse()
+            .map_err(|_| anyhow::anyhow!("test mint listen must be an IP address and port"))?;
+        if !addr.ip().is_loopback() {
+            anyhow::bail!("test mint listen must bind loopback");
+        }
+        if self.units.is_empty() {
+            anyhow::bail!("test mint must configure at least one unit");
+        }
+        for unit in self.units.values() {
+            unit.validate()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -823,6 +925,57 @@ clients:
     fn substitute_missing_is_error() {
         std::env::remove_var("MONAD_TEST_MISSING");
         assert!(substitute_env_vars("${MONAD_TEST_MISSING}").is_err());
+    }
+
+    #[test]
+    fn test_mint_only_config_supports_sat_and_msat_and_checks_collisions() {
+        let yaml = r#"
+test_mints:
+  - name: demo
+    listen: 127.0.0.1:3338
+    db_path: /tmp/demo-mint.db
+    units:
+      sat: {input_fee_ppk: 400}
+      msat: {input_fee_ppk: 700}
+management:
+  listen: 127.0.0.1:8090
+  test_mint_socket: /tmp/demo-mint.sock
+"#;
+        let mut config: MonadConfig = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.test_mints[0].units[&TestMintUnit::Msat].input_fee_ppk,
+            700
+        );
+        config.test_mints.push(config.test_mints[0].clone());
+        assert!(config.validate().is_err());
+        config.test_mints.pop();
+        config.management.as_mut().unwrap().client_socket = Some("/tmp/demo-mint.sock".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("distinct"));
+        assert!(serde_yaml::from_str::<MonadConfig>(&yaml.replace("msat:", "usd:")).is_err());
+        assert!(serde_yaml::from_str::<MonadConfig>(&yaml.replace("700", "-1")).is_err());
+        let too_high: MonadConfig = serde_yaml::from_str(&yaml.replace("700", "1000")).unwrap();
+        assert!(too_high
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("0..=999"));
+        let config: MonadConfig =
+            serde_yaml::from_str(&yaml.replace("127.0.0.1:3338", "0.0.0.0:3338")).unwrap();
+        assert!(config.validate().is_err());
+        let mut collision: MonadConfig = serde_yaml::from_str(yaml).unwrap();
+        collision.relay_wallet = Some(RelayWalletConfig {
+            db_path: collision.test_mints[0].db_path.clone(),
+        });
+        assert!(collision
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("separate"));
     }
 
     #[test]

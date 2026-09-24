@@ -12,6 +12,15 @@ processes on `management.listen`. `GET /v1/snapshot` provides JSON monitoring an
 `/v1/processes/{name}/commands`. The TCP listener is loopback-only; this release
 provides a headless API, ready for a later dashboard.
 
+Optional **SAT/MSAT CDK test mints** can be configured under `test_mints` and started
+with `cargo run -p monad-test-mint -- run --config monad.yaml`. One process hosts all
+configured test mints; each has its own persistent database and Cashu HTTP address.
+Set `management.test_mint_socket` to expose keyset monitoring and per-unit rotation
+through the same management TCP/SSE service. YAML fees initialize the first keysets;
+rotation commands select subsequent fees, and restart preserves the rotated state.
+See [managed test mints](docs/test-mints.md) for configuration, fee units/range, and
+operation examples.
+
 Relay embedders can pass a per-relay `Arc<SessionRegistry>` to
 `run_with_wallet_manager_registry_and_shutdown` and update `RelayControls` while
 the relay runs. All controls default to enabled. These are process-local overrides,

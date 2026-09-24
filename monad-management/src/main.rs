@@ -30,6 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(path) = settings.client_socket {
             processes.insert("clients".into(), path);
         }
+        if let Some(path) = settings.test_mint_socket {
+            processes.insert("test-mints".into(), path);
+        }
     }
     if processes.is_empty() {
         return Err("configure at least one management process socket".into());

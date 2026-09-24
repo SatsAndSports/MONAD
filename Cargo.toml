@@ -6,5 +6,6 @@ members = [
     "monad-test-client",
     "monad-quic",
     "monad-management",
+    "monad-test-mint",
 ]
 resolver = "2"

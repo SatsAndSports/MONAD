@@ -2566,6 +2566,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "monad-test-mint"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cdk",
+ "cdk-axum",
+ "cdk-common",
+ "cdk-fake-wallet",
+ "cdk-spilman",
+ "cdk-sqlite",
+ "clap",
+ "monad-client",
+ "monad-common",
+ "monad-management",
+ "monad-relay",
+ "rand 0.9.3",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
