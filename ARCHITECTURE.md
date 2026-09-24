@@ -74,7 +74,10 @@ supervisor and connection manager remain authoritative for start/stop, retries a
 route rebuilds; the payment driver remains authoritative for funding and payments.
 Management records their transitions but never drives them. Run and route generations
 reject stale updates, including exit failures from tunnels that outlive a replaced
-route. A recovered active route retains its last sanitized failure while bounded
+route. Exit diagnostics are accepted only from the published final session while
+that route is active; withdrawing the route closes that observation window before
+rebuild cleanup. Disable is terminal for ordinary same-generation callbacks until
+the runtime owner finishes cleanup. A recovered active route retains its last sanitized failure while bounded
 events provide recent history. Per-hop funding is represented by one tagged state,
 not combinations of waiting/provisioning/error booleans. Lifecycle mutation never
 holds its short synchronous lock across network, wallet, SQLite, H2 or cleanup work.

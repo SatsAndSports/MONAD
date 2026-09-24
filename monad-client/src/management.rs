@@ -94,8 +94,7 @@ pub enum ClientLifecycle {
         reconnect: bool,
     },
     WaitingForAdmission {
-        attempt: u32,
-        reconnect: bool,
+        context: AdmissionWaitContext,
         wait: crate::admission::AdmissionWait,
     },
     Active,
@@ -117,12 +116,26 @@ pub enum ClientLifecycle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AdmissionWaitContext {
+    Connecting {
+        attempt: u32,
+        reconnect: bool,
+    },
+    RebuildingSuffix {
+        failed_hop: usize,
+        preserved_hops: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClientRuntimeSnapshot {
     pub revision: u64,
     pub run_generation: u64,
     pub route_generation: u64,
     pub transitioned_at_unix_ms: u64,
     pub lifecycle: ClientLifecycle,
+    pub active_exit_session_id: Option<String>,
     pub last_failure: Option<ClientFailure>,
     pub last_exit_failure: Option<ExitFailure>,
 }
@@ -135,6 +148,7 @@ impl Default for ClientRuntimeSnapshot {
             route_generation: 0,
             transitioned_at_unix_ms: now_unix_ms(),
             lifecycle: ClientLifecycle::Stopped,
+            active_exit_session_id: None,
             last_failure: None,
             last_exit_failure: None,
         }
@@ -155,6 +169,19 @@ struct ClientRuntimeState {
     running: bool,
 }
 
+struct RuntimeUpdate<'a> {
+    snapshot: ClientRuntimeSnapshot,
+    _publication: std::sync::MutexGuard<'a, ()>,
+}
+
+impl std::ops::Deref for RuntimeUpdate<'_> {
+    type Target = ClientRuntimeSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
 /// A handle belongs to one configured client, not to its shared wallet.
 #[derive(Debug)]
 pub struct ClientManagement {
@@ -162,6 +189,7 @@ pub struct ClientManagement {
     hops: Mutex<BTreeMap<String, Arc<HopManagement>>>,
     changed: watch::Sender<u64>,
     runtime: Mutex<ClientRuntimeState>,
+    runtime_publication: Mutex<()>,
     pub events: monad_management::events::EventLog,
 }
 
@@ -172,6 +200,7 @@ impl Default for ClientManagement {
             hops: Mutex::new(BTreeMap::new()),
             changed: watch::channel(0).0,
             runtime: Default::default(),
+            runtime_publication: Default::default(),
             events: Default::default(),
         }
     }
@@ -186,14 +215,24 @@ impl ClientManagement {
         &self,
         run_generation: u64,
         update: impl FnOnce(&mut ClientRuntimeSnapshot) -> bool,
-    ) -> Option<ClientRuntimeSnapshot> {
+    ) -> Option<RuntimeUpdate<'_>> {
+        let publication = self.runtime_publication.lock().unwrap();
         let mut runtime = self.runtime.lock().unwrap();
-        if runtime.snapshot.run_generation != run_generation || !update(&mut runtime.snapshot) {
+        if runtime.snapshot.run_generation != run_generation
+            || matches!(
+                runtime.snapshot.lifecycle,
+                ClientLifecycle::Disabling | ClientLifecycle::Disabled
+            )
+            || !update(&mut runtime.snapshot)
+        {
             return None;
         }
         runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
         runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
-        Some(runtime.snapshot.clone())
+        Some(RuntimeUpdate {
+            snapshot: runtime.snapshot.clone(),
+            _publication: publication,
+        })
     }
 
     fn record_lifecycle(&self, snapshot: &ClientRuntimeSnapshot) {
@@ -225,11 +264,21 @@ impl ClientManagement {
     ) {
         let mut refusal_event = None;
         if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
-            let (attempt, reconnect) = match &snapshot.lifecycle {
-                ClientLifecycle::Connecting { attempt, reconnect }
-                | ClientLifecycle::WaitingForAdmission {
-                    attempt, reconnect, ..
-                } => (*attempt, *reconnect),
+            let context = match &snapshot.lifecycle {
+                ClientLifecycle::Connecting { attempt, reconnect } => {
+                    AdmissionWaitContext::Connecting {
+                        attempt: *attempt,
+                        reconnect: *reconnect,
+                    }
+                }
+                ClientLifecycle::RebuildingSuffix {
+                    failed_hop,
+                    preserved_hops,
+                } => AdmissionWaitContext::RebuildingSuffix {
+                    failed_hop: *failed_hop,
+                    preserved_hops: *preserved_hops,
+                },
+                ClientLifecycle::WaitingForAdmission { context, .. } => context.clone(),
                 _ => return false,
             };
             let changed_refusal = !matches!(
@@ -240,11 +289,7 @@ impl ClientManagement {
             if changed_refusal {
                 refusal_event = Some(wait.refusal.clone());
             }
-            snapshot.lifecycle = ClientLifecycle::WaitingForAdmission {
-                attempt,
-                reconnect,
-                wait,
-            };
+            snapshot.lifecycle = ClientLifecycle::WaitingForAdmission { context, wait };
             true
         }) {
             if let Some(refusal) = refusal_event {
@@ -263,15 +308,23 @@ impl ClientManagement {
 
     pub(crate) fn clear_admission_wait(&self, run_generation: u64) {
         if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
-            let ClientLifecycle::WaitingForAdmission {
-                attempt, reconnect, ..
-            } = &snapshot.lifecycle
-            else {
+            let ClientLifecycle::WaitingForAdmission { context, .. } = &snapshot.lifecycle else {
                 return false;
             };
-            snapshot.lifecycle = ClientLifecycle::Connecting {
-                attempt: *attempt,
-                reconnect: *reconnect,
+            snapshot.lifecycle = match context {
+                AdmissionWaitContext::Connecting { attempt, reconnect } => {
+                    ClientLifecycle::Connecting {
+                        attempt: *attempt,
+                        reconnect: *reconnect,
+                    }
+                }
+                AdmissionWaitContext::RebuildingSuffix {
+                    failed_hop,
+                    preserved_hops,
+                } => ClientLifecycle::RebuildingSuffix {
+                    failed_hop: *failed_hop,
+                    preserved_hops: *preserved_hops,
+                },
             };
             true
         }) {
@@ -279,15 +332,65 @@ impl ClientManagement {
         }
     }
 
-    pub(crate) fn active(&self, run_generation: u64) {
+    fn activate_route(
+        &self,
+        run_generation: u64,
+        exit_session_id: String,
+        publish: impl FnOnce(),
+    ) -> bool {
         if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
             snapshot.route_generation = snapshot.route_generation.wrapping_add(1);
             snapshot.lifecycle = ClientLifecycle::Active;
+            snapshot.active_exit_session_id = Some(exit_session_id);
             snapshot.last_exit_failure = None;
             true
         }) {
             self.record_lifecycle(&snapshot);
+            publish();
+            true
+        } else {
+            false
         }
+    }
+
+    pub(crate) fn publish_active_route(
+        &self,
+        run_generation: u64,
+        exit_session_id: String,
+        publish: impl FnOnce(),
+    ) -> bool {
+        self.activate_route(run_generation, exit_session_id, publish)
+    }
+
+    pub(crate) fn withdraw_active_route(
+        &self,
+        run_generation: u64,
+        unpublish: impl FnOnce(),
+    ) -> bool {
+        let _publication = self.runtime_publication.lock().unwrap();
+        let mut runtime = self.runtime.lock().unwrap();
+        if runtime.snapshot.run_generation != run_generation {
+            unpublish();
+            return false;
+        }
+        unpublish();
+        if !matches!(runtime.snapshot.lifecycle, ClientLifecycle::Active)
+            || runtime.snapshot.active_exit_session_id.is_none()
+        {
+            return false;
+        }
+        runtime.snapshot.active_exit_session_id = None;
+        runtime.snapshot.last_exit_failure = None;
+        runtime.snapshot.lifecycle = ClientLifecycle::Connecting {
+            attempt: 0,
+            reconnect: true,
+        };
+        runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
+        runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
+        let snapshot = runtime.snapshot.clone();
+        drop(runtime);
+        self.record_lifecycle(&snapshot);
+        true
     }
 
     pub(crate) fn rebuilding_suffix(
@@ -410,12 +513,18 @@ impl ClientManagement {
             rejection: failure,
         };
         let runtime = self.runtime.lock().unwrap().snapshot.clone();
-        if route_generation != runtime.route_generation {
+        if route_generation != runtime.route_generation
+            || !matches!(runtime.lifecycle, ClientLifecycle::Active)
+            || runtime.active_exit_session_id.as_deref() != Some(failure.session_id.as_str())
+        {
             return;
         }
         let run_generation = runtime.run_generation;
         if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
-            if snapshot.route_generation != route_generation {
+            if snapshot.route_generation != route_generation
+                || !matches!(snapshot.lifecycle, ClientLifecycle::Active)
+                || snapshot.active_exit_session_id.as_deref() != Some(failure.session_id.as_str())
+            {
                 return false;
             }
             snapshot.last_exit_failure = Some(failure.clone());
@@ -444,6 +553,7 @@ impl ClientManagement {
     }
 
     pub fn set_enabled(&self, enabled: bool) -> Result<(), &'static str> {
+        let _publication = self.runtime_publication.lock().unwrap();
         let mut runtime = self.runtime.lock().unwrap();
         if enabled && !self.controls().enabled && runtime.running {
             return Err("client is still disabling");
@@ -453,6 +563,8 @@ impl ClientManagement {
             runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
             runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
             runtime.snapshot.lifecycle = ClientLifecycle::Disabling;
+            runtime.snapshot.active_exit_session_id = None;
+            runtime.snapshot.last_exit_failure = None;
             let snapshot = runtime.snapshot.clone();
             drop(runtime);
             self.record_lifecycle(&snapshot);
@@ -486,6 +598,7 @@ impl ClientManagement {
     }
 
     pub(crate) fn begin_run(&self) -> Option<u64> {
+        let _publication = self.runtime_publication.lock().unwrap();
         let mut runtime = self.runtime.lock().unwrap();
         if !self.controls().enabled {
             return None;
@@ -500,6 +613,7 @@ impl ClientManagement {
         runtime.snapshot.route_generation = 0;
         runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
         runtime.snapshot.lifecycle = ClientLifecycle::Starting;
+        runtime.snapshot.active_exit_session_id = None;
         runtime.snapshot.last_failure = None;
         runtime.snapshot.last_exit_failure = None;
         let snapshot = runtime.snapshot.clone();
@@ -509,6 +623,7 @@ impl ClientManagement {
     }
 
     pub(crate) fn finish_run(&self, run_generation: u64) {
+        let _publication = self.runtime_publication.lock().unwrap();
         let mut runtime = self.runtime.lock().unwrap();
         if runtime.snapshot.run_generation != run_generation {
             return;
@@ -524,6 +639,7 @@ impl ClientManagement {
             ClientLifecycle::Stopped
         };
         runtime.snapshot.last_exit_failure = None;
+        runtime.snapshot.active_exit_session_id = None;
         let snapshot = runtime.snapshot.clone();
         drop(runtime);
         self.record_lifecycle(&snapshot);
@@ -567,7 +683,11 @@ impl ClientManagement {
             return Err("automatic provisioning is enabled");
         }
         let hops = self.hops.lock().unwrap();
-        let hop = hops.get(session_id).ok_or("session is no longer active")?;
+        let hop = hops
+            .get(session_id)
+            .cloned()
+            .ok_or("session is no longer active")?;
+        let _publication = hop.funding_publication.lock().unwrap();
         let mut state = hop.state.lock().unwrap();
         if state.manual_requested || state.snapshot.funding == HopFundingState::Provisioning {
             return Err("provisioning is already in progress");
@@ -579,10 +699,18 @@ impl ClientManagement {
             return Err("session is not waiting for manual funding");
         }
         state.manual_requested = true;
-        state.snapshot.funding = HopFundingState::WaitingForManualFunding { error: None };
+        let funding = HopFundingState::WaitingForManualFunding { error: None };
+        let changed = state.snapshot.funding != funding;
+        state.snapshot.funding = funding.clone();
         drop(state);
         drop(hops);
         drop(controls);
+        if changed {
+            self.events.record(
+                "hop_funding_changed",
+                serde_json::json!({"session_id": session_id, "funding": funding}),
+            );
+        }
         self.notify();
         Ok(())
     }
@@ -613,6 +741,7 @@ impl ClientManagement {
             session_id: id.clone(),
             route_generation,
             counters: Default::default(),
+            funding_publication: Default::default(),
             state: Mutex::new(HopState {
                 snapshot: HopSnapshot {
                     session_id: id.clone(),
@@ -650,6 +779,7 @@ pub(crate) struct HopManagement {
     session_id: String,
     route_generation: u64,
     state: Mutex<HopState>,
+    funding_publication: Mutex<()>,
     pub(crate) counters: Mutex<monad_common::proxy::CleartextByteCounters>,
 }
 
@@ -675,6 +805,7 @@ impl Drop for HopLease {
 
 impl HopManagement {
     fn set_funding(&self, owner: &ClientManagement, funding: HopFundingState) {
+        let _publication = self.funding_publication.lock().unwrap();
         let mut state = self.state.lock().unwrap();
         if state.snapshot.funding == funding {
             return;
@@ -690,6 +821,7 @@ impl HopManagement {
 
     pub(crate) fn begin_provisioning(&self, owner: &ClientManagement) -> bool {
         let controls = owner.controls.borrow();
+        let _publication = self.funding_publication.lock().unwrap();
         let mut state = self.state.lock().unwrap();
         if !controls.enabled {
             return false;
@@ -700,15 +832,33 @@ impl HopManagement {
                 HopFundingState::WaitingForManualFunding { error } => error.clone(),
                 _ => None,
             };
-            state.snapshot.funding = HopFundingState::WaitingForManualFunding { error };
+            let funding = HopFundingState::WaitingForManualFunding { error };
+            let changed = state.snapshot.funding != funding;
+            state.snapshot.funding = funding.clone();
             drop(state);
             drop(controls);
+            if changed {
+                owner.events.record(
+                    "hop_funding_changed",
+                    serde_json::json!({"session_id": self.session_id, "funding": funding}),
+                );
+            }
             owner.notify();
             return false;
         }
+        let changed = state.snapshot.funding != HopFundingState::Provisioning;
         state.snapshot.funding = HopFundingState::Provisioning;
         drop(state);
         drop(controls);
+        if changed {
+            owner.events.record(
+                "hop_funding_changed",
+                serde_json::json!({
+                    "session_id": self.session_id,
+                    "funding": HopFundingState::Provisioning,
+                }),
+            );
+        }
         owner.notify();
         true
     }
@@ -737,15 +887,24 @@ impl HopManagement {
     }
 
     pub(crate) fn channel_admitted(&self, owner: &ClientManagement) {
-        let was_waiting = {
-            matches!(
-                self.state.lock().unwrap().snapshot.funding,
-                HopFundingState::WaitingForRelayAdmission { .. }
-            )
-        };
-        if was_waiting {
-            self.set_funding(owner, HopFundingState::AwaitingFunding);
+        let _publication = self.funding_publication.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        if !matches!(
+            state.snapshot.funding,
+            HopFundingState::WaitingForRelayAdmission { .. }
+        ) {
+            return;
         }
+        state.snapshot.funding = HopFundingState::AwaitingFunding;
+        drop(state);
+        owner.events.record(
+            "hop_funding_changed",
+            serde_json::json!({
+                "session_id": self.session_id,
+                "funding": HopFundingState::AwaitingFunding,
+            }),
+        );
+        owner.notify();
     }
 
     pub(crate) fn linking(&self, owner: &ClientManagement, channel_id: String) {
@@ -768,13 +927,14 @@ impl HopManagement {
         paid: u64,
         remaining: i64,
     ) {
+        let _publication = self.funding_publication.lock().unwrap();
         let mut state = self.state.lock().unwrap();
         let previous_funding = state.snapshot.funding.clone();
         state.snapshot.linked_channel = linked;
         state.snapshot.paused = paused;
         state.snapshot.total_paid_msats = paid;
         state.snapshot.remaining_msats = remaining;
-        if !paused {
+        if !paused && !matches!(state.snapshot.funding, HopFundingState::Blocked { .. }) {
             state.snapshot.funding = HopFundingState::Ready;
         } else if !matches!(
             state.snapshot.funding,

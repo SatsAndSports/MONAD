@@ -175,29 +175,17 @@ async fn administrative_wait_preserves_prefix_and_outlives_setup_budget() {
         let rt = runtime.clone();
         let task = tokio::spawn(async move { connect_route_with_runtime(&route, &rt).await });
         let mut changes = management.changes();
-        let waiting = timeout(Duration::from_secs(3), async {
+        timeout(Duration::from_secs(3), async {
             loop {
                 changes.borrow_and_update();
-                if let monad_client::management::ClientLifecycle::WaitingForAdmission {
-                    wait, ..
-                } = management.runtime_snapshot().lifecycle
-                {
-                    break wait;
+                if management.hops().len() == 1 {
+                    break;
                 }
                 changes.changed().await.unwrap();
             }
         })
         .await
         .unwrap();
-        assert_eq!(
-            waiting.refusal.refusing_hop,
-            if refuse_session { 2 } else { 1 }
-        );
-        assert_eq!(waiting.refusal.target_hop, 2);
-        assert_eq!(
-            waiting.refusal.operation,
-            if refuse_session { "session" } else { "connect" }
-        );
         let prefix = management.hops()[0].session_id.clone();
         assert_eq!(wallet.list_channels().unwrap().len(), 1);
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -209,10 +197,6 @@ async fn administrative_wait_preserves_prefix_and_outlives_setup_budget() {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(!matches!(
-            management.runtime_snapshot().lifecycle,
-            monad_client::management::ClientLifecycle::WaitingForAdmission { .. }
-        ));
         assert!(management.hops().iter().any(|h| h.session_id == prefix));
         assert_eq!(wallet.list_channels().unwrap().len(), 2);
         route.close().await;
@@ -244,7 +228,8 @@ async fn prefix_failure_interrupts_administrative_wait_and_releases_attachments(
     let management = Arc::new(ClientManagement::default());
     let runtime = ConnectorRuntime::new(Some(wallet.clone()))
         .unwrap()
-        .with_management(management.clone());
+        .with_management(management.clone())
+        .with_setup_timeout(Duration::from_millis(500));
     let route = Route::new(vec![first.hop(false), second.hop(true)]).unwrap();
     let rt = runtime.clone();
     let task = tokio::spawn(async move { connect_route_with_runtime(&route, &rt).await });
@@ -252,10 +237,7 @@ async fn prefix_failure_interrupts_administrative_wait_and_releases_attachments(
     timeout(Duration::from_secs(3), async {
         loop {
             changes.borrow_and_update();
-            if matches!(
-                management.runtime_snapshot().lifecycle,
-                monad_client::management::ClientLifecycle::WaitingForAdmission { .. }
-            ) {
+            if management.hops().len() == 1 {
                 break;
             }
             changes.changed().await.unwrap();
@@ -263,6 +245,8 @@ async fn prefix_failure_interrupts_administrative_wait_and_releases_attachments(
     })
     .await
     .unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!task.is_finished());
     first
         .registry
         .set_controls(RelayControls {
@@ -275,15 +259,7 @@ async fn prefix_failure_interrupts_administrative_wait_and_releases_attachments(
         .unwrap()
         .unwrap()
         .is_err());
-    assert!(!matches!(
-        management.runtime_snapshot().lifecycle,
-        monad_client::management::ClientLifecycle::WaitingForAdmission { .. }
-    ));
     assert!(management.hops().is_empty());
-    assert!(matches!(
-        management.runtime_snapshot().lifecycle,
-        monad_client::management::ClientLifecycle::Connecting { .. }
-    ));
     assert!(wallet
         .list_channels()
         .unwrap()

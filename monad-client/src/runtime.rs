@@ -358,7 +358,11 @@ fn public_failure(
 ) -> ClientFailure {
     let mut message = error.to_string();
     if message.len() > 512 {
-        message.truncate(512);
+        let mut boundary = 512;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
     }
     ClientFailure {
         stage,
@@ -465,10 +469,15 @@ async fn run_configured_client_leaf(
             }
         };
         if let Err(error) = &result {
-            controls.failed(
-                run_generation,
-                public_failure(ClientFailureStage::Runtime, error, None, false),
-            );
+            if !matches!(
+                controls.runtime_snapshot().lifecycle,
+                crate::management::ClientLifecycle::Failed { .. }
+            ) {
+                controls.failed(
+                    run_generation,
+                    public_failure(ClientFailureStage::Runtime, error, None, false),
+                );
+            }
         }
         controls.finish_run(run_generation);
         result?;
@@ -596,8 +605,16 @@ where
                     let funded_hop_count =
                         active_route.hops().iter().filter(|hop| hop.funded).count();
                     let conn = active_route.final_connection_arc();
-                    management.active(run_generation);
-                    let _ = conn_tx.send(Some(conn.clone()));
+                    if !management.publish_active_route(
+                        run_generation,
+                        hex::encode(conn.session_id()),
+                        || {
+                            let _ = conn_tx.send(Some(conn.clone()));
+                        },
+                    ) {
+                        active_route.close().await;
+                        return Ok(());
+                    }
                     let snapshot = stats.record_route_connected();
                     info!(
                         hops = hop_count,
@@ -612,7 +629,9 @@ where
                         biased;
                         _ = &mut *shutdown => {
                             info!("shutting down configured client");
-                            let _ = conn_tx.send(None);
+                            management.withdraw_active_route(run_generation, || {
+                                let _ = conn_tx.send(None);
+                            });
                             active_route.close().await;
                             return Ok(());
                         }
@@ -636,7 +655,9 @@ where
                                 true,
                             ),
                         );
-                        let _ = conn_tx.send(None);
+                        management.withdraw_active_route(run_generation, || {
+                            let _ = conn_tx.send(None);
+                        });
                         active_route.close().await;
                         break;
                     };
@@ -664,7 +685,9 @@ where
                         suffix_rebuild_failures_total = snapshot.suffix_rebuild_failures_total,
                         "route failed at funded hop"
                     );
-                    let _ = conn_tx.send(None);
+                    management.withdraw_active_route(run_generation, || {
+                        let _ = conn_tx.send(None);
+                    });
 
                     if hop_idx == 0 {
                         warn!(
@@ -996,6 +1019,26 @@ mod tests {
         assert_eq!(
             SharedRouteRuntimeStats::default().snapshot(),
             RouteRuntimeStatsSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn public_failure_truncates_unicode_on_a_character_boundary() {
+        let failure = public_failure(ClientFailureStage::Connect, "é".repeat(300), None, true);
+        assert!(failure.message.len() <= 512);
+        assert_eq!(failure.message.chars().count(), 256);
+    }
+
+    #[tokio::test]
+    async fn direct_connector_management_attachment_does_not_claim_runtime_lifecycle() {
+        let management = Arc::new(crate::management::ClientManagement::default());
+        let _runtime = ConnectorRuntime::new(None)
+            .unwrap()
+            .with_management(management.clone());
+        assert!(!management.is_running());
+        assert_eq!(
+            management.runtime_snapshot().lifecycle,
+            crate::management::ClientLifecycle::Stopped
         );
     }
 

@@ -35,7 +35,7 @@ pub struct ConnectorRuntime {
     setup_tail: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     setup_timeout: Option<Duration>,
     management: Option<Arc<crate::management::ClientManagement>>,
-    management_run_generation: u64,
+    management_run_generation: Option<u64>,
     setup_funding: tokio::sync::watch::Sender<Option<String>>,
     admission_wait: tokio::sync::watch::Sender<bool>,
 }
@@ -44,9 +44,10 @@ impl ConnectorRuntime {
     pub(crate) fn management_observer(
         &self,
     ) -> Option<(Arc<crate::management::ClientManagement>, u64)> {
-        self.management
-            .as_ref()
-            .map(|management| (management.clone(), self.management_run_generation))
+        self.management.as_ref().and_then(|management| {
+            self.management_run_generation
+                .map(|generation| (management.clone(), generation))
+        })
     }
 
     pub fn new(wallet: Option<Arc<dyn MonadWallet>>) -> io::Result<Self> {
@@ -64,7 +65,7 @@ impl ConnectorRuntime {
             setup_tail: Arc::new(Mutex::new(None)),
             setup_timeout: None,
             management: None,
-            management_run_generation: 0,
+            management_run_generation: None,
             setup_funding: tokio::sync::watch::channel(None).0,
             admission_wait: tokio::sync::watch::channel(false).0,
         })
@@ -75,9 +76,6 @@ impl ConnectorRuntime {
     }
 
     pub fn with_management(mut self, management: Arc<crate::management::ClientManagement>) -> Self {
-        let run_generation = management.runtime_snapshot().run_generation;
-        management.connecting(run_generation, 0, false);
-        self.management_run_generation = run_generation;
         self.management = Some(management);
         self
     }
@@ -88,7 +86,7 @@ impl ConnectorRuntime {
         run_generation: u64,
     ) -> Self {
         self.management = Some(management);
-        self.management_run_generation = run_generation;
+        self.management_run_generation = Some(run_generation);
         self
     }
 
@@ -740,8 +738,10 @@ struct AdmissionEpisode<'a>(&'a ConnectorRuntime);
 impl Drop for AdmissionEpisode<'_> {
     fn drop(&mut self) {
         self.0.admission_wait.send_replace(false);
-        if let Some(management) = &self.0.management {
-            management.clear_admission_wait(self.0.management_run_generation);
+        if let (Some(management), Some(run_generation)) =
+            (&self.0.management, self.0.management_run_generation)
+        {
+            management.clear_admission_wait(run_generation);
         }
     }
 }
@@ -817,14 +817,16 @@ fn chain_from_hop(
                             return Err(error);
                         };
                         runtime.admission_wait.send_replace(true);
-                        if let Some(management) = &runtime.management {
+                        if let (Some(management), Some(run_generation)) =
+                            (&runtime.management, runtime.management_run_generation)
+                        {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis()
                                 .min(u64::MAX as u128) as u64;
                             management.waiting_for_admission(
-                                runtime.management_run_generation,
+                                run_generation,
                                 AdmissionWait {
                                     refusal,
                                     retry_at_unix_ms: now

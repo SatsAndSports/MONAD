@@ -147,14 +147,19 @@ is one of `stopped`, `disabled`, `starting`, `connecting`,
 retry, failed-hop, preserved-prefix or structured-refusal details. `run_generation`
 changes when the configured client starts again; `route_generation` changes only
 when a complete route is published. Delayed observations from older generations
-cannot overwrite the current state.
+cannot overwrite the current state. `active_exit_session_id` identifies the final
+session of the currently published route and is absent whenever no route is
+published. An admission wait retains whether it interrupted an initial/full connect
+or a suffix rebuild, so clearing the wait restores the correct parent lifecycle.
 
 `last_failure` retains the latest sanitized connection, route, failure-watcher,
 suffix-rebuild or runtime failure after recovery so an `active` state does not erase
 the diagnostic. `last_exit_failure` identifies the session, route generation,
 destination and structured rejection for the latest failed SOCKS exit on the current
 route. A successful concurrent exit does not clear another tunnel's failure; route
-replacement or disable does. Historical transitions and failures remain in the
+withdrawal, replacement or disable does. Exit failures are accepted only from the
+published final session while the lifecycle is `active`. Historical transitions and
+failures remain in the
 bounded event ring as `client_lifecycle_changed`, `client_failure`, `route_refused`,
 `exit_refused`, and `hop_funding_changed`.
 
