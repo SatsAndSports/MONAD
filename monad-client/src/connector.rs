@@ -75,11 +75,7 @@ impl ConnectorRuntime {
     }
 
     pub fn with_management(mut self, management: Arc<crate::management::ClientManagement>) -> Self {
-        let run_generation = if management.is_running() {
-            management.runtime_snapshot().run_generation
-        } else {
-            management.begin_run().unwrap_or_default()
-        };
+        let run_generation = management.runtime_snapshot().run_generation;
         management.connecting(run_generation, 0, false);
         self.management_run_generation = run_generation;
         self.management = Some(management);

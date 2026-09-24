@@ -117,9 +117,10 @@ fn repeated_admission_wait_updates_retry_time_without_duplicate_refusal_event() 
 
 #[test]
 fn successful_exit_does_not_erase_another_tunnels_last_failure() {
-    let owner = ClientManagement::default();
+    let owner = Arc::new(ClientManagement::default());
     let generation = owner.begin_run().unwrap();
     owner.connecting(generation, 0, false);
+    let _lease = owner.register([3; 32], "hop 1");
     owner.active(generation);
     let error = monad_common::rejection::RejectionCode::DestinationPolicyDenied
         .rejection()
@@ -134,4 +135,54 @@ fn successful_exit_does_not_erase_another_tunnels_last_failure() {
         owner.runtime_snapshot().last_exit_failure.as_ref(),
         Some(&failure)
     );
+}
+
+#[test]
+fn stale_exit_failure_cannot_overwrite_replacement_route() {
+    let owner = Arc::new(ClientManagement::default());
+    let generation = owner.begin_run().unwrap();
+    owner.connecting(generation, 0, false);
+    let _old = owner.register([1; 32], "old hop");
+    owner.active(generation);
+    owner.connecting(generation, 1, true);
+    let _new = owner.register([2; 32], "new hop");
+    owner.active(generation);
+    let error = monad_common::rejection::RejectionCode::DestinationPolicyDenied
+        .rejection()
+        .into_io();
+
+    owner.note_exit_result(&[1; 32], "stale.example:443", Some(&error));
+    assert!(owner.runtime_snapshot().last_exit_failure.is_none());
+    owner.note_exit_result(&[2; 32], "current.example:443", Some(&error));
+    let failure = owner.runtime_snapshot().last_exit_failure.unwrap();
+    assert_eq!(failure.route_generation, 2);
+    assert_eq!(failure.destination, "current.example:443");
+}
+
+#[test]
+fn recovery_retains_last_failure_while_lifecycle_returns_active() {
+    let owner = ClientManagement::default();
+    let generation = owner.begin_run().unwrap();
+    owner.connecting(generation, 0, false);
+    owner.active(generation);
+    let failure = ClientFailure {
+        stage: ClientFailureStage::Route,
+        message: "funded hop failed".into(),
+        hop: Some(2),
+        retryable: true,
+    };
+    owner.record_failure(generation, failure.clone());
+    owner.rebuilding_suffix(generation, 2, 1);
+    owner.active(generation);
+
+    let snapshot = owner.runtime_snapshot();
+    assert_eq!(snapshot.lifecycle, ClientLifecycle::Active);
+    assert_eq!(snapshot.route_generation, 2);
+    assert_eq!(snapshot.last_failure, Some(failure));
+    let events = owner.events.snapshot();
+    assert!(events.iter().any(|event| event.kind == "client_failure"));
+    assert!(events
+        .iter()
+        .filter(|event| event.kind == "client_lifecycle_changed")
+        .any(|event| event.data["lifecycle"]["state"] == "rebuilding_suffix"));
 }

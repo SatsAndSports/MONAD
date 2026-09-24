@@ -174,18 +174,23 @@ async fn tcp_sse_api_drives_real_manual_funding_disable_and_channel_close() {
     .await
     .unwrap();
     let counters = snapshot(&client).await;
-    assert!(
-        counters["data"]["instances"]["local"]["hops"][0]["outbound_bytes"]
-            .as_u64()
-            .unwrap()
-            >= 32 * 65_536
-    );
-    assert!(
-        counters["data"]["instances"]["local"]["hops"][0]["inbound_bytes"]
-            .as_u64()
-            .unwrap()
-            >= 32 * 65_536
-    );
+    let instance = &counters["data"]["instances"]["local"];
+    assert_eq!(instance["runtime"]["lifecycle"]["state"], "active");
+    assert_eq!(instance["runtime"]["route_generation"], 1);
+    assert!(instance["runtime"]["revision"].as_u64().unwrap() > 0);
+    assert_eq!(instance["hops"][0]["introduced_in_route_generation"], 1);
+    assert!(instance["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "client_lifecycle_changed"));
+    assert!(instance["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "hop_funding_changed"));
+    assert!(instance["hops"][0]["outbound_bytes"].as_u64().unwrap() >= 32 * 65_536);
+    assert!(instance["hops"][0]["inbound_bytes"].as_u64().unwrap() >= 32 * 65_536);
     eprintln!(
         "monitored management traffic: 32 concurrent tunnels, 4 MiB roundtrip, elapsed_ms={}",
         started.elapsed().as_millis()

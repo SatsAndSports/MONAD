@@ -80,22 +80,27 @@ It applies equally to TCP and QUIC onward tunnels, including pooled connections.
 
 Configured client snapshots expose:
 
-- `admission_wait`: refusing/target hop (one-based), operation (`session` or
-  `connect`), destination, structured error, next retry timestamp and interval.
-- `route_refusal`: current structured route refusal, including non-retrying policy
-  blockage. Cleared on success, non-refusal failure, or disable cleanup.
-- `last_exit_refusal`: session ID, destination and structured refusal for a failed
-  individual exit. Cleared on successful CONNECT, published route change or disable.
-- Hop `funding_rejection` and `waiting_for_relay_admission`: channel-link refusal;
-  cleared when the intended channel is accepted.
+- `runtime.lifecycle.state = waiting_for_admission`: refusing/target hop (one-based),
+  operation (`session` or `connect`), destination, structured error, next retry
+  timestamp and interval.
+- `runtime.lifecycle.state = blocked_by_policy`: non-retrying policy blockage.
+- `runtime.last_exit_failure`: session ID, route generation, destination and
+  structured refusal for a failed individual exit. A successful concurrent exit does
+  not erase it; publishing a replacement route or disabling the client does.
+- Hop `funding.state = waiting_for_relay_admission`: channel-link refusal, cleared
+  when the intended channel is accepted.
 
-`route_refused` and `exit_refused` events provide discrete diagnostics. An onward
-CONNECT refusal attributes the reason to the preceding relay; a bootstrap refusal
-attributes it to the destination relay itself.
+`route_refused`, `exit_refused`, and lifecycle/funding events provide bounded
+diagnostic history. Repeated retries of one unchanged administrative refusal update
+the current retry timestamp without duplicating `route_refused`. An onward CONNECT
+refusal attributes the reason to the preceding relay; a bootstrap refusal attributes
+it to the destination relay itself.
 
 ## Alpha compatibility
 
-This changes the rejection envelope from `{result,supported_versions,reason}` to
+The lifecycle cleanup also replaces the alpha client snapshot's independent
+`running`, `admission_wait`, `route_refusal`, and `last_exit_refusal` fields and hop
+funding booleans with the tagged objects above. This changes the rejection envelope from `{result,supported_versions,reason}` to
 `{result,error:{code,message}}`, renames `LINK_ADMISSION_DISABLED` to
 `CHANNEL_ADMISSION_DISABLED`, and makes the responder accept-builder API fallible.
 Update MONAD clients/relays together. No wallet schema changes, migrations, database

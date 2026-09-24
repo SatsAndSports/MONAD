@@ -30,6 +30,7 @@ impl Default for ClientControls {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HopSnapshot {
     pub session_id: String,
+    pub introduced_in_route_generation: u64,
     pub label: String,
     pub funding: HopFundingState,
     pub linked_channel: Option<monad_common::protocol::LinkedChannelStatus>,
@@ -143,6 +144,7 @@ impl Default for ClientRuntimeSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ExitFailure {
     pub session_id: String,
+    pub route_generation: u64,
     pub destination: String,
     pub rejection: monad_common::rejection::Rejection,
 }
@@ -387,16 +389,35 @@ impl ClientManagement {
     ) {
         let failure = error
             .and_then(monad_common::rejection::Rejection::from_io)
-            .map(|rejection| ExitFailure {
-                session_id: hex::encode(session),
-                destination: destination.to_owned(),
-                rejection: rejection.clone(),
-            });
+            .cloned();
         let Some(failure) = failure else {
             return;
         };
-        let run_generation = self.runtime.lock().unwrap().snapshot.run_generation;
+        let session_id = hex::encode(session);
+        let Some(route_generation) = self
+            .hops
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .map(|hop| hop.route_generation)
+        else {
+            return;
+        };
+        let failure = ExitFailure {
+            session_id,
+            route_generation,
+            destination: destination.to_owned(),
+            rejection: failure,
+        };
+        let runtime = self.runtime.lock().unwrap().snapshot.clone();
+        if route_generation != runtime.route_generation {
+            return;
+        }
+        let run_generation = runtime.run_generation;
         if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            if snapshot.route_generation != route_generation {
+                return false;
+            }
             snapshot.last_exit_failure = Some(failure.clone());
             true
         }) {
@@ -441,6 +462,15 @@ impl ClientManagement {
             runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
             runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
             runtime.snapshot.lifecycle = ClientLifecycle::Disabled;
+            let snapshot = runtime.snapshot.clone();
+            drop(runtime);
+            self.record_lifecycle(&snapshot);
+            return Ok(());
+        }
+        if !runtime.running && matches!(runtime.snapshot.lifecycle, ClientLifecycle::Disabled) {
+            runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
+            runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
+            runtime.snapshot.lifecycle = ClientLifecycle::Stopped;
             let snapshot = runtime.snapshot.clone();
             drop(runtime);
             self.record_lifecycle(&snapshot);
@@ -570,12 +600,23 @@ impl ClientManagement {
 
     pub(crate) fn register(self: &Arc<Self>, session_id: [u8; 32], label: &str) -> HopLease {
         let id = hex::encode(session_id);
+        let runtime = self.runtime_snapshot();
+        let route_generation = runtime.route_generation.saturating_add(u64::from(matches!(
+            runtime.lifecycle,
+            ClientLifecycle::Starting
+                | ClientLifecycle::Connecting { .. }
+                | ClientLifecycle::WaitingForAdmission { .. }
+                | ClientLifecycle::RebuildingSuffix { .. }
+                | ClientLifecycle::RetryBackoff { .. }
+        )));
         let hop = Arc::new(HopManagement {
             session_id: id.clone(),
+            route_generation,
             counters: Default::default(),
             state: Mutex::new(HopState {
                 snapshot: HopSnapshot {
                     session_id: id.clone(),
+                    introduced_in_route_generation: route_generation,
                     label: label.to_owned(),
                     funding: HopFundingState::AwaitingStatus,
                     linked_channel: None,
@@ -607,6 +648,7 @@ struct HopState {
 #[derive(Debug)]
 pub(crate) struct HopManagement {
     session_id: String,
+    route_generation: u64,
     state: Mutex<HopState>,
     pub(crate) counters: Mutex<monad_common::proxy::CleartextByteCounters>,
 }

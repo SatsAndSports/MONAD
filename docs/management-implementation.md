@@ -40,6 +40,11 @@ validation.
 - Never expose proof secrets, private keys, immutable secret-bearing mint requests,
   or refund derivation material in management data.
 - Expose process availability/staleness, not frozen data masquerading as live state.
+- Client runtime monitoring is one revisioned, generation-checked lifecycle
+  projection. Per-hop funding uses one tagged state. The configured runtime and
+  payment driver publish transitions; management never becomes operational authority.
+- Retain current blockage separately from bounded failure history. Recovery clears
+  the current lifecycle blockage but preserves the latest sanitized failure.
 
 ## Validation gates
 
