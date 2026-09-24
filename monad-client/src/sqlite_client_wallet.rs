@@ -7854,7 +7854,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn provisions_real_channel_from_loose_proofs() {
+    async fn provisions_real_channel_and_rejects_exact_duplicate_before_mint_io() {
         let port = free_loopback_port();
         let mint_url = format!("http://127.0.0.1:{port}");
         let config = TestMintConfig::for_port(port);
@@ -7944,14 +7944,14 @@ mod tests {
         let after_open = SqliteClientWallet::now_seconds().unwrap();
 
         let channel = wallet.get_channel(&channel_id).unwrap();
-        let attempt = wallet
+        let completed_attempt = wallet
             .loose_wallet()
             .opening_attempt(&channel_id)
             .unwrap()
             .expect("completed opening journal");
-        assert_eq!(attempt.state, OpeningAttemptState::Completed);
+        assert_eq!(completed_attempt.state, OpeningAttemptState::Completed);
         let persisted_prepared: PreparedOpenChannel =
-            serde_json::from_str(&attempt.prepared_open_json).unwrap();
+            serde_json::from_str(&completed_attempt.prepared_open_json).unwrap();
         assert_eq!(persisted_prepared.channel_id, channel_id);
         assert!(!persisted_prepared.swap_request_json.is_empty());
         assert_eq!(channel.receiver_pubkey, receiver_pubkey);
@@ -7991,6 +7991,98 @@ mod tests {
             .available_balance_raw(&mint_url, unit, std::slice::from_ref(&keyset_id))
             .unwrap();
         assert_eq!(available, expected_change_raw);
+
+        let output_keyset = wallet
+            .select_output_keyset_refreshing_client_first(&offer, stored_expiry)
+            .unwrap();
+        let reserved_proofs = wallet
+            .loose_wallet()
+            .proofs_for_reservation(&completed_attempt.reservation_id)
+            .unwrap();
+        let reserved_total_raw = reserved_proofs
+            .iter()
+            .map(|proof| proof.amount_raw)
+            .sum::<u64>();
+        let duplicate = ClientOpenAttempt {
+            opening_id: channel_id.clone(),
+            output_keyset,
+            reservation: ProofReservation {
+                reservation_id: completed_attempt.reservation_id.clone(),
+                proofs: reserved_proofs,
+                total_amount_raw: reserved_total_raw,
+            },
+            prepared: persisted_prepared.clone(),
+            requested_capacity_raw: None,
+            desired_funding_token_amount_raw: Some(funding_token_target_raw),
+            funding_token_target_msats,
+            selected_input_msats: raw_to_msats(unit, reserved_total_raw).unwrap(),
+            expiry_timestamp: stored_expiry,
+        };
+        let custody_before = wallet
+            .loose_wallet()
+            .list_custody_summaries()
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.mint_url,
+                    row.unit,
+                    row.state,
+                    row.proof_count,
+                    row.amount_raw,
+                )
+            })
+            .collect::<Vec<_>>();
+        let duplicate_networking = CountingSwapNetworking {
+            calls: Mutex::new(0),
+        };
+
+        assert_eq!(
+            wallet
+                .execute_open_attempt_with_networking(
+                    &offer,
+                    duplicate,
+                    false,
+                    &duplicate_networking,
+                )
+                .unwrap_err(),
+            WalletError::AlreadyOpen {
+                channel_id: channel_id.clone()
+            }
+        );
+        assert_eq!(*duplicate_networking.calls.lock().unwrap(), 0);
+        assert_eq!(wallet.list_channels().unwrap().len(), 1);
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .available_balance_raw(&mint_url, unit, std::slice::from_ref(&keyset_id))
+                .unwrap(),
+            available
+        );
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .list_custody_summaries()
+                .unwrap()
+                .into_iter()
+                .map(|row| (
+                    row.mint_url,
+                    row.unit,
+                    row.state,
+                    row.proof_count,
+                    row.amount_raw
+                ))
+                .collect::<Vec<_>>(),
+            custody_before
+        );
+        assert_eq!(
+            wallet
+                .loose_wallet()
+                .opening_attempt(&channel_id)
+                .unwrap()
+                .unwrap(),
+            completed_attempt
+        );
 
         // Attach, build link request, then build a channel payment.
         let session_id = [7u8; 32];
