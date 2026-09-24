@@ -1,6 +1,6 @@
 //! Headless process management protocol and bounded operation ownership.
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -14,6 +14,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+pub mod aggregate;
 pub mod events;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -116,12 +117,37 @@ fn error(status: StatusCode, message: &str) -> ApiError {
     (status, Json(json!({"error": message})))
 }
 
-async fn snapshot(State(service): State<Arc<Service>>) -> Result<Json<Value>, ApiError> {
-    let data = service
+#[derive(Default, Deserialize)]
+struct SnapshotQuery {
+    after: Option<String>,
+}
+
+async fn snapshot(
+    State(service): State<Arc<Service>>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let after: BTreeMap<String, u64> = match query.after {
+        Some(value) if value.len() <= 16384 => serde_json::from_str(&value)
+            .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid event cursors"))?,
+        Some(_) => return Err(error(StatusCode::BAD_REQUEST, "event cursors too large")),
+        None => BTreeMap::new(),
+    };
+    let mut data = service
         .backend
         .snapshot()
         .await
         .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, &e))?;
+    if let Some(instances) = data["instances"].as_object_mut() {
+        for (name, instance) in instances {
+            if let Some(events) = instance["events"].as_array_mut() {
+                let oldest = events.first().and_then(|event| event["sequence"].as_u64());
+                if let Some(cursor) = after.get(name) {
+                    events.retain(|e| e["sequence"].as_u64().is_some_and(|n| n > *cursor));
+                }
+                instance["events_oldest_sequence"] = serde_json::json!(oldest);
+            }
+        }
+    }
     Ok(Json(
         json!({"generation": service.generation, "data": data}),
     ))
@@ -219,24 +245,43 @@ pub async fn serve_unix(
         device: meta.dev(),
     };
     let (service, receiver) = Service::new(backend);
-    let stop = tokio_util::sync::CancellationToken::new();
-    let _cancel = stop.clone().drop_guard();
-    let server = axum::serve(listener, service.router())
-        .with_graceful_shutdown(stop.clone().cancelled_owned())
-        .into_future();
-    use std::future::IntoFuture;
+    let server = serve_owned(listener, service.router(), shutdown);
     tokio::pin!(server);
     let executor = service.run(receiver);
     tokio::pin!(executor);
     tokio::select! {
         result = &mut server => result,
         () = &mut executor => Err(std::io::Error::other("management executor stopped")),
-        () = shutdown => {
-            stop.cancel();
-            // Dropping the owned executor cancels unfinished journaled actions;
-            // process restart uses existing wallet recovery, never blind replay.
-            tokio::time::timeout(std::time::Duration::from_secs(2), &mut server).await
-                .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "management HTTP shutdown timed out")))
+    }
+}
+
+/// HTTP connection futures are directly owned, including long-lived SSE bodies.
+/// Shutdown/drop closes slow subscribers rather than waiting for them to drain.
+pub async fn serve_owned<L: axum::serve::Listener>(
+    mut listener: L,
+    router: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> std::io::Result<()> {
+    use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
+    use hyper_util::{
+        rt::{TokioExecutor, TokioIo},
+        server::conn::auto::Builder,
+        service::TowerToHyperService,
+    };
+    let mut connections = FuturesUnordered::new();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut shutdown => return Ok(()),
+            Some(()) = connections.next(), if !connections.is_empty() => {},
+            (stream, _) = listener.accept(), if connections.len() < 128 => {
+                let router = router.clone();
+                connections.push(async move {
+                    let builder = Builder::new(TokioExecutor::new());
+                    let _ = builder.serve_connection(TokioIo::new(stream), TowerToHyperService::new(router)).await;
+                }.boxed());
+            }
         }
     }
 }

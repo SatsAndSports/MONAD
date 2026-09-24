@@ -14,6 +14,14 @@ session owner or forming a registry cycle. Wallet inventories are cached separat
 from traffic counters. Discrete payment events enter a bounded in-memory ring after
 acceptance, never an unbounded channel to a slow observer.
 
+The standalone aggregator polls each process independently at 5 Hz, forwarding only
+new source events and retaining a bounded replay ring. HTTP snapshots are cached
+views; HTTP commands are forwarded with the caller's process generation and request
+ID unchanged. SSE cursors include an aggregator epoch and global sequence. A missing
+history interval produces an explicit reset/source-gap, never silent event loss.
+The HTTP server directly owns its connection futures, including SSE bodies, so
+shutdown/drop closes even blocked subscribers. No browser owns runtime authority.
+
 A relay's session registry owns its runtime admission policy alongside registered
 session cancellation tokens. A short synchronous admission lock orders policy
 changes with session registration, channel validation/acceptance, and CONNECT

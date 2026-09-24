@@ -40,7 +40,9 @@ impl Backend for ClientBackend {
             let inventory = tokio::task::spawn_blocking(move || {
                 let channels = wallet.list_channels().map_err(|_| "channel inventory unavailable")?;
                 let proofs = wallet.loose_wallet().list_available_proof_summaries().map_err(|_| "proof inventory unavailable")?;
+                let custody = wallet.loose_wallet().list_custody_summaries().map_err(|_| "custody inventory unavailable")?;
                 Ok::<_, String>(json!({
+                    "proof_custody": custody,
                     "channels": channels.into_iter().map(|c| json!({
                         "channel_id": c.channel_id, "state": format!("{:?}", c.state),
                         "receiver_pubkey": c.receiver_pubkey, "mint_url": c.mint_url, "unit": c.unit,
@@ -88,6 +90,9 @@ impl Backend for ClientBackend {
                         changes.borrow_and_update();
                         if !controls.is_running() {
                             break;
+                        }
+                        if controls.controls().enabled {
+                            return Err("disable completed and was superseded by re-enable".into());
                         }
                         changes.changed().await.map_err(|_| "client stopped")?;
                     }

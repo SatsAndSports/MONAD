@@ -5,6 +5,7 @@ use std::{collections::VecDeque, sync::Mutex};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub sequence: u64,
+    pub timestamp_unix_ms: u64,
     pub kind: String,
     pub data: Value,
 }
@@ -24,6 +25,11 @@ impl EventLog {
         }
         inner.1.push_back(Event {
             sequence,
+            timestamp_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
             kind: kind.into(),
             data,
         });

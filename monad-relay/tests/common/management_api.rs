@@ -23,15 +23,16 @@ async fn command(
     instance: &str,
     action: &str,
     arguments: Value,
+    base: &str,
 ) -> Value {
-    let response = client.post("http://localhost/v1/commands").json(&json!({
+    let response = client.post(format!("{base}/commands")).json(&json!({
         "generation": generation, "request_id": id, "instance": instance, "action": action, "arguments": arguments,
     })).send().await.unwrap();
     assert_eq!(response.status(), 202);
     timeout(Duration::from_secs(30), async {
         loop {
             let result: Value = client
-                .get(format!("http://localhost/v1/operations/{id}"))
+                .get(format!("{base}/operations/{id}"))
                 .send()
                 .await
                 .unwrap()
@@ -50,7 +51,7 @@ async fn command(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unix_api_drives_real_manual_funding_disable_and_channel_close() {
+async fn tcp_sse_api_drives_real_manual_funding_disable_and_channel_close() {
     let fixture = ConfiguredRouteFixture::start(ConfiguredRouteFixtureConfig {
         subnet: 80,
         hop_count: 1,
@@ -79,6 +80,25 @@ async fn unix_api_drives_real_manual_funding_disable_and_channel_close() {
             let _ = stopped_client.await;
         },
     ));
+    let state = monad_management::aggregate::Aggregator::new(BTreeMap::from([
+        ("clients".into(), client_socket.display().to_string()),
+        ("relays".into(), relay_socket.display().to_string()),
+    ]))
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let client_base = format!("{api_base}/v1/processes/clients");
+    let relay_base = format!("{api_base}/v1/processes/relays");
+    let (stop_api, stopped_api) = tokio::sync::oneshot::channel();
+    let api_task = tokio::spawn(monad_management::aggregate::serve(listener, state, async {
+        let _ = stopped_api.await;
+    }));
+    let http = reqwest::Client::new();
+    let mut sse = http
+        .get(format!("{api_base}/v1/events?process=clients"))
+        .send()
+        .await
+        .unwrap();
     let client = monad_management::unix_client(client_socket).unwrap();
     let initial = snapshot(&client).await;
     let generation = initial["generation"].clone();
@@ -104,15 +124,24 @@ async fn unix_api_drives_real_manual_funding_disable_and_channel_close() {
         .unwrap()
         .is_empty());
     let funded = command(
-        &client,
+        &http,
         &generation,
         "fund",
         "local",
         "provision_channel",
         json!({"session_id": session}),
+        &client_base,
     )
     .await;
     let channel = funded["linked_channel_id"].as_str().unwrap();
+    timeout(Duration::from_secs(5), async {
+        let mut received = String::new();
+        while !received.contains("event: payment_observed") {
+            received.push_str(std::str::from_utf8(&sse.chunk().await.unwrap().unwrap()).unwrap());
+        }
+    })
+    .await
+    .unwrap();
     let payload = b"management api";
     assert_eq!(
         timeout(
@@ -124,13 +153,51 @@ async fn unix_api_drives_real_manual_funding_disable_and_channel_close() {
         .unwrap(),
         b"MANAGEMENT API"
     );
+    let started = std::time::Instant::now();
+    let mut probes = tokio::task::JoinSet::new();
+    for _ in 0..32 {
+        let socks = fixture.socks_listen;
+        let target = fixture.upper_addr;
+        probes.spawn(async move {
+            let payload = vec![b'a'; 65_536];
+            let response = configured_client_socks_roundtrip(socks, target, &payload)
+                .await
+                .unwrap();
+            assert_eq!(response, vec![b'A'; 65_536]);
+        });
+    }
+    timeout(Duration::from_secs(15), async {
+        while let Some(result) = probes.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let counters = snapshot(&client).await;
+    assert!(
+        counters["data"]["instances"]["local"]["hops"][0]["outbound_bytes"]
+            .as_u64()
+            .unwrap()
+            >= 32 * 65_536
+    );
+    assert!(
+        counters["data"]["instances"]["local"]["hops"][0]["inbound_bytes"]
+            .as_u64()
+            .unwrap()
+            >= 32 * 65_536
+    );
+    eprintln!(
+        "monitored management traffic: 32 concurrent tunnels, 4 MiB roundtrip, elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     command(
-        &client,
+        &http,
         &generation,
         "disable",
         "local",
         "set_enabled",
         json!({"enabled": false}),
+        &client_base,
     )
     .await;
     let view = snapshot(&client).await;
@@ -157,12 +224,13 @@ async fn unix_api_drives_real_manual_funding_disable_and_channel_close() {
     let relay = monad_management::unix_client(relay_socket).unwrap();
     let view = snapshot(&relay).await;
     let closed = command(
-        &relay,
+        &http,
         &view["generation"],
         "close",
         &name,
         "close_channel",
         json!({"channel_id": channel}),
+        &relay_base,
     )
     .await;
     assert_eq!(closed["outcome"], "closed");
@@ -170,6 +238,8 @@ async fn unix_api_drives_real_manual_funding_disable_and_channel_close() {
         fixture.wallet_manager.list_channels(Some(&name)).unwrap()[0].state,
         cdk_spilman::ChannelState::Closed
     );
+    stop_api.send(()).unwrap();
+    api_task.await.unwrap().unwrap();
     stop_client.send(()).unwrap();
     client_task.await.unwrap().unwrap();
     stop_relay_api.send(()).unwrap();

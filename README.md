@@ -6,10 +6,16 @@ Configured client and relay processes now optionally expose Unix-socket manageme
 endpoints. See [the headless API reference](docs/management-api.md) for configuration,
 commands, operation tracking, and monitoring semantics.
 
+Run `cargo run -p monad-management -- --config monad.yaml` to aggregate those
+processes on `management.listen`. `GET /v1/snapshot` provides JSON monitoring and
+`GET /v1/events` streams SSE at five samples per second per process. Commands use
+`/v1/processes/{name}/commands`. The TCP listener is loopback-only; this release
+provides a headless API, ready for a later dashboard.
+
 Relay embedders can pass a per-relay `Arc<SessionRegistry>` to
 `run_with_wallet_manager_registry_and_shutdown` and update `RelayControls` while
 the relay runs. All controls default to enabled. These are process-local overrides,
-not YAML edits; the HTTP management service is being implemented separately.
+not YAML edits; the HTTP management service uses these same controls.
 
 - `accept_new_channels = false` rejects first-time channel links, while stored
   channels can relink and receive payments.
