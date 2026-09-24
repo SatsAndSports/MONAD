@@ -7,7 +7,7 @@ pub const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Hop indices in monitoring are one-based. The issuer of an onward CONNECT
 /// refusal is the preceding relay, not the session we were trying to establish.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RouteRefusal {
     pub refusing_hop: usize,
     pub target_hop: usize,
@@ -70,7 +70,7 @@ impl fmt::Display for RouteRefusal {
 }
 impl std::error::Error for RouteRefusal {}
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdmissionWait {
     pub refusal: RouteRefusal,
     pub retry_at_unix_ms: u64,

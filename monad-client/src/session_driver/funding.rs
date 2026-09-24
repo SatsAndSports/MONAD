@@ -141,7 +141,10 @@ async fn send_channel_link(
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
     send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await?;
-    set_link_in_flight(state, channel_id, channel.keyset_id, offer);
+    set_link_in_flight(state, channel_id.clone(), channel.keyset_id, offer);
+    if let Some((owner, hop)) = &config.management {
+        hop.linking(owner, channel_id);
+    }
     publish_spilman_info(config, state).await;
     Ok(())
 }
@@ -335,16 +338,15 @@ pub(super) async fn maybe_ensure_linked_channel(
                         )
                     },
                 );
-                if let Some((_, hop)) = &config.management {
-                    hop.provisioning_finished();
+                if let Some((owner, hop)) = &config.management {
+                    hop.provisioning_finished(owner);
                 }
                 let (channel_id, offer) = match selected {
                     Ok(Some(selected)) => selected,
                     Ok(None) => {
                         if let Some((owner, hop)) = &config.management {
                             if !owner.controls().automatic_provisioning {
-                                hop.safe_provisioning_failure();
-                                owner.notify();
+                                hop.safe_provisioning_failure(owner);
                             }
                         }
                         return Ok(());
@@ -352,8 +354,7 @@ pub(super) async fn maybe_ensure_linked_channel(
                     Err(error) if provisioning_offer_is_unavailable(&error) => {
                         if let Some((owner, hop)) = &config.management {
                             if !owner.controls().automatic_provisioning {
-                                hop.safe_provisioning_failure();
-                                owner.notify();
+                                hop.safe_provisioning_failure(owner);
                                 return Ok(());
                             }
                         }
@@ -539,7 +540,10 @@ pub(super) async fn maybe_progress_payment(
             state.local_session_paid_msats = state
                 .local_session_paid_msats
                 .saturating_add(authorized_delta_msats);
-            set_payment_in_flight(state, intended_channel_id);
+            set_payment_in_flight(state, intended_channel_id.clone());
+            if let Some((owner, hop)) = &config.management {
+                hop.paying(owner, intended_channel_id);
+            }
         }
         Err(error) => {
             if matches!(error, WalletError::Backend(_)) {

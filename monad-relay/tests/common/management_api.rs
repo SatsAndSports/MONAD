@@ -108,7 +108,7 @@ async fn tcp_sse_api_drives_real_manual_funding_disable_and_channel_close() {
             if let Some(hops) = view["data"]["instances"]["local"]["hops"].as_array() {
                 if let Some(hop) = hops
                     .iter()
-                    .find(|h| h["waiting_for_manual_funding"] == true)
+                    .find(|h| h["funding"]["state"] == "waiting_for_manual_funding")
                 {
                     return hop["session_id"].as_str().unwrap().to_owned();
                 }
@@ -201,7 +201,10 @@ async fn tcp_sse_api_drives_real_manual_funding_disable_and_channel_close() {
     )
     .await;
     let view = snapshot(&client).await;
-    assert_eq!(view["data"]["instances"]["local"]["running"], false);
+    assert_eq!(
+        view["data"]["instances"]["local"]["runtime"]["lifecycle"]["state"],
+        "disabled"
+    );
     assert_eq!(view["data"]["instances"]["local"]["hops"], json!([]));
     let public = view.to_string();
     assert!(!public.contains(&fixture.sender_secret_hex));

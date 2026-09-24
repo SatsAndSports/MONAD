@@ -176,7 +176,7 @@ pub(super) async fn run_session_driver(
                                 &config.conn.cleartext_byte_counters,
                             )?;
                             if let Some((owner, hop)) = &config.management {
-                                if super::state::relay_confirms_intended_channel(&state) { hop.channel_admitted(); }
+                                if super::state::relay_confirms_intended_channel(&state) { hop.channel_admitted(owner); }
                                 if total_paid_millisats > previous_paid {
                                     owner.events.record("payment_observed", serde_json::json!({
                                         "session_id": hex::encode(config.conn.session_id),
@@ -184,8 +184,7 @@ pub(super) async fn run_session_driver(
                                         "total_paid_msats": total_paid_millisats,
                                     }));
                                 }
-                                hop.status(state.relay_snapshot.as_ref().and_then(|s| s.linked_channel.clone()), paused, total_paid_millisats, remaining_milli_sats);
-                                owner.notify();
+                                hop.status(owner, state.relay_snapshot.as_ref().and_then(|s| s.linked_channel.clone()), paused, total_paid_millisats, remaining_milli_sats);
                             }
                             if !paused {
                                 signal_ready(&mut state, &mut ready_tx).await;

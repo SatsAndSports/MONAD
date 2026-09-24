@@ -35,16 +35,20 @@ pub struct ConnectorRuntime {
     setup_tail: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     setup_timeout: Option<Duration>,
     management: Option<Arc<crate::management::ClientManagement>>,
+    management_run_generation: u64,
     setup_funding: tokio::sync::watch::Sender<Option<String>>,
     admission_wait: tokio::sync::watch::Sender<bool>,
 }
 
 impl ConnectorRuntime {
-    pub(crate) fn clear_exit_refusal(&self) {
-        if let Some(management) = &self.management {
-            management.clear_exit_refusal();
-        }
+    pub(crate) fn management_observer(
+        &self,
+    ) -> Option<(Arc<crate::management::ClientManagement>, u64)> {
+        self.management
+            .as_ref()
+            .map(|management| (management.clone(), self.management_run_generation))
     }
+
     pub fn new(wallet: Option<Arc<dyn MonadWallet>>) -> io::Result<Self> {
         Self::with_payment_policy(wallet, PaymentPolicy::default())
     }
@@ -60,6 +64,7 @@ impl ConnectorRuntime {
             setup_tail: Arc::new(Mutex::new(None)),
             setup_timeout: None,
             management: None,
+            management_run_generation: 0,
             setup_funding: tokio::sync::watch::channel(None).0,
             admission_wait: tokio::sync::watch::channel(false).0,
         })
@@ -70,7 +75,24 @@ impl ConnectorRuntime {
     }
 
     pub fn with_management(mut self, management: Arc<crate::management::ClientManagement>) -> Self {
+        let run_generation = if management.is_running() {
+            management.runtime_snapshot().run_generation
+        } else {
+            management.begin_run().unwrap_or_default()
+        };
+        management.connecting(run_generation, 0, false);
+        self.management_run_generation = run_generation;
         self.management = Some(management);
+        self
+    }
+
+    pub(crate) fn with_management_run_generation(
+        mut self,
+        management: Arc<crate::management::ClientManagement>,
+        run_generation: u64,
+    ) -> Self {
+        self.management = Some(management);
+        self.management_run_generation = run_generation;
         self
     }
 
@@ -723,13 +745,7 @@ impl Drop for AdmissionEpisode<'_> {
     fn drop(&mut self) {
         self.0.admission_wait.send_replace(false);
         if let Some(management) = &self.0.management {
-            if management
-                .route_refusal()
-                .is_some_and(|r| r.is_administrative())
-            {
-                management.set_route_refusal(None);
-            }
-            management.set_admission_wait(None);
+            management.clear_admission_wait(self.0.management_run_generation);
         }
     }
 }
@@ -795,15 +811,9 @@ fn chain_from_hop(
                 };
                 match result {
                     Ok(accepted) => {
-                        if let Some(management) = &runtime.management {
-                            management.set_route_refusal(None);
-                        }
                         break accepted;
                     }
                     Err(error) => {
-                        if let Some(management) = &runtime.management {
-                            management.set_route_refusal(RouteRefusal::from_io(&error).cloned());
-                        }
                         let Some(refusal) = RouteRefusal::from_io(&error)
                             .filter(|r| r.is_administrative())
                             .cloned()
@@ -817,12 +827,15 @@ fn chain_from_hop(
                                 .unwrap_or_default()
                                 .as_millis()
                                 .min(u64::MAX as u128) as u64;
-                            management.set_admission_wait(Some(AdmissionWait {
-                                refusal,
-                                retry_at_unix_ms: now
-                                    .saturating_add(RETRY_INTERVAL.as_millis() as u64),
-                                retry_interval_ms: RETRY_INTERVAL.as_millis() as u64,
-                            }));
+                            management.waiting_for_admission(
+                                runtime.management_run_generation,
+                                AdmissionWait {
+                                    refusal,
+                                    retry_at_unix_ms: now
+                                        .saturating_add(RETRY_INTERVAL.as_millis() as u64),
+                                    retry_interval_ms: RETRY_INTERVAL.as_millis() as u64,
+                                },
+                            );
                         }
                         info!(%error, "administrative refusal; preserving prefix and retrying in five seconds");
                         tokio::select! {

@@ -329,6 +329,9 @@ pub(super) fn set_blocked_reason(
         config.hop_label, reason
     );
     state.funding_blocked_reason = Some(reason.clone());
+    if let Some((owner, hop)) = &config.management {
+        hop.blocked(owner, detail.to_owned());
+    }
     if !state.ready_signaled {
         return Err(io::Error::other(format!(
             "session funding blocked before readiness: {:?} ({detail})",

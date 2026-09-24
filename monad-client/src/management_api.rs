@@ -63,9 +63,7 @@ impl Backend for ClientBackend {
                 (
                     name,
                     json!({
-            "controls": c.controls(), "running": c.is_running(), "hops": c.hops(), "events": c.events.snapshot(),
-            "admission_wait": c.admission_wait(), "last_exit_refusal": c.last_exit_refusal(),
-            "route_refusal": c.route_refusal(),
+            "controls": c.controls(), "runtime": c.runtime_snapshot(), "hops": c.hops(), "events": c.events.snapshot(),
                     }),
                 )
             })
@@ -130,7 +128,14 @@ impl Backend for ClientBackend {
                         .into_iter()
                         .find(|h| h.session_id == session)
                         .ok_or("session ended before funding completed")?;
-                    if let Some(error) = hop.funding_error {
+                    let funding_error = match hop.funding {
+                        crate::management::HopFundingState::WaitingForManualFunding { error } => {
+                            error
+                        }
+                        crate::management::HopFundingState::Blocked { message } => Some(message),
+                        _ => None,
+                    };
+                    if let Some(error) = funding_error {
                         return Err(error);
                     }
                     if let Some(channel) = hop.linked_channel {
