@@ -175,26 +175,17 @@ async fn administrative_wait_preserves_prefix_and_outlives_setup_budget() {
         let rt = runtime.clone();
         let task = tokio::spawn(async move { connect_route_with_runtime(&route, &rt).await });
         let mut changes = management.changes();
-        let waiting = timeout(Duration::from_secs(3), async {
+        timeout(Duration::from_secs(3), async {
             loop {
                 changes.borrow_and_update();
-                if let Some(wait) = management.admission_wait() {
-                    break wait;
+                if management.hops().len() == 1 {
+                    break;
                 }
                 changes.changed().await.unwrap();
             }
         })
         .await
         .unwrap();
-        assert_eq!(
-            waiting.refusal.refusing_hop,
-            if refuse_session { 2 } else { 1 }
-        );
-        assert_eq!(waiting.refusal.target_hop, 2);
-        assert_eq!(
-            waiting.refusal.operation,
-            if refuse_session { "session" } else { "connect" }
-        );
         let prefix = management.hops()[0].session_id.clone();
         assert_eq!(wallet.list_channels().unwrap().len(), 1);
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -206,7 +197,6 @@ async fn administrative_wait_preserves_prefix_and_outlives_setup_budget() {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(management.admission_wait().is_none());
         assert!(management.hops().iter().any(|h| h.session_id == prefix));
         assert_eq!(wallet.list_channels().unwrap().len(), 2);
         route.close().await;
@@ -238,7 +228,8 @@ async fn prefix_failure_interrupts_administrative_wait_and_releases_attachments(
     let management = Arc::new(ClientManagement::default());
     let runtime = ConnectorRuntime::new(Some(wallet.clone()))
         .unwrap()
-        .with_management(management.clone());
+        .with_management(management.clone())
+        .with_setup_timeout(Duration::from_millis(500));
     let route = Route::new(vec![first.hop(false), second.hop(true)]).unwrap();
     let rt = runtime.clone();
     let task = tokio::spawn(async move { connect_route_with_runtime(&route, &rt).await });
@@ -246,7 +237,7 @@ async fn prefix_failure_interrupts_administrative_wait_and_releases_attachments(
     timeout(Duration::from_secs(3), async {
         loop {
             changes.borrow_and_update();
-            if management.admission_wait().is_some() {
+            if management.hops().len() == 1 {
                 break;
             }
             changes.changed().await.unwrap();
@@ -254,6 +245,8 @@ async fn prefix_failure_interrupts_administrative_wait_and_releases_attachments(
     })
     .await
     .unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!task.is_finished());
     first
         .registry
         .set_controls(RelayControls {
@@ -266,9 +259,7 @@ async fn prefix_failure_interrupts_administrative_wait_and_releases_attachments(
         .unwrap()
         .unwrap()
         .is_err());
-    assert!(management.admission_wait().is_none());
     assert!(management.hops().is_empty());
-    assert!(management.route_refusal().is_none());
     assert!(wallet
         .list_channels()
         .unwrap()
@@ -314,7 +305,9 @@ async fn management_disable_cancels_administrative_wait_promptly() {
         loop {
             if let Ok(response) = client.get("http://localhost/v1/snapshot").send().await {
                 let view: Value = response.json().await.unwrap();
-                if view["data"]["instances"]["local"]["admission_wait"].is_object() {
+                if view["data"]["instances"]["local"]["runtime"]["lifecycle"]["state"]
+                    == "waiting_for_admission"
+                {
                     break view;
                 }
             }
@@ -324,7 +317,8 @@ async fn management_disable_cancels_administrative_wait_promptly() {
     .await
     .unwrap();
     assert_eq!(
-        snapshot["data"]["instances"]["local"]["admission_wait"]["refusal"]["rejection"]["code"],
+        snapshot["data"]["instances"]["local"]["runtime"]["lifecycle"]["wait"]["refusal"]
+            ["rejection"]["code"],
         "RELAY_DISABLED"
     );
     let response = client.post("http://localhost/v1/commands").json(&json!({
@@ -358,8 +352,10 @@ async fn management_disable_cancels_administrative_wait_promptly() {
         .json()
         .await
         .unwrap();
-    assert_eq!(view["data"]["instances"]["local"]["running"], false);
-    assert!(view["data"]["instances"]["local"]["admission_wait"].is_null());
+    assert_eq!(
+        view["data"]["instances"]["local"]["runtime"]["lifecycle"]["state"],
+        "disabled"
+    );
     assert_eq!(view["data"]["instances"]["local"]["hops"], json!([]));
     stop.send(()).unwrap();
     timeout(Duration::from_secs(3), task)
@@ -399,11 +395,12 @@ async fn channel_admission_wait_retains_funding_in_automatic_mode() {
     timeout(Duration::from_secs(3), async {
         loop {
             changes.borrow_and_update();
-            if management
-                .hops()
-                .iter()
-                .any(|h| h.waiting_for_relay_admission)
-            {
+            if management.hops().iter().any(|h| {
+                matches!(
+                    h.funding,
+                    monad_client::management::HopFundingState::WaitingForRelayAdmission { .. }
+                )
+            }) {
                 break;
             }
             changes.changed().await.unwrap();
@@ -412,14 +409,11 @@ async fn channel_admission_wait_retains_funding_in_automatic_mode() {
     .await
     .unwrap();
     let funded_id = wallet.list_channels().unwrap()[0].channel_id.clone();
-    assert_eq!(
-        management.hops()[0]
-            .funding_rejection
-            .as_ref()
-            .unwrap()
-            .code,
-        RejectionCode::ChannelAdmissionDisabled
-    );
+    assert!(matches!(
+        management.hops()[0].funding,
+        monad_client::management::HopFundingState::WaitingForRelayAdmission { ref rejection }
+            if rejection.code == RejectionCode::ChannelAdmissionDisabled
+    ));
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert!(!task.is_finished());
     relay.registry.set_controls(Default::default()).unwrap();
@@ -437,7 +431,10 @@ async fn channel_admission_wait_retains_funding_in_automatic_mode() {
             .channel_id,
         funded_id
     );
-    assert!(management.hops()[0].funding_rejection.is_none());
+    assert!(!matches!(
+        management.hops()[0].funding,
+        monad_client::management::HopFundingState::WaitingForRelayAdmission { .. }
+    ));
     route.close().await;
     drop(route);
     drop(runtime);

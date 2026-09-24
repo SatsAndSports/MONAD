@@ -479,11 +479,12 @@ async fn test_managed_client_exhaustion_waits_then_resumes_same_session() {
         timeout(Duration::from_secs(5), async {
             loop {
                 changes.borrow_and_update();
-                if management
-                    .hops()
-                    .iter()
-                    .any(|h| h.waiting_for_manual_funding)
-                {
+                if management.hops().iter().any(|h| {
+                    matches!(
+                        h.funding,
+                        monad_client::management::HopFundingState::WaitingForManualFunding { .. }
+                    )
+                }) {
                     break;
                 }
                 changes.changed().await.unwrap();
@@ -559,11 +560,12 @@ async fn test_managed_client_funds_partial_route_manually_and_reuses_channels() 
         let waiting = timeout(Duration::from_secs(5), async {
             loop {
                 changes.borrow_and_update();
-                if let Some(hop) = management
-                    .hops()
-                    .into_iter()
-                    .find(|h| h.waiting_for_manual_funding)
-                {
+                if let Some(hop) = management.hops().into_iter().find(|h| {
+                    matches!(
+                        h.funding,
+                        monad_client::management::HopFundingState::WaitingForManualFunding { .. }
+                    )
+                }) {
                     break hop;
                 }
                 changes.changed().await.unwrap();
@@ -590,7 +592,7 @@ async fn test_managed_client_funds_partial_route_manually_and_reuses_channels() 
                 if !management
                     .hops()
                     .iter()
-                    .any(|h| h.session_id == waiting.session_id && h.waiting_for_manual_funding)
+                    .any(|h| h.session_id == waiting.session_id && matches!(h.funding, monad_client::management::HopFundingState::WaitingForManualFunding { .. }))
                 {
                     break;
                 }

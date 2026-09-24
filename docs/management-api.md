@@ -140,10 +140,36 @@ replay management commands, and retains the wallet's existing durable recovery.
 
 ### Client actions
 
-Administrative refusal/retry state is exposed in client `admission_wait` and
-`route_refusal`, and channel admission state in hop `funding_rejection`. Individual
-exit failures appear in `last_exit_refusal`. See [structured admission refusals](admission-refusals.md)
-for codes, hop attribution, retry timing, policy blockage and cancellation behavior.
+Each client instance exposes one revisioned `runtime` object. Its tagged `lifecycle`
+is one of `stopped`, `disabled`, `starting`, `connecting`,
+`waiting_for_admission`, `active`, `rebuilding_suffix`, `retry_backoff`,
+`blocked_by_policy`, `disabling`, or `failed`. State-specific fields carry attempt,
+retry, failed-hop, preserved-prefix or structured-refusal details. `run_generation`
+changes when the configured client starts again; `route_generation` changes only
+when a complete route is published. Delayed observations from older generations
+cannot overwrite the current state. `active_exit_session_id` identifies the final
+session of the currently published route and is absent whenever no route is
+published. An admission wait retains whether it interrupted an initial/full connect
+or a suffix rebuild, so clearing the wait restores the correct parent lifecycle.
+
+`last_failure` retains the latest sanitized connection, route, failure-watcher,
+suffix-rebuild or runtime failure after recovery so an `active` state does not erase
+the diagnostic. `last_exit_failure` identifies the session, route generation,
+destination and structured rejection for the latest failed SOCKS exit on the current
+route. A successful concurrent exit does not clear another tunnel's failure; route
+withdrawal, replacement or disable does. Exit failures are accepted only from the
+published final session while the lifecycle is `active`. Historical transitions and
+failures remain in the
+bounded event ring as `client_lifecycle_changed`, `client_failure`, `route_refused`,
+`exit_refused`, and `hop_funding_changed`.
+
+Each hop has one tagged `funding` state instead of overlapping waiting/provisioning
+booleans: `awaiting_status`, `awaiting_funding`, `waiting_for_manual_funding`,
+`provisioning`, `linking`, `waiting_for_relay_admission`, `paying`, `ready`, or
+`blocked`. A manual-funding error appears inside that state. The hop's
+`introduced_in_route_generation` allows a UI to distinguish preserved prefix
+sessions from newly introduced suffix sessions. See
+[structured admission refusals](admission-refusals.md) for codes and attribution.
 
 | Action | Arguments | Completion |
 | --- | --- | --- |

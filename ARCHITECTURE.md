@@ -69,6 +69,19 @@ session owner or forming a registry cycle. Wallet inventories are cached separat
 from traffic counters. Discrete payment events enter a bounded in-memory ring after
 acceptance, never an unbounded channel to a slow observer.
 
+Each configured client publishes one typed, revisioned observer projection. The leaf
+supervisor and connection manager remain authoritative for start/stop, retries and
+route rebuilds; the payment driver remains authoritative for funding and payments.
+Management records their transitions but never drives them. Run and route generations
+reject stale updates, including exit failures from tunnels that outlive a replaced
+route. Exit diagnostics are accepted only from the published final session while
+that route is active; withdrawing the route closes that observation window before
+rebuild cleanup. Disable is terminal for ordinary same-generation callbacks until
+the runtime owner finishes cleanup. A recovered active route retains its last sanitized failure while bounded
+events provide recent history. Per-hop funding is represented by one tagged state,
+not combinations of waiting/provisioning/error booleans. Lifecycle mutation never
+holds its short synchronous lock across network, wallet, SQLite, H2 or cleanup work.
+
 The standalone aggregator polls each process independently at 5 Hz, forwarding only
 new source events and retaining a bounded replay ring. HTTP snapshots are cached
 views; HTTP commands are forwarded with the caller's process generation and request

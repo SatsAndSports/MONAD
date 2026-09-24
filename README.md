@@ -12,6 +12,12 @@ processes on `management.listen`. `GET /v1/snapshot` provides JSON monitoring an
 `/v1/processes/{name}/commands`. The TCP listener is loopback-only; this release
 provides a headless API, ready for a later dashboard.
 
+Client snapshots expose a tagged, revisioned lifecycle with run/route generations,
+one tagged funding state per hop, the latest sanitized route/exit failures, and a
+bounded transition history. A recovered client can therefore be `active` while still
+showing what most recently failed; management observes this state but does not own
+route recovery or payment decisions.
+
 Optional **SAT/MSAT CDK test mints** can be configured under `test_mints` and started
 with `cargo run -p monad-test-mint -- run --config monad.yaml`. One process hosts all
 configured test mints; each has its own persistent database and Cashu HTTP address.

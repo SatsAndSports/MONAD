@@ -18,6 +18,8 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+use crate::management::{ClientFailure, ClientFailureStage};
+
 const MAX_STARTUP_CONNECT_ATTEMPTS: u32 = 5;
 const INITIAL_RECONNECT_BACKOFF_MS: u64 = 250;
 const MAX_RECONNECT_BACKOFF_MS: u64 = 5_000;
@@ -348,6 +350,37 @@ fn selected_clients(
     }
 }
 
+fn public_failure(
+    stage: ClientFailureStage,
+    error: impl std::fmt::Display,
+    hop: Option<usize>,
+    retryable: bool,
+) -> ClientFailure {
+    let mut message = error.to_string();
+    if message.len() > 512 {
+        let mut boundary = 512;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
+    }
+    ClientFailure {
+        stage,
+        message,
+        hop,
+        retryable,
+    }
+}
+
+fn unix_ms_after(duration: Duration) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .saturating_add(duration.as_millis())
+        .min(u64::MAX as u128) as u64
+}
+
 struct PreparedConfiguredClient {
     client: ClientConfig,
     route: crate::route::Route,
@@ -375,17 +408,17 @@ async fn run_configured_client_leaf(
         if *process_shutdown.borrow() {
             return Ok(());
         }
-        if !controls.begin_run() {
+        let Some(run_generation) = controls.begin_run() else {
             tokio::select! {
                 result = listener.accept() => { drop(result?); }
                 result = process_shutdown.changed() => { if result.is_err() { return Ok(()); } }
                 _ = control_changes.changed() => {}
             }
             continue;
-        }
+        };
         let runtime = ConnectorRuntime::with_payment_policy(Some(wallet.clone()), policy)?
             .with_setup_timeout(options.route_setup_timeout)
-            .with_management(controls.clone());
+            .with_management_run_generation(controls.clone(), run_generation);
         info!(client = %client.name, socks = %client.socks, hops = route.hops().len(), "connecting configured route");
         info!(client = %client.name, socks = %client.socks, "SOCKS5 listener ready");
 
@@ -435,7 +468,18 @@ async fn run_configured_client_leaf(
                 listener_result.map_err(anyhow::Error::from).and(manager_result)
             }
         };
-        controls.finish_run();
+        if let Err(error) = &result {
+            if !matches!(
+                controls.runtime_snapshot().lifecycle,
+                crate::management::ClientLifecycle::Failed { .. }
+            ) {
+                controls.failed(
+                    run_generation,
+                    public_failure(ClientFailureStage::Runtime, error, None, false),
+                );
+            }
+        }
+        controls.finish_run(run_generation);
         result?;
     }
 }
@@ -474,6 +518,9 @@ async fn connection_manager_loop<S>(
 where
     S: Future<Output = ()> + Send + Unpin,
 {
+    let (management, run_generation) = runtime
+        .management_observer()
+        .expect("configured connection manager requires management observer");
     let mut attempt = 0u32;
     let mut backoff_ms = INITIAL_RECONNECT_BACKOFF_MS;
     // Startup connects fail fast after a bounded number of attempts so a
@@ -512,6 +559,7 @@ where
         }
 
         let snapshot = stats.record_route_connect_attempt();
+        management.connecting(run_generation, attempt, route_has_connected);
         info!(
             attempt,
             hops = route.hops().len(),
@@ -532,10 +580,17 @@ where
         match connected {
             Err(err) => {
                 if crate::admission::RouteRefusal::is_policy_denial(&err) {
+                    if let Some(refusal) = crate::admission::RouteRefusal::from_io(&err).cloned() {
+                        management.blocked_by_policy(run_generation, refusal);
+                    }
                     warn!(%err, "route blocked by destination policy; disable/re-enable or reconfigure to retry");
                     shutdown.await;
                     return Ok(());
                 }
+                management.record_failure(
+                    run_generation,
+                    public_failure(ClientFailureStage::Connect, &err, None, true),
+                );
                 warn!("failed to connect route: {err}");
             }
             Ok(route_conn) => {
@@ -550,8 +605,16 @@ where
                     let funded_hop_count =
                         active_route.hops().iter().filter(|hop| hop.funded).count();
                     let conn = active_route.final_connection_arc();
-                    runtime.clear_exit_refusal();
-                    let _ = conn_tx.send(Some(conn.clone()));
+                    if !management.publish_active_route(
+                        run_generation,
+                        hex::encode(conn.session_id()),
+                        || {
+                            let _ = conn_tx.send(Some(conn.clone()));
+                        },
+                    ) {
+                        active_route.close().await;
+                        return Ok(());
+                    }
                     let snapshot = stats.record_route_connected();
                     info!(
                         hops = hop_count,
@@ -566,7 +629,9 @@ where
                         biased;
                         _ = &mut *shutdown => {
                             info!("shutting down configured client");
-                            let _ = conn_tx.send(None);
+                            management.withdraw_active_route(run_generation, || {
+                                let _ = conn_tx.send(None);
+                            });
                             active_route.close().await;
                             return Ok(());
                         }
@@ -581,12 +646,32 @@ where
                             full_reconnects_total = snapshot.full_reconnects_total,
                             "route failure watcher unavailable; rebuilding full route"
                         );
-                        let _ = conn_tx.send(None);
+                        management.record_failure(
+                            run_generation,
+                            public_failure(
+                                ClientFailureStage::FailureWatcher,
+                                "route failure watcher unavailable",
+                                None,
+                                true,
+                            ),
+                        );
+                        management.withdraw_active_route(run_generation, || {
+                            let _ = conn_tx.send(None);
+                        });
                         active_route.close().await;
                         break;
                     };
 
                     let (failure_path, snapshot) = stats.record_failed_hop(hop_idx);
+                    management.record_failure(
+                        run_generation,
+                        public_failure(
+                            ClientFailureStage::Route,
+                            "funded hop failed",
+                            Some(hop_idx + 1),
+                            true,
+                        ),
+                    );
                     warn!(
                         hop = hop_idx + 1,
                         hops = hop_count,
@@ -600,7 +685,9 @@ where
                         suffix_rebuild_failures_total = snapshot.suffix_rebuild_failures_total,
                         "route failed at funded hop"
                     );
-                    let _ = conn_tx.send(None);
+                    management.withdraw_active_route(run_generation, || {
+                        let _ = conn_tx.send(None);
+                    });
 
                     if hop_idx == 0 {
                         warn!(
@@ -618,6 +705,7 @@ where
                     let suffix_hops = hop_count - hop_idx;
                     let suffix_session_ids = active_route.suffix_session_ids_from(hop_idx);
                     let snapshot = stats.record_suffix_rebuild_attempt();
+                    management.rebuilding_suffix(run_generation, hop_idx + 1, preserved_hops);
                     info!(
                         hop = hop_idx + 1,
                         preserved_hops,
@@ -671,11 +759,25 @@ where
                         }
                         Err(err) => {
                             if crate::admission::RouteRefusal::is_policy_denial(&err) {
+                                if let Some(refusal) =
+                                    crate::admission::RouteRefusal::from_io(&err).cloned()
+                                {
+                                    management.blocked_by_policy(run_generation, refusal);
+                                }
                                 warn!(%err, "route blocked by destination policy; disable/re-enable or reconfigure to retry");
                                 shutdown.await;
                                 return Ok(());
                             }
                             let snapshot = stats.record_suffix_rebuild_failure_with_fallback();
+                            management.record_failure(
+                                run_generation,
+                                public_failure(
+                                    ClientFailureStage::SuffixRebuild,
+                                    &err,
+                                    Some(hop_idx + 1),
+                                    true,
+                                ),
+                            );
                             warn!(
                                 hop = hop_idx + 1,
                                 preserved_hops,
@@ -699,12 +801,22 @@ where
 
         attempt += 1;
         if !route_has_connected && attempt > MAX_STARTUP_CONNECT_ATTEMPTS {
-            return Err(anyhow::anyhow!(
+            let error = anyhow::anyhow!(
                 "route failed before first successful connect: max startup attempts ({MAX_STARTUP_CONNECT_ATTEMPTS}) exceeded"
-            ));
+            );
+            management.failed(
+                run_generation,
+                public_failure(ClientFailureStage::Connect, &error, None, false),
+            );
+            return Err(error);
         }
 
         info!("reconnecting in {backoff_ms}ms");
+        management.retry_backoff(
+            run_generation,
+            attempt,
+            unix_ms_after(Duration::from_millis(backoff_ms)),
+        );
         tokio::select! {
             biased;
             _ = &mut *shutdown => {
@@ -911,6 +1023,26 @@ mod tests {
     }
 
     #[test]
+    fn public_failure_truncates_unicode_on_a_character_boundary() {
+        let failure = public_failure(ClientFailureStage::Connect, "é".repeat(300), None, true);
+        assert!(failure.message.len() <= 512);
+        assert_eq!(failure.message.chars().count(), 256);
+    }
+
+    #[tokio::test]
+    async fn direct_connector_management_attachment_does_not_claim_runtime_lifecycle() {
+        let management = Arc::new(crate::management::ClientManagement::default());
+        let _runtime = ConnectorRuntime::new(None)
+            .unwrap()
+            .with_management(management.clone());
+        assert!(!management.is_running());
+        assert_eq!(
+            management.runtime_snapshot().lifecycle,
+            crate::management::ClientLifecycle::Stopped
+        );
+    }
+
+    #[test]
     fn route_runtime_stats_record_connect_attempts() {
         let stats = SharedRouteRuntimeStats::default();
 
@@ -1106,9 +1238,10 @@ mod tests {
         ])
         .unwrap();
         let management = Arc::new(crate::management::ClientManagement::default());
+        let run_generation = management.begin_run().unwrap();
         let runtime = ConnectorRuntime::new(None)
             .unwrap()
-            .with_management(management.clone());
+            .with_management_run_generation(management.clone(), run_generation);
         let (conn_tx, _conn_rx) = watch::channel(None);
         let stats = SharedRouteRuntimeStats::default();
         let observed = stats.clone();
@@ -1131,15 +1264,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            management.route_refusal().unwrap().rejection.code,
-            RejectionCode::DestinationPolicyDenied
-        );
+        assert!(matches!(
+            management.runtime_snapshot().lifecycle,
+            crate::management::ClientLifecycle::BlockedByPolicy { refusal }
+                if refusal.rejection.code == RejectionCode::DestinationPolicyDenied
+        ));
         assert!(tokio::time::timeout(Duration::from_millis(500), &mut task)
             .await
             .is_err());
         assert_eq!(observed.snapshot().route_connect_attempts_total, 1);
-        assert!(management.admission_wait().is_none());
         stop.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), task)
             .await

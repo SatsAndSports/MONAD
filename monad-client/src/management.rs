@@ -4,6 +4,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ClientControls {
     pub enabled: bool,
@@ -22,18 +30,156 @@ impl Default for ClientControls {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HopSnapshot {
     pub session_id: String,
+    pub introduced_in_route_generation: u64,
     pub label: String,
-    pub waiting_for_manual_funding: bool,
-    pub waiting_for_relay_admission: bool,
-    pub funding_rejection: Option<monad_common::rejection::Rejection>,
-    pub provisioning: bool,
+    pub funding: HopFundingState,
     pub linked_channel: Option<monad_common::protocol::LinkedChannelStatus>,
     pub paused: bool,
     pub total_paid_msats: u64,
     pub remaining_msats: i64,
-    pub funding_error: Option<String>,
     pub inbound_bytes: u64,
     pub outbound_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum HopFundingState {
+    AwaitingStatus,
+    AwaitingFunding,
+    WaitingForManualFunding {
+        error: Option<String>,
+    },
+    Provisioning,
+    Linking {
+        channel_id: String,
+    },
+    WaitingForRelayAdmission {
+        rejection: monad_common::rejection::Rejection,
+    },
+    Paying {
+        channel_id: String,
+    },
+    Ready,
+    Blocked {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientFailureStage {
+    Connect,
+    Route,
+    FailureWatcher,
+    SuffixRebuild,
+    Runtime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClientFailure {
+    pub stage: ClientFailureStage,
+    pub message: String,
+    pub hop: Option<usize>,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ClientLifecycle {
+    Stopped,
+    Disabled,
+    Starting,
+    Connecting {
+        attempt: u32,
+        reconnect: bool,
+    },
+    WaitingForAdmission {
+        context: AdmissionWaitContext,
+        wait: crate::admission::AdmissionWait,
+    },
+    Active,
+    RebuildingSuffix {
+        failed_hop: usize,
+        preserved_hops: usize,
+    },
+    RetryBackoff {
+        attempt: u32,
+        retry_at_unix_ms: u64,
+    },
+    BlockedByPolicy {
+        refusal: crate::admission::RouteRefusal,
+    },
+    Disabling,
+    Failed {
+        failure: ClientFailure,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AdmissionWaitContext {
+    Connecting {
+        attempt: u32,
+        reconnect: bool,
+    },
+    RebuildingSuffix {
+        failed_hop: usize,
+        preserved_hops: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClientRuntimeSnapshot {
+    pub revision: u64,
+    pub run_generation: u64,
+    pub route_generation: u64,
+    pub transitioned_at_unix_ms: u64,
+    pub lifecycle: ClientLifecycle,
+    pub active_exit_session_id: Option<String>,
+    pub last_failure: Option<ClientFailure>,
+    pub last_exit_failure: Option<ExitFailure>,
+}
+
+impl Default for ClientRuntimeSnapshot {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            run_generation: 0,
+            route_generation: 0,
+            transitioned_at_unix_ms: now_unix_ms(),
+            lifecycle: ClientLifecycle::Stopped,
+            active_exit_session_id: None,
+            last_failure: None,
+            last_exit_failure: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExitFailure {
+    pub session_id: String,
+    pub route_generation: u64,
+    pub destination: String,
+    pub rejection: monad_common::rejection::Rejection,
+}
+
+#[derive(Debug, Default)]
+struct ClientRuntimeState {
+    snapshot: ClientRuntimeSnapshot,
+    running: bool,
+}
+
+struct RuntimeUpdate<'a> {
+    snapshot: ClientRuntimeSnapshot,
+    _publication: std::sync::MutexGuard<'a, ()>,
+}
+
+impl std::ops::Deref for RuntimeUpdate<'_> {
+    type Target = ClientRuntimeSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
 }
 
 /// A handle belongs to one configured client, not to its shared wallet.
@@ -42,11 +188,9 @@ pub struct ClientManagement {
     controls: watch::Sender<ClientControls>,
     hops: Mutex<BTreeMap<String, Arc<HopManagement>>>,
     changed: watch::Sender<u64>,
-    running: Mutex<bool>,
+    runtime: Mutex<ClientRuntimeState>,
+    runtime_publication: Mutex<()>,
     pub events: monad_management::events::EventLog,
-    admission_wait: Mutex<Option<crate::admission::AdmissionWait>>,
-    last_exit_refusal: Mutex<Option<serde_json::Value>>,
-    route_refusal: Mutex<Option<crate::admission::RouteRefusal>>,
 }
 
 impl Default for ClientManagement {
@@ -55,58 +199,348 @@ impl Default for ClientManagement {
             controls: watch::channel(ClientControls::default()).0,
             hops: Mutex::new(BTreeMap::new()),
             changed: watch::channel(0).0,
-            running: Mutex::new(false),
+            runtime: Default::default(),
+            runtime_publication: Default::default(),
             events: Default::default(),
-            admission_wait: Default::default(),
-            last_exit_refusal: Default::default(),
-            route_refusal: Default::default(),
         }
     }
 }
 
 impl ClientManagement {
-    pub fn route_refusal(&self) -> Option<crate::admission::RouteRefusal> {
-        self.route_refusal.lock().unwrap().clone()
+    pub fn runtime_snapshot(&self) -> ClientRuntimeSnapshot {
+        self.runtime.lock().unwrap().snapshot.clone()
     }
-    pub(crate) fn set_route_refusal(&self, refusal: Option<crate::admission::RouteRefusal>) {
-        if let Some(refusal) = &refusal {
-            self.events
-                .record("route_refused", serde_json::to_value(refusal).unwrap());
+
+    fn update_runtime(
+        &self,
+        run_generation: u64,
+        update: impl FnOnce(&mut ClientRuntimeSnapshot) -> bool,
+    ) -> Option<RuntimeUpdate<'_>> {
+        let publication = self.runtime_publication.lock().unwrap();
+        let mut runtime = self.runtime.lock().unwrap();
+        if runtime.snapshot.run_generation != run_generation
+            || matches!(
+                runtime.snapshot.lifecycle,
+                ClientLifecycle::Disabling | ClientLifecycle::Disabled
+            )
+            || !update(&mut runtime.snapshot)
+        {
+            return None;
         }
-        *self.route_refusal.lock().unwrap() = refusal;
+        runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
+        runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
+        Some(RuntimeUpdate {
+            snapshot: runtime.snapshot.clone(),
+            _publication: publication,
+        })
+    }
+
+    fn record_lifecycle(&self, snapshot: &ClientRuntimeSnapshot) {
+        self.events.record(
+            "client_lifecycle_changed",
+            serde_json::json!({
+                "revision": snapshot.revision,
+                "run_generation": snapshot.run_generation,
+                "route_generation": snapshot.route_generation,
+                "lifecycle": snapshot.lifecycle,
+            }),
+        );
         self.notify();
     }
-    pub(crate) fn clear_exit_refusal(&self) {
-        *self.last_exit_refusal.lock().unwrap() = None;
+
+    pub(crate) fn connecting(&self, run_generation: u64, attempt: u32, reconnect: bool) {
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            snapshot.lifecycle = ClientLifecycle::Connecting { attempt, reconnect };
+            true
+        }) {
+            self.record_lifecycle(&snapshot);
+        }
     }
-    pub fn admission_wait(&self) -> Option<crate::admission::AdmissionWait> {
-        self.admission_wait.lock().unwrap().clone()
+
+    pub(crate) fn waiting_for_admission(
+        &self,
+        run_generation: u64,
+        wait: crate::admission::AdmissionWait,
+    ) {
+        let mut refusal_event = None;
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            let context = match &snapshot.lifecycle {
+                ClientLifecycle::Connecting { attempt, reconnect } => {
+                    AdmissionWaitContext::Connecting {
+                        attempt: *attempt,
+                        reconnect: *reconnect,
+                    }
+                }
+                ClientLifecycle::RebuildingSuffix {
+                    failed_hop,
+                    preserved_hops,
+                } => AdmissionWaitContext::RebuildingSuffix {
+                    failed_hop: *failed_hop,
+                    preserved_hops: *preserved_hops,
+                },
+                ClientLifecycle::WaitingForAdmission { context, .. } => context.clone(),
+                _ => return false,
+            };
+            let changed_refusal = !matches!(
+                &snapshot.lifecycle,
+                ClientLifecycle::WaitingForAdmission { wait: current, .. }
+                    if current.refusal == wait.refusal
+            );
+            if changed_refusal {
+                refusal_event = Some(wait.refusal.clone());
+            }
+            snapshot.lifecycle = ClientLifecycle::WaitingForAdmission { context, wait };
+            true
+        }) {
+            if let Some(refusal) = refusal_event {
+                self.events.record(
+                    "route_refused",
+                    serde_json::json!({
+                        "revision": snapshot.revision,
+                        "run_generation": run_generation,
+                        "refusal": refusal,
+                    }),
+                );
+            }
+            self.record_lifecycle(&snapshot);
+        }
     }
-    pub(crate) fn set_admission_wait(&self, wait: Option<crate::admission::AdmissionWait>) {
-        *self.admission_wait.lock().unwrap() = wait;
-        self.notify();
+
+    pub(crate) fn clear_admission_wait(&self, run_generation: u64) {
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            let ClientLifecycle::WaitingForAdmission { context, .. } = &snapshot.lifecycle else {
+                return false;
+            };
+            snapshot.lifecycle = match context {
+                AdmissionWaitContext::Connecting { attempt, reconnect } => {
+                    ClientLifecycle::Connecting {
+                        attempt: *attempt,
+                        reconnect: *reconnect,
+                    }
+                }
+                AdmissionWaitContext::RebuildingSuffix {
+                    failed_hop,
+                    preserved_hops,
+                } => ClientLifecycle::RebuildingSuffix {
+                    failed_hop: *failed_hop,
+                    preserved_hops: *preserved_hops,
+                },
+            };
+            true
+        }) {
+            self.record_lifecycle(&snapshot);
+        }
     }
-    pub fn last_exit_refusal(&self) -> Option<serde_json::Value> {
-        self.last_exit_refusal.lock().unwrap().clone()
+
+    fn activate_route(
+        &self,
+        run_generation: u64,
+        exit_session_id: String,
+        publish: impl FnOnce(),
+    ) -> bool {
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            snapshot.route_generation = snapshot.route_generation.wrapping_add(1);
+            snapshot.lifecycle = ClientLifecycle::Active;
+            snapshot.active_exit_session_id = Some(exit_session_id);
+            snapshot.last_exit_failure = None;
+            true
+        }) {
+            self.record_lifecycle(&snapshot);
+            publish();
+            true
+        } else {
+            false
+        }
     }
+
+    pub(crate) fn publish_active_route(
+        &self,
+        run_generation: u64,
+        exit_session_id: String,
+        publish: impl FnOnce(),
+    ) -> bool {
+        self.activate_route(run_generation, exit_session_id, publish)
+    }
+
+    pub(crate) fn withdraw_active_route(
+        &self,
+        run_generation: u64,
+        unpublish: impl FnOnce(),
+    ) -> bool {
+        let _publication = self.runtime_publication.lock().unwrap();
+        let mut runtime = self.runtime.lock().unwrap();
+        if runtime.snapshot.run_generation != run_generation {
+            unpublish();
+            return false;
+        }
+        unpublish();
+        if !matches!(runtime.snapshot.lifecycle, ClientLifecycle::Active)
+            || runtime.snapshot.active_exit_session_id.is_none()
+        {
+            return false;
+        }
+        runtime.snapshot.active_exit_session_id = None;
+        runtime.snapshot.last_exit_failure = None;
+        runtime.snapshot.lifecycle = ClientLifecycle::Connecting {
+            attempt: 0,
+            reconnect: true,
+        };
+        runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
+        runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
+        let snapshot = runtime.snapshot.clone();
+        drop(runtime);
+        self.record_lifecycle(&snapshot);
+        true
+    }
+
+    pub(crate) fn rebuilding_suffix(
+        &self,
+        run_generation: u64,
+        failed_hop: usize,
+        preserved_hops: usize,
+    ) {
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            snapshot.lifecycle = ClientLifecycle::RebuildingSuffix {
+                failed_hop,
+                preserved_hops,
+            };
+            true
+        }) {
+            self.record_lifecycle(&snapshot);
+        }
+    }
+
+    pub(crate) fn retry_backoff(&self, run_generation: u64, attempt: u32, retry_at_unix_ms: u64) {
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            snapshot.lifecycle = ClientLifecycle::RetryBackoff {
+                attempt,
+                retry_at_unix_ms,
+            };
+            true
+        }) {
+            self.record_lifecycle(&snapshot);
+        }
+    }
+
+    pub(crate) fn blocked_by_policy(
+        &self,
+        run_generation: u64,
+        refusal: crate::admission::RouteRefusal,
+    ) {
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            snapshot.lifecycle = ClientLifecycle::BlockedByPolicy {
+                refusal: refusal.clone(),
+            };
+            true
+        }) {
+            self.events.record(
+                "route_refused",
+                serde_json::json!({
+                    "revision": snapshot.revision,
+                    "run_generation": run_generation,
+                    "refusal": refusal,
+                }),
+            );
+            self.record_lifecycle(&snapshot);
+        }
+    }
+
+    pub(crate) fn record_failure(&self, run_generation: u64, failure: ClientFailure) {
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            snapshot.last_failure = Some(failure.clone());
+            true
+        }) {
+            self.events.record(
+                "client_failure",
+                serde_json::json!({
+                    "revision": snapshot.revision,
+                    "run_generation": run_generation,
+                    "route_generation": snapshot.route_generation,
+                    "failure": failure,
+                }),
+            );
+            self.notify();
+        }
+    }
+
+    pub(crate) fn failed(&self, run_generation: u64, failure: ClientFailure) {
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            snapshot.last_failure = Some(failure.clone());
+            snapshot.lifecycle = ClientLifecycle::Failed {
+                failure: failure.clone(),
+            };
+            true
+        }) {
+            self.events.record(
+                "client_failure",
+                serde_json::json!({
+                    "revision": snapshot.revision,
+                    "run_generation": run_generation,
+                    "route_generation": snapshot.route_generation,
+                    "failure": failure,
+                }),
+            );
+            self.record_lifecycle(&snapshot);
+        }
+    }
+
     pub(crate) fn note_exit_result(
         &self,
         session: &[u8; 32],
         destination: &str,
         error: Option<&std::io::Error>,
     ) {
-        let refusal = error
+        let failure = error
             .and_then(monad_common::rejection::Rejection::from_io)
-            .map(|r| {
-                serde_json::json!({
-                    "session_id": hex::encode(session), "destination": destination, "rejection": r,
-                })
-            });
-        if let Some(refusal) = &refusal {
-            self.events.record("exit_refused", refusal.clone());
+            .cloned();
+        let Some(failure) = failure else {
+            return;
+        };
+        let session_id = hex::encode(session);
+        let Some(route_generation) = self
+            .hops
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .map(|hop| hop.route_generation)
+        else {
+            return;
+        };
+        let failure = ExitFailure {
+            session_id,
+            route_generation,
+            destination: destination.to_owned(),
+            rejection: failure,
+        };
+        let runtime = self.runtime.lock().unwrap().snapshot.clone();
+        if route_generation != runtime.route_generation
+            || !matches!(runtime.lifecycle, ClientLifecycle::Active)
+            || runtime.active_exit_session_id.as_deref() != Some(failure.session_id.as_str())
+        {
+            return;
         }
-        *self.last_exit_refusal.lock().unwrap() = refusal;
-        self.notify();
+        let run_generation = runtime.run_generation;
+        if let Some(snapshot) = self.update_runtime(run_generation, |snapshot| {
+            if snapshot.route_generation != route_generation
+                || !matches!(snapshot.lifecycle, ClientLifecycle::Active)
+                || snapshot.active_exit_session_id.as_deref() != Some(failure.session_id.as_str())
+            {
+                return false;
+            }
+            snapshot.last_exit_failure = Some(failure.clone());
+            true
+        }) {
+            self.events.record(
+                "exit_refused",
+                serde_json::json!({
+                    "revision": snapshot.revision,
+                    "run_generation": run_generation,
+                    "route_generation": snapshot.route_generation,
+                    "failure": failure,
+                }),
+            );
+            self.notify();
+        }
     }
     pub fn controls(&self) -> ClientControls {
         *self.controls.borrow()
@@ -119,37 +553,96 @@ impl ClientManagement {
     }
 
     pub fn set_enabled(&self, enabled: bool) -> Result<(), &'static str> {
-        let running = self.running.lock().unwrap();
-        if enabled && !self.controls().enabled && *running {
+        let _publication = self.runtime_publication.lock().unwrap();
+        let mut runtime = self.runtime.lock().unwrap();
+        if enabled && !self.controls().enabled && runtime.running {
             return Err("client is still disabling");
         }
         self.controls.send_modify(|c| c.enabled = enabled);
+        if !enabled && runtime.running {
+            runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
+            runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
+            runtime.snapshot.lifecycle = ClientLifecycle::Disabling;
+            runtime.snapshot.active_exit_session_id = None;
+            runtime.snapshot.last_exit_failure = None;
+            let snapshot = runtime.snapshot.clone();
+            drop(runtime);
+            self.record_lifecycle(&snapshot);
+            return Ok(());
+        }
+        if !enabled {
+            runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
+            runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
+            runtime.snapshot.lifecycle = ClientLifecycle::Disabled;
+            let snapshot = runtime.snapshot.clone();
+            drop(runtime);
+            self.record_lifecycle(&snapshot);
+            return Ok(());
+        }
+        if !runtime.running && matches!(runtime.snapshot.lifecycle, ClientLifecycle::Disabled) {
+            runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
+            runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
+            runtime.snapshot.lifecycle = ClientLifecycle::Stopped;
+            let snapshot = runtime.snapshot.clone();
+            drop(runtime);
+            self.record_lifecycle(&snapshot);
+            return Ok(());
+        }
+        drop(runtime);
         self.notify();
         Ok(())
     }
 
     pub fn is_running(&self) -> bool {
-        *self.running.lock().unwrap()
+        self.runtime.lock().unwrap().running
     }
 
-    pub(crate) fn begin_run(&self) -> bool {
-        let mut running = self.running.lock().unwrap();
+    pub(crate) fn begin_run(&self) -> Option<u64> {
+        let _publication = self.runtime_publication.lock().unwrap();
+        let mut runtime = self.runtime.lock().unwrap();
         if !self.controls().enabled {
-            return false;
+            return None;
         }
         assert!(
-            !*running,
+            !runtime.running,
             "client management handle already has a runtime owner"
         );
-        *running = true;
-        true
+        runtime.running = true;
+        runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
+        runtime.snapshot.run_generation = runtime.snapshot.run_generation.wrapping_add(1);
+        runtime.snapshot.route_generation = 0;
+        runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
+        runtime.snapshot.lifecycle = ClientLifecycle::Starting;
+        runtime.snapshot.active_exit_session_id = None;
+        runtime.snapshot.last_failure = None;
+        runtime.snapshot.last_exit_failure = None;
+        let snapshot = runtime.snapshot.clone();
+        drop(runtime);
+        self.record_lifecycle(&snapshot);
+        Some(snapshot.run_generation)
     }
 
-    pub(crate) fn finish_run(&self) {
-        self.set_route_refusal(None);
-        *self.last_exit_refusal.lock().unwrap() = None;
-        *self.running.lock().unwrap() = false;
-        self.notify();
+    pub(crate) fn finish_run(&self, run_generation: u64) {
+        let _publication = self.runtime_publication.lock().unwrap();
+        let mut runtime = self.runtime.lock().unwrap();
+        if runtime.snapshot.run_generation != run_generation {
+            return;
+        }
+        runtime.running = false;
+        runtime.snapshot.revision = runtime.snapshot.revision.wrapping_add(1);
+        runtime.snapshot.transitioned_at_unix_ms = now_unix_ms();
+        runtime.snapshot.lifecycle = if !self.controls().enabled {
+            ClientLifecycle::Disabled
+        } else if matches!(runtime.snapshot.lifecycle, ClientLifecycle::Failed { .. }) {
+            runtime.snapshot.lifecycle.clone()
+        } else {
+            ClientLifecycle::Stopped
+        };
+        runtime.snapshot.last_exit_failure = None;
+        runtime.snapshot.active_exit_session_id = None;
+        let snapshot = runtime.snapshot.clone();
+        drop(runtime);
+        self.record_lifecycle(&snapshot);
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<ClientControls> {
@@ -190,19 +683,34 @@ impl ClientManagement {
             return Err("automatic provisioning is enabled");
         }
         let hops = self.hops.lock().unwrap();
-        let hop = hops.get(session_id).ok_or("session is no longer active")?;
+        let hop = hops
+            .get(session_id)
+            .cloned()
+            .ok_or("session is no longer active")?;
+        let _publication = hop.funding_publication.lock().unwrap();
         let mut state = hop.state.lock().unwrap();
-        if state.manual_requested || state.snapshot.provisioning {
+        if state.manual_requested || state.snapshot.funding == HopFundingState::Provisioning {
             return Err("provisioning is already in progress");
         }
-        if !state.snapshot.waiting_for_manual_funding {
+        if !matches!(
+            state.snapshot.funding,
+            HopFundingState::WaitingForManualFunding { .. }
+        ) {
             return Err("session is not waiting for manual funding");
         }
         state.manual_requested = true;
-        state.snapshot.funding_error = None;
+        let funding = HopFundingState::WaitingForManualFunding { error: None };
+        let changed = state.snapshot.funding != funding;
+        state.snapshot.funding = funding.clone();
         drop(state);
         drop(hops);
         drop(controls);
+        if changed {
+            self.events.record(
+                "hop_funding_changed",
+                serde_json::json!({"session_id": session_id, "funding": funding}),
+            );
+        }
         self.notify();
         Ok(())
     }
@@ -210,27 +718,40 @@ impl ClientManagement {
     pub(crate) fn waiting_for_funding(&self, session_id: &str) -> bool {
         self.hops.lock().unwrap().get(session_id).is_some_and(|h| {
             let state = h.state.lock().unwrap();
-            state.snapshot.waiting_for_manual_funding || state.snapshot.waiting_for_relay_admission
+            matches!(
+                state.snapshot.funding,
+                HopFundingState::WaitingForManualFunding { .. }
+                    | HopFundingState::WaitingForRelayAdmission { .. }
+            )
         })
     }
 
     pub(crate) fn register(self: &Arc<Self>, session_id: [u8; 32], label: &str) -> HopLease {
         let id = hex::encode(session_id);
+        let runtime = self.runtime_snapshot();
+        let route_generation = runtime.route_generation.saturating_add(u64::from(matches!(
+            runtime.lifecycle,
+            ClientLifecycle::Starting
+                | ClientLifecycle::Connecting { .. }
+                | ClientLifecycle::WaitingForAdmission { .. }
+                | ClientLifecycle::RebuildingSuffix { .. }
+                | ClientLifecycle::RetryBackoff { .. }
+        )));
         let hop = Arc::new(HopManagement {
+            session_id: id.clone(),
+            route_generation,
             counters: Default::default(),
+            funding_publication: Default::default(),
             state: Mutex::new(HopState {
                 snapshot: HopSnapshot {
                     session_id: id.clone(),
+                    introduced_in_route_generation: route_generation,
                     label: label.to_owned(),
-                    waiting_for_manual_funding: false,
-                    waiting_for_relay_admission: false,
-                    funding_rejection: None,
-                    provisioning: false,
+                    funding: HopFundingState::AwaitingStatus,
                     linked_channel: None,
                     paused: true,
                     total_paid_msats: 0,
                     remaining_msats: 0,
-                    funding_error: None,
                     inbound_bytes: 0,
                     outbound_bytes: 0,
                 },
@@ -255,7 +776,10 @@ struct HopState {
 
 #[derive(Debug)]
 pub(crate) struct HopManagement {
+    session_id: String,
+    route_generation: u64,
     state: Mutex<HopState>,
+    funding_publication: Mutex<()>,
     pub(crate) counters: Mutex<monad_common::proxy::CleartextByteCounters>,
 }
 
@@ -280,73 +804,158 @@ impl Drop for HopLease {
 }
 
 impl HopManagement {
+    fn set_funding(&self, owner: &ClientManagement, funding: HopFundingState) {
+        let _publication = self.funding_publication.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        if state.snapshot.funding == funding {
+            return;
+        }
+        state.snapshot.funding = funding.clone();
+        drop(state);
+        owner.events.record(
+            "hop_funding_changed",
+            serde_json::json!({"session_id": self.session_id, "funding": funding}),
+        );
+        owner.notify();
+    }
+
     pub(crate) fn begin_provisioning(&self, owner: &ClientManagement) -> bool {
         let controls = owner.controls.borrow();
+        let _publication = self.funding_publication.lock().unwrap();
         let mut state = self.state.lock().unwrap();
         if !controls.enabled {
             return false;
         }
         let manual = std::mem::take(&mut state.manual_requested);
         if !controls.automatic_provisioning && !manual {
-            state.snapshot.waiting_for_manual_funding = true;
-            state.snapshot.provisioning = false;
+            let error = match &state.snapshot.funding {
+                HopFundingState::WaitingForManualFunding { error } => error.clone(),
+                _ => None,
+            };
+            let funding = HopFundingState::WaitingForManualFunding { error };
+            let changed = state.snapshot.funding != funding;
+            state.snapshot.funding = funding.clone();
             drop(state);
             drop(controls);
+            if changed {
+                owner.events.record(
+                    "hop_funding_changed",
+                    serde_json::json!({"session_id": self.session_id, "funding": funding}),
+                );
+            }
             owner.notify();
             return false;
         }
-        state.snapshot.waiting_for_manual_funding = false;
-        state.snapshot.provisioning = true;
-        state.snapshot.funding_error = None;
+        let changed = state.snapshot.funding != HopFundingState::Provisioning;
+        state.snapshot.funding = HopFundingState::Provisioning;
         drop(state);
         drop(controls);
+        if changed {
+            owner.events.record(
+                "hop_funding_changed",
+                serde_json::json!({
+                    "session_id": self.session_id,
+                    "funding": HopFundingState::Provisioning,
+                }),
+            );
+        }
         owner.notify();
         true
     }
 
-    pub(crate) fn provisioning_finished(&self) {
-        self.state.lock().unwrap().snapshot.provisioning = false;
+    pub(crate) fn provisioning_finished(&self, owner: &ClientManagement) {
+        self.set_funding(owner, HopFundingState::AwaitingFunding);
     }
 
-    pub(crate) fn safe_provisioning_failure(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.snapshot.funding_error = Some("no available compatible funding offer".to_owned());
-        state.snapshot.waiting_for_manual_funding = true;
+    pub(crate) fn safe_provisioning_failure(&self, owner: &ClientManagement) {
+        self.set_funding(
+            owner,
+            HopFundingState::WaitingForManualFunding {
+                error: Some("no available compatible funding offer".to_owned()),
+            },
+        );
     }
 
     pub(crate) fn relay_admission_refused(&self, owner: &ClientManagement) {
+        self.set_funding(
+            owner,
+            HopFundingState::WaitingForRelayAdmission {
+                rejection: monad_common::rejection::RejectionCode::ChannelAdmissionDisabled
+                    .rejection(),
+            },
+        );
+    }
+
+    pub(crate) fn channel_admitted(&self, owner: &ClientManagement) {
+        let _publication = self.funding_publication.lock().unwrap();
         let mut state = self.state.lock().unwrap();
-        state.snapshot.funding_error = Some("relay is not accepting this new channel".into());
-        state.snapshot.waiting_for_relay_admission = true;
-        state.snapshot.funding_rejection =
-            Some(monad_common::rejection::RejectionCode::ChannelAdmissionDisabled.rejection());
+        if !matches!(
+            state.snapshot.funding,
+            HopFundingState::WaitingForRelayAdmission { .. }
+        ) {
+            return;
+        }
+        state.snapshot.funding = HopFundingState::AwaitingFunding;
         drop(state);
+        owner.events.record(
+            "hop_funding_changed",
+            serde_json::json!({
+                "session_id": self.session_id,
+                "funding": HopFundingState::AwaitingFunding,
+            }),
+        );
         owner.notify();
     }
 
-    pub(crate) fn channel_admitted(&self) {
-        let mut state = self.state.lock().unwrap();
-        if state.snapshot.funding_rejection.take().is_some() {
-            state.snapshot.funding_error = None;
-        }
-        state.snapshot.waiting_for_relay_admission = false;
+    pub(crate) fn linking(&self, owner: &ClientManagement, channel_id: String) {
+        self.set_funding(owner, HopFundingState::Linking { channel_id });
+    }
+
+    pub(crate) fn paying(&self, owner: &ClientManagement, channel_id: String) {
+        self.set_funding(owner, HopFundingState::Paying { channel_id });
+    }
+
+    pub(crate) fn blocked(&self, owner: &ClientManagement, message: String) {
+        self.set_funding(owner, HopFundingState::Blocked { message });
     }
 
     pub(crate) fn status(
         &self,
+        owner: &ClientManagement,
         linked: Option<monad_common::protocol::LinkedChannelStatus>,
         paused: bool,
         paid: u64,
         remaining: i64,
     ) {
+        let _publication = self.funding_publication.lock().unwrap();
         let mut state = self.state.lock().unwrap();
+        let previous_funding = state.snapshot.funding.clone();
         state.snapshot.linked_channel = linked;
         state.snapshot.paused = paused;
         state.snapshot.total_paid_msats = paid;
         state.snapshot.remaining_msats = remaining;
-        if !paused {
-            state.snapshot.waiting_for_manual_funding = false;
+        if !paused && !matches!(state.snapshot.funding, HopFundingState::Blocked { .. }) {
+            state.snapshot.funding = HopFundingState::Ready;
+        } else if !matches!(
+            state.snapshot.funding,
+            HopFundingState::WaitingForManualFunding { .. }
+                | HopFundingState::Provisioning
+                | HopFundingState::Linking { .. }
+                | HopFundingState::WaitingForRelayAdmission { .. }
+                | HopFundingState::Paying { .. }
+                | HopFundingState::Blocked { .. }
+        ) {
+            state.snapshot.funding = HopFundingState::AwaitingFunding;
         }
+        let funding = state.snapshot.funding.clone();
+        drop(state);
+        if funding != previous_funding {
+            owner.events.record(
+                "hop_funding_changed",
+                serde_json::json!({"session_id": self.session_id, "funding": funding}),
+            );
+        }
+        owner.notify();
     }
 }
 
