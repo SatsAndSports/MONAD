@@ -449,9 +449,9 @@ impl RelayConnection {
             .map_err(|e| io::Error::other(format!("h2 response error: {e}")))?;
 
         if !response.status().is_success() {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("CONNECT rejected: {}", response.status()),
+            return Err(crate::rejection::connect_error(
+                response.status(),
+                response.headers(),
             ));
         }
 

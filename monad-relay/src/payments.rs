@@ -132,7 +132,7 @@ impl std::error::Error for LinkError {}
 impl LinkError {
     pub(crate) fn code(&self) -> ServerErrorCode {
         match self {
-            Self::AdmissionDisabled => ServerErrorCode::LinkAdmissionDisabled,
+            Self::AdmissionDisabled => ServerErrorCode::ChannelAdmissionDisabled,
             Self::InvalidPayment(_) => ServerErrorCode::LinkInvalidPayment,
             Self::InvalidChannel(_) => ServerErrorCode::LinkInvalidChannel,
             Self::MintOrKeysetNotAcceptable | Self::UnknownTrustedKeyset { .. } => {

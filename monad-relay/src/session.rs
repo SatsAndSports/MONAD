@@ -571,9 +571,13 @@ impl ConnectHandler {
         mut respond: server::SendResponse<Bytes>,
     ) {
         let controls = self.state.session_registry.controls();
-        if !controls.enabled || !controls.accept_new_tunnels {
+        if let Some(code) = controls.tunnel_rejection() {
             let resp = Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .status(code.connect_status().unwrap())
+                .header(
+                    monad_common::rejection::CONNECT_REJECTION_HEADER,
+                    code.header_value(),
+                )
                 .body(())
                 .unwrap();
             let _ = respond.send_response(resp, true);
@@ -733,13 +737,21 @@ impl ConnectHandler {
             return Ok(());
         }
         let h2_send = self.state.session_registry.with_controls(|controls| {
-            if !controls.enabled || !controls.accept_new_tunnels || self.state.is_terminated() {
+            if let Some(code) = controls.tunnel_rejection() {
                 let resp = Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .status(code.connect_status().unwrap())
+                    .header(
+                        monad_common::rejection::CONNECT_REJECTION_HEADER,
+                        code.header_value(),
+                    )
                     .body(())
                     .unwrap();
                 respond.send_response(resp, true)?;
                 return Ok::<_, h2::Error>(None);
+            }
+            if self.state.is_terminated() {
+                respond.send_reset(h2::Reason::CANCEL);
+                return Ok(None);
             }
             let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
             respond.send_response(resp, false).map(Some)

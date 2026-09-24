@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod client_wallet_manager;
 pub mod config_runtime;
 pub mod connector;

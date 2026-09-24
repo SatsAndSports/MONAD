@@ -25,6 +25,7 @@ pub struct HopSnapshot {
     pub label: String,
     pub waiting_for_manual_funding: bool,
     pub waiting_for_relay_admission: bool,
+    pub funding_rejection: Option<monad_common::rejection::Rejection>,
     pub provisioning: bool,
     pub linked_channel: Option<monad_common::protocol::LinkedChannelStatus>,
     pub paused: bool,
@@ -43,6 +44,9 @@ pub struct ClientManagement {
     changed: watch::Sender<u64>,
     running: Mutex<bool>,
     pub events: monad_management::events::EventLog,
+    admission_wait: Mutex<Option<crate::admission::AdmissionWait>>,
+    last_exit_refusal: Mutex<Option<serde_json::Value>>,
+    route_refusal: Mutex<Option<crate::admission::RouteRefusal>>,
 }
 
 impl Default for ClientManagement {
@@ -53,11 +57,57 @@ impl Default for ClientManagement {
             changed: watch::channel(0).0,
             running: Mutex::new(false),
             events: Default::default(),
+            admission_wait: Default::default(),
+            last_exit_refusal: Default::default(),
+            route_refusal: Default::default(),
         }
     }
 }
 
 impl ClientManagement {
+    pub fn route_refusal(&self) -> Option<crate::admission::RouteRefusal> {
+        self.route_refusal.lock().unwrap().clone()
+    }
+    pub(crate) fn set_route_refusal(&self, refusal: Option<crate::admission::RouteRefusal>) {
+        if let Some(refusal) = &refusal {
+            self.events
+                .record("route_refused", serde_json::to_value(refusal).unwrap());
+        }
+        *self.route_refusal.lock().unwrap() = refusal;
+        self.notify();
+    }
+    pub(crate) fn clear_exit_refusal(&self) {
+        *self.last_exit_refusal.lock().unwrap() = None;
+    }
+    pub fn admission_wait(&self) -> Option<crate::admission::AdmissionWait> {
+        self.admission_wait.lock().unwrap().clone()
+    }
+    pub(crate) fn set_admission_wait(&self, wait: Option<crate::admission::AdmissionWait>) {
+        *self.admission_wait.lock().unwrap() = wait;
+        self.notify();
+    }
+    pub fn last_exit_refusal(&self) -> Option<serde_json::Value> {
+        self.last_exit_refusal.lock().unwrap().clone()
+    }
+    pub(crate) fn note_exit_result(
+        &self,
+        session: &[u8; 32],
+        destination: &str,
+        error: Option<&std::io::Error>,
+    ) {
+        let refusal = error
+            .and_then(monad_common::rejection::Rejection::from_io)
+            .map(|r| {
+                serde_json::json!({
+                    "session_id": hex::encode(session), "destination": destination, "rejection": r,
+                })
+            });
+        if let Some(refusal) = &refusal {
+            self.events.record("exit_refused", refusal.clone());
+        }
+        *self.last_exit_refusal.lock().unwrap() = refusal;
+        self.notify();
+    }
     pub fn controls(&self) -> ClientControls {
         *self.controls.borrow()
     }
@@ -96,6 +146,8 @@ impl ClientManagement {
     }
 
     pub(crate) fn finish_run(&self) {
+        self.set_route_refusal(None);
+        *self.last_exit_refusal.lock().unwrap() = None;
         *self.running.lock().unwrap() = false;
         self.notify();
     }
@@ -172,6 +224,7 @@ impl ClientManagement {
                     label: label.to_owned(),
                     waiting_for_manual_funding: false,
                     waiting_for_relay_admission: false,
+                    funding_rejection: None,
                     provisioning: false,
                     linked_channel: None,
                     paused: true,
@@ -262,12 +315,21 @@ impl HopManagement {
     }
 
     pub(crate) fn relay_admission_refused(&self, owner: &ClientManagement) {
-        let manual = !owner.controls().automatic_provisioning;
         let mut state = self.state.lock().unwrap();
         state.snapshot.funding_error = Some("relay is not accepting this new channel".into());
-        state.snapshot.waiting_for_relay_admission = manual;
+        state.snapshot.waiting_for_relay_admission = true;
+        state.snapshot.funding_rejection =
+            Some(monad_common::rejection::RejectionCode::ChannelAdmissionDisabled.rejection());
         drop(state);
         owner.notify();
+    }
+
+    pub(crate) fn channel_admitted(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.snapshot.funding_rejection.take().is_some() {
+            state.snapshot.funding_error = None;
+        }
+        state.snapshot.waiting_for_relay_admission = false;
     }
 
     pub(crate) fn status(
@@ -278,9 +340,6 @@ impl HopManagement {
         remaining: i64,
     ) {
         let mut state = self.state.lock().unwrap();
-        if linked.is_some() {
-            state.snapshot.waiting_for_relay_admission = false;
-        }
         state.snapshot.linked_channel = linked;
         state.snapshot.paused = paused;
         state.snapshot.total_paid_msats = paid;

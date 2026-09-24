@@ -20,6 +20,15 @@ pub async fn open_tunnel(
     target_authority: &str,
     local_stream: &mut TcpStream,
 ) -> io::Result<()> {
+    open_tunnel_observed(conn, target_authority, local_stream, None).await
+}
+
+pub(crate) async fn open_tunnel_observed(
+    conn: &RelayConnection,
+    target_authority: &str,
+    local_stream: &mut TcpStream,
+    management: Option<&crate::management::ClientManagement>,
+) -> io::Result<()> {
     validate_network_endpoint(target_authority)?;
     info!("opening tunnel to {target_authority}");
     let mut h2_client = conn.clone_send_request().await;
@@ -46,13 +55,25 @@ pub async fn open_tunnel(
         .map_err(|e| io::Error::other(format!("h2 response error: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("relay rejected CONNECT: {}", response.status()),
-        ));
+        let error = monad_common::rejection::connect_error(response.status(), response.headers());
+        if let Some(management) = management {
+            management.note_exit_result(conn.session_id(), target_authority, Some(&error));
+        }
+        let reply = if monad_common::rejection::Rejection::from_io(&error).is_some_and(|r| {
+            r.code == monad_common::rejection::RejectionCode::DestinationPolicyDenied
+        }) {
+            0x02
+        } else {
+            0x05
+        };
+        let _ = socks::send_reply(local_stream, reply, "0.0.0.0", 0).await;
+        return Err(error);
     }
 
     info!("tunnel established to {target_authority}");
+    if let Some(management) = management {
+        management.note_exit_result(conn.session_id(), target_authority, None);
+    }
 
     // Send SOCKS5 success reply to local client
     socks::send_reply(local_stream, 0x00, "0.0.0.0", 0).await?;

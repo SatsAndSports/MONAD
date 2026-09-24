@@ -2,6 +2,35 @@
 
 ## Runtime admission control
 
+Administrative refusal uses the shared `Rejection { code, message }` model.
+Bootstrap carries it in `{"result":"reject","error":...}` instead of acceptance
+metadata. Noise authenticates/encrypts this negative result, but H2 and operational
+session registration do not follow. A disabled/admission-closed relay retains a
+rejection-only path (five-second deadline, 64 concurrent rejection slots per relay),
+separate from the cancellation generation of accepted sessions. QUIC attestation
+and stream preambles are bounded and remain usable to reach that negative bootstrap
+result. Immediate teardown does not depend on delivering a final notification.
+
+CONNECT conveys refusal with HTTP 503 for temporary administration or 403 for
+destination policy, plus `monad-rejection-code`. The client validates the pair and
+preserves a typed error. Route construction adds issuer/target hop attribution;
+an onward CONNECT refusal belongs to the preceding hop, not its destination.
+
+The connector retries administrative refusal at the current hop, keeping funded
+prefix connections owned by the setup supervisor. The whole refusal/retry episode
+is excluded from the cumulative setup budget; each transport+Noise attempt has its
+own ten-second timeout. Thus repeated fast rejections cannot eventually exhaust the
+budget, but an unresponsive attempt is still a transport failure. Prefix failure
+or caller cancellation interrupts the wait and follows existing awaited cleanup.
+Channel admission waits similarly preserve the funded channel and pause readiness
+budget accounting, including when automatic provisioning is enabled.
+
+A destination-policy refusal is terminal for that route attempt, not an automatic
+retry condition. The configured runtime stays observable with no published route
+until disabled/re-enabled or reconfigured. Final-exit rejection affects only its
+SOCKS request. Full details and the wire compatibility boundary are documented in
+`docs/admission-refusals.md`.
+
 The `monad-management` crate supplies HTTP-over-Unix process endpoints and bounded,
 process-owned command execution. Runtime backends expose sanitized snapshots and
 typed runtime actions. Generation-bound request IDs make retries idempotent during

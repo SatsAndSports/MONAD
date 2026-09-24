@@ -139,6 +139,11 @@ replay management commands, and retains the wallet's existing durable recovery.
 
 ### Client actions
 
+Administrative refusal/retry state is exposed in client `admission_wait` and
+`route_refusal`, and channel admission state in hop `funding_rejection`. Individual
+exit failures appear in `last_exit_refusal`. See [structured admission refusals](admission-refusals.md)
+for codes, hop attribution, retry timing, policy blockage and cancellation behavior.
+
 | Action | Arguments | Completion |
 | --- | --- | --- |
 | `set_enabled` | `{"enabled": false}` or `true` | Disable awaits runtime cleanup; enable requests startup. |

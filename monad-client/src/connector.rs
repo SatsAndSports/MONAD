@@ -36,9 +36,15 @@ pub struct ConnectorRuntime {
     setup_timeout: Option<Duration>,
     management: Option<Arc<crate::management::ClientManagement>>,
     setup_funding: tokio::sync::watch::Sender<Option<String>>,
+    admission_wait: tokio::sync::watch::Sender<bool>,
 }
 
 impl ConnectorRuntime {
+    pub(crate) fn clear_exit_refusal(&self) {
+        if let Some(management) = &self.management {
+            management.clear_exit_refusal();
+        }
+    }
     pub fn new(wallet: Option<Arc<dyn MonadWallet>>) -> io::Result<Self> {
         Self::with_payment_policy(wallet, PaymentPolicy::default())
     }
@@ -55,6 +61,7 @@ impl ConnectorRuntime {
             setup_timeout: None,
             management: None,
             setup_funding: tokio::sync::watch::channel(None).0,
+            admission_wait: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -87,22 +94,28 @@ impl ConnectorRuntime {
         let Some(mut remaining) = self.setup_timeout else {
             return std::future::pending().await;
         };
-        let Some(management) = &self.management else {
-            return tokio::time::sleep(remaining).await;
-        };
-        let mut changes = management.changes();
+        let mut changes = self
+            .management
+            .as_ref()
+            .map(|management| management.changes());
+        let mut admission = self.admission_wait.subscribe();
         let mut funding = self.setup_funding.subscribe();
         loop {
-            changes.borrow_and_update();
-            let waiting = funding
-                .borrow_and_update()
-                .as_ref()
-                .is_some_and(|id| management.waiting_for_funding(id));
+            if let Some(changes) = &mut changes {
+                changes.borrow_and_update();
+            }
+            let waiting_for_admission = *admission.borrow_and_update();
+            let waiting = funding.borrow_and_update().as_ref().is_some_and(|id| {
+                self.management
+                    .as_ref()
+                    .is_some_and(|m| m.waiting_for_funding(id))
+            }) || waiting_for_admission;
             let started = tokio::time::Instant::now();
             tokio::select! {
                 _ = tokio::time::sleep(remaining), if !waiting => return,
-                _ = changes.changed() => {},
+                _ = async { match &mut changes { Some(changes) => { let _ = changes.changed().await; }, None => std::future::pending().await } } => {},
                 _ = funding.changed() => {},
+                _ = admission.changed() => {},
             }
             if !waiting {
                 remaining = remaining.saturating_sub(started.elapsed());
@@ -128,6 +141,25 @@ struct RouteSetup {
 }
 
 impl RouteSetup {
+    fn forget_closed(&self, conn: &Arc<RelayConnection>) {
+        self.conns
+            .lock()
+            .unwrap()
+            .retain(|owned| !Arc::ptr_eq(owned, conn));
+    }
+    async fn prefix_failed(&self) {
+        let connections = self.conns.lock().unwrap().clone();
+        let mut failures = FuturesUnordered::new();
+        for conn in &connections {
+            failures.push(conn.wait_for_failure());
+        }
+        while let Some(result) = failures.next().await {
+            if result.is_some() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    }
     fn track(&self, conn: Arc<RelayConnection>) {
         self.conns.lock().unwrap().push(conn);
     }
@@ -404,6 +436,7 @@ async fn rebuild_route_internal(
                     &old_route.connection_for_hop(idx).unwrap(),
                     runtime,
                 );
+                setup.forget_closed(&old_route.connection_for_hop(idx).unwrap());
             }
         }
         return build_route(route, runtime.clone(), true, setup).await;
@@ -448,12 +481,6 @@ async fn rebuild_route_internal(
                 format!("missing preserved prefix for hop {}", start_hop_idx + 1),
             )
         })?;
-    let next_hop = route.hops().get(start_hop_idx).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("missing route hop {}", start_hop_idx + 1),
-        )
-    })?;
 
     let RouteConnection {
         final_conn: old_final_conn,
@@ -474,12 +501,12 @@ async fn rebuild_route_internal(
     for conn in old_suffix_conns {
         conn.close().await;
         close_failed_funded_connection(&conn, runtime);
+        setup.forget_closed(&conn);
     }
 
     let preserved_hops = old_hops.into_iter().take(start_hop_idx).collect::<Vec<_>>();
-    let h2_connect_stream = open_next_hop_tunnel(&prefix_tail, next_hop).await?;
-    let mut rebuilt_suffix = chain_from_stream(
-        h2_connect_stream,
+    let mut rebuilt_suffix = chain_from_hop(
+        Some(prefix_tail),
         route.clone(),
         start_hop_idx,
         runtime.clone(),
@@ -518,37 +545,13 @@ async fn build_route(
     fund_last_hop: bool,
     setup: Arc<RouteSetup>,
 ) -> io::Result<RouteConnection> {
-    let first = route.hops().first().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "at least one hop is required")
-    })?;
-
-    let RouteHop::Cleartext {
-        addr,
-        pubkey,
-        use_quic,
-    } = first
-    else {
+    if route.hops().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the first hop must be cleartext",
+            "at least one hop is required",
         ));
-    };
-    validate_network_endpoint(addr)?;
-
-    let funded = if *use_quic {
-        info!("connecting to first hop via QUIC: {addr}");
-        let quic_stream = runtime
-            .first_hop_quic_pool
-            .open_stream(addr, ClientAuthMode::Secp256k1(*pubkey))
-            .await?;
-        info!("QUIC connected to {addr}");
-        chain_from_stream(quic_stream, route.clone(), 0, runtime, fund_last_hop, setup).await?
-    } else {
-        info!("connecting to first hop: {addr}");
-        let tcp_stream = TcpStream::connect(addr).await?;
-        info!("TCP connected to {addr}");
-        chain_from_stream(tcp_stream, route.clone(), 0, runtime, fund_last_hop, setup).await?
-    };
+    }
+    let funded = chain_from_hop(None, route.clone(), 0, runtime, fund_last_hop, setup).await?;
     Ok(RouteConnection::from_funded(funded))
 }
 
@@ -678,17 +681,67 @@ async fn open_next_hop_tunnel(
     }
 }
 
-fn chain_from_stream<S>(
-    mut stream: S,
+trait HopTransport: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> HopTransport for T {}
+
+async fn hop_transport(
+    hop: &RouteHop,
+    runtime: &ConnectorRuntime,
+    upstream: Option<&Arc<RelayConnection>>,
+) -> io::Result<Box<dyn HopTransport>> {
+    if let Some(upstream) = upstream {
+        return open_next_hop_tunnel(upstream, hop)
+            .await
+            .map(|s| Box::new(s) as Box<dyn HopTransport>);
+    }
+    let RouteHop::Cleartext {
+        addr,
+        pubkey,
+        use_quic,
+    } = hop
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the first hop must be cleartext",
+        ));
+    };
+    validate_network_endpoint(addr)?;
+    if *use_quic {
+        Ok(Box::new(
+            runtime
+                .first_hop_quic_pool
+                .open_stream(addr, ClientAuthMode::Secp256k1(*pubkey))
+                .await?,
+        ))
+    } else {
+        Ok(Box::new(TcpStream::connect(addr).await?))
+    }
+}
+
+struct AdmissionEpisode<'a>(&'a ConnectorRuntime);
+impl Drop for AdmissionEpisode<'_> {
+    fn drop(&mut self) {
+        self.0.admission_wait.send_replace(false);
+        if let Some(management) = &self.0.management {
+            if management
+                .route_refusal()
+                .is_some_and(|r| r.is_administrative())
+            {
+                management.set_route_refusal(None);
+            }
+            management.set_admission_wait(None);
+        }
+    }
+}
+
+fn chain_from_hop(
+    upstream: Option<Arc<RelayConnection>>,
     route: Route,
     hop_idx: usize,
     runtime: ConnectorRuntime,
     fund_last_hop: bool,
     setup: Arc<RouteSetup>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<FundedConnection>> + Send>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<FundedConnection>> + Send>> {
     let runtime = runtime.clone();
 
     Box::pin(async move {
@@ -702,12 +755,85 @@ where
             hop_label
         );
 
-        let (send_cipher, recv_cipher, session_id, server_accept) =
-            noise_secp256k1::handshake_initiator_with_pubkey_and_server_accept(
-                &mut stream,
-                hop.handshake_pubkey().to_compressed_bytes(),
-            )
-            .await?;
+        let (stream, (send_cipher, recv_cipher, session_id, server_accept)) = {
+            use crate::admission::{AdmissionWait, RouteRefusal, ATTEMPT_TIMEOUT, RETRY_INTERVAL};
+            let _episode = AdmissionEpisode(&runtime);
+            loop {
+                let attempt = async {
+                    let mut stream = hop_transport(hop, &runtime, upstream.as_ref())
+                        .await
+                        .map_err(|e| {
+                            RouteRefusal::annotate(
+                                e,
+                                hop_idx.max(1),
+                                hop_idx + 1,
+                                "connect",
+                                hop_label.clone(),
+                            )
+                        })?;
+                    let accepted =
+                        noise_secp256k1::handshake_initiator_with_pubkey_and_server_accept(
+                            &mut stream,
+                            hop.handshake_pubkey().to_compressed_bytes(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            RouteRefusal::annotate(
+                                e,
+                                hop_idx + 1,
+                                hop_idx + 1,
+                                "session",
+                                hop_label.clone(),
+                            )
+                        })?;
+                    Ok::<_, io::Error>((stream, accepted))
+                };
+                let result = tokio::select! {
+                    biased;
+                    () = setup.prefix_failed() => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "preserved route prefix failed")),
+                    result = tokio::time::timeout(ATTEMPT_TIMEOUT, attempt) => result.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "hop connection attempt timed out"))),
+                };
+                match result {
+                    Ok(accepted) => {
+                        if let Some(management) = &runtime.management {
+                            management.set_route_refusal(None);
+                        }
+                        break accepted;
+                    }
+                    Err(error) => {
+                        if let Some(management) = &runtime.management {
+                            management.set_route_refusal(RouteRefusal::from_io(&error).cloned());
+                        }
+                        let Some(refusal) = RouteRefusal::from_io(&error)
+                            .filter(|r| r.is_administrative())
+                            .cloned()
+                        else {
+                            return Err(error);
+                        };
+                        runtime.admission_wait.send_replace(true);
+                        if let Some(management) = &runtime.management {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis()
+                                .min(u64::MAX as u128) as u64;
+                            management.set_admission_wait(Some(AdmissionWait {
+                                refusal,
+                                retry_at_unix_ms: now
+                                    .saturating_add(RETRY_INTERVAL.as_millis() as u64),
+                                retry_interval_ms: RETRY_INTERVAL.as_millis() as u64,
+                            }));
+                        }
+                        info!(%error, "administrative refusal; preserving prefix and retrying in five seconds");
+                        tokio::select! {
+                            biased;
+                            () = setup.prefix_failed() => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "preserved route prefix failed during administrative wait")),
+                            () = tokio::time::sleep(RETRY_INTERVAL) => {},
+                        }
+                    }
+                }
+            }
+        };
         let capabilities = server_accept.capabilities.clone();
 
         let noise_stream = noise_secp256k1::SecpNoiseStream::new(
@@ -783,10 +909,8 @@ where
                 hop_display_label(next_hop)
             );
 
-            let h2_connect_stream = open_next_hop_tunnel(&conn, next_hop).await?;
-
-            let mut next_funded = chain_from_stream(
-                h2_connect_stream,
+            let mut next_funded = chain_from_hop(
+                Some(conn.clone()),
                 route.clone(),
                 hop_idx + 1,
                 runtime.clone(),

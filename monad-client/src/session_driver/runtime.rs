@@ -176,6 +176,7 @@ pub(super) async fn run_session_driver(
                                 &config.conn.cleartext_byte_counters,
                             )?;
                             if let Some((owner, hop)) = &config.management {
+                                if super::state::relay_confirms_intended_channel(&state) { hop.channel_admitted(); }
                                 if total_paid_millisats > previous_paid {
                                     owner.events.record("payment_observed", serde_json::json!({
                                         "session_id": hex::encode(config.conn.session_id),
