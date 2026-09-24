@@ -30,8 +30,10 @@ not YAML edits; the HTTP management service uses these same controls.
 
 The listener stays bound while disabled so the same instance can be re-enabled.
 Normal defaults retain existing behavior. New-channel refusal uses the new
-`LinkAdmissionDisabled` control error; clients using an older exhaustive wire-error
-enum need a coordinated update before using this control.
+`CHANNEL_ADMISSION_DISABLED` control error. Bootstrap rejection now uses a minimal
+structured error, and CONNECT refusal carries a machine-readable reason header.
+Update clients and relays together for these alpha wire changes; no wallet/schema
+migration or database reset is required.
 
 Client embedders can supply one `Arc<ClientManagement>` per configured client to
 `run_configured_client_managed`, or attach a handle to a `ConnectorRuntime` with
@@ -51,6 +53,17 @@ Deliberate manual-funding waits do not consume the route setup timeout; network
 setup, mint request, and heartbeat deadlines still apply. A relay's new-channel
 refusal retains the already-funded channel and retries its link every five seconds
 instead of opening replacements. Transport failures still use normal route rebuilds.
+
+Explicit administrative session/CONNECT refusals during route construction retry
+every five seconds without discarding healthy prefix sessions or spending the route
+setup budget. Each connection attempt remains bounded. Disable the client through
+management to cancel these waits and clean up the partial route. An individual
+exit refusal fails its SOCKS request promptly while other tunnels continue.
+
+`DESTINATION_POLICY_DENIED` is distinct from temporary admission refusal. A denied
+next relay blocks the configured route without automatic retries; management stays
+available to inspect the reason and disable/re-enable the client. Destination policy
+rules themselves are not implemented yet. See [admission refusals](docs/admission-refusals.md).
 
 MONAD is a multi-hop, VPN-like TCP tunneling system built in Rust.
 

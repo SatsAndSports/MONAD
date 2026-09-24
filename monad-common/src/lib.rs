@@ -12,6 +12,7 @@ pub mod payment_units;
 pub mod protocol;
 pub mod proxy;
 pub mod quic_cert_identity;
+pub mod rejection;
 pub mod secp_identity;
 pub mod session;
 pub mod wallet_lock;

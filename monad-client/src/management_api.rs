@@ -64,6 +64,8 @@ impl Backend for ClientBackend {
                     name,
                     json!({
             "controls": c.controls(), "running": c.is_running(), "hops": c.hops(), "events": c.events.snapshot(),
+            "admission_wait": c.admission_wait(), "last_exit_refusal": c.last_exit_refusal(),
+            "route_refusal": c.route_refusal(),
                     }),
                 )
             })

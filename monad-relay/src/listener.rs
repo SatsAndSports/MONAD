@@ -57,24 +57,83 @@ async fn run_quic_noise_session(
     label_suffix: &str,
     runtime: QuicSessionRuntime,
 ) {
+    let registry = runtime.session_registry.clone();
+    if let Some(rejection) = registry.session_rejection() {
+        if let Some(_slot) = registry.rejection_slot() {
+            reject_noise_session(quic_stream, responder_secret_key, rejection).await;
+        }
+        return;
+    }
+    registry
+        .run_admitted(run_quic_noise_session_admitted(
+            quic_stream,
+            responder_secret_key,
+            remote,
+            stream_id,
+            label_suffix,
+            runtime,
+        ))
+        .await;
+}
+
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn reject_noise_session<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: T,
+    key: [u8; 32],
+    rejection: monad_common::rejection::Rejection,
+) {
+    use tokio::io::AsyncWriteExt;
+    let _ = tokio::time::timeout(BOOTSTRAP_TIMEOUT, async {
+        let _ = noise_secp256k1::handshake_responder_with_secret_key_bytes_and_accept_builder(
+            &mut stream,
+            key,
+            |_| Err(rejection),
+        )
+        .await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+}
+
+async fn run_quic_noise_session_admitted(
+    quic_stream: QuicStream,
+    responder_secret_key: [u8; 32],
+    remote: std::net::SocketAddr,
+    stream_id: quinn::StreamId,
+    label_suffix: &str,
+    runtime: QuicSessionRuntime,
+) {
     let mut quic_stream = quic_stream;
-    let (send_cipher, recv_cipher, session_id, bootstrap_accept) =
-        match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_accept_builder(
+    let (send_cipher, recv_cipher, session_id, bootstrap_accept) = match tokio::time::timeout(
+        BOOTSTRAP_TIMEOUT,
+        noise_secp256k1::handshake_responder_with_secret_key_bytes_and_accept_builder(
             &mut quic_stream,
             responder_secret_key,
-            |hello| runtime.config.bootstrap_accept_v1(hello),
-        )
-        .await
-        {
-            Ok(v) => {
-                info!("secp noise handshake complete with {remote} (QUIC {stream_id:?} {label_suffix})");
-                v
-            }
-            Err(e) => {
-                error!("secp noise handshake failed with {remote} (QUIC {stream_id:?} {label_suffix}): {e}");
-                return;
-            }
-        };
+            |hello| match runtime.session_registry.session_rejection() {
+                Some(rejection) => Err(rejection),
+                None => Ok(runtime.config.bootstrap_accept_v1(hello)),
+            },
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "bootstrap timed out",
+        ))
+    }) {
+        Ok(v) => {
+            info!(
+                "secp noise handshake complete with {remote} (QUIC {stream_id:?} {label_suffix})"
+            );
+            v
+        }
+        Err(e) => {
+            error!("secp noise handshake failed with {remote} (QUIC {stream_id:?} {label_suffix}): {e}");
+            return;
+        }
+    };
     let secp_stream = noise_secp256k1::SecpNoiseStream::new(
         quic_stream,
         send_cipher,
@@ -662,14 +721,23 @@ where
 
                 sessions.push(std::panic::AssertUnwindSafe(async move {
                     let registry = services.session_registry.clone();
+                    if let Some(rejection) = registry.session_rejection() {
+                        if let Some(_slot) = registry.rejection_slot() {
+                            reject_noise_session(tcp_stream, transport_key.normalized_secret_bytes(), rejection).await;
+                        }
+                        return;
+                    }
                     registry.run_admitted(async move {
                     let (send_cipher, recv_cipher, session_id, bootstrap_accept) =
-                        match noise_secp256k1::handshake_responder_with_secret_key_bytes_and_accept_builder(
+                        match tokio::time::timeout(BOOTSTRAP_TIMEOUT, noise_secp256k1::handshake_responder_with_secret_key_bytes_and_accept_builder(
                             &mut tcp_stream,
                             transport_key.normalized_secret_bytes(),
-                            |hello| config.bootstrap_accept_v1(hello),
-                        )
-                        .await {
+                            |hello| match services.session_registry.session_rejection() {
+                                Some(rejection) => Err(rejection),
+                                None => Ok(config.bootstrap_accept_v1(hello)),
+                            },
+                        ))
+                        .await.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "bootstrap timed out"))) {
                             Ok(v) => {
                                 info!("secp noise handshake complete with {peer_addr} (TCP)");
                                 v
@@ -773,24 +841,24 @@ where
                                 let authenticated = authenticated.clone();
                                 let conn = conn.clone();
                                 stream_tasks.push(std::panic::AssertUnwindSafe(async move {
-                                    let registry = services.session_registry.clone();
-                                    registry.run_admitted(async move {
+                                    let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
                                     let mut send = send;
                                     let mut recv = recv;
                                     let mut kind = [0u8; 1];
-                                    if recv.read_exact(&mut kind).await.is_err() {
+                                    if !matches!(tokio::time::timeout_at(deadline, recv.read_exact(&mut kind)).await, Ok(Ok(_))) {
                                         return;
                                     }
 
                                     if kind[0] == AUTH_STREAM_KIND {
-                                        if let Err(e) = serve_attestation_stream(
+                                        if let Err(e) = tokio::time::timeout_at(deadline, serve_attestation_stream(
                                             &conn,
                                             &transport_key,
                                             &authenticated,
                                             &mut send,
                                             &mut recv,
-                                        )
+                                        ))
                                         .await
+                                        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "attestation timed out")))
                                         {
                                             error!("QUIC secp256k1 auth failed with {remote} ({stream_id:?}): {e}");
                                         }
@@ -836,8 +904,8 @@ where
                                             }
 
                                             let mut tweak = [0u8; 32];
-                                            if let Err(e) = recv.read_exact(&mut tweak).await {
-                                                error!("failed to read tweaked QUIC preamble with {remote} ({stream_id:?}): {e}");
+                                            if !matches!(tokio::time::timeout_at(deadline, recv.read_exact(&mut tweak)).await, Ok(Ok(_))) {
+                                                error!("failed to read tweaked QUIC preamble with {remote} ({stream_id:?})");
                                                 return;
                                             }
 
@@ -876,7 +944,6 @@ where
                                     }
 
                                     info!("QUIC stream {stream_id:?} from {remote} closed");
-                                    }).await;
                                 }).catch_unwind().boxed());
                             }
                             Err(quinn::ConnectionError::ApplicationClosed(_))
@@ -955,4 +1022,23 @@ where
 
     info!("relay shut down");
     result
+}
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn rejection_exchange_times_out_without_creating_a_session() {
+        use tokio::io::AsyncReadExt;
+        let key = SecpTransportKeypair::generate();
+        let (mut peer, stream) = tokio::io::duplex(64);
+        let started = Instant::now();
+        reject_noise_session(
+            stream,
+            key.normalized_secret_bytes(),
+            monad_common::rejection::RejectionCode::RelayDisabled.rejection(),
+        )
+        .await;
+        assert_eq!(started.elapsed(), BOOTSTRAP_TIMEOUT);
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    }
 }

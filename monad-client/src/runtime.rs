@@ -412,7 +412,12 @@ async fn run_configured_client_leaf(
             stats.clone(),
             &mut manager_shutdown,
         );
-        let listener = run_socks_listener_shared(listener.clone(), conn_rx, leaf_shutdown_rx);
+        let listener = run_socks_listener_shared(
+            listener.clone(),
+            conn_rx,
+            leaf_shutdown_rx,
+            Some(controls.clone()),
+        );
         tokio::pin!(manager);
         tokio::pin!(listener);
 
@@ -526,6 +531,11 @@ where
         };
         match connected {
             Err(err) => {
+                if crate::admission::RouteRefusal::is_policy_denial(&err) {
+                    warn!(%err, "route blocked by destination policy; disable/re-enable or reconfigure to retry");
+                    shutdown.await;
+                    return Ok(());
+                }
                 warn!("failed to connect route: {err}");
             }
             Ok(route_conn) => {
@@ -540,6 +550,7 @@ where
                     let funded_hop_count =
                         active_route.hops().iter().filter(|hop| hop.funded).count();
                     let conn = active_route.final_connection_arc();
+                    runtime.clear_exit_refusal();
                     let _ = conn_tx.send(Some(conn.clone()));
                     let snapshot = stats.record_route_connected();
                     info!(
@@ -659,6 +670,11 @@ where
                             continue;
                         }
                         Err(err) => {
+                            if crate::admission::RouteRefusal::is_policy_denial(&err) {
+                                warn!(%err, "route blocked by destination policy; disable/re-enable or reconfigure to retry");
+                                shutdown.await;
+                                return Ok(());
+                            }
                             let snapshot = stats.record_suffix_rebuild_failure_with_fallback();
                             warn!(
                                 hop = hop_idx + 1,
@@ -747,13 +763,14 @@ pub async fn run_socks_listener(
     conn_rx: watch::Receiver<Option<Arc<RelayConnection>>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    run_socks_listener_shared(Arc::new(listener), conn_rx, shutdown_rx).await
+    run_socks_listener_shared(Arc::new(listener), conn_rx, shutdown_rx, None).await
 }
 
 async fn run_socks_listener_shared(
     listener: Arc<TcpListener>,
     conn_rx: watch::Receiver<Option<Arc<RelayConnection>>>,
     mut shutdown_rx: watch::Receiver<bool>,
+    management: Option<Arc<crate::management::ClientManagement>>,
 ) -> std::io::Result<()> {
     let mut connections: FuturesUnordered<BoxFuture<'static, std::thread::Result<()>>> =
         FuturesUnordered::new();
@@ -771,6 +788,7 @@ async fn run_socks_listener_shared(
                 };
                 let conn_rx = conn_rx.clone();
                 let shutdown_rx = shutdown_rx.clone();
+                let management = management.clone();
 
                 connections.push(std::panic::AssertUnwindSafe(async move {
                     let result = async {
@@ -786,7 +804,7 @@ async fn run_socks_listener_shared(
                                 return Ok(());
                             }
                         };
-                        tunnel::open_tunnel(&conn, &target.authority, &mut stream).await
+                        tunnel::open_tunnel_observed(&conn, &target.authority, &mut stream, management.as_deref()).await
                     }
                     .await;
                     if let Err(err) = result {
@@ -1032,6 +1050,102 @@ mod tests {
         let selected = selected_clients(&config, Some("second")).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "second");
+    }
+
+    #[tokio::test]
+    async fn destination_policy_blocks_route_without_killing_management_or_retrying() {
+        use crate::route::{Route, RouteHop};
+        use monad_common::{
+            noise_secp256k1,
+            rejection::{RejectionCode, CONNECT_REJECTION_HEADER},
+            secp_identity::SecpTransportKeypair,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key = SecpTransportKeypair::generate();
+        let pubkey = key.pubkey();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (send, recv, id) = noise_secp256k1::handshake_responder_with_secret_key_bytes(
+                &mut stream,
+                key.normalized_secret_bytes(),
+            )
+            .await
+            .unwrap();
+            let stream =
+                noise_secp256k1::SecpNoiseStream::new(stream, send, recv, id, "policy test");
+            let mut h2 = h2::server::handshake(stream).await.unwrap();
+            let (request, mut respond) = h2.accept().await.unwrap().unwrap();
+            let _body = request.into_body();
+            respond
+                .send_response(
+                    http::Response::builder()
+                        .status(403)
+                        .header(
+                            CONNECT_REJECTION_HEADER,
+                            RejectionCode::DestinationPolicyDenied.header_value(),
+                        )
+                        .body(())
+                        .unwrap(),
+                    true,
+                )
+                .unwrap();
+            while h2.accept().await.is_some() {}
+        });
+        let route = Route::new(vec![
+            RouteHop::Cleartext {
+                addr: addr.to_string(),
+                pubkey,
+                use_quic: false,
+            },
+            RouteHop::Cleartext {
+                addr: "127.0.0.1:1".into(),
+                pubkey,
+                use_quic: false,
+            },
+        ])
+        .unwrap();
+        let management = Arc::new(crate::management::ClientManagement::default());
+        let runtime = ConnectorRuntime::new(None)
+            .unwrap()
+            .with_management(management.clone());
+        let (conn_tx, _conn_rx) = watch::channel(None);
+        let stats = SharedRouteRuntimeStats::default();
+        let observed = stats.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut task = tokio::spawn(async move {
+            let mut shutdown = Box::pin(async {
+                let _ = stopped.await;
+            });
+            connection_manager_loop(
+                &route,
+                runtime,
+                Arc::new(MockWallet::new()),
+                conn_tx,
+                stats,
+                &mut shutdown,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            management.route_refusal().unwrap().rejection.code,
+            RejectionCode::DestinationPolicyDenied
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(500), &mut task)
+            .await
+            .is_err());
+        assert_eq!(observed.snapshot().route_connect_attempts_total, 1);
+        assert!(management.admission_wait().is_none());
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

@@ -24,6 +24,19 @@ impl Default for RelayControls {
     }
 }
 
+impl RelayControls {
+    pub(crate) fn tunnel_rejection(self) -> Option<monad_common::rejection::RejectionCode> {
+        use monad_common::rejection::RejectionCode;
+        if !self.enabled {
+            Some(RejectionCode::RelayDisabled)
+        } else if !self.accept_new_tunnels {
+            Some(RejectionCode::TunnelAdmissionDisabled)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Admission {
     controls: RelayControls,
@@ -38,12 +51,25 @@ struct RegisteredSession {
     monitor: Option<crate::session::SessionMonitor>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SessionRegistry {
     inner: Mutex<HashMap<[u8; 32], RegisteredSession>>,
     admission: Mutex<Admission>,
     drained: Notify,
     pub events: monad_management::events::EventLog,
+    rejection_slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            admission: Default::default(),
+            drained: Default::default(),
+            events: Default::default(),
+            rejection_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -80,6 +106,22 @@ impl SessionRegistry {
 
     pub fn controls(&self) -> RelayControls {
         self.admission.lock().unwrap().controls
+    }
+
+    pub fn session_rejection(&self) -> Option<monad_common::rejection::Rejection> {
+        use monad_common::rejection::RejectionCode;
+        let controls = self.controls();
+        if !controls.enabled {
+            Some(RejectionCode::RelayDisabled.rejection())
+        } else if !controls.accept_new_sessions {
+            Some(RejectionCode::SessionAdmissionDisabled.rejection())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn rejection_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.rejection_slots.clone().try_acquire_owned().ok()
     }
 
     pub(crate) fn monitor(&self, id: [u8; 32], monitor: crate::session::SessionMonitor) {

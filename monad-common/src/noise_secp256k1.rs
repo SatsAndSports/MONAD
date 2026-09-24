@@ -13,9 +13,9 @@ use crate::bootstrap::{
     decode_client_hello, decode_server_response, decode_v1_client_hello, decode_v1_server_accept,
     encode_client_hello, encode_server_response, highest_supported_version, initial_client_hello,
     initial_server_accept_v1, is_supported_cashu_spilman_protocol_version,
-    is_supported_pricing_policy, server_accept, supported_bootstrap_versions,
-    validate_v1_client_hello, validate_v1_server_accept, BootstrapServerResponse,
-    BootstrapV1ClientHello, BootstrapV1ServerAccept, BOOTSTRAP_VERSION,
+    is_supported_pricing_policy, server_accept, validate_v1_client_hello,
+    validate_v1_server_accept, BootstrapServerResponse, BootstrapV1ClientHello,
+    BootstrapV1ServerAccept, BOOTSTRAP_VERSION,
 };
 use crate::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 
@@ -413,10 +413,21 @@ pub async fn handshake_initiator_with_pubkey_and_hello<T: AsyncRead + AsyncWrite
             }
             Ok((send, recv, session_id, accept))
         }
-        BootstrapServerResponse::Reject { reason, .. } => Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("relay bootstrap rejected session: {reason}"),
-        )),
+        BootstrapServerResponse::Reject { error } => {
+            use crate::rejection::RejectionCode;
+            if !matches!(
+                error.code,
+                RejectionCode::RelayDisabled
+                    | RejectionCode::SessionAdmissionDisabled
+                    | RejectionCode::BootstrapRejected
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid bootstrap rejection code",
+                ));
+            }
+            Err(error.into_io())
+        }
     }
 }
 
@@ -490,33 +501,33 @@ pub async fn handshake_responder_with_secret_key_bytes_and_server_accept<
                         Ok(_) => (server_accept(accept.clone()), true),
                         Err(reason) => (
                             BootstrapServerResponse::Reject {
-                                supported_versions: supported_bootstrap_versions(),
-                                reason,
+                                error: crate::rejection::Rejection::bootstrap(reason),
                             },
                             false,
                         ),
                     },
                     Some(other) => (
                         BootstrapServerResponse::Reject {
-                            supported_versions: supported_bootstrap_versions(),
-                            reason: format!(
+                            error: crate::rejection::Rejection::bootstrap(format!(
                                 "unsupported bootstrap version selected by relay: {other}"
-                            ),
+                            )),
                         },
                         false,
                     ),
                     None => (
                         BootstrapServerResponse::Reject {
-                            supported_versions: supported_bootstrap_versions(),
-                            reason: "no mutually supported bootstrap version".to_string(),
+                            error: crate::rejection::Rejection::bootstrap(
+                                "no mutually supported bootstrap version".into(),
+                            ),
                         },
                         false,
                     ),
                 },
                 Err(reason) => (
                     BootstrapServerResponse::Reject {
-                        supported_versions: supported_bootstrap_versions(),
-                        reason: format!("invalid bootstrap hello: {reason}"),
+                        error: crate::rejection::Rejection::bootstrap(format!(
+                            "invalid bootstrap hello: {reason}"
+                        )),
                     },
                     false,
                 ),
@@ -530,7 +541,7 @@ pub async fn handshake_responder_with_secret_key_bytes_and_server_accept<
 
 pub async fn handshake_responder_with_secret_key_bytes_and_accept_builder<
     T: AsyncRead + AsyncWrite + Unpin,
-    F: FnOnce(&BootstrapV1ClientHello) -> BootstrapV1ServerAccept,
+    F: FnOnce(&BootstrapV1ClientHello) -> Result<BootstrapV1ServerAccept, crate::rejection::Rejection>,
 >(
     stream: &mut T,
     server_key: [u8; 32],
@@ -554,14 +565,13 @@ pub async fn handshake_responder_with_secret_key_bytes_and_accept_builder<
                     Some(BOOTSTRAP_VERSION) => match decode_v1_client_hello(&client_hello)
                         .and_then(|hello| validate_v1_client_hello(&hello).map(|_| hello))
                     {
-                        Ok(hello) => {
-                            let accept = build_accept(&hello);
-                            (server_accept(accept.clone()), true, Some(accept))
-                        }
+                        Ok(hello) => match build_accept(&hello) {
+                            Ok(accept) => (server_accept(accept.clone()), true, Some(accept)),
+                            Err(error) => (BootstrapServerResponse::Reject { error }, false, None),
+                        },
                         Err(reason) => (
                             BootstrapServerResponse::Reject {
-                                supported_versions: supported_bootstrap_versions(),
-                                reason,
+                                error: crate::rejection::Rejection::bootstrap(reason),
                             },
                             false,
                             None,
@@ -569,18 +579,18 @@ pub async fn handshake_responder_with_secret_key_bytes_and_accept_builder<
                     },
                     Some(other) => (
                         BootstrapServerResponse::Reject {
-                            supported_versions: supported_bootstrap_versions(),
-                            reason: format!(
+                            error: crate::rejection::Rejection::bootstrap(format!(
                                 "unsupported bootstrap version selected by relay: {other}"
-                            ),
+                            )),
                         },
                         false,
                         None,
                     ),
                     None => (
                         BootstrapServerResponse::Reject {
-                            supported_versions: supported_bootstrap_versions(),
-                            reason: "no mutually supported bootstrap version".to_string(),
+                            error: crate::rejection::Rejection::bootstrap(
+                                "no mutually supported bootstrap version".into(),
+                            ),
                         },
                         false,
                         None,
@@ -588,8 +598,9 @@ pub async fn handshake_responder_with_secret_key_bytes_and_accept_builder<
                 },
                 Err(reason) => (
                     BootstrapServerResponse::Reject {
-                        supported_versions: supported_bootstrap_versions(),
-                        reason: format!("invalid bootstrap hello: {reason}"),
+                        error: crate::rejection::Rejection::bootstrap(format!(
+                            "invalid bootstrap hello: {reason}"
+                        )),
                     },
                     false,
                     None,
@@ -638,31 +649,27 @@ pub async fn handshake_responder_with_secret_key_bytes<T: AsyncRead + AsyncWrite
                         }
                         Err(reason) => (
                             BootstrapServerResponse::Reject {
-                                supported_versions: supported_bootstrap_versions(),
-                                reason,
+                                error: crate::rejection::Rejection::bootstrap(reason),
                             },
                             false,
                         ),
                     },
                     Some(other) => (
                         BootstrapServerResponse::Reject {
-                            supported_versions: supported_bootstrap_versions(),
-                            reason: format!("selected bootstrap version is unsupported: {other}"),
+                            error: crate::rejection::Rejection::bootstrap(format!("selected bootstrap version is unsupported: {other}")),
                         },
                         false,
                     ),
                     None => (
                         BootstrapServerResponse::Reject {
-                            supported_versions: supported_bootstrap_versions(),
-                            reason: "no supported bootstrap version".to_string(),
+                            error: crate::rejection::Rejection::bootstrap("no supported bootstrap version".into()),
                         },
                         false,
                     ),
                 },
                 Err(err) => (
                     BootstrapServerResponse::Reject {
-                        supported_versions: supported_bootstrap_versions(),
-                        reason: format!("invalid client bootstrap: {err}"),
+                        error: crate::rejection::Rejection::bootstrap(format!("invalid client bootstrap: {err}")),
                     },
                     false,
                 ),

@@ -596,10 +596,10 @@ pub(super) async fn apply_server_error(
 ) {
     clear_control_op(state);
 
-    if code == ServerErrorCode::LinkAdmissionDisabled {
+    if code == ServerErrorCode::ChannelAdmissionDisabled {
         // Retain the funded channel and retry its link at a bounded cadence.
         // Admission policy never authorizes provisioning a replacement.
-        state.funding_retry_not_before = Some(Instant::now() + Duration::from_secs(5));
+        state.funding_retry_not_before = Some(Instant::now() + crate::admission::RETRY_INTERVAL);
         if let Some((owner, hop)) = &config.management {
             hop.relay_admission_refused(owner);
         }

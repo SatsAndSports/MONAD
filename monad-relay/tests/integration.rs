@@ -14496,8 +14496,8 @@ async fn test_bootstrap_rejects_client_without_mutual_pricing_policy() {
     let response = decode_server_response(&server_payload).unwrap();
 
     match response {
-        monad_common::bootstrap::BootstrapServerResponse::Reject { reason, .. } => {
-            assert!(reason.contains("unsupported pricing_policies"));
+        monad_common::bootstrap::BootstrapServerResponse::Reject { error } => {
+            assert!(error.message.contains("unsupported pricing_policies"));
         }
         monad_common::bootstrap::BootstrapServerResponse::Accept { .. } => {
             panic!("expected bootstrap handshake to be rejected")
@@ -14535,8 +14535,10 @@ async fn test_bootstrap_rejects_client_without_mutual_cashu_spilman_protocol_ver
     let response = decode_server_response(&server_payload).unwrap();
 
     match response {
-        monad_common::bootstrap::BootstrapServerResponse::Reject { reason, .. } => {
-            assert!(reason.contains("unsupported cashu_spilman_protocol_keyset_versions"));
+        monad_common::bootstrap::BootstrapServerResponse::Reject { error } => {
+            assert!(error
+                .message
+                .contains("unsupported cashu_spilman_protocol_keyset_versions"));
         }
         monad_common::bootstrap::BootstrapServerResponse::Accept { .. } => {
             panic!("expected bootstrap handshake to be rejected")
@@ -14694,5 +14696,7 @@ async fn test_quic_first_hop_then_tcp() {
     drop(h2);
     conn.shutdown().await;
 }
+#[path = "common/admission.rs"]
+mod admission;
 #[path = "common/management_api.rs"]
 mod management_api;

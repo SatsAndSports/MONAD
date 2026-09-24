@@ -56,8 +56,7 @@ pub enum BootstrapServerResponse {
         response: Value,
     },
     Reject {
-        supported_versions: Vec<u8>,
-        reason: String,
+        error: crate::rejection::Rejection,
     },
 }
 
