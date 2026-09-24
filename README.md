@@ -1,5 +1,57 @@
 # MONAD
 
+### Runtime management foundations
+
+Configured client and relay processes now optionally expose Unix-socket management
+endpoints. See [the headless API reference](docs/management-api.md) for configuration,
+commands, operation tracking, and monitoring semantics.
+
+Run `cargo run -p monad-management -- --config monad.yaml` to aggregate those
+processes on `management.listen`. `GET /v1/snapshot` provides JSON monitoring and
+`GET /v1/events` streams SSE at five samples per second per process. Commands use
+`/v1/processes/{name}/commands`. The TCP listener is loopback-only; this release
+provides a headless API, ready for a later dashboard.
+
+Relay embedders can pass a per-relay `Arc<SessionRegistry>` to
+`run_with_wallet_manager_registry_and_shutdown` and update `RelayControls` while
+the relay runs. All controls default to enabled. These are process-local overrides,
+not YAML edits; the HTTP management service uses these same controls.
+
+- `accept_new_channels = false` rejects first-time channel links, while stored
+  channels can relink and receive payments.
+- `accept_new_tunnels = false` rejects new CONNECT requests with HTTP 503,
+  including onward QUIC tunnels. Established tunnels continue.
+- `accept_new_sessions = false` rejects new sessions, including streams on an
+  existing QUIC connection. Existing sessions continue.
+- `enabled = false` cancels pending handshakes and active sessions. Await
+  `wait_disabled()` for application cleanup before re-enabling. The three admission
+  settings are preserved. Payment channels are not automatically closed by disable;
+  any separately configured expiry auto-close policy remains in effect.
+
+The listener stays bound while disabled so the same instance can be re-enabled.
+Normal defaults retain existing behavior. New-channel refusal uses the new
+`LinkAdmissionDisabled` control error; clients using an older exhaustive wire-error
+enum need a coordinated update before using this control.
+
+Client embedders can supply one `Arc<ClientManagement>` per configured client to
+`run_configured_client_managed`, or attach a handle to a `ConnectorRuntime` with
+`with_management`. `set_automatic_provisioning(false)` permits existing-channel
+reuse and payments but makes an unfunded hop wait. `hops()` exposes partial-route
+sessions; `provision_once(session_id)` authorizes one normal provisioning attempt
+for a waiting hop using the configured funding budget. Duplicate pending requests
+and stale session IDs are rejected. This does not toggle automatic provisioning.
+
+Configured-client `set_enabled(false)` stops route/SOCKS work; `is_running()` stays
+true during cleanup. Re-enable is rejected until cleanup finishes. The SOCKS socket
+stays bound, and connections received while disabled are immediately dropped.
+The connector-only handle exposes funding controls; lifecycle enable/disable is
+implemented by the configured-client runtime owner.
+
+Deliberate manual-funding waits do not consume the route setup timeout; network
+setup, mint request, and heartbeat deadlines still apply. A relay's new-channel
+refusal retains the already-funded channel and retries its link every five seconds
+instead of opening replacements. Transport failures still use normal route rebuilds.
+
 MONAD is a multi-hop, VPN-like TCP tunneling system built in Rust.
 
 It provides:

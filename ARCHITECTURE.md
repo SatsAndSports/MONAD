@@ -1,5 +1,69 @@
 # MONAD Architecture
 
+## Runtime admission control
+
+The `monad-management` crate supplies HTTP-over-Unix process endpoints and bounded,
+process-owned command execution. Runtime backends expose sanitized snapshots and
+typed runtime actions. Generation-bound request IDs make retries idempotent during
+a process lifetime. The HTTP caller does not own an accepted money operation;
+the process executor does. Process shutdown cancels its futures using the existing
+journaled wallet recovery semantics. No management transport retries a mint request.
+
+Snapshot-only registry handles retain billing/counter objects without retaining a
+session owner or forming a registry cycle. Wallet inventories are cached separately
+from traffic counters. Discrete payment events enter a bounded in-memory ring after
+acceptance, never an unbounded channel to a slow observer.
+
+The standalone aggregator polls each process independently at 5 Hz, forwarding only
+new source events and retaining a bounded replay ring. HTTP snapshots are cached
+views; HTTP commands are forwarded with the caller's process generation and request
+ID unchanged. SSE cursors include an aggregator epoch and global sequence. A missing
+history interval produces an explicit reset/source-gap, never silent event loss.
+The HTTP server directly owns its connection futures, including SSE bodies, so
+shutdown/drop closes even blocked subscribers. No browser owns runtime authority.
+
+A relay's session registry owns its runtime admission policy alongside registered
+session cancellation tokens. A short synchronous admission lock orders policy
+changes with session registration, channel validation/acceptance, and CONNECT
+publication. It is never held across an await or for the lifetime of a tunnel.
+CONNECT checks policy both before target setup and before publishing success;
+setup already in flight may finish but cannot publish while admission is off.
+
+Listener-owned TCP and QUIC stream futures run inside a cancellation generation.
+Disable cancels that generation, covering pending Noise/H2 handshakes as well as
+registered sessions. A drop guard tracks completion, and `wait_disabled` waits for
+both these owned futures and session registrations to drain. Re-enable is rejected
+until cleanup finishes and then installs a fresh cancellation generation. QUIC
+transport connections may remain pooled/idle; they cannot admit new MONAD work
+while disabled. Runtime-owned Quinn protocol drivers retain their existing lifetime.
+
+New-channel admission checks relay-known stored state before invoking the normal
+link validator. Stored relinks still undergo normal signature, receiver, funding,
+expiry, and negotiated-version validation. Management does not bypass wallet
+ownership or recovery rules. These controls are a library foundation; process IPC
+and HTTP/SSE aggregation are separate implementation stages.
+
+### Client funding controls
+
+One client management handle tracks live payment drivers by Noise session ID.
+Each driver owns a registration lease; cleanup removes it, preventing commands for
+old sessions from authorizing work on replacement routes. The existing funding loop
+still selects stored channels first and remains the sole caller of provisioning.
+A one-shot request is consumed at the provisioning boundary; it is never a reusable
+credit. Switching automatic provisioning on also consumes any pending manual request.
+
+The setup supervisor observes only the hop currently awaiting funded readiness.
+Time deliberately spent at its manual-funding gate is excluded from the setup
+budget. Other network work retains the remaining budget. Cancellation drops the
+setup caller and then awaits the existing setup supervisor before runtime disable
+is declared complete, preserving blocking wallet work and attachment authority.
+The same cleanup applies to cancellation during suffix rebuild.
+
+Configured-client enable/disable is owned by the leaf supervisor. Disable wakes
+its connection manager, closes the active route, and drains SOCKS work; enable
+cannot supersede an in-progress disable. Listeners remain bound between generations.
+Runtime switches are not persisted to YAML or wallet databases.
+
 ## Overview
 
 ### Terminal Refunds

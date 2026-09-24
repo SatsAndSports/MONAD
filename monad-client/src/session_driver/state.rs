@@ -17,6 +17,10 @@ pub(super) struct SessionDriverConfig {
     pub(super) conn: RelayConnectionHandles,
     pub(super) hop_label: String,
     pub(super) payment_policy: PaymentPolicy,
+    pub(super) management: Option<(
+        Arc<crate::management::ClientManagement>,
+        Arc<crate::management::HopManagement>,
+    )>,
 }
 
 #[derive(Clone)]

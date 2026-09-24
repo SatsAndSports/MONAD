@@ -9,6 +9,7 @@ funds-lifecycle-test = []
 
 [dependencies]
 monad-common = { path = "../monad-common" }
+monad-management = { path = "../monad-management" }
 monad-quic = { path = "../monad-quic" }
 h2 = "0.4"
 futures-util = "0.3"

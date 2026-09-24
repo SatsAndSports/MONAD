@@ -199,7 +199,39 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut workers = JoinSet::new();
+    let registries: BTreeMap<_, _> = prepared
+        .iter()
+        .map(|(relay, ..)| {
+            (
+                relay.name.clone(),
+                Arc::new(monad_relay::session_registry::SessionRegistry::new()),
+            )
+        })
+        .collect();
+    if let Some(path) = config
+        .management
+        .as_ref()
+        .and_then(|m| m.relay_socket.clone())
+    {
+        let backend = Arc::new(monad_relay::management::RelayBackend::new(
+            registries.clone(),
+            wallet_manager.clone(),
+        ));
+        let mut stopped = shutdown_rx.clone();
+        workers.spawn(async move {
+            let result = monad_management::serve_unix(path.into(), backend, async move {
+                while !*stopped.borrow() {
+                    if stopped.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            ("management".to_string(), result)
+        });
+    }
     for (relay, identity, transport_key, _, tcp_listener, quic_endpoint) in prepared {
+        let registry = registries[&relay.name].clone();
         let receiver_pubkey_hex = wallet_manager.receiver_pubkey_hex(&relay.name)?;
         let server_config = Arc::new(listener::ServerConfig {
             identity,
@@ -218,11 +250,12 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
         let name = relay.name.clone();
         info!(relay = %name, address = %tcp_listener.local_addr()?, "relay starting");
         workers.spawn(async move {
-            let result = listener::run_with_wallet_manager_and_shutdown(
+            let result = listener::run_with_wallet_manager_registry_and_shutdown(
                 tcp_listener,
                 Some(quic_endpoint),
                 server_config,
                 manager,
+                registry,
                 async move {
                     while !*relay_shutdown.borrow() {
                         if relay_shutdown.changed().await.is_err() {

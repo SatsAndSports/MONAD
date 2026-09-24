@@ -5,6 +5,7 @@ pub mod keyset_refresh;
 #[cfg(feature = "funds-lifecycle-test")]
 mod lifecycle_test;
 pub mod listener;
+pub mod management;
 pub mod mint_recovery;
 pub mod payments;
 pub mod proxy;

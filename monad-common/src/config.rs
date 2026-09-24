@@ -270,6 +270,32 @@ impl MonadConfig {
             }
         }
 
+        if let Some(management) = &self.management {
+            for name in management
+                .manual_funding_clients
+                .iter()
+                .chain(&management.disabled_clients)
+            {
+                if !client_names.contains(name) {
+                    anyhow::bail!("management references unknown client '{name}'");
+                }
+            }
+            if management.relay_socket.is_some()
+                && management.relay_socket == management.client_socket
+            {
+                anyhow::bail!("management relay_socket and client_socket must be distinct");
+            }
+            for path in management
+                .relay_socket
+                .iter()
+                .chain(&management.client_socket)
+                .chain(management.processes.values())
+            {
+                if !Path::new(path).is_absolute() {
+                    anyhow::bail!("management socket paths must be absolute");
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -342,6 +368,17 @@ pub struct ManagementConfig {
     pub listen: String,
     #[serde(default)]
     pub auth_token: Option<String>,
+    #[serde(default)]
+    pub relay_socket: Option<String>,
+    #[serde(default)]
+    pub client_socket: Option<String>,
+    /// Named process Unix sockets consumed by the HTTP aggregator.
+    #[serde(default)]
+    pub processes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub manual_funding_clients: BTreeSet<String>,
+    #[serde(default)]
+    pub disabled_clients: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -786,6 +823,40 @@ clients:
     fn substitute_missing_is_error() {
         std::env::remove_var("MONAD_TEST_MISSING");
         assert!(substitute_env_vars("${MONAD_TEST_MISSING}").is_err());
+    }
+
+    #[test]
+    fn management_validates_client_names_and_socket_paths() {
+        let mut config: MonadConfig = serde_yaml::from_str(&minimal_config_yaml()).unwrap();
+        config
+            .management
+            .as_mut()
+            .unwrap()
+            .manual_funding_clients
+            .insert("typo".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown client"));
+        let management = config.management.as_mut().unwrap();
+        management.manual_funding_clients = BTreeSet::from(["c1".into()]);
+        management.client_socket = Some("relative.sock".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("absolute"));
+        let management = config.management.as_mut().unwrap();
+        management.client_socket = Some("/tmp/client.sock".into());
+        management.relay_socket = management.client_socket.clone();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("distinct"));
+        config.management.as_mut().unwrap().relay_socket = Some("/tmp/relay.sock".into());
+        config.validate().unwrap();
     }
 
     #[test]

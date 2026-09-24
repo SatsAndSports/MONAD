@@ -34,6 +34,8 @@ pub struct ConnectorRuntime {
     payment_policy: PaymentPolicy,
     setup_tail: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     setup_timeout: Option<Duration>,
+    management: Option<Arc<crate::management::ClientManagement>>,
+    setup_funding: tokio::sync::watch::Sender<Option<String>>,
 }
 
 impl ConnectorRuntime {
@@ -51,11 +53,61 @@ impl ConnectorRuntime {
             payment_policy,
             setup_tail: Arc::new(Mutex::new(None)),
             setup_timeout: None,
+            management: None,
+            setup_funding: tokio::sync::watch::channel(None).0,
         })
     }
 
     pub fn with_mock_wallet() -> io::Result<Self> {
         Self::new(Some(Arc::new(MockWallet::new())))
+    }
+
+    pub fn with_management(mut self, management: Arc<crate::management::ClientManagement>) -> Self {
+        self.management = Some(management);
+        self
+    }
+
+    /// Await the setup supervisor after cancellation, retaining wallet authority.
+    pub async fn wait_for_setup_cleanup(&self) {
+        use std::future::Future;
+        std::future::poll_fn(|cx| {
+            let mut completion = self.setup_tail.lock().unwrap();
+            if let Some(receiver) = completion.as_mut() {
+                if std::pin::Pin::new(receiver).poll(cx).is_pending() {
+                    return std::task::Poll::Pending;
+                }
+            }
+            *completion = None;
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    async fn setup_deadline(&self) {
+        let Some(mut remaining) = self.setup_timeout else {
+            return std::future::pending().await;
+        };
+        let Some(management) = &self.management else {
+            return tokio::time::sleep(remaining).await;
+        };
+        let mut changes = management.changes();
+        let mut funding = self.setup_funding.subscribe();
+        loop {
+            changes.borrow_and_update();
+            let waiting = funding
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|id| management.waiting_for_funding(id));
+            let started = tokio::time::Instant::now();
+            tokio::select! {
+                _ = tokio::time::sleep(remaining), if !waiting => return,
+                _ = changes.changed() => {},
+                _ = funding.changed() => {},
+            }
+            if !waiting {
+                remaining = remaining.saturating_sub(started.elapsed());
+            }
+        }
     }
 
     /// Bound setup work, excluding the time needed to quiesce cancelled tasks.
@@ -114,12 +166,7 @@ where
         if let Some(previous) = previous {
             let _ = previous.await;
         }
-        let deadline = async {
-            match runtime.setup_timeout {
-                Some(duration) => tokio::time::sleep(duration).await,
-                None => std::future::pending().await,
-            }
-        };
+        let deadline = runtime.setup_deadline();
         let result = {
             tokio::pin!(build);
             tokio::select! {
@@ -517,6 +564,7 @@ async fn optionally_fund_session(
     wallet: Option<Arc<dyn MonadWallet>>,
     hop_label: &str,
     payment_policy: PaymentPolicy,
+    runtime: &ConnectorRuntime,
 ) -> io::Result<FundedConnection> {
     let Some(wallet) = wallet else {
         return Ok(FundedConnection {
@@ -529,10 +577,26 @@ async fn optionally_fund_session(
 
     info!("{hop_label}: opening funded control session");
     let (control_task, ready_rx, failure_rx) =
-        session_driver::start_session_payment_driver(&conn, wallet, hop_label, payment_policy)
-            .await?;
+        session_driver::start_managed_session_payment_driver(
+            &conn,
+            wallet,
+            hop_label,
+            payment_policy,
+            runtime.management.clone(),
+        )
+        .await?;
     info!("{hop_label}: waiting for funded session readiness");
     conn.add_task(control_task);
+    struct FundingStage<'a>(&'a tokio::sync::watch::Sender<Option<String>>);
+    impl Drop for FundingStage<'_> {
+        fn drop(&mut self) {
+            self.0.send_replace(None);
+        }
+    }
+    runtime
+        .setup_funding
+        .send_replace(Some(hex::encode(conn.session_id())));
+    let _stage = FundingStage(&runtime.setup_funding);
     ready_rx.await.map_err(|_| {
         io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -693,6 +757,7 @@ where
             },
             &funding_label,
             runtime.payment_policy,
+            &runtime,
         )
         .await?;
         let conn = funded.conn;

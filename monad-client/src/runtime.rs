@@ -192,6 +192,28 @@ pub async fn run_configured_client_until_shutdown_with_options<S>(
 where
     S: Future<Output = ()> + Send,
 {
+    run_configured_client_managed(
+        config,
+        client_name,
+        stats,
+        options,
+        Default::default(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_configured_client_managed<S>(
+    config: MonadConfig,
+    client_name: Option<&str>,
+    stats: SharedRouteRuntimeStats,
+    options: ConfiguredClientRuntimeOptions,
+    mut management: std::collections::BTreeMap<String, Arc<crate::management::ClientManagement>>,
+    shutdown: S,
+) -> anyhow::Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
     tokio::pin!(shutdown);
     let clients = selected_clients(&config, client_name)?;
     let client_wallet = config
@@ -228,15 +250,63 @@ where
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
+    for prepared in &prepared_clients {
+        let controls = management.entry(prepared.client.name.clone()).or_default();
+        if let Some(settings) = &config.management {
+            if settings
+                .manual_funding_clients
+                .contains(&prepared.client.name)
+            {
+                controls.set_automatic_provisioning(false);
+            }
+            if settings.disabled_clients.contains(&prepared.client.name) {
+                controls.set_enabled(false).map_err(anyhow::Error::msg)?;
+            }
+        }
+    }
+    if let Some(path) = config
+        .management
+        .as_ref()
+        .and_then(|m| m.client_socket.clone())
+    {
+        let backend = Arc::new(crate::management_api::ClientBackend::new(
+            management.clone(),
+            manager.managed_wallet(),
+        ));
+        let mut stopped = shutdown_rx.clone();
+        tasks.spawn(async move {
+            monad_management::serve_unix(path.into(), backend, async move {
+                while !*stopped.borrow() {
+                    if stopped.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .map_err(Into::into)
+        });
+    }
     for prepared in prepared_clients {
+        let controls = management
+            .get(&prepared.client.name)
+            .cloned()
+            .unwrap_or_default();
         let wallet = manager.wallet();
         let stats = stats.clone();
         let shutdown_rx = shutdown_rx.clone();
         tasks.spawn(async move {
             let name = prepared.client.name.clone();
-            run_configured_client_leaf(prepared, wallet, policy, stats, options, shutdown_rx)
-                .await
-                .map_err(|error| anyhow::anyhow!("client '{name}' failed: {error}"))
+            run_configured_client_leaf(
+                prepared,
+                wallet,
+                policy,
+                stats,
+                options,
+                shutdown_rx,
+                controls,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("client '{name}' failed: {error}"))
         });
     }
 
@@ -291,50 +361,78 @@ async fn run_configured_client_leaf(
     stats: SharedRouteRuntimeStats,
     options: ConfiguredClientRuntimeOptions,
     shutdown_rx: watch::Receiver<bool>,
+    controls: Arc<crate::management::ClientManagement>,
 ) -> anyhow::Result<()> {
     let PreparedConfiguredClient {
         client,
         route,
         listener,
     } = prepared;
-    let runtime = ConnectorRuntime::with_payment_policy(Some(wallet.clone()), policy)?
-        .with_setup_timeout(options.route_setup_timeout);
-    info!(client = %client.name, socks = %client.socks, hops = route.hops().len(), "connecting configured route");
-    info!(client = %client.name, socks = %client.socks, "SOCKS5 listener ready");
-
-    let (conn_tx, conn_rx) = watch::channel::<Option<Arc<RelayConnection>>>(None);
-    let (leaf_shutdown_tx, leaf_shutdown_rx) = watch::channel(false);
-    let mut manager_shutdown = Box::pin(shutdown_signal(
-        shutdown_rx.clone(),
-        leaf_shutdown_rx.clone(),
-    ));
-    let manager = connection_manager_loop(
-        &route,
-        runtime,
-        wallet,
-        conn_tx.clone(),
-        stats,
-        &mut manager_shutdown,
-    );
-    let listener = run_socks_listener(listener, conn_rx, leaf_shutdown_rx);
-    tokio::pin!(manager);
-    tokio::pin!(listener);
-
-    let result = tokio::select! {
-        result = &mut manager => {
-            let _ = conn_tx.send(None);
-            let _ = leaf_shutdown_tx.send(true);
-            let listener_result = listener.await;
-            result.and(listener_result.map_err(Into::into))
+    let listener = Arc::new(listener);
+    let mut process_shutdown = shutdown_rx.clone();
+    let mut control_changes = controls.subscribe();
+    loop {
+        if *process_shutdown.borrow() {
+            return Ok(());
         }
-        listener_result = &mut listener => {
-            let _ = conn_tx.send(None);
-            let _ = leaf_shutdown_tx.send(true);
-            let manager_result = manager.await;
-            listener_result.map_err(anyhow::Error::from).and(manager_result)
+        if !controls.begin_run() {
+            tokio::select! {
+                result = listener.accept() => { drop(result?); }
+                result = process_shutdown.changed() => { if result.is_err() { return Ok(()); } }
+                _ = control_changes.changed() => {}
+            }
+            continue;
         }
-    };
-    result
+        let runtime = ConnectorRuntime::with_payment_policy(Some(wallet.clone()), policy)?
+            .with_setup_timeout(options.route_setup_timeout)
+            .with_management(controls.clone());
+        info!(client = %client.name, socks = %client.socks, hops = route.hops().len(), "connecting configured route");
+        info!(client = %client.name, socks = %client.socks, "SOCKS5 listener ready");
+
+        let (conn_tx, conn_rx) = watch::channel::<Option<Arc<RelayConnection>>>(None);
+        let (leaf_shutdown_tx, leaf_shutdown_rx) = watch::channel(false);
+        let mut disabled = controls.subscribe();
+        let process_stop = shutdown_signal(shutdown_rx.clone(), leaf_shutdown_rx.clone());
+        let mut manager_shutdown = Box::pin(async move {
+            tokio::select! {
+                _ = process_stop => {},
+                _ = async {
+                    loop {
+                        if !disabled.borrow_and_update().enabled { break; }
+                        if disabled.changed().await.is_err() { break; }
+                    }
+                } => {},
+            }
+        });
+        let manager = connection_manager_loop(
+            &route,
+            runtime,
+            wallet.clone(),
+            conn_tx.clone(),
+            stats.clone(),
+            &mut manager_shutdown,
+        );
+        let listener = run_socks_listener_shared(listener.clone(), conn_rx, leaf_shutdown_rx);
+        tokio::pin!(manager);
+        tokio::pin!(listener);
+
+        let result = tokio::select! {
+            result = &mut manager => {
+                let _ = conn_tx.send(None);
+                let _ = leaf_shutdown_tx.send(true);
+                let listener_result = listener.await;
+                result.and(listener_result.map_err(Into::into))
+            }
+            listener_result = &mut listener => {
+                let _ = conn_tx.send(None);
+                let _ = leaf_shutdown_tx.send(true);
+                let manager_result = manager.await;
+                listener_result.map_err(anyhow::Error::from).and(manager_result)
+            }
+        };
+        controls.finish_run();
+        result?;
+    }
 }
 
 async fn shutdown_signal(
@@ -417,7 +515,16 @@ where
             "connecting route"
         );
 
-        match connect_route_with_runtime(route, &runtime).await {
+        let connected = tokio::select! {
+            biased;
+            _ = &mut *shutdown => None,
+            result = connect_route_with_runtime(route, &runtime) => Some(result),
+        };
+        let Some(connected) = connected else {
+            runtime.wait_for_setup_cleanup().await;
+            return Ok(());
+        };
+        match connected {
             Err(err) => {
                 warn!("failed to connect route: {err}");
             }
@@ -520,14 +627,21 @@ where
                         "detached suffix channels before route rebuild"
                     );
                     let rebuild_started = Instant::now();
-                    match rebuild_route_from_with_runtime(
+                    let rebuilt = tokio::select! {
+                        biased;
+                        _ = &mut *shutdown => None,
+                        result = rebuild_route_from_with_runtime(
                         route,
                         &runtime,
                         Some(active_route),
                         hop_idx,
-                    )
-                    .await
-                    {
+                        ) => Some(result),
+                    };
+                    let Some(rebuilt) = rebuilt else {
+                        runtime.wait_for_setup_cleanup().await;
+                        return Ok(());
+                    };
+                    match rebuilt {
                         Ok(rebuilt_route) => {
                             let snapshot = stats.record_suffix_rebuild_success();
                             info!(
@@ -630,6 +744,14 @@ fn detach_channels_for_sessions(
 
 pub async fn run_socks_listener(
     listener: TcpListener,
+    conn_rx: watch::Receiver<Option<Arc<RelayConnection>>>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    run_socks_listener_shared(Arc::new(listener), conn_rx, shutdown_rx).await
+}
+
+async fn run_socks_listener_shared(
+    listener: Arc<TcpListener>,
     conn_rx: watch::Receiver<Option<Arc<RelayConnection>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
@@ -910,6 +1032,94 @@ mod tests {
         let selected = selected_clients(&config, Some("second")).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "second");
+    }
+
+    #[tokio::test]
+    async fn managed_disable_interrupts_setup_and_can_restart_same_listener() {
+        use crate::management::ClientManagement;
+        use crate::route::{Route, RouteHop};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks = listener.local_addr().unwrap();
+        let management = Arc::new(ClientManagement::default());
+        let route = Route::new(vec![RouteHop::Cleartext {
+            addr: blackhole.local_addr().unwrap().to_string(),
+            pubkey: monad_common::secp_identity::SecpTransportKeypair::generate().pubkey(),
+            use_quic: false,
+        }])
+        .unwrap();
+        let prepared = PreparedConfiguredClient {
+            client: ClientConfig {
+                name: "managed".into(),
+                socks: socks.to_string(),
+                route: vec![],
+            },
+            route,
+            listener,
+        };
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(run_configured_client_leaf(
+            prepared,
+            Arc::new(MockWallet::new()),
+            PaymentPolicy::default(),
+            SharedRouteRuntimeStats::default(),
+            ConfiguredClientRuntimeOptions {
+                route_setup_timeout: Duration::from_secs(60),
+            },
+            stopped,
+            management.clone(),
+        ));
+        let (mut pending, _) = timeout(Duration::from_secs(2), blackhole.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        // Consume the first Noise byte: setup has entered the real handshake.
+        pending.read_exact(&mut [0]).await.unwrap();
+        let mut socks_peer = tokio::net::TcpStream::connect(socks).await.unwrap();
+        socks_peer.write_all(&[5, 1, 0]).await.unwrap();
+        let mut greeting = [0; 2];
+        timeout(Duration::from_secs(2), socks_peer.read_exact(&mut greeting))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(greeting, [5, 0]);
+        management.set_enabled(false).unwrap();
+        let mut changed = management.changes();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                changed.borrow_and_update();
+                if !management.is_running() {
+                    break;
+                }
+                changed.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), pending.read_to_end(&mut Vec::new()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), socks_peer.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        management.set_enabled(true).unwrap();
+        let (_new, _) = timeout(Duration::from_secs(2), blackhole.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        stop.send(true).unwrap();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

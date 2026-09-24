@@ -39,6 +39,7 @@ pub struct LinkedChannelStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ServerErrorCode {
+    LinkAdmissionDisabled,
     ControlInvalidMessage,
     LinkInvalidPayment,
     LinkInvalidChannel,

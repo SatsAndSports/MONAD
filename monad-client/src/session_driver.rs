@@ -73,14 +73,31 @@ pub async fn start_session_payment_driver(
     hop_label: &str,
     payment_policy: PaymentPolicy,
 ) -> io::Result<(JoinHandle<()>, oneshot::Receiver<()>, watch::Receiver<bool>)> {
+    start_managed_session_payment_driver(conn, wallet, hop_label, payment_policy, None).await
+}
+
+pub async fn start_managed_session_payment_driver(
+    conn: &RelayConnection,
+    wallet: Arc<dyn MonadWallet>,
+    hop_label: &str,
+    payment_policy: PaymentPolicy,
+    management: Option<Arc<crate::management::ClientManagement>>,
+) -> io::Result<(JoinHandle<()>, oneshot::Receiver<()>, watch::Receiver<bool>)> {
     let (control_send, control_recv) = conn.open_control().await?;
     let (ready_tx, ready_rx) = oneshot::channel();
     let (failed_tx, failed_rx) = watch::channel(false);
+    let lease = management
+        .as_ref()
+        .map(|m| m.register(*conn.session_id(), hop_label));
+    if let Some(lease) = &lease {
+        *lease.hop.counters.lock().unwrap() = conn.cleartext_byte_counters();
+    }
     let config = SessionDriverConfig {
         wallet,
         conn: RelayConnectionHandles::from(conn),
         hop_label: hop_label.to_string(),
         payment_policy,
+        management: lease.as_ref().map(|l| (l.owner.clone(), l.hop.clone())),
     };
 
     let attachments = SessionAttachments {
@@ -88,6 +105,7 @@ pub async fn start_session_payment_driver(
         session_id: *conn.session_id(),
     };
     let handle = tokio::spawn(async move {
+        let _lease = lease;
         let _attachments = attachments;
         let result = run_session_driver(control_send, control_recv, ready_tx, config).await;
         if let Err(e) = result {
@@ -1000,6 +1018,7 @@ mod tests {
                     },
                     hop_label: "test".to_string(),
                     payment_policy: PaymentPolicy::default(),
+                    management: None,
                 },
                 &mut state,
                 &mut h2_send,

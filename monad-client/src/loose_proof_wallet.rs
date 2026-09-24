@@ -333,6 +333,17 @@ pub struct LooseProofSummary {
     pub amount_raw: u64,
 }
 
+/// Public custody totals without proof material. Spent totals are historical,
+/// and reserved totals must not be presented as spendable funds.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LooseCustodySummary {
+    pub mint_url: String,
+    pub unit: String,
+    pub state: String,
+    pub proof_count: u64,
+    pub amount_raw: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewLooseProof {
     pub proof_id: String,
@@ -1096,6 +1107,30 @@ impl LooseProofWallet {
             .map_err(|e| LooseProofWalletError::Backend(format!("query proof summaries: {e}")))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| LooseProofWalletError::Backend(format!("decode proof summaries: {e}")))
+    }
+
+    pub fn list_custody_summaries(&self) -> Result<Vec<LooseCustodySummary>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT mint_url, unit, state, COUNT(*), SUM(amount_raw)
+             FROM monad_client_loose_proofs WHERE wallet_name = ?1
+             GROUP BY mint_url, unit, state ORDER BY mint_url, unit, state",
+            )
+            .map_err(|e| LooseProofWalletError::Backend(format!("prepare custody summary: {e}")))?;
+        let rows = stmt
+            .query_map(params![self.wallet_name], |row| {
+                Ok(LooseCustodySummary {
+                    mint_url: row.get(0)?,
+                    unit: row.get(1)?,
+                    state: row.get(2)?,
+                    proof_count: from_i64(row.get::<_, i64>(3)?)?,
+                    amount_raw: from_i64(row.get::<_, i64>(4)?)?,
+                })
+            })
+            .map_err(|e| LooseProofWalletError::Backend(format!("query custody summary: {e}")))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| LooseProofWalletError::Backend(format!("decode custody summary: {e}")))
     }
 
     pub fn reserve_proofs(
@@ -3436,6 +3471,45 @@ mod tests {
                 .state,
             PremintBatchState::Completed
         );
+    }
+
+    #[test]
+    fn custody_summary_distinguishes_reserved_spent_and_other_wallets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custody.db");
+        let first = LooseProofWallet::open(&path, "first").unwrap();
+        let other = LooseProofWallet::open(&path, "other").unwrap();
+        first
+            .import_proofs(&[
+                proof("a", 1, "keyset-a"),
+                proof("b", 2, "keyset-a"),
+                proof("c", 4, "keyset-a"),
+            ])
+            .unwrap();
+        other
+            .import_proofs(&[proof("other", 100, "keyset-a")])
+            .unwrap();
+        first
+            .reserve_selected_proofs(MINT, "sat", &["b".into()])
+            .unwrap();
+        let spent = first
+            .reserve_selected_proofs(MINT, "sat", &["c".into()])
+            .unwrap();
+        first
+            .mark_reservation_spent(&spent.reservation_id, "channel")
+            .unwrap();
+        let summary = first.list_custody_summaries().unwrap();
+        let amount = |state: LooseProofState| {
+            summary
+                .iter()
+                .find(|s| s.state == state.as_str())
+                .unwrap()
+                .amount_raw
+        };
+        assert_eq!(amount(LooseProofState::Available), 1);
+        assert_eq!(amount(LooseProofState::Reserved), 2);
+        assert_eq!(amount(LooseProofState::Spent), 4);
+        assert_eq!(summary.iter().map(|s| s.proof_count).sum::<u64>(), 3);
     }
 
     #[test]

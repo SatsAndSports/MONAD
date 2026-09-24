@@ -147,6 +147,28 @@ pub(crate) struct SessionState {
     cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
 }
 
+/// Snapshot-only handles have no back-reference to the registry/session owner.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionMonitor {
+    billing: Arc<Mutex<BillingState>>,
+    counters: Arc<SessionCounters>,
+}
+
+impl SessionMonitor {
+    pub(crate) async fn snapshot(&self, id: [u8; 32]) -> serde_json::Value {
+        let billing = self.billing.lock().await;
+        let (active, total) = self.counters.snapshot();
+        serde_json::json!({
+            "session_id": hex::encode(id), "inbound_bytes": billing.state.session_total_in,
+            "outbound_bytes": billing.state.session_total_out,
+            "total_paid_msats": billing.state.total_paid_millisats,
+            "remaining_msats": billing.remaining_milli_sats().to_string(),
+            "paused": billing.state.paused, "linked_channel_id": billing.state.linked_channel_id,
+            "active_tunnels": active, "total_tunnels": total,
+        })
+    }
+}
+
 impl SessionState {
     // Lifecycle and shared handles.
 
@@ -156,7 +178,7 @@ impl SessionState {
         config
             .session_registry
             .register_session(session_id, termination.clone());
-        Self {
+        let state = Self {
             billing: Arc::new(Mutex::new(BillingState {
                 state: ServerSessionState {
                     session_total_in: 0,
@@ -186,7 +208,15 @@ impl SessionState {
             keyset_refresh: config.keyset_refresh.clone(),
             cashu_spilman_protocol_version: config.cashu_spilman_protocol_version.clone(),
             cashu_spilman_keyset_versions: config.cashu_spilman_keyset_versions.clone(),
-        }
+        };
+        config.session_registry.monitor(
+            session_id,
+            SessionMonitor {
+                billing: state.billing.clone(),
+                counters: state.counters.clone(),
+            },
+        );
+        state
     }
 
     pub(crate) fn session_id(&self) -> [u8; 32] {
@@ -220,13 +250,29 @@ impl SessionState {
         {
             return Err(crate::payments::LinkError::UnsupportedCashuSpilmanProtocolVersion);
         }
-        let outcome = self.payments.link_channel(
-            self.cashu_spilman_keyset_versions
-                .as_ref()
-                .expect("checked above"),
-            self.session_id,
-            payment_json,
-        )?;
+        let outcome = self.session_registry.with_controls(|controls| {
+            if !controls.enabled || self.is_terminated() {
+                return Err(crate::payments::LinkError::AdmissionDisabled);
+            }
+            if !controls.accept_new_channels {
+                #[derive(serde::Deserialize)]
+                struct ChannelReference {
+                    channel_id: String,
+                }
+                let reference: ChannelReference = serde_json::from_str(payment_json)
+                    .map_err(|e| crate::payments::LinkError::InvalidPayment(e.to_string()))?;
+                if self.payments.channel_state(&reference.channel_id).is_none() {
+                    return Err(crate::payments::LinkError::AdmissionDisabled);
+                }
+            }
+            self.payments.link_channel(
+                self.cashu_spilman_keyset_versions
+                    .as_ref()
+                    .expect("checked above"),
+                self.session_id,
+                payment_json,
+            )
+        })?;
         // Record the side effect before another await can cancel the reducer.
         self.owned_channels
             .lock()
@@ -279,8 +325,19 @@ impl SessionState {
         expected_channel_id: &str,
         payment_json: &str,
     ) -> Result<crate::payments::PaymentOutcome, crate::payments::ChannelPaymentError> {
-        self.payments
-            .apply_channel_payment(self.session_id, expected_channel_id, payment_json)
+        let result = self.payments.apply_channel_payment(
+            self.session_id,
+            expected_channel_id,
+            payment_json,
+        )?;
+        self.session_registry.events.record(
+            "payment_accepted",
+            serde_json::json!({
+                "session_id": hex::encode(self.session_id), "channel_id": result.channel_id,
+                "delta_msats": result.delta_millisats,
+            }),
+        );
+        Ok(result)
     }
 
     pub(crate) fn notify_session_evicted(&self, target_session_id: &[u8; 32], channel_id: String) {
@@ -513,6 +570,15 @@ impl ConnectHandler {
         request: Request<RecvStream>,
         mut respond: server::SendResponse<Bytes>,
     ) {
+        let controls = self.state.session_registry.controls();
+        if !controls.enabled || !controls.accept_new_tunnels {
+            let resp = Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(())
+                .unwrap();
+            let _ = respond.send_response(resp, true);
+            return;
+        }
         if self.state.is_paused().await {
             let resp = Response::builder()
                 .status(StatusCode::PAYMENT_REQUIRED)
@@ -666,8 +732,21 @@ impl ConnectHandler {
             respond.send_response(resp, true)?;
             return Ok(());
         }
-        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
-        let h2_send = respond.send_response(resp, false)?;
+        let h2_send = self.state.session_registry.with_controls(|controls| {
+            if !controls.enabled || !controls.accept_new_tunnels || self.state.is_terminated() {
+                let resp = Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(())
+                    .unwrap();
+                respond.send_response(resp, true)?;
+                return Ok::<_, h2::Error>(None);
+            }
+            let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+            respond.send_response(resp, false).map(Some)
+        })?;
+        let Some(h2_send) = h2_send else {
+            return Ok(());
+        };
         let (_, h2_recv) = request.into_parts();
         let state = self.state.clone();
         let session_id = self.state.session_id;
@@ -1217,6 +1296,43 @@ mod tests {
     }
 
     #[test]
+    fn new_channel_gate_preserves_relinks_and_payments() {
+        let (state, payments) = test_state();
+        let existing = r#"{"channel_id":"existing","balance":0,"capacity":100,"unit":"msat"}"#;
+        state.link_channel(existing).unwrap();
+        payments.release_channel_ownership(state.session_id, "existing");
+        state
+            .session_registry
+            .set_controls(crate::session_registry::RelayControls {
+                accept_new_channels: false,
+                ..Default::default()
+            })
+            .unwrap();
+        state.link_channel(existing).unwrap();
+        let payment = r#"{"channel_id":"existing","balance":10,"capacity":100,"unit":"msat"}"#;
+        assert_eq!(
+            payments
+                .apply_channel_payment(state.session_id, "existing", payment)
+                .unwrap()
+                .delta_millisats,
+            10
+        );
+        assert_eq!(
+            state.link_channel(r#"{"channel_id":"new","balance":0,"capacity":100,"unit":"msat"}"#),
+            Err(LinkError::AdmissionDisabled)
+        );
+        assert!(payments.channel_state("new").is_none());
+        state
+            .session_registry
+            .set_controls(Default::default())
+            .unwrap();
+        state
+            .link_channel(r#"{"channel_id":"new","balance":0,"capacity":100,"unit":"msat"}"#)
+            .unwrap();
+        state.cleanup();
+    }
+
+    #[test]
     fn cleanup_covers_link_before_reducer_and_preserves_replacement_owner() {
         let (state, payments) = test_state();
         let payment = r#"{"channel_id":"owned","balance":0,"capacity":100,"unit":"msat"}"#;
@@ -1547,11 +1663,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_publication_rechecks_pause_and_termination() {
-        for terminate in [false, true] {
+    async fn connect_publication_rechecks_pause_termination_and_admission() {
+        for mode in ["pause", "terminate", "admission"] {
+            let terminate = mode == "terminate";
             let (state, _) = test_state();
             if terminate {
                 state.terminate();
+            }
+            if mode == "admission" {
+                state.billing.lock().await.state.paused = false;
+                state
+                    .session_registry
+                    .set_controls(crate::session_registry::RelayControls {
+                        accept_new_tunnels: false,
+                        ..Default::default()
+                    })
+                    .unwrap();
             }
             let (client_io, server_io) = tokio::io::duplex(4096);
             let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
@@ -1584,6 +1711,8 @@ mod tests {
             let response = response.await;
             if terminate {
                 assert!(response.is_err());
+            } else if mode == "admission" {
+                assert_eq!(response.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
             } else {
                 assert_eq!(response.unwrap().status(), StatusCode::PAYMENT_REQUIRED);
             }
