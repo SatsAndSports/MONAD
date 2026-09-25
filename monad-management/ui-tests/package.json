@@ -1,0 +1,7 @@
+{
+  "name": "monad-mint-ui-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {"test": "playwright test", "demo": "node demo.mjs"},
+  "devDependencies": {"@playwright/test": "1.58.2"}
+}
