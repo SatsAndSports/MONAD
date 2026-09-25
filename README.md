@@ -1,5 +1,21 @@
 # MONAD
 
+### Try the mint management page
+
+```bash
+cargo build -p monad-management -p monad-test-mint
+node monad-management/ui-tests/demo.mjs
+```
+
+Open the printed `/mints` URL in one or more browser tabs. The disposable demo
+starts two SAT/MSAT test mints and the management aggregator; Ctrl-C stops them.
+Keysets and rotation outcomes update across live tabs. Reload restores state
+without resubmitting commands. Each launch uses fresh temporary databases and
+prints their location; they are retained for inspection.
+
+For existing configurations, open `/mints` on your `monad-management` listener.
+See [mint UI usage and browser tests](docs/mint-ui.md).
+
 ### Runtime management foundations
 
 Configured client and relay processes now optionally expose Unix-socket management

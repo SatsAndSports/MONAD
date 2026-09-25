@@ -105,7 +105,8 @@ The normal recipes were then rerun successfully with their repository-defined li
 
 ## Explicit scope boundaries
 
-- No webpage, authentication, remote TCP binding, route editing, or persisted
+- The mint webpage is now available; client/relay pages are not yet implemented.
+  No authentication, remote TCP binding, route editing, or persisted
   runtime overrides. The aggregator rejects non-loopback binds and configured
   `auth_token` rather than pretending authentication exists.
 - API traffic metrics are cleartext/session accounting; encrypted wire metrics
