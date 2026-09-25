@@ -48,6 +48,7 @@ pub struct Service {
     backend: Arc<dyn Backend>,
     operations: Mutex<BTreeMap<String, Operation>>,
     commands: mpsc::Sender<Command>,
+    operation_events: events::EventLog,
 }
 
 impl Service {
@@ -59,6 +60,7 @@ impl Service {
                 backend,
                 operations: Mutex::new(BTreeMap::new()),
                 commands,
+                operation_events: Default::default(),
             }),
             receiver,
         )
@@ -93,6 +95,7 @@ impl Service {
     async fn execute(&self, command: Command) {
         if let Some(op) = self.operations.lock().unwrap().get_mut(&command.request_id) {
             op.state = "running".into();
+            self.record_operation(op);
         }
         let result = self.backend.execute(&command).await;
         let mut operations = self.operations.lock().unwrap();
@@ -109,6 +112,20 @@ impl Service {
                 op.error = Some(error);
             }
         }
+        self.record_operation(op);
+    }
+
+    fn record_operation(&self, op: &Operation) {
+        // Arguments are caller-controlled and may contain secrets. Broadcast
+        // only identifiers and the backend's explicitly public result/error.
+        self.operation_events.record(
+            "operation_updated",
+            json!({
+                "request_id": op.request.request_id, "instance": op.request.instance,
+                "action": op.request.action, "state": op.state,
+                "result": op.result, "error": op.error,
+            }),
+        );
     }
 }
 
@@ -148,9 +165,8 @@ async fn snapshot(
             }
         }
     }
-    Ok(Json(
-        json!({"generation": service.generation, "data": data}),
-    ))
+    Ok(Json(json!({"generation": service.generation, "data": data,
+            "operation_events": service.operation_events.snapshot()})))
 }
 
 async fn command(
@@ -197,6 +213,7 @@ async fn command(
         )
     })?;
     operations.insert(command.request_id, op.clone());
+    service.record_operation(&op);
     Ok((StatusCode::ACCEPTED, Json(op)))
 }
 

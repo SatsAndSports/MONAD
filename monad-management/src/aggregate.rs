@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive},
-        Sse,
+        Html, IntoResponse, Redirect, Response, Sse,
     },
     routing::{get, post},
     Json, Router,
@@ -75,6 +75,10 @@ impl Aggregator {
 
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
+            .route("/", get(root))
+            .route("/mints", get(mints))
+            .route("/assets/mints.css", get(mints_css))
+            .route("/assets/mints.js", get(mints_js))
             .route("/v1/snapshot", get(snapshot))
             .route("/v1/events", get(events))
             .route("/v1/processes/{name}/commands", post(command))
@@ -107,6 +111,7 @@ impl Aggregator {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut generation = String::new();
         let mut seen = BTreeMap::<String, u64>::new();
+        let mut operation_cursor = 0u64;
         loop {
             tick.tick().await;
             let result = async {
@@ -146,9 +151,38 @@ impl Aggregator {
                 // cursors. Refetch without those cursors before publishing it.
                 let was_known = !generation.is_empty();
                 seen.clear();
+                operation_cursor = 0;
                 generation = next_generation;
                 if was_known {
                     continue;
+                }
+            }
+            if let Some(events) = snapshot["operation_events"].as_array() {
+                if let Some(first) = events.first().and_then(|e| e["sequence"].as_u64()) {
+                    if first > operation_cursor.saturating_add(1) {
+                        self.publish(
+                            &name,
+                            "source_gap",
+                            json!({"process": name,
+                            "generation": generation, "source": "operations"}),
+                            None,
+                        );
+                    }
+                }
+                for event in events {
+                    if let Some(sequence) = event["sequence"].as_u64() {
+                        if sequence > operation_cursor {
+                            operation_cursor = sequence;
+                            self.publish(
+                                &name,
+                                "operation_updated",
+                                json!({
+                                "process": name, "generation": generation,
+                                "event": event}),
+                                None,
+                            );
+                        }
+                    }
                 }
             }
             if let Some(instances) = snapshot["data"]["instances"].as_object_mut() {
@@ -236,6 +270,43 @@ impl Aggregator {
                 }
             })
     }
+}
+
+async fn root() -> Redirect {
+    Redirect::temporary("/mints")
+}
+
+async fn mints() -> Response {
+    let mut response = Html(include_str!("ui/mints.html")).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        "content-security-policy",
+        "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    response
+}
+
+async fn mints_css() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "text/css; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("ui/mints.css"),
+    )
+}
+
+async fn mints_js() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "text/javascript; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("ui/mints.js"),
+    )
 }
 
 async fn snapshot(State(state): State<Arc<Aggregator>>) -> Json<Value> {
