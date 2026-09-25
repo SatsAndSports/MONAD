@@ -126,6 +126,27 @@ async fn tcp_sse_aggregates_replays_forwards_and_survives_process_restart() {
         let _ = stopped_api.await;
     }));
     let client = reqwest::Client::new();
+    for (path, content_type) in [
+        ("/mints", "text/html"),
+        ("/assets/mints.js", "text/javascript"),
+        ("/assets/mints.css", "text/css"),
+    ] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with(content_type));
+    }
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/not-found"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
     let view = wait_view(&client, &base, |v| v["processes"]["live"]["online"] == true).await;
     assert_eq!(view["processes"]["missing"]["online"], false);
     let generation = view["processes"]["live"]["generation"].clone();
@@ -137,6 +158,13 @@ async fn tcp_sse_aggregates_replays_forwards_and_survives_process_restart() {
     assert_eq!(sse.headers()["content-type"], "text/event-stream");
     let mut buffer = String::new();
     assert_eq!(next_event(&mut sse, &mut buffer).await.1, "reset");
+    let mut second = client
+        .get(format!("{base}/v1/events"))
+        .send()
+        .await
+        .unwrap();
+    let mut second_buffer = String::new();
+    assert_eq!(next_event(&mut second, &mut second_buffer).await.1, "reset");
     let request = json!({"generation": generation, "request_id": "payment", "instance": "relay", "action": "test", "arguments": {}});
     assert_eq!(
         client
@@ -155,6 +183,16 @@ async fn tcp_sse_aggregates_replays_forwards_and_survives_process_restart() {
             break id;
         }
     };
+    let mut states = Vec::new();
+    while states.len() < 3 {
+        let (_, kind, data) = next_event(&mut second, &mut second_buffer).await;
+        if kind == "operation_updated" {
+            assert_eq!(data["event"]["data"]["request_id"], "payment");
+            states.push(data["event"]["data"]["state"].as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(states, ["queued", "running", "succeeded"]);
+    drop(second);
     let operation: Value = client
         .get(format!("{base}/v1/processes/live/operations/payment"))
         .send()

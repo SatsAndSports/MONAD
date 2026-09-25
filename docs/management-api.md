@@ -1,6 +1,21 @@
-# Headless management API
+# Management API
 
 ## Single localhost TCP endpoint
+
+The mint UI consumes the initial `reset` snapshot and live updates from one SSE
+connection. Process snapshots now also contain a bounded `operation_events` array;
+the aggregator forwards new entries as `operation_updated` with this envelope:
+
+```json
+{"process":"test-mints","generation":"...","event":{"sequence":1,"timestamp_unix_ms":0,"kind":"operation_updated","data":{"request_id":"...","instance":"demo-mint","action":"rotate_keyset","state":"queued","result":null,"error":null}}}
+```
+
+States are `queued` (accepted), `running`, `succeeded`, and `failed`. Repeating an
+identical accepted command does not emit another acceptance. Raw command arguments
+are excluded. This separate 512-entry event ring is independent of the retained
+idempotency records; overflow produces `source_gap` with `source: "operations"`.
+Rebuild the managed processes along with the aggregator to receive command events.
+No database reset is required.
 
 Run the configured runtimes, then the aggregator using the same YAML:
 
@@ -11,7 +26,8 @@ cargo run -p monad-management -- --config monad.yaml
 ```
 
 The aggregator binds `management.listen` (a numeric IPv4/IPv6 loopback address).
-It serves JSON and SSE only; no webpage is included yet. By default it discovers
+It serves JSON, SSE, and the embedded [mint page](mint-ui.md) at `/mints`.
+By default it discovers
 the configured `relay_socket` as process `relays` and `client_socket` as process
 `clients`. An optional `test_mint_socket` is discovered as `test-mints`. For more
 processes, explicitly name all their sockets:

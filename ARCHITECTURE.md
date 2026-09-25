@@ -90,6 +90,13 @@ history interval produces an explicit reset/source-gap, never silent event loss.
 The HTTP server directly owns its connection futures, including SSE bodies, so
 shutdown/drop closes even blocked subscribers. No browser owns runtime authority.
 
+The aggregator also embeds the `/mints` browser page. Its initial state comes from
+the SSE reset snapshot, with subsequent updates ordered on the same stream. The
+process command executor records accepted/running/terminal operation events in a
+separate bounded ring; the aggregator forwards these with generation and request
+identity and detects source gaps. Argument payloads are excluded from broadcasts.
+The browser never owns execution and does not resubmit commands on refresh.
+
 A relay's session registry owns its runtime admission policy alongside registered
 session cancellation tokens. A short synchronous admission lock orders policy
 changes with session registration, channel validation/acceptance, and CONNECT

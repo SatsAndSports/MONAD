@@ -50,7 +50,7 @@ async fn unix_commands_are_generation_bound_idempotent_and_owned() {
             request_id: "one".into(),
             instance: "test".into(),
             action: "gate".into(),
-            arguments: json!({}),
+            arguments: json!({"private_test_argument": "must-not-be-broadcast"}),
         };
         let response = client
             .post("http://localhost/v1/commands")
@@ -108,6 +108,26 @@ async fn unix_commands_are_generation_bound_idempotent_and_owned() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        let snapshot: Value = client
+            .get("http://localhost/v1/snapshot")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let events = snapshot["operation_events"].as_array().unwrap();
+        assert_eq!(events.len(), 3, "duplicate submission emits no acceptance");
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e["data"]["state"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["queued", "running", "succeeded"]
+        );
+        assert!(!serde_json::to_string(events)
+            .unwrap()
+            .contains("must-not-be-broadcast"));
         stop.send(()).unwrap();
         task.await.unwrap().unwrap();
         assert!(!path.exists());
