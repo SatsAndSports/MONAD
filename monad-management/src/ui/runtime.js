@@ -372,6 +372,7 @@ function instanceCard(process, name, state, instance) {
     );
     if (!hops.length) card.append(el("p", "No active hop sessions."));
   } else {
+    const sessions = instance.sessions || [];
     card.append(
       el(
         "h3",
@@ -391,7 +392,7 @@ function instanceCard(process, name, state, instance) {
           "Inbound / outbound (bytes)",
           "Tunnels active / total",
         ],
-        instance.sessions.map((s) => [
+        sessions.map((s) => [
           `${s.session_id.slice(0, 16)}… / ${s.linked_channel_id?.slice(0, 16) || "—"}…`,
           s.paused,
           `${sats(s.remaining_msats)} / ${sats(s.total_paid_msats)}`,
@@ -400,30 +401,52 @@ function instanceCard(process, name, state, instance) {
         ]),
       ),
     );
+    if (!sessions.length) card.append(el("p", "No active relay sessions."));
     card.append(el("h3", "Linked channels"));
+    const inventory = new Map(
+      (state.data.wallet?.channels || [])
+        .filter((channel) => channel.relay_name === name)
+        .map((channel) => [channel.channel_id, channel]),
+    );
+    const linkedChannels = [
+      ...new Set(sessions.map((session) => session.linked_channel_id).filter(Boolean)),
+    ].map((channelId) => ({ channelId, channel: inventory.get(channelId) }));
     card.append(
       table(
         ["Channel", "State", "Mint / unit", "Paid / capacity (sat)", "Action"],
-        (state.data.wallet?.channels || [])
-          .filter((c) => c.relay_name === name && linkedIds(instance).has(c.channel_id))
-          .map((c) => [
-            shortId(c.channel_id),
-            channelState(c),
-            `${c.mint_url} / ${c.unit}`,
-            channelPanel(c),
-            c.retired
-              ? el("span", "Unlink requested — waiting for client", "unlink-pending")
-              : button(
-                  "Request unlink",
-                  process,
-                  name,
-                  "request_channel_unlink",
-                  { channel_id: c.channel_id },
-                  String(c.state).toLowerCase() === "open",
-                ),
-          ]),
+        linkedChannels.map(({ channelId, channel }) =>
+          channel
+            ? [
+                shortId(channel.channel_id),
+                channelState(channel),
+                `${channel.mint_url} / ${channel.unit}`,
+                channelPanel(channel),
+                channel.retired
+                  ? el(
+                      "span",
+                      "Unlink requested — waiting for client",
+                      "unlink-pending",
+                    )
+                  : button(
+                      "Request unlink",
+                      process,
+                      name,
+                      "request_channel_unlink",
+                      { channel_id: channel.channel_id },
+                      String(channel.state).toLowerCase() === "open",
+                    ),
+              ]
+            : [
+                shortId(channelId),
+                el("span", "Details unavailable", "missing-channel"),
+                "—",
+                "—",
+                el("span", "Waiting for wallet inventory", "missing-channel"),
+              ],
+        ),
       ),
     );
+    if (!linkedChannels.length) card.append(el("p", "No linked channels."));
   }
   return card;
 }
@@ -446,6 +469,7 @@ function render() {
     seen.add(key);
     const wallet = el("section", null, "mint");
     wallet.append(el("h2", `${process} · wallet inventory`));
+    const walletData = state.data.wallet;
     if (kind === "clients") {
       wallet.append(
         el(
@@ -456,7 +480,7 @@ function render() {
       wallet.append(
         table(
           ["Mint", "Unit", "Available (raw unit)", "Proofs"],
-          (state.data.wallet?.available_proofs || []).map((p) => [
+          (walletData?.available_proofs || []).map((p) => [
             p.mint_url,
             p.unit,
             p.amount_raw,
@@ -464,16 +488,21 @@ function render() {
           ]),
         ),
       );
+      if (!walletData?.available_proofs?.length)
+        wallet.append(el("p", "No available loose proofs."));
     }
-    const details = el("details"),
-      summary = el("summary", "Wallet details (channels and custody)");
-    details.append(
-      summary,
-      el("pre", JSON.stringify(state.data.wallet, null, 2)),
-    );
-    wallet.append(details);
+    if (!walletData) wallet.append(el("p", "Wallet inventory unavailable."));
+    else {
+      if (!walletData.channels?.length)
+        wallet.append(el("p", "No wallet channels."));
+      const details = el("details"),
+        summary = el("summary", "Wallet details (channels and custody)");
+      details.append(summary, el("pre", JSON.stringify(walletData, null, 2)));
+      wallet.append(details);
+    }
     const old = cards.get(key);
-    if (old?.querySelector("details")?.open) details.open = true;
+    if (old?.querySelector("details")?.open && wallet.querySelector("details"))
+      wallet.querySelector("details").open = true;
     if (old) cards.set(key, update(old, wallet));
     else {
       root.append(wallet);
