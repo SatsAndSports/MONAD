@@ -11,6 +11,7 @@ use std::{
 
 pub struct ClientBackend {
     controls: BTreeMap<String, Arc<ClientManagement>>,
+    socks_listens: BTreeMap<String, String>,
     wallet: Arc<SqliteClientWallet>,
     inventory: tokio::sync::Mutex<Option<(Instant, Value)>>,
 }
@@ -18,10 +19,12 @@ pub struct ClientBackend {
 impl ClientBackend {
     pub fn new(
         controls: BTreeMap<String, Arc<ClientManagement>>,
+        socks_listens: BTreeMap<String, String>,
         wallet: Arc<SqliteClientWallet>,
     ) -> Self {
         Self {
             controls,
+            socks_listens,
             wallet,
             inventory: Default::default(),
         }
@@ -63,6 +66,7 @@ impl Backend for ClientBackend {
                 (
                     name,
                     json!({
+            "socks_listen": self.socks_listens.get(name),
             "controls": c.controls(), "runtime": c.runtime_snapshot(), "hops": c.hops(), "events": c.events.snapshot(),
                     }),
                 )

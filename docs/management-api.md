@@ -193,6 +193,8 @@ booleans: `awaiting_status`, `awaiting_funding`, `waiting_for_manual_funding`,
 `introduced_in_route_generation` allows a UI to distinguish preserved prefix
 sessions from newly introduced suffix sessions. See
 [structured admission refusals](admission-refusals.md) for codes and attribution.
+The instance's `socks_listen` is the actual bound listener address, including the
+allocated port when configuration requested port zero.
 
 | Action | Arguments | Completion |
 | --- | --- | --- |

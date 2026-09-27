@@ -27,6 +27,14 @@ test("clients and relays share commands, fund hops, carry traffic and recover", 
       relay.goto(`${demo.url}/relays`),
     ]);
     const client = (p) => p.locator('[data-instance="demo-client"]');
+    await expect(client(a).getByRole("heading", { level: 2 })).toHaveText(
+      `demo-client · SOCKS 127.0.0.1:${demo.socks}`,
+    );
+    await expect(
+      a
+        .locator('[data-instance="second-client"]')
+        .getByRole("heading", { level: 2 }),
+    ).toHaveText(`second-client · SOCKS 127.0.0.1:${demo.socks2}`);
     await expect(client(a)).toContainText("waiting_for_manual_funding");
     for (let hop = 0; hop < 2; hop++) {
       await client(a)
