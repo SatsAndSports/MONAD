@@ -18,6 +18,36 @@ See [relay management actions](docs/management-api.md#relay-actions).
 The cooperative unlink messages require coordinated client and relay updates;
 older clients do not understand the release request.
 
+### Try all three management pages
+
+```bash
+cargo build -p monad-management -p monad-client -p monad-relay -p monad-test-mint
+cargo build -p monad-test-mint --example demo-fund
+node monad-management/ui-tests/network-demo.mjs
+```
+
+The launcher prints **Clients**, **Relays**, and **Mints** URLs on one localhost
+server. Open each in its own tab. The demo has two clients, a two-hop QUIC route,
+and one SAT/MSAT mint. Its shared client wallet starts with **1,000,000 test sats**
+issued by that mint; the second client starts disabled. Nothing is funded by a
+browser refresh. Type `traffic`, `topup 100000`, `restart-relays`, or `quit` in the
+launcher terminal. `traffic-on` / `traffic-off` start/stop paced traffic for the
+small-channel demo. Entry uses SAT channels and exit uses MSAT channels, with
+500-msat credit targets and 30-sat channel funding budgets. Provisioning starts
+manual; enable automatic channel provisioning in the UI whenever you like.
+The initial purse is split across SAT and MSAT proofs. Ctrl-C also stops the demo;
+temporary databases are retained.
+
+For hop-by-hop provisioning or an empty-wallet experiment, set
+`MONAD_DEMO_MANUAL=1` and optionally `MONAD_DEMO_SATS=0` before launching.
+See [the combined demo guide](docs/management-ui.md) for detailed experiments and
+browser tests. Node 20+ and `curl` are used by the demo; production pages need only
+the Rust management binary and a browser.
+
+The relay page keeps linked channels beside their sessions and places unlinked
+channels in a shared newest-first list below the relays. Closing remains visible;
+closed channels show compact final paid/capacity amounts without low-capacity red.
+
 ### Try the mint management page
 
 ```bash

@@ -1,0 +1,54 @@
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+  color: #b9cddd;
+}
+.closing-state { color: #ffca80; }
+.channel-panel.closing-channel { border-color: #ffca80; }
+.closed-channel { color: #aab9c8; font-size: .9rem; }
+.retired-state { color: #d6a2ff; }
+.unlink-pending { color: #ffca80; font-size: .85rem; }
+.channel-panel {
+  border: 1px solid #3e6573;
+  border-radius: 8px;
+  padding: 0.7rem;
+  min-width: 190px;
+}
+.channel-panel.low-capacity {
+  border-color: #f57979;
+  color: #ffaaaa;
+  background: #391c23;
+}
+.channel-panel progress {
+  width: 100%;
+  accent-color: #69dfc0;
+}
+.channel-panel.low-capacity progress {
+  accent-color: #ff7777;
+}
+.channel-panel p {
+  color: inherit;
+  margin: 0.4rem 0;
+}
+article {
+  min-width: 0;
+}
+td {
+  vertical-align: top;
+}
+summary {
+  cursor: pointer;
+  padding: 0.7rem 0;
+  color: #69dfc0;
+}
+nav [aria-current="page"] {
+  text-decoration: underline;
+  text-underline-offset: 0.3em;
+}
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible {
+  outline: 2px solid #ffca80;
+  outline-offset: 3px;
+}

@@ -128,6 +128,10 @@ async fn tcp_sse_aggregates_replays_forwards_and_survives_process_restart() {
     let client = reqwest::Client::new();
     for (path, content_type) in [
         ("/mints", "text/html"),
+        ("/clients", "text/html"),
+        ("/relays", "text/html"),
+        ("/assets/runtime.js", "text/javascript"),
+        ("/assets/runtime.css", "text/css"),
         ("/assets/mints.js", "text/javascript"),
         ("/assets/mints.css", "text/css"),
     ] {

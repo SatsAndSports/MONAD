@@ -1,5 +1,11 @@
 # Management API
 
+Relay wallet channel summaries include `last_linked_at_unix_ms` (nullable), stamped
+on successful links in the current relay-process lifetime. Browser refresh retains
+these times; a process restart loses them until channels are linked again. The UI
+partitions channels using `instances.*.sessions[].linked_channel_id`, including
+paused sessions, and sorts unlinked channels newest-link-first with unknown times last.
+
 ## Single localhost TCP endpoint
 
 The mint UI consumes the initial `reset` snapshot and live updates from one SSE
@@ -26,7 +32,8 @@ cargo run -p monad-management -- --config monad.yaml
 ```
 
 The aggregator binds `management.listen` (a numeric IPv4/IPv6 loopback address).
-It serves JSON, SSE, and the embedded [mint page](mint-ui.md) at `/mints`.
+It serves JSON, SSE, and embedded [management pages](management-ui.md) at
+`/mints`, `/clients`, and `/relays`.
 By default it discovers
 the configured `relay_socket` as process `relays` and `client_socket` as process
 `clients`. An optional `test_mint_socket` is discovered as `test-mints`. For more

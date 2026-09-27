@@ -58,6 +58,7 @@ pub struct SessionRegistry {
     drained: Notify,
     pub events: monad_management::events::EventLog,
     rejection_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    last_linked: Mutex<HashMap<String, u64>>,
 }
 
 impl Default for SessionRegistry {
@@ -68,11 +69,28 @@ impl Default for SessionRegistry {
             drained: Default::default(),
             events: Default::default(),
             rejection_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            last_linked: Default::default(),
         }
     }
 }
 
 impl SessionRegistry {
+    pub(crate) fn record_channel_link(&self, channel_id: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        self.last_linked
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_owned(), now);
+    }
+
+    pub(crate) fn last_linked_at(&self, channel_id: &str) -> Option<u64> {
+        self.last_linked.lock().unwrap().get(channel_id).copied()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
