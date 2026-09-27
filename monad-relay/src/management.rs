@@ -1,8 +1,9 @@
 use crate::{
     payments::CloseOutcome,
     session_registry::{RelayControls, SessionRegistry},
-    wallet_manager::RelayWalletManager,
+    wallet_manager::{ChannelSummary, DrainSummary, RelayWalletManager},
 };
+use cdk_spilman::ChannelState;
 use monad_management::{Backend, Command};
 use serde_json::{json, Value};
 use std::{
@@ -10,6 +11,43 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+fn wallet_summary(channels: &[ChannelSummary], drains: &[DrainSummary]) -> Result<Value, String> {
+    let mut proof_totals =
+        BTreeMap::from([("sat".to_string(), 0_u64), ("msat".to_string(), 0_u64)]);
+    for drain in drains.iter().filter(|drain| drain.state == "Completed") {
+        let total = proof_totals.entry(drain.unit.clone()).or_default();
+        *total = total
+            .checked_add(drain.output_amount_raw)
+            .ok_or("drained proof amount overflow")?;
+    }
+    let drained_proofs = proof_totals
+        .into_iter()
+        .map(|(unit, amount)| (unit, json!({"amount_raw": amount.to_string()})))
+        .collect::<BTreeMap<_, _>>();
+    let mut open = 0_u64;
+    let mut closing = 0_u64;
+    let mut closed = 0_u64;
+    let mut sender_refunded_after_expiry = 0_u64;
+    for channel in channels {
+        let count = match channel.state {
+            ChannelState::Open => &mut open,
+            ChannelState::Closing => &mut closing,
+            ChannelState::Closed => &mut closed,
+            ChannelState::SenderRefundedAfterExpiry => &mut sender_refunded_after_expiry,
+        };
+        *count = count.checked_add(1).ok_or("channel count overflow")?;
+    }
+    Ok(json!({
+        "drained_proofs": drained_proofs,
+        "channel_state_counts": {
+            "open": open,
+            "closing": closing,
+            "closed": closed,
+            "sender_refunded_after_expiry": sender_refunded_after_expiry,
+        },
+    }))
+}
 
 pub struct RelayBackend {
     pub registries: BTreeMap<String, Arc<SessionRegistry>>,
@@ -65,8 +103,9 @@ impl Backend for RelayBackend {
                     .into_iter()
                     .filter(|d| names.contains(&d.relay_name))
                     .collect::<Vec<_>>();
+                let summary = wallet_summary(&channels, &drains)?;
                 Ok::<_, String>(
-                    json!({"channels": channels, "expiring_channels": expiring, "drains": drains}),
+                    json!({"summary": summary, "channels": channels, "expiring_channels": expiring, "drains": drains}),
                 )
             })
             .await
@@ -229,5 +268,76 @@ impl Backend for RelayBackend {
             }
             _ => Err("unknown relay action".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallet_summary_counts_completed_drains_and_every_channel_state() {
+        let channel = |state| ChannelSummary {
+            channel_id: String::new(),
+            relay_name: "relay".into(),
+            receiver_pubkey_hex: String::new(),
+            state,
+            mint_url: String::new(),
+            unit: String::new(),
+            capacity_raw: 0,
+            balance_raw: 0,
+        };
+        let drain = |state: &str, unit: &str, amount| DrainSummary {
+            drain_id: String::new(),
+            relay_name: "relay".into(),
+            mint_url: String::new(),
+            unit: unit.into(),
+            state: state.into(),
+            input_amount_raw: amount,
+            output_amount_raw: amount,
+        };
+        let channels = [
+            channel(ChannelState::Open),
+            channel(ChannelState::Closing),
+            channel(ChannelState::Closed),
+            channel(ChannelState::SenderRefundedAfterExpiry),
+        ];
+        let drains = [
+            drain("Completed", "sat", 20),
+            drain("Completed", "msat", 500),
+            drain("Submitted", "sat", 100),
+        ];
+        assert_eq!(
+            wallet_summary(&channels, &drains).unwrap(),
+            json!({
+                "drained_proofs": {
+                    "msat": {"amount_raw": "500"},
+                    "sat": {"amount_raw": "20"},
+                },
+                "channel_state_counts": {
+                    "open": 1,
+                    "closing": 1,
+                    "closed": 1,
+                    "sender_refunded_after_expiry": 1,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn wallet_summary_rejects_completed_drain_overflow() {
+        let drain = |amount| DrainSummary {
+            drain_id: String::new(),
+            relay_name: "relay".into(),
+            mint_url: String::new(),
+            unit: "sat".into(),
+            state: "Completed".into(),
+            input_amount_raw: amount,
+            output_amount_raw: amount,
+        };
+        assert_eq!(
+            wallet_summary(&[], &[drain(u64::MAX), drain(1)]).unwrap_err(),
+            "drained proof amount overflow"
+        );
     }
 }

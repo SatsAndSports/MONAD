@@ -47,6 +47,19 @@ td {
   flex-wrap: wrap;
   gap: .7rem;
 }
+#wallet-summary:empty {
+  display: none;
+}
+.wallet-summary-card {
+  margin: 0.8rem 0 1.5rem;
+  padding: 1rem 1.25rem;
+}
+.wallet-summary-card p {
+  margin: 0.3rem 0;
+}
+.wallet-summary-card strong {
+  color: #e5edf5;
+}
 summary {
   cursor: pointer;
   padding: 0.7rem 0;
