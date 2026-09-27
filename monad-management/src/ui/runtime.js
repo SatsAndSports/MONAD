@@ -78,24 +78,28 @@ function button(text, process, name, action, args, enabled = true) {
   b.type = "button";
   b.disabled =
     !healthy(processes[process]) ||
-    pending.has(JSON.stringify([process, name])) ||
+    instancePending(process, name) ||
     !enabled;
   const generation = processes[process].generation;
   b.onclick = () => submit(process, name, generation, action, args);
   return b;
 }
+function instancePending(process, instance) {
+  return [...pending.values()].some(c => c.process === process && c.instance === instance);
+}
+const operationKey = c => JSON.stringify([c.process, c.generation, c.request_id]);
 async function submit(process, name, generation, action, args) {
-  const key = JSON.stringify([process, name]);
   if (
     !healthy(processes[process]) ||
     processes[process].generation !== generation ||
-    pending.has(key)
+    instancePending(process, name)
   )
     return;
   const request_id = crypto.randomUUID();
   const controller = new AbortController(),
     timer = setTimeout(() => controller.abort(), 10000);
   const tracked = {process, instance:name, generation, request_id, action, channel_id:args.channel_id, state:"submitting"};
+  const key = operationKey(tracked);
   pending.set(key, tracked);
   render();
   try {
@@ -132,10 +136,10 @@ async function submit(process, name, generation, action, args) {
 
 function observeOperation(c) {
   if (processes[c.process]?.generation !== c.generation) return;
-  const id = JSON.stringify([c.process, c.generation, c.request_id]);
+  const id = operationKey(c);
   const previous = commands.get(id);
   if (["succeeded", "failed"].includes(previous?.state)) return;
-  const key = JSON.stringify([c.process, c.instance]);
+  const key = id;
   const local = pending.get(key);
   c = {...previous, ...c, channel_id:c.channel_id || previous?.channel_id || (local?.request_id === c.request_id ? local.channel_id : undefined)};
   commands.set(id, c);
@@ -156,7 +160,7 @@ async function reconcileOperations() {
   try {
     await Promise.all([...pending.values()].map(async c => {
       if (processes[c.process]?.generation !== c.generation) {
-        pending.delete(JSON.stringify([c.process, c.instance]));
+        pending.delete(operationKey(c));
         notice.textContent = `${c.instance}: process restarted; prior command outcome is unknown. Inspect current state.`;
         return;
       }

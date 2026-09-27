@@ -33,5 +33,14 @@ test("accepted commands stay locked and lost events reconcile to a visible failu
     await page.evaluate(request => observeOperation({...request,process:"relays",state:"queued"}), request);
     await expect(close).toBeEnabled();
     await expect(page.locator("#notice")).toContainText("failed");
+    // Concurrent commands observed from two tabs must both finish before unlock.
+    await page.evaluate(request => {
+      observeOperation({...request,process:"relays",request_id:"other-a",state:"running"});
+      observeOperation({...request,process:"relays",request_id:"other-b",state:"running"});
+      observeOperation({...request,process:"relays",request_id:"other-a",state:"succeeded"});
+    }, request);
+    await expect(close).toBeDisabled();
+    await page.evaluate(request => observeOperation({...request,process:"relays",request_id:"other-b",state:"succeeded"}), request);
+    await expect(close).toBeEnabled();
   } finally { await demo.stop(); }
 });
