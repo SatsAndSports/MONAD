@@ -37,6 +37,17 @@ test("cooperative unlink retires the channel and separate close works", async ({
     const channelId = await linkedChannel.getAttribute("data-channel-id");
     expect(channelId).toBeTruthy();
     const short = channelId.slice(0, 16);
+    const linkedSnapshot = await demo.wait((snapshot) =>
+      snapshot.processes.relays.data.wallet.channels.some(
+        (channel) =>
+          channel.channel_id === channelId &&
+          Number.isInteger(channel.last_linked_at_unix_ms),
+      ),
+    );
+    const linkedAt = linkedSnapshot.processes.relays.data.wallet.channels.find(
+      (channel) => channel.channel_id === channelId,
+    ).last_linked_at_unix_ms;
+    expect(linkedAt).toBeGreaterThan(0);
 
     // Request cooperative unlink: the linked channel moves to the retired,
     // unlinked list while remaining Open. The button label changes to the
@@ -70,6 +81,16 @@ test("cooperative unlink retires the channel and separate close works", async ({
     await expect(
       unlinked.locator("tbody tr").filter({ hasText: short }),
     ).toContainText("Closed", { timeout: 10000 });
+    const closedSnapshot = await demo.wait((snapshot) =>
+      snapshot.processes.relays.data.wallet.channels.some(
+        (channel) => channel.channel_id === channelId && channel.state === "Closed",
+      ),
+    );
+    expect(
+      closedSnapshot.processes.relays.data.wallet.channels.find(
+        (channel) => channel.channel_id === channelId,
+      ).last_linked_at_unix_ms,
+    ).toBe(linkedAt);
 
     // With manual provisioning, the session keeps its remaining credit after
     // the unlink. Drive traffic until it runs out; the client then waits for
