@@ -291,6 +291,8 @@ impl SessionState {
             .lock()
             .unwrap()
             .insert(outcome.channel_id.clone());
+        self.session_registry
+            .record_channel_link(&outcome.channel_id);
         Ok(outcome)
     }
 

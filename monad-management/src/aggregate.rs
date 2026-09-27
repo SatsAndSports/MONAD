@@ -77,6 +77,10 @@ impl Aggregator {
         Router::new()
             .route("/", get(root))
             .route("/mints", get(mints))
+            .route("/clients", get(runtime_page))
+            .route("/relays", get(runtime_page))
+            .route("/assets/runtime.js", get(runtime_js))
+            .route("/assets/runtime.css", get(runtime_css))
             .route("/assets/mints.css", get(mints_css))
             .route("/assets/mints.js", get(mints_js))
             .route("/v1/snapshot", get(snapshot))
@@ -274,6 +278,33 @@ impl Aggregator {
 
 async fn root() -> Redirect {
     Redirect::temporary("/mints")
+}
+
+async fn runtime_page() -> impl IntoResponse {
+    (
+        [("cache-control", "no-store")],
+        Html(include_str!("ui/runtime.html")),
+    )
+}
+
+async fn runtime_js() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "text/javascript; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("ui/runtime.js"),
+    )
+}
+
+async fn runtime_css() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "text/css; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("ui/runtime.css"),
+    )
 }
 
 async fn mints() -> Response {

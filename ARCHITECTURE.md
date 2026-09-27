@@ -90,12 +90,16 @@ history interval produces an explicit reset/source-gap, never silent event loss.
 The HTTP server directly owns its connection futures, including SSE bodies, so
 shutdown/drop closes even blocked subscribers. No browser owns runtime authority.
 
-The aggregator also embeds the `/mints` browser page. Its initial state comes from
+The aggregator embeds `/mints`, `/clients`, and `/relays` browser pages. Their initial state comes from
 the SSE reset snapshot, with subsequent updates ordered on the same stream. The
 process command executor records accepted/running/terminal operation events in a
 separate bounded ring; the aggregator forwards these with generation and request
 identity and detects source gaps. Argument payloads are excluded from broadcasts.
 The browser never owns execution and does not resubmit commands on refresh.
+Relay link timestamps are an in-memory registry observation updated after successful
+link validation, exposed separately from cached wallet inventory. The UI derives
+linked/unlinked membership from current session snapshots, even when paused. Unknown
+pre-restart link times remain explicitly unknown rather than inferred by each browser.
 
 ### Cooperative channel retirement
 
@@ -122,6 +126,9 @@ that regress paid totals, byte counters, or the same channel's accepted balance
 are ignored; asynchronous pause notifications must not roll back a newer payment
 baseline. The SQLite wallet also rejects decreasing signed balances while holding
 the same bridge lock used for signing and persistence.
+Client and relay pages render the existing sanitized runtime/wallet projections
+and send generation-bound commands. Wallet inventory remains process-scoped, not
+duplicated into a per-client spendable balance.
 
 Receiver channel-state lookups preserve the upstream
 `Result<Option<ChannelState>, String>` contract: known state, unknown channel,

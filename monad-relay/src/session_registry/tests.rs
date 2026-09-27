@@ -82,3 +82,13 @@ async fn session_gate_preserves_existing_sessions_and_rejects_new_work() {
     registry.deregister_session(&[1; 32]);
     registry.wait_disabled().await.unwrap();
 }
+#[test]
+fn link_timestamp_is_shared_and_retained_after_session_departure() {
+    let registry = super::SessionRegistry::new();
+    assert_eq!(registry.last_linked_at("channel"), None);
+    registry.record_channel_link("channel");
+    let timestamp = registry.last_linked_at("channel").unwrap();
+    assert!(timestamp > 0);
+    registry.deregister_session(&[1; 32]);
+    assert_eq!(registry.last_linked_at("channel"), Some(timestamp));
+}

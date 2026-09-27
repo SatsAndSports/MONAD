@@ -49,7 +49,7 @@ open the aggregator's `/mints` page.
 cargo build -p monad-management -p monad-test-mint
 npm ci --prefix monad-management/ui-tests
 npm exec --prefix monad-management/ui-tests -- playwright install chromium
-npm test --prefix monad-management/ui-tests
+npm test --prefix monad-management/ui-tests -- mints.spec.js
 ```
 
 Playwright uses real disposable mint and aggregator processes. Coverage includes

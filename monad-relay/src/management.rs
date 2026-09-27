@@ -84,6 +84,15 @@ impl Backend for RelayBackend {
         let mut wallet = cache.as_ref().unwrap().1.clone();
         if let Some(channels) = wallet["channels"].as_array_mut() {
             for channel in channels {
+                let registry = channel["relay_name"]
+                    .as_str()
+                    .and_then(|name| self.registries.get(name));
+                let linked_at = registry.and_then(|registry| {
+                    channel["channel_id"]
+                        .as_str()
+                        .and_then(|id| registry.last_linked_at(id))
+                });
+                channel["last_linked_at_unix_ms"] = json!(linked_at);
                 let retired = channel["channel_id"]
                     .as_str()
                     .map(|id| self.wallet.channel_is_retired(id))

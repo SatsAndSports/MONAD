@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MONAD management</title>
+    <link rel="stylesheet" href="/assets/mints.css" />
+    <link rel="stylesheet" href="/assets/runtime.css" />
+    <script src="/assets/runtime.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/mints">MONAD <span>management</span></a>
+      <nav aria-label="Management pages">
+        <a href="/mints">Mints</a> · <a href="/clients">Clients</a> ·
+        <a href="/relays">Relays</a>
+      </nav>
+      <span id="connection" role="status">Connecting…</span>
+    </header>
+    <main>
+      <h1 id="title"></h1>
+      <p id="notice" role="status"></p>
+      <section id="instances" aria-label="Instances">
+        Waiting for initial SSE snapshot…
+      </section>
+      <section class="activity">
+        <h2>Live command activity</h2>
+        <p>
+          Shared across connected tabs. Reload restores state, never resubmits
+          commands.
+        </p>
+        <ol id="activity">
+          <li>No command activity observed yet.</li>
+        </ol>
+      </section>
+    </main>
+  </body>
+</html>
