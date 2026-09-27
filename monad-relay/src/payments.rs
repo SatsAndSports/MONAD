@@ -82,7 +82,8 @@ pub trait RelayPayments: Send + Sync + 'static {
 
     fn release_channel_ownership(&self, session_id: [u8; 32], channel_id: &str);
 
-    fn channel_state(&self, channel_id: &str) -> Option<ChannelState>;
+    /// Distinguish unknown channels from storage failures; neither is Open.
+    fn channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,7 +556,11 @@ impl SpilmanRelayPayments {
                 .recover_close(channel_id, mint_client, keyset_refresher)
                 .await;
         }
-        match self.store.channel_state(channel_id) {
+        match self
+            .store
+            .channel_state(channel_id)
+            .map_err(CloseError::storage_failed)?
+        {
             Some(ChannelState::Closed) => {
                 let data = self.store.closed_data(channel_id).ok_or_else(|| {
                     CloseError::ValidationFailed {
@@ -817,7 +822,7 @@ impl RelayPayments for SpilmanRelayPayments {
         let _ = self.store.release_channel_owner(channel_id, session_id);
     }
 
-    fn channel_state(&self, channel_id: &str) -> Option<ChannelState> {
+    fn channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String> {
         self.store.channel_state(channel_id)
     }
     fn retire_channel(
@@ -896,13 +901,8 @@ impl SpilmanHost<PaymentContext> for MonadHost {
         let _ = self.store.record_payment(channel_id, payment);
     }
 
-    fn get_channel_state(&self, channel_id: &str) -> ChannelState {
-        self.store
-            .get_channel(channel_id)
-            .ok()
-            .flatten()
-            .map(|channel| channel.state)
-            .unwrap_or(ChannelState::Open)
+    fn get_channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String> {
+        self.store.channel_state(channel_id)
     }
 
     fn mark_channel_closing(
@@ -1465,14 +1465,18 @@ pub mod testing {
             }
         }
 
-        fn channel_state(&self, channel_id: &str) -> Option<ChannelState> {
-            let inner = self.inner.lock().ok()?;
-            let record = inner.channels.get(channel_id)?;
-            Some(if record.closed {
-                ChannelState::Closed
-            } else {
-                ChannelState::Open
-            })
+        fn channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String> {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| "payment lock poisoned".to_string())?;
+            Ok(inner.channels.get(channel_id).map(|record| {
+                if record.closed {
+                    ChannelState::Closed
+                } else {
+                    ChannelState::Open
+                }
+            }))
         }
     }
 

@@ -82,7 +82,7 @@ impl RelayPayments for ObservedPayments {
         self.observer.state.lock().unwrap().releases.push(session);
     }
 
-    fn channel_state(&self, channel: &str) -> Option<ChannelState> {
+    fn channel_state(&self, channel: &str) -> Result<Option<ChannelState>, String> {
         self.inner.channel_state(channel)
     }
 }

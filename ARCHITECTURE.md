@@ -123,6 +123,13 @@ are ignored; asynchronous pause notifications must not roll back a newer payment
 baseline. The SQLite wallet also rejects decreasing signed balances while holding
 the same bridge lock used for signing and persistence.
 
+Receiver channel-state lookups preserve the upstream
+`Result<Option<ChannelState>, String>` contract: known state, unknown channel,
+and storage failure are distinct. New-channel admission rejects unknown channels
+while disabled and propagates lookup failures as internal errors. Linking,
+close/recovery, and drain selection never substitute `Open` for missing or
+unreadable state. Known channel records with unreadable funding are errors.
+
 A relay's session registry owns its runtime admission policy alongside registered
 session cancellation tokens. A short synchronous admission lock orders policy
 changes with session registration, channel validation/acceptance, and CONNECT

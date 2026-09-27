@@ -1907,11 +1907,11 @@ async fn assert_auto_close_worker_lifecycle(cancel: Option<bool>) {
             wallet_manager
                 .spilman_storage()
                 .get_state(untouched_channel.as_ref().unwrap()),
-            ChannelState::Open
+            Ok(Some(ChannelState::Open))
         );
         assert_eq!(
             wallet_manager.spilman_storage().get_state(&channel_id),
-            ChannelState::Closing
+            Ok(Some(ChannelState::Closing))
         );
         assert!(wallet_manager
             .spilman_storage()
@@ -11138,7 +11138,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     assert_eq!(close_success.total_value, capacity_raw);
 
     assert_eq!(
-        payments.channel_state(&channel_id),
+        payments.channel_state(&channel_id).unwrap(),
         Some(ChannelState::Closed),
         "channel should be Closed after unilateral close"
     );
@@ -11824,7 +11824,10 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     .to_string()
     .contains("already active"));
     drop(closing);
-    assert_eq!(storage.get_state(&channel_id), ChannelState::Closing);
+    assert_eq!(
+        storage.get_state(&channel_id).unwrap(),
+        Some(ChannelState::Closing)
+    );
     let saved = storage.get_close_journal(&channel_id).unwrap().unwrap();
     let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
     assert_eq!(saved["version"], 3);
@@ -11866,7 +11869,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
     assert_eq!(close_success.total_value, capacity_raw);
     assert_eq!(
-        payments.channel_state(&channel_id),
+        payments.channel_state(&channel_id).unwrap(),
         Some(ChannelState::Closed)
     );
     assert!(payments.closed_data(&channel_id).is_some());
@@ -12457,7 +12460,7 @@ async fn test_close_server_error_and_replay_rejection_preserve_exact_request() {
         "close replay changed immutable preparation"
     );
     assert_eq!(
-        ctx.payments.channel_state(&channel),
+        ctx.payments.channel_state(&channel).unwrap(),
         Some(ChannelState::Closing)
     );
     let completed = ctx
@@ -12577,7 +12580,7 @@ async fn test_sender_refund_is_terminal_with_or_without_extra_signature() {
                 CloseOutcome::SenderRefundedAfterExpiry { .. }
             ));
             assert_eq!(
-                ctx.payments.channel_state(&channel_id),
+                ctx.payments.channel_state(&channel_id).unwrap(),
                 Some(ChannelState::SenderRefundedAfterExpiry)
             );
             assert!(ctx
@@ -12723,7 +12726,7 @@ async fn test_final_close_restore_checks_predecessor_then_successor_after_spent(
     assert_eq!(ids[0], ctx.offer.preferred_keyset_ids[0]);
     assert_ne!(ids[0], ids[1]);
     assert_eq!(
-        ctx.payments.channel_state(&channel),
+        ctx.payments.channel_state(&channel).unwrap(),
         Some(ChannelState::Closed)
     );
     ctx.shutdown();

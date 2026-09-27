@@ -129,10 +129,14 @@ impl ChannelStore {
     }
 
     pub(crate) fn get_channel(&self, channel_id: &str) -> Result<Option<StoredChannel>, String> {
-        let funding = match self.storage.get_funding(channel_id) {
-            Some(f) => f,
+        let state = match self.channel_state(channel_id)? {
+            Some(state) => state,
             None => return Ok(None),
         };
+        let funding = self
+            .storage
+            .get_funding(channel_id)
+            .ok_or_else(|| format!("known channel {channel_id} has no readable funding"))?;
 
         let metadata = parse_channel_metadata(&funding.params_json)
             .map_err(|e| format!("corrupt stored channel params for {channel_id}: {e}"))?;
@@ -145,7 +149,6 @@ impl ChannelStore {
                 signature: String::new(),
             });
 
-        let state = self.storage.get_state(channel_id);
         let closing_data = self.storage.get_closing_data(channel_id);
 
         Ok(Some(StoredChannel {
@@ -332,8 +335,8 @@ impl ChannelStore {
         self.storage.mark_closed(channel_id, data)
     }
 
-    pub(crate) fn channel_state(&self, channel_id: &str) -> Option<ChannelState> {
-        Some(self.storage.get_state(channel_id))
+    pub(crate) fn channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String> {
+        self.storage.get_state(channel_id)
     }
 
     pub(crate) fn closed_data(&self, channel_id: &str) -> Option<ClosedDataView> {
@@ -405,10 +408,15 @@ mod tests {
         {
             let storage = Arc::new(SqliteStorage::open(&path).unwrap());
             let store = ChannelStore::new(storage);
+            assert_eq!(store.channel_state("chan1").unwrap(), None);
             store
                 .save_funding("chan1", dummy_funding("chan1"), payment_proof(0))
                 .unwrap();
             store.record_payment("chan1", payment_proof(5_000)).unwrap();
+            assert_eq!(
+                store.channel_state("chan1").unwrap(),
+                Some(ChannelState::Open)
+            );
 
             let channel = store.get_channel("chan1").unwrap().unwrap();
             assert_eq!(channel.latest_payment.balance, 5_000);
@@ -420,6 +428,11 @@ mod tests {
         {
             let storage = Arc::new(SqliteStorage::open(&path).unwrap());
             let store = ChannelStore::new(storage);
+            assert_eq!(store.channel_state("missing").unwrap(), None);
+            assert_eq!(
+                store.channel_state("chan1").unwrap(),
+                Some(ChannelState::Open)
+            );
             let channel = store.get_channel("chan1").unwrap().unwrap();
             assert_eq!(channel.latest_payment.balance, 5_000);
             assert_eq!(channel.unit, ChannelUnit::Sat);
@@ -458,6 +471,30 @@ mod tests {
         // Unlinked retirement allows closure; linked retirement does not.
         store.retire_channel("chan", true).unwrap();
         assert!(store.set_channel_owner("chan", owner).is_err());
+    }
+
+    #[test]
+    fn channel_reads_propagate_invalid_state_and_query_failure() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap();
+        let store = ChannelStore::new(Arc::new(SqliteStorage::open(path).unwrap()));
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE spilman_channels SET state='invalid' WHERE channel_id='chan'",
+            [],
+        )
+        .unwrap();
+        assert!(store.channel_state("chan").is_err());
+        assert!(store.get_channel("chan").is_err());
+        assert!(store.get_channel("unknown").unwrap().is_none());
+        conn.execute("DROP TABLE spilman_channels", []).unwrap();
+        assert!(store.channel_state("chan").is_err());
+        assert!(store.channel_state("unknown").is_err());
+        assert!(store.get_channel("chan").is_err());
+        assert!(store.get_channel("unknown").is_err());
     }
 
     #[test]

@@ -80,7 +80,7 @@ impl SpilmanRelayPayments {
             Some(json) => serde_json::from_str::<CloseJournal>(json)
                 .map_err(|_| error("incompatible or corrupt close journal; database retained"))?,
             None => {
-                if storage.get_state(channel_id) != ChannelState::Open {
+                if storage.get_state(channel_id).map_err(error)? != Some(ChannelState::Open) {
                     return Err(error(
                         "non-open channel lacks exact close journal; database retained",
                     ));
@@ -192,7 +192,8 @@ impl SpilmanRelayPayments {
         if let Some(evidence) = &journal.refunded {
             if journal.completed
                 || journal.finalizing.is_some()
-                || storage.get_state(channel_id) != ChannelState::SenderRefundedAfterExpiry
+                || storage.get_state(channel_id).map_err(error)?
+                    != Some(ChannelState::SenderRefundedAfterExpiry)
                 || channel
                     .classify_funding_spend_against_prepared_closes(
                         evidence,

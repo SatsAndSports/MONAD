@@ -1,5 +1,10 @@
 # MONAD
 
+MONAD pins the Spilman library revision with explicit, fallible receiver-state
+lookups. Custom `RelayPayments` implementations must return
+`Result<Option<ChannelState>, String>` from `channel_state`: `None` for unknown
+channels and `Err` for lookup failures. This API update requires no database reset.
+
 ### Retire a linked payment channel
 
 Use the relay management action `request_channel_unlink` with

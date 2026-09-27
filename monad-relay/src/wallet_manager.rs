@@ -1332,7 +1332,7 @@ impl RelayWalletManager {
                 .optional()
                 .map_err(|e| format!("query drained channel marker: {e}"))?;
             if already_drained.is_some()
-                || self.storage.get_state(&channel_id) != ChannelState::Closed
+                || self.storage.get_state(&channel_id)? != Some(ChannelState::Closed)
             {
                 continue;
             }
@@ -2187,7 +2187,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("lacks exact close journal"));
-        assert_eq!(store.channel_state("channel"), Some(ChannelState::Closing));
+        assert_eq!(
+            store.channel_state("channel").unwrap(),
+            Some(ChannelState::Closing)
+        );
         assert!(manager
             .storage
             .get_close_journal("channel")

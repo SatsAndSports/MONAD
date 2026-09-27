@@ -28,4 +28,4 @@ tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 monad-client = { path = "../monad-client" }
 monad-relay = { path = "../monad-relay" }
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "7eeb3ca54c76ed16b9522ea2a196dfe520d14dc0", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "97ce73a17812b54157b65dae9d3a6801ac3ba236", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
