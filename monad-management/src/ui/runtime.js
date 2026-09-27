@@ -363,8 +363,12 @@ function pulseChanges(process, before, after) {
 function instanceCard(process, name, state, instance) {
   const card = el("article", null, "mint");
   card.dataset.instance = name;
+  const heading =
+    kind === "clients" && instance.socks_listen
+      ? `${name} · SOCKS ${instance.socks_listen}`
+      : name;
   card.append(
-    el("h2", name),
+    el("h2", heading),
     el(
       "p",
       `${process} · ${healthy(state) ? "Live" : "Stale / unavailable"} · sampled ${new Date(state.last_success_unix_ms).toLocaleTimeString()}`,
