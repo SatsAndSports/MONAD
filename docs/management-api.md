@@ -260,6 +260,15 @@ reports available, reserved, and spent proof totals grouped by mint/unit/state;
 reserved amounts are locked custody, and spent amounts are historical, not balances
 to add to channel holdings.
 
+`wallet.summary` is computed from that cached local inventory with checked
+arithmetic. Client `available_loose_proofs` includes only proofs recorded as
+available, grouped by unit, while `channel_state_counts` reports Open, Closing and
+Closed channels. Relay `drained_proofs` includes only locally Completed drain
+outputs, grouped by unit; its channel counts also include
+`sender_refunded_after_expiry`. Summary amounts are decimal strings. They are
+nominal totals across configured mints for one unit, not a mint status check or a
+promise that separate mints are fungible.
+
 Each instance retains 512 discrete events with increasing sequence numbers.
 `payment_accepted` is recorded after successful relay payment validation;
 `payment_observed` is the client's observation of an increased authoritative paid

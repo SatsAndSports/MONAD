@@ -35,6 +35,12 @@ test("clients and relays share commands, fund hops, carry traffic and recover", 
         .locator('[data-instance="second-client"]')
         .getByRole("heading", { level: 2 }),
     ).toHaveText(`second-client · SOCKS 127.0.0.1:${demo.socks2}`);
+    await expect(
+      a.locator('[data-wallet-process="clients"]'),
+    ).toContainText("Available loose proofs");
+    await expect(
+      relay.locator('[data-wallet-process="relays"]'),
+    ).toContainText("Drained proofs");
     await expect(client(a)).toContainText("waiting_for_manual_funding");
     for (let hop = 0; hop < 2; hop++) {
       await client(a)

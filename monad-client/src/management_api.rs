@@ -1,5 +1,8 @@
 use crate::{
-    management::ClientManagement, sqlite_client_wallet::SqliteClientWallet, wallet::MonadWallet,
+    loose_proof_wallet::LooseProofSummary,
+    management::ClientManagement,
+    sqlite_client_wallet::SqliteClientWallet,
+    wallet::{MonadWallet, WalletChannel, WalletChannelState},
 };
 use monad_management::{Backend, Command};
 use serde_json::{json, Value};
@@ -8,6 +11,51 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+fn wallet_summary(
+    proofs: &[LooseProofSummary],
+    channels: &[WalletChannel],
+) -> Result<Value, String> {
+    let mut proof_totals = BTreeMap::from([
+        ("sat".to_string(), (0_u64, 0_u64)),
+        ("msat".to_string(), (0_u64, 0_u64)),
+    ]);
+    for proof in proofs {
+        let total = proof_totals.entry(proof.unit.clone()).or_default();
+        total.0 = total
+            .0
+            .checked_add(proof.amount_raw)
+            .ok_or("available proof amount overflow")?;
+        total.1 = total
+            .1
+            .checked_add(proof.proof_count)
+            .ok_or("available proof count overflow")?;
+    }
+    let available_loose_proofs = proof_totals
+        .into_iter()
+        .map(|(unit, (amount, count))| {
+            (
+                unit,
+                json!({"amount_raw": amount.to_string(), "proof_count": count}),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut open = 0_u64;
+    let mut closing = 0_u64;
+    let mut closed = 0_u64;
+    for channel in channels {
+        let count = match channel.state {
+            WalletChannelState::Open => &mut open,
+            WalletChannelState::Closing => &mut closing,
+            WalletChannelState::Closed => &mut closed,
+        };
+        *count = count.checked_add(1).ok_or("channel count overflow")?;
+    }
+    Ok(json!({
+        "available_loose_proofs": available_loose_proofs,
+        "channel_state_counts": {"open": open, "closing": closing, "closed": closed},
+    }))
+}
 
 pub struct ClientBackend {
     controls: BTreeMap<String, Arc<ClientManagement>>,
@@ -44,7 +92,9 @@ impl Backend for ClientBackend {
                 let channels = wallet.list_channels().map_err(|_| "channel inventory unavailable")?;
                 let proofs = wallet.loose_wallet().list_available_proof_summaries().map_err(|_| "proof inventory unavailable")?;
                 let custody = wallet.loose_wallet().list_custody_summaries().map_err(|_| "custody inventory unavailable")?;
+                let summary = wallet_summary(&proofs, &channels)?;
                 Ok::<_, String>(json!({
+                    "summary": summary,
                     "proof_custody": custody,
                     "channels": channels.into_iter().map(|c| json!({
                         "channel_id": c.channel_id, "state": format!("{:?}", c.state),
@@ -153,5 +203,79 @@ impl Backend for ClientBackend {
             _ => return Err("unknown client action".into()),
         }
         Ok(json!({"controls": controls.controls()}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallet_summary_groups_available_proofs_and_channel_states() {
+        let proofs = [
+            LooseProofSummary {
+                mint_url: "mint-a".into(),
+                unit: "sat".into(),
+                keyset_id: "a".into(),
+                proof_count: 2,
+                amount_raw: 30,
+            },
+            LooseProofSummary {
+                mint_url: "mint-b".into(),
+                unit: "sat".into(),
+                keyset_id: "b".into(),
+                proof_count: 3,
+                amount_raw: 40,
+            },
+            LooseProofSummary {
+                mint_url: "mint-a".into(),
+                unit: "msat".into(),
+                keyset_id: "c".into(),
+                proof_count: 1,
+                amount_raw: 500,
+            },
+        ];
+        let channel = |state| WalletChannel {
+            channel_id: String::new(),
+            state,
+            receiver_pubkey: String::new(),
+            mint_url: String::new(),
+            unit: String::new(),
+            capacity_msats: 0,
+            current_signed_balance_msats: 0,
+            expiry_timestamp: 0,
+            attached_session_id: None,
+            keyset_id: String::new(),
+        };
+        let channels = [
+            channel(WalletChannelState::Open),
+            channel(WalletChannelState::Open),
+            channel(WalletChannelState::Closed),
+        ];
+        assert_eq!(
+            wallet_summary(&proofs, &channels).unwrap(),
+            json!({
+                "available_loose_proofs": {
+                    "msat": {"amount_raw": "500", "proof_count": 1},
+                    "sat": {"amount_raw": "70", "proof_count": 5},
+                },
+                "channel_state_counts": {"open": 2, "closing": 0, "closed": 1},
+            })
+        );
+    }
+
+    #[test]
+    fn wallet_summary_rejects_amount_overflow() {
+        let proof = |amount_raw| LooseProofSummary {
+            mint_url: String::new(),
+            unit: "sat".into(),
+            keyset_id: String::new(),
+            proof_count: 1,
+            amount_raw,
+        };
+        assert_eq!(
+            wallet_summary(&[proof(u64::MAX), proof(1)], &[]).unwrap_err(),
+            "available proof amount overflow"
+        );
     }
 }

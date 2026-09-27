@@ -7,13 +7,15 @@ document
   .querySelector(`nav a[href="/${kind}"]`)
   .setAttribute("aria-current", "page");
 const root = document.querySelector("#instances"),
+  summaryRoot = document.querySelector("#wallet-summary"),
   notice = document.querySelector("#notice"),
   activity = document.querySelector("#activity");
 let processes = {},
   live = false;
 const pending = new Map(),
   commands = new Map(),
-  cards = new Map();
+  cards = new Map(),
+  summaryCards = new Map();
 function el(tag, text, cls) {
   const n = document.createElement(tag);
   if (text != null) n.textContent = text;
@@ -506,7 +508,72 @@ function instanceCard(process, name, state, instance) {
   }
   return card;
 }
+function wholeNumber(value) {
+  try {
+    return BigInt(value ?? 0).toLocaleString("en-US");
+  } catch {
+    return "unavailable";
+  }
+}
+function summarizedAmount(summary, category, unit) {
+  return wholeNumber(summary?.[category]?.[unit]?.amount_raw);
+}
+function summarizedCount(summary, state) {
+  return wholeNumber(summary?.channel_state_counts?.[state]);
+}
+function walletSummary(process, state) {
+  const card = el("section", null, "mint wallet-summary-card");
+  card.dataset.walletProcess = process;
+  card.append(el("h2", `${process} · wallet summary`));
+  const summary = state.data.wallet?.summary;
+  if (!summary) {
+    card.append(el("p", "Wallet summary unavailable."));
+    return card;
+  }
+  const proofs = el("p");
+  proofs.dataset.walletCategory = "proofs";
+  const proofLabel = kind === "clients" ? "Available loose proofs" : "Drained proofs";
+  proofs.append(
+    el("strong", proofLabel),
+    ` · ${summarizedAmount(summary, kind === "clients" ? "available_loose_proofs" : "drained_proofs", "sat")} sat`,
+    ` · ${summarizedAmount(summary, kind === "clients" ? "available_loose_proofs" : "drained_proofs", "msat")} msat`,
+  );
+  const channels = el("p");
+  channels.dataset.walletCategory = "channels";
+  channels.append(
+    el("strong", "Channels"),
+    ` · Open ${summarizedCount(summary, "open")}`,
+    ` · Closing ${summarizedCount(summary, "closing")}`,
+    ` · Closed ${summarizedCount(summary, "closed")}`,
+  );
+  if (kind === "relays")
+    channels.append(
+      ` · Refunded after expiry ${summarizedCount(summary, "sender_refunded_after_expiry")}`,
+    );
+  card.append(proofs, channels);
+  return card;
+}
+function renderWalletSummaries() {
+  const seen = new Set();
+  for (const [process, state] of Object.entries(processes)) {
+    if (state.data?.kind !== kind) continue;
+    seen.add(process);
+    const next = walletSummary(process, state);
+    const old = summaryCards.get(process);
+    if (old) summaryCards.set(process, update(old, next));
+    else {
+      summaryRoot.append(next);
+      summaryCards.set(process, next);
+    }
+  }
+  for (const [process, card] of summaryCards)
+    if (!seen.has(process)) {
+      card.remove();
+      summaryCards.delete(process);
+    }
+}
 function render() {
+  renderWalletSummaries();
   const seen = new Set();
   for (const [process, state] of Object.entries(processes)) {
     if (state.data?.kind !== kind) continue;
