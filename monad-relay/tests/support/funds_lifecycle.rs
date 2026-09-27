@@ -248,8 +248,28 @@ impl Process {
     }
 
     fn spawn_with_env(binary: &Path, args: &[&str], config: &Path, env: &[(&str, &str)]) -> Self {
+        use std::os::unix::fs::OpenOptionsExt;
+        static NEXT_PROCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_PROCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let label = format!(
+            "process-{sequence}-{}",
+            binary.file_name().unwrap().to_string_lossy()
+        );
+        let log = |extension: &str| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(
+                    config
+                        .parent()
+                        .unwrap()
+                        .join(format!("{label}.{extension}")),
+                )
+                .unwrap()
+        };
         eprintln!(
-            "funds process {} {}",
+            "funds process {} {} diagnostics={label}",
             binary.file_name().unwrap().to_string_lossy(),
             args[..args.len().min(2)].join(" ")
         );
@@ -259,7 +279,7 @@ impl Process {
                 .arg("--config")
                 .arg(config)
                 .args(&args[1..])
-                .env("RUST_LOG", "off")
+                .env("RUST_LOG", "info")
                 .env("NO_PROXY", "*")
                 .env_remove("MONAD_FUNDS_BOUNDARY")
                 .env_remove("MONAD_FUNDS_IPC")
@@ -269,12 +289,9 @@ impl Process {
                 .stdout(if args.contains(&"--json") {
                     Stdio::piped()
                 } else {
-                    Stdio::null()
+                    Stdio::from(log("stdout"))
                 })
-                .stderr(
-                    std::fs::File::create(config.parent().unwrap().join("last-process.stderr"))
-                        .unwrap(),
-                )
+                .stderr(log("stderr"))
                 .spawn()
                 .expect("spawn production CLI"),
         )
@@ -828,8 +845,20 @@ clients:
     }
 
     async fn roundtrip(&self) {
-        tokio::time::timeout(DEADLINE, async {
+        self.roundtrip_observed(&mut []).await;
+    }
+
+    async fn roundtrip_observed(&self, processes: &mut [(&str, &mut Process)]) {
+        let mut attempts = 0;
+        let mut last_error = String::from("no probe completed");
+        let result = tokio::time::timeout(DEADLINE, async {
             loop {
+                for (label, process) in processes.iter_mut() {
+                    if let Some(status) = process.0.try_wait().expect("check child status") {
+                        panic!("route setup child {label} exited: {status}; probes={attempts} last={last_error}; inspect private process diagnostics");
+                    }
+                }
+                attempts += 1;
                 let attempt = tokio::time::timeout(Duration::from_secs(2), async {
                     let mut stream = TcpStream::connect(self.socks).await?;
                     stream.write_all(&[5, 1, 0]).await?;
@@ -857,11 +886,16 @@ clients:
                 if matches!(attempt, Ok(Ok(()))) {
                     break;
                 }
+                last_error = match attempt {
+                    Ok(Err(error)) => format!("{:?}: {error}", error.kind()),
+                    Err(_) => "probe exceeded 2 seconds".to_string(),
+                    Ok(Ok(())) => unreachable!(),
+                };
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
-        .await
-        .expect("production QUIC/SOCKS route did not become ready");
+        .await;
+        assert!(result.is_ok(), "production QUIC/SOCKS route did not become ready; probes={attempts} last={last_error}; inspect private process diagnostics");
     }
 
     pub async fn cycle(&mut self, crash_opening: bool) {
@@ -1342,14 +1376,15 @@ clients:
     }
 
     async fn open_expired(&self) -> String {
-        let relay = self.relay(&["run"]);
-        let client = Process::spawn_with_env(
+        let mut relay = self.relay(&["run"]);
+        let mut client = Process::spawn_with_env(
             &self.client_bin,
             &["run"],
             &self.config,
             &[("MONAD_FUNDS_LIFETIME", "8")],
         );
-        self.roundtrip().await;
+        self.roundtrip_observed(&mut [("relay", &mut relay), ("client", &mut client)])
+            .await;
         drop(client);
         drop(relay);
         let channel = self.active_channel();
