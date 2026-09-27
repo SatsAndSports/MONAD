@@ -11,7 +11,7 @@ const root = document.querySelector("#instances"),
   activity = document.querySelector("#activity");
 let processes = {},
   live = false;
-const pending = new Set(),
+const pending = new Map(),
   commands = new Map(),
   cards = new Map();
 function el(tag, text, cls) {
@@ -95,7 +95,8 @@ async function submit(process, name, generation, action, args) {
   const request_id = crypto.randomUUID();
   const controller = new AbortController(),
     timer = setTimeout(() => controller.abort(), 10000);
-  pending.add(key);
+  const tracked = {process, instance:name, generation, request_id, action, channel_id:args.channel_id, state:"submitting"};
+  pending.set(key, tracked);
   render();
   try {
     const response = await fetch(
@@ -114,16 +115,62 @@ async function submit(process, name, generation, action, args) {
       },
     );
     const result = await response.json();
+    if ([400, 409, 429].includes(response.status)) {
+      observeOperation({...tracked, state:"failed", error:result.error || `HTTP ${response.status}`});
+      return;
+    }
     if (!response.ok) throw Error(result.error || `HTTP ${response.status}`);
-    notice.textContent = `${name}: ${action} accepted (${request_id}). Follow live activity for completion.`;
+    observeOperation({...result.request, ...result, process, generation, request_id, instance:name, action, channel_id:args.channel_id});
   } catch (e) {
-    notice.textContent = `Submission unconfirmed: ${e.message}. Request ${request_id}. Inspect state before issuing another command; reload never retries.`;
+    if (pending.get(key) === tracked)
+      notice.textContent = `Submission unconfirmed: ${e.message}. Request ${request_id}. Checking operation status; do not resubmit.`;
   } finally {
     clearTimeout(timer);
-    pending.delete(key);
     render();
   }
 }
+
+function observeOperation(c) {
+  if (processes[c.process]?.generation !== c.generation) return;
+  const id = JSON.stringify([c.process, c.generation, c.request_id]);
+  const previous = commands.get(id);
+  if (["succeeded", "failed"].includes(previous?.state)) return;
+  const key = JSON.stringify([c.process, c.instance]);
+  const local = pending.get(key);
+  c = {...previous, ...c, channel_id:c.channel_id || previous?.channel_id || (local?.request_id === c.request_id ? local.channel_id : undefined)};
+  commands.set(id, c);
+  const terminal = ["succeeded", "failed"].includes(c.state);
+  if (terminal) {
+    if (local?.request_id === c.request_id) pending.delete(key);
+  } else if (!local || local.request_id === c.request_id) pending.set(key, c);
+  notice.textContent = `${c.instance}: ${c.action}${c.channel_id ? " · channel " + c.channel_id : ""} · ${c.state} (${c.request_id})${c.error ? ": " + c.error : ""}${c.action === "request_channel_unlink" && c.state === "succeeded" ? " — check channel ownership for release completion" : ""}`;
+  while (commands.size > 100) commands.delete(commands.keys().next().value);
+  renderActivity();
+  render();
+}
+
+let reconciling = false;
+async function reconcileOperations() {
+  if (reconciling) return;
+  reconciling = true;
+  try {
+    await Promise.all([...pending.values()].map(async c => {
+      if (processes[c.process]?.generation !== c.generation) {
+        pending.delete(JSON.stringify([c.process, c.instance]));
+        notice.textContent = `${c.instance}: process restarted; prior command outcome is unknown. Inspect current state.`;
+        return;
+      }
+      try {
+        const response = await fetch(`/v1/processes/${encodeURIComponent(c.process)}/operations/${encodeURIComponent(c.request_id)}`, {signal:AbortSignal.timeout(5000)});
+        if (!response.ok) return;
+        const op = await response.json();
+        if (op.request.generation === c.generation)
+          observeOperation({...c, ...op, ...op.request});
+      } catch { /* Keep uncertain commands locked until lookup succeeds. */ }
+    }));
+  } finally { reconciling = false; render(); }
+}
+setInterval(reconcileOperations, 2000);
 function controls(process, name, instance) {
   const box = el("div", null, "controls");
   const c = instance.controls;
@@ -546,15 +593,15 @@ function renderActivity() {
     activity.append(
       el(
         "li",
-        `${c.process} / ${c.instance} · ${c.action} · ${c.state} · ${c.request_id}${c.error ? " · " + c.error : ""}${c.result ? " · " + JSON.stringify(c.result) : ""}`,
+        `${c.process} / ${c.instance} · ${c.action} · ${c.state} · ${c.request_id}${c.channel_id ? " · channel " + c.channel_id : ""}${c.error ? " · " + c.error : ""}${c.result ? " · " + JSON.stringify(c.result) : ""}`,
       ),
     );
 }
 const stream = new EventSource("/v1/events");
 stream.addEventListener("reset", (e) => {
   processes = JSON.parse(e.data).processes;
-  commands.clear();
   live = true;
+  reconcileOperations();
   renderActivity();
   render();
 });
@@ -587,15 +634,14 @@ stream.addEventListener("operation_updated", (e) => {
     ].includes(c.action)
   )
     return;
-  commands.set(JSON.stringify([u.process, u.generation, c.request_id]), {
+   observeOperation({
     ...c,
     process: u.process,
     generation: u.generation,
   });
-  while (commands.size > 100) commands.delete(commands.keys().next().value);
-  renderActivity();
 });
 stream.addEventListener("source_gap", () => {
+  reconcileOperations();
   notice.textContent =
     "Some activity was missed; snapshots still restore current state.";
 });
