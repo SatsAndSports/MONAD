@@ -38,7 +38,7 @@ stress-custom:
 	cargo test -p monad-relay --test stress -- --ignored stress_three_hop_quic_configurable --nocapture
 
 stress-stable-5hop:
-	ulimit -n 65536 && \
+	ulimit -Sn 65536 && \
 	echo "ulimit -n=$$(ulimit -n)" && \
 	NO_COLOR=1 RUST_LOG=error \
 	MONAD_STRESS_RELAYS=10 \
@@ -50,7 +50,7 @@ stress-stable-5hop:
 
 # Approx wall time on clanker's machine: ~22m41s
 stress-transport-extreme:
-	ulimit -n 524288 && \
+	ulimit -Sn 524288 && \
 	echo "ulimit -n=$$(ulimit -n)" && \
 	NO_COLOR=1 RUST_LOG=error \
 	MONAD_STRESS_RELAYS=10 \
@@ -64,7 +64,7 @@ stress-transport-extreme:
 
 # Approx wall time on clanker's machine: ~1m59s
 stress-payment-buffered:
-	ulimit -n 524288 && \
+	ulimit -Sn 524288 && \
 	echo "ulimit -n=$$(ulimit -n)" && \
 	NO_COLOR=1 RUST_LOG=error \
 	MONAD_STRESS_PAYMENT_MODE=buffered \
@@ -83,7 +83,7 @@ stress-payment-buffered:
 
 # Approx wall time on clanker's machine: ~29s
 stress-payment-relink:
-	ulimit -n 524288 && \
+	ulimit -Sn 524288 && \
 	echo "ulimit -n=$$(ulimit -n)" && \
 	NO_COLOR=1 RUST_LOG=error \
 	MONAD_STRESS_PAYMENT_MODE=relink-buffered \
