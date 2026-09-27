@@ -42,6 +42,12 @@ pub(crate) struct OwnershipState {
     retired: std::collections::HashSet<String>,
 }
 
+impl OwnershipState {
+    pub(crate) fn owner(&self, channel_id: &str) -> Option<[u8; 32]> {
+        self.owners.get(channel_id).copied().flatten()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ChannelStore {
     storage: Arc<dyn SpilmanStorage>,

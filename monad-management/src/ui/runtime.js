@@ -219,9 +219,6 @@ function channelPanel(c, session) {
   );
   return panel;
 }
-function linkedIds(instance) {
-  return new Set((instance.sessions || []).map(s=>s.linked_channel_id).filter(Boolean));
-}
 function channelState(c) {
   const state = String(c.state).toLowerCase();
   const box = el("span");
@@ -236,8 +233,7 @@ function unlinkedChannels() {
   for (const [process,state] of Object.entries(processes)) {
     if (state.data?.kind !== "relays") continue;
     for (const c of state.data.wallet?.channels || []) {
-      const instance = state.data.instances[c.relay_name];
-      if (instance && linkedIds(instance).has(c.channel_id)) continue;
+      if (c.ownership?.state === "linked") continue;
       entries.push({process,state,c});
     }
   }
@@ -247,7 +243,9 @@ function unlinkedChannels() {
     `${c.relay_name} / ${process}${healthy(state) ? "" : " · Stale / unavailable"}`,
     shortId(c.channel_id), channelState(c), `${c.mint_url} / ${c.unit}`, channelPanel(c),
     c.last_linked_at_unix_ms ? new Date(c.last_linked_at_unix_ms).toLocaleString() : "Unknown (before this process run)",
-    button("Close channel",process,c.relay_name,"close_channel",{channel_id:c.channel_id},String(c.state).toLowerCase()==="open")
+    c.ownership?.state === "unlinked"
+      ? button("Close channel",process,c.relay_name,"close_channel",{channel_id:c.channel_id},String(c.state).toLowerCase()==="open")
+      : el("span", "Ownership unavailable")
   ])));
   if(!entries.length) section.append(el("p","No unlinked channels."));
   return section;
@@ -409,7 +407,10 @@ function instanceCard(process, name, state, instance) {
         .map((channel) => [channel.channel_id, channel]),
     );
     const linkedChannels = [
-      ...new Set(sessions.map((session) => session.linked_channel_id).filter(Boolean)),
+      ...new Set([
+        ...[...inventory.values()].filter(channel => channel.ownership?.state === "linked").map(channel => channel.channel_id),
+        ...sessions.map(session => session.linked_channel_id).filter(id => id && !inventory.has(id)),
+      ]),
     ].map((channelId) => ({ channelId, channel: inventory.get(channelId) }));
     card.append(
       table(
@@ -417,7 +418,7 @@ function instanceCard(process, name, state, instance) {
         linkedChannels.map(({ channelId, channel }) =>
           channel
             ? [
-                shortId(channel.channel_id),
+                el("span", `${channel.channel_id.slice(0, 16)}… · session ${channel.ownership.session_id}`),
                 channelState(channel),
                 `${channel.mint_url} / ${channel.unit}`,
                 channelPanel(channel),

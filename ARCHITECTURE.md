@@ -1928,3 +1928,12 @@ The full QUIC transport chain is implemented and tested:
 - QUIC connection pool entries are only evicted lazily (on failed stream open) plus transport idle timeout; there is no proactive stale-entry cleanup.
 - configured mint/unit advertisements currently share the relay session's pricing
   rates rather than carrying independently configured rates per offer.
+
+## Management channel ownership
+
+Relay management samples process-local channel ownership directly from the shared
+wallet ownership store, independently of cached wallet inventory and session
+monitor snapshots. Each channel exposes `ownership.state` as `linked` (with
+`session_id`), `unlinked`, or `unavailable`. Session-monitor absence does not imply
+release. Command execution still atomically checks ownership and retirement;
+snapshot eligibility is observational, not a reservation.
