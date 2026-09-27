@@ -1000,6 +1000,48 @@ async fn start_auto_control(
                     );
                     funding.reset();
                 }
+                ServerMessage::ChannelReleaseRequested { channel_id } => {
+                    info!(
+                        "{hop_label}: relay requested release of channel {channel_id}; unlinking"
+                    );
+                    if let Ok(channel) = wallet.get_channel(&channel_id) {
+                        let _ = wallet.mark_channel_unusable(&channel_id);
+                        let final_balance_raw = match channel.unit.as_str() {
+                            "msat" => channel.current_signed_balance_msats,
+                            "sat" => channel.current_signed_balance_msats.div_ceil(1000),
+                            other => {
+                                warn!("{hop_label}: unsupported unit {other} for unlink");
+                                channel.current_signed_balance_msats
+                            }
+                        };
+                        if let Err(err) = send_control_message(
+                            &mut h2_send,
+                            &ClientMessage::ChannelUnlink {
+                                channel_id: channel_id.clone(),
+                                final_balance_raw,
+                            },
+                        )
+                        .await
+                        {
+                            report_hop_failure(
+                                &failure_tx,
+                                hop_idx,
+                                epoch,
+                                format!("failed to send channel unlink: {err}"),
+                            );
+                            break;
+                        }
+                    } else {
+                        warn!(
+                            "{hop_label}: release requested for unknown channel {channel_id}; resetting funding"
+                        );
+                        funding.reset();
+                    }
+                }
+                ServerMessage::ChannelUnlinked { channel_id, .. } => {
+                    info!("{hop_label}: relay confirmed unlink of channel {channel_id}");
+                    funding.reset();
+                }
                 ServerMessage::Error { code, message } => {
                     if is_recoverable_funding_error(&code) {
                         warn!(

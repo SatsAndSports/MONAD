@@ -278,6 +278,7 @@ pub struct RelayWalletIdentity {
 pub(crate) struct ChannelMetadataStore {
     pub(crate) db_path: String,
     authority: Arc<Mutex<WalletLocks>>,
+    pub(crate) ownership: Arc<Mutex<crate::channel_store::OwnershipState>>,
 }
 
 impl ChannelMetadataStore {
@@ -288,6 +289,7 @@ impl ChannelMetadataStore {
         let store = Self {
             db_path: db_path.into(),
             authority,
+            ownership: Default::default(),
         };
         store.init()?;
         Ok(store)
@@ -298,6 +300,8 @@ impl ChannelMetadataStore {
             .map_err(|e| io::Error::other(format!("open relay wallet metadata db: {e}")))?;
         conn.execute_batch(CREATE_CHANNEL_META_TABLE_SQL)
             .map_err(|e| io::Error::other(format!("create relay wallet metadata table: {e}")))?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS monad_relay_retired_channels (channel_id TEXT PRIMARY KEY NOT NULL)")
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -318,6 +322,28 @@ impl ChannelMetadataStore {
             params![channel_id, relay_name, receiver_pubkey_hex],
         )
         .map_err(|e| format!("record relay channel metadata: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn is_retired(&self, channel_id: &str) -> Result<bool, String> {
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.db_path)
+            .map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM monad_relay_retired_channels WHERE channel_id=?1)",
+            [channel_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn retire(&self, channel_id: &str) -> Result<(), String> {
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.db_path)
+            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR IGNORE INTO monad_relay_retired_channels(channel_id) VALUES (?1)",
+            [channel_id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -964,6 +990,12 @@ impl RelayWalletManager {
         self.metadata.relay_name_for_channel(channel_id)
     }
 
+    /// Whether this channel has been retired (no new links; cooperative unlink
+    /// requested or already completed). Retirement persists across restarts.
+    pub fn channel_is_retired(&self, channel_id: &str) -> bool {
+        self.metadata.is_retired(channel_id).unwrap_or(false)
+    }
+
     pub fn list_identities(&self) -> Vec<RelayWalletIdentitySummary> {
         let identities = self
             .identities
@@ -1300,7 +1332,7 @@ impl RelayWalletManager {
                 .optional()
                 .map_err(|e| format!("query drained channel marker: {e}"))?;
             if already_drained.is_some()
-                || self.storage.get_state(&channel_id) != ChannelState::Closed
+                || self.storage.get_state(&channel_id)? != Some(ChannelState::Closed)
             {
                 continue;
             }
@@ -2155,7 +2187,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("lacks exact close journal"));
-        assert_eq!(store.channel_state("channel"), Some(ChannelState::Closing));
+        assert_eq!(
+            store.channel_state("channel").unwrap(),
+            Some(ChannelState::Closing)
+        );
         assert!(manager
             .storage
             .get_close_journal("channel")

@@ -60,6 +60,8 @@ pub enum ServerErrorCode {
     PaymentNoNewFunds,
     PaymentConflict,
     InternalError,
+    LinkChannelRetired,
+    ChannelUnlinkRejected,
 }
 
 /// Messages sent from client to server on the control channel.
@@ -75,6 +77,11 @@ pub enum ClientMessage {
     ///
     /// The payload is a serialized `cdk_spilman::Payment` JSON object.
     ChannelPayment { payment_json: String },
+    /// Stop using a retiring channel after all signed payments are acknowledged.
+    ChannelUnlink {
+        channel_id: String,
+        final_balance_raw: u64,
+    },
     /// Request a fresh session status snapshot.
     GetSessionStatus,
 }
@@ -107,7 +114,16 @@ pub enum ServerMessage {
     },
 
     /// Another session claimed the channel; this session is now Unlinked.
-    ChannelEvicted { channel_id: String },
+    ChannelEvicted {
+        channel_id: String,
+    },
+    ChannelReleaseRequested {
+        channel_id: String,
+    },
+    ChannelUnlinked {
+        channel_id: String,
+        final_balance_raw: u64,
+    },
 
     /// Server-initiated error or notification
     Error {

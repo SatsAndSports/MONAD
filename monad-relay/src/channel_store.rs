@@ -39,6 +39,7 @@ pub(crate) enum PaymentStoreError {
 #[derive(Debug, Default)]
 pub(crate) struct OwnershipState {
     owners: HashMap<String, Option<[u8; 32]>>,
+    retired: std::collections::HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -93,7 +94,7 @@ impl ChannelStore {
     ) -> Self {
         Self {
             storage,
-            ownership: Arc::new(Mutex::new(OwnershipState::default())),
+            ownership: metadata.ownership.clone(),
             metadata: Some(metadata),
             relay_name: Some(relay_name),
             receiver_pubkey_hex: Some(receiver_pubkey_hex),
@@ -128,10 +129,14 @@ impl ChannelStore {
     }
 
     pub(crate) fn get_channel(&self, channel_id: &str) -> Result<Option<StoredChannel>, String> {
-        let funding = match self.storage.get_funding(channel_id) {
-            Some(f) => f,
+        let state = match self.channel_state(channel_id)? {
+            Some(state) => state,
             None => return Ok(None),
         };
+        let funding = self
+            .storage
+            .get_funding(channel_id)
+            .ok_or_else(|| format!("known channel {channel_id} has no readable funding"))?;
 
         let metadata = parse_channel_metadata(&funding.params_json)
             .map_err(|e| format!("corrupt stored channel params for {channel_id}: {e}"))?;
@@ -144,7 +149,6 @@ impl ChannelStore {
                 signature: String::new(),
             });
 
-        let state = self.storage.get_state(channel_id);
         let closing_data = self.storage.get_closing_data(channel_id);
 
         Ok(Some(StoredChannel {
@@ -209,6 +213,16 @@ impl ChannelStore {
         session_id: [u8; 32],
     ) -> Result<Option<[u8; 32]>, String> {
         let mut ownership = self.ownership_lock()?;
+        if ownership.retired.contains(channel_id)
+            || self
+                .metadata
+                .as_ref()
+                .map(|m| m.is_retired(channel_id))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            return Err("channel retired".into());
+        }
         let evicted = match ownership.owners.get(channel_id).copied().flatten() {
             Some(owner) if owner != session_id => Some(owner),
             _ => None,
@@ -229,6 +243,70 @@ impl ChannelStore {
             if *owner == session_id {
                 ownership.owners.insert(channel_id.to_string(), None);
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire_channel(
+        &self,
+        channel_id: &str,
+        require_unowned: bool,
+    ) -> Result<Option<[u8; 32]>, String> {
+        let mut ownership = self.ownership_lock()?;
+        if self.storage.get_funding(channel_id).is_none() {
+            return Err("unknown channel".into());
+        }
+        let owner = ownership.owners.get(channel_id).copied().flatten();
+        if require_unowned && owner.is_some() {
+            return Err("channel is linked; request unlink first".into());
+        }
+        if let Some(metadata) = &self.metadata {
+            metadata.retire(channel_id)?;
+        }
+        ownership.retired.insert(channel_id.to_owned());
+        Ok(owner)
+    }
+
+    pub(crate) fn is_retired(&self, channel_id: &str) -> Result<bool, String> {
+        let ownership = self.ownership_lock()?;
+        Ok(ownership.retired.contains(channel_id)
+            || self
+                .metadata
+                .as_ref()
+                .map(|m| m.is_retired(channel_id))
+                .transpose()?
+                .unwrap_or(false))
+    }
+
+    pub(crate) fn unlink_channel(
+        &self,
+        session: [u8; 32],
+        channel_id: &str,
+        final_balance: u64,
+    ) -> Result<(), String> {
+        let mut ownership = self.ownership_lock()?;
+        if !ownership.retired.contains(channel_id)
+            && !self
+                .metadata
+                .as_ref()
+                .map(|m| m.is_retired(channel_id))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            return Err("channel release was not requested".into());
+        }
+        let balance = self
+            .storage
+            .get_balance(channel_id)
+            .ok_or("missing channel payment")?;
+        if balance.balance != final_balance {
+            return Err("final channel balance mismatch".into());
+        }
+        if let Some(owner) = ownership.owners.get(channel_id).copied().flatten() {
+            if owner != session {
+                return Err("channel is owned by another session".into());
+            }
+            ownership.owners.insert(channel_id.to_owned(), None);
         }
         Ok(())
     }
@@ -257,8 +335,8 @@ impl ChannelStore {
         self.storage.mark_closed(channel_id, data)
     }
 
-    pub(crate) fn channel_state(&self, channel_id: &str) -> Option<ChannelState> {
-        Some(self.storage.get_state(channel_id))
+    pub(crate) fn channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String> {
+        self.storage.get_state(channel_id)
     }
 
     pub(crate) fn closed_data(&self, channel_id: &str) -> Option<ClosedDataView> {
@@ -330,10 +408,15 @@ mod tests {
         {
             let storage = Arc::new(SqliteStorage::open(&path).unwrap());
             let store = ChannelStore::new(storage);
+            assert_eq!(store.channel_state("chan1").unwrap(), None);
             store
                 .save_funding("chan1", dummy_funding("chan1"), payment_proof(0))
                 .unwrap();
             store.record_payment("chan1", payment_proof(5_000)).unwrap();
+            assert_eq!(
+                store.channel_state("chan1").unwrap(),
+                Some(ChannelState::Open)
+            );
 
             let channel = store.get_channel("chan1").unwrap().unwrap();
             assert_eq!(channel.latest_payment.balance, 5_000);
@@ -345,10 +428,128 @@ mod tests {
         {
             let storage = Arc::new(SqliteStorage::open(&path).unwrap());
             let store = ChannelStore::new(storage);
+            assert_eq!(store.channel_state("missing").unwrap(), None);
+            assert_eq!(
+                store.channel_state("chan1").unwrap(),
+                Some(ChannelState::Open)
+            );
             let channel = store.get_channel("chan1").unwrap().unwrap();
             assert_eq!(channel.latest_payment.balance, 5_000);
             assert_eq!(channel.unit, ChannelUnit::Sat);
             assert_eq!(channel.capacity_raw, 100);
+        }
+    }
+
+    #[test]
+    fn retirement_blocks_relink_and_unlink_releases_owner() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = ChannelStore::new(storage);
+        let owner = [7u8; 32];
+        let other = [9u8; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.record_payment("chan", payment_proof(42)).unwrap();
+        store.set_channel_owner("chan", owner).unwrap();
+
+        // Retirement reports the current owner and keeps payments valid.
+        assert_eq!(store.retire_channel("chan", false).unwrap(), Some(owner));
+        assert!(store.is_retired("chan").unwrap());
+        assert!(store.set_channel_owner("chan", other).is_err());
+        store
+            .compare_owned_payment("chan", owner, &payment_proof(42), payment_proof(50))
+            .unwrap();
+
+        // Unlink requires the correct owner and final balance.
+        assert!(store.unlink_channel(other, "chan", 50).is_err());
+        assert!(store.unlink_channel(owner, "chan", 49).is_err());
+        store.unlink_channel(owner, "chan", 50).unwrap();
+        assert!(store.is_retired("chan").unwrap());
+        assert!(store.set_channel_owner("chan", other).is_err());
+
+        // Unlinked retirement allows closure; linked retirement does not.
+        store.retire_channel("chan", true).unwrap();
+        assert!(store.set_channel_owner("chan", owner).is_err());
+    }
+
+    #[test]
+    fn channel_reads_propagate_invalid_state_and_query_failure() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap();
+        let store = ChannelStore::new(Arc::new(SqliteStorage::open(path).unwrap()));
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE spilman_channels SET state='invalid' WHERE channel_id='chan'",
+            [],
+        )
+        .unwrap();
+        assert!(store.channel_state("chan").is_err());
+        assert!(store.get_channel("chan").is_err());
+        assert!(store.get_channel("unknown").unwrap().is_none());
+        conn.execute("DROP TABLE spilman_channels", []).unwrap();
+        assert!(store.channel_state("chan").is_err());
+        assert!(store.channel_state("unknown").is_err());
+        assert!(store.get_channel("chan").is_err());
+        assert!(store.get_channel("unknown").is_err());
+    }
+
+    #[test]
+    fn linked_retirement_blocks_direct_close_retirement() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = ChannelStore::new(storage);
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.set_channel_owner("chan", [1; 32]).unwrap();
+        let error = store.retire_channel("chan", true).unwrap_err();
+        assert_eq!(error, "channel is linked; request unlink first");
+    }
+
+    #[test]
+    fn retirement_persists_across_wallet_metadata_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.db");
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap().to_string();
+        let authority = Arc::new(Mutex::new(
+            monad_common::wallet_lock::WalletLocks::acquire(
+                [meta_path.as_path()],
+                monad_common::wallet_lock::WalletLockMode::Runtime,
+                "test",
+            )
+            .unwrap(),
+        ));
+        for iteration in 0..2 {
+            let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+            let metadata = Arc::new(
+                crate::wallet_manager::ChannelMetadataStore::new(
+                    meta_path.display().to_string(),
+                    authority.clone(),
+                )
+                .unwrap(),
+            );
+            let store = ChannelStore::with_relay_metadata(
+                storage,
+                metadata,
+                "relay".into(),
+                "receiver".into(),
+            );
+            if iteration == 0 {
+                store
+                    .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+                    .unwrap();
+                assert_eq!(store.retire_channel("chan", true).unwrap(), None);
+            } else {
+                // A fresh in-memory ownership map must still see the persisted
+                // retirement and reject a new link.
+                assert!(store.is_retired("chan").unwrap());
+            }
+            assert!(store.set_channel_owner("chan", [1; 32]).is_err());
         }
     }
 

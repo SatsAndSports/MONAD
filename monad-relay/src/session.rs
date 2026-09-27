@@ -239,6 +239,14 @@ impl SessionState {
         self.termination.is_cancelled()
     }
 
+    pub(crate) fn unlink_channel(&self, channel_id: &str, balance: u64) -> Result<(), String> {
+        self.payments
+            .unlink_channel(self.session_id, channel_id, balance)?;
+        self.owned_channels.lock().unwrap().remove(channel_id);
+        self.session_registry.events.record("channel_unlinked",serde_json::json!({"channel_id":channel_id,"session_id":hex::encode(self.session_id),"final_balance_raw":balance}));
+        Ok(())
+    }
+
     // Driver-facing accessors for payment / registry / pause side effects.
 
     pub(crate) fn link_channel(
@@ -261,7 +269,12 @@ impl SessionState {
                 }
                 let reference: ChannelReference = serde_json::from_str(payment_json)
                     .map_err(|e| crate::payments::LinkError::InvalidPayment(e.to_string()))?;
-                if self.payments.channel_state(&reference.channel_id).is_none() {
+                if self
+                    .payments
+                    .channel_state(&reference.channel_id)
+                    .map_err(crate::payments::LinkError::Internal)?
+                    .is_none()
+                {
                     return Err(crate::payments::LinkError::AdmissionDisabled);
                 }
             }
@@ -1096,6 +1109,9 @@ async fn handle_control_stream(
                                 };
 
                                 match message {
+                                    ClientMessage::ChannelUnlink { channel_id, final_balance_raw } => {
+                                        terminate_session = process_session_event(&state, SessionEvent::ClientChannelUnlink {channel_id,final_balance_raw}, &mut h2_send).await?;
+                                    }
                                     ClientMessage::GetSessionStatus => {
                                         terminate_session = process_session_event(
                                             &state,
@@ -1308,6 +1324,62 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_new_channel_gate_distinguishes_unknown_and_lookup_failure() {
+        use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        let storage = Arc::new(SqliteStorage::open(path).unwrap());
+        let (mut state, _) = test_state();
+        state.payments = Arc::new(
+            crate::payments::SpilmanRelayPayments::from_store_with_snapshot(
+                cashu::nuts::SecretKey::generate(),
+                SpilmanMintCache::default(),
+                BTreeMap::new(),
+                Default::default(),
+                crate::channel_store::ChannelStore::new(storage.clone()),
+            ),
+        );
+        state
+            .session_registry
+            .set_controls(crate::session_registry::RelayControls {
+                accept_new_channels: false,
+                ..Default::default()
+            })
+            .unwrap();
+        let link = r#"{"channel_id":"channel","balance":0,"capacity":100,"unit":"msat"}"#;
+        assert_eq!(state.link_channel(link), Err(LinkError::AdmissionDisabled));
+        assert_eq!(state.payments.channel_state("channel").unwrap(), None);
+
+        storage
+            .save_funding(
+                "channel",
+                cdk_spilman::ChannelFunding {
+                    params_json: "{}".to_string(),
+                    funding_proofs_json: "[]".to_string(),
+                    channel_secret_hex: String::new(),
+                    keyset_info_json: "{}".to_string(),
+                },
+            )
+            .unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE spilman_channels SET state='invalid' WHERE channel_id='channel'",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            state.link_channel(link),
+            Err(LinkError::Internal(_))
+        ));
+        assert!(storage.get_funding("channel").is_some());
+        conn.execute("DROP TABLE spilman_channels", []).unwrap();
+        assert!(matches!(
+            state.link_channel(link),
+            Err(LinkError::Internal(_))
+        ));
+    }
+
+    #[test]
     fn new_channel_gate_preserves_relinks_and_payments() {
         let (state, payments) = test_state();
         let existing = r#"{"channel_id":"existing","balance":0,"capacity":100,"unit":"msat"}"#;
@@ -1333,7 +1405,7 @@ mod tests {
             state.link_channel(r#"{"channel_id":"new","balance":0,"capacity":100,"unit":"msat"}"#),
             Err(LinkError::AdmissionDisabled)
         );
-        assert!(payments.channel_state("new").is_none());
+        assert!(payments.channel_state("new").unwrap().is_none());
         state
             .session_registry
             .set_controls(Default::default())

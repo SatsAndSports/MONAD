@@ -972,6 +972,46 @@ async fn start_huge_funding_control(
                     println!("{hop_label}: stress funding channel evicted: {channel_id}");
                     break;
                 }
+                ServerMessage::ChannelReleaseRequested { channel_id } => {
+                    println!(
+                        "{hop_label}: relay requested release of stress channel {channel_id}; unlinking"
+                    );
+                    if active_channel_id.as_deref() == Some(channel_id.as_str()) {
+                        if let Some(channel_state) = channel_states.get(&channel_id) {
+                            let final_balance_raw = channel_state
+                                .last_confirmed_balance_raw
+                                .max(channel_state.last_attempted_balance_raw.unwrap_or(0));
+                            let _ = wallet.mark_channel_unusable(&channel_id);
+                            if let Err(err) = send_control_message(
+                                &mut h2_send,
+                                &ClientMessage::ChannelUnlink {
+                                    channel_id: channel_id.clone(),
+                                    final_balance_raw,
+                                },
+                            )
+                            .await
+                            {
+                                payment_stats.control_errors.fetch_add(1, Ordering::Relaxed);
+                                println!("{hop_label}: failed to send channel unlink: {err}");
+                                break;
+                            }
+                        }
+                        active_channel_id = None;
+                        if let Some(channel_state) = channel_states.get_mut(&channel_id) {
+                            channel_state.last_attempted_balance_raw = None;
+                        }
+                        continue;
+                    }
+                    println!(
+                        "{hop_label}: release requested for non-active stress channel {channel_id}"
+                    );
+                }
+                ServerMessage::ChannelUnlinked { channel_id, .. } => {
+                    println!("{hop_label}: relay confirmed unlink of stress channel {channel_id}");
+                    if active_channel_id.as_deref() == Some(channel_id.as_str()) {
+                        active_channel_id = None;
+                    }
+                }
                 ServerMessage::Error { code, message } => {
                     if matches!(code, ServerErrorCode::PaymentNoNewFunds) {
                         payment_stats
