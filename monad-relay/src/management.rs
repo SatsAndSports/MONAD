@@ -98,6 +98,17 @@ impl Backend for RelayBackend {
                     .map(|id| self.wallet.channel_is_retired(id))
                     .unwrap_or(false);
                 channel["retired"] = json!(retired);
+                channel["ownership"] = match channel["channel_id"]
+                    .as_str()
+                    .ok_or_else(|| "missing channel id".to_string())
+                    .and_then(|id| self.wallet.channel_owner(id))
+                {
+                    Ok(Some(session)) => {
+                        json!({"state": "linked", "session_id": hex::encode(session)})
+                    }
+                    Ok(None) => json!({"state": "unlinked"}),
+                    Err(_) => json!({"state": "unavailable"}),
+                };
             }
         }
         Ok(json!({"kind": "relays", "instances": instances, "wallet": wallet}))

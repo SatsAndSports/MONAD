@@ -66,6 +66,10 @@ See [mint UI usage and browser tests](docs/mint-ui.md).
 
 ### Runtime management foundations
 
+Relay channel rows report authoritative ownership, including the owning session ID.
+Close is available only for channels reported as unlinked; unavailable ownership
+is shown explicitly and disables Close.
+
 Configured client and relay processes now optionally expose Unix-socket management
 endpoints. See [the headless API reference](docs/management-api.md) for configuration,
 commands, operation tracking, and monitoring semantics.

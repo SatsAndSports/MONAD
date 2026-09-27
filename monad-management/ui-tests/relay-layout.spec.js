@@ -3,7 +3,7 @@ import {startDemo} from "./demo.mjs";
 
 test("relay channels partition by linkage, preserve Closing, and compact Closed",async({page})=>{
   const demo=await startDemo();
-  const channel=(id,state,time)=>({channel_id:id.repeat(64),relay_name:"exit",state,mint_url:"http://mint",unit:"msat",capacity_raw:30000,balance_raw:29500,last_linked_at_unix_ms:time});
+  const channel=(id,state,time)=>({channel_id:id.repeat(64),relay_name:"exit",state,mint_url:"http://mint",unit:"msat",capacity_raw:30000,balance_raw:29500,last_linked_at_unix_ms:time,ownership:id==="a"?{state:"linked",session_id:"session"}:{state:"unlinked"}});
   const data={kind:"relays",instances:{exit:{controls:{enabled:true,accept_new_sessions:true,accept_new_tunnels:true,accept_new_channels:true},disabling:false,sessions:[{session_id:"session",linked_channel_id:"a".repeat(64),paused:true}]}},wallet:{channels:[channel("a","Open",3000),channel("b","Closing",2000),channel("c","Closed",1000)]}};
   const state={online:true,generation:"one",last_success_unix_ms:Date.now(),data};
   try {
@@ -29,6 +29,10 @@ test("relay channels partition by linkage, preserve Closing, and compact Closed"
     // Paused remains linked; only withdrawing the session moves its channel.
     data.instances.exit.sessions=[];
     await page.evaluate(state=>stream.dispatchEvent(new MessageEvent("snapshot",{data:JSON.stringify({process:"relays",state})})),state);
+    await expect(lower.locator("tbody tr")).toHaveCount(2);
+    await expect(page.locator('[data-instance="exit"]')).toContainText("session session");
+    data.wallet.channels[0].ownership={state:"unlinked"};
+    await page.evaluate(state=>stream.dispatchEvent(new MessageEvent("snapshot",{data:JSON.stringify({process:"relays",state})})),state);
     await expect(lower.locator("tbody tr")).toHaveCount(3);
     await expect(lower.locator("tbody tr").first()).toContainText("a".repeat(16));
     await expect(page.locator('[data-instance="exit"] .channel-panel')).toHaveCount(0);
@@ -38,6 +42,7 @@ test("relay channels partition by linkage, preserve Closing, and compact Closed"
     await expect(lower.locator("tbody tr").first()).toContainText("a".repeat(16));
     await page.evaluate(()=>stream.close());
     data.instances.exit.sessions=[{session_id:"replacement",linked_channel_id:"a".repeat(64),paused:false}];
+    data.wallet.channels[0].ownership={state:"linked",session_id:"replacement"};
     await page.evaluate(state=>stream.dispatchEvent(new MessageEvent("snapshot",{data:JSON.stringify({process:"relays",state})})),state);
     await expect(lower.locator("tbody tr")).toHaveCount(2);
     await expect(page.locator('[data-instance="exit"] .channel-panel')).toHaveCount(1);
