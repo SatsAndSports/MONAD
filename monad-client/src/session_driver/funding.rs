@@ -14,14 +14,17 @@ pub(super) const LINK_REFRESH_BUSY_RETRY_DELAY: Duration = Duration::from_secs(1
 pub(super) const LOCAL_KEYSET_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
 use super::payment::{
-    compute_estimated_remaining, exclude_on_wallet_error, plan_payment_topup, raw_amount_to_msats,
-    server_error_invalidates_channel, server_error_rejects_intended_channel, PaymentTopupPlan,
+    channel_signed_balance_raw, compute_estimated_remaining, exclude_on_wallet_error,
+    plan_payment_topup, raw_amount_to_msats, server_error_invalidates_channel,
+    server_error_rejects_intended_channel, PaymentTopupPlan,
 };
 use super::state::{
-    abandon_intended_channel, clear_control_op, exclude_channel, publish_spilman_info,
-    relay_confirms_intended_channel, relay_linked_channel_id, session_is_paused,
-    set_blocked_reason, set_link_in_flight, set_payment_in_flight, state_summary,
-    terminate_session, ControlOpInFlight, DriverState, FundingBlockedReason, SessionDriverConfig,
+    abandon_intended_channel, clear_channel_control_op, clear_control_op, exclude_channel,
+    finish_channel_release, publish_spilman_info, relay_confirms_intended_channel,
+    relay_linked_channel_id, release_is_pending, request_channel_release, session_is_paused,
+    set_blocked_reason, set_link_in_flight, set_payment_in_flight, set_unlink_in_flight,
+    state_summary, terminate_session, ControlOpInFlight, DriverState, FundingBlockedReason,
+    SessionDriverConfig,
 };
 
 pub(super) async fn send_control_message(
@@ -422,6 +425,138 @@ pub(super) async fn maybe_ensure_linked_channel(
     }
 }
 
+/// The relay has politely asked to retire a linked channel. Stop creating new
+/// payments on it, persist it as unusable for future funding, and unlink it as
+/// soon as any in-flight payment is acknowledged. Remaining session credit
+/// stays intact; the funding cycle may link a replacement afterward.
+pub(super) async fn apply_channel_release_requested(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    h2_send: &mut h2::SendStream<Bytes>,
+    channel_id: String,
+) -> io::Result<()> {
+    info!(
+        "{} relay requested channel release for {} | {}",
+        config.hop_label,
+        channel_id,
+        state_summary(state, &config.conn.cleartext_byte_counters)
+    );
+    request_channel_release(state, &channel_id);
+    // Persist that this channel must never be reused for future funding. The
+    // channel records and refund recovery data remain intact; unusable does
+    // not mean closed.
+    if let Err(error) = config.wallet.mark_channel_unusable(&channel_id) {
+        warn!(
+            "{} failed to mark retiring channel {} unusable: {error}",
+            config.hop_label, channel_id
+        );
+    }
+    if let Some((owner, _hop)) = &config.management {
+        owner.events.record(
+            "channel_release_requested",
+            serde_json::json!({
+                "session_id": hex::encode(config.conn.session_id),
+                "channel_id": channel_id,
+            }),
+        );
+        owner.notify();
+    }
+    maybe_send_channel_unlink(config, state, h2_send).await
+}
+
+/// Send `ChannelUnlink` for a retirement-pending channel once no payment or
+/// link operation on it is still in flight. The final balance is the wallet's
+/// cumulative signed balance, which the relay verifies against its accepted
+/// balance before releasing ownership.
+pub(super) async fn maybe_send_channel_unlink(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    h2_send: &mut h2::SendStream<Bytes>,
+) -> io::Result<()> {
+    if state.terminated || state.control_op_in_flight.is_some() {
+        return Ok(());
+    }
+    let Some(intended) = state.intended_channel_id.clone() else {
+        return Ok(());
+    };
+    if !release_is_pending(state, &intended) {
+        return Ok(());
+    }
+    // The relay reports this channel as still linked only until it confirms the
+    // unlink. Do not confuse a stale status with an outstanding operation.
+    let channel = match config.wallet.get_channel(&intended) {
+        Ok(channel) => channel,
+        Err(error) => {
+            warn!(
+                "{} cannot unlink retiring channel {}: {error}",
+                config.hop_label, intended
+            );
+            abandon_intended_channel(config, state, intended, false).await;
+            return Ok(());
+        }
+    };
+    let final_balance_raw = match channel_signed_balance_raw(&channel) {
+        Ok(balance) => balance,
+        Err(error) => {
+            warn!(
+                "{} cannot compute final balance for retiring channel {}: {error}",
+                config.hop_label, intended
+            );
+            abandon_intended_channel(config, state, intended, false).await;
+            return Ok(());
+        }
+    };
+    info!(
+        "{} sending ChannelUnlink for {} final_balance_raw={} | {}",
+        config.hop_label,
+        intended,
+        final_balance_raw,
+        state_summary(state, &config.conn.cleartext_byte_counters)
+    );
+    send_control_message(
+        h2_send,
+        &ClientMessage::ChannelUnlink {
+            channel_id: intended.clone(),
+            final_balance_raw,
+        },
+    )
+    .await?;
+    set_unlink_in_flight(state, intended);
+    Ok(())
+}
+
+/// The relay confirmed the cooperative unlink: ownership is released and the
+/// channel moved to its retired, unlinked state. Abandon the local intended
+/// channel state; the session keeps its remaining credit and may link a
+/// replacement according to provisioning policy.
+pub(super) async fn apply_channel_unlinked(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    channel_id: String,
+) {
+    info!(
+        "{} relay confirmed unlink of channel {} | {}",
+        config.hop_label,
+        channel_id,
+        state_summary(state, &config.conn.cleartext_byte_counters)
+    );
+    finish_channel_release(state, &channel_id);
+    clear_channel_control_op(state, &channel_id);
+    if let Some((owner, _hop)) = &config.management {
+        owner.events.record(
+            "channel_unlinked",
+            serde_json::json!({
+                "session_id": hex::encode(config.conn.session_id),
+                "channel_id": channel_id,
+            }),
+        );
+        owner.notify();
+    }
+    if state.intended_channel_id.as_deref() == Some(channel_id.as_str()) {
+        abandon_intended_channel(config, state, channel_id, true).await;
+    }
+}
+
 pub(super) async fn maybe_progress_payment(
     config: &SessionDriverConfig,
     state: &mut DriverState,
@@ -433,7 +568,7 @@ pub(super) async fn maybe_progress_payment(
         || state.funding_blocked_reason.is_some()
         || matches!(
             state.control_op_in_flight,
-            Some(ControlOpInFlight::Payment { .. })
+            Some(ControlOpInFlight::Payment { .. }) | Some(ControlOpInFlight::Unlink { .. })
         )
     {
         return Ok(());
@@ -448,6 +583,12 @@ pub(super) async fn maybe_progress_payment(
     let Some(intended_channel_id) = state.intended_channel_id.clone() else {
         return Ok(());
     };
+    // A channel whose release the relay has requested receives no new payments.
+    // The unlink handshake runs through `maybe_send_channel_unlink` once the
+    // in-flight operation is acknowledged.
+    if release_is_pending(state, &intended_channel_id) {
+        return Ok(());
+    }
     let Some(intended_offer) = state.intended_offer.clone() else {
         return Ok(());
     };
@@ -569,15 +710,16 @@ pub(super) async fn maybe_progress_payment(
     Ok(())
 }
 
-/// Run one funding cycle: ensure a channel is linked, try to progress payment,
-/// then ensure a channel is linked again in case payment planning abandoned the
-/// previous one.
+/// Run one funding cycle: progress any pending cooperative unlink first, then
+/// ensure a channel is linked, try to progress payment, then ensure a channel
+/// is linked again in case payment planning abandoned the previous one.
 pub(super) async fn run_funding_cycle(
     config: &SessionDriverConfig,
     state: &mut DriverState,
     h2_send: &mut h2::SendStream<Bytes>,
     skip_for_resolved_payment: bool,
 ) -> io::Result<()> {
+    maybe_send_channel_unlink(config, state, h2_send).await?;
     maybe_ensure_linked_channel(config, state, h2_send).await?;
     maybe_progress_payment(config, state, h2_send, skip_for_resolved_payment).await?;
     maybe_ensure_linked_channel(config, state, h2_send).await?;
@@ -613,6 +755,24 @@ pub(super) async fn apply_server_error(
 
     if defer_link_after_refresh_error(state, &code, Instant::now()) {
         publish_spilman_info(config, state).await;
+        return;
+    }
+
+    if code == ServerErrorCode::ChannelUnlinkRejected {
+        // The relay could not accept our final balance for the retiring
+        // channel. It remains retired relay-side, so it must not be reused
+        // locally either. Abandon the intended channel; session ownership on
+        // the relay is released when this session detaches.
+        warn!(
+            "{} channel unlink rejected | {}",
+            config.hop_label,
+            state_summary(state, &config.conn.cleartext_byte_counters)
+        );
+        if let Some(channel_id) = state.intended_channel_id.clone() {
+            finish_channel_release(state, &channel_id);
+            let _ = config.wallet.mark_channel_unusable(&channel_id);
+            abandon_intended_channel(config, state, channel_id, true).await;
+        }
         return;
     }
 

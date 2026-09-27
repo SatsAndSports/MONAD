@@ -14,17 +14,36 @@ pub(crate) struct ServerSessionState {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionEvent {
+    ClientChannelUnlink {
+        channel_id: String,
+        final_balance_raw: u64,
+    },
+    UnlinkValidationFinished {
+        channel_id: String,
+        final_balance_raw: u64,
+        result: Result<(), String>,
+    },
     ClientGetSessionStatus,
-    ClientChannelLink { payment_json: String },
+    ClientChannelLink {
+        payment_json: String,
+    },
     LinkValidationFinished(Result<LinkOutcome, LinkError>),
-    ClientChannelPayment { payment_json: String },
+    ClientChannelPayment {
+        payment_json: String,
+    },
     PaymentValidationFinished(Result<PaymentOutcome, ChannelPaymentError>),
-    ChannelEvicted { channel_id: String },
+    ChannelEvicted {
+        channel_id: String,
+    },
     ControlDetached,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionEffect {
+    RunUnlinkValidation {
+        channel_id: String,
+        final_balance_raw: u64,
+    },
     SendControl(ServerMessage),
     SendStatus,
     RunLinkValidation {
@@ -61,6 +80,47 @@ pub(crate) fn step(
     }
 
     let effects = match event {
+        SessionEvent::ClientChannelUnlink {
+            channel_id,
+            final_balance_raw,
+        } => {
+            if state
+                .linked_channel_id
+                .as_ref()
+                .is_some_and(|id| id != &channel_id)
+            {
+                vec![SessionEffect::SendControl(ServerMessage::Error {
+                    code: monad_common::protocol::ServerErrorCode::ChannelUnlinkRejected,
+                    message: "channel is not linked to this session".into(),
+                })]
+            } else {
+                vec![SessionEffect::RunUnlinkValidation {
+                    channel_id,
+                    final_balance_raw,
+                }]
+            }
+        }
+        SessionEvent::UnlinkValidationFinished {
+            channel_id,
+            final_balance_raw,
+            result,
+        } => match result {
+            Ok(()) => {
+                state.linked_channel_id = None;
+                vec![
+                    SessionEffect::SendControl(ServerMessage::ChannelUnlinked {
+                        channel_id,
+                        final_balance_raw,
+                    }),
+                    SessionEffect::SendStatus,
+                ]
+            }
+            Err(_) => vec![SessionEffect::SendControl(ServerMessage::Error {
+                code: monad_common::protocol::ServerErrorCode::ChannelUnlinkRejected,
+                message: "channel unlink rejected: retirement, ownership or final balance mismatch"
+                    .into(),
+            })],
+        },
         SessionEvent::ClientGetSessionStatus => vec![SessionEffect::SendStatus],
         SessionEvent::ClientChannelLink { payment_json } => {
             vec![SessionEffect::RunLinkValidation { payment_json }]
@@ -296,6 +356,103 @@ mod tests {
                 SessionEffect::SendControl(ServerMessage::ChannelEvicted { channel_id }),
                 SessionEffect::SendStatus,
             ] if channel_id == "chan-a"
+        ));
+    }
+
+    #[test]
+    fn unlink_wrong_channel_rejected_without_clearing_link() {
+        let mut current = state();
+        current.linked_channel_id = Some("chan-a".to_string());
+
+        let (next, effects) = step(
+            current,
+            SessionEvent::ClientChannelUnlink {
+                channel_id: "chan-b".to_string(),
+                final_balance_raw: 5,
+            },
+            SessionPricing::new(1, 1),
+        );
+
+        assert_eq!(next.linked_channel_id.as_deref(), Some("chan-a"));
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::SendControl(ServerMessage::Error { code, .. })]
+                if *code == monad_common::protocol::ServerErrorCode::ChannelUnlinkRejected
+        ));
+    }
+
+    #[test]
+    fn unlink_success_clears_link_and_confirms() {
+        let mut current = state();
+        current.linked_channel_id = Some("chan-a".to_string());
+
+        let (next, effects) = step(
+            current,
+            SessionEvent::UnlinkValidationFinished {
+                channel_id: "chan-a".to_string(),
+                final_balance_raw: 42,
+                result: Ok(()),
+            },
+            SessionPricing::new(1, 1),
+        );
+
+        assert_eq!(next.linked_channel_id, None);
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                SessionEffect::SendControl(ServerMessage::ChannelUnlinked {
+                    channel_id,
+                    final_balance_raw,
+                }),
+                SessionEffect::SendStatus,
+            ] if channel_id == "chan-a" && *final_balance_raw == 42
+        ));
+    }
+
+    #[test]
+    fn unlink_validation_failure_keeps_link() {
+        let mut current = state();
+        current.linked_channel_id = Some("chan-a".to_string());
+
+        let (next, effects) = step(
+            current,
+            SessionEvent::UnlinkValidationFinished {
+                channel_id: "chan-a".to_string(),
+                final_balance_raw: 41,
+                result: Err("final channel balance mismatch".to_string()),
+            },
+            SessionPricing::new(1, 1),
+        );
+
+        assert_eq!(next.linked_channel_id.as_deref(), Some("chan-a"));
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::SendControl(ServerMessage::Error { code, .. })]
+                if *code == monad_common::protocol::ServerErrorCode::ChannelUnlinkRejected
+        ));
+    }
+
+    #[test]
+    fn unlink_runs_validation_for_linked_channel() {
+        let mut current = state();
+        current.linked_channel_id = Some("chan-a".to_string());
+
+        let (next, effects) = step(
+            current.clone(),
+            SessionEvent::ClientChannelUnlink {
+                channel_id: "chan-a".to_string(),
+                final_balance_raw: 7,
+            },
+            SessionPricing::new(1, 1),
+        );
+
+        assert_eq!(next, current);
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::RunUnlinkValidation {
+                channel_id,
+                final_balance_raw,
+            }] if channel_id == "chan-a" && *final_balance_raw == 7
         ));
     }
 

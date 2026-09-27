@@ -239,6 +239,14 @@ impl SessionState {
         self.termination.is_cancelled()
     }
 
+    pub(crate) fn unlink_channel(&self, channel_id: &str, balance: u64) -> Result<(), String> {
+        self.payments
+            .unlink_channel(self.session_id, channel_id, balance)?;
+        self.owned_channels.lock().unwrap().remove(channel_id);
+        self.session_registry.events.record("channel_unlinked",serde_json::json!({"channel_id":channel_id,"session_id":hex::encode(self.session_id),"final_balance_raw":balance}));
+        Ok(())
+    }
+
     // Driver-facing accessors for payment / registry / pause side effects.
 
     pub(crate) fn link_channel(
@@ -1096,6 +1104,9 @@ async fn handle_control_stream(
                                 };
 
                                 match message {
+                                    ClientMessage::ChannelUnlink { channel_id, final_balance_raw } => {
+                                        terminate_session = process_session_event(&state, SessionEvent::ClientChannelUnlink {channel_id,final_balance_raw}, &mut h2_send).await?;
+                                    }
                                     ClientMessage::GetSessionStatus => {
                                         terminate_session = process_session_event(
                                             &state,

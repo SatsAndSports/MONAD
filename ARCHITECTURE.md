@@ -97,6 +97,25 @@ separate bounded ring; the aggregator forwards these with generation and request
 identity and detects source gaps. Argument payloads are excluded from broadcasts.
 The browser never owns execution and does not resubmit commands on refresh.
 
+### Cooperative channel retirement
+
+A relay can politely retire a linked channel without racing in-flight payments.
+Management's `request_channel_unlink` persists a per-channel retirement flag
+(alongside Open/Closing/Closed state), so the channel can never be relinked —
+including after a relay restart — and then delivers `ChannelReleaseRequested` to
+the owning session. Payments from the current owner remain valid while pending.
+The client stops creating new payments on the channel, marks it unusable in its
+wallet (retaining close/recovery records), waits for its outstanding payment to
+be acknowledged, and replies `ChannelUnlink` with its cumulative signed balance.
+The relay validates that balance against its accepted balance, releases
+ownership, and confirms `ChannelUnlinked` plus a fresh `SessionStatus`. Remaining
+session credit survives, so traffic keeps flowing while unlinked; the client
+links a replacement once the relay reports the session paused. `close_channel` is separate:
+it is rejected while any session owns the channel, and it retires the channel
+atomically to reserve it against a concurrent relink.
+The new control messages require coordinated client and relay updates; older
+clients cannot participate in the release handshake.
+
 The client acknowledges a pending channel payment only when a status for that
 channel reaches the submitted cumulative raw balance. Queued status snapshots
 that regress paid totals, byte counters, or the same channel's accepted balance

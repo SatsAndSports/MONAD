@@ -3642,6 +3642,342 @@ async fn test_session_payment_driver_pays_with_v2_active_keyset() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_cooperative_channel_unlink_handshake() {
+    init_test_tracing();
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_addr = mint_listener.local_addr().unwrap();
+    let mint_url = format!("http://{mint_addr}");
+    let mint_router = build_router(mint_helper.mint()).await.unwrap();
+    let (mint_stop, mint_stopped) = tokio::sync::oneshot::channel();
+    let mint_task = tokio::spawn(async move {
+        axum::serve(mint_listener, mint_router)
+            .with_graceful_shutdown(async {
+                let _ = mint_stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let wallet = Arc::new(
+        TestSigningWallet::new(
+            mint_helper.mint(),
+            receiver_secret.public_key().to_hex(),
+            mint_url,
+            keyset_id,
+            keyset_info_json,
+        )
+        .await,
+    );
+    let channel_a = wallet.pre_create_channel(1_000).await.unwrap();
+    let channel_b = wallet.pre_create_channel(1_000).await.unwrap();
+
+    // Relay with an explicit registry so the management service can notify the
+    // live session of the release request.
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager = Arc::new(RelayWalletManager::open(db.path().to_str().unwrap()).unwrap());
+    let wallet_name = "unlink-test-relay";
+    wallet_manager
+        .register_identity(wallet_name, receiver_secret.clone())
+        .unwrap();
+    wallet_manager.install_keyset_cache(mint_cache);
+    wallet_manager.set_trusted_mint_units(trusted_mint_units.clone());
+    let transport_key = SecpTransportKeypair::generate();
+    let pubkey = transport_key.pubkey();
+    let identity = QuicCertIdentity::generate().unwrap();
+    let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
+    let quic_server_config =
+        monad_quic::server::build_server_config(&quic_km.cert_pem, &quic_km.key_pem).unwrap();
+    let (listener, quic_endpoint, addr) =
+        bind_tcp_and_quic_on_same_port("127.0.0.1:0".parse().unwrap(), quic_server_config)
+            .await
+            .unwrap();
+    let config = Arc::new(ServerConfig {
+        identity,
+        transport_key: Some(transport_key),
+        receiver_pubkey_hex: receiver_secret.public_key().to_hex(),
+        trusted_mint_units,
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+        bootstrap_capabilities: None,
+        relay_wallet_name: wallet_name.to_string(),
+        spilman_storage_path: String::new(),
+        channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+    });
+    let payments = wallet_manager
+        .spilman_payments_for_live(wallet_name)
+        .unwrap();
+    let registry = Arc::new(SessionRegistry::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let relay_handle = tokio::spawn(run_with_payments_and_registry_and_shutdown(
+        listener,
+        Some(quic_endpoint),
+        config,
+        payments.clone(),
+        wallet_manager.keyset_cache(),
+        RelayRuntimeServices {
+            session_registry: registry.clone(),
+            keyset_refresh: None,
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    // Client session driver links the first channel and pays.
+    let pool = QuicPool::new().unwrap();
+    let stream = pool
+        .open_stream(&addr.to_string(), ClientAuthMode::Secp256k1(pubkey))
+        .await
+        .unwrap();
+    let conn =
+        connect_with_keyset_versions(stream, &pubkey, supported_cashu_spilman_keyset_versions())
+            .await;
+    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
+        &conn,
+        wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
+        "cooperative unlink test hop",
+        PaymentPolicy {
+            target_topup_buffer_msats: 1_000,
+            minimum_topup_msats: 1_000,
+            ..PaymentPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .expect("driver should link and pay")
+        .expect("driver ready signal");
+    let session_id = *conn.session_id();
+    // The driver selects either pre-created channel; discover which one is
+    // actually linked to the session before requesting its release.
+    let first = timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions = registry.snapshots().await;
+            if let Some(session) = sessions
+                .iter()
+                .find(|s| s["session_id"] == serde_json::json!(hex::encode(session_id)))
+            {
+                if let Some(linked) = session["linked_channel_id"].as_str() {
+                    break linked.to_string();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = if first == channel_a {
+        channel_b
+    } else {
+        assert_eq!(first, channel_b);
+        channel_a
+    };
+    // Capture a valid relink payload while the channel is still open so we can
+    // prove the retired channel is rejected by channel ID after unlink.
+    let relink = wallet.build_raw_link_request(&first).unwrap();
+
+    // Relay management service over a unix socket.
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket = socket_dir.path().join("relay.sock");
+    let backend = Arc::new(monad_relay::management::RelayBackend::new(
+        BTreeMap::from([(wallet_name.to_string(), registry.clone())]),
+        wallet_manager.clone(),
+    ));
+    let (stop_api, stopped_api) = tokio::sync::oneshot::channel();
+    let api_task = tokio::spawn(monad_management::serve_unix(
+        socket.clone(),
+        backend,
+        async {
+            let _ = stopped_api.await;
+        },
+    ));
+    let http = monad_management::unix_client(socket).unwrap();
+    let api = |path: &str| format!("http://localhost{path}");
+    let mut initial = None;
+    for _ in 0..300 {
+        if let Ok(response) = http.get(api("/v1/snapshot")).send().await {
+            initial = Some(response.json::<serde_json::Value>().await.unwrap());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let generation = initial.expect("snapshot")["generation"].clone();
+
+    // Request cooperative unlink for the currently linked channel.
+    let response = http
+        .post(api("/v1/commands"))
+        .json(&serde_json::json!({
+            "generation": generation,
+            "request_id": "unlink",
+            "instance": wallet_name,
+            "action": "request_channel_unlink",
+            "arguments": {"channel_id": first},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let mut unlink_result = None;
+    for _ in 0..300 {
+        let operation: serde_json::Value = http
+            .get(api("/v1/operations/unlink"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if operation["state"] == "succeeded" {
+            unlink_result = Some(operation["result"].clone());
+            break;
+        }
+        assert_ne!(operation["state"], "failed", "unlink command: {operation}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let unlink_result = unlink_result.expect("unlink command did not complete");
+    assert_eq!(unlink_result["retired"], true);
+    assert_eq!(unlink_result["release_requested"], true);
+    assert_eq!(
+        unlink_result["session_id"],
+        serde_json::json!(hex::encode(session_id))
+    );
+
+    // The session releases ownership.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let sessions = registry.snapshots().await;
+            let session = sessions
+                .iter()
+                .find(|s| s["session_id"] == serde_json::json!(hex::encode(session_id)))
+                .expect("session snapshot missing");
+            if session["linked_channel_id"].is_null() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(wallet_manager.channel_is_retired(&first));
+
+    // The retired channel cannot be relinked, even with a valid funding package.
+    assert_eq!(
+        payments
+            .link_channel(&supported_cashu_spilman_keyset_versions(), [9; 32], &relink)
+            .unwrap_err(),
+        monad_relay::payments::LinkError::Retired
+    );
+
+    // Remaining session credit survives the unlink: traffic still flows without
+    // any linked channel. When that credit is exhausted, the driver links the
+    // pre-created replacement channel and pays, restoring unpaused flow.
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(upper_listener));
+    let target = format!("127.0.0.1:{}", upper_addr.port());
+    async fn accounted_roundtrip(
+        conn: &monad_common::session::RelayConnection,
+        target: &str,
+        payload: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = conn.open_tunnel(target).await?;
+        stream.write_all(payload).await?;
+        stream.shutdown().await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok(response)
+    }
+    assert_eq!(
+        accounted_roundtrip(&conn, &target, b"credit survives unlink")
+            .await
+            .unwrap(),
+        b"CREDIT SURVIVES UNLINK"
+    );
+    // Exhaust the remaining credit with small roundtrips until the session
+    // pauses (which cancels an in-flight tunnel) or the replacement channel is
+    // already linked. A terminal tunnel failure at the pause boundary is by
+    // design and simply means the credit ran out.
+    let mut roundtrips = 0usize;
+    loop {
+        roundtrips += 1;
+        assert!(roundtrips <= 200, "session did not exhaust credit");
+        let sessions = registry.snapshots().await;
+        let session = sessions
+            .iter()
+            .find(|s| s["session_id"] == serde_json::json!(hex::encode(session_id)))
+            .expect("session snapshot missing");
+        if session["paused"] == serde_json::json!(true)
+            || session["linked_channel_id"] == serde_json::json!(second)
+        {
+            break;
+        }
+        if accounted_roundtrip(&conn, &target, b"drain credit")
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let sessions = registry.snapshots().await;
+            let session = sessions
+                .iter()
+                .find(|s| s["session_id"] == serde_json::json!(hex::encode(session_id)))
+                .expect("session snapshot missing");
+            if session["linked_channel_id"] == serde_json::json!(second)
+                && session["paused"] == serde_json::json!(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        accounted_roundtrip(&conn, &target, b"replacement works")
+            .await
+            .unwrap(),
+        b"REPLACEMENT WORKS"
+    );
+
+    // The retired, unlinked channel can now be closed.
+    let wallet_state = wallet_manager
+        .list_channels(Some(wallet_name))
+        .unwrap()
+        .into_iter()
+        .find(|c| c.channel_id == first)
+        .unwrap();
+    assert_eq!(wallet_state.state, cdk_spilman::ChannelState::Open);
+    let net = wallet_manager.mint_client_for_channel(&first).unwrap();
+    let outcome = wallet_manager.close_channel(&first, &net).await.unwrap();
+    assert!(matches!(
+        outcome,
+        monad_relay::payments::CloseOutcome::Closed(_)
+            | monad_relay::payments::CloseOutcome::UnknownSpent { .. }
+    ));
+
+    stop_api.send(()).unwrap();
+    api_task.await.unwrap().unwrap();
+    driver_handle.abort();
+    let _ = driver_handle.await;
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    relay_handle.await.unwrap().unwrap();
+    let _ = mint_stop.send(());
+    mint_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_expiring_funding_keyset_discovery_persistence_and_link_admission() {
     use monad_common::config::RelayChannelPolicyConfig;
     use monad_relay::payments::LinkError;

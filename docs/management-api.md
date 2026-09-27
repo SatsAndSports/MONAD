@@ -203,7 +203,20 @@ request must not be used to replace it. Inspect hop funding/error state.
 | Action | Arguments | Completion |
 | --- | --- | --- |
 | `set_controls` | All four booleans: `enabled`, `accept_new_sessions`, `accept_new_tunnels`, `accept_new_channels` | Disable awaits owned work cleanup; admission updates are synchronous. |
-| `close_channel` | `{"channel_id": "..."}` | Uses the owning relay's journaled close/recovery path. |
+| `request_channel_unlink` | `{"channel_id": "..."}` | Persists retirement (no new links), asks the owning session to release, and reports `session_id` and `release_requested`. The channel stays Open. |
+| `close_channel` | `{"channel_id": "..."}` | Uses the owning relay's journaled close/recovery path. Rejected while any session still owns the channel; use `request_channel_unlink` first. |
+
+`request_channel_unlink` retires the channel in the relay's persisted wallet, so
+it cannot be relinked — including after a relay restart — while any in-flight
+payment from the current owner is still accepted. The client stops creating new
+payments, waits for its outstanding payment to be acknowledged, then sends
+`ChannelUnlink` with its cumulative signed balance. The relay verifies that
+balance, releases ownership, and confirms with `ChannelUnlinked` plus an
+authoritative `SessionStatus` showing no linked channel. Remaining session
+credit survives; the client links a replacement later according to its
+provisioning policy. Wallet channel summaries expose `retired: true/false`.
+Closing an unlinked channel first retires it (idempotent) and requires no
+session to own it, which also reserves it against a concurrent relink.
 
 Close results distinguish `closed`, `sender_refunded`, and `unresolved_spent`.
 The last is not successful settlement. No proof payloads are returned. A close

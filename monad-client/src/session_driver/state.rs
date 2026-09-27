@@ -79,6 +79,9 @@ pub(super) enum ControlOpInFlight {
         channel_id: String,
         balance_raw: u64,
     },
+    Unlink {
+        channel_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +103,10 @@ pub(super) struct DriverState {
     pub(super) intended_offer: Option<RelayPaymentOffer>,
     pub(super) session_excluded_channels: BTreeSet<String>,
     pub(super) control_op_in_flight: Option<ControlOpInFlight>,
+    /// Channels the relay has politely asked to retire. The client stops
+    /// creating payments on them, awaits acknowledgement of any in-flight
+    /// payment, then sends `ChannelUnlink` with the final signed balance.
+    pub(super) release_requested_channels: BTreeSet<String>,
     pub(super) funding_retry_not_before: Option<Instant>,
     pub(super) funding_blocked_reason: Option<FundingBlockedReason>,
     pub(super) ready_signaled: bool,
@@ -218,6 +225,9 @@ fn clear_resolved_control_op_on_status(state: &mut DriverState, snapshot: &Relay
             }),
             Some(linked),
         ) => linked.channel_id == *channel_id && linked.balance_raw >= *balance_raw,
+        (Some(ControlOpInFlight::Unlink { channel_id }), linked) => {
+            !matches!(linked, Some(linked) if linked.channel_id == *channel_id)
+        }
         _ => false,
     };
     if !acknowledged {
@@ -229,7 +239,9 @@ fn clear_resolved_control_op_on_status(state: &mut DriverState, snapshot: &Relay
     );
     if matches!(
         state.control_op_in_flight,
-        Some(ControlOpInFlight::Link { .. }) | Some(ControlOpInFlight::Payment { .. })
+        Some(ControlOpInFlight::Link { .. })
+            | Some(ControlOpInFlight::Payment { .. })
+            | Some(ControlOpInFlight::Unlink { .. })
     ) {
         state.control_op_in_flight = None;
     }
@@ -244,6 +256,9 @@ pub(super) fn clear_channel_control_op(state: &mut DriverState, channel_id: &str
         | Some(ControlOpInFlight::Payment {
             channel_id: in_flight_channel,
             ..
+        })
+        | Some(ControlOpInFlight::Unlink {
+            channel_id: in_flight_channel,
         }) if in_flight_channel == channel_id => {
             state.control_op_in_flight = None;
         }
@@ -285,8 +300,26 @@ pub(super) fn set_payment_in_flight(state: &mut DriverState, channel_id: String,
     });
 }
 
+pub(super) fn set_unlink_in_flight(state: &mut DriverState, channel_id: String) {
+    state.control_op_in_flight = Some(ControlOpInFlight::Unlink { channel_id });
+}
+
 pub(super) fn clear_control_op(state: &mut DriverState) {
     state.control_op_in_flight = None;
+}
+
+pub(super) fn request_channel_release(state: &mut DriverState, channel_id: &str) {
+    state
+        .release_requested_channels
+        .insert(channel_id.to_owned());
+}
+
+pub(super) fn release_is_pending(state: &DriverState, channel_id: &str) -> bool {
+    state.release_requested_channels.contains(channel_id)
+}
+
+pub(super) fn finish_channel_release(state: &mut DriverState, channel_id: &str) {
+    state.release_requested_channels.remove(channel_id);
 }
 
 /// Abandon the intended channel: detach it from the wallet, optionally exclude it

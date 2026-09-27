@@ -1,5 +1,18 @@
 # MONAD
 
+### Retire a linked payment channel
+
+Use the relay management action `request_channel_unlink` with
+`{"channel_id": "..."}` before `close_channel` for a linked channel. Retirement
+persists across relay restarts and prevents relinking. The client finishes any
+outstanding payment acknowledgement and releases the channel; its remaining
+session credit stays usable. Close the channel separately after it is unlinked.
+Automatic replacement channel provisioning occurs when the session pauses.
+See [relay management actions](docs/management-api.md#relay-actions).
+
+The cooperative unlink messages require coordinated client and relay updates;
+older clients do not understand the release request.
+
 ### Try the mint management page
 
 ```bash

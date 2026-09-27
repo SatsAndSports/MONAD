@@ -42,6 +42,24 @@ impl CloseOutcome {
 }
 
 pub trait RelayPayments: Send + Sync + 'static {
+    fn retire_channel(
+        &self,
+        _channel_id: &str,
+        _require_unowned: bool,
+    ) -> Result<Option<[u8; 32]>, String> {
+        Err("channel retirement unsupported".into())
+    }
+    fn is_retired(&self, _channel_id: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn unlink_channel(
+        &self,
+        _session: [u8; 32],
+        _channel_id: &str,
+        _balance: u64,
+    ) -> Result<(), String> {
+        Err("channel unlink unsupported".into())
+    }
     fn funding_keyset_recovery_window_secs(&self) -> u64 {
         monad_common::keyset_expiry::DEFAULT_RECOVERY_WINDOW_SECS
     }
@@ -82,6 +100,7 @@ pub struct PaymentOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkError {
+    Retired,
     AdmissionDisabled,
     InvalidPayment(String),
     InvalidChannel(String),
@@ -103,6 +122,7 @@ pub enum LinkError {
 impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Retired => write!(f, "channel retired; new links are disabled"),
             Self::AdmissionDisabled => write!(f, "relay is not accepting new channels"),
             Self::InvalidPayment(s) => write!(f, "invalid payment: {s}"),
             Self::InvalidChannel(s) => write!(f, "invalid channel: {s}"),
@@ -132,6 +152,7 @@ impl std::error::Error for LinkError {}
 impl LinkError {
     pub(crate) fn code(&self) -> ServerErrorCode {
         match self {
+            Self::Retired => ServerErrorCode::LinkChannelRetired,
             Self::AdmissionDisabled => ServerErrorCode::ChannelAdmissionDisabled,
             Self::InvalidPayment(_) => ServerErrorCode::LinkInvalidPayment,
             Self::InvalidChannel(_) => ServerErrorCode::LinkInvalidChannel,
@@ -694,7 +715,13 @@ impl RelayPayments for SpilmanRelayPayments {
         let evicted_session = self
             .store
             .set_channel_owner(&payment.channel_id, session_id)
-            .map_err(LinkError::Internal)?;
+            .map_err(|error| {
+                if error == "channel retired" {
+                    LinkError::Retired
+                } else {
+                    LinkError::Internal(error)
+                }
+            })?;
 
         let channel = self
             .store
@@ -792,6 +819,24 @@ impl RelayPayments for SpilmanRelayPayments {
 
     fn channel_state(&self, channel_id: &str) -> Option<ChannelState> {
         self.store.channel_state(channel_id)
+    }
+    fn retire_channel(
+        &self,
+        channel_id: &str,
+        require_unowned: bool,
+    ) -> Result<Option<[u8; 32]>, String> {
+        self.store.retire_channel(channel_id, require_unowned)
+    }
+    fn is_retired(&self, channel_id: &str) -> Result<bool, String> {
+        self.store.is_retired(channel_id)
+    }
+    fn unlink_channel(
+        &self,
+        session: [u8; 32],
+        channel_id: &str,
+        balance: u64,
+    ) -> Result<(), String> {
+        self.store.unlink_channel(session, channel_id, balance)
     }
 }
 

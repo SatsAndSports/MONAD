@@ -216,6 +216,25 @@ pub(super) async fn run_session_driver(
                             apply_channel_evicted(&config, &mut state, channel_id).await;
                             false
                         }
+                        ServerMessage::ChannelReleaseRequested { channel_id } => {
+                            super::funding::apply_channel_release_requested(
+                                &config,
+                                &mut state,
+                                &mut h2_send,
+                                channel_id,
+                            )
+                            .await?;
+                            false
+                        }
+                        ServerMessage::ChannelUnlinked { channel_id, .. } => {
+                            super::funding::apply_channel_unlinked(
+                                &config,
+                                &mut state,
+                                channel_id,
+                            )
+                            .await;
+                            false
+                        }
                         ServerMessage::Error { code, message } => {
                             warn!(
                                 "{} control error: code={:?} message={} | {}",
