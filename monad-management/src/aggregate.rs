@@ -24,6 +24,7 @@ use std::{
 use tokio::sync::watch;
 
 const HISTORY: usize = 512;
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 #[derive(Clone)]
 struct Record {
@@ -280,11 +281,8 @@ async fn root() -> Redirect {
     Redirect::temporary("/mints")
 }
 
-async fn runtime_page() -> impl IntoResponse {
-    (
-        [("cache-control", "no-store")],
-        Html(include_str!("ui/runtime.html")),
-    )
+async fn runtime_page() -> Response {
+    html_page(include_str!("ui/runtime.html"))
 }
 
 async fn runtime_js() -> impl IntoResponse {
@@ -308,13 +306,15 @@ async fn runtime_css() -> impl IntoResponse {
 }
 
 async fn mints() -> Response {
-    let mut response = Html(include_str!("ui/mints.html")).into_response();
+    html_page(include_str!("ui/mints.html"))
+}
+
+fn html_page(content: &'static str) -> Response {
+    let mut response = Html(content).into_response();
     let headers = response.headers_mut();
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
-            .parse()
-            .unwrap(),
+        CONTENT_SECURITY_POLICY.parse().unwrap(),
     );
     headers.insert("cache-control", "no-store".parse().unwrap());
     response

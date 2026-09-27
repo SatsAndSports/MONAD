@@ -36,6 +36,15 @@ article {
 }
 td {
   vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.table-scroll {
+  overflow-x: auto;
+}
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .7rem;
 }
 summary {
   cursor: pointer;

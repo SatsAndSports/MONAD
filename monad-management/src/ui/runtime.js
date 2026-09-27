@@ -62,7 +62,6 @@ function table(headers, rows) {
     const tr = el("tr");
     row.forEach((cell) => {
       const td = el("td");
-      td.style.overflowWrap = "anywhere";
       if (cell instanceof Node) td.append(cell);
       else td.textContent = value(cell);
       tr.append(td);
@@ -70,8 +69,7 @@ function table(headers, rows) {
     body.append(tr);
   });
   t.append(body);
-  const wrap = el("div");
-  wrap.style.overflowX = "auto";
+  const wrap = el("div", null, "table-scroll");
   wrap.append(t);
   return wrap;
 }
@@ -127,10 +125,7 @@ async function submit(process, name, generation, action, args) {
   }
 }
 function controls(process, name, instance) {
-  const box = el("div");
-  box.style.display = "flex";
-  box.style.flexWrap = "wrap";
-  box.style.gap = ".7rem";
+  const box = el("div", null, "controls");
   const c = instance.controls;
   if (kind === "clients") {
     box.append(
