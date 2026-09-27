@@ -1,7 +1,7 @@
 //! Disposable local demo funding only. Reuses the real CDK test-mint issuance
 //! helper rather than fabricating balances or proof signatures.
-#[path = "../tests/support/mod.rs"]
-mod support;
+#[path = "../dev-support/issuance.rs"]
+mod issuance;
 
 use monad_client::loose_proof_wallet::{LooseProofWallet, NewLooseProof};
 use monad_client::wallet_lock::ClientWalletLocks;
@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
                 (raw & value != 0).then_some(value)
             })
             .collect::<Vec<_>>();
-        let proofs = support::mint_proofs(
+        let proofs = issuance::mint_proofs(
             &client,
             args[1].trim_end_matches('/'),
             unit.clone(),
