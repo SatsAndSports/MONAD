@@ -1937,3 +1937,9 @@ monitor snapshots. Each channel exposes `ownership.state` as `linked` (with
 `session_id`), `unlinked`, or `unavailable`. Session-monitor absence does not imply
 release. Command execution still atomically checks ownership and retirement;
 snapshot eligibility is observational, not a reservation.
+
+The runtime browser tracks outstanding commands by process generation and request
+ID. SSE updates and bounded HTTP operation lookups reconcile execution; terminal
+results cannot regress to queued acceptance. Transport uncertainty never causes
+automatic command replay. Browser-local tracking survives SSE resets but is not
+persisted across page reloads.

@@ -69,6 +69,11 @@ See [mint UI usage and browser tests](docs/mint-ui.md).
 Relay channel rows report authoritative ownership, including the owning session ID.
 Close is available only for channels reported as unlinked; unavailable ownership
 is shown explicitly and disables Close.
+Command controls stay disabled through queued/running execution. The main notice
+shows terminal results and channel IDs. Lost responses are reconciled by request
+ID without resubmission; unresolved requests remain locked until confirmed or the
+process generation changes. Unlink-request success still requires waiting for
+the channel ownership to become unlinked before closing.
 
 Configured client and relay processes now optionally expose Unix-socket management
 endpoints. See [the headless API reference](docs/management-api.md) for configuration,
