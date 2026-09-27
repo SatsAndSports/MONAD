@@ -100,6 +100,12 @@ file prefix alongside operation names and totals. Short-lived channel setup chec
 relay/client exit status while probing SOCKS and reports the last probe error and
 attempt count, without changing startup order, expiry, or retry policy.
 
+Fixture setup reserves the relay address on both TCP and UDP/QUIC. A candidate
+with occupied UDP is discarded and selection retries (at most 128 candidates).
+Both sockets remain reserved through configuration and initial funding, then are
+released before child launch. This intentionally accepts the small handoff race;
+later relay restarts also reuse the configured address without a reservation.
+
 ## Work Tracking
 
 - [x] Actual CLI processes, persisted cold restart, kill and reap cleanup.

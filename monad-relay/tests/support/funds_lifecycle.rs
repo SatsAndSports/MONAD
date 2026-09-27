@@ -24,6 +24,67 @@ use tokio::task::JoinSet;
 const DEADLINE: Duration = Duration::from_secs(45);
 const INITIAL: u64 = 16_384;
 
+/// Reserve the relay's TCP and QUIC address together until fixture setup ends.
+/// The child binds fresh sockets, so release-to-child handoff is not atomic.
+struct RelayPortReservation {
+    tcp: std::net::TcpListener,
+    _udp: std::net::UdpSocket,
+}
+
+impl RelayPortReservation {
+    fn bind(address: std::net::SocketAddr) -> std::io::Result<Self> {
+        let tcp = std::net::TcpListener::bind(address)?;
+        let udp = std::net::UdpSocket::bind(tcp.local_addr()?)?;
+        Ok(Self { tcp, _udp: udp })
+    }
+
+    fn reserve() -> std::io::Result<Self> {
+        for _ in 0..128 {
+            match Self::bind("127.0.0.1:0".parse().unwrap()) {
+                Ok(reservation) => return Ok(reservation),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "could not reserve a relay TCP/UDP port after 128 candidates",
+        ))
+    }
+}
+
+#[test]
+fn relay_port_reservation_rejects_occupied_udp_and_releases_tcp() {
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = udp.local_addr().unwrap();
+    let error = RelayPortReservation::bind(address)
+        .err()
+        .expect("UDP collision");
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    // A rejected UDP candidate must not leave its temporary TCP reservation held.
+    let tcp = std::net::TcpListener::bind(address).unwrap();
+    drop(tcp);
+    drop(udp);
+}
+
+#[test]
+fn relay_port_reservation_holds_both_protocols_until_release() {
+    let reservation = RelayPortReservation::reserve().unwrap();
+    let address = reservation.tcp.local_addr().unwrap();
+    assert_eq!(reservation._udp.local_addr().unwrap(), address);
+    assert_eq!(
+        std::net::TcpListener::bind(address).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    assert_eq!(
+        std::net::UdpSocket::bind(address).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    drop(reservation);
+    let child = RelayPortReservation::bind(address).unwrap();
+    assert_eq!(child.tcp.local_addr().unwrap(), address);
+}
+
 fn loopback_url(url: &str) -> bool {
     url.starts_with("http://")
         && !url.chars().any(char::is_whitespace)
@@ -649,8 +710,8 @@ impl Fixture {
         });
         let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socks = socks_listener.local_addr().unwrap();
-        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let relay = relay_listener.local_addr().unwrap();
+        let relay_reservation = RelayPortReservation::reserve().unwrap();
+        let relay = relay_reservation.tcp.local_addr().unwrap();
         let key = SecpTransportKeypair::generate();
         let config = dir.path().join("monad.yaml");
         std::fs::write(
@@ -725,7 +786,7 @@ clients:
             .unwrap();
         drop(wallet);
         drop(socks_listener);
-        drop(relay_listener);
+        drop(relay_reservation);
         Self {
             dir: Some(dir),
             config,
