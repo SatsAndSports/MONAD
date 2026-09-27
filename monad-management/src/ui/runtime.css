@@ -9,6 +9,7 @@ pre {
 .closed-channel { color: #aab9c8; font-size: .9rem; }
 .retired-state { color: #d6a2ff; }
 .unlink-pending { color: #ffca80; font-size: .85rem; }
+.missing-channel { color: #ffca80; font-size: .85rem; }
 .channel-panel {
   border: 1px solid #3e6573;
   border-radius: 8px;
