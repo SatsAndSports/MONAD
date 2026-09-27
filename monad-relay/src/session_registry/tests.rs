@@ -83,12 +83,33 @@ async fn session_gate_preserves_existing_sessions_and_rejects_new_work() {
     registry.wait_disabled().await.unwrap();
 }
 #[test]
-fn link_timestamp_is_shared_and_retained_after_session_departure() {
-    let registry = super::SessionRegistry::new();
-    assert_eq!(registry.last_linked_at("channel"), None);
+fn link_timestamps_are_per_channel_and_refresh_on_relink() {
+    let registry = SessionRegistry::new();
+    assert_eq!(registry.last_linked_at("channel-a"), None);
+    assert_eq!(registry.last_linked_at("channel-b"), None);
+
+    registry.record_channel_link("channel-a");
+    let first_a = registry.last_linked_at("channel-a").unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    registry.record_channel_link("channel-b");
+    let first_b = registry.last_linked_at("channel-b").unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    registry.record_channel_link("channel-a");
+    let second_a = registry.last_linked_at("channel-a").unwrap();
+
+    assert!(first_a > 0);
+    assert!(first_b > first_a);
+    assert!(second_a > first_b);
+}
+
+#[test]
+fn link_timestamp_is_retained_after_session_departure() {
+    let registry = SessionRegistry::new();
+    registry.register_session([1; 32], CancellationToken::new());
     registry.record_channel_link("channel");
     let timestamp = registry.last_linked_at("channel").unwrap();
-    assert!(timestamp > 0);
+
     registry.deregister_session(&[1; 32]);
+
     assert_eq!(registry.last_linked_at("channel"), Some(timestamp));
 }
