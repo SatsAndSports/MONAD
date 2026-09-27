@@ -540,7 +540,7 @@ pub(super) async fn maybe_progress_payment(
             state.local_session_paid_msats = state
                 .local_session_paid_msats
                 .saturating_add(authorized_delta_msats);
-            set_payment_in_flight(state, intended_channel_id.clone());
+            set_payment_in_flight(state, intended_channel_id.clone(), next_balance_raw);
             if let Some((owner, hop)) = &config.management {
                 hop.paying(owner, intended_channel_id);
             }

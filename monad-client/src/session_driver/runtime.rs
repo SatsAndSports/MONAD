@@ -152,9 +152,7 @@ pub(super) async fn run_session_driver(
                                 state.funding_blocked_reason,
                                 compute_estimated_remaining(&state, &config.conn.cleartext_byte_counters),
                             );
-                            let resolved = apply_session_status(
-                                &mut state,
-                                RelaySnapshot {
+                             let snapshot = RelaySnapshot {
                                     receiver_pubkey,
                                     advertisements,
                                     linked_channel,
@@ -163,14 +161,32 @@ pub(super) async fn run_session_driver(
                                     total_paid_millisats,
                                     remaining_milli_sats,
                                     paused,
-                                },
-                            );
+                                 };
+                             if super::state::session_status_is_stale(&state, &snapshot) {
+                                 continue;
+                             }
+                             let resolved = apply_session_status(&mut state, snapshot);
                             publish_pricing(&config, pricing).await;
                             publish_spilman_info(&config, &state).await;
-                            validate_linked_channel_balance_against_wallet(
-                                config.wallet.as_ref(),
-                                &mut state,
-                            )?;
+                             if let Err(error) = validate_linked_channel_balance_against_wallet(
+                                 config.wallet.as_ref(),
+                                 &mut state,
+                             ) {
+                                 if let Some((owner, _)) = &config.management {
+                                     // Expose the numeric protocol mismatch, but not
+                                     // arbitrary wallet/backend error contents.
+                                     let message = if error.kind() == io::ErrorKind::InvalidData {
+                                         error.to_string()
+                                     } else {
+                                         "Unable to validate linked channel against local wallet".to_owned()
+                                     };
+                                     owner.events.record("session_payment_failed", serde_json::json!({
+                                         "session_id": hex::encode(config.conn.session_id),
+                                         "message": message,
+                                     }));
+                                 }
+                                 return Err(error);
+                             }
                             validate_session_status_baseline_against_local_counters(
                                 &state,
                                 &config.conn.cleartext_byte_counters,

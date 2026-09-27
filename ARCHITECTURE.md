@@ -97,6 +97,13 @@ separate bounded ring; the aggregator forwards these with generation and request
 identity and detects source gaps. Argument payloads are excluded from broadcasts.
 The browser never owns execution and does not resubmit commands on refresh.
 
+The client acknowledges a pending channel payment only when a status for that
+channel reaches the submitted cumulative raw balance. Queued status snapshots
+that regress paid totals, byte counters, or the same channel's accepted balance
+are ignored; asynchronous pause notifications must not roll back a newer payment
+baseline. The SQLite wallet also rejects decreasing signed balances while holding
+the same bridge lock used for signing and persistence.
+
 A relay's session registry owns its runtime admission policy alongside registered
 session cancellation tokens. A short synchronous admission lock orders policy
 changes with session registration, channel validation/acceptance, and CONNECT

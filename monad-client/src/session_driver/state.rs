@@ -72,8 +72,13 @@ pub(super) struct RelaySnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ControlOpInFlight {
-    Link { channel_id: String },
-    Payment { channel_id: String },
+    Link {
+        channel_id: String,
+    },
+    Payment {
+        channel_id: String,
+        balance_raw: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +206,23 @@ pub(super) async fn publish_pricing(config: &SessionDriverConfig, pricing: Sessi
     *config.conn.pricing_handle.write().await = Some(pricing);
 }
 
-fn clear_resolved_control_op_on_status(state: &mut DriverState) -> bool {
+fn clear_resolved_control_op_on_status(state: &mut DriverState, snapshot: &RelaySnapshot) -> bool {
+    let acknowledged = match (&state.control_op_in_flight, &snapshot.linked_channel) {
+        (Some(ControlOpInFlight::Link { channel_id }), Some(linked)) => {
+            linked.channel_id == *channel_id
+        }
+        (
+            Some(ControlOpInFlight::Payment {
+                channel_id,
+                balance_raw,
+            }),
+            Some(linked),
+        ) => linked.channel_id == *channel_id && linked.balance_raw >= *balance_raw,
+        _ => false,
+    };
+    if !acknowledged {
+        return false;
+    }
     let resolved_payment = matches!(
         state.control_op_in_flight,
         Some(ControlOpInFlight::Payment { .. })
@@ -222,6 +243,7 @@ pub(super) fn clear_channel_control_op(state: &mut DriverState, channel_id: &str
         })
         | Some(ControlOpInFlight::Payment {
             channel_id: in_flight_channel,
+            ..
         }) if in_flight_channel == channel_id => {
             state.control_op_in_flight = None;
         }
@@ -256,8 +278,11 @@ pub(super) fn set_link_in_flight(
     state.control_op_in_flight = Some(ControlOpInFlight::Link { channel_id });
 }
 
-pub(super) fn set_payment_in_flight(state: &mut DriverState, channel_id: String) {
-    state.control_op_in_flight = Some(ControlOpInFlight::Payment { channel_id });
+pub(super) fn set_payment_in_flight(state: &mut DriverState, channel_id: String, balance_raw: u64) {
+    state.control_op_in_flight = Some(ControlOpInFlight::Payment {
+        channel_id,
+        balance_raw,
+    });
 }
 
 pub(super) fn clear_control_op(state: &mut DriverState) {
@@ -364,7 +389,94 @@ pub(super) fn pre_ready_blocked_error(
 // A `SessionStatus` both refreshes the relay-authoritative baseline and clears
 // any link/payment operation that was waiting for the next status update.
 pub(super) fn apply_session_status(state: &mut DriverState, snapshot: RelaySnapshot) -> bool {
-    let resolved_payment = clear_resolved_control_op_on_status(state);
+    if session_status_is_stale(state, &snapshot) {
+        return false;
+    }
+    let resolved_payment = clear_resolved_control_op_on_status(state, &snapshot);
     state.relay_snapshot = Some(snapshot);
     resolved_payment
+}
+
+pub(super) fn session_status_is_stale(state: &DriverState, snapshot: &RelaySnapshot) -> bool {
+    state.relay_snapshot.as_ref().is_some_and(|previous| {
+        snapshot.total_paid_millisats < previous.total_paid_millisats
+            || snapshot.session_total_in < previous.session_total_in
+            || snapshot.session_total_out < previous.session_total_out
+            || matches!((&previous.linked_channel, &snapshot.linked_channel), (Some(old),Some(new))
+                if old.channel_id == new.channel_id && new.balance_raw < old.balance_raw)
+    })
+}
+
+#[cfg(test)]
+mod acknowledgement_tests {
+    use super::*;
+    fn status(channel: &str, balance_raw: u64) -> RelaySnapshot {
+        RelaySnapshot {
+            receiver_pubkey: String::new(),
+            advertisements: vec![],
+            linked_channel: Some(LinkedChannelStatus {
+                channel_id: channel.into(),
+                balance_raw,
+                capacity_raw: 30000,
+                unit: "msat".into(),
+            }),
+            session_total_in: 0,
+            session_total_out: 0,
+            total_paid_millisats: balance_raw,
+            remaining_milli_sats: -21,
+            paused: true,
+        }
+    }
+    #[test]
+    fn unsolicited_pause_status_does_not_acknowledge_pending_payment() {
+        let mut state = DriverState::default();
+        set_payment_in_flight(&mut state, "channel".into(), 3527);
+        for snapshot in [
+            status("channel", 3010),
+            status("other", 3527),
+            status("channel", 3526),
+        ] {
+            assert!(!apply_session_status(&mut state, snapshot));
+            assert!(state.control_op_in_flight.is_some());
+        }
+        assert!(apply_session_status(&mut state, status("channel", 3527)));
+        assert!(state.control_op_in_flight.is_none());
+        assert!(!apply_session_status(&mut state, status("channel", 3527)));
+    }
+    #[test]
+    fn unrelated_status_does_not_acknowledge_link() {
+        let mut state = DriverState {
+            control_op_in_flight: Some(ControlOpInFlight::Link {
+                channel_id: "new".into(),
+            }),
+            ..Default::default()
+        };
+        apply_session_status(&mut state, status("old", 0));
+        assert!(state.control_op_in_flight.is_some());
+        apply_session_status(&mut state, status("new", 0));
+        assert!(state.control_op_in_flight.is_none());
+    }
+
+    #[test]
+    fn queued_pre_payment_snapshot_cannot_roll_back_acknowledged_balance() {
+        let mut state = DriverState::default();
+        set_payment_in_flight(&mut state, "channel".into(), 1000);
+        assert!(apply_session_status(&mut state, status("channel", 1000)));
+        assert!(!apply_session_status(&mut state, status("channel", 500)));
+        assert_eq!(
+            state
+                .relay_snapshot
+                .as_ref()
+                .unwrap()
+                .linked_channel
+                .as_ref()
+                .unwrap()
+                .balance_raw,
+            1000
+        );
+        set_payment_in_flight(&mut state, "channel".into(), 1651);
+        assert!(!apply_session_status(&mut state, status("channel", 500)));
+        assert!(state.control_op_in_flight.is_some());
+        assert!(apply_session_status(&mut state, status("channel", 1651)));
+    }
 }

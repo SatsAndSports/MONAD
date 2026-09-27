@@ -3662,7 +3662,7 @@ impl MonadWallet for SqliteClientWallet {
         &self,
         channel_id: &str,
         offer: &RelayPaymentOffer,
-        _latest_server_balance_raw: u64,
+        latest_server_balance_raw: u64,
         next_balance_raw: u64,
     ) -> Result<String, WalletError> {
         let channel = self.get_channel(channel_id)?;
@@ -3681,6 +3681,15 @@ impl MonadWallet for SqliteClientWallet {
                 .bridge
                 .lock()
                 .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
+            let current = bridge
+                .get_channel_info(channel_id)
+                .ok_or(WalletError::NotFound)?
+                .current_balance;
+            if next_balance_raw < current || next_balance_raw < latest_server_balance_raw {
+                return Err(WalletError::Backend(
+                    "refusing to decrease cumulative signed channel balance".into(),
+                ));
+            }
             let payment = bridge
                 .sign_payment(channel_id, next_balance_raw)
                 .map_err(|e| map_create_payment_error(&channel, e, next_balance_raw))?;
@@ -8108,6 +8117,32 @@ mod tests {
         assert_eq!(payment.balance, next_balance_raw);
         assert!(payment.params.is_none());
         assert!(payment.funding_proofs.is_none());
+
+        // A delayed relay status must never allow a lower signed balance to
+        // overwrite the durable high-water mark, even if the driver asks for it.
+        assert!(wallet
+            .build_channel_payment(&channel_id, &offer, 0, next_balance_raw - 1)
+            .is_err());
+        let info = wallet
+            .bridge
+            .lock()
+            .unwrap()
+            .get_channel_info(&channel_id)
+            .unwrap();
+        assert_eq!(info.current_balance, next_balance_raw);
+        assert!(wallet
+            .build_channel_payment(&channel_id, &offer, next_balance_raw + 1, next_balance_raw)
+            .is_err());
+        assert_eq!(
+            wallet
+                .bridge
+                .lock()
+                .unwrap()
+                .get_channel_info(&channel_id)
+                .unwrap()
+                .current_balance,
+            next_balance_raw
+        );
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
