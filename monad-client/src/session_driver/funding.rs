@@ -635,6 +635,7 @@ pub(super) async fn maybe_progress_payment(
 
     let (_requested_delta_msats, planned_next_balance_raw, _reaches_capacity) = match plan {
         PaymentTopupPlan::NoPaymentNeeded => return Ok(()),
+        PaymentTopupPlan::ExhaustedChannel if !snapshot.paused => return Ok(()),
         PaymentTopupPlan::ExhaustedChannel => {
             warn!(
                 "{} abandoning exhausted channel {}: balance_raw={} capacity_raw={} | {}",
