@@ -114,6 +114,21 @@ pub(super) fn plan_payment_topup(
     })
 }
 
+pub(super) fn reconcile_payment_topup(
+    planned_next_balance_raw: u64,
+    signed_balance_raw: u64,
+    linked_channel: &LinkedChannelStatus,
+) -> Result<(u64, u64, bool), WalletError> {
+    let next_balance_raw = planned_next_balance_raw.max(signed_balance_raw);
+    let authorized_delta_raw = next_balance_raw.saturating_sub(linked_channel.balance_raw);
+    let authorized_delta_msats = raw_amount_to_msats(&linked_channel.unit, authorized_delta_raw)?;
+    Ok((
+        next_balance_raw,
+        authorized_delta_msats,
+        next_balance_raw == linked_channel.capacity_raw,
+    ))
+}
+
 pub(super) fn exclude_on_wallet_error(error: &WalletError) -> bool {
     matches!(
         error,

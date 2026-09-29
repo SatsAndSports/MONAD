@@ -8130,6 +8130,11 @@ mod tests {
             .get_channel_info(&channel_id)
             .unwrap();
         assert_eq!(info.current_balance, next_balance_raw);
+        let replay_json = wallet
+            .build_channel_payment(&channel_id, &offer, 0, next_balance_raw)
+            .unwrap();
+        let replay: Payment = serde_json::from_str(&replay_json).unwrap();
+        assert_eq!(replay.balance, next_balance_raw);
         assert!(wallet
             .build_channel_payment(&channel_id, &offer, next_balance_raw + 1, next_balance_raw)
             .is_err());

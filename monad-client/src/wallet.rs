@@ -1067,6 +1067,25 @@ mod tests {
     }
 
     #[test]
+    fn payment_rebuilds_existing_signed_high_water() {
+        let wallet = MockWallet::new();
+        let mut chan = channel("chan");
+        chan.capacity_msats = 20_000;
+        chan.current_signed_balance_msats = 12_000;
+        wallet.insert_channel(chan).unwrap();
+        wallet
+            .attach_channel_to_session("chan", session(1))
+            .unwrap();
+
+        let payload = wallet
+            .build_channel_payment("chan", &offer("msat"), 7_000, 12_000)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["balance"], 12_000);
+        assert_eq!(wallet.successful_payment_build_count("chan").unwrap(), 1);
+    }
+
+    #[test]
     fn sat_payments_round_up_to_next_sat() {
         let wallet = MockWallet::new();
         let mut chan = channel("chan");

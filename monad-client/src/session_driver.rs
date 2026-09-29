@@ -125,9 +125,10 @@ mod tests {
     };
     use super::payment::{
         channel_signed_balance_raw, exclude_on_wallet_error, plan_payment_topup,
-        raw_amount_to_msats, requested_delta_msats, server_error_rejects_intended_channel,
-        validate_linked_channel_balance_against_wallet, validate_session_pricing,
-        validate_session_status_baseline_against_local_counters, PaymentTopupPlan,
+        raw_amount_to_msats, reconcile_payment_topup, requested_delta_msats,
+        server_error_rejects_intended_channel, validate_linked_channel_balance_against_wallet,
+        validate_session_pricing, validate_session_status_baseline_against_local_counters,
+        PaymentTopupPlan,
     };
     use super::state::{
         current_spilman_info, pre_ready_blocked_error, relay_confirms_intended_channel,
@@ -779,6 +780,21 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, WalletError::OfferMismatch(_)));
+    }
+
+    #[test]
+    fn payment_replays_signed_high_water_and_accounts_actual_delta() {
+        let linked = LinkedChannelStatus {
+            channel_id: "recover".to_string(),
+            balance_raw: 3_460,
+            capacity_raw: 30_000,
+            unit: "msat".to_string(),
+        };
+
+        assert_eq!(
+            reconcile_payment_topup(3_960, 4_444, &linked).unwrap(),
+            (4_444, 984, false),
+        );
     }
 
     #[test]
