@@ -123,6 +123,14 @@ provision each hop or switch to automatic funding. The funding helper is a
 demo-only Cargo example, restricted to HTTP loopback and bounded test amounts.
 Set `MONAD_DEMO_MANUAL=0` to start with automatic channel provisioning instead.
 
+The launcher keeps random ports and `target/debug` binaries by default. Deployment
+wrappers may set `MONAD_DEMO_MANAGEMENT_PORT`, `MONAD_DEMO_SOCKS_PORT`, and
+`MONAD_DEMO_SOCKS2_PORT` to distinct fixed loopback ports, and
+`MONAD_DEMO_BIN_DIR` to a directory containing the four service binaries plus
+`examples/demo-fund`. `MONAD_DEMO_FAIL_FAST=1` makes an unexpected service exit
+stop the complete demo process tree. Readiness has a bounded overall deadline,
+and a failed topup restarts the clients without automatically repeating issuance.
+
 ## Suggested manual experiments
 
 To generate continuous traffic from a separate terminal, pass the SOCKS address
