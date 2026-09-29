@@ -78,11 +78,29 @@ docker compose -f compose.demo.yml down
 ```
 
 Each start creates fresh keys, wallets, and ports for internal services. Private
-configuration, databases, and child logs live in the container's `/tmp` tmpfs;
-they are lost when the container stops. There is no persistent volume. The image
-runs as a non-root user with a read-only root filesystem and dropped capabilities.
-Three socat bridges run **inside** the container. The supervisor handles signals,
-reaps children, and shuts down if an essential process exits unexpectedly.
+configuration and databases live in the container's `/tmp` tmpfs and are lost
+when the container stops. Child stdout/stderr logs and snapshots of each child's
+`/proc/<pid>/limits` are mode `0600` files in a per-run directory under
+`/var/log/monad-demo`, backed by the private `monad-demo-logs` named volume. The
+volume survives container replacement and `docker compose down`; remove it only
+with the explicit `docker compose -f compose.demo.yml down -v` command.
+
+The container log prints each private child-log path, PID, and effective open-file
+limit. After a failure, list retained runs and inspect the reported file without
+starting the demo services:
+
+```sh
+docker compose -f compose.demo.yml run --rm --no-deps --entrypoint sh monad-demo \
+  -c 'ls -l /var/log/monad-demo/run-*'
+docker compose -f compose.demo.yml run --rm --no-deps --entrypoint sh monad-demo \
+  -c 'cat /var/log/monad-demo/run-XXXXXX/monad-client.log'
+```
+
+Treat these diagnostics as private: child output may contain operational details.
+The image runs as a non-root user with a read-only root filesystem and dropped
+capabilities. Three socat bridges run **inside** the container. The supervisor
+handles signals, reaps children, and shuts down if an essential process exits
+unexpectedly.
 
 The health check verifies all three managed processes are online; it does not
 require clients to remain enabled or funded. No automatic restart policy is set:
@@ -96,6 +114,8 @@ The normal launcher retains random-port/debug-binary defaults. Optional variable
   internal loopback ports (zero means allocate dynamically).
 - `MONAD_DEMO_BIN_DIR`: directory containing service binaries and
   `examples/demo-fund`.
+- `MONAD_DEMO_LOG_DIR`: optional parent for persistent, per-run private child logs
+  and process-limit snapshots. Without it, logs remain beside ephemeral demo data.
 - `MONAD_DEMO_FAIL_FAST=1`: shut down on unexpected service exit; enabled by the
   container supervisor.
 
@@ -107,6 +127,7 @@ node --test monad-management/ui-tests/container-demo.test.mjs
 
 This exercises the same supervisor and forwarding processes locally, checks SSE,
 enables the second client via management, carries traffic through both SOCKS
-ports, restarts relays, and shuts down. For container verification, additionally
-check Compose health, both published SOCKS ports, `docker compose stop`, and a
-fresh start with a new wallet.
+ports, restarts relays, verifies retained diagnostics after shutdown, deliberately
+kills a client to exercise fail-fast diagnostics, and checks cleanup. For
+container verification, additionally check Compose health, both published SOCKS
+ports, `docker compose stop`, and a fresh start with a new wallet.

@@ -7,6 +7,9 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 const exec = promisify(execFile);
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -37,6 +40,7 @@ test(
   { timeout: 120000 },
   async () => {
     await assertPortsFree();
+    const logRoot = await mkdtemp(join(tmpdir(), "monad-demo-logs-test-"));
     const child = spawn(
       process.execPath,
       [fileURLToPath(new URL("./container-demo.mjs", import.meta.url))],
@@ -44,6 +48,7 @@ test(
         env: {
           ...process.env,
           MONAD_DEMO_BIN_DIR: `${root}/target/debug`,
+          MONAD_DEMO_LOG_DIR: logRoot,
           MONAD_DEMO_MANUAL: "0",
         },
         stdio: ["pipe", "pipe", "pipe"],
@@ -131,6 +136,18 @@ test(
       child.kill("SIGTERM");
       assert.deepEqual(await done, { code: 0, signal: null });
       await assertPortsFree();
+      const runs = await readdir(logRoot);
+      assert.equal(runs.length, 1);
+      const run = join(logRoot, runs[0]);
+      for (const name of ["monad-client.log", "monad-client.limits"]) {
+        const path = join(run, name);
+        assert.ok((await readFile(path)).length > 0);
+        assert.equal((await stat(path)).mode & 0o777, 0o600);
+      }
+      assert.match(
+        await readFile(join(run, "monad-client.limits"), "utf8"),
+        /Max open files/,
+      );
     } catch (error) {
       console.error(output);
       throw error;
@@ -138,6 +155,70 @@ test(
       if (child.exitCode === null && child.signalCode === null)
         child.kill("SIGTERM");
       await done;
+      await rm(logRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "container supervisor retains diagnostics after an unexpected client exit",
+  { timeout: 120000 },
+  async () => {
+    await assertPortsFree();
+    const logRoot = await mkdtemp(join(tmpdir(), "monad-demo-logs-test-"));
+    const child = spawn(
+      process.execPath,
+      [fileURLToPath(new URL("./container-demo.mjs", import.meta.url))],
+      {
+        env: {
+          ...process.env,
+          MONAD_DEMO_BIN_DIR: `${root}/target/debug`,
+          MONAD_DEMO_LOG_DIR: logRoot,
+          MONAD_DEMO_MANUAL: "0",
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    let output = "";
+    child.stdout.on("data", (data) => {
+      output += data;
+    });
+    child.stderr.on("data", (data) => {
+      output += data;
+    });
+    const done = new Promise((resolve) =>
+      child.once("exit", (code, signal) => resolve({ code, signal })),
+    );
+    try {
+      await waitFor(async () => {
+        const response = await fetch(`${base}/v1/snapshot`, {
+          signal: AbortSignal.timeout(2000),
+        });
+        return response.ok;
+      });
+      const match = await waitFor(() =>
+        output.match(/monad-client started pid=(\d+).*private_log=([^\s]+)/),
+      );
+      process.kill(Number(match[1]), "SIGKILL");
+      assert.deepEqual(await done, { code: 1, signal: null });
+      await assertPortsFree();
+      assert.match(
+        output,
+        /monad-client exited unexpectedly \(signal SIGKILL\)/,
+      );
+      assert.ok(output.includes(`private_log=${match[2]}`));
+      const limitsPath = match[2].replace(/\.log$/, ".limits");
+      assert.ok(output.includes(`limits=${limitsPath}`));
+      assert.match(await readFile(limitsPath, "utf8"), /Max open files/);
+      await stat(match[2]);
+    } catch (error) {
+      console.error(output);
+      throw error;
+    } finally {
+      if (child.exitCode === null && child.signalCode === null)
+        child.kill("SIGTERM");
+      await done;
+      await rm(logRoot, { recursive: true, force: true });
     }
   },
 );

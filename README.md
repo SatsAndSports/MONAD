@@ -1006,5 +1006,7 @@ conservative capacity/fee margin rather than replenishing funds.
 Run the disposable management and two-SOCKS demo with
 `docker compose -f compose.demo.yml up --build -d`.
 Management is published at `127.0.0.1:18080` for a host HTTPS proxy; SOCKS5 is
-published on ports `11080` and `11081`. See [Docker demo](docs/docker-demo.md)
-for startup, port overrides, interactive commands, and verification.
+published on ports `11080` and `11081`. Private child logs and process-limit
+snapshots persist across container exit for diagnosis; wallets and keys do not.
+See [Docker demo](docs/docker-demo.md) for startup, diagnostics, port overrides,
+interactive commands, and verification.

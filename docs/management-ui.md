@@ -130,6 +130,8 @@ wrappers may set `MONAD_DEMO_MANAGEMENT_PORT`, `MONAD_DEMO_SOCKS_PORT`, and
 `examples/demo-fund`. `MONAD_DEMO_FAIL_FAST=1` makes an unexpected service exit
 stop the complete demo process tree. Readiness has a bounded overall deadline,
 and a failed topup restarts the clients without automatically repeating issuance.
+`MONAD_DEMO_LOG_DIR` stores child output and process-limit snapshots in a private
+per-run directory separate from the ephemeral wallet and configuration directory.
 
 ## Suggested manual experiments
 

@@ -1952,4 +1952,6 @@ management and both SOCKS listeners while MONAD retains container-loopback binds
 mint, relay TCP/QUIC, and traffic-target ports remain internal. Host Nginx can
 terminate HTTPS using the host-loopback management publication. SOCKS has direct
 public TCP publications and unrestricted egress. Container starts create fresh
-temporary wallets; this topology is demo tooling, not persistent deployment.
+temporary wallets. Child logs and process-limit snapshots persist in a private
+named volume for post-exit diagnosis, while keys, configuration, and wallet state
+remain ephemeral. This topology is demo tooling, not persistent deployment.

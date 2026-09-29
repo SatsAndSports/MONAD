@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile, open } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +32,12 @@ export async function startNetworkDemo({
   if (!Number.isSafeInteger(sats) || sats < 0 || sats > 100000000)
     throw Error("MONAD_DEMO_SATS must be 0..100000000");
   const directory = await mkdtemp(join(tmpdir(), "monad-network-ui-"));
+  const configuredLogRoot = process.env.MONAD_DEMO_LOG_DIR;
+  if (configuredLogRoot)
+    await mkdir(configuredLogRoot, { recursive: true, mode: 0o700 });
+  const logDirectory = configuredLogRoot
+    ? await mkdtemp(join(configuredLogRoot, "run-"))
+    : directory;
   const fixed = [managementPort, socksPort, socks2Port].filter((p) => p !== 0);
   if (new Set(fixed).size !== fixed.length)
     throw Error("Demo ports must be distinct");
@@ -48,29 +54,58 @@ export async function startNetworkDemo({
   await new Promise((r) => target.listen(0, "127.0.0.1", r));
   const targetUrl = `http://127.0.0.1:${target.address().port}`;
   async function launch(binary, args) {
-    const log = await open(
-      join(directory, `${binary.replaceAll("/", "-")}.log`),
-      "a",
-    );
-    const binaryDir = process.env.MONAD_DEMO_BIN_DIR || resolve(root, "target/debug");
+    const label = binary.replaceAll("/", "-");
+    const logPath = join(logDirectory, `${label}.log`);
+    const limitsPath = join(logDirectory, `${label}.limits`);
+    const log = await open(logPath, "a", 0o600);
+    const binaryDir =
+      process.env.MONAD_DEMO_BIN_DIR || resolve(root, "target/debug");
     const child = spawn(resolve(binaryDir, binary), args, {
       stdio: ["ignore", log.fd, log.fd],
     });
     const entry = {
       child,
+      logPath,
+      limitsPath,
       expectedExit: binary === "examples/demo-fund",
       done: new Promise((r) => {
-        child.once("exit", (code) => r(code));
-        child.once("error", () => r(-1));
+        child.once("exit", (code, signal) => r({ code, signal }));
+        child.once("error", (error) =>
+          r({ code: null, signal: null, error: error.message }),
+        );
       }),
     };
-    entry.done.then((code) => {
+    if (child.pid) {
+      try {
+        const limits = await readFile(`/proc/${child.pid}/limits`, "utf8");
+        await writeFile(limitsPath, limits, { mode: 0o600 });
+        const nofile = limits
+          .split("\n")
+          .find((line) => line.startsWith("Max open files"))
+          ?.trim();
+        console.log(
+          `${binary} started pid=${child.pid}${nofile ? ` ${nofile}` : ""} private_log=${logPath}`,
+        );
+      } catch (error) {
+        console.error(
+          `${binary} limits unavailable: ${error.message}; private_log=${logPath}`,
+        );
+      }
+    }
+    entry.done.then((status) => {
       if (
         process.env.MONAD_DEMO_FAIL_FAST === "1" &&
         !entry.expectedExit &&
         !stopping
       ) {
-        console.error(`${binary} exited unexpectedly (${code}); inspect ${directory}`);
+        const outcome = status.error
+          ? `spawn error: ${status.error}`
+          : status.signal
+            ? `signal ${status.signal}`
+            : `code ${status.code}`;
+        console.error(
+          `${binary} exited unexpectedly (${outcome}); private_log=${logPath} limits=${limitsPath}`,
+        );
         stop().finally(() => process.exit(1));
       }
     });
@@ -190,7 +225,7 @@ export async function startNetworkDemo({
       } catch {}
       await delay(100);
     }
-    throw Error(`Demo not ready; inspect logs in ${directory}`);
+    throw Error(`Demo not ready; inspect private logs in ${logDirectory}`);
   }
   async function fund(amount) {
     const e = await launch("examples/demo-fund", [
@@ -199,8 +234,9 @@ export async function startNetworkDemo({
       channels,
       String(amount),
     ]);
-    if ((await e.done) !== 0)
-      throw Error(`Funding failed; inspect ${directory}`);
+    const status = await e.done;
+    if (status.code !== 0)
+      throw Error(`Funding failed; inspect private log ${e.logPath}`);
   }
   let clients, relays, management;
   try {
@@ -221,6 +257,7 @@ export async function startNetworkDemo({
     return {
       url,
       directory,
+      logDirectory,
       socks,
       socks2,
       stop,
@@ -287,7 +324,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     manual: process.env.MONAD_DEMO_MANUAL !== "0",
   });
   console.log(
-    `Clients: ${demo.url}/clients\nRelays: ${demo.url}/relays\nMints: ${demo.url}/mints\nSOCKS: 127.0.0.1:${demo.socks}\nTraffic target: ${demo.targetUrl}\nData/config/logs retained: ${demo.directory}\nWallet starts with ${process.env.MONAD_DEMO_SATS ?? 1000000} test sats equivalent, split across SAT/MSAT and shared by both clients. Second client starts disabled.\nSAT entry / MSAT exit · 500-msat credit targets · 30-sat channel budgets\nCommands: traffic | traffic-on | traffic-off | topup SATS | restart-relays | quit`,
+    `Clients: ${demo.url}/clients\nRelays: ${demo.url}/relays\nMints: ${demo.url}/mints\nSOCKS: 127.0.0.1:${demo.socks}\nTraffic target: ${demo.targetUrl}\nPrivate child logs: ${demo.logDirectory}\nEphemeral data/config: ${demo.directory}\nWallet starts with ${process.env.MONAD_DEMO_SATS ?? 1000000} test sats equivalent, split across SAT/MSAT and shared by both clients. Second client starts disabled.\nSAT entry / MSAT exit · 500-msat credit targets · 30-sat channel budgets\nCommands: traffic | traffic-on | traffic-off | topup SATS | restart-relays | quit`,
   );
   const input = createInterface({
     input: process.stdin,

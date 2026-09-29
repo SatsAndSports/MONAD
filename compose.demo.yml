@@ -9,6 +9,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,mode=1777,size=1g
+    volumes:
+      - monad-demo-logs:/var/log/monad-demo
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     stop_grace_period: 60s
@@ -25,3 +27,6 @@ services:
       timeout: 5s
       start_period: 60s
       retries: 3
+
+volumes:
+  monad-demo-logs:
