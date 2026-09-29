@@ -15,7 +15,7 @@ pub(super) const LOCAL_KEYSET_RETRY_COOLDOWN: Duration = Duration::from_secs(60)
 
 use super::payment::{
     channel_signed_balance_raw, compute_estimated_remaining, exclude_on_wallet_error,
-    plan_payment_topup, raw_amount_to_msats, server_error_invalidates_channel,
+    plan_payment_topup, reconcile_payment_topup, server_error_invalidates_channel,
     server_error_rejects_intended_channel, PaymentTopupPlan,
 };
 use super::state::{
@@ -633,7 +633,7 @@ pub(super) async fn maybe_progress_payment(
         }
     };
 
-    let (_requested_delta_msats, next_balance_raw, reaches_capacity) = match plan {
+    let (_requested_delta_msats, planned_next_balance_raw, _reaches_capacity) = match plan {
         PaymentTopupPlan::NoPaymentNeeded => return Ok(()),
         PaymentTopupPlan::ExhaustedChannel => {
             warn!(
@@ -655,6 +655,15 @@ pub(super) async fn maybe_progress_payment(
         } => (requested_delta_msats, next_balance_raw, reaches_capacity),
     };
 
+    let signed_balance_raw = config
+        .wallet
+        .get_channel(&intended_channel_id)
+        .and_then(|channel| channel_signed_balance_raw(&channel))
+        .map_err(|e| io::Error::other(format!("wallet channel balance lookup failed: {e}")))?;
+    let (next_balance_raw, authorized_delta_msats, reaches_capacity) =
+        reconcile_payment_topup(planned_next_balance_raw, signed_balance_raw, linked_channel)
+            .map_err(|e| io::Error::other(format!("payment delta conversion failed: {e}")))?;
+
     match config.wallet.build_channel_payment(
         &intended_channel_id,
         &intended_offer,
@@ -662,11 +671,6 @@ pub(super) async fn maybe_progress_payment(
         next_balance_raw,
     ) {
         Ok(payment_json) => {
-            let authorized_delta_msats = raw_amount_to_msats(
-                &linked_channel.unit,
-                next_balance_raw.saturating_sub(linked_channel.balance_raw),
-            )
-            .map_err(|e| io::Error::other(format!("payment delta conversion failed: {e}")))?;
             info!(
                 "{} sending ChannelPayment for {}: remaining={} target={} reaches_capacity={} next_balance_raw={} | {}",
                 config.hop_label,
