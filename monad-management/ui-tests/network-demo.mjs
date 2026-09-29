@@ -196,7 +196,7 @@ export async function startNetworkDemo({
     config.relays.push({
       name,
       listen,
-      transport_key: key.getPrivateKey().toString("hex"),
+      transport_key: key.getPrivateKey().toString("hex").padStart(64, "0"),
       receiver_secret_hex: randomBytes(32).toString("hex"),
       quic_cert_seed: randomBytes(32).toString("hex"),
       trusted_mints: [
