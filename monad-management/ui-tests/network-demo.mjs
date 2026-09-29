@@ -10,9 +10,14 @@ import { createECDH, randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function port() {
+async function port(requested = 0) {
+  if (!Number.isInteger(requested) || requested < 0 || requested > 65535)
+    throw Error("Demo ports must be integers from 0 to 65535");
   const server = createServer();
-  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  await new Promise((r, reject) => {
+    server.once("error", reject);
+    server.listen(requested, "127.0.0.1", r);
+  });
   const p = server.address().port;
   await new Promise((r) => server.close(r));
   return p;
@@ -20,13 +25,19 @@ async function port() {
 export async function startNetworkDemo({
   sats = Number(process.env.MONAD_DEMO_SATS ?? 1000000),
   manual = true,
+  managementPort = Number(process.env.MONAD_DEMO_MANAGEMENT_PORT ?? 0),
+  socksPort = Number(process.env.MONAD_DEMO_SOCKS_PORT ?? 0),
+  socks2Port = Number(process.env.MONAD_DEMO_SOCKS2_PORT ?? 0),
 } = {}) {
   if (!Number.isSafeInteger(sats) || sats < 0 || sats > 100000000)
     throw Error("MONAD_DEMO_SATS must be 0..100000000");
   const directory = await mkdtemp(join(tmpdir(), "monad-network-ui-"));
-  const api = await port(),
-    socks = await port(),
-    socks2 = await port(),
+  const fixed = [managementPort, socksPort, socks2Port].filter((p) => p !== 0);
+  if (new Set(fixed).size !== fixed.length)
+    throw Error("Demo ports must be distinct");
+  const api = await port(managementPort),
+    socks = await port(socksPort),
+    socks2 = await port(socks2Port),
     mintPort = await port();
   const url = `http://127.0.0.1:${api}`,
     mintUrl = `http://127.0.0.1:${mintPort}`;
@@ -41,21 +52,34 @@ export async function startNetworkDemo({
       join(directory, `${binary.replaceAll("/", "-")}.log`),
       "a",
     );
-    const child = spawn(resolve(root, "target/debug", binary), args, {
+    const binaryDir = process.env.MONAD_DEMO_BIN_DIR || resolve(root, "target/debug");
+    const child = spawn(resolve(binaryDir, binary), args, {
       stdio: ["ignore", log.fd, log.fd],
     });
     const entry = {
       child,
+      expectedExit: binary === "examples/demo-fund",
       done: new Promise((r) => {
         child.once("exit", (code) => r(code));
         child.once("error", () => r(-1));
       }),
     };
+    entry.done.then((code) => {
+      if (
+        process.env.MONAD_DEMO_FAIL_FAST === "1" &&
+        !entry.expectedExit &&
+        !stopping
+      ) {
+        console.error(`${binary} exited unexpectedly (${code}); inspect ${directory}`);
+        stop().finally(() => process.exit(1));
+      }
+    });
     children.push(entry);
     await log.close();
     return entry;
   }
   async function stopChild(e) {
+    e.expectedExit = true;
     if (e.child.exitCode !== null || e.child.signalCode !== null) return;
     e.child.kill("SIGINT");
     let timer;
@@ -153,7 +177,9 @@ export async function startNetworkDemo({
   const path = join(directory, "demo.json");
   await writeFile(path, JSON.stringify(config), { mode: 0o600 });
   async function wait(predicate) {
-    for (let i = 0; i < 300; i++) {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      if (stopping) throw Error("Demo is stopping");
       try {
         const s = await (
           await fetch(`${url}/v1/snapshot`, {
@@ -225,8 +251,12 @@ export async function startNetworkDemo({
             throw Error("Invalid topup");
           const before = await wait((s) => s.processes.clients?.online);
           await stopChild(clients);
-          await fund(amount);
-          clients = await launch("monad-client", ["run", "--config", path]);
+          try {
+            await fund(amount);
+          } finally {
+            if (!stopping)
+              clients = await launch("monad-client", ["run", "--config", path]);
+          }
           await wait(
             (s) =>
               s.processes.clients?.online &&
