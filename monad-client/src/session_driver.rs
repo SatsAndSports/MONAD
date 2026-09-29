@@ -937,11 +937,11 @@ mod tests {
     }
 
     #[test]
-    fn maybe_progress_payment_abandons_exhausted_channel() {
+    fn maybe_progress_payment_keeps_exhausted_channel_until_relay_pauses() {
         use super::state::{RelayConnectionHandles, SessionDriverConfig};
-        use crate::wallet::{MockWallet, WalletChannelState};
+        use crate::wallet::{MockWallet, MonadWallet, WalletChannelState};
 
-        let wallet = MockWallet::new();
+        let wallet = Arc::new(MockWallet::new());
         wallet
             .insert_channel(crate::wallet::WalletChannel {
                 channel_id: "exhausted".to_string(),
@@ -950,7 +950,7 @@ mod tests {
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
                 keyset_id: "keyset-a".to_string(),
-                attached_session_id: None,
+                attached_session_id: Some([0; 32]),
                 capacity_msats: 100,
                 current_signed_balance_msats: 100,
                 expiry_timestamp: u64::MAX,
@@ -990,14 +990,30 @@ mod tests {
                     unit: "msat".to_string(),
                 }),
                 session_total_in: 0,
-                session_total_out: 0,
+                session_total_out: 99,
                 total_paid_millisats: 100,
-                remaining_milli_sats: 0,
-                paused: true,
+                remaining_milli_sats: 1,
+                paused: false,
             }),
             established_pricing: Some(SessionPricing::new(1, 1)),
             local_session_paid_msats: 100,
             ..DriverState::default()
+        };
+        let counters = CleartextByteCounters::default();
+        counters.note_outbound(101);
+        let config = SessionDriverConfig {
+            wallet: wallet.clone(),
+            conn: RelayConnectionHandles {
+                session_id: [0; 32],
+                pricing_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                spilman_info_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                cashu_spilman_protocol_version_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                cashu_spilman_keyset_versions_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                cleartext_byte_counters: counters,
+            },
+            hop_label: "test".to_string(),
+            payment_policy: PaymentPolicy::default(),
+            management: None,
         };
 
         let result = rt.block_on(async {
@@ -1017,36 +1033,37 @@ mod tests {
                 .unwrap();
             let (_response, mut h2_send) = h2_client.send_request(request, false).unwrap();
 
-            super::funding::maybe_progress_payment(
-                &SessionDriverConfig {
-                    wallet: Arc::new(wallet),
-                    conn: RelayConnectionHandles {
-                        session_id: [0; 32],
-                        pricing_handle: Arc::new(tokio::sync::RwLock::new(None)),
-                        spilman_info_handle: Arc::new(tokio::sync::RwLock::new(None)),
-                        cashu_spilman_protocol_version_handle: Arc::new(tokio::sync::RwLock::new(
-                            None,
-                        )),
-                        cashu_spilman_keyset_versions_handle: Arc::new(tokio::sync::RwLock::new(
-                            None,
-                        )),
-                        cleartext_byte_counters: CleartextByteCounters::default(),
-                    },
-                    hop_label: "test".to_string(),
-                    payment_policy: PaymentPolicy::default(),
-                    management: None,
-                },
-                &mut state,
-                &mut h2_send,
-                false,
-            )
-            .await
+            super::funding::maybe_progress_payment(&config, &mut state, &mut h2_send, false)
+                .await
+                .unwrap();
+            assert_eq!(state.intended_channel_id.as_deref(), Some("exhausted"));
+            assert_eq!(
+                wallet.get_channel("exhausted").unwrap().state,
+                WalletChannelState::Open
+            );
+            assert_eq!(wallet.attachment("exhausted").unwrap(), Some([0; 32]));
+            assert!(!state.session_excluded_channels.contains("exhausted"));
+            assert_eq!(
+                wallet.successful_payment_build_count("exhausted").unwrap(),
+                0
+            );
+
+            let snapshot = state.relay_snapshot.as_mut().unwrap();
+            snapshot.paused = true;
+            snapshot.remaining_milli_sats = 0;
+            super::funding::maybe_progress_payment(&config, &mut state, &mut h2_send, false).await
         });
 
         assert!(result.is_ok());
         assert!(
             state.intended_channel_id.is_none(),
-            "exhausted intended channel should be cleared"
+            "exhausted intended channel should be cleared after relay pause"
         );
+        assert_eq!(
+            wallet.get_channel("exhausted").unwrap().state,
+            WalletChannelState::Closing
+        );
+        assert_eq!(wallet.attachment("exhausted").unwrap(), None);
+        assert!(state.session_excluded_channels.contains("exhausted"));
     }
 }
