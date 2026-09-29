@@ -1,0 +1,27 @@
+services:
+  monad-demo:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
+    init: true
+    stdin_open: true
+    tty: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777,size=1g
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 60s
+    environment:
+      MONAD_DEMO_SATS: ${MONAD_DEMO_SATS:-1000000}
+      MONAD_DEMO_MANUAL: ${MONAD_DEMO_MANUAL:-0}
+    ports:
+      - "127.0.0.1:${MONAD_DEMO_HTTP_PORT:-18080}:8080"
+      - "${MONAD_DEMO_PUBLIC_SOCKS_PORT:-11080}:1080"
+      - "${MONAD_DEMO_PUBLIC_SOCKS2_PORT:-11081}:1081"
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/v1/snapshot',{signal:AbortSignal.timeout(3000)}).then(r=>r.json()).then(s=>{if(!['clients','relays','test-mints'].every(k=>s.processes[k]?.online))process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

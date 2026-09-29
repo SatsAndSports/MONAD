@@ -1001,3 +1001,10 @@ instrumented client binary is test-only: never use it with real funds.
 `MONAD_FUNDS_SEED=20260921 MONAD_FUNDS_CYCLES=256 make stress-funds-lifecycle`
 runs reproducible crash/rotation cycles from one fixed purse, stopping at a
 conservative capacity/fee margin rather than replenishing funds.
+## Containerized public demo
+
+Run the disposable management and two-SOCKS demo with
+`docker compose -f compose.demo.yml up --build -d`.
+Management is published at `127.0.0.1:18080` for a host HTTPS proxy; SOCKS5 is
+published on ports `11080` and `11081`. See [Docker demo](docs/docker-demo.md)
+for startup, port overrides, interactive commands, and verification.
