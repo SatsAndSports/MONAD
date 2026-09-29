@@ -1943,3 +1943,13 @@ ID. SSE updates and bounded HTTP operation lookups reconcile execution; terminal
 results cannot regress to queued acceptance. Transport uncertainty never causes
 automatic command replay. Browser-local tracking survives SSE resets but is not
 persisted across page reloads.
+## Container demo topology
+
+The optional `compose.demo.yml` packages the disposable mint, relays, clients,
+and management aggregator in one bridge-network container. A Node supervisor
+owns the demo launcher and three socat TCP forwarders. The forwarders expose
+management and both SOCKS listeners while MONAD retains container-loopback binds;
+mint, relay TCP/QUIC, and traffic-target ports remain internal. Host Nginx can
+terminate HTTPS using the host-loopback management publication. SOCKS has direct
+public TCP publications and unrestricted egress. Container starts create fresh
+temporary wallets; this topology is demo tooling, not persistent deployment.

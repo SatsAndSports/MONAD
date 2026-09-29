@@ -1,0 +1,15 @@
+# Only source/build inputs belong in the Docker context; exclude local artifacts
+# and private demo databases/configs/logs by default.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!monad-*/
+!monad-*/Cargo.toml
+!monad-*/build.rs
+!monad-*/src/**
+!monad-*/tests/**
+!monad-*/examples/**
+!monad-test-mint/dev-support/**
+!monad-management/ui-tests/network-demo.mjs
+!monad-management/ui-tests/container-demo.mjs
