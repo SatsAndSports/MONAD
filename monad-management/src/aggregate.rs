@@ -24,6 +24,7 @@ use std::{
 use tokio::sync::watch;
 
 const HISTORY: usize = 512;
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 #[derive(Clone)]
 struct Record {
@@ -77,6 +78,10 @@ impl Aggregator {
         Router::new()
             .route("/", get(root))
             .route("/mints", get(mints))
+            .route("/clients", get(runtime_page))
+            .route("/relays", get(runtime_page))
+            .route("/assets/runtime.js", get(runtime_js))
+            .route("/assets/runtime.css", get(runtime_css))
             .route("/assets/mints.css", get(mints_css))
             .route("/assets/mints.js", get(mints_js))
             .route("/v1/snapshot", get(snapshot))
@@ -276,14 +281,40 @@ async fn root() -> Redirect {
     Redirect::temporary("/mints")
 }
 
+async fn runtime_page() -> Response {
+    html_page(include_str!("ui/runtime.html"))
+}
+
+async fn runtime_js() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "text/javascript; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("ui/runtime.js"),
+    )
+}
+
+async fn runtime_css() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "text/css; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("ui/runtime.css"),
+    )
+}
+
 async fn mints() -> Response {
-    let mut response = Html(include_str!("ui/mints.html")).into_response();
+    html_page(include_str!("ui/mints.html"))
+}
+
+fn html_page(content: &'static str) -> Response {
+    let mut response = Html(content).into_response();
     let headers = response.headers_mut();
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
-            .parse()
-            .unwrap(),
+        CONTENT_SECURITY_POLICY.parse().unwrap(),
     );
     headers.insert("cache-control", "no-store".parse().unwrap());
     response

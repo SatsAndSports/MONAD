@@ -1,5 +1,11 @@
 # Management API
 
+Relay wallet channel summaries include `last_linked_at_unix_ms` (nullable), stamped
+on successful links in the current relay-process lifetime. Browser refresh retains
+these times; a process restart loses them until channels are linked again. The UI
+partitions channels using `instances.*.sessions[].linked_channel_id`, including
+paused sessions, and sorts unlinked channels newest-link-first with unknown times last.
+
 ## Single localhost TCP endpoint
 
 The mint UI consumes the initial `reset` snapshot and live updates from one SSE
@@ -26,7 +32,8 @@ cargo run -p monad-management -- --config monad.yaml
 ```
 
 The aggregator binds `management.listen` (a numeric IPv4/IPv6 loopback address).
-It serves JSON, SSE, and the embedded [mint page](mint-ui.md) at `/mints`.
+It serves JSON, SSE, and embedded [management pages](management-ui.md) at
+`/mints`, `/clients`, and `/relays`.
 By default it discovers
 the configured `relay_socket` as process `relays` and `client_socket` as process
 `clients`. An optional `test_mint_socket` is discovered as `test-mints`. For more
@@ -186,6 +193,8 @@ booleans: `awaiting_status`, `awaiting_funding`, `waiting_for_manual_funding`,
 `introduced_in_route_generation` allows a UI to distinguish preserved prefix
 sessions from newly introduced suffix sessions. See
 [structured admission refusals](admission-refusals.md) for codes and attribution.
+The instance's `socks_listen` is the actual bound listener address, including the
+allocated port when configuration requested port zero.
 
 | Action | Arguments | Completion |
 | --- | --- | --- |
@@ -250,6 +259,15 @@ opening funds are not included in available loose proofs. `proof_custody` also
 reports available, reserved, and spent proof totals grouped by mint/unit/state;
 reserved amounts are locked custody, and spent amounts are historical, not balances
 to add to channel holdings.
+
+`wallet.summary` is computed from that cached local inventory with checked
+arithmetic. Client `available_loose_proofs` includes only proofs recorded as
+available, grouped by unit, while `channel_state_counts` reports Open, Closing and
+Closed channels. Relay `drained_proofs` includes only locally Completed drain
+outputs, grouped by unit; its channel counts also include
+`sender_refunded_after_expiry`. Summary amounts are decimal strings. They are
+nominal totals across configured mints for one unit, not a mint status check or a
+promise that separate mints are fungible.
 
 Each instance retains 512 discrete events with increasing sequence numbers.
 `payment_accepted` is recorded after successful relay payment validation;

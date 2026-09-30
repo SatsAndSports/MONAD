@@ -105,7 +105,7 @@ The normal recipes were then rerun successfully with their repository-defined li
 
 ## Explicit scope boundaries
 
-- The mint webpage is now available; client/relay pages are not yet implemented.
+- Mint, client, and relay webpages are available; see [management-ui.md](management-ui.md).
   No authentication, remote TCP binding, route editing, or persisted
   runtime overrides. The aggregator rejects non-loopback binds and configured
   `auth_token` rather than pretending authentication exists.

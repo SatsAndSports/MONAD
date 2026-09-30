@@ -128,6 +128,10 @@ async fn tcp_sse_aggregates_replays_forwards_and_survives_process_restart() {
     let client = reqwest::Client::new();
     for (path, content_type) in [
         ("/mints", "text/html"),
+        ("/clients", "text/html"),
+        ("/relays", "text/html"),
+        ("/assets/runtime.js", "text/javascript"),
+        ("/assets/runtime.css", "text/css"),
         ("/assets/mints.js", "text/javascript"),
         ("/assets/mints.css", "text/css"),
     ] {
@@ -137,6 +141,13 @@ async fn tcp_sse_aggregates_replays_forwards_and_survives_process_restart() {
             .to_str()
             .unwrap()
             .starts_with(content_type));
+        if content_type == "text/html" {
+            assert_eq!(
+                response.headers()["content-security-policy"],
+                "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+            );
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
     }
     assert_eq!(
         client

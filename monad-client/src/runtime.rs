@@ -271,8 +271,18 @@ where
         .as_ref()
         .and_then(|m| m.client_socket.clone())
     {
+        let socks_listens = prepared_clients
+            .iter()
+            .map(|prepared| {
+                prepared
+                    .listener
+                    .local_addr()
+                    .map(|address| (prepared.client.name.clone(), address.to_string()))
+            })
+            .collect::<std::io::Result<std::collections::BTreeMap<_, _>>>()?;
         let backend = Arc::new(crate::management_api::ClientBackend::new(
             management.clone(),
+            socks_listens,
             manager.managed_wallet(),
         ));
         let mut stopped = shutdown_rx.clone();

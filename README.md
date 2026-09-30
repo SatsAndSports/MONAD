@@ -18,6 +18,38 @@ See [relay management actions](docs/management-api.md#relay-actions).
 The cooperative unlink messages require coordinated client and relay updates;
 older clients do not understand the release request.
 
+### Try all three management pages
+
+```bash
+cargo build -p monad-management -p monad-client -p monad-relay -p monad-test-mint
+cargo build -p monad-test-mint --example demo-fund
+node monad-management/ui-tests/network-demo.mjs
+```
+
+The launcher prints **Clients**, **Relays**, and **Mints** URLs on one localhost
+server. Open each in its own tab. The demo has two clients, a two-hop QUIC route,
+and one SAT/MSAT mint. Its shared client wallet starts with **1,000,000 test sats**
+issued by that mint; the second client starts disabled. Nothing is funded by a
+browser refresh. Type `traffic`, `topup 100000`, `restart-relays`, or `quit` in the
+launcher terminal. `traffic-on` / `traffic-off` start/stop paced traffic for the
+demo. Entry uses SAT channels and exit uses MSAT channels, with
+100-sat credit targets, 50-sat minimum topups, and 1,000-sat channel funding budgets.
+At 200 bytes/msat per hop, these correspond to 20 MB of target credit,
+10 MB per minimum topup, and 200 MB per channel. Provisioning starts
+manual; enable automatic channel provisioning in the UI whenever you like.
+The initial purse is split across SAT and MSAT proofs. Ctrl-C also stops the demo;
+temporary databases are retained.
+
+For hop-by-hop provisioning or an empty-wallet experiment, set
+`MONAD_DEMO_MANUAL=1` and optionally `MONAD_DEMO_SATS=0` before launching.
+See [the combined demo guide](docs/management-ui.md) for detailed experiments and
+browser tests. Node 20+ and `curl` are used by the demo; production pages need only
+the Rust management binary and a browser.
+
+The relay page keeps linked channels beside their sessions and places unlinked
+channels in a shared newest-first list below the relays. Closing remains visible;
+closed channels show compact final paid/capacity amounts without low-capacity red.
+
 ### Try the mint management page
 
 ```bash
@@ -35,6 +67,15 @@ For existing configurations, open `/mints` on your `monad-management` listener.
 See [mint UI usage and browser tests](docs/mint-ui.md).
 
 ### Runtime management foundations
+
+Relay channel rows report authoritative ownership, including the owning session ID.
+Close is available only for channels reported as unlinked; unavailable ownership
+is shown explicitly and disables Close.
+Command controls stay disabled through queued/running execution. The main notice
+shows terminal results and channel IDs. Lost responses are reconciled by request
+ID without resubmission; unresolved requests remain locked until confirmed or the
+process generation changes. Unlink-request success still requires waiting for
+the channel ownership to become unlinked before closing.
 
 Configured client and relay processes now optionally expose Unix-socket management
 endpoints. See [the headless API reference](docs/management-api.md) for configuration,
@@ -962,3 +1003,12 @@ instrumented client binary is test-only: never use it with real funds.
 `MONAD_FUNDS_SEED=20260921 MONAD_FUNDS_CYCLES=256 make stress-funds-lifecycle`
 runs reproducible crash/rotation cycles from one fixed purse, stopping at a
 conservative capacity/fee margin rather than replenishing funds.
+## Containerized public demo
+
+Run the disposable management and two-SOCKS demo with
+`docker compose -f compose.demo.yml up --build -d`.
+Management is published at `127.0.0.1:18080` for a host HTTPS proxy; SOCKS5 is
+published on ports `11080` and `11081`. Private child logs and process-limit
+snapshots persist across container exit for diagnosis; wallets and keys do not.
+See [Docker demo](docs/docker-demo.md) for startup, diagnostics, port overrides,
+interactive commands, and verification.

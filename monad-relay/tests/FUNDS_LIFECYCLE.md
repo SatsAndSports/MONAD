@@ -90,9 +90,21 @@ mints more money. The harness stops below 2048 available sats, a conservative
 capacity/fee margin, rather than intentionally failing the last affordable open.
 This is not an exact fee-only exhaustion threshold test.
 
-Requests, witnesses, responses, wallet files, and child stderr are private.
+Requests, witnesses, responses, wallet files, and child stdout/stderr are private.
 Successful runs delete their temporary directory. Failures retain it with a
-warning; never upload it. Console events contain only operation names and totals.
+warning; never upload it. Each CLI invocation writes separate mode-0600
+`process-N-BINARY.stderr` and (unless JSON output is consumed) `.stdout` files.
+Children use INFO logging so startup failures can be investigated after a failure;
+these logs are not copied into test output. Console events identify the diagnostic
+file prefix alongside operation names and totals. Short-lived channel setup checks
+relay/client exit status while probing SOCKS and reports the last probe error and
+attempt count, without changing startup order, expiry, or retry policy.
+
+Fixture setup reserves the relay address on both TCP and UDP/QUIC. A candidate
+with occupied UDP is discarded and selection retries (at most 128 candidates).
+Both sockets remain reserved through configuration and initial funding, then are
+released before child launch. This intentionally accepts the small handoff race;
+later relay restarts also reuse the configured address without a reservation.
 
 ## Work Tracking
 

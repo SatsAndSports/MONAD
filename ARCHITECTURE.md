@@ -90,12 +90,16 @@ history interval produces an explicit reset/source-gap, never silent event loss.
 The HTTP server directly owns its connection futures, including SSE bodies, so
 shutdown/drop closes even blocked subscribers. No browser owns runtime authority.
 
-The aggregator also embeds the `/mints` browser page. Its initial state comes from
+The aggregator embeds `/mints`, `/clients`, and `/relays` browser pages. Their initial state comes from
 the SSE reset snapshot, with subsequent updates ordered on the same stream. The
 process command executor records accepted/running/terminal operation events in a
 separate bounded ring; the aggregator forwards these with generation and request
 identity and detects source gaps. Argument payloads are excluded from broadcasts.
 The browser never owns execution and does not resubmit commands on refresh.
+Relay link timestamps are an in-memory registry observation updated after successful
+link validation, exposed separately from cached wallet inventory. The UI derives
+linked/unlinked membership from current session snapshots, even when paused. Unknown
+pre-restart link times remain explicitly unknown rather than inferred by each browser.
 
 ### Cooperative channel retirement
 
@@ -122,6 +126,9 @@ that regress paid totals, byte counters, or the same channel's accepted balance
 are ignored; asynchronous pause notifications must not roll back a newer payment
 baseline. The SQLite wallet also rejects decreasing signed balances while holding
 the same bridge lock used for signing and persistence.
+Client and relay pages render the existing sanitized runtime/wallet projections
+and send generation-bound commands. Wallet inventory remains process-scoped, not
+duplicated into a per-client spendable balance.
 
 Receiver channel-state lookups preserve the upstream
 `Result<Option<ChannelState>, String>` contract: known state, unknown channel,
@@ -1921,3 +1928,30 @@ The full QUIC transport chain is implemented and tested:
 - QUIC connection pool entries are only evicted lazily (on failed stream open) plus transport idle timeout; there is no proactive stale-entry cleanup.
 - configured mint/unit advertisements currently share the relay session's pricing
   rates rather than carrying independently configured rates per offer.
+
+## Management channel ownership
+
+Relay management samples process-local channel ownership directly from the shared
+wallet ownership store, independently of cached wallet inventory and session
+monitor snapshots. Each channel exposes `ownership.state` as `linked` (with
+`session_id`), `unlinked`, or `unavailable`. Session-monitor absence does not imply
+release. Command execution still atomically checks ownership and retirement;
+snapshot eligibility is observational, not a reservation.
+
+The runtime browser tracks outstanding commands by process generation and request
+ID. SSE updates and bounded HTTP operation lookups reconcile execution; terminal
+results cannot regress to queued acceptance. Transport uncertainty never causes
+automatic command replay. Browser-local tracking survives SSE resets but is not
+persisted across page reloads.
+## Container demo topology
+
+The optional `compose.demo.yml` packages the disposable mint, relays, clients,
+and management aggregator in one bridge-network container. A Node supervisor
+owns the demo launcher and three socat TCP forwarders. The forwarders expose
+management and both SOCKS listeners while MONAD retains container-loopback binds;
+mint, relay TCP/QUIC, and traffic-target ports remain internal. Host Nginx can
+terminate HTTPS using the host-loopback management publication. SOCKS has direct
+public TCP publications and unrestricted egress. Container starts create fresh
+temporary wallets. Child logs and process-limit snapshots persist in a private
+named volume for post-exit diagnosis, while keys, configuration, and wallet state
+remain ephemeral. This topology is demo tooling, not persistent deployment.

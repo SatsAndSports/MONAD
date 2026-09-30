@@ -990,8 +990,16 @@ impl RelayWalletManager {
         self.metadata.relay_name_for_channel(channel_id)
     }
 
-    /// Whether this channel has been retired (no new links; cooperative unlink
-    /// requested or already completed). Retirement persists across restarts.
+    /// Current process-local owner, independently of session monitoring.
+    pub(crate) fn channel_owner(&self, channel_id: &str) -> Result<Option<[u8; 32]>, String> {
+        self.metadata
+            .ownership
+            .lock()
+            .map(|ownership| ownership.owner(channel_id))
+            .map_err(|_| "channel ownership unavailable".to_string())
+    }
+
+    /// Whether retirement was requested; persists across restarts.
     pub fn channel_is_retired(&self, channel_id: &str) -> bool {
         self.metadata.is_retired(channel_id).unwrap_or(false)
     }
