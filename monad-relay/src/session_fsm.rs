@@ -127,8 +127,14 @@ pub(crate) fn step(
         }
         SessionEvent::LinkValidationFinished(result) => match result {
             Ok(outcome) => {
-                state.linked_channel_id = Some(outcome.channel_id.clone());
+                let previous_channel = state
+                    .linked_channel_id
+                    .replace(outcome.channel_id.clone())
+                    .filter(|channel_id| channel_id != &outcome.channel_id);
                 let mut effects = Vec::new();
+                if let Some(channel_id) = previous_channel {
+                    effects.push(SessionEffect::ReleaseLinkedChannelOwnership { channel_id });
+                }
                 if let Some(evicted_session) = outcome.evicted_session {
                     effects.push(SessionEffect::NotifySessionEvicted {
                         target_session_id: evicted_session,
@@ -264,6 +270,50 @@ mod tests {
     fn link_accept_updates_linked_channel_and_emits_status() {
         let (next, effects) = step(
             state(),
+            SessionEvent::LinkValidationFinished(Ok(LinkOutcome {
+                channel_id: "chan-a".to_string(),
+                capacity_millisats: 123,
+                evicted_session: None,
+            })),
+            SessionPricing::new(1, 1),
+        );
+
+        assert_eq!(next.linked_channel_id.as_deref(), Some("chan-a"));
+        assert!(matches!(effects.as_slice(), [SessionEffect::SendStatus]));
+    }
+
+    #[test]
+    fn link_accept_releases_previous_channel_before_status() {
+        let mut current = state();
+        current.linked_channel_id = Some("chan-a".to_string());
+
+        let (next, effects) = step(
+            current,
+            SessionEvent::LinkValidationFinished(Ok(LinkOutcome {
+                channel_id: "chan-b".to_string(),
+                capacity_millisats: 123,
+                evicted_session: None,
+            })),
+            SessionPricing::new(1, 1),
+        );
+
+        assert_eq!(next.linked_channel_id.as_deref(), Some("chan-b"));
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                SessionEffect::ReleaseLinkedChannelOwnership { channel_id },
+                SessionEffect::SendStatus,
+            ] if channel_id == "chan-a"
+        ));
+    }
+
+    #[test]
+    fn same_channel_relink_keeps_ownership() {
+        let mut current = state();
+        current.linked_channel_id = Some("chan-a".to_string());
+
+        let (next, effects) = step(
+            current,
             SessionEvent::LinkValidationFinished(Ok(LinkOutcome {
                 channel_id: "chan-a".to_string(),
                 capacity_millisats: 123,

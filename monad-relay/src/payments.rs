@@ -717,6 +717,15 @@ impl RelayPayments for SpilmanRelayPayments {
             capacity
         };
 
+        let channel = self
+            .store
+            .get_channel(&payment.channel_id)
+            .map_err(LinkError::Internal)?
+            .ok_or_else(|| {
+                LinkError::Internal("linked channel missing after validation".to_string())
+            })?;
+        let capacity_millisats = channel.unit.capacity_millisats(capacity_raw)?;
+
         let evicted_session = self
             .store
             .set_channel_owner(&payment.channel_id, session_id)
@@ -728,17 +737,9 @@ impl RelayPayments for SpilmanRelayPayments {
                 }
             })?;
 
-        let channel = self
-            .store
-            .get_channel(&payment.channel_id)
-            .map_err(LinkError::Internal)?
-            .ok_or_else(|| {
-                LinkError::Internal("linked channel missing after validation".to_string())
-            })?;
-
         Ok(LinkOutcome {
             channel_id: payment.channel_id,
-            capacity_millisats: channel.unit.capacity_millisats(capacity_raw)?,
+            capacity_millisats,
             evicted_session,
         })
     }
@@ -1342,6 +1343,7 @@ pub mod testing {
                     return Err(LinkError::ChannelClosed);
                 }
 
+                let capacity_millisats = record.unit.capacity_millisats(record.capacity_raw)?;
                 let evicted_session = match record.owner {
                     Some(owner) if owner != session_id => Some(owner),
                     _ => None,
@@ -1350,7 +1352,7 @@ pub mod testing {
 
                 return Ok(LinkOutcome {
                     channel_id: parsed.channel_id,
-                    capacity_millisats: record.unit.capacity_millisats(record.capacity_raw)?,
+                    capacity_millisats,
                     evicted_session,
                 });
             }
@@ -1482,8 +1484,8 @@ pub mod testing {
 
     #[cfg(test)]
     mod tests {
-        use super::InMemoryRelayPayments;
-        use crate::payments::{ChannelPaymentError, LinkError, RelayPayments};
+        use super::{ChannelRecord, InMemoryRelayPayments};
+        use crate::payments::{ChannelPaymentError, ChannelUnit, LinkError, RelayPayments};
 
         fn payment_json(
             channel_id: &str,
@@ -1646,6 +1648,38 @@ pub mod testing {
                 .unwrap();
             assert_eq!(outcome.evicted_session, None);
             assert_eq!(outcome.capacity_millisats, 10);
+        }
+
+        #[test]
+        fn failed_relink_does_not_replace_owner() {
+            let payments = InMemoryRelayPayments::new();
+            payments.inner.lock().unwrap().channels.insert(
+                "chan".to_string(),
+                ChannelRecord {
+                    capacity_raw: u64::MAX,
+                    unit: ChannelUnit::Sat,
+                    latest_balance: 0,
+                    closed: false,
+                    owner: Some(session(1)),
+                },
+            );
+
+            let error = payments
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(2),
+                    &payment_json("chan", 0, None, None),
+                )
+                .unwrap_err();
+
+            assert_eq!(
+                error,
+                LinkError::InvalidChannel("capacity overflow".to_string())
+            );
+            assert_eq!(
+                payments.inner.lock().unwrap().channels["chan"].owner,
+                Some(session(1))
+            );
         }
 
         #[test]
