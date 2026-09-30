@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { setTimeout as sleep } from "node:timers/promises";
 import { createServer as httpServer } from "node:http";
 import { createECDH, randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
@@ -12,7 +13,6 @@ import {
   reserveTcpPort,
 } from "./port-reservations.mjs";
 const root = fileURLToPath(new URL("../../", import.meta.url));
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export async function startNetworkDemo({
   sats = Number(process.env.MONAD_DEMO_SATS ?? 1000000),
   manual = true,
@@ -78,6 +78,7 @@ export async function startNetworkDemo({
   const url = `http://127.0.0.1:${api}`,
     mintUrl = `http://127.0.0.1:${mintPort}`;
   const children = [];
+  const childExitWaiters = new Set();
   const target = httpServer((req, res) =>
     res.end("MONAD local demo traffic. ".repeat(4096)),
   );
@@ -100,6 +101,18 @@ export async function startNetworkDemo({
     throw error;
   }
   const targetUrl = `http://127.0.0.1:${target.address().port}`;
+  const childExitError = (entry, status) => {
+    const outcome = status.error
+      ? `spawn error: ${status.error}`
+      : status.signal
+        ? `signal ${status.signal}`
+        : `code ${status.code}`;
+    const error = Error(
+      `${entry.binary} exited unexpectedly (${outcome}); private_log=${entry.logPath} limits=${entry.limitsPath}`,
+    );
+    error.code = "DEMO_CHILD_EXIT";
+    return error;
+  };
   async function launch(binary, args, reservations = []) {
     const label = binary.replaceAll("/", "-");
     const logPath = join(logDirectory, `${label}.log`);
@@ -121,17 +134,28 @@ export async function startNetworkDemo({
       throw error;
     }
     const entry = {
+      binary,
       child,
       logPath,
       limitsPath,
       expectedExit: binary === "examples/demo-fund",
-      done: new Promise((r) => {
-        child.once("exit", (code, signal) => r({ code, signal }));
-        child.once("error", (error) =>
-          r({ code: null, signal: null, error: error.message }),
-        );
-      }),
+      status: null,
+      done: null,
     };
+    entry.done = new Promise((resolve) => {
+      let settled = false;
+      const finish = (status) => {
+        if (settled) return;
+        settled = true;
+        entry.status = status;
+        for (const notify of childExitWaiters) notify(entry, status);
+        resolve(status);
+      };
+      child.once("exit", (code, signal) => finish({ code, signal }));
+      child.once("error", (error) =>
+        finish({ code: null, signal: null, error: error.message }),
+      );
+    });
     children.push(entry);
     if (child.pid) {
       try {
@@ -156,14 +180,7 @@ export async function startNetworkDemo({
         !entry.expectedExit &&
         !stopping
       ) {
-        const outcome = status.error
-          ? `spawn error: ${status.error}`
-          : status.signal
-            ? `signal ${status.signal}`
-            : `code ${status.code}`;
-        console.error(
-          `${binary} exited unexpectedly (${outcome}); private_log=${logPath} limits=${limitsPath}`,
-        );
+        console.error(childExitError(entry, status).message);
         stop().finally(() => process.exit(1));
       }
     });
@@ -189,6 +206,7 @@ export async function startNetworkDemo({
   }
   let stopping;
   let maintenance = Promise.resolve();
+  const shutdown = new AbortController();
   const emergency = () =>
     children.forEach((e) => {
       if (e.child.exitCode === null && e.child.signalCode === null)
@@ -196,11 +214,12 @@ export async function startNetworkDemo({
     });
   const stop = () =>
     (stopping ??= (async () => {
-      await maintenance;
+      shutdown.abort();
       await releaseReservations([...liveReservations]);
       target.closeAllConnections();
       await new Promise((r) => target.close(r));
       for (const e of [...children].reverse()) await stopChild(e);
+      await maintenance;
       process.off("exit", emergency);
       process.off("SIGINT", interrupt);
       process.off("SIGTERM", interrupt);
@@ -285,19 +304,75 @@ export async function startNetworkDemo({
     await stop();
     throw error;
   }
-  async function wait(predicate) {
+  let mint, clients, relays, management;
+  const essentialChildren = () =>
+    [mint, management, relays, clients].filter(Boolean);
+  async function wait(predicate, required) {
     const deadline = Date.now() + 30000;
+    const requiredChildren = () => required ?? essentialChildren();
+    const throwIfRequiredExited = () => {
+      for (const entry of requiredChildren())
+        if (entry.status && !entry.expectedExit)
+          throw childExitError(entry, entry.status);
+    };
+    const raceChildExit = (operation) =>
+      new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (complete, value) => {
+          if (settled) return;
+          settled = true;
+          childExitWaiters.delete(onExit);
+          complete(value);
+        };
+        const onExit = (entry, status) => {
+          if (!entry.expectedExit && requiredChildren().includes(entry))
+            finish(reject, childExitError(entry, status));
+        };
+        childExitWaiters.add(onExit);
+        try {
+          throwIfRequiredExited();
+        } catch (error) {
+          finish(reject, error);
+        }
+        operation.then(
+          (value) => finish(resolve, value),
+          (error) => finish(reject, error),
+        );
+      });
+    const handleWaitError = (error) => {
+      if (error.code === "DEMO_CHILD_EXIT") throw error;
+      if (shutdown.signal.aborted) throw Error("Demo is stopping");
+    };
     while (Date.now() < deadline) {
-      if (stopping) throw Error("Demo is stopping");
+      if (shutdown.signal.aborted) throw Error("Demo is stopping");
+      const remaining = deadline - Date.now();
       try {
-        const s = await (
-          await fetch(`${url}/v1/snapshot`, {
-            signal: AbortSignal.timeout(2000),
-          })
-        ).json();
-        if (predicate(s)) return s;
-      } catch {}
-      await delay(100);
+        const s = await raceChildExit(
+          fetch(`${url}/v1/snapshot`, {
+            signal: AbortSignal.any([
+              shutdown.signal,
+              AbortSignal.timeout(Math.min(2000, remaining)),
+            ]),
+          }).then((response) => response.json()),
+        );
+        if (predicate(s)) {
+          throwIfRequiredExited();
+          return s;
+        }
+      } catch (error) {
+        handleWaitError(error);
+      }
+      const remainingAfterRequest = deadline - Date.now();
+      if (remainingAfterRequest <= 0) break;
+      try {
+        await raceChildExit(
+          sleep(Math.min(100, remainingAfterRequest), undefined, {
+            signal: shutdown.signal,
+          }),
+        );
+      } catch (error) {
+        handleWaitError(error);
+      }
     }
     throw Error(`Demo not ready; inspect private logs in ${logDirectory}`);
   }
@@ -312,9 +387,8 @@ export async function startNetworkDemo({
     if (status.code !== 0)
       throw Error(`Funding failed; inspect private log ${e.logPath}`);
   }
-  let clients, relays, management;
   try {
-    await launch("monad-test-mint", ["run", "--config", path], [
+    mint = await launch("monad-test-mint", ["run", "--config", path], [
       mintReservation,
     ]);
     management = await launch("monad-management", ["--config", path], [
@@ -347,6 +421,7 @@ export async function startNetworkDemo({
       wait,
       targetUrl,
       stopManagement: () => stopChild(management),
+      stopMint: () => stopChild(mint),
       restartManagement: () =>
         serialized(async () => {
           await stopChild(management);
