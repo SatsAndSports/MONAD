@@ -80,13 +80,16 @@ The purse is split equally into SAT proofs and MSAT proofs (valued in sats).
 `demo-client` starts enabled; `second-client` starts disabled. Both use entry → exit
 over QUIC, with a SAT entry channel and an MSAT exit channel. Channel provisioning
 starts manual; payments within existing channels remain automatic. Both hops use a
-500-msat session credit target and a 500-msat minimum top-up. SAT payments round up
+100-sat session credit target and a 50-sat minimum top-up. SAT payments round up
 to whole sats; these targets are not hard ceilings on session credit.
 
-Channel funding budgets are 30 sat each, with actual capacity determined by funding
-and fees. `traffic-on` requests about 100 KiB per second at 200 bytes/msat, targeting
-roughly one minute per channel. Traffic stalls, overhead, and unit rounding affect
-the timing. Enable automatic channel provisioning in the UI to replace exhausted
+Channel funding budgets are 1,000 sat each, with actual capacity determined by funding
+and fees. At 200 bytes/msat per hop, target credit covers 20 MB, minimum topups
+cover 10 MB, and a channel covers 200 MB (upload and download combined).
+`traffic-on` requests about 100 KiB per second; browser/video traffic consumes credit
+faster. Imported automated UI fixtures retain 500-msat targets/minimum topups and
+30-sat channels to exercise turnover quickly.
+Enable automatic channel provisioning in the UI to replace exhausted
 channels without clicking Provision channel each time.
 
 Session credit is displayed separately from cumulative channel payment. SAT channel

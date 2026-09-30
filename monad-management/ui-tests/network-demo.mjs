@@ -28,6 +28,10 @@ export async function startNetworkDemo({
   managementPort = Number(process.env.MONAD_DEMO_MANAGEMENT_PORT ?? 0),
   socksPort = Number(process.env.MONAD_DEMO_SOCKS_PORT ?? 0),
   socks2Port = Number(process.env.MONAD_DEMO_SOCKS2_PORT ?? 0),
+  // Small defaults keep imported UI fixtures exercising payment/channel turnover.
+  channelFundingMsats = 30000,
+  targetTopupMsats = 500,
+  minimumTopupMsats = 500,
 } = {}) {
   if (!Number.isSafeInteger(sats) || sats < 0 || sats > 100000000)
     throw Error("MONAD_DEMO_SATS must be 0..100000000");
@@ -170,9 +174,9 @@ export async function startNetworkDemo({
       loose_db_path: loose,
       channel_db_path: channels,
       sender_secret_hex: randomBytes(32).toString("hex"),
-      channel_funding_token_target_msats: 30000,
-      target_topup_buffer_msats: 500,
-      minimum_topup_msats: 500,
+      channel_funding_token_target_msats: channelFundingMsats,
+      target_topup_buffer_msats: targetTopupMsats,
+      minimum_topup_msats: minimumTopupMsats,
     },
     relays: [],
     clients: [],
@@ -322,9 +326,12 @@ export async function startNetworkDemo({
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const demo = await startNetworkDemo({
     manual: process.env.MONAD_DEMO_MANUAL !== "0",
+    channelFundingMsats: 1000000,
+    targetTopupMsats: 100000,
+    minimumTopupMsats: 50000,
   });
   console.log(
-    `Clients: ${demo.url}/clients\nRelays: ${demo.url}/relays\nMints: ${demo.url}/mints\nSOCKS: 127.0.0.1:${demo.socks}\nTraffic target: ${demo.targetUrl}\nPrivate child logs: ${demo.logDirectory}\nEphemeral data/config: ${demo.directory}\nWallet starts with ${process.env.MONAD_DEMO_SATS ?? 1000000} test sats equivalent, split across SAT/MSAT and shared by both clients. Second client starts disabled.\nSAT entry / MSAT exit · 500-msat credit targets · 30-sat channel budgets\nCommands: traffic | traffic-on | traffic-off | topup SATS | restart-relays | quit`,
+    `Clients: ${demo.url}/clients\nRelays: ${demo.url}/relays\nMints: ${demo.url}/mints\nSOCKS: 127.0.0.1:${demo.socks}\nTraffic target: ${demo.targetUrl}\nPrivate child logs: ${demo.logDirectory}\nEphemeral data/config: ${demo.directory}\nWallet starts with ${process.env.MONAD_DEMO_SATS ?? 1000000} test sats equivalent, split across SAT/MSAT and shared by both clients. Second client starts disabled.\nSAT entry / MSAT exit · 100-sat credit targets · 50-sat minimum topups · 1,000-sat channel budgets\nCommands: traffic | traffic-on | traffic-off | topup SATS | restart-relays | quit`,
   );
   const input = createInterface({
     input: process.stdin,
