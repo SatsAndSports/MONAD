@@ -1651,7 +1651,7 @@ pub mod testing {
         }
 
         #[test]
-        fn failed_relink_does_not_replace_owner() {
+        fn capacity_overflow_does_not_replace_owner() {
             let payments = InMemoryRelayPayments::new();
             payments.inner.lock().unwrap().channels.insert(
                 "chan".to_string(),
