@@ -1475,6 +1475,51 @@ mod tests {
         (send, request.into_body(), client_send, recv, drivers)
     }
 
+    #[tokio::test]
+    async fn cancellation_during_replacement_status_releases_new_owner() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let (state, payments) = test_state();
+        let channel_a = r#"{"channel_id":"replace-a","balance":0,"capacity":100,"unit":"msat"}"#;
+        let channel_b = r#"{"channel_id":"replace-b","balance":0,"capacity":100,"unit":"msat"}"#;
+        let linked_a = state.link_channel(channel_a).unwrap();
+        state.billing.lock().await.state.linked_channel_id = Some(linked_a.channel_id);
+        let (mut send, _recv, _client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
+
+        let mut replacement = Box::pin(process_session_event(
+            &state,
+            SessionEvent::ClientChannelLink {
+                payment_json: channel_b.to_string(),
+            },
+            &mut send,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(replacement.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        assert_eq!(
+            state
+                .billing
+                .lock()
+                .await
+                .state
+                .linked_channel_id
+                .as_deref(),
+            Some("replace-b")
+        );
+        assert_eq!(payments.owner_of("replace-a"), None);
+        assert_eq!(payments.owner_of("replace-b"), Some(state.session_id));
+
+        drop(replacement);
+        state.cleanup();
+        assert_eq!(payments.owner_of("replace-a"), None);
+        assert_eq!(payments.owner_of("replace-b"), None);
+        drivers.shutdown().await;
+    }
+
     #[derive(Clone, Copy)]
     enum BlockedOperation {
         Write,

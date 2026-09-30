@@ -67,7 +67,9 @@ use monad_relay::listener::{
     run_with_payments_and_registry_and_shutdown, run_with_wallet_manager_and_shutdown,
     shared_spilman_mint_cache, CachedKeyset, RelayRuntimeServices, ServerConfig, SpilmanMintCache,
 };
-use monad_relay::payments::{testing::InMemoryRelayPayments, RelayPayments, SpilmanRelayPayments};
+use monad_relay::payments::{
+    testing::InMemoryRelayPayments, LinkError, RelayPayments, SpilmanRelayPayments,
+};
 use monad_relay::quic_pool::QuicPool;
 use monad_relay::session_registry::SessionRegistry;
 use monad_relay::wallet_manager::{DrainSwapNetworking, RelayWalletManager, RelayWalletMintClient};
@@ -5329,7 +5331,7 @@ async fn test_nested_tcp_parent_control_detach_releases_child_channel() {
 #[tokio::test]
 async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_old_channel_payment()
 {
-    let (server_addr, pubkey) = start_monad_relay().await;
+    let (server_addr, pubkey, payments) = start_monad_relay_with_test_payments().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
 
@@ -5346,6 +5348,7 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
     assert_eq!(paid1, 0);
     assert_eq!(rem1, 0);
     assert!(paused1);
+    assert_eq!(payments.owner_of("chan-a"), Some(*conn.session_id()));
     let (_in1, _out1, paid1, rem1, paused1) =
         channel_a.pay(&mut control_send, &mut control_recv, 7).await;
     assert_eq!(paid1, 7);
@@ -5357,6 +5360,8 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
     assert_eq!(paid2, 7);
     assert_eq!(rem2, 7);
     assert!(!paused2);
+    assert_eq!(payments.owner_of("chan-a"), None);
+    assert_eq!(payments.owner_of("chan-b"), Some(*conn.session_id()));
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::SessionStatus {
@@ -5427,11 +5432,195 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
         other => panic!("expected SessionStatus after rejected old channel payment, got {other:?}"),
     }
 
+    let relinked_a = channel_a
+        .link_expect_balance(&mut control_send, &mut control_recv, 7)
+        .await;
+    assert_eq!(relinked_a.total_paid_millisats, 12);
+    assert_eq!(relinked_a.remaining_milli_sats, 12);
+    assert!(!relinked_a.paused);
+    assert_eq!(payments.owner_of("chan-a"), Some(*conn.session_id()));
+    assert_eq!(payments.owner_of("chan-b"), None);
+
+    channel_a.cumulative_balance_units = 7;
+    let (_in3, _out3, paid3, rem3, paused3) =
+        channel_a.pay(&mut control_send, &mut control_recv, 2).await;
+    assert_eq!(paid3, 14, "only A's new delta should credit the session");
+    assert_eq!(rem3, 14);
+    assert!(!paused3);
+
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
     drop(control_recv);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_failed_replacement_preserves_link_ownership_and_credit() {
+    let (server_addr, pubkey, payments) = start_monad_relay_with_test_payments().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let _ = control_handshake(&mut control_send, &mut control_recv).await;
+
+    let mut channel_a = SessionPaymentChannel::for_explicit_id("valid-a");
+    let _ = channel_a.link(&mut control_send, &mut control_recv).await;
+    let (_, _, paid_before, remaining_before, paused_before) =
+        channel_a.pay(&mut control_send, &mut control_recv, 7).await;
+    assert_eq!(payments.owner_of("valid-a"), Some(*conn.session_id()));
+
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::ChannelLink {
+            payment_json: serde_json::json!({
+                "channel_id": "invalid-b",
+                "balance": 0,
+                "capacity": TEST_CHANNEL_CAPACITY_UNITS,
+                "unit": "msat",
+                "invalid": true,
+            })
+            .to_string(),
+        },
+        false,
+    )
+    .await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, .. } => {
+            assert_eq!(code, ServerErrorCode::LinkInvalidPayment);
+        }
+        other => panic!("expected rejected replacement, got {other:?}"),
+    }
+
+    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
+    let status = expect_session_status_struct(read_control_message(&mut control_recv).await);
+    assert_eq!(
+        status
+            .linked_channel
+            .as_ref()
+            .map(|channel| channel.channel_id.as_str()),
+        Some("valid-a")
+    );
+    assert_eq!(status.total_paid_millisats, paid_before);
+    assert_eq!(status.remaining_milli_sats, remaining_before);
+    assert_eq!(status.paused, paused_before);
+    assert_eq!(payments.owner_of("valid-a"), Some(*conn.session_id()));
+    assert_eq!(payments.owner_of("invalid-b"), None);
+
+    let (_, _, paid_after, remaining_after, paused_after) =
+        channel_a.pay(&mut control_send, &mut control_recv, 2).await;
+    assert_eq!(paid_after, paid_before + 2);
+    assert_eq!(remaining_after, remaining_before + 2);
+    assert_eq!(paused_after, paused_before);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_production_link_failures_do_not_change_ownership() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_string();
+    let keyset_id = mint_helper.keyset_id().to_string();
+    let keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let mint_cache = mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info_json, true);
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let db_path = temp_db.path().to_str().unwrap();
+    let wallet_manager = RelayWalletManager::open(db_path).unwrap();
+    let relay_name = "link-failure-relay";
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    wallet_manager
+        .register_identity(relay_name, receiver_secret)
+        .unwrap();
+    let payments = wallet_manager
+        .spilman_payments_for(relay_name, mint_cache, trusted_mint_units)
+        .unwrap();
+    let wallet = TestSigningWallet::new(
+        mint_helper.mint(),
+        receiver_pubkey_hex,
+        mint_url,
+        keyset_id,
+        keyset_info_json,
+    )
+    .await;
+    let versions = supported_cashu_spilman_keyset_versions();
+    let old_owner = [41; 32];
+    let candidate = [42; 32];
+
+    let read_failure_channel = wallet.pre_create_channel(1_000).await.unwrap();
+    wallet
+        .attach_channel_to_session(&read_failure_channel, old_owner)
+        .unwrap();
+    let read_failure_link = wallet
+        .build_raw_link_request(&read_failure_channel)
+        .unwrap();
+    payments
+        .link_channel(&versions, old_owner, &read_failure_link)
+        .unwrap();
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "UPDATE spilman_channels SET state='invalid' WHERE channel_id=?1",
+        [&read_failure_channel],
+    )
+    .unwrap();
+    assert!(matches!(
+        payments.link_channel(&versions, candidate, &read_failure_link),
+        Err(LinkError::Internal(_))
+    ));
+    conn.execute(
+        "UPDATE spilman_channels SET state='Open' WHERE channel_id=?1",
+        [&read_failure_channel],
+    )
+    .unwrap();
+    assert_eq!(
+        payments
+            .link_channel(&versions, old_owner, &read_failure_link)
+            .unwrap()
+            .evicted_session,
+        None,
+        "a failed channel read must not replace the existing owner"
+    );
+
+    let owner_failure_channel = wallet.pre_create_channel(1_000).await.unwrap();
+    wallet
+        .attach_channel_to_session(&owner_failure_channel, old_owner)
+        .unwrap();
+    let owner_failure_link = wallet
+        .build_raw_link_request(&owner_failure_channel)
+        .unwrap();
+    payments
+        .link_channel(&versions, old_owner, &owner_failure_link)
+        .unwrap();
+    conn.execute("DROP TABLE monad_relay_retired_channels", [])
+        .unwrap();
+    assert!(matches!(
+        payments.link_channel(&versions, candidate, &owner_failure_link),
+        Err(LinkError::Internal(_))
+    ));
+    conn.execute(
+        "CREATE TABLE monad_relay_retired_channels (channel_id TEXT PRIMARY KEY NOT NULL)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        payments
+            .link_channel(&versions, old_owner, &owner_failure_link)
+            .unwrap()
+            .evicted_session,
+        None,
+        "a failed ownership-store check must preserve the existing owner"
+    );
+    assert_eq!(
+        payments
+            .link_channel(&versions, candidate, &owner_failure_link)
+            .unwrap()
+            .evicted_session,
+        Some(old_owner),
+        "the repaired path should still report the real ownership handoff"
+    );
 }
 
 #[tokio::test]

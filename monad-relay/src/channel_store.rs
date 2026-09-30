@@ -620,6 +620,32 @@ mod tests {
     }
 
     #[test]
+    fn stale_owner_release_preserves_replacement_owner() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = ChannelStore::new(storage);
+        let old_owner = [1; 32];
+        let new_owner = [2; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.set_channel_owner("chan", old_owner).unwrap();
+        assert_eq!(
+            store.set_channel_owner("chan", new_owner).unwrap(),
+            Some(old_owner)
+        );
+
+        store.release_channel_owner("chan", old_owner).unwrap();
+        assert_eq!(
+            store.ownership_lock().unwrap().owner("chan"),
+            Some(new_owner)
+        );
+
+        store.release_channel_owner("chan", new_owner).unwrap();
+        assert_eq!(store.ownership_lock().unwrap().owner("chan"), None);
+    }
+
+    #[test]
     fn competing_payment_snapshot_conflicts_without_duplicate_credit() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());

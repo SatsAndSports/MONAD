@@ -286,6 +286,11 @@ mod tests {
     fn link_accept_releases_previous_channel_before_status() {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());
+        current.session_total_in = 11;
+        current.session_total_out = 13;
+        current.total_paid_millisats = 29;
+        current.paused = false;
+        let accounting = current.clone();
 
         let (next, effects) = step(
             current,
@@ -298,6 +303,10 @@ mod tests {
         );
 
         assert_eq!(next.linked_channel_id.as_deref(), Some("chan-b"));
+        assert_eq!(next.session_total_in, accounting.session_total_in);
+        assert_eq!(next.session_total_out, accounting.session_total_out);
+        assert_eq!(next.total_paid_millisats, accounting.total_paid_millisats);
+        assert_eq!(next.paused, accounting.paused);
         assert!(matches!(
             effects.as_slice(),
             [
@@ -435,6 +444,11 @@ mod tests {
     fn unlink_success_clears_link_and_confirms() {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());
+        current.session_total_in = 11;
+        current.session_total_out = 13;
+        current.total_paid_millisats = 29;
+        current.paused = false;
+        let accounting = current.clone();
 
         let (next, effects) = step(
             current,
@@ -447,6 +461,10 @@ mod tests {
         );
 
         assert_eq!(next.linked_channel_id, None);
+        assert_eq!(next.session_total_in, accounting.session_total_in);
+        assert_eq!(next.session_total_out, accounting.session_total_out);
+        assert_eq!(next.total_paid_millisats, accounting.total_paid_millisats);
+        assert_eq!(next.paused, accounting.paused);
         assert!(matches!(
             effects.as_slice(),
             [
