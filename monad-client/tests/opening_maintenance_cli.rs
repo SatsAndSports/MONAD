@@ -414,6 +414,40 @@ fn maintenance(loose: &Path, channel: &Path, command: &str) -> Output {
 }
 
 #[test]
+fn wallet_json_stdout_remains_parseable_with_info_logging() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_monad-client"))
+        .arg("wallet")
+        .arg("--loose-db")
+        .arg(dir.path().join("loose.db"))
+        .arg("--channel-db")
+        .arg(dir.path().join("channel.db"))
+        .args([
+            "--sender-secret-hex",
+            &"01".repeat(32),
+            "--json",
+            "recover-openings",
+        ])
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "recovered_channel_ids": [], "cancelled_attempt_ids": [],
+            "externally_spent_attempt_ids": [], "unresolved": []
+        })
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("running client wallet command"), "{stderr}");
+    assert!(!String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("running client wallet command"));
+}
+
+#[test]
 fn opening_maintenance_cli_excludes_runtime_before_database_work() {
     for initialized in [false, true] {
         let dir = tempfile::tempdir().unwrap();

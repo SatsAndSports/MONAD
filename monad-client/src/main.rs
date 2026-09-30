@@ -194,6 +194,7 @@ impl MintConnection for HttpMintConnection {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -259,6 +260,7 @@ async fn run_configured_client(args: RunArgs) -> anyhow::Result<()> {
 }
 
 async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
+    tracing::info!("running client wallet command");
     let read_only = matches!(
         args.command,
         WalletCommand::Channels | WalletCommand::Proofs
