@@ -32,8 +32,10 @@ and one SAT/MSAT mint. Its shared client wallet starts with **1,000,000 test sat
 issued by that mint; the second client starts disabled. Nothing is funded by a
 browser refresh. Type `traffic`, `topup 100000`, `restart-relays`, or `quit` in the
 launcher terminal. `traffic-on` / `traffic-off` start/stop paced traffic for the
-small-channel demo. Entry uses SAT channels and exit uses MSAT channels, with
-500-msat credit targets and 30-sat channel funding budgets. Provisioning starts
+demo. Entry uses SAT channels and exit uses MSAT channels, with
+100-sat credit targets, 50-sat minimum topups, and 1,000-sat channel funding budgets.
+At 200 bytes/msat per hop, these correspond to 20 MB of target credit,
+10 MB per minimum topup, and 200 MB per channel. Provisioning starts
 manual; enable automatic channel provisioning in the UI whenever you like.
 The initial purse is split across SAT and MSAT proofs. Ctrl-C also stops the demo;
 temporary databases are retained.
