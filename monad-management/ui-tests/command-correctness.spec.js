@@ -83,3 +83,70 @@ test("relay admission toggle submits only its selected field", async ({page}) =>
   expect(submitted.action).toBe("set_control");
   expect(submitted.arguments).toEqual({field:"accept_new_tunnels", enabled:false});
 });
+
+for (const kind of ["clients", "relays"]) {
+  test(`${kind} wallet retains stale values and distinguishes missing from zero`, async ({page}) => {
+    await setup(page, kind);
+    const publish = async (online, age, summary) => page.evaluate(({kind, online, age, summary}) => {
+      window.events.dispatchEvent(new MessageEvent("snapshot", {data:JSON.stringify({process:kind, state:{
+        online, generation:"g", last_success_unix_ms:Date.now() - age,
+        data:{kind, instances:{}, wallet:{summary}}
+      }})}));
+    }, {kind, online, age, summary});
+    const summary = {channel_state_counts:{open:0, closing:2},
+      [kind === "clients" ? "available_loose_proofs" : "drained_proofs"]:{sat:{amount_raw:"123"}}};
+    const card = page.locator(`[data-wallet-process="${kind}"]`);
+    await publish(true, 0, summary);
+    await expect(card).toContainText("Live · Last successful sample:");
+    await expect(card).toContainText("123 sat");
+    await expect(card).toContainText("unavailable msat");
+    await expect(card).toContainText("Open 0");
+    await expect(card).toContainText("Closed unavailable");
+    await publish(false, 0, summary);
+    await expect(card).toContainText("Stale / unavailable");
+    await expect(card).toContainText("123 sat");
+    await publish(true, 7000, summary);
+    await expect(card).toContainText("Stale / unavailable");
+    await publish(true, 0, summary);
+    await expect(card).toContainText("Live · Last successful sample:");
+    await page.evaluate(() => window.events.onerror());
+    await expect(card).toContainText("Stale / unavailable");
+    await publish(true, 0, undefined);
+    await expect(card).toContainText("Wallet summary unavailable");
+    await expect(page.locator("#instances")).not.toContainText("No available loose proofs");
+  });
+}
+
+test("Resume close uses the existing command and locks on pending or stale state", async ({page}) => {
+  await setup(page, "relays");
+  const publish = async (online, channelState = "Closing", ownership = "unlinked") => page.evaluate(({online, channelState, ownership}) => {
+    window.events.dispatchEvent(new MessageEvent("snapshot", {data:JSON.stringify({process:"relays", state:{
+      online, generation:"g", last_success_unix_ms:Date.now(),
+      data:{kind:"relays", instances:{}, wallet:{channels:[{channel_id:"channel-1", relay_name:"demo",
+        mint_url:"http://mint", unit:"sat", state:channelState, ownership:{state:ownership}, balance_raw:5, capacity_raw:10}]}}
+    }})}));
+  }, {online, channelState, ownership});
+  await publish(false);
+  const resume = page.getByRole("button", {name:"Resume close", exact:true});
+  await expect(resume).toBeDisabled();
+  await publish(true);
+  await expect(resume).toBeEnabled();
+  let submitted;
+  await page.route("**/commands", route => {
+    submitted = route.request().postDataJSON();
+    return route.fulfill({status:202, json:{request:submitted, state:"running"}});
+  });
+  await resume.click();
+  await expect(resume).toBeDisabled();
+  expect(submitted.action).toBe("close_channel");
+  expect(submitted.arguments).toEqual({channel_id:"channel-1"});
+  await page.evaluate(request => window.events.dispatchEvent(new MessageEvent("operation_updated", {
+    data:JSON.stringify({process:"relays", generation:"g", event:{data:{...request, state:"failed", error:"retry recovery"}}})
+  })), submitted);
+  await expect(resume).toBeEnabled();
+  await publish(true, "Closed");
+  await expect(resume).toHaveCount(0);
+  await expect(page.getByRole("button", {name:"Close channel", exact:true})).toBeDisabled();
+  await publish(true, "Closing", "linked");
+  await expect(resume).toHaveCount(0);
+});
