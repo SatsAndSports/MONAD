@@ -121,7 +121,8 @@ async function submit(process, name, generation, action, args) {
       },
     );
     const result = await response.json();
-    if ([400, 409, 429].includes(response.status)) {
+    if ([400, 409, 429].includes(response.status) ||
+        (response.status === 503 && result.code === "command_not_admitted")) {
       observeOperation({...tracked, state:"failed", error:result.error || `HTTP ${response.status}`});
       return;
     }
