@@ -1121,6 +1121,12 @@ still opens or creates the adjacent maintenance sidecar and requires directory
 permission for it. Hard-linked existing wallet databases are rejected. Kernel
 file locks provide process-death release.
 
+The in-process runtime owner is additionally authorized to start and recover
+drains after the maintenance gate is downgraded for steady state. This authority
+does not transfer to another process: standalone mutating commands still require
+the exclusive maintenance lock. Close and other wallet mutations retain their
+existing authority rules.
+
 The relay binary now also exposes wallet-admin commands over that same durable
 state (`monad-relay wallet ...`) so operators can list identities, inspect
 stored channels, close a channel by `channel_id`, drain closed-channel receiver
@@ -1138,8 +1144,13 @@ inserted atomically with channel reservations. Every request and submission coun
 is retained; a single typed initial 4xx/12002 may authorize a retained-predecessor
 successor. Exact restore and all-input Unspent checks gate bounded replay.
 Verified Finalizing payloads permit offline completion, with terminal custody
-remaining in the relay DB. Matching exclusive maintenance authority and journal
-CAS protect the full operation, not just completion.
+remaining in the relay DB. Drain selection accepts at most 1,024 explicit,
+duplicate-free channel IDs and rejects the whole set unless each channel is
+Closed, unreserved, has valid nonempty receiver proofs, and is owned by the same
+relay/mint/unit. The existing relay/mint/unit/limit selector resolves IDs before
+entering this same exact path.
+Matching runtime-owner or exclusive-maintenance authority, atomic unique channel
+reservations, and journal CAS protect the full operation, not just completion.
 
 Receiver close uses a separate versioned exact-request journal. Storage freezes
 the accepted payment with Closing and the journal atomically, rejecting later

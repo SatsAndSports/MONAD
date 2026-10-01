@@ -534,6 +534,11 @@ or late failure cannot overwrite those proofs or release their reservations.
 Drain journal version 1 atomically reserves source channels with the first exact
 request. It binds the normalized database, wallet/receiver, mint/unit, closed
 input-proof snapshots, per-input-keyset fees, output secrets and historical keys.
+Exact selection is bounded to 1,024 unique channel IDs. It rejects the entire set
+before mint submission unless every channel is Closed, unreserved, owned by the
+requested relay, has valid nonempty receiver proofs, and shares one mint/unit. The
+legacy relay/mint/unit/limit drain selector resolves channel IDs and enters this
+same exact path.
 Every submitted request and the one permitted rejected predecessor remain in the
 journal. Submitted uncertainty is recorded before HTTP; only an initial typed
 HTTP 4xx numeric `12002` without prior uncertainty authorizes one changed-output
@@ -549,11 +554,14 @@ are saved as Finalizing, then atomically committed with the completed journal an
 terminal custody; resumed local completion rechecks proofs and makes no HTTP
 requests. Proofs stay in the relay DB, with no additional loose-wallet import.
 
-Exclusive wallet authority, per-drain singleflight, unique channel reservations,
-and journal CAS prevent concurrent recovery from replacing requests or terminal
-proofs. Incompatible nonempty old drain journals are rejected without migration,
-reinterpretation, or deletion. Read-only inspection remains available. Failed
-development fixtures require an explicit operator decision before any reset.
+The in-process runtime owner or an offline caller with exclusive maintenance
+authority may execute and recover drains. Per-drain singleflight, atomic unique
+channel reservations, and journal CAS prevent concurrent recovery from replacing
+requests or terminal proofs. A separate process cannot acquire maintenance access
+while the runtime owns the database. Incompatible nonempty old drain journals are
+rejected without migration, reinterpretation, or deletion. Read-only inspection
+remains available. Failed development fixtures require an explicit operator
+decision before any reset.
 
 ### Relay Close Recovery
 
