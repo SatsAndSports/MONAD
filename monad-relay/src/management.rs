@@ -1,6 +1,6 @@
 use crate::{
     payments::CloseOutcome,
-    session_registry::{RelayControls, SessionRegistry},
+    session_registry::SessionRegistry,
     wallet_manager::{ChannelSummary, DrainSummary, RelayWalletManager},
 };
 use cdk_spilman::ChannelState;
@@ -159,11 +159,19 @@ impl Backend for RelayBackend {
             .get(&command.instance)
             .ok_or("unknown relay")?;
         match command.action.as_str() {
-            "set_controls" => {
-                let controls: RelayControls = serde_json::from_value(command.arguments.clone())
-                    .map_err(|_| "all four relay control booleans are required")?;
-                registry.set_controls(controls)?;
-                if !controls.enabled {
+            "set_control" => {
+                let field = command
+                    .arguments
+                    .get("field")
+                    .and_then(Value::as_str)
+                    .ok_or("field required")?;
+                let enabled = command
+                    .arguments
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or("enabled boolean required")?;
+                registry.set_control(field, enabled)?;
+                if field == "enabled" && !enabled {
                     registry.wait_disabled().await?;
                 }
                 Ok(json!({"controls": registry.controls()}))

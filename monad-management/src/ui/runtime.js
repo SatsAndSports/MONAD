@@ -80,21 +80,24 @@ function button(text, process, name, action, args, enabled = true) {
   b.type = "button";
   b.disabled =
     !healthy(processes[process]) ||
-    instancePending(process, name) ||
+    instancePending(process, name, action, args) ||
     !enabled;
   const generation = processes[process].generation;
   b.onclick = () => submit(process, name, generation, action, args);
   return b;
 }
-function instancePending(process, instance) {
-  return [...pending.values()].some(c => c.process === process && c.instance === instance);
+function instancePending(process, instance, action, args) {
+  const disabling = (action === "set_enabled" ||
+    (action === "set_control" && args.field === "enabled")) && args.enabled === false;
+  return [...pending.values()].some(c => c.process === process && c.instance === instance &&
+    (!disabling || c.action === "set_enabled" || c.action === "set_control"));
 }
 const operationKey = c => JSON.stringify([c.process, c.generation, c.request_id]);
 async function submit(process, name, generation, action, args) {
   if (
     !healthy(processes[process]) ||
     processes[process].generation !== generation ||
-    instancePending(process, name)
+    instancePending(process, name, action, args)
   )
     return;
   const request_id = crypto.randomUUID();
@@ -215,8 +218,8 @@ function controls(process, name, instance) {
           `${c[field] ? "Disable" : "Enable"} ${label}`,
           process,
           name,
-          "set_controls",
-          { ...c, [field]: !c[field] },
+          "set_control",
+          { field, enabled: !c[field] },
           !instance.disabling,
         ),
       );
@@ -704,7 +707,7 @@ stream.addEventListener("operation_updated", (e) => {
       "set_enabled",
       "set_automatic_provisioning",
       "provision_channel",
-      "set_controls",
+      "set_control",
       "close_channel",
       "request_channel_unlink",
     ].includes(c.action)

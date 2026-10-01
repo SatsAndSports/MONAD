@@ -1955,3 +1955,12 @@ public TCP publications and unrestricted egress. Container starts create fresh
 temporary wallets. Child logs and process-limit snapshots persist in a private
 named volume for post-exit diagnosis, while keys, configuration, and wallet state
 remain ephemeral. This topology is demo tooling, not persistent deployment.
+# Management command admission and execution
+
+Process-local management admission acknowledges queued operations independently
+of executor completion. A structured `command_not_admitted` 503 means no operation
+was created; transport errors and unclassified 5xx responses remain ambiguous.
+Relay `set_control` commands mutate a single policy field under the admission lock,
+preserving concurrent updates to unrelated fields. The browser permits Disable
+alongside slow wallet operations and tracks both request IDs independently using
+the existing bounded concurrent executor, without priority scheduling.

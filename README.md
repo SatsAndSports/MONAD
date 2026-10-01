@@ -20,6 +20,12 @@ older clients do not understand the release request.
 
 ### Try all three management pages
 
+Relay toggles use `set_control` with `{"field":"accept_new_tunnels","enabled":false}`,
+changing only the selected setting. This replaces the alpha `set_controls` command:
+update API callers and serve the updated UI alongside the relay; no database reset
+is needed. Client/relay Disable stays available during slow provisioning or close
+operations. Each command retains its own progress record; Disable has no queue priority.
+
 ```bash
 cargo build -p monad-management -p monad-client -p monad-relay -p monad-test-mint
 cargo build -p monad-test-mint --example demo-fund

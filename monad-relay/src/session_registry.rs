@@ -172,7 +172,30 @@ impl SessionRegistry {
     /// Atomically replace runtime policy. False `enabled` requests cancellation;
     /// use `wait_disabled` to observe cleanup completion before re-enabling.
     pub fn set_controls(&self, controls: RelayControls) -> Result<(), &'static str> {
+        self.update_controls(|current| *current = controls)
+    }
+
+    /// Mutate one policy field under the admission lock, preserving other callers' updates.
+    pub fn set_control(&self, field: &str, enabled: bool) -> Result<(), &'static str> {
+        if !matches!(
+            field,
+            "enabled" | "accept_new_sessions" | "accept_new_tunnels" | "accept_new_channels"
+        ) {
+            return Err("unknown relay control field");
+        }
+        self.update_controls(|controls| match field {
+            "enabled" => controls.enabled = enabled,
+            "accept_new_sessions" => controls.accept_new_sessions = enabled,
+            "accept_new_tunnels" => controls.accept_new_tunnels = enabled,
+            "accept_new_channels" => controls.accept_new_channels = enabled,
+            _ => unreachable!(),
+        })
+    }
+
+    fn update_controls(&self, update: impl FnOnce(&mut RelayControls)) -> Result<(), &'static str> {
         let mut admission = self.admission.lock().unwrap();
+        let mut controls = admission.controls;
+        update(&mut controls);
         let inner = self.inner.lock().unwrap();
         if controls.enabled && !admission.controls.enabled {
             if admission.active_runs != 0 || !inner.is_empty() {

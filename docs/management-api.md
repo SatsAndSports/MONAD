@@ -155,6 +155,11 @@ stale process generation returns 409. A transport timeout is not evidence that a
 command failed: query its operation or retry the identical envelope. Never replace
 its ID merely because the response was lost.
 
+Queue-full or unavailable-executor rejection returns HTTP 503 with
+`code: "command_not_admitted"`. No operation was created; the browser releases
+its submission lock. An unclassified 503, other ambiguous server error, or lost
+response does not establish rejection and remains pending for reconciliation.
+
 The executor owns commands independently of HTTP connections. At most 16 execute
 concurrently, with 64 queued. Each process retains at most 4096 operation records;
 after that, new commands are refused rather than evicting idempotency records and
@@ -211,7 +216,7 @@ request must not be used to replace it. Inspect hop funding/error state.
 
 | Action | Arguments | Completion |
 | --- | --- | --- |
-| `set_controls` | All four booleans: `enabled`, `accept_new_sessions`, `accept_new_tunnels`, `accept_new_channels` | Disable awaits owned work cleanup; admission updates are synchronous. |
+| `set_control` | `field`: one of `enabled`, `accept_new_sessions`, `accept_new_tunnels`, `accept_new_channels`; `enabled`: boolean | Atomically changes only this field. Disable awaits owned work cleanup; admission updates are synchronous. |
 | `request_channel_unlink` | `{"channel_id": "..."}` | Persists retirement (no new links), asks the owning session to release, and reports `session_id` and `release_requested`. The channel stays Open. |
 | `close_channel` | `{"channel_id": "..."}` | Uses the owning relay's journaled close/recovery path. Rejected while any session still owns the channel; use `request_channel_unlink` first. |
 
