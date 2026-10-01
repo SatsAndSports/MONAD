@@ -13,3 +13,4 @@
 !monad-test-mint/dev-support/**
 !monad-management/ui-tests/network-demo.mjs
 !monad-management/ui-tests/container-demo.mjs
+!monad-management/ui-tests/port-reservations.mjs

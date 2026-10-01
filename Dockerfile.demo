@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 COPY --from=build /src/target/release/monad-management /src/target/release/monad-client /src/target/release/monad-relay /src/target/release/monad-test-mint /app/bin/
 COPY --from=build /src/target/release/examples/demo-fund /app/bin/examples/demo-fund
-COPY monad-management/ui-tests/network-demo.mjs monad-management/ui-tests/container-demo.mjs /app/
+COPY monad-management/ui-tests/network-demo.mjs monad-management/ui-tests/container-demo.mjs monad-management/ui-tests/port-reservations.mjs /app/
 RUN mkdir -p /var/log/monad-demo && chown node:node /var/log/monad-demo
 ENV MONAD_DEMO_BIN_DIR=/app/bin MONAD_DEMO_LOG_DIR=/var/log/monad-demo MONAD_DEMO_MANUAL=0
 USER node

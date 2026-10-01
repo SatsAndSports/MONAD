@@ -4,24 +4,15 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { setTimeout as sleep } from "node:timers/promises";
 import { createServer as httpServer } from "node:http";
-import { createServer } from "node:net";
 import { createECDH, randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
+import {
+  reserveRelayPort,
+  reserveTcpPort,
+} from "./port-reservations.mjs";
 const root = fileURLToPath(new URL("../../", import.meta.url));
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function port(requested = 0) {
-  if (!Number.isInteger(requested) || requested < 0 || requested > 65535)
-    throw Error("Demo ports must be integers from 0 to 65535");
-  const server = createServer();
-  await new Promise((r, reject) => {
-    server.once("error", reject);
-    server.listen(requested, "127.0.0.1", r);
-  });
-  const p = server.address().port;
-  await new Promise((r) => server.close(r));
-  return p;
-}
 export async function startNetworkDemo({
   sats = Number(process.env.MONAD_DEMO_SATS ?? 1000000),
   manual = true,
@@ -45,40 +36,127 @@ export async function startNetworkDemo({
   const fixed = [managementPort, socksPort, socks2Port].filter((p) => p !== 0);
   if (new Set(fixed).size !== fixed.length)
     throw Error("Demo ports must be distinct");
-  const api = await port(managementPort),
-    socks = await port(socksPort),
-    socks2 = await port(socks2Port),
-    mintPort = await port();
+  const liveReservations = new Set();
+  const reserve = async (factory, requested = 0) => {
+    const reservation = await factory(requested);
+    liveReservations.add(reservation);
+    return reservation;
+  };
+  const releaseReservation = async (reservation) => {
+    if (!reservation) return;
+    liveReservations.delete(reservation);
+    await reservation.release();
+  };
+  const releaseReservations = async (reservations) => {
+    await Promise.all(reservations.map(releaseReservation));
+  };
+  const reserveMany = async (ports, factory) => {
+    const reservations = [];
+    try {
+      for (const requested of ports)
+        reservations.push(await reserve(factory, requested));
+      return reservations;
+    } catch (error) {
+      await releaseReservations(reservations);
+      throw error;
+    }
+  };
+  let apiReservation, socksReservation, socks2Reservation, mintReservation;
+  try {
+    apiReservation = await reserve(reserveTcpPort, managementPort);
+    socksReservation = await reserve(reserveTcpPort, socksPort);
+    socks2Reservation = await reserve(reserveTcpPort, socks2Port);
+    mintReservation = await reserve(reserveTcpPort);
+  } catch (error) {
+    await releaseReservations([...liveReservations]);
+    throw error;
+  }
+  const api = apiReservation.port,
+    socks = socksReservation.port,
+    socks2 = socks2Reservation.port,
+    mintPort = mintReservation.port;
   const url = `http://127.0.0.1:${api}`,
     mintUrl = `http://127.0.0.1:${mintPort}`;
   const children = [];
+  const childExitWaiters = new Set();
   const target = httpServer((req, res) =>
     res.end("MONAD local demo traffic. ".repeat(4096)),
   );
-  await new Promise((r) => target.listen(0, "127.0.0.1", r));
+  try {
+    await new Promise((resolve, reject) => {
+      const failed = (error) => {
+        target.off("listening", ready);
+        reject(error);
+      };
+      const ready = () => {
+        target.off("error", failed);
+        resolve();
+      };
+      target.once("error", failed);
+      target.once("listening", ready);
+      target.listen(0, "127.0.0.1");
+    });
+  } catch (error) {
+    await releaseReservations([...liveReservations]);
+    throw error;
+  }
   const targetUrl = `http://127.0.0.1:${target.address().port}`;
-  async function launch(binary, args) {
+  const childExitError = (entry, status) => {
+    const outcome = status.error
+      ? `spawn error: ${status.error}`
+      : status.signal
+        ? `signal ${status.signal}`
+        : `code ${status.code}`;
+    const error = Error(
+      `${entry.binary} exited unexpectedly (${outcome}); private_log=${entry.logPath} limits=${entry.limitsPath}`,
+    );
+    error.code = "DEMO_CHILD_EXIT";
+    return error;
+  };
+  async function launch(binary, args, reservations = []) {
     const label = binary.replaceAll("/", "-");
     const logPath = join(logDirectory, `${label}.log`);
     const limitsPath = join(logDirectory, `${label}.limits`);
-    const log = await open(logPath, "a", 0o600);
     const binaryDir =
       process.env.MONAD_DEMO_BIN_DIR || resolve(root, "target/debug");
-    const child = spawn(resolve(binaryDir, binary), args, {
-      stdio: ["ignore", log.fd, log.fd],
-    });
+    let child, log;
+    try {
+      log = await open(logPath, "a", 0o600);
+      if (stopping) throw Error("Demo is stopping");
+      await releaseReservations(reservations);
+      if (stopping) throw Error("Demo is stopping");
+      child = spawn(resolve(binaryDir, binary), args, {
+        stdio: ["ignore", log.fd, log.fd],
+      });
+    } catch (error) {
+      await releaseReservations(reservations);
+      await log?.close();
+      throw error;
+    }
     const entry = {
+      binary,
       child,
       logPath,
       limitsPath,
       expectedExit: binary === "examples/demo-fund",
-      done: new Promise((r) => {
-        child.once("exit", (code, signal) => r({ code, signal }));
-        child.once("error", (error) =>
-          r({ code: null, signal: null, error: error.message }),
-        );
-      }),
+      status: null,
+      done: null,
     };
+    entry.done = new Promise((resolve) => {
+      let settled = false;
+      const finish = (status) => {
+        if (settled) return;
+        settled = true;
+        entry.status = status;
+        for (const notify of childExitWaiters) notify(entry, status);
+        resolve(status);
+      };
+      child.once("exit", (code, signal) => finish({ code, signal }));
+      child.once("error", (error) =>
+        finish({ code: null, signal: null, error: error.message }),
+      );
+    });
+    children.push(entry);
     if (child.pid) {
       try {
         const limits = await readFile(`/proc/${child.pid}/limits`, "utf8");
@@ -102,18 +180,10 @@ export async function startNetworkDemo({
         !entry.expectedExit &&
         !stopping
       ) {
-        const outcome = status.error
-          ? `spawn error: ${status.error}`
-          : status.signal
-            ? `signal ${status.signal}`
-            : `code ${status.code}`;
-        console.error(
-          `${binary} exited unexpectedly (${outcome}); private_log=${logPath} limits=${limitsPath}`,
-        );
+        console.error(childExitError(entry, status).message);
         stop().finally(() => process.exit(1));
       }
     });
-    children.push(entry);
     await log.close();
     return entry;
   }
@@ -136,6 +206,7 @@ export async function startNetworkDemo({
   }
   let stopping;
   let maintenance = Promise.resolve();
+  const shutdown = new AbortController();
   const emergency = () =>
     children.forEach((e) => {
       if (e.child.exitCode === null && e.child.signalCode === null)
@@ -143,10 +214,12 @@ export async function startNetworkDemo({
     });
   const stop = () =>
     (stopping ??= (async () => {
-      await maintenance;
+      shutdown.abort();
+      await releaseReservations([...liveReservations]);
       target.closeAllConnections();
       await new Promise((r) => target.close(r));
       for (const e of [...children].reverse()) await stopChild(e);
+      await maintenance;
       process.off("exit", emergency);
       process.off("SIGINT", interrupt);
       process.off("SIGTERM", interrupt);
@@ -190,44 +263,116 @@ export async function startNetworkDemo({
     },
   };
   const route = [];
-  for (const name of ["entry", "exit"]) {
-    const key = createECDH("secp256k1");
-    key.generateKeys();
-    const listen = `127.0.0.1:${await port()}`;
-    route.push(
-      `${key.getPublicKey(null, "compressed").subarray(1).toString("hex")}::${listen}`,
-    );
-    config.relays.push({
-      name,
-      listen,
-      transport_key: key.getPrivateKey().toString("hex").padStart(64, "0"),
-      receiver_secret_hex: randomBytes(32).toString("hex"),
-      quic_cert_seed: randomBytes(32).toString("hex"),
-      trusted_mints: [
-        { url: mintUrl, units: [name === "entry" ? "sat" : "msat"] },
-      ],
-      pricing: { in_bytes_per_millisat: 200, out_bytes_per_millisat: 200 },
-    });
+  const relayReservations = [];
+  try {
+    for (const name of ["entry", "exit"]) {
+      const key = createECDH("secp256k1");
+      key.generateKeys();
+      const relayReservation = await reserve(reserveRelayPort);
+      relayReservations.push(relayReservation);
+      const listen = `127.0.0.1:${relayReservation.port}`;
+      route.push(
+        `${key.getPublicKey(null, "compressed").subarray(1).toString("hex")}::${listen}`,
+      );
+      config.relays.push({
+        name,
+        listen,
+        transport_key: key.getPrivateKey().toString("hex").padStart(64, "0"),
+        receiver_secret_hex: randomBytes(32).toString("hex"),
+        quic_cert_seed: randomBytes(32).toString("hex"),
+        trusted_mints: [
+          { url: mintUrl, units: [name === "entry" ? "sat" : "msat"] },
+        ],
+        pricing: {
+          in_bytes_per_millisat: 200,
+          out_bytes_per_millisat: 200,
+        },
+      });
+    }
+  } catch (error) {
+    await stop();
+    throw error;
   }
   config.clients = [
     { name: "demo-client", socks: `127.0.0.1:${socks}`, route },
     { name: "second-client", socks: `127.0.0.1:${socks2}`, route },
   ];
   const path = join(directory, "demo.json");
-  await writeFile(path, JSON.stringify(config), { mode: 0o600 });
-  async function wait(predicate) {
+  try {
+    await writeFile(path, JSON.stringify(config), { mode: 0o600 });
+  } catch (error) {
+    await stop();
+    throw error;
+  }
+  let mint, clients, relays, management;
+  const essentialChildren = () =>
+    [mint, management, relays, clients].filter(Boolean);
+  async function wait(predicate, required) {
     const deadline = Date.now() + 30000;
+    const requiredChildren = () => required ?? essentialChildren();
+    const throwIfRequiredExited = () => {
+      for (const entry of requiredChildren())
+        if (entry.status && !entry.expectedExit)
+          throw childExitError(entry, entry.status);
+    };
+    const raceChildExit = (operation) =>
+      new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (complete, value) => {
+          if (settled) return;
+          settled = true;
+          childExitWaiters.delete(onExit);
+          complete(value);
+        };
+        const onExit = (entry, status) => {
+          if (!entry.expectedExit && requiredChildren().includes(entry))
+            finish(reject, childExitError(entry, status));
+        };
+        childExitWaiters.add(onExit);
+        try {
+          throwIfRequiredExited();
+        } catch (error) {
+          finish(reject, error);
+        }
+        operation.then(
+          (value) => finish(resolve, value),
+          (error) => finish(reject, error),
+        );
+      });
+    const handleWaitError = (error) => {
+      if (error.code === "DEMO_CHILD_EXIT") throw error;
+      if (shutdown.signal.aborted) throw Error("Demo is stopping");
+    };
     while (Date.now() < deadline) {
-      if (stopping) throw Error("Demo is stopping");
+      if (shutdown.signal.aborted) throw Error("Demo is stopping");
+      const remaining = deadline - Date.now();
       try {
-        const s = await (
-          await fetch(`${url}/v1/snapshot`, {
-            signal: AbortSignal.timeout(2000),
-          })
-        ).json();
-        if (predicate(s)) return s;
-      } catch {}
-      await delay(100);
+        const s = await raceChildExit(
+          fetch(`${url}/v1/snapshot`, {
+            signal: AbortSignal.any([
+              shutdown.signal,
+              AbortSignal.timeout(Math.min(2000, remaining)),
+            ]),
+          }).then((response) => response.json()),
+        );
+        if (predicate(s)) {
+          throwIfRequiredExited();
+          return s;
+        }
+      } catch (error) {
+        handleWaitError(error);
+      }
+      const remainingAfterRequest = deadline - Date.now();
+      if (remainingAfterRequest <= 0) break;
+      try {
+        await raceChildExit(
+          sleep(Math.min(100, remainingAfterRequest), undefined, {
+            signal: shutdown.signal,
+          }),
+        );
+      } catch (error) {
+        handleWaitError(error);
+      }
     }
     throw Error(`Demo not ready; inspect private logs in ${logDirectory}`);
   }
@@ -242,15 +387,23 @@ export async function startNetworkDemo({
     if (status.code !== 0)
       throw Error(`Funding failed; inspect private log ${e.logPath}`);
   }
-  let clients, relays, management;
   try {
-    await launch("monad-test-mint", ["run", "--config", path]);
-    management = await launch("monad-management", ["--config", path]);
+    mint = await launch("monad-test-mint", ["run", "--config", path], [
+      mintReservation,
+    ]);
+    management = await launch("monad-management", ["--config", path], [
+      apiReservation,
+    ]);
     await wait((s) => s.processes["test-mints"]?.online);
     await fund(sats);
-    relays = await launch("monad-relay", ["run", "--config", path]);
+    relays = await launch("monad-relay", ["run", "--config", path], [
+      ...relayReservations,
+    ]);
     await wait((s) => s.processes.relays?.online);
-    clients = await launch("monad-client", ["run", "--config", path]);
+    clients = await launch("monad-client", ["run", "--config", path], [
+      socksReservation,
+      socks2Reservation,
+    ]);
     await wait((s) => s.processes.clients?.online);
     const serialized = (fn) => {
       if (stopping) return Promise.reject(new Error("Demo is stopping"));
@@ -268,10 +421,21 @@ export async function startNetworkDemo({
       wait,
       targetUrl,
       stopManagement: () => stopChild(management),
+      stopMint: () => stopChild(mint),
       restartManagement: () =>
         serialized(async () => {
           await stopChild(management);
-          management = await launch("monad-management", ["--config", path]);
+          const reservations = await reserveMany([api], reserveTcpPort);
+          try {
+            if (!stopping)
+              management = await launch(
+                "monad-management",
+                ["--config", path],
+                reservations,
+              );
+          } finally {
+            await releaseReservations(reservations);
+          }
           await wait((s) => s.processes.clients?.online);
         }),
       traffic: () =>
@@ -292,11 +456,20 @@ export async function startNetworkDemo({
             throw Error("Invalid topup");
           const before = await wait((s) => s.processes.clients?.online);
           await stopChild(clients);
+          const reservations = await reserveMany(
+            [socks, socks2],
+            reserveTcpPort,
+          );
           try {
             await fund(amount);
           } finally {
             if (!stopping)
-              clients = await launch("monad-client", ["run", "--config", path]);
+              clients = await launch(
+                "monad-client",
+                ["run", "--config", path],
+                reservations,
+              );
+            else await releaseReservations(reservations);
           }
           await wait(
             (s) =>
@@ -309,7 +482,20 @@ export async function startNetworkDemo({
         serialized(async () => {
           const before = await wait((s) => s.processes.relays?.online);
           await stopChild(relays);
-          relays = await launch("monad-relay", ["run", "--config", path]);
+          const reservations = await reserveMany(
+            relayReservations.map(({ port }) => port),
+            reserveRelayPort,
+          );
+          try {
+            if (!stopping)
+              relays = await launch(
+                "monad-relay",
+                ["run", "--config", path],
+                reservations,
+              );
+          } finally {
+            await releaseReservations(reservations);
+          }
           await wait(
             (s) =>
               s.processes.relays?.online &&

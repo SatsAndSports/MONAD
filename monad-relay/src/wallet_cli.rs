@@ -115,6 +115,7 @@ pub enum WalletCommand {
 }
 
 pub async fn run_wallet_command(args: WalletArgs) -> anyhow::Result<()> {
+    tracing::info!("running relay wallet command");
     let wallet_db_path = resolve_wallet_db_path(&args)?;
     let read_only = wallet_command_is_read_only(&args.command);
     let _locks = WalletLocks::acquire(

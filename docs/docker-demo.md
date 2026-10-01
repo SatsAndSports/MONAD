@@ -119,15 +119,25 @@ The normal launcher retains random-port/debug-binary defaults. Optional variable
 - `MONAD_DEMO_FAIL_FAST=1`: shut down on unexpected service exit; enabled by the
   container supervisor.
 
+Readiness has a 30-second absolute deadline and fails immediately when a required
+child exits. Shutdown aborts in-flight readiness work and terminates children
+before waiting for maintenance helpers. A failed interactive top-up reports the
+funding error and restores the client process, but deliberately does not retry
+issuance because the first attempt may have partially succeeded.
+
 After normal debug builds, with socat installed and the six fixed ports free:
 
 ```sh
+node --test monad-management/ui-tests/port-reservations.test.mjs
+node --test monad-management/ui-tests/network-demo-lifecycle.test.mjs
 node --test monad-management/ui-tests/container-demo.test.mjs
 ```
 
-This exercises the same supervisor and forwarding processes locally, checks SSE,
-enables the second client via management, carries traffic through both SOCKS
-ports, restarts relays, verifies retained diagnostics after shutdown, deliberately
-kills a client to exercise fail-fast diagnostics, and checks cleanup. For
-container verification, additionally check Compose health, both published SOCKS
-ports, `docker compose stop`, and a fresh start with a new wallet.
+These exercise port reservation and release, failed-top-up recovery, prompt child
+exit and shutdown cancellation, and the same supervisor and forwarding processes
+used by the container. The supervisor coverage checks SSE, enables the second
+client via management, carries traffic through both SOCKS ports, restarts relays,
+verifies retained diagnostics after shutdown, deliberately kills a client to
+exercise fail-fast diagnostics, and checks cleanup. For container verification,
+additionally check Compose health, both published SOCKS ports,
+`docker compose stop`, and a fresh start with a new wallet.
