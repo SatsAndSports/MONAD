@@ -43,6 +43,50 @@ pub trait Backend: Send + Sync + 'static {
     async fn execute(&self, command: &Command) -> Result<Value, String>;
 }
 
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    struct Idle;
+    #[async_trait::async_trait]
+    impl Backend for Idle {
+        async fn snapshot(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn execute(&self, _: &Command) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_rejection_has_no_operation_and_can_be_resubmitted() {
+        let (service, mut receiver) = Service::new(Arc::new(Idle));
+        let request = |id: usize| Command {
+            generation: service.generation.clone(),
+            request_id: id.to_string(),
+            instance: "test".into(),
+            action: "test".into(),
+            arguments: json!({}),
+        };
+        for id in 0..64 {
+            let _ = command(State(service.clone()), Json(request(id)))
+                .await
+                .unwrap();
+        }
+        let (status, body) = command(State(service.clone()), Json(request(64)))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["code"], "command_not_admitted");
+        assert!(!service.operations.lock().unwrap().contains_key("64"));
+        receiver.recv().await.unwrap();
+        let _ = command(State(service.clone()), Json(request(64)))
+            .await
+            .unwrap();
+        assert!(service.operations.lock().unwrap().contains_key("64"));
+    }
+}
+
 pub struct Service {
     pub generation: String,
     backend: Arc<dyn Backend>,
@@ -207,9 +251,9 @@ async fn command(
         error: None,
     };
     service.commands.try_send(command.clone()).map_err(|_| {
-        error(
+        (
             StatusCode::SERVICE_UNAVAILABLE,
-            "command executor unavailable or busy",
+            Json(json!({"error": "command executor unavailable or busy", "code": "command_not_admitted"})),
         )
     })?;
     operations.insert(command.request_id, op.clone());

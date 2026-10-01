@@ -54,9 +54,11 @@ bounded and transient, not a durable audit trail.
 - **Mints:** inspect keysets and rotate SAT/MSAT independently.
 
 Controls act through existing backend APIs. Runtime/payment decisions remain in
-their Rust owners. Relay control commands replace all four flags using the latest
-snapshot; competing tabs can supersede one another, and the resulting snapshot is
-authoritative. Channel/session identifiers and process generations bind commands
+their Rust owners. Relay control commands atomically change only the selected
+flag, preserving unrelated updates from other tabs. Disable client/relay remains
+available during slow wallet operations; both operations are tracked independently.
+Pending enable/disable or relay-control commands still block conflicting controls.
+Channel/session identifiers and process generations bind commands
 to their original targets. Requests are never automatically retried after a lost
 response; inspect state/activity before issuing a new action.
 

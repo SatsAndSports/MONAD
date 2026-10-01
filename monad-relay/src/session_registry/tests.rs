@@ -37,6 +37,9 @@ async fn disable_waits_for_owned_handshake_drop_and_preserves_policy() {
         ..policy
     };
     assert!(registry.set_controls(enabled).is_err());
+    assert!(registry.set_control("enabled", true).is_err());
+    registry.set_control("accept_new_channels", false).unwrap();
+    assert!(!registry.controls().enabled);
     timeout(Duration::from_secs(2), registry.wait_disabled())
         .await
         .unwrap()
@@ -112,4 +115,27 @@ fn link_timestamp_is_retained_after_session_departure() {
     registry.deregister_session(&[1; 32]);
 
     assert_eq!(registry.last_linked_at("channel"), Some(timestamp));
+}
+#[test]
+fn concurrent_field_updates_preserve_independent_policy() {
+    let registry = std::sync::Arc::new(SessionRegistry::default());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    std::thread::scope(|scope| {
+        for field in ["accept_new_channels", "accept_new_tunnels", "enabled"] {
+            let registry = registry.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                registry.set_control(field, false).unwrap();
+            });
+        }
+    });
+    let controls = registry.controls();
+    assert!(!controls.enabled);
+    assert!(!controls.accept_new_channels);
+    assert!(!controls.accept_new_tunnels);
+    assert!(controls.accept_new_sessions);
+    assert!(registry.set_control("typo", true).is_err());
+    registry.set_control("enabled", true).unwrap();
+    assert!(!registry.controls().accept_new_channels);
 }
