@@ -91,16 +91,18 @@ impl RelayWalletManager {
 
     pub(super) async fn start_exact_drain<N: DrainSwapNetworking>(
         &self,
-        relay: &str,
-        mint: &str,
-        unit: &str,
+        selection: DrainSelection,
         net: &N,
-        limit: Option<usize>,
     ) -> Result<DrainSwapResult, String> {
-        self.require_maintenance()?;
+        self.require_drain_authority()?;
+        let DrainSelection {
+            relay_name: relay,
+            mint_url: mint,
+            unit,
+            inputs,
+        } = selection;
         let drain_id = new_drain_id();
         let flight = Flight::enter(format!("{}:{drain_id}", self.drain_binding()?))?;
-        let inputs = self.closed_drain_candidates(relay, mint, unit, limit)?;
         if inputs.is_empty() {
             return Err("no closed channels available to drain".to_string());
         }
@@ -121,9 +123,9 @@ impl RelayWalletManager {
         if total == 0 {
             return Err("closed channels have no receiver proofs to drain".to_string());
         }
-        self.ensure_drain_keysets_cached(mint, unit).await?;
+        self.ensure_drain_keysets_cached(&mint, &unit).await?;
         let attempt = self.prepare_drain_attempt_with_keysets(
-            self.drain_keysets_from_shared_cache(mint, unit)?,
+            self.drain_keysets_from_shared_cache(&mint, &unit)?,
             &proofs,
             total,
         )?;
@@ -131,10 +133,12 @@ impl RelayWalletManager {
             version: 1,
             db: self.drain_binding()?,
             drain_id,
-            relay: relay.to_string(),
-            receiver: self.receiver_pubkey_hex(relay).map_err(|e| e.to_string())?,
-            mint: mint.to_string(),
-            unit: unit.to_string(),
+            receiver: self
+                .receiver_pubkey_hex(&relay)
+                .map_err(|e| e.to_string())?,
+            relay,
+            mint,
+            unit,
             inputs,
             attempts: vec![attempt.into()],
             finalizing: None,
@@ -146,7 +150,7 @@ impl RelayWalletManager {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let attempt = &journal.attempts[0];
         let keyset = cdk_spilman::parse_keyset_info_from_json(&attempt.keys)?;
-        tx.execute("INSERT INTO monad_relay_drains (drain_id,relay_name,mint_url,unit,state,input_amount_raw,output_amount_raw,swap_request_json,restore_request_json,output_secrets_json,output_keyset_id,output_keyset_info_json,created_at) VALUES (?1,?2,?3,?4,'Prepared',?5,?6,?7,?8,?9,?10,?11,?12)", params![journal.drain_id, relay, mint, unit, i64_from_u64(total)?, i64_from_u64(attempt.output_amount)?, attempt.prepared.swap_request_json, attempt.prepared.restore_request_json, attempt.prepared.output_secrets_json, keyset.keyset_id.to_string(), attempt.keys, i64_from_u64(now_seconds())?]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO monad_relay_drains (drain_id,relay_name,mint_url,unit,state,input_amount_raw,output_amount_raw,swap_request_json,restore_request_json,output_secrets_json,output_keyset_id,output_keyset_info_json,created_at) VALUES (?1,?2,?3,?4,'Prepared',?5,?6,?7,?8,?9,?10,?11,?12)", params![journal.drain_id, journal.relay, journal.mint, journal.unit, i64_from_u64(total)?, i64_from_u64(attempt.output_amount)?, attempt.prepared.swap_request_json, attempt.prepared.restore_request_json, attempt.prepared.output_secrets_json, keyset.keyset_id.to_string(), attempt.keys, i64_from_u64(now_seconds())?]).map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT INTO monad_relay_drain_journals VALUES (?1, ?2)",
             params![journal.drain_id, encode(&journal)?],
@@ -167,7 +171,17 @@ impl RelayWalletManager {
                 "INSERT INTO monad_relay_drained_channels VALUES (?1,?2)",
                 params![input.channel_id, journal.drain_id],
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| match &error {
+                rusqlite::Error::SqliteFailure(failure, _)
+                    if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    format!(
+                        "channel {} was concurrently reserved by another drain",
+                        input.channel_id
+                    )
+                }
+                _ => error.to_string(),
+            })?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         #[cfg(feature = "funds-lifecycle-test")]
@@ -356,7 +370,7 @@ impl RelayWalletManager {
         resumed: bool,
         flight: Option<Flight>,
     ) -> Result<DrainSwapResult, String> {
-        self.require_maintenance()?;
+        self.require_drain_authority()?;
         let _flight = match flight {
             Some(flight) => flight,
             None => Flight::enter(format!("{}:{id}", self.drain_binding()?))?,

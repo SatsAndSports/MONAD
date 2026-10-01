@@ -48,6 +48,7 @@ use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
+use monad_common::wallet_lock::{WalletLockMode, WalletLocks};
 
 use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
 use cdk_spilman::{
@@ -2367,9 +2368,19 @@ struct DrainTestContext {
 
 impl DrainTestContext {
     async fn new(relay_name: &str) -> Self {
-        Self::with_policy(
+        Self::with_policy_and_lock_mode(
             relay_name,
             monad_common::config::RelayChannelPolicyConfig::default(),
+            WalletLockMode::Maintenance,
+        )
+        .await
+    }
+
+    async fn new_runtime(relay_name: &str) -> Self {
+        Self::with_policy_and_lock_mode(
+            relay_name,
+            monad_common::config::RelayChannelPolicyConfig::default(),
+            WalletLockMode::Runtime,
         )
         .await
     }
@@ -2377,6 +2388,14 @@ impl DrainTestContext {
     async fn with_policy(
         relay_name: &str,
         policy: monad_common::config::RelayChannelPolicyConfig,
+    ) -> Self {
+        Self::with_policy_and_lock_mode(relay_name, policy, WalletLockMode::Maintenance).await
+    }
+
+    async fn with_policy_and_lock_mode(
+        relay_name: &str,
+        policy: monad_common::config::RelayChannelPolicyConfig,
+        lock_mode: WalletLockMode,
     ) -> Self {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2400,7 +2419,9 @@ impl DrainTestContext {
         let trusted_mint_units =
             BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
         let temp_db = tempfile::NamedTempFile::new().unwrap();
-        let wallet_manager = RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap();
+        let locks = WalletLocks::acquire([temp_db.path()], lock_mode, "drain test").unwrap();
+        let wallet_manager =
+            RelayWalletManager::open_with_locks(temp_db.path().to_str().unwrap(), locks).unwrap();
         let receiver_secret = cashu::nuts::SecretKey::generate();
         let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
         wallet_manager
@@ -2428,6 +2449,9 @@ impl DrainTestContext {
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         };
+        if lock_mode == WalletLockMode::Runtime {
+            wallet_manager.enter_steady_state().unwrap();
+        }
 
         Self {
             mint: mint_helper.mint(),
@@ -12285,6 +12309,324 @@ async fn test_wallet_manager_drain_swap_limit_selects_subset() {
         .chain(second.channel_ids)
         .collect::<BTreeSet<_>>();
     assert_eq!(drained, BTreeSet::from([ch1, ch2, ch3]));
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_exact_drain_uses_only_requested_channels() {
+    let ctx = DrainTestContext::new("exact-selection-relay").await;
+    let ch1 = ctx.create_closed_channel([41u8; 32], 100).await;
+    let ch2 = ctx.create_closed_channel([42u8; 32], 200).await;
+    let ch3 = ctx.create_closed_channel([43u8; 32], 300).await;
+    let net = ctx.net_for(&ch1);
+
+    let selected = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-selection-relay",
+            &[ch3.clone(), ch1.clone()],
+            &net,
+        )
+        .await
+        .unwrap();
+    let mut expected = vec![ch1.clone(), ch3.clone()];
+    expected.sort();
+    assert_eq!(selected.channel_ids, expected);
+    assert_eq!(selected.input_amount_raw, 400);
+    let completed = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-selection-relay",
+            std::slice::from_ref(&ch1),
+            &net,
+        )
+        .await
+        .unwrap_err();
+    assert!(completed.contains("already reserved"));
+
+    let remaining = ctx
+        .wallet_manager
+        .drain_closed_channels_to_swap("exact-selection-relay", &ctx.mint_url, "sat", &net, None)
+        .await
+        .unwrap();
+    assert_eq!(remaining.channel_ids, vec![ch2]);
+    assert_eq!(remaining.input_amount_raw, 200);
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_exact_drain_rejects_invalid_sets_without_partial_reservation() {
+    let ctx = DrainTestContext::new("exact-validation-relay").await;
+    let ch1 = ctx.create_closed_channel([44u8; 32], 100).await;
+    let ch2 = ctx.create_closed_channel([45u8; 32], 200).await;
+    let net = ctx.net_for(&ch1);
+
+    let empty = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap("exact-validation-relay", &[], &net)
+        .await
+        .unwrap_err();
+    assert!(empty.contains("at least one"));
+    let duplicate = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-validation-relay",
+            &[ch1.clone(), ch1.clone()],
+            &net,
+        )
+        .await
+        .unwrap_err();
+    assert!(duplicate.contains("duplicate"));
+    let oversized = (0..=1024)
+        .map(|index| format!("missing-{index}"))
+        .collect::<Vec<_>>();
+    let oversized = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap("exact-validation-relay", &oversized, &net)
+        .await
+        .unwrap_err();
+    assert!(oversized.contains("1024-channel limit"));
+    let missing = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-validation-relay",
+            &[ch1.clone(), "missing-channel".to_string()],
+            &net,
+        )
+        .await
+        .unwrap_err();
+    assert!(missing.contains("not found in wallet metadata"));
+
+    let open_channel = ctx.wallet.pre_create_channel(1_000).await.unwrap();
+    ctx.wallet
+        .attach_channel_to_session(&open_channel, [48u8; 32])
+        .unwrap();
+    let link = ctx
+        .wallet
+        .build_link_request(&open_channel, &ctx.offer)
+        .unwrap();
+    ctx.payments
+        .link_channel(
+            &supported_cashu_spilman_keyset_versions(),
+            [48u8; 32],
+            &link,
+        )
+        .unwrap();
+    let non_closed = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-validation-relay",
+            &[ch1.clone(), open_channel],
+            &net,
+        )
+        .await
+        .unwrap_err();
+    assert!(non_closed.contains("is not Closed"));
+    assert!(ctx.wallet_manager.list_drains().unwrap().is_empty());
+
+    ctx.wallet_manager
+        .register_identity("other-exact-relay", cashu::nuts::SecretKey::generate())
+        .unwrap();
+    let conn = rusqlite::Connection::open(ctx._temp_db.path()).unwrap();
+    conn.execute(
+        "UPDATE monad_relay_channel_meta SET relay_name='other-exact-relay' WHERE channel_id=?1",
+        [&ch2],
+    )
+    .unwrap();
+    let mixed_relay = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-validation-relay",
+            &[ch1.clone(), ch2.clone()],
+            &net,
+        )
+        .await
+        .unwrap_err();
+    assert!(mixed_relay.contains("belongs to relay"));
+    conn.execute(
+        "UPDATE monad_relay_channel_meta SET relay_name='exact-validation-relay' WHERE channel_id=?1",
+        [&ch2],
+    )
+    .unwrap();
+
+    let original_funding: String = conn
+        .query_row(
+            "SELECT funding_json FROM spilman_channels WHERE channel_id=?1",
+            [&ch2],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for (field, value) in [("mint", "https://other-mint.invalid"), ("unit", "msat")] {
+        let mut funding: serde_json::Value = serde_json::from_str(&original_funding).unwrap();
+        let mut params: serde_json::Value =
+            serde_json::from_str(funding["params_json"].as_str().unwrap()).unwrap();
+        params[field] = serde_json::Value::String(value.to_string());
+        funding["params_json"] = serde_json::Value::String(params.to_string());
+        conn.execute(
+            "UPDATE spilman_channels SET funding_json=?2 WHERE channel_id=?1",
+            rusqlite::params![ch2, funding.to_string()],
+        )
+        .unwrap();
+        let validation_manager = ctx.wallet_manager.reopen().unwrap();
+        let mixed = validation_manager
+            .drain_closed_channels_by_id_to_swap(
+                "exact-validation-relay",
+                &[ch1.clone(), ch2.clone()],
+                &net,
+            )
+            .await
+            .unwrap_err();
+        assert!(mixed.contains("share one mint and unit"));
+        assert!(ctx.wallet_manager.list_drains().unwrap().is_empty());
+    }
+    conn.execute(
+        "UPDATE spilman_channels SET funding_json=?2 WHERE channel_id=?1",
+        rusqlite::params![ch2, original_funding],
+    )
+    .unwrap();
+    drop(conn);
+
+    let drained = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-validation-relay",
+            &[ch1.clone(), ch2.clone()],
+            &net,
+        )
+        .await
+        .unwrap();
+    let mut expected = vec![ch1, ch2];
+    expected.sort();
+    assert_eq!(drained.channel_ids, expected);
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wallet_manager_exact_drain_reservation_survives_ambiguous_submission() {
+    let ctx = DrainTestContext::new("exact-reservation-relay").await;
+    let ch1 = ctx.create_closed_channel([46u8; 32], 150).await;
+    let ch2 = ctx.create_closed_channel([47u8; 32], 250).await;
+    let net = ctx.net_for(&ch1);
+
+    let error = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-reservation-relay",
+            std::slice::from_ref(&ch1),
+            &DropAfterSwap { inner: &net },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("submitted"));
+    let drain_id = ctx.wallet_manager.list_drains().unwrap()[0]
+        .drain_id
+        .clone();
+    let overlap = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-reservation-relay",
+            &[ch1.clone(), ch2.clone()],
+            &net,
+        )
+        .await
+        .unwrap_err();
+    assert!(overlap.contains("already reserved"));
+    assert_eq!(ctx.wallet_manager.list_drains().unwrap().len(), 1);
+
+    let recovered = ctx
+        .wallet_manager
+        .recover_submitted_drain(&drain_id, &net)
+        .await
+        .unwrap();
+    assert_eq!(recovered.channel_ids, vec![ch1]);
+    let second = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "exact-reservation-relay",
+            std::slice::from_ref(&ch2),
+            &net,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.channel_ids, vec![ch2]);
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_runtime_owner_drains_while_relay_control_traffic_continues() {
+    let ctx = DrainTestContext::new_runtime("online-drain-relay").await;
+    let channel_id = ctx.create_closed_channel([49u8; 32], 300).await;
+    let net = ctx.net_for(&channel_id);
+    let config_file = tempfile::NamedTempFile::new().unwrap();
+    let transport_key = SecpTransportKeypair::generate();
+    let quic_identity = QuicCertIdentity::generate().unwrap();
+    std::fs::write(
+        config_file.path(),
+        format!(
+            r#"
+relay_wallet:
+  db_path: {}
+relays:
+  - name: online-drain-relay
+    quic_cert_seed: {}
+    transport_key: {}
+    listen: 127.0.0.1:0
+    trusted_mints:
+      - url: {}
+        units: [sat]
+    pricing:
+      in_bytes_per_millisat: 1
+      out_bytes_per_millisat: 1
+"#,
+            ctx._temp_db.path().display(),
+            hex::encode(quic_identity.seed()),
+            hex::encode(transport_key.normalized_secret_bytes()),
+            ctx.mint_url,
+        ),
+    )
+    .unwrap();
+    let config = MonadConfig::load(config_file.path()).unwrap();
+    let relay_config = config.select_relay(None).unwrap();
+    let manager = Arc::new(ctx.wallet_manager.clone());
+    let (server_addr, pubkey, relay_task, shutdown_tx, _) = start_relay_from_config(
+        relay_config,
+        manager,
+        ctx.wallet_manager.keyset_cache_snapshot(),
+    )
+    .await
+    .unwrap();
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    control_handshake_status(&mut control_send, &mut control_recv).await;
+
+    let error = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "online-drain-relay",
+            std::slice::from_ref(&channel_id),
+            &DropAfterSwap { inner: &net },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("submitted"));
+    let drain_id = ctx.wallet_manager.list_drains().unwrap()[0]
+        .drain_id
+        .clone();
+    let drained = ctx
+        .wallet_manager
+        .recover_submitted_drain(&drain_id, &net)
+        .await
+        .unwrap();
+    assert!(drained.recovered);
+    assert_eq!(drained.channel_ids, vec![channel_id]);
+
+    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
+    expect_session_status_struct(read_control_message(&mut control_recv).await);
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    relay_task.await.unwrap().unwrap();
     ctx.shutdown();
 }
 
