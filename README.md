@@ -20,6 +20,13 @@ older clients do not understand the release request.
 
 ### Try all three management pages
 
+Wallet summaries show **Live** or **Stale / unavailable** with the last successful
+process sample time. Stale snapshots retain last-known figures; missing amounts
+and counts display as unavailable rather than zero. On the relay page, an unlinked
+channel in `Closing` offers **Resume close** to resume its durable close journal.
+Wallet actions are disabled while the source is stale or a conflicting command
+is pending. Resume close does not initiate client-side fund recovery.
+
 Relay toggles use `set_control` with `{"field":"accept_new_tunnels","enabled":false}`,
 changing only the selected setting. This replaces the alpha `set_controls` command:
 update API callers and serve the updated UI alongside the relay; no database reset

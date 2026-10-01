@@ -54,7 +54,15 @@ bounded and transient, not a durable audit trail.
 - **Mints:** inspect keysets and rotate SAT/MSAT independently.
 
 Controls act through existing backend APIs. Runtime/payment decisions remain in
-their Rust owners. Relay control commands atomically change only the selected
+their Rust owners. Wallet summaries include source freshness and last successful
+sample time. Offline sources, disconnected SSE, or samples older than six seconds
+are marked **Stale / unavailable**, retaining last-known amounts. Missing values
+are unavailable, not zero. An unlinked relay channel in `Closing` offers
+**Resume close**, using the same journal-aware `close_channel` command. Pending
+commands and stale sources disable Close and Resume close; a failed attempt can
+be resumed again after inspecting the current channel state.
+
+Relay control commands atomically change only the selected
 flag, preserving unrelated updates from other tabs. Disable client/relay remains
 available during slow wallet operations; both operations are tracked independently.
 Pending enable/disable or relay-control commands still block conflicting controls.
