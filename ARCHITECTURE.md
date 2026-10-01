@@ -1957,6 +1957,14 @@ named volume for post-exit diagnosis, while keys, configuration, and wallet stat
 remain ephemeral. This topology is demo tooling, not persistent deployment.
 # Management command admission and execution
 
+Wallet summary freshness follows the source process health and the aggregator's
+last successful snapshot timestamp (including its normal inventory-cache delay).
+Inventory-read failures fail the process snapshot, allowing retained values to
+be shown as stale rather than refreshed. Browser **Resume close** submits the same
+relay `close_channel` operation as Close; the wallet's existing durable journal
+determines the recovery path. HTTP admission remains distinct from completed
+settlement, and ownership checks still require an unlinked channel.
+
 Process-local management admission acknowledges queued operations independently
 of executor completion. A structured `command_not_admitted` 503 means no operation
 was created; transport errors and unclassified 5xx responses remain ambiguous.

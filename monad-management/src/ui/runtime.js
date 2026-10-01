@@ -301,7 +301,9 @@ function unlinkedChannels() {
     shortId(c.channel_id), channelState(c), `${c.mint_url} / ${c.unit}`, channelPanel(c),
     c.last_linked_at_unix_ms ? new Date(c.last_linked_at_unix_ms).toLocaleString() : "Unknown (before this process run)",
     c.ownership?.state === "unlinked"
-      ? button("Close channel",process,c.relay_name,"close_channel",{channel_id:c.channel_id},String(c.state).toLowerCase()==="open")
+      ? button(String(c.state).toLowerCase()==="closing" ? "Resume close" : "Close channel",
+          process,c.relay_name,"close_channel",{channel_id:c.channel_id},
+          ["open", "closing"].includes(String(c.state).toLowerCase()))
       : el("span", "Ownership unavailable")
   ])));
   if(!entries.length) section.append(el("p","No unlinked channels."));
@@ -513,8 +515,9 @@ function instanceCard(process, name, state, instance) {
   return card;
 }
 function wholeNumber(value) {
+  if (value == null || value === "") return "unavailable";
   try {
-    return BigInt(value ?? 0).toLocaleString("en-US");
+    return BigInt(value).toLocaleString("en-US");
   } catch {
     return "unavailable";
   }
@@ -529,6 +532,11 @@ function walletSummary(process, state) {
   const card = el("section", null, "mint wallet-summary-card");
   card.dataset.walletProcess = process;
   card.append(el("h2", `${process} · wallet summary`));
+  card.append(el("p", `${healthy(state) ? "Live" : "Stale / unavailable"} · Last successful sample: ${
+    state.last_success_unix_ms != null
+      ? new Date(state.last_success_unix_ms).toLocaleString()
+      : "unavailable"
+  }`));
   const summary = state.data.wallet?.summary;
   if (!summary) {
     card.append(el("p", "Wallet summary unavailable."));
@@ -615,7 +623,7 @@ function render() {
           ]),
         ),
       );
-      if (!walletData?.available_proofs?.length)
+      if (Array.isArray(walletData?.available_proofs) && !walletData.available_proofs.length)
         wallet.append(el("p", "No available loose proofs."));
     }
     if (!walletData) wallet.append(el("p", "Wallet inventory unavailable."));
