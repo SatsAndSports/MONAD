@@ -342,9 +342,11 @@ request may contain at most 1,024 unique Closed channels, all owned by one relay
 and using one mint/unit, with valid nonempty receiver proofs; any invalid or
 already reserved channel rejects the whole request before mint submission. An
 in-process caller holding the running relay's manager may execute or recover these
-drains through runtime-owner authority. No online management command exposes this
-yet. The standalone wallet CLI remains an offline maintenance command and still
-fails while that runtime owns the wallet.
+drains through runtime-owner authority. The loopback management API and relay page
+expose this as exact channel selection plus durable-attempt recovery while relay
+traffic remains active. The standalone wallet CLI keeps its selector-based syntax,
+remains an offline maintenance command, and still fails while that runtime owns the
+wallet.
 
 Add `--json` to any wallet command for machine-readable output.
 

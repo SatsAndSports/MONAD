@@ -1,6 +1,6 @@
 //! One loopback HTTP/SSE service for independently running local processes.
 use axum::{
-    extract::{Path, Query, State},
+    extract::{rejection::JsonRejection, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive},
@@ -89,7 +89,9 @@ impl Aggregator {
             .route("/v1/processes/{name}/commands", post(command))
             .route("/v1/processes/{name}/operations/{id}", get(operation))
             .with_state(self.clone())
-            .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
+            .layer(axum::extract::DefaultBodyLimit::max(
+                crate::COMMAND_BODY_LIMIT,
+            ))
     }
 
     fn publish(&self, process: &str, kind: &str, data: Value, current: Option<Value>) {
@@ -403,8 +405,22 @@ async fn events(
 async fn command(
     State(state): State<Arc<Aggregator>>,
     Path(name): Path<String>,
-    Json(command): Json<crate::Command>,
+    payload: Result<Json<crate::Command>, JsonRejection>,
 ) -> (StatusCode, Json<Value>) {
+    let Json(command) = match payload {
+        Ok(command) => command,
+        Err(rejection) => {
+            let (status, message) = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "management command exceeds the 128 KiB request limit",
+                )
+            } else {
+                (StatusCode::BAD_REQUEST, "invalid management command JSON")
+            };
+            return (status, Json(json!({"error": message})));
+        }
+    };
     let Some(client) = state.clients.get(&name) else {
         return (
             StatusCode::NOT_FOUND,

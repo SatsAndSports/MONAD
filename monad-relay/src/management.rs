@@ -1,10 +1,14 @@
 use crate::{
     payments::CloseOutcome,
     session_registry::SessionRegistry,
-    wallet_manager::{ChannelSummary, DrainSummary, RelayWalletManager},
+    wallet_manager::{
+        ChannelSummary, DrainStartOutcome, DrainSummary, DrainSwapResult, RelayWalletManager,
+        RelayWalletMintClient,
+    },
 };
 use cdk_spilman::ChannelState;
 use monad_management::{Backend, Command};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -68,6 +72,62 @@ impl RelayBackend {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrainChannelsArguments {
+    channel_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoverDrainArguments {
+    drain_id: String,
+}
+
+fn public_drain_result(result: &DrainSwapResult) -> Value {
+    json!({
+        "drain_id": result.drain_id,
+        "relay_name": result.relay_name,
+        "mint_url": result.mint_url,
+        "unit": result.unit,
+        "state": "Completed",
+        "input_amount_raw": result.input_amount_raw.to_string(),
+        "output_amount_raw": result.output_amount_raw.to_string(),
+        "channel_ids": result.channel_ids,
+        "recovered": result.recovered,
+        "recovery_required": false,
+    })
+}
+
+fn public_pending_drain(drain: &DrainSummary) -> Value {
+    json!({
+        "drain_id": drain.drain_id,
+        "relay_name": drain.relay_name,
+        "mint_url": drain.mint_url,
+        "unit": drain.unit,
+        "state": drain.state,
+        "input_amount_raw": drain.input_amount_raw.to_string(),
+        "output_amount_raw": drain.output_amount_raw.to_string(),
+        "channel_ids": drain.channel_ids,
+        "recovered": false,
+        "recovery_required": true,
+        "message": "drain did not complete; resume it using the durable drain ID",
+    })
+}
+
+fn public_drain_summary(drain: &DrainSummary) -> Value {
+    json!({
+        "drain_id": drain.drain_id,
+        "relay_name": drain.relay_name,
+        "mint_url": drain.mint_url,
+        "unit": drain.unit,
+        "state": drain.state,
+        "input_amount_raw": drain.input_amount_raw.to_string(),
+        "output_amount_raw": drain.output_amount_raw.to_string(),
+        "channel_ids": drain.channel_ids,
+    })
+}
+
 #[async_trait::async_trait]
 impl Backend for RelayBackend {
     async fn snapshot(&self) -> Result<Value, String> {
@@ -104,6 +164,18 @@ impl Backend for RelayBackend {
                     .filter(|d| names.contains(&d.relay_name))
                     .collect::<Vec<_>>();
                 let summary = wallet_summary(&channels, &drains)?;
+                let drains = drains.iter().map(public_drain_summary).collect::<Vec<_>>();
+                let channels = channels
+                    .into_iter()
+                    .map(|channel| {
+                        let drain = wallet.channel_drain_status(&channel.channel_id);
+                        let mut value = serde_json::to_value(channel)
+                            .map_err(|_| "channel inventory encoding failed")?;
+                        value["drain"] = serde_json::to_value(drain)
+                            .map_err(|_| "drain status encoding failed")?;
+                        Ok::<_, String>(value)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok::<_, String>(
                     json!({"summary": summary, "channels": channels, "expiring_channels": expiring, "drains": drains}),
                 )
@@ -274,6 +346,88 @@ impl Backend for RelayBackend {
                 );
                 Ok(json!({"channel_id": channel, "outcome": outcome}))
             }
+            "drain_channels" => {
+                let arguments: DrainChannelsArguments =
+                    serde_json::from_value(command.arguments.clone()).map_err(|_| {
+                        "channel_ids must be an array of strings and the only argument"
+                    })?;
+                let outcome = self
+                    .wallet
+                    .drain_closed_channels_by_id_to_swap_with_outcome(
+                        &command.instance,
+                        &arguments.channel_ids,
+                        &RelayWalletMintClient::new(),
+                    )
+                    .await;
+                *self.inventory.lock().await = None;
+                match outcome? {
+                    DrainStartOutcome::Completed(result) => {
+                        registry.events.record(
+                            "drain_completed",
+                            json!({
+                                "drain_id": result.drain_id,
+                                "channel_ids": result.channel_ids,
+                                "unit": result.unit,
+                                "input_amount_raw": result.input_amount_raw.to_string(),
+                                "output_amount_raw": result.output_amount_raw.to_string(),
+                                "recovered": false,
+                            }),
+                        );
+                        Ok(public_drain_result(&result))
+                    }
+                    DrainStartOutcome::RecoveryRequired { drain, .. } => {
+                        registry.events.record(
+                            "drain_recovery_required",
+                            json!({
+                                "drain_id": drain.drain_id,
+                                "channel_ids": drain.channel_ids,
+                                "state": drain.state,
+                            }),
+                        );
+                        Ok(public_pending_drain(&drain))
+                    }
+                }
+            }
+            "recover_drain" => {
+                let arguments: RecoverDrainArguments =
+                    serde_json::from_value(command.arguments.clone())
+                        .map_err(|_| "drain_id must be a string and the only argument")?;
+                let drain = self
+                    .wallet
+                    .list_drains()
+                    .map_err(|_| "drain inventory unavailable")?
+                    .into_iter()
+                    .find(|drain| drain.drain_id == arguments.drain_id)
+                    .ok_or("unknown drain")?;
+                if drain.relay_name != command.instance {
+                    return Err("drain is not owned by this relay".to_string());
+                }
+                let net = self
+                    .wallet
+                    .mint_client_for_relay(&drain.relay_name, &drain.mint_url, &drain.unit)
+                    .map_err(|_| "drain mint unavailable")?;
+                let outcome = self
+                    .wallet
+                    .recover_submitted_drain(&drain.drain_id, &net)
+                    .await;
+                *self.inventory.lock().await = None;
+                let result = outcome.map_err(|_| {
+                    "drain recovery did not complete; inspect its durable state and retry"
+                        .to_string()
+                })?;
+                registry.events.record(
+                    "drain_completed",
+                    json!({
+                        "drain_id": result.drain_id,
+                        "channel_ids": result.channel_ids,
+                        "unit": result.unit,
+                        "input_amount_raw": result.input_amount_raw.to_string(),
+                        "output_amount_raw": result.output_amount_raw.to_string(),
+                        "recovered": result.recovered,
+                    }),
+                );
+                Ok(public_drain_result(&result))
+            }
             _ => Err("unknown relay action".into()),
         }
     }
@@ -303,6 +457,7 @@ mod tests {
             state: state.into(),
             input_amount_raw: amount,
             output_amount_raw: amount,
+            channel_ids: Vec::new(),
         };
         let channels = [
             channel(ChannelState::Open),
@@ -342,10 +497,33 @@ mod tests {
             state: "Completed".into(),
             input_amount_raw: amount,
             output_amount_raw: amount,
+            channel_ids: Vec::new(),
         };
         assert_eq!(
             wallet_summary(&[], &[drain(u64::MAX), drain(1)]).unwrap_err(),
             "drained proof amount overflow"
         );
+    }
+
+    #[test]
+    fn public_drain_results_never_expose_proof_custody() {
+        let result = DrainSwapResult {
+            drain_id: "drain".into(),
+            relay_name: "relay".into(),
+            mint_url: "https://mint.invalid".into(),
+            unit: "sat".into(),
+            input_amount_raw: 10,
+            output_amount_raw: 9,
+            output_proofs_json: "secret proof material".into(),
+            channel_ids: vec!["channel".into()],
+            recovered: false,
+        };
+        let public = public_drain_result(&result);
+        assert_eq!(public["drain_id"], "drain");
+        assert_eq!(public["state"], "Completed");
+        assert_eq!(public["input_amount_raw"], "10");
+        assert_eq!(public["output_amount_raw"], "9");
+        assert!(!public.to_string().contains("secret proof material"));
+        assert!(public.get("output_proofs_json").is_none());
     }
 }

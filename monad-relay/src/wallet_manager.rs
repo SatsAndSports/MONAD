@@ -112,6 +112,21 @@ pub struct DrainSummary {
     pub state: String,
     pub input_amount_raw: u64,
     pub output_amount_raw: u64,
+    pub channel_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DrainChannelStatus {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub enum DrainStartOutcome {
+    Completed(DrainSwapResult),
+    RecoveryRequired { drain: DrainSummary, error: String },
 }
 
 pub trait DrainSwapNetworking: Sync {
@@ -517,11 +532,28 @@ impl RelayWalletInspection {
                     state: row.get(4)?,
                     input_amount_raw: u64_from_i64(row.get(5)?)?,
                     output_amount_raw: u64_from_i64(row.get(6)?)?,
+                    channel_ids: Vec::new(),
                 })
             })
             .map_err(|e| io::Error::other(format!("query drains: {e}")))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| io::Error::other(format!("decode drains: {e}")))
+        let mut drains = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::other(format!("decode drains: {e}")))?;
+        drop(stmt);
+        for drain in &mut drains {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT channel_id FROM monad_relay_drain_inputs
+                     WHERE drain_id=?1 ORDER BY channel_id",
+                )
+                .map_err(|e| io::Error::other(format!("prepare drain inputs: {e}")))?;
+            drain.channel_ids = stmt
+                .query_map([&drain.drain_id], |row| row.get(0))
+                .map_err(|e| io::Error::other(format!("query drain inputs: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| io::Error::other(format!("decode drain inputs: {e}")))?;
+        }
+        Ok(drains)
     }
 
     fn channel_records(&self, relay_name: Option<&str>) -> io::Result<Vec<InspectionChannel>> {
@@ -1244,7 +1276,10 @@ impl RelayWalletManager {
             return Err("no closed channels available to drain".to_string());
         }
         let selection = self.exact_drain_selection(relay_name, &channel_ids)?;
-        self.start_exact_drain(selection, net).await
+        match self.start_exact_drain(selection, net).await? {
+            DrainStartOutcome::Completed(result) => Ok(result),
+            DrainStartOutcome::RecoveryRequired { error, .. } => Err(error),
+        }
     }
 
     /// Drain exactly the requested closed channels in canonical channel-ID order.
@@ -1257,6 +1292,21 @@ impl RelayWalletManager {
         channel_ids: &[String],
         net: &N,
     ) -> Result<DrainSwapResult, String> {
+        match self
+            .drain_closed_channels_by_id_to_swap_with_outcome(relay_name, channel_ids, net)
+            .await?
+        {
+            DrainStartOutcome::Completed(result) => Ok(result),
+            DrainStartOutcome::RecoveryRequired { error, .. } => Err(error),
+        }
+    }
+
+    pub async fn drain_closed_channels_by_id_to_swap_with_outcome<N: DrainSwapNetworking>(
+        &self,
+        relay_name: &str,
+        channel_ids: &[String],
+        net: &N,
+    ) -> Result<DrainStartOutcome, String> {
         self.require_drain_authority()?;
         let selection = self.exact_drain_selection(relay_name, channel_ids)?;
         self.start_exact_drain(selection, net).await
@@ -1290,11 +1340,68 @@ impl RelayWalletManager {
                     state: row.get(4)?,
                     input_amount_raw: u64_from_i64(row.get(5)?)?,
                     output_amount_raw: u64_from_i64(row.get(6)?)?,
+                    channel_ids: Vec::new(),
                 })
             })
             .map_err(|e| format!("query drains: {e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("decode drains: {e}"))
+        let mut drains = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("decode drains: {e}"))?;
+        drop(stmt);
+        for drain in &mut drains {
+            drain.channel_ids = self.drain_channel_ids(&drain.drain_id)?;
+        }
+        Ok(drains)
+    }
+
+    pub fn channel_drain_status(&self, channel_id: &str) -> DrainChannelStatus {
+        if self.storage.get_state(channel_id).ok() != Some(Some(ChannelState::Closed)) {
+            return DrainChannelStatus {
+                state: "ineligible".to_string(),
+                drain_id: None,
+                reason: Some("channel is not Closed".to_string()),
+            };
+        }
+        let conn =
+            match cdk_spilman::sqlite_durability::open_wallet_database(&self.metadata.db_path) {
+                Ok(conn) => conn,
+                Err(_) => {
+                    return DrainChannelStatus {
+                        state: "unavailable".to_string(),
+                        drain_id: None,
+                        reason: Some("drain status unavailable".to_string()),
+                    };
+                }
+            };
+        match self.drain_reservation(&conn, channel_id) {
+            Ok(Some(drain_id)) => {
+                return DrainChannelStatus {
+                    state: "reserved".to_string(),
+                    drain_id: Some(drain_id),
+                    reason: None,
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return DrainChannelStatus {
+                    state: "unavailable".to_string(),
+                    drain_id: None,
+                    reason: Some("drain status unavailable".to_string()),
+                };
+            }
+        }
+        match self.drain_candidate(channel_id) {
+            Ok(_) => DrainChannelStatus {
+                state: "eligible".to_string(),
+                drain_id: None,
+                reason: None,
+            },
+            Err(_) => DrainChannelStatus {
+                state: "ineligible".to_string(),
+                drain_id: None,
+                reason: Some("receiver proofs are unavailable or invalid".to_string()),
+            },
+        }
     }
 
     /// Fetch all keysets reported by one mint and persist them in SQLite.
@@ -1412,7 +1519,8 @@ impl RelayWalletManager {
         }
         if channel_ids.len() > MAX_DRAIN_CHANNELS {
             return Err(format!(
-                "exact drain selection exceeds the {MAX_DRAIN_CHANNELS}-channel limit"
+                "exact drain selection contains {} channels; maximum is {MAX_DRAIN_CHANNELS}",
+                channel_ids.len()
             ));
         }
         let selected = channel_ids.iter().cloned().collect::<BTreeSet<_>>();
@@ -1440,14 +1548,7 @@ impl RelayWalletManager {
                     "channel {channel_id} belongs to relay '{owner}', not '{relay_name}'"
                 ));
             }
-            let reserved_by: Option<String> = conn
-                .query_row(
-                    "SELECT drain_id FROM monad_relay_drained_channels WHERE channel_id = ?1",
-                    params![channel_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| format!("query drained channel marker: {e}"))?;
+            let reserved_by = self.drain_reservation(&conn, &channel_id)?;
             if let Some(drain_id) = reserved_by {
                 return Err(format!(
                     "channel {channel_id} is already reserved by drain {drain_id}"
@@ -1476,37 +1577,55 @@ impl RelayWalletManager {
             }
             mint_url.get_or_insert_with(|| channel_mint.to_string());
             unit.get_or_insert_with(|| channel_unit.to_string());
-            let closed = self
-                .storage
-                .get_closed_data(&channel_id)
-                .ok_or_else(|| format!("channel {channel_id} is Closed but has no closed data"))?;
-            let proofs = serde_json::from_str::<Vec<Proof>>(&closed.receiver_proofs_json)
-                .map_err(|_| format!("channel {channel_id} has invalid receiver proofs"))?;
-            let proof_sum = proofs
-                .iter()
-                .try_fold(0u64, |sum, proof| sum.checked_add(u64::from(proof.amount)))
-                .ok_or_else(|| format!("channel {channel_id} receiver proof amount overflow"))?;
-            if proofs.is_empty() || proof_sum == 0 {
-                return Err(format!(
-                    "channel {channel_id} has no receiver proofs available to drain"
-                ));
-            }
-            if proof_sum != closed.receiver_sum {
-                return Err(format!(
-                    "channel {channel_id} receiver proof amount does not match closed data"
-                ));
-            }
-            inputs.push(DrainCandidate {
-                channel_id,
-                receiver_sum_raw: closed.receiver_sum,
-                receiver_proofs_json: closed.receiver_proofs_json,
-            });
+            inputs.push(self.drain_candidate(&channel_id)?);
         }
         Ok(DrainSelection {
             relay_name: relay_name.to_string(),
             mint_url: mint_url.expect("nonempty exact drain selection has a mint"),
             unit: unit.expect("nonempty exact drain selection has a unit"),
             inputs,
+        })
+    }
+
+    fn drain_reservation(
+        &self,
+        conn: &Connection,
+        channel_id: &str,
+    ) -> Result<Option<String>, String> {
+        conn.query_row(
+            "SELECT drain_id FROM monad_relay_drained_channels WHERE channel_id = ?1",
+            params![channel_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("query drained channel marker: {e}"))
+    }
+
+    fn drain_candidate(&self, channel_id: &str) -> Result<DrainCandidate, String> {
+        let closed = self
+            .storage
+            .get_closed_data(channel_id)
+            .ok_or_else(|| format!("channel {channel_id} is Closed but has no closed data"))?;
+        let proofs = serde_json::from_str::<Vec<Proof>>(&closed.receiver_proofs_json)
+            .map_err(|_| format!("channel {channel_id} has invalid receiver proofs"))?;
+        let proof_sum = proofs
+            .iter()
+            .try_fold(0u64, |sum, proof| sum.checked_add(u64::from(proof.amount)))
+            .ok_or_else(|| format!("channel {channel_id} receiver proof amount overflow"))?;
+        if proofs.is_empty() || proof_sum == 0 {
+            return Err(format!(
+                "channel {channel_id} has no receiver proofs available to drain"
+            ));
+        }
+        if proof_sum != closed.receiver_sum {
+            return Err(format!(
+                "channel {channel_id} receiver proof amount does not match closed data"
+            ));
+        }
+        Ok(DrainCandidate {
+            channel_id: channel_id.to_string(),
+            receiver_sum_raw: closed.receiver_sum,
+            receiver_proofs_json: closed.receiver_proofs_json,
         })
     }
 

@@ -60,7 +60,9 @@ SOCKS request. Full details and the wire compatibility boundary are documented i
 The `monad-management` crate supplies HTTP-over-Unix process endpoints and bounded,
 process-owned command execution. Runtime backends expose sanitized snapshots and
 typed runtime actions. Generation-bound request IDs make retries idempotent during
-a process lifetime. The HTTP caller does not own an accepted money operation;
+a process lifetime. Retained operations redact arguments and keep a SHA-256 request
+fingerprint for comparison; the 512-record bound limits both idempotency state and
+large public results. The HTTP caller does not own an accepted money operation;
 the process executor does. Process shutdown cancels its futures using the existing
 journaled wallet recovery semantics. No management transport retries a mint request.
 
@@ -1151,6 +1153,15 @@ relay/mint/unit. The existing relay/mint/unit/limit selector resolves IDs before
 entering this same exact path.
 Matching runtime-owner or exclusive-maintenance authority, atomic unique channel
 reservations, and journal CAS protect the full operation, not just completion.
+The relay management backend exposes this exact path as `drain_channels` and
+`recover_drain`. It validates the command instance against the channel/drain relay
+owner and invalidates cached inventory after every attempt. Mint I/O runs in the
+bounded management executor without stopping listener, session, control-stream, or
+data-plane tasks. Ambiguous submission is a successful management operation whose
+public result is `recovery_required` and carries the durable drain ID; recovery must
+resume that ID rather than create another drain. Public snapshots, operation results,
+and events contain decimal-string aggregate amounts and channel IDs but never output
+proofs, secrets, swap/restore requests, or journal payloads.
 
 Receiver close uses a separate versioned exact-request journal. Storage freezes
 the accepted payment with Closing and the journal atomically, rejecting later
@@ -1953,7 +1964,10 @@ The runtime browser tracks outstanding commands by process generation and reques
 ID. SSE updates and bounded HTTP operation lookups reconcile execution; terminal
 results cannot regress to queued acceptance. Transport uncertainty never causes
 automatic command replay. Browser-local tracking survives SSE resets but is not
-persisted across page reloads.
+persisted across page reloads. An aggregator restart may temporarily expose an
+offline process without a generation; the browser retains uncertain operations
+until a known process generation proves they are stale, then removes both their
+activity and control locks.
 ## Container demo topology
 
 The optional `compose.demo.yml` packages the disposable mint, relays, clients,

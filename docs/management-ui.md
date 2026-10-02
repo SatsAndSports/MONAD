@@ -49,8 +49,15 @@ bounded and transient, not a durable audit trail.
   even if it stalls. Closed channels show compact final paid/capacity amounts
   without red low-capacity styling or a progress bar. Final paid is not a
   net-after-fees earnings figure. Capacity and accepted channel balances use each
-  channel's raw unit; session payments/balances are msat. A close request goes
-  through the normal wallet close/recovery path.
+   channel's raw unit; session payments/balances are msat. A close request goes
+   through the normal wallet close/recovery path. **Channel drains** groups eligible
+   Closed channels by process generation, relay, mint and unit. Select up to 1,024
+   channels in one group and use **Drain selected** for an exact, all-or-nothing
+   request. Reserved channels identify their drain instead of being selectable.
+   Durable Prepared, Submitted, and Finalizing attempts offer **Resume drain**;
+   Completed attempts remain visible without exposing output proofs or secrets.
+   Selection is cleared when its process generation changes, and stale/offline
+   sources disable drain and recovery controls.
 - **Mints:** inspect keysets and rotate SAT/MSAT independently.
 
 Controls act through existing backend APIs. Runtime/payment decisions remain in
@@ -59,8 +66,8 @@ sample time. Offline sources, disconnected SSE, or samples older than six second
 are marked **Stale / unavailable**, retaining last-known amounts. Missing values
 are unavailable, not zero. An unlinked relay channel in `Closing` offers
 **Resume close**, using the same journal-aware `close_channel` command. Pending
-commands and stale sources disable Close and Resume close; a failed attempt can
-be resumed again after inspecting the current channel state.
+commands and stale sources disable Close, Resume close, Drain selected, and Resume
+drain; a failed attempt can be resumed again after inspecting current wallet state.
 
 Relay control commands atomically change only the selected
 flag, preserving unrelated updates from other tabs. Disable client/relay remains

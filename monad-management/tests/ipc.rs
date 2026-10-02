@@ -149,6 +149,59 @@ async fn unix_bind_preserves_existing_artifacts() {
     assert_eq!(std::fs::read(path).unwrap(), b"do not remove");
 }
 
+#[tokio::test]
+async fn command_body_limit_accepts_full_drain_payload_and_returns_json_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("management.sock");
+    let backend = Arc::new(GatedBackend::default());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(monad_management::serve_unix(
+        path.clone(),
+        backend.clone(),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let client = monad_management::unix_client(path).unwrap();
+    let snapshot: Value = loop {
+        if let Ok(response) = client.get("http://localhost/v1/snapshot").send().await {
+            break response.json().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
+    let command = |request_id: &str, bytes: usize| Command {
+        generation: snapshot["generation"].as_str().unwrap().into(),
+        request_id: request_id.into(),
+        instance: "test".into(),
+        action: "drain_channels".into(),
+        arguments: json!({"channel_ids": ["a".repeat(bytes)]}),
+    };
+    let accepted = client
+        .post("http://localhost/v1/commands")
+        .json(&command("within-limit", 70 * 1024))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 202);
+    let accepted: Value = accepted.json().await.unwrap();
+    assert!(accepted["request"]["arguments"].is_null());
+    let response = client
+        .post("http://localhost/v1/commands")
+        .json(&command("over-limit", 129 * 1024))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(
+        error["error"],
+        "management command exceeds the 128 KiB request limit"
+    );
+    backend.gate.notify_one();
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
 #[test]
 fn event_history_is_bounded_and_keeps_sequence_gaps_visible() {
     let log = monad_management::events::EventLog::default();
