@@ -337,6 +337,15 @@ the relay DB and cannot be replaced by conflicting completion. Incompatible old
 nonempty drain journals are rejected, never migrated or deleted. See
 [WALLET.md](WALLET.md#relay-drain-recovery) for the recovery policy.
 
+The reusable relay wallet backend also supports exact drains by channel ID. A
+request may contain at most 1,024 unique Closed channels, all owned by one relay
+and using one mint/unit, with valid nonempty receiver proofs; any invalid or
+already reserved channel rejects the whole request before mint submission. An
+in-process caller holding the running relay's manager may execute or recover these
+drains through runtime-owner authority. No online management command exposes this
+yet. The standalone wallet CLI remains an offline maintenance command and still
+fails while that runtime owns the wallet.
+
 Add `--json` to any wallet command for machine-readable output.
 
 Repeating `wallet close --channel-id <id>` resumes the exact persisted close.

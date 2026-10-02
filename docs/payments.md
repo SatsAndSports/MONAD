@@ -110,9 +110,10 @@ One relay process owns that database through an OS-backed runtime-owner lock and
 hosts all configured relays by default through one manager/cache. Runtime startup
 uses exclusive maintenance access; steady state and read-only SQLite wallet
 inspection share the maintenance gate. Inspection performs no SQLite schema or
-data writes but still requires access to the adjacent lock sidecar. Mutating
-close/drain administration is fail-fast while the runtime is active and does not
-begin database or mint work.
+data writes but still requires access to the adjacent lock sidecar. Separate
+mutating wallet commands remain fail-fast while the runtime is active. The
+in-process runtime owner may start or recover relay drains after entering steady
+state; other mutating administration still requires exclusive maintenance access.
 
 The in-memory cache stores all keysets returned by configured mints: all units,
 active and inactive. The relay's trusted mint/unit policy is applied when reading
@@ -141,7 +142,7 @@ Their durable recovery models are intentionally different:
 | --- | --- |
 | Client opening | Exact immutable attempt plus execution authority; bounded identical live replay; one direct-rejection-only successor; exclusive stale-input bearer-token export. |
 | Client post-expiry refund | Custody-bound v2 journal and execution history; exact restore before bounded per-invocation replay; one initial structured `12002` successor without prior uncertainty; verified proofs persisted for offline finalization. |
-| Relay drain | Exact swap/restore requests, output secrets, keyset metadata, and source-channel reservations are persisted. Ambiguous submission remains `Submitted`; `recover-drain` restores the persisted outputs and does not replay the swap. |
+| Relay drain | An explicit selection is nonempty, bounded, duplicate-free, and restricted to eligible Closed channels for one relay/mint/unit. Exact swap/restore requests, output secrets, keyset metadata, and all source-channel reservations are persisted atomically. Ambiguous submission remains `Submitted`; `recover-drain` restores the persisted outputs and does not replay the swap. |
 | Relay close | The channel enters durable `Closing` before mint I/O. Resumption reconstructs close execution from stored closing authorization; it is not drain-style restoration of a journaled exact swap request. |
 
 ## Relay Channel Policy

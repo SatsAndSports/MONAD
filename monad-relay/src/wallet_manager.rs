@@ -16,7 +16,7 @@ use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::wallet_lock::{WalletLockIdentity, WalletLockMode, WalletLocks};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -81,6 +81,8 @@ const CREATE_DRAIN_TABLES_SQL: &str = r#"
         FOREIGN KEY (drain_id) REFERENCES monad_relay_drains(drain_id)
     );
 "#;
+
+const MAX_DRAIN_CHANNELS: usize = 1024;
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct DrainSwapResult {
@@ -786,6 +788,22 @@ impl RelayWalletManager {
             .map_err(|e| e.to_string())
     }
 
+    fn require_drain_authority(&self) -> Result<(), String> {
+        let locks = self
+            .metadata
+            .authority
+            .lock()
+            .map_err(|_| "relay authority lock poisoned".to_string())?;
+        if locks.holds_runtime_owner() || locks.exclusive_access().is_ok() {
+            Ok(())
+        } else {
+            Err(
+                "runtime wallet ownership or exclusive wallet maintenance access is required"
+                    .to_string(),
+            )
+        }
+    }
+
     pub fn register_identity(
         &self,
         relay_name: &str,
@@ -1208,6 +1226,10 @@ impl RelayWalletManager {
         result
     }
 
+    /// Drain eligible channels selected by relay, mint, unit, and optional limit.
+    ///
+    /// Selection resolves to channel IDs before entering the same exact,
+    /// all-or-nothing path used by [`Self::drain_closed_channels_by_id_to_swap`].
     pub async fn drain_closed_channels_to_swap<N: DrainSwapNetworking>(
         &self,
         relay_name: &str,
@@ -1216,8 +1238,28 @@ impl RelayWalletManager {
         net: &N,
         limit: Option<usize>,
     ) -> Result<DrainSwapResult, String> {
-        self.start_exact_drain(relay_name, mint_url, unit, net, limit)
-            .await
+        self.require_drain_authority()?;
+        let channel_ids = self.closed_drain_channel_ids(relay_name, mint_url, unit, limit)?;
+        if channel_ids.is_empty() {
+            return Err("no closed channels available to drain".to_string());
+        }
+        let selection = self.exact_drain_selection(relay_name, &channel_ids)?;
+        self.start_exact_drain(selection, net).await
+    }
+
+    /// Drain exactly the requested closed channels in canonical channel-ID order.
+    ///
+    /// The set must be nonempty, duplicate-free, no larger than 1,024 channels,
+    /// and contain only unreserved channels for one relay, mint, and unit.
+    pub async fn drain_closed_channels_by_id_to_swap<N: DrainSwapNetworking>(
+        &self,
+        relay_name: &str,
+        channel_ids: &[String],
+        net: &N,
+    ) -> Result<DrainSwapResult, String> {
+        self.require_drain_authority()?;
+        let selection = self.exact_drain_selection(relay_name, channel_ids)?;
+        self.start_exact_drain(selection, net).await
     }
 
     pub async fn recover_submitted_drain<N: DrainSwapNetworking>(
@@ -1313,13 +1355,13 @@ impl RelayWalletManager {
         Ok(self.keyset_cache.clone())
     }
 
-    fn closed_drain_candidates(
+    fn closed_drain_channel_ids(
         &self,
         relay_name: &str,
         mint_url: &str,
         unit: &str,
         limit: Option<usize>,
-    ) -> Result<Vec<DrainCandidate>, String> {
+    ) -> Result<Vec<String>, String> {
         let meta = self
             .metadata
             .list_channels(Some(relay_name))
@@ -1355,17 +1397,117 @@ impl RelayWalletManager {
             {
                 continue;
             }
+            out.push(channel_id);
+        }
+        Ok(out)
+    }
+
+    fn exact_drain_selection(
+        &self,
+        relay_name: &str,
+        channel_ids: &[String],
+    ) -> Result<DrainSelection, String> {
+        if channel_ids.is_empty() {
+            return Err("exact drain selection must contain at least one channel".to_string());
+        }
+        if channel_ids.len() > MAX_DRAIN_CHANNELS {
+            return Err(format!(
+                "exact drain selection exceeds the {MAX_DRAIN_CHANNELS}-channel limit"
+            ));
+        }
+        let selected = channel_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if selected.len() != channel_ids.len() {
+            return Err("exact drain selection contains duplicate channel IDs".to_string());
+        }
+        let metadata = self
+            .metadata
+            .list_channels(None)
+            .map_err(|e| format!("list relay channels: {e}"))?
+            .into_iter()
+            .map(|(channel_id, relay_name, _)| (channel_id, relay_name))
+            .collect::<HashMap<_, _>>();
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.metadata.db_path)
+            .map_err(|e| format!("open relay wallet db: {e}"))?;
+        let mut mint_url = None;
+        let mut unit = None;
+        let mut inputs = Vec::with_capacity(selected.len());
+        for channel_id in selected {
+            let owner = metadata
+                .get(&channel_id)
+                .ok_or_else(|| format!("channel {channel_id} not found in wallet metadata"))?;
+            if owner != relay_name {
+                return Err(format!(
+                    "channel {channel_id} belongs to relay '{owner}', not '{relay_name}'"
+                ));
+            }
+            let reserved_by: Option<String> = conn
+                .query_row(
+                    "SELECT drain_id FROM monad_relay_drained_channels WHERE channel_id = ?1",
+                    params![channel_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("query drained channel marker: {e}"))?;
+            if let Some(drain_id) = reserved_by {
+                return Err(format!(
+                    "channel {channel_id} is already reserved by drain {drain_id}"
+                ));
+            }
+            let state = self.storage.get_state(&channel_id)?;
+            if state != Some(ChannelState::Closed) {
+                return Err(format!("channel {channel_id} is not Closed"));
+            }
+            let funding = self
+                .storage
+                .get_funding(&channel_id)
+                .ok_or_else(|| format!("channel {channel_id} has no funding"))?;
+            let funding_json: serde_json::Value = serde_json::from_str(&funding.params_json)
+                .map_err(|e| format!("corrupt funding JSON for {channel_id}: {e}"))?;
+            let channel_mint = funding_json["mint"]
+                .as_str()
+                .ok_or_else(|| format!("channel {channel_id} funding has no mint URL"))?;
+            let channel_unit = funding_json["unit"]
+                .as_str()
+                .ok_or_else(|| format!("channel {channel_id} funding has no unit"))?;
+            if mint_url.as_deref().is_some_and(|mint| mint != channel_mint)
+                || unit.as_deref().is_some_and(|unit| unit != channel_unit)
+            {
+                return Err("exact drain channels must share one mint and unit".to_string());
+            }
+            mint_url.get_or_insert_with(|| channel_mint.to_string());
+            unit.get_or_insert_with(|| channel_unit.to_string());
             let closed = self
                 .storage
                 .get_closed_data(&channel_id)
                 .ok_or_else(|| format!("channel {channel_id} is Closed but has no closed data"))?;
-            out.push(DrainCandidate {
+            let proofs = serde_json::from_str::<Vec<Proof>>(&closed.receiver_proofs_json)
+                .map_err(|_| format!("channel {channel_id} has invalid receiver proofs"))?;
+            let proof_sum = proofs
+                .iter()
+                .try_fold(0u64, |sum, proof| sum.checked_add(u64::from(proof.amount)))
+                .ok_or_else(|| format!("channel {channel_id} receiver proof amount overflow"))?;
+            if proofs.is_empty() || proof_sum == 0 {
+                return Err(format!(
+                    "channel {channel_id} has no receiver proofs available to drain"
+                ));
+            }
+            if proof_sum != closed.receiver_sum {
+                return Err(format!(
+                    "channel {channel_id} receiver proof amount does not match closed data"
+                ));
+            }
+            inputs.push(DrainCandidate {
                 channel_id,
                 receiver_sum_raw: closed.receiver_sum,
                 receiver_proofs_json: closed.receiver_proofs_json,
             });
         }
-        Ok(out)
+        Ok(DrainSelection {
+            relay_name: relay_name.to_string(),
+            mint_url: mint_url.expect("nonempty exact drain selection has a mint"),
+            unit: unit.expect("nonempty exact drain selection has a unit"),
+            inputs,
+        })
     }
 
     fn load_drain(&self, drain_id: &str) -> Result<StoredDrain, String> {
@@ -1589,6 +1731,13 @@ struct DrainCandidate {
     channel_id: String,
     receiver_sum_raw: u64,
     receiver_proofs_json: String,
+}
+
+struct DrainSelection {
+    relay_name: String,
+    mint_url: String,
+    unit: String,
+    inputs: Vec<DrainCandidate>,
 }
 
 #[derive(Debug, Clone)]
@@ -2142,6 +2291,7 @@ mod tests {
         let manager = RelayWalletManager::open_with_locks(db.to_str().unwrap(), locks).unwrap();
         manager.enter_steady_state().unwrap();
         assert!(manager.require_maintenance().is_err());
+        assert!(manager.require_drain_authority().is_ok());
         assert!(manager.reopen().is_err());
         let channel_owner = manager.metadata.clone();
         drop(manager);
