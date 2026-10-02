@@ -8,6 +8,14 @@ pre {
 .channel-panel.closing-channel { border-color: #ffca80; }
 .closed-channel { color: #aab9c8; font-size: .9rem; }
 .retired-state { color: #d6a2ff; }
+.drain-reserved { color: #79c9ff; }
+.drain-selection-summary { color: #b9cddd; }
+#relay-drains h3 { margin-top: 1.4rem; }
+#relay-drains input[type="checkbox"] {
+  width: 1.15rem;
+  height: 1.15rem;
+  accent-color: #69dfc0;
+}
 .unlink-pending { color: #ffca80; font-size: .85rem; }
 .missing-channel { color: #ffca80; font-size: .85rem; }
 .channel-panel {

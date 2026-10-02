@@ -15,7 +15,9 @@ let processes = {},
 const pending = new Map(),
   commands = new Map(),
   cards = new Map(),
-  summaryCards = new Map();
+  summaryCards = new Map(),
+  drainSelections = new Map();
+const MAX_DRAIN_CHANNELS = 1024;
 function el(tag, text, cls) {
   const n = document.createElement(tag);
   if (text != null) n.textContent = text;
@@ -43,6 +45,11 @@ function update(old, next) {
   if (old instanceof HTMLButtonElement) {
     old.disabled = next.disabled;
     old.onclick = next.onclick;
+  }
+  if (old instanceof HTMLInputElement) {
+    old.checked = next.checked;
+    old.disabled = next.disabled;
+    old.onchange = next.onchange;
   }
   const children = [...next.childNodes];
   children.forEach((child, i) => {
@@ -90,6 +97,7 @@ function instancePending(process, instance, action, args) {
   const disabling = (action === "set_enabled" ||
     (action === "set_control" && args.field === "enabled")) && args.enabled === false;
   return [...pending.values()].some(c => c.process === process && c.instance === instance &&
+    c.generation === processes[process]?.generation &&
     (!disabling || c.action === "set_enabled" || c.action === "set_control"));
 }
 const operationKey = c => JSON.stringify([c.process, c.generation, c.request_id]);
@@ -103,7 +111,9 @@ async function submit(process, name, generation, action, args) {
   const request_id = crypto.randomUUID();
   const controller = new AbortController(),
     timer = setTimeout(() => controller.abort(), 10000);
-  const tracked = {process, instance:name, generation, request_id, action, channel_id:args.channel_id, state:"submitting"};
+  const tracked = {process, instance:name, generation, request_id, action,
+    channel_id:args.channel_id, drain_id:args.drain_id,
+    channel_count:args.channel_ids?.length, state:"submitting"};
   const key = operationKey(tracked);
   pending.set(key, tracked);
   render();
@@ -124,13 +134,15 @@ async function submit(process, name, generation, action, args) {
       },
     );
     const result = await response.json();
-    if ([400, 409, 429].includes(response.status) ||
+    if ([400, 409, 413, 429].includes(response.status) ||
         (response.status === 503 && result.code === "command_not_admitted")) {
       observeOperation({...tracked, state:"failed", error:result.error || `HTTP ${response.status}`});
       return;
     }
     if (!response.ok) throw Error(result.error || `HTTP ${response.status}`);
-    observeOperation({...result.request, ...result, process, generation, request_id, instance:name, action, channel_id:args.channel_id});
+    observeOperation({...result.request, ...result, process, generation, request_id,
+      instance:name, action, channel_id:args.channel_id, drain_id:args.drain_id,
+      channel_count:args.channel_ids?.length});
   } catch (e) {
     if (pending.get(key) === tracked)
       notice.textContent = `Submission unconfirmed: ${e.message}. Request ${request_id}. Checking operation status; do not resubmit.`;
@@ -147,13 +159,16 @@ function observeOperation(c) {
   if (["succeeded", "failed"].includes(previous?.state)) return;
   const key = id;
   const local = pending.get(key);
-  c = {...previous, ...c, channel_id:c.channel_id || previous?.channel_id || (local?.request_id === c.request_id ? local.channel_id : undefined)};
+  c = {...previous, ...c,
+    channel_id:c.channel_id || previous?.channel_id || (local?.request_id === c.request_id ? local.channel_id : undefined),
+    drain_id:c.drain_id || c.result?.drain_id || previous?.drain_id || (local?.request_id === c.request_id ? local.drain_id : undefined),
+    channel_count:c.channel_count || c.result?.channel_ids?.length || previous?.channel_count || (local?.request_id === c.request_id ? local.channel_count : undefined)};
   commands.set(id, c);
   const terminal = ["succeeded", "failed"].includes(c.state);
   if (terminal) {
     if (local?.request_id === c.request_id) pending.delete(key);
   } else if (!local || local.request_id === c.request_id) pending.set(key, c);
-  notice.textContent = `${c.instance}: ${c.action}${c.channel_id ? " · channel " + c.channel_id : ""} · ${c.state} (${c.request_id})${c.error ? ": " + c.error : ""}${c.action === "request_channel_unlink" && c.state === "succeeded" ? " — check channel ownership for release completion" : ""}`;
+  notice.textContent = `${c.instance}: ${c.action}${c.channel_id ? " · channel " + c.channel_id : ""}${c.drain_id ? " · drain " + c.drain_id : ""}${c.channel_count ? " · " + c.channel_count + " channels" : ""} · ${c.state} (${c.request_id})${c.error ? ": " + c.error : ""}${c.action === "request_channel_unlink" && c.state === "succeeded" ? " — check channel ownership for release completion" : ""}`;
   while (commands.size > 100) commands.delete(commands.keys().next().value);
   renderActivity();
   render();
@@ -281,6 +296,8 @@ function channelState(c) {
   const box = el("span");
   box.append(el("strong", value(c.state), state === "closing" ? "closing-state" : ""));
   if (c.retired) box.append(el("strong", " · Retired", "retired-state"));
+  if (c.drain?.state === "reserved")
+    box.append(el("strong", ` · Drain ${c.drain.drain_id?.slice(0, 12) || "reserved"}`, "drain-reserved"));
   return box;
 }
 function unlinkedChannels() {
@@ -307,6 +324,89 @@ function unlinkedChannels() {
       : el("span", "Ownership unavailable")
   ])));
   if(!entries.length) section.append(el("p","No unlinked channels."));
+  return section;
+}
+function drainGroupKey(process, state, channel) {
+  return JSON.stringify([process, state.generation, channel.relay_name, channel.mint_url, channel.unit]);
+}
+function relayDrains() {
+  const section = el("section", null, "mint");
+  section.id = "relay-drains";
+  section.append(
+    el("h2", "Channel drains"),
+    el("p", "Select eligible Closed channels from one relay, mint, and unit. Every selection is revalidated atomically before mint submission."),
+  );
+  const groups = new Map(), attempts = [];
+  for (const [process, state] of Object.entries(processes)) {
+    if (state.data?.kind !== "relays") continue;
+    for (const channel of state.data.wallet?.channels || []) {
+      if (channel.drain?.state !== "eligible") continue;
+      const key = drainGroupKey(process, state, channel);
+      if (!groups.has(key)) groups.set(key, {key, process, state, channels:[]});
+      groups.get(key).channels.push(channel);
+    }
+    for (const drain of state.data.wallet?.drains || []) attempts.push({process, state, drain});
+  }
+  for (const key of [...drainSelections.keys()]) {
+    const group = groups.get(key);
+    if (!group) {
+      drainSelections.delete(key);
+      continue;
+    }
+    const eligible = new Set(group.channels.map(channel => channel.channel_id));
+    const selected = drainSelections.get(key);
+    for (const id of [...selected]) if (!eligible.has(id)) selected.delete(id);
+  }
+  for (const group of groups.values()) {
+    group.channels.sort((a,b)=>a.channel_id.localeCompare(b.channel_id));
+    const first = group.channels[0], selected = drainSelections.get(group.key) || new Set();
+    drainSelections.set(group.key, selected);
+    const heading = el("h3", `${first.relay_name} · ${first.mint_url} · ${first.unit}`);
+    const summary = el("p", `${selected.size} selected · maximum ${MAX_DRAIN_CHANNELS} channels per drain`);
+    summary.className = "drain-selection-summary";
+    const rows = group.channels.map(channel => {
+      const checkbox = el("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = selected.has(channel.channel_id);
+      checkbox.disabled = !healthy(group.state) || (!checkbox.checked && selected.size >= MAX_DRAIN_CHANNELS) || instancePending(group.process, channel.relay_name, "drain_channels", {});
+      checkbox.setAttribute("aria-label", `Select channel ${channel.channel_id}`);
+      checkbox.onchange = event => {
+        if (event.currentTarget.checked) {
+          if (selected.size >= MAX_DRAIN_CHANNELS) return;
+          selected.add(channel.channel_id);
+        } else selected.delete(channel.channel_id);
+        render();
+      };
+      return [checkbox, shortId(channel.channel_id), channelAmount(channel.balance_raw, channel.unit), channelAmount(channel.capacity_raw, channel.unit)];
+    });
+    section.append(heading, summary, table(["Select", "Channel", `Paid (${first.unit})`, `Capacity (${first.unit})`], rows));
+    section.append(button(
+      `Drain selected (${selected.size})`,
+      group.process,
+      first.relay_name,
+      "drain_channels",
+      {channel_ids:[...selected].sort()},
+      selected.size > 0 && selected.size <= MAX_DRAIN_CHANNELS,
+    ));
+  }
+  if (!groups.size) section.append(el("p", "No eligible Closed channels."));
+  section.append(el("h3", "Drain attempts"));
+  attempts.sort((a,b)=>a.process.localeCompare(b.process) || a.drain.drain_id.localeCompare(b.drain.drain_id));
+  section.append(table(
+    ["Relay / process", "Drain", "State", "Mint / unit", "Input / output", "Channels", "Action"],
+    attempts.map(({process,state,drain})=>[
+      `${drain.relay_name} / ${process}${healthy(state) ? "" : " · Stale / unavailable"}`,
+      shortId(drain.drain_id),
+      drain.state,
+      `${drain.mint_url} / ${drain.unit}`,
+      `${wholeNumber(drain.input_amount_raw)} / ${wholeNumber(drain.output_amount_raw)}`,
+      drain.channel_ids?.length ?? "unavailable",
+      ["Prepared","Submitted","Finalizing"].includes(drain.state)
+        ? button("Resume drain", process, drain.relay_name, "recover_drain", {drain_id:drain.drain_id})
+        : el("span", "Completed"),
+    ]),
+  ));
+  if (!attempts.length) section.append(el("p", "No drain attempts."));
   return section;
 }
 function sessionPanel(h) {
@@ -648,12 +748,15 @@ function render() {
     const key = "unlinked"; seen.add(key);
     const next = unlinkedChannels(), old = cards.get(key);
     if(old) cards.set(key,update(old,next)); else {root.append(next); cards.set(key,next);}
+    const drainKey = "drains"; seen.add(drainKey);
+    const drains = relayDrains(), oldDrains = cards.get(drainKey);
+    if(oldDrains) cards.set(drainKey,update(oldDrains,drains)); else {root.append(drains); cards.set(drainKey,drains);}
     const order = [];
     for(const [process,state] of Object.entries(processes)) {
       if(state.data?.kind!=="relays") continue;
       for(const name of Object.keys(state.data.instances)) order.push(cards.get(JSON.stringify(["instance",process,name])));
     }
-    order.push(cards.get(key));
+    order.push(cards.get(key), cards.get(drainKey));
     for(const [process,state] of Object.entries(processes)) if(state.data?.kind==="relays") order.push(cards.get(JSON.stringify(["wallet",process])));
     order.forEach((card,index)=>{if(root.children[index]!==card) root.insertBefore(card,root.children[index] || null);});
   }
@@ -680,13 +783,23 @@ function renderActivity() {
     activity.append(
       el(
         "li",
-        `${c.process} / ${c.instance} · ${c.action} · ${c.state} · ${c.request_id}${c.channel_id ? " · channel " + c.channel_id : ""}${c.error ? " · " + c.error : ""}${c.result ? " · " + JSON.stringify(c.result) : ""}`,
+        `${c.process} / ${c.instance} · ${c.action} · ${c.state} · ${c.request_id}${c.channel_id ? " · channel " + c.channel_id : ""}${c.drain_id ? " · drain " + c.drain_id : ""}${c.channel_count ? " · " + c.channel_count + " channels" : ""}${c.error ? " · " + c.error : ""}${c.result ? " · " + JSON.stringify(c.result) : ""}`,
       ),
     );
+}
+function discardStaleOperations() {
+  for (const collection of [commands, pending]) {
+    for (const [key, command] of collection) {
+      const generation = processes[command.process]?.generation;
+      if (generation && generation !== command.generation)
+        collection.delete(key);
+    }
+  }
 }
 const stream = new EventSource("/v1/events");
 stream.addEventListener("reset", (e) => {
   processes = JSON.parse(e.data).processes;
+  discardStaleOperations();
   live = true;
   reconcileOperations();
   renderActivity();
@@ -696,10 +809,9 @@ stream.addEventListener("snapshot", (e) => {
   const u = JSON.parse(e.data);
   const before = processes[u.process];
   const previous = processes[u.process]?.generation;
-  if (previous && previous !== u.state.generation) {
-    for (const [key, c] of commands)
-      if (c.process === u.process && c.generation !== u.state.generation)
-        commands.delete(key);
+  if (previous !== u.state.generation) {
+    processes[u.process] = u.state;
+    discardStaleOperations();
     renderActivity();
   }
   processes[u.process] = u.state;
@@ -718,6 +830,8 @@ stream.addEventListener("operation_updated", (e) => {
       "set_control",
       "close_channel",
       "request_channel_unlink",
+      "drain_channels",
+      "recover_drain",
     ].includes(c.action)
   )
     return;

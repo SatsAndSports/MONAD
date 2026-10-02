@@ -224,6 +224,53 @@ async fn tcp_sse_aggregates_replays_forwards_and_survives_process_restart() {
         202
     );
     assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    let exact_channel_ids = (0..1024)
+        .map(|index| format!("{index:064x}"))
+        .collect::<Vec<_>>();
+    let large_request = json!({
+        "generation": generation,
+        "request_id": "large-drain",
+        "instance": "relay",
+        "action": "drain_channels",
+        "arguments": {"channel_ids": exact_channel_ids},
+    });
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/processes/live/commands"))
+            .json(&large_request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime.calls.load(Ordering::SeqCst) != 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let oversized = json!({
+        "generation": generation,
+        "request_id": "oversized",
+        "instance": "relay",
+        "action": "drain_channels",
+        "arguments": {"channel_ids": ["a".repeat(129 * 1024)]},
+    });
+    let response = client
+        .post(format!("{base}/v1/processes/live/commands"))
+        .json(&oversized)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(
+        error["error"],
+        "management command exceeds the 128 KiB request limit"
+    );
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
     drop(sse);
     let mut replay = client
         .get(format!("{base}/v1/events"))

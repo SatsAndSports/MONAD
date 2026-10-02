@@ -73,7 +73,11 @@ use monad_relay::payments::{
 };
 use monad_relay::quic_pool::QuicPool;
 use monad_relay::session_registry::SessionRegistry;
-use monad_relay::wallet_manager::{DrainSwapNetworking, RelayWalletManager, RelayWalletMintClient};
+use monad_relay::wallet_manager::{
+    DrainStartOutcome, DrainSwapNetworking, RelayWalletManager, RelayWalletMintClient,
+};
+use rusqlite::OptionalExtension;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::future::Future;
@@ -8795,6 +8799,188 @@ struct ConfiguredRouteFixtureConfig {
     label: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MintIoGateMode {
+    Idle,
+    SwapCommitThenFail,
+    SwapBlocked,
+    FailNextRestore,
+    RestoreBeforeExecution,
+    RestoreBlocked,
+}
+
+#[derive(Clone, Debug)]
+enum MintIoGateTarget {
+    Channel(String),
+    Drain(String),
+}
+
+#[derive(Debug)]
+struct MintIoGateState {
+    mode: MintIoGateMode,
+    target: Option<MintIoGateTarget>,
+}
+
+struct MintIoGate {
+    db_path: PathBuf,
+    state: Mutex<MintIoGateState>,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl MintIoGate {
+    fn new(db_path: PathBuf) -> Self {
+        Self {
+            db_path,
+            state: Mutex::new(MintIoGateState {
+                mode: MintIoGateMode::Idle,
+                target: None,
+            }),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn arm(&self, mode: MintIoGateMode, target: MintIoGateTarget) {
+        assert!(matches!(
+            mode,
+            MintIoGateMode::SwapCommitThenFail | MintIoGateMode::RestoreBeforeExecution
+        ));
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(
+            state.mode,
+            MintIoGateMode::Idle,
+            "mint I/O gate already armed"
+        );
+        assert_eq!(self.entered.available_permits(), 0);
+        assert_eq!(self.release.available_permits(), 0);
+        state.mode = mode;
+        state.target = Some(target);
+    }
+
+    fn expected_request_fingerprint(
+        &self,
+        mode: MintIoGateMode,
+        target: &MintIoGateTarget,
+    ) -> Option<[u8; 32]> {
+        let column = match mode {
+            MintIoGateMode::SwapCommitThenFail => "swap_request_json",
+            MintIoGateMode::FailNextRestore | MintIoGateMode::RestoreBeforeExecution => {
+                "restore_request_json"
+            }
+            _ => return None,
+        };
+        let conn = cdk_spilman::sqlite_durability::open_wallet_database(&self.db_path).unwrap();
+        let request: Option<String> = match target {
+            MintIoGateTarget::Channel(channel_id) => conn
+                .query_row(
+                    &format!(
+                        "SELECT d.{column} FROM monad_relay_drains d \
+                         JOIN monad_relay_drain_inputs i ON i.drain_id=d.drain_id \
+                         WHERE i.channel_id=?1"
+                    ),
+                    [channel_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap(),
+            MintIoGateTarget::Drain(drain_id) => conn
+                .query_row(
+                    &format!("SELECT {column} FROM monad_relay_drains WHERE drain_id=?1"),
+                    [drain_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap(),
+        };
+        request.map(|request| Sha256::digest(request.as_bytes()).into())
+    }
+
+    async fn wait_entered(&self) {
+        timeout(Duration::from_secs(5), self.entered.acquire())
+            .await
+            .expect("mint I/O gate was not entered")
+            .unwrap()
+            .forget();
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    async fn middleware(
+        self: Arc<Self>,
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let path = request.uri().path().to_string();
+        let (mode, target) = {
+            let state = self.state.lock().unwrap();
+            (state.mode, state.target.clone())
+        };
+        let candidate = matches!(
+            (path.as_str(), mode),
+            ("/v1/swap", MintIoGateMode::SwapCommitThenFail)
+                | ("/v1/restore", MintIoGateMode::FailNextRestore)
+                | ("/v1/restore", MintIoGateMode::RestoreBeforeExecution)
+        );
+        let request = if candidate {
+            let (parts, body) = request.into_parts();
+            let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+            let fingerprint: [u8; 32] = Sha256::digest(&body).into();
+            let matches_target = target
+                .as_ref()
+                .and_then(|target| self.expected_request_fingerprint(mode, target))
+                .is_some_and(|expected| expected == fingerprint);
+            let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(body));
+            if !matches_target {
+                return next.run(request).await;
+            }
+            request
+        } else {
+            request
+        };
+        if path == "/v1/swap" && mode == MintIoGateMode::SwapCommitThenFail {
+            self.state.lock().unwrap().mode = MintIoGateMode::SwapBlocked;
+            let response = next.run(request).await;
+            assert!(response.status().is_success());
+            self.entered.add_permits(1);
+            timeout(Duration::from_secs(10), self.release.acquire())
+                .await
+                .expect("swap response gate release timed out")
+                .unwrap()
+                .forget();
+            self.state.lock().unwrap().mode = MintIoGateMode::FailNextRestore;
+            return axum::response::Response::builder()
+                .status(503)
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+        if path == "/v1/restore" && mode == MintIoGateMode::FailNextRestore {
+            let mut state = self.state.lock().unwrap();
+            state.mode = MintIoGateMode::Idle;
+            state.target = None;
+            return axum::response::Response::builder()
+                .status(503)
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+        if path == "/v1/restore" && mode == MintIoGateMode::RestoreBeforeExecution {
+            self.state.lock().unwrap().mode = MintIoGateMode::RestoreBlocked;
+            self.entered.add_permits(1);
+            timeout(Duration::from_secs(10), self.release.acquire())
+                .await
+                .expect("restore request gate release timed out")
+                .unwrap()
+                .forget();
+            let mut state = self.state.lock().unwrap();
+            state.mode = MintIoGateMode::Idle;
+            state.target = None;
+        }
+        next.run(request).await
+    }
+}
+
 struct ConfiguredRouteFixture {
     wallet_manager: Arc<RelayWalletManager>,
     _temp_dir: tempfile::TempDir,
@@ -8810,6 +8996,7 @@ struct ConfiguredRouteFixture {
     relay_handles: Vec<JoinHandle<io::Result<()>>>,
     relay_shutdown_txs: Vec<tokio::sync::oneshot::Sender<()>>,
     mint_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    mint_io_gate: Arc<MintIoGate>,
 }
 
 impl ConfiguredRouteFixture {
@@ -8841,13 +9028,27 @@ impl ConfiguredRouteFixture {
         let upper_addr = upper_listener.local_addr().unwrap();
         tokio::spawn(run_uppercase_server(upper_listener));
 
+        let temp_dir = tempfile::tempdir().unwrap();
+        let relay_db_path = temp_dir.path().join("relay.db");
+        let loose_db_path = temp_dir.path().join("client-loose.db");
+        let channel_db_path = temp_dir.path().join("client-channel.db");
+        let config_path = temp_dir.path().join("monad.yaml");
+
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint_listener = TcpListener::bind(SocketAddr::from(([127, 10, subnet, 20], 0)))
             .await
             .unwrap();
         let mint_addr = mint_listener.local_addr().unwrap();
         let mint_url = format!("http://127.10.{subnet}.20:{}", mint_addr.port());
-        let mint_router = build_router(mint_helper.mint()).await.unwrap();
+        let mint_io_gate = Arc::new(MintIoGate::new(relay_db_path.clone()));
+        let mint_router =
+            build_router(mint_helper.mint())
+                .await
+                .unwrap()
+                .layer(axum::middleware::from_fn({
+                    let mint_io_gate = mint_io_gate.clone();
+                    move |request, next| mint_io_gate.clone().middleware(request, next)
+                }));
         let (mint_shutdown_tx, mint_shutdown_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             axum::serve(mint_listener, mint_router)
@@ -8857,12 +9058,6 @@ impl ConfiguredRouteFixture {
                 .await
                 .unwrap();
         });
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let relay_db_path = temp_dir.path().join("relay.db");
-        let loose_db_path = temp_dir.path().join("client-loose.db");
-        let channel_db_path = temp_dir.path().join("client-channel.db");
-        let config_path = temp_dir.path().join("monad.yaml");
 
         let mut input_proofs = Vec::new();
         for _ in 0..fixture_config.proof_batches {
@@ -9025,6 +9220,7 @@ relays:
             relay_handles,
             relay_shutdown_txs,
             mint_shutdown_tx: Some(mint_shutdown_tx),
+            mint_io_gate,
         }
     }
 
@@ -12385,7 +12581,7 @@ async fn test_wallet_manager_exact_drain_rejects_invalid_sets_without_partial_re
         .drain_closed_channels_by_id_to_swap("exact-validation-relay", &oversized, &net)
         .await
         .unwrap_err();
-    assert!(oversized.contains("1024-channel limit"));
+    assert!(oversized.contains("maximum is 1024"));
     let missing = ctx
         .wallet_manager
         .drain_closed_channels_by_id_to_swap(
@@ -12508,19 +12704,24 @@ async fn test_wallet_manager_exact_drain_reservation_survives_ambiguous_submissi
     let ch2 = ctx.create_closed_channel([47u8; 32], 250).await;
     let net = ctx.net_for(&ch1);
 
-    let error = ctx
+    let outcome = ctx
         .wallet_manager
-        .drain_closed_channels_by_id_to_swap(
+        .drain_closed_channels_by_id_to_swap_with_outcome(
             "exact-reservation-relay",
             std::slice::from_ref(&ch1),
             &DropAfterSwap { inner: &net },
         )
         .await
-        .unwrap_err();
+        .unwrap();
+    let (drain_id, error) = match outcome {
+        DrainStartOutcome::RecoveryRequired { drain, error } => {
+            assert_eq!(drain.state, "Submitted");
+            assert_eq!(drain.channel_ids, vec![ch1.clone()]);
+            (drain.drain_id, error)
+        }
+        DrainStartOutcome::Completed(_) => panic!("ambiguous submission unexpectedly completed"),
+    };
     assert!(error.contains("submitted"));
-    let drain_id = ctx.wallet_manager.list_drains().unwrap()[0]
-        .drain_id
-        .clone();
     let overlap = ctx
         .wallet_manager
         .drain_closed_channels_by_id_to_swap(
@@ -12824,16 +13025,44 @@ async fn test_wallet_manager_drain_restore_checks_output_identities() {
 async fn test_drain_singleflight_and_cancellation_preserve_immutable_request() {
     let ctx = DrainTestContext::new("drain-singleflight").await;
     let channel = ctx.create_closed_channel([31; 32], 450).await;
+    let independent = ctx.create_closed_channel([32; 32], 225).await;
     let pending = PendingDrainSwap(tokio::sync::Notify::new());
-    let mut submit = Box::pin(ctx.wallet_manager.drain_closed_channels_to_swap(
-        "drain-singleflight",
-        &ctx.mint_url,
-        "sat",
-        &pending,
-        None,
-    ));
+    let mut submit = Box::pin(
+        ctx.wallet_manager
+            .drain_closed_channels_by_id_to_swap_with_outcome(
+                "drain-singleflight",
+                std::slice::from_ref(&channel),
+                &pending,
+            ),
+    );
     tokio::select! { _ = pending.0.notified() => {}, result = &mut submit => panic!("unexpected drain completion: {}", result.is_ok()) }
-    let id = ctx.wallet_manager.list_drains().unwrap()[0]
+    let overlap = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "drain-singleflight",
+            &[channel.clone(), independent.clone()],
+            &ctx.net_for(&independent),
+        )
+        .await
+        .unwrap_err();
+    assert!(overlap.contains("already reserved"));
+    let independent_result = ctx
+        .wallet_manager
+        .drain_closed_channels_by_id_to_swap(
+            "drain-singleflight",
+            std::slice::from_ref(&independent),
+            &ctx.net_for(&independent),
+        )
+        .await
+        .unwrap();
+    assert_eq!(independent_result.channel_ids, vec![independent]);
+    let id = ctx
+        .wallet_manager
+        .list_drains()
+        .unwrap()
+        .into_iter()
+        .find(|drain| drain.channel_ids == vec![channel.clone()])
+        .unwrap()
         .drain_id
         .clone();
     assert!(ctx

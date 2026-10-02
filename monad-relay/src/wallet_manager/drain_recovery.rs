@@ -93,7 +93,7 @@ impl RelayWalletManager {
         &self,
         selection: DrainSelection,
         net: &N,
-    ) -> Result<DrainSwapResult, String> {
+    ) -> Result<DrainStartOutcome, String> {
         self.require_drain_authority()?;
         let DrainSelection {
             relay_name: relay,
@@ -145,49 +145,64 @@ impl RelayWalletManager {
             completed: false,
         };
         self.verify_drain_journal(&journal)?;
-        let mut conn = cdk_spilman::sqlite_durability::open_wallet_database(self.db_path())
-            .map_err(|e| e.to_string())?;
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let attempt = &journal.attempts[0];
-        let keyset = cdk_spilman::parse_keyset_info_from_json(&attempt.keys)?;
-        tx.execute("INSERT INTO monad_relay_drains (drain_id,relay_name,mint_url,unit,state,input_amount_raw,output_amount_raw,swap_request_json,restore_request_json,output_secrets_json,output_keyset_id,output_keyset_info_json,created_at) VALUES (?1,?2,?3,?4,'Prepared',?5,?6,?7,?8,?9,?10,?11,?12)", params![journal.drain_id, journal.relay, journal.mint, journal.unit, i64_from_u64(total)?, i64_from_u64(attempt.output_amount)?, attempt.prepared.swap_request_json, attempt.prepared.restore_request_json, attempt.prepared.output_secrets_json, keyset.keyset_id.to_string(), attempt.keys, i64_from_u64(now_seconds())?]).map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO monad_relay_drain_journals VALUES (?1, ?2)",
-            params![journal.drain_id, encode(&journal)?],
-        )
-        .map_err(|e| e.to_string())?;
-        for input in &journal.inputs {
+        {
+            let mut conn = cdk_spilman::sqlite_durability::open_wallet_database(self.db_path())
+                .map_err(|e| e.to_string())?;
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let attempt = &journal.attempts[0];
+            let keyset = cdk_spilman::parse_keyset_info_from_json(&attempt.keys)?;
+            tx.execute("INSERT INTO monad_relay_drains (drain_id,relay_name,mint_url,unit,state,input_amount_raw,output_amount_raw,swap_request_json,restore_request_json,output_secrets_json,output_keyset_id,output_keyset_info_json,created_at) VALUES (?1,?2,?3,?4,'Prepared',?5,?6,?7,?8,?9,?10,?11,?12)", params![journal.drain_id, journal.relay, journal.mint, journal.unit, i64_from_u64(total)?, i64_from_u64(attempt.output_amount)?, attempt.prepared.swap_request_json, attempt.prepared.restore_request_json, attempt.prepared.output_secrets_json, keyset.keyset_id.to_string(), attempt.keys, i64_from_u64(now_seconds())?]).map_err(|e| e.to_string())?;
             tx.execute(
-                "INSERT INTO monad_relay_drain_inputs VALUES (?1,?2,?3,?4)",
-                params![
-                    journal.drain_id,
-                    input.channel_id,
-                    i64_from_u64(input.receiver_sum_raw)?,
-                    input.receiver_proofs_json
-                ],
+                "INSERT INTO monad_relay_drain_journals VALUES (?1, ?2)",
+                params![journal.drain_id, encode(&journal)?],
             )
             .map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT INTO monad_relay_drained_channels VALUES (?1,?2)",
-                params![input.channel_id, journal.drain_id],
-            )
-            .map_err(|error| match &error {
-                rusqlite::Error::SqliteFailure(failure, _)
-                    if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    format!(
-                        "channel {} was concurrently reserved by another drain",
-                        input.channel_id
-                    )
-                }
-                _ => error.to_string(),
-            })?;
+            for input in &journal.inputs {
+                tx.execute(
+                    "INSERT INTO monad_relay_drain_inputs VALUES (?1,?2,?3,?4)",
+                    params![
+                        journal.drain_id,
+                        input.channel_id,
+                        i64_from_u64(input.receiver_sum_raw)?,
+                        input.receiver_proofs_json
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO monad_relay_drained_channels VALUES (?1,?2)",
+                    params![input.channel_id, journal.drain_id],
+                )
+                .map_err(|error| match &error {
+                    rusqlite::Error::SqliteFailure(failure, _)
+                        if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        format!(
+                            "channel {} was concurrently reserved by another drain",
+                            input.channel_id
+                        )
+                    }
+                    _ => error.to_string(),
+                })?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())?;
         #[cfg(feature = "funds-lifecycle-test")]
         crate::lifecycle_test::boundary("drain-prepared");
-        self.run_exact_drain(&journal.drain_id, net, false, Some(flight))
+        let drain_id = journal.drain_id.clone();
+        match self
+            .run_exact_drain(&drain_id, net, false, Some(flight))
             .await
+        {
+            Ok(result) => Ok(DrainStartOutcome::Completed(result)),
+            Err(error) => {
+                let drain = self
+                    .list_drains()?
+                    .into_iter()
+                    .find(|drain| drain.drain_id == drain_id)
+                    .ok_or("persisted drain unavailable after execution failure")?;
+                Ok(DrainStartOutcome::RecoveryRequired { drain, error })
+            }
+        }
     }
 
     fn verify_drain_journal(&self, journal: &Journal) -> Result<(), String> {

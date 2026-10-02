@@ -16,6 +16,46 @@ async fn snapshot(client: &reqwest::Client) -> Value {
     .unwrap()
 }
 
+async fn submit_command(
+    client: &reqwest::Client,
+    generation: &Value,
+    id: &str,
+    instance: &str,
+    action: &str,
+    arguments: Value,
+    base: &str,
+) {
+    let response = client.post(format!("{base}/commands")).json(&json!({
+        "generation": generation, "request_id": id, "instance": instance, "action": action, "arguments": arguments,
+    })).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+}
+
+async fn operation(client: &reqwest::Client, id: &str, base: &str) -> Value {
+    client
+        .get(format!("{base}/operations/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn wait_operation(client: &reqwest::Client, id: &str, base: &str) -> Value {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let operation = operation(client, id, base).await;
+            match operation["state"].as_str().unwrap() {
+                "succeeded" | "failed" => return operation,
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
 async fn command(
     client: &reqwest::Client,
     generation: &Value,
@@ -25,29 +65,13 @@ async fn command(
     arguments: Value,
     base: &str,
 ) -> Value {
-    let response = client.post(format!("{base}/commands")).json(&json!({
-        "generation": generation, "request_id": id, "instance": instance, "action": action, "arguments": arguments,
-    })).send().await.unwrap();
-    assert_eq!(response.status(), 202);
-    timeout(Duration::from_secs(30), async {
-        loop {
-            let result: Value = client
-                .get(format!("{base}/operations/{id}"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            match result["state"].as_str().unwrap() {
-                "succeeded" => return result["result"].clone(),
-                "failed" => panic!("management command failed: {result}"),
-                _ => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        }
-    })
-    .await
-    .unwrap()
+    submit_command(client, generation, id, instance, action, arguments, base).await;
+    let operation = wait_operation(client, id, base).await;
+    assert_eq!(
+        operation["state"], "succeeded",
+        "management command failed: {operation}"
+    );
+    operation["result"].clone()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -215,10 +239,14 @@ async fn tcp_sse_api_drives_real_manual_funding_disable_and_channel_close() {
     assert!(!public.contains(&fixture.sender_secret_hex));
     assert!(!public.contains("proof_json"));
     let name = fixture.relay_names[0].clone();
+    let other_name = "management-api-other-relay".to_string();
     // Reuse the actual wallet's close path. Admission controls are exercised by
     // the listener-specific integration test; this endpoint tests wallet actions.
     let backend = Arc::new(monad_relay::management::RelayBackend::new(
-        BTreeMap::from([(name.clone(), Arc::new(SessionRegistry::new()))]),
+        BTreeMap::from([
+            (name.clone(), Arc::new(SessionRegistry::new())),
+            (other_name.clone(), Arc::new(SessionRegistry::new())),
+        ]),
         fixture.wallet_manager.clone(),
     ));
     let (stop_relay_api, stopped_relay_api) = tokio::sync::oneshot::channel();
@@ -246,6 +274,226 @@ async fn tcp_sse_api_drives_real_manual_funding_disable_and_channel_close() {
         fixture.wallet_manager.list_channels(Some(&name)).unwrap()[0].state,
         cdk_spilman::ChannelState::Closed
     );
+
+    command(
+        &http,
+        &generation,
+        "enable-again",
+        "local",
+        "set_enabled",
+        json!({"enabled": true}),
+        &client_base,
+    )
+    .await;
+    let replacement_session = timeout(Duration::from_secs(10), async {
+        loop {
+            let view = snapshot(&client).await;
+            if let Some(hop) = view["data"]["instances"]["local"]["hops"]
+                .as_array()
+                .and_then(|hops| {
+                    hops.iter()
+                        .find(|hop| hop["funding"]["state"] == "waiting_for_manual_funding")
+                })
+            {
+                break hop["session_id"].as_str().unwrap().to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    command(
+        &http,
+        &generation,
+        "fund-again",
+        "local",
+        "provision_channel",
+        json!({"session_id": replacement_session}),
+        &client_base,
+    )
+    .await;
+    assert_eq!(
+        configured_client_socks_roundtrip(
+            fixture.socks_listen,
+            fixture.upper_addr,
+            b"before online drain"
+        )
+        .await
+        .unwrap(),
+        b"BEFORE ONLINE DRAIN"
+    );
+
+    fixture.mint_io_gate.arm(
+        MintIoGateMode::SwapCommitThenFail,
+        MintIoGateTarget::Channel(channel.to_string()),
+    );
+    let mint_url = &fixture.config.relays[0].trusted_mints[0].url;
+    assert!(
+        !http
+            .post(format!("{mint_url}/v1/swap"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success(),
+        "an unrelated swap request should bypass the armed drain gate"
+    );
+    submit_command(
+        &http,
+        &view["generation"],
+        "drain",
+        &name,
+        "drain_channels",
+        json!({"channel_ids": [channel]}),
+        &relay_base,
+    )
+    .await;
+    fixture.mint_io_gate.wait_entered().await;
+    assert_eq!(
+        operation(&http, "drain", &relay_base).await["state"],
+        "running"
+    );
+    for _ in 0..4 {
+        assert_eq!(
+            timeout(
+                Duration::from_secs(5),
+                configured_client_socks_roundtrip(
+                    fixture.socks_listen,
+                    fixture.upper_addr,
+                    b"during online drain"
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            b"DURING ONLINE DRAIN"
+        );
+    }
+    assert_eq!(
+        operation(&http, "drain", &relay_base).await["state"],
+        "running"
+    );
+    fixture.mint_io_gate.release();
+    let drain_operation = wait_operation(&http, "drain", &relay_base).await;
+    assert_eq!(drain_operation["state"], "succeeded");
+    let drained = &drain_operation["result"];
+    assert_eq!(drained["state"], "Submitted");
+    assert_eq!(drained["channel_ids"], json!([channel]));
+    assert_eq!(drained["recovery_required"], true);
+    let drain_id = drained["drain_id"].as_str().unwrap().to_string();
+    let public = drained.to_string();
+    assert!(!public.contains("proof"));
+    assert!(!public.contains("secret"));
+    assert!(!public.contains("swap_request"));
+    assert!(!public.contains("restore_request"));
+    let relay_view = snapshot(&relay).await;
+    assert_eq!(
+        relay_view["data"]["wallet"]["drains"][0]["state"],
+        "Submitted"
+    );
+    assert_eq!(
+        relay_view["data"]["wallet"]["drains"][0]["channel_ids"],
+        json!([channel])
+    );
+    assert_eq!(
+        relay_view["data"]["wallet"]["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["channel_id"] == channel)
+            .unwrap()["drain"]["state"],
+        "reserved"
+    );
+
+    submit_command(
+        &http,
+        &view["generation"],
+        "wrong-relay-recovery",
+        &other_name,
+        "recover_drain",
+        json!({"drain_id": drain_id}),
+        &relay_base,
+    )
+    .await;
+    let wrong_relay = wait_operation(&http, "wrong-relay-recovery", &relay_base).await;
+    assert_eq!(wrong_relay["state"], "failed");
+    assert_eq!(wrong_relay["error"], "drain is not owned by this relay");
+
+    fixture.mint_io_gate.arm(
+        MintIoGateMode::RestoreBeforeExecution,
+        MintIoGateTarget::Drain(drain_id.clone()),
+    );
+    assert!(
+        !http
+            .post(format!("{mint_url}/v1/restore"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success(),
+        "an unrelated restore request should bypass the armed drain gate"
+    );
+    submit_command(
+        &http,
+        &view["generation"],
+        "recover-drain",
+        &name,
+        "recover_drain",
+        json!({"drain_id": drain_id}),
+        &relay_base,
+    )
+    .await;
+    fixture.mint_io_gate.wait_entered().await;
+    assert_eq!(
+        operation(&http, "recover-drain", &relay_base).await["state"],
+        "running"
+    );
+    for _ in 0..4 {
+        assert_eq!(
+            timeout(
+                Duration::from_secs(5),
+                configured_client_socks_roundtrip(
+                    fixture.socks_listen,
+                    fixture.upper_addr,
+                    b"during online drain recovery"
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            b"DURING ONLINE DRAIN RECOVERY"
+        );
+    }
+    assert_eq!(
+        operation(&http, "recover-drain", &relay_base).await["state"],
+        "running"
+    );
+    fixture.mint_io_gate.release();
+    let recovery_operation = wait_operation(&http, "recover-drain", &relay_base).await;
+    assert_eq!(recovery_operation["state"], "succeeded");
+    let recovered = &recovery_operation["result"];
+    assert_eq!(recovered["state"], "Completed");
+    assert_eq!(recovered["channel_ids"], json!([channel]));
+    assert_eq!(recovered["recovered"], true);
+    assert_eq!(recovered["recovery_required"], false);
+    let final_view = snapshot(&relay).await;
+    assert_eq!(
+        final_view["data"]["wallet"]["drains"][0]["state"],
+        "Completed"
+    );
+    for field in [
+        "output_proofs_json",
+        "output_secret",
+        "swap_request",
+        "restore_request",
+    ] {
+        assert!(!final_view["operation_events"].to_string().contains(field));
+        assert!(!final_view["data"]["instances"][&name]["events"]
+            .to_string()
+            .contains(field));
+    }
     stop_api.send(()).unwrap();
     api_task.await.unwrap().unwrap();
     stop_client.send(()).unwrap();

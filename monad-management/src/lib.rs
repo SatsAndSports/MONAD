@@ -1,12 +1,13 @@
 //! Headless process management protocol and bounded operation ownership.
 use axum::{
-    extract::{Path, Query, State},
+    extract::{rejection::JsonRejection, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -16,6 +17,9 @@ use tokio::sync::mpsc;
 
 pub mod aggregate;
 pub mod events;
+
+pub const COMMAND_BODY_LIMIT: usize = 128 * 1024;
+const MAX_OPERATIONS: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +38,8 @@ pub struct Operation {
     pub state: String,
     pub result: Option<Value>,
     pub error: Option<String>,
+    #[serde(skip)]
+    request_fingerprint: [u8; 32],
 }
 
 #[async_trait::async_trait]
@@ -69,18 +75,18 @@ mod admission_tests {
             arguments: json!({}),
         };
         for id in 0..64 {
-            let _ = command(State(service.clone()), Json(request(id)))
+            let _ = command(State(service.clone()), Ok(Json(request(id))))
                 .await
                 .unwrap();
         }
-        let (status, body) = command(State(service.clone()), Json(request(64)))
+        let (status, body) = command(State(service.clone()), Ok(Json(request(64))))
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["code"], "command_not_admitted");
         assert!(!service.operations.lock().unwrap().contains_key("64"));
         receiver.recv().await.unwrap();
-        let _ = command(State(service.clone()), Json(request(64)))
+        let _ = command(State(service.clone()), Ok(Json(request(64))))
             .await
             .unwrap();
         assert!(service.operations.lock().unwrap().contains_key("64"));
@@ -116,7 +122,7 @@ impl Service {
             .route("/v1/commands", post(command))
             .route("/v1/operations/{id}", get(operation))
             .with_state(self.clone())
-            .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
+            .layer(axum::extract::DefaultBodyLimit::max(COMMAND_BODY_LIMIT))
     }
 
     /// Owned bounded executor, independent of HTTP request lifetimes. Disable
@@ -215,8 +221,18 @@ async fn snapshot(
 
 async fn command(
     State(service): State<Arc<Service>>,
-    Json(command): Json<Command>,
+    payload: Result<Json<Command>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
+    let Json(command) = payload.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "management command exceeds the 128 KiB request limit",
+            )
+        } else {
+            error(StatusCode::BAD_REQUEST, "invalid management command JSON")
+        }
+    })?;
     if command.generation != service.generation {
         return Err(error(StatusCode::CONFLICT, "stale process generation"));
     }
@@ -226,9 +242,14 @@ async fn command(
             "request_id must be 1..128 bytes",
         ));
     }
+    let request_fingerprint = Sha256::digest(
+        serde_json::to_vec(&command)
+            .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid management command JSON"))?,
+    )
+    .into();
     let mut operations = service.operations.lock().unwrap();
     if let Some(existing) = operations.get(&command.request_id) {
-        if existing.request != command {
+        if existing.request_fingerprint != request_fingerprint {
             return Err(error(
                 StatusCode::CONFLICT,
                 "request_id already used for a different command",
@@ -238,17 +259,25 @@ async fn command(
     }
     // Never evict idempotency records and accidentally replay a money operation.
     // This deliberately bounded alpha service refuses new commands when full.
-    if operations.len() >= 4096 {
+    if operations.len() >= MAX_OPERATIONS {
         return Err(error(
             StatusCode::TOO_MANY_REQUESTS,
             "operation history capacity reached",
         ));
     }
+    let public_request = Command {
+        generation: command.generation.clone(),
+        request_id: command.request_id.clone(),
+        instance: command.instance.clone(),
+        action: command.action.clone(),
+        arguments: Value::Null,
+    };
     let op = Operation {
-        request: command.clone(),
+        request: public_request,
         state: "queued".into(),
         result: None,
         error: None,
+        request_fingerprint,
     };
     service.commands.try_send(command.clone()).map_err(|_| {
         (

@@ -113,7 +113,7 @@ The normal recipes were then rerun successfully with their repository-defined li
   remain in transport logs. The monitored traffic test is a correctness/load
   check, not a controlled before/after CPU or latency benchmark.
 - Event rings are transient and bounded to 512 entries. Operations retain at most
-  4,096 idempotency records per process lifetime; capacity exhaustion is explicit.
+  512 idempotency records per process lifetime; capacity exhaustion is explicit.
 - Wallet categories are shown separately. Historical spent proofs and channel
   capacities must not be added to spendable balances. The API never exports proofs
   or secret-bearing recovery requests and never automatically replays management

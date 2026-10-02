@@ -563,6 +563,14 @@ rejected without migration, reinterpretation, or deletion. Read-only inspection
 remains available. Failed development fixtures require an explicit operator
 decision before any reset.
 
+The relay management backend uses runtime-owner authority for `drain_channels`
+with an exact channel-ID list and `recover_drain` with a durable drain ID. These
+online operations do not stop listeners, sessions, or data traffic. Their public
+snapshots, events, and operation results contain only aggregate amounts, channel
+IDs, state, and recovery metadata; persisted proofs, secrets, requests, and journal
+payloads remain private. The wallet CLI remains selector-based and requires offline
+exclusive maintenance authority.
+
 ### Relay Close Recovery
 
 Close journal version 1 binds the normalized relay DB path, wallet name, receiver,

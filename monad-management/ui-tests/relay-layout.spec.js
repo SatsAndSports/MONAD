@@ -50,6 +50,6 @@ test("relay channels partition by linkage, preserve Closing, and compact Closed"
     await page.evaluate(state=>stream.dispatchEvent(new MessageEvent("snapshot",{data:JSON.stringify({process:"relays",state})})),state);
     await expect(page.locator('[data-instance="exit"]')).toContainText("Details unavailable");
     await expect(page.getByText("No wallet channels.",{exact:true})).toBeVisible();
-    expect(await page.locator("#instances > section, #instances > article").evaluateAll(nodes=>nodes.map(n=>n.querySelector("h2").textContent))).toEqual(["exit","Unlinked channels","relays · wallet inventory"]);
+    expect(await page.locator("#instances > section, #instances > article").evaluateAll(nodes=>nodes.map(n=>n.querySelector("h2").textContent))).toEqual(["exit","Unlinked channels","Channel drains","relays · wallet inventory"]);
   } finally {await demo.stop();}
 });

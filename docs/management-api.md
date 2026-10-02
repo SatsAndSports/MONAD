@@ -130,6 +130,11 @@ interface; the public aggregator binds loopback only. Do not configure `auth_tok
 - `GET /v1/operations/{request_id}`: read `queued`, `running`, `succeeded`, or
   `failed`, with a public `result` or `error`.
 
+Command bodies are limited to 128 KiB at both the aggregator and process endpoint.
+An oversized body returns HTTP 413 with a JSON error. This accommodates a maximum
+exact drain selection of 1,024 hexadecimal channel IDs without raising limits for
+the snapshot or event endpoints.
+
 Example snapshot:
 
 ```sh
@@ -161,10 +166,12 @@ its submission lock. An unclassified 503, other ambiguous server error, or lost
 response does not establish rejection and remains pending for reconciliation.
 
 The executor owns commands independently of HTTP connections. At most 16 execute
-concurrently, with 64 queued. Each process retains at most 4096 operation records;
+concurrently, with 64 queued. Each process retains at most 512 operation records;
 after that, new commands are refused rather than evicting idempotency records and
 allowing accidental replay. A process restart creates a fresh generation, does not
 replay management commands, and retains the wallet's existing durable recovery.
+Retained operations expose a redacted request with `arguments: null` and keep only
+a SHA-256 fingerprint of the original request for exact idempotency comparison.
 
 ### Client actions
 
@@ -219,6 +226,8 @@ request must not be used to replace it. Inspect hop funding/error state.
 | `set_control` | `field`: one of `enabled`, `accept_new_sessions`, `accept_new_tunnels`, `accept_new_channels`; `enabled`: boolean | Atomically changes only this field. Disable awaits owned work cleanup; admission updates are synchronous. |
 | `request_channel_unlink` | `{"channel_id": "..."}` | Persists retirement (no new links), asks the owning session to release, and reports `session_id` and `release_requested`. The channel stays Open. |
 | `close_channel` | `{"channel_id": "..."}` | Uses the owning relay's journaled close/recovery path. Rejected while any session still owns the channel; use `request_channel_unlink` first. |
+| `drain_channels` | `{"channel_ids": ["...", "..."]}` | Atomically validates and drains an exact nonempty selection of at most 1,024 eligible Closed channels belonging to this relay and one mint/unit. |
+| `recover_drain` | `{"drain_id": "..."}` | Resumes the selected relay's durable Prepared, Submitted, or Finalizing drain attempt; Completed recovery is idempotent. |
 
 `request_channel_unlink` retires the channel in the relay's persisted wallet, so
 it cannot be relinked — including after a relay restart — while any in-flight
@@ -236,6 +245,18 @@ Close results distinguish `closed`, `sender_refunded`, and `unresolved_spent`.
 The last is not successful settlement. No proof payloads are returned. A close
 failure requires inspecting/recovering the stored channel, not blindly spending
 again. Snapshot expiry records include absolute expiry and seconds remaining.
+
+Drain snapshots project each channel as `eligible`, `reserved` (with its public
+`drain_id`), `ineligible`, or `unavailable`, and list durable attempts with their
+selected channel IDs and aggregate raw amounts. Drain `input_amount_raw` and
+`output_amount_raw` are decimal strings so clients do not lose integer precision.
+Proofs, output secrets, swap and
+restore requests, and journal payloads are never included. A submission whose mint
+outcome is ambiguous completes the management operation with
+`recovery_required: true`, its durable `drain_id`, and the persisted attempt state;
+the operator must use `recover_drain`, not start a replacement drain. Distinct
+request IDs may execute concurrently. Atomic channel reservations make overlapping
+selections fail without partially reserving the losing selection.
 
 ### Test-mint actions
 

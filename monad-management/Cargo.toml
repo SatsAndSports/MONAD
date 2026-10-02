@@ -15,6 +15,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 rand = "0.9"
 hex = "0.4"
+sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 
 [dev-dependencies]
