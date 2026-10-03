@@ -192,8 +192,14 @@ Playwright uses real process wallets/mints, actual SOCKS traffic, and API snapsh
 alongside DOM assertions. The combined tests cover manual hop provisioning,
 shared-tab activity, refresh, automatic funding, all relay admission controls,
 enable/disable, channel closure, mint rotation before new funding, aggregator
-disconnect/reconnect, relay restart, and empty-wallet top-up recovery. Chromium is
-the automated browser target. These tests are separate from ordinary `cargo test`.
+disconnect/reconnect, relay restart, and empty-wallet top-up recovery. The online
+drain crash scenario places an opt-in reverse proxy in front of the real configured
+test mint, holds a successful swap response after mint commit, kills and restarts
+the relay process on the same wallet, and resumes the durable drain through the
+browser while the configured client recovers traffic. It also checks process
+generation invalidation, exact-once restore, and permanent source-channel
+reservation. Chromium is the automated browser target. These tests are separate
+from ordinary `cargo test`.
 
 The real new-channel admission scenario also found and guards a SQLite-store bug:
 upstream default state `Open` must not make an unknown channel count as a stored

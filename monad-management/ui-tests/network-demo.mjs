@@ -1,11 +1,11 @@
-import { mkdir, mkdtemp, open, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
-import { createServer as httpServer } from "node:http";
+import { createServer as httpServer, request as httpRequest } from "node:http";
 import { createECDH, randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
 import {
@@ -23,6 +23,7 @@ export async function startNetworkDemo({
   channelFundingMsats = 30000,
   targetTopupMsats = 500,
   minimumTopupMsats = 500,
+  mintProxy = false,
 } = {}) {
   if (!Number.isSafeInteger(sats) || sats < 0 || sats > 100000000)
     throw Error("MONAD_DEMO_SATS must be 0..100000000");
@@ -61,12 +62,17 @@ export async function startNetworkDemo({
       throw error;
     }
   };
-  let apiReservation, socksReservation, socks2Reservation, mintReservation;
+  let apiReservation,
+    socksReservation,
+    socks2Reservation,
+    mintReservation,
+    mintBackendReservation;
   try {
     apiReservation = await reserve(reserveTcpPort, managementPort);
     socksReservation = await reserve(reserveTcpPort, socksPort);
     socks2Reservation = await reserve(reserveTcpPort, socks2Port);
     mintReservation = await reserve(reserveTcpPort);
+    if (mintProxy) mintBackendReservation = await reserve(reserveTcpPort);
   } catch (error) {
     await releaseReservations([...liveReservations]);
     throw error;
@@ -74,7 +80,8 @@ export async function startNetworkDemo({
   const api = apiReservation.port,
     socks = socksReservation.port,
     socks2 = socks2Reservation.port,
-    mintPort = mintReservation.port;
+    mintPort = mintReservation.port,
+    mintBackendPort = mintBackendReservation?.port ?? mintPort;
   const url = `http://127.0.0.1:${api}`,
     mintUrl = `http://127.0.0.1:${mintPort}`;
   const children = [];
@@ -82,6 +89,66 @@ export async function startNetworkDemo({
   const target = httpServer((req, res) =>
     res.end("MONAD local demo traffic. ".repeat(4096)),
   );
+  const mintRequestCounts = new Map();
+  let mintGate;
+  const mintProxyServer = mintProxy
+    ? httpServer((request, response) => {
+        const chunks = [];
+        let size = 0;
+        request.on("data", (chunk) => {
+          size += chunk.length;
+          if (size > 1024 * 1024) request.destroy(Error("Mint proxy request too large"));
+          else chunks.push(chunk);
+        });
+        request.on("error", (error) => {
+          if (!response.headersSent) response.writeHead(502);
+          response.end(error.message);
+        });
+        request.on("end", () => {
+          const pathname = new URL(request.url, mintUrl).pathname;
+          mintRequestCounts.set(pathname, (mintRequestCounts.get(pathname) ?? 0) + 1);
+          const headers = { ...request.headers, host: `127.0.0.1:${mintBackendPort}` };
+          delete headers["content-length"];
+          const upstream = httpRequest(
+            {
+              host: "127.0.0.1",
+              port: mintBackendPort,
+              path: request.url,
+              method: request.method,
+              headers,
+            },
+            (upstreamResponse) => {
+              const responseChunks = [];
+              upstreamResponse.on("data", (chunk) => responseChunks.push(chunk));
+              upstreamResponse.on("end", async () => {
+                const body = Buffer.concat(responseChunks);
+                const gate = mintGate;
+                if (
+                  gate &&
+                  !gate.entered &&
+                  pathname === gate.path &&
+                  upstreamResponse.statusCode >= 200 &&
+                  upstreamResponse.statusCode < 300
+                ) {
+                  gate.entered = true;
+                  gate.resolveEntered();
+                  await gate.released;
+                  if (mintGate === gate) mintGate = undefined;
+                }
+                if (response.destroyed) return;
+                response.writeHead(upstreamResponse.statusCode, upstreamResponse.headers);
+                response.end(body);
+              });
+            },
+          );
+          upstream.on("error", (error) => {
+            if (!response.headersSent) response.writeHead(502);
+            response.end(error.message);
+          });
+          upstream.end(Buffer.concat(chunks));
+        });
+      })
+    : undefined;
   try {
     await new Promise((resolve, reject) => {
       const failed = (error) => {
@@ -216,6 +283,10 @@ export async function startNetworkDemo({
     (stopping ??= (async () => {
       shutdown.abort();
       await releaseReservations([...liveReservations]);
+      if (mintGate) mintGate.resolveReleased();
+      mintProxyServer?.closeAllConnections();
+      if (mintProxyServer?.listening)
+        await new Promise((resolve) => mintProxyServer.close(resolve));
       target.closeAllConnections();
       await new Promise((r) => target.close(r));
       for (const e of [...children].reverse()) await stopChild(e);
@@ -237,7 +308,7 @@ export async function startNetworkDemo({
     test_mints: [
       {
         name: "demo-mint",
-        listen: `127.0.0.1:${mintPort}`,
+        listen: `127.0.0.1:${mintBackendPort}`,
         db_path: join(directory, "mint.db"),
         units: { sat: { input_fee_ppk: 0 }, msat: { input_fee_ppk: 0 } },
       },
@@ -389,12 +460,28 @@ export async function startNetworkDemo({
   }
   try {
     mint = await launch("monad-test-mint", ["run", "--config", path], [
-      mintReservation,
+      mintProxy ? mintBackendReservation : mintReservation,
     ]);
     management = await launch("monad-management", ["--config", path], [
       apiReservation,
     ]);
     await wait((s) => s.processes["test-mints"]?.online);
+    if (mintProxy) {
+      await releaseReservation(mintReservation);
+      await new Promise((resolve, reject) => {
+        const failed = (error) => {
+          mintProxyServer.off("listening", ready);
+          reject(error);
+        };
+        const ready = () => {
+          mintProxyServer.off("error", failed);
+          resolve();
+        };
+        mintProxyServer.once("error", failed);
+        mintProxyServer.once("listening", ready);
+        mintProxyServer.listen(mintPort, "127.0.0.1");
+      });
+    }
     await fund(sats);
     relays = await launch("monad-relay", ["run", "--config", path], [
       ...relayReservations,
@@ -420,6 +507,73 @@ export async function startNetworkDemo({
       stop,
       wait,
       targetUrl,
+      mintRequestCount: (pathname) => mintRequestCounts.get(pathname) ?? 0,
+      armMintPostCommit(pathname) {
+        if (!mintProxy) throw Error("Mint proxy is not enabled");
+        if (mintGate) throw Error("Mint proxy gate is already armed");
+        let resolveEntered, resolveReleased;
+        const entered = new Promise((resolve) => (resolveEntered = resolve));
+        const released = new Promise((resolve) => (resolveReleased = resolve));
+        mintGate = {
+          path: pathname,
+          entered: false,
+          resolveEntered,
+          released,
+          resolveReleased,
+        };
+        return {
+          entered,
+          release: () => resolveReleased(),
+        };
+      },
+      async command(process, instance, action, args, requestId) {
+        const snapshot = await wait((s) => s.processes[process]?.online);
+        const request = {
+          generation: snapshot.processes[process].generation,
+          request_id: requestId,
+          instance,
+          action,
+          arguments: args,
+        };
+        const response = await fetch(
+          `${url}/v1/processes/${encodeURIComponent(process)}/commands`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(request),
+            signal: AbortSignal.any([
+              shutdown.signal,
+              AbortSignal.timeout(5000),
+            ]),
+          },
+        );
+        return { status: response.status, body: await response.json(), request };
+      },
+      async waitOperation(process, requestId) {
+        const deadline = Date.now() + 30000;
+        while (Date.now() < deadline) {
+          try {
+            const response = await fetch(
+              `${url}/v1/processes/${encodeURIComponent(process)}/operations/${encodeURIComponent(requestId)}`,
+              {
+                signal: AbortSignal.any([
+                  shutdown.signal,
+                  AbortSignal.timeout(Math.min(5000, deadline - Date.now())),
+                ]),
+              },
+            );
+            if (response.ok) {
+              const operation = await response.json();
+              if (["succeeded", "failed"].includes(operation.state))
+                return operation;
+            }
+          } catch (error) {
+            if (shutdown.signal.aborted) throw error;
+          }
+          await sleep(100);
+        }
+        throw Error(`Operation ${requestId} did not finish`);
+      },
       stopManagement: () => stopChild(management),
       stopMint: () => stopChild(mint),
       restartManagement: () =>
@@ -501,6 +655,37 @@ export async function startNetworkDemo({
               s.processes.relays?.online &&
               s.processes.relays.generation !==
                 before.processes.relays.generation,
+          );
+        }),
+      crashRelays: () =>
+        serialized(async () => {
+          const before = await wait((s) => s.processes.relays?.online);
+          relays.expectedExit = true;
+          relays.child.kill("SIGKILL");
+          await relays.done;
+          await rm(socket("relays"), { force: true });
+          return before.processes.relays.generation;
+        }),
+      startRelays: (previousGeneration) =>
+        serialized(async () => {
+          const reservations = await reserveMany(
+            relayReservations.map(({ port }) => port),
+            reserveRelayPort,
+          );
+          try {
+            if (!stopping)
+              relays = await launch(
+                "monad-relay",
+                ["run", "--config", path],
+                reservations,
+              );
+          } finally {
+            await releaseReservations(reservations);
+          }
+          return wait(
+            (s) =>
+              s.processes.relays?.online &&
+              s.processes.relays.generation !== previousGeneration,
           );
         }),
     };
