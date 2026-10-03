@@ -1,10 +1,15 @@
 "use strict";
-const kind = location.pathname === "/clients" ? "clients" : "relays";
-document.title = `${kind === "clients" ? "Clients" : "Relays"} · MONAD`;
-document.querySelector("#title").textContent =
-  kind === "clients" ? "Clients & routes" : "Relays & sessions";
+const PAGES = {
+  "/clients": ["clients", "Clients", "Clients & routes"],
+  "/relays": ["relays", "Relays", "Relays & sessions"],
+  "/traffic-servers": ["traffic_servers", "Traffic servers", "Traffic servers"],
+};
+const [kind, pageName, pageHeading] =
+  PAGES[location.pathname] || PAGES["/relays"];
+document.title = `${pageName} · MONAD`;
+document.querySelector("#title").textContent = pageHeading;
 document
-  .querySelector(`nav a[href="/${kind}"]`)
+  .querySelector(`nav a[href="${location.pathname}"]`)
   .setAttribute("aria-current", "page");
 const root = document.querySelector("#instances"),
   summaryRoot = document.querySelector("#wallet-summary"),
@@ -252,6 +257,249 @@ function controls(process, name, instance) {
     }
   }
   return box;
+}
+const TRAFFIC_RATES = [
+  1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
+  2097152, 4194304, 8388608, 16777216, 33554432, 67108864, 134217728, 268435456,
+  536870912, 1073741824,
+];
+const TRAFFIC_RATIOS = [
+  [1, 100], [1, 50], [1, 20], [1, 10], [1, 5], [1, 2], [1, 1], [2, 1], [5, 1],
+  [10, 1], [20, 1], [50, 1], [100, 1],
+];
+// Form state survives re-renders; keyed by process + client name. Snapshot
+// values only seed the initial form.
+const trafficForms = new Map();
+function binaryUnits(v, suffix) {
+  const units = ["", "Ki", "Mi", "Gi", "Ti"];
+  let n = Number(v) || 0,
+    i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  const rounded =
+    n >= 100 || Number.isInteger(n) ? String(Math.round(n)) : n.toFixed(1);
+  return `${rounded} ${units[i]}${suffix}`;
+}
+const fmtMs = (v) =>
+  v == null ? "—" : `${v < 10 ? v.toFixed(2) : v.toFixed(1)} ms`;
+function trafficServerUrls() {
+  const urls = [];
+  for (const state of Object.values(processes))
+    if (state.data?.kind === "traffic_servers")
+      for (const instance of Object.values(state.data.instances || {}))
+        if (instance.base_url) urls.push(instance.base_url);
+  return urls.sort();
+}
+function trafficRateIndex(rate) {
+  let best = 0;
+  TRAFFIC_RATES.forEach((r, i) => {
+    if (
+      Math.abs(Math.log2(r / rate)) <
+      Math.abs(Math.log2(TRAFFIC_RATES[best] / rate))
+    )
+      best = i;
+  });
+  return best;
+}
+function trafficForm(process, name, t) {
+  const key = `${process}\n${name}`;
+  let form = trafficForms.get(key);
+  if (!form) {
+    const valid = new Set(TRAFFIC_RATIOS.map(([u, d]) => `${u}:${d}`));
+    const snapRatio = `${t?.upload_ratio}:${t?.download_ratio}`;
+    form = {
+      url: t?.server_url || trafficServerUrls()[0] || "",
+      rateIndex:
+        t?.total_rate_bytes_per_second > 0
+          ? trafficRateIndex(t.total_rate_bytes_per_second)
+          : trafficRateIndex(1048576),
+      ratio: valid.has(snapRatio) ? snapRatio : "1:1",
+    };
+    trafficForms.set(key, form);
+  }
+  return form;
+}
+// Like button(), but arguments are built lazily at click time from the latest
+// snapshot so expected_run_id is never stale from a re-render race.
+function trafficButton(text, process, name, action, argsFor, enabled = true) {
+  const b = el("button", text);
+  b.type = "button";
+  b.disabled =
+    !healthy(processes[process]) ||
+    instancePending(process, name, action, {}) ||
+    !enabled;
+  b.onclick = () => {
+    const state = processes[process];
+    const args = argsFor(state?.data?.instances?.[name]?.traffic_test);
+    if (state?.generation && args)
+      submit(process, name, state.generation, action, args);
+  };
+  return b;
+}
+function trafficPanel(process, name, instance) {
+  const t = instance.traffic_test || {};
+  const form = trafficForm(process, name, t);
+  const panel = el("section", null, "traffic-panel");
+  panel.append(el("h3", "Speed test"));
+  const stateName = t.state || "stopped";
+  const status = el("p", null, "traffic-status");
+  status.append(
+    el(
+      "strong",
+      stateName[0].toUpperCase() + stateName.slice(1),
+      `traffic-state-${stateName}`,
+    ),
+    ` · run ${t.run_id ?? 0}`,
+  );
+  if (t.started_at_unix_ms)
+    status.append(
+      ` · started ${new Date(t.started_at_unix_ms).toLocaleTimeString()}`,
+    );
+  panel.append(status);
+  const metrics = el("div", null, "traffic-metrics");
+  const metric = (label, text) => {
+    const box = el("div");
+    box.append(el("small", label), el("div", text, "traffic-metric-value"));
+    return box;
+  };
+  metrics.append(
+    metric(
+      "Uploaded",
+      `${binaryUnits(t.uploaded_bytes, "B")} · ${binaryUnits(t.upload_rate_bytes_per_second, "B/s")}`,
+    ),
+    metric(
+      "Downloaded",
+      `${binaryUnits(t.downloaded_bytes, "B")} · ${binaryUnits(t.download_rate_bytes_per_second, "B/s")}`,
+    ),
+    metric(
+      "Latency latest / median / p95",
+      `${fmtMs(t.latency?.latest_ms)} / ${fmtMs(t.latency?.median_ms)} / ${fmtMs(t.latency?.p95_ms)}`,
+    ),
+    metric("Probes", `${t.latency?.samples ?? 0}`),
+    metric(
+      "Failures",
+      `${t.failures ?? 0}${t.latency_failures ? ` (${t.latency_failures} latency)` : ""}`,
+    ),
+  );
+  panel.append(metrics);
+  if (t.last_error)
+    panel.append(el("p", `Latest error: ${t.last_error}`, "traffic-error"));
+  const formRow = el("div", null, "traffic-form");
+  const listId = `traffic-urls-${`${process}-${name}`.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+  const urlInput = el("input");
+  urlInput.type = "text";
+  urlInput.setAttribute("list", listId);
+  urlInput.placeholder = "http://host:port";
+  urlInput.spellcheck = false;
+  urlInput.value = form.url;
+  urlInput.oninput = (e) => {
+    form.url = e.currentTarget.value.trim();
+  };
+  const urlLabel = el("label");
+  urlLabel.append(el("span", "Server URL"), urlInput);
+  const urlList = el("datalist");
+  urlList.id = listId;
+  for (const u of trafficServerUrls()) {
+    const option = el("option");
+    option.value = u;
+    urlList.append(option);
+  }
+  const rateInput = el("input");
+  rateInput.type = "range";
+  rateInput.min = 0;
+  rateInput.max = TRAFFIC_RATES.length - 1;
+  rateInput.step = 1;
+  rateInput.value = form.rateIndex;
+  rateInput.oninput = (e) => {
+    form.rateIndex = Number(e.currentTarget.value);
+    render();
+  };
+  const rateLabel = el("label");
+  rateLabel.append(
+    el("span", "Rate (up + down)"),
+    rateInput,
+    el(
+      "span",
+      binaryUnits(TRAFFIC_RATES[form.rateIndex], "B/s"),
+      "traffic-rate-value",
+    ),
+  );
+  const ratioSelect = el("select");
+  for (const [u, d] of TRAFFIC_RATIOS) {
+    const option = el("option", `${u}:${d}`);
+    option.value = `${u}:${d}`;
+    if (form.ratio === option.value) option.selected = true;
+    ratioSelect.append(option);
+  }
+  ratioSelect.onchange = (e) => {
+    form.ratio = e.currentTarget.value;
+  };
+  const ratioLabel = el("label");
+  ratioLabel.append(el("span", "Upload : download"), ratioSelect);
+  const running = stateName !== "stopped";
+  const clientEnabled = instance.controls?.enabled === true;
+  const start = trafficButton(
+    running ? "Restart with these settings" : "Start test",
+    process,
+    name,
+    "start_traffic_test",
+    (current) => {
+      // Built at click time: renders only happen once per second and must not
+      // capture stale form values.
+      const [u, d] = form.ratio.split(":").map(Number);
+      return {
+        expected_run_id: current?.run_id ?? 0,
+        server_url: form.url,
+        total_rate_bytes_per_second: TRAFFIC_RATES[form.rateIndex],
+        upload_ratio: u,
+        download_ratio: d,
+      };
+    },
+    clientEnabled && form.url.trim().length > 0,
+  );
+  if (!clientEnabled) start.title = "Enable the client to run a speed test";
+  else if (!form.url.trim()) start.title = "Enter a traffic server URL";
+  const stop = trafficButton(
+    "Stop test",
+    process,
+    name,
+    "stop_traffic_test",
+    (current) => (current ? { expected_run_id: current.run_id } : null),
+    running,
+  );
+  formRow.append(urlLabel, rateLabel, ratioLabel, start, stop);
+  panel.append(formRow, urlList);
+  return panel;
+}
+function trafficServerCard(process, name, state, instance) {
+  const card = el("article", null, "mint");
+  card.dataset.instance = name;
+  card.append(
+    el("h2", name),
+    el(
+      "p",
+      `${process} · ${healthy(state) ? "Live" : "Stale / unavailable"} · sampled ${new Date(state.last_success_unix_ms).toLocaleTimeString()}`,
+    ),
+  );
+  const endpoint = el("p");
+  endpoint.append("Endpoint ", el("code", instance.base_url || "unavailable"));
+  card.append(
+    el("h3", "Ratio stream server"),
+    endpoint,
+    table(
+      ["Connections active / total", "Uploaded", "Downloaded"],
+      [
+        [
+          `${instance.active_connections ?? 0} / ${instance.total_connections ?? 0}`,
+          binaryUnits(instance.uploaded_bytes, "B"),
+          binaryUnits(instance.downloaded_bytes, "B"),
+        ],
+      ],
+    ),
+  );
+  return card;
 }
 function sats(msat) {
   return (Number(msat) / 1000).toFixed(3);
@@ -523,6 +771,8 @@ function pulseChanges(process, before, after) {
   }
 }
 function instanceCard(process, name, state, instance) {
+  if (kind === "traffic_servers")
+    return trafficServerCard(process, name, state, instance);
   const card = el("article", null, "mint");
   card.dataset.instance = name;
   const heading =
@@ -538,6 +788,7 @@ function instanceCard(process, name, state, instance) {
   );
   card.append(controls(process, name, instance));
   if (kind === "clients") {
+    card.append(trafficPanel(process, name, instance));
     const runtime = instance.runtime;
     card.append(
       el("h3", `State: ${runtime.lifecycle.state}`),
@@ -720,6 +971,7 @@ function walletSummary(process, state) {
   return card;
 }
 function renderWalletSummaries() {
+  if (kind === "traffic_servers") return;
   const seen = new Set();
   for (const [process, state] of Object.entries(processes)) {
     if (state.data?.kind !== kind) continue;
@@ -754,6 +1006,7 @@ function render() {
         cards.set(key, card);
       }
     }
+    if (kind === "traffic_servers") continue;
     const key = JSON.stringify(["wallet", process]);
     seen.add(key);
     const wallet = el("section", null, "mint");
@@ -825,7 +1078,9 @@ function render() {
     root.append(
       el(
         "p",
-        `No ${kind} process is available yet. Start the configured runtime.`,
+        kind === "traffic_servers"
+          ? "No traffic server process is available yet. Start monad-test-traffic."
+          : `No ${kind} process is available yet. Start the configured runtime.`,
       ),
     );
 }
@@ -886,6 +1141,8 @@ stream.addEventListener("operation_updated", (e) => {
       "request_channel_unlink",
       "drain_channels",
       "recover_drain",
+      "start_traffic_test",
+      "stop_traffic_test",
     ].includes(c.action)
   )
     return;

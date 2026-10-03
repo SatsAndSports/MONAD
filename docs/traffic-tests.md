@@ -2,7 +2,9 @@
 
 The traffic test engine is owned by each configured MONAD client. Both connections
 go through that client's own SOCKS listener. The server must be reachable from the
-final relay. Browser controls are under development; the management API is usable.
+final relay. Browser controls live in each client card's **Speed test** panel;
+server processes appear on the **Traffic servers** page. The management API below
+is what the browser uses.
 
 ## Server configuration
 

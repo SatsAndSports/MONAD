@@ -29,7 +29,19 @@ bounded and transient, not a durable audit trail.
   only the sessions established so far. Wallet inventory is process-wide because
   clients in the same process share a wallet. Available proofs are shown by mint
   and raw unit; expandable details include custody and channels. These categories
-  are not added together into a fictitious spendable balance.
+  are not added together into a fictitious spendable balance. Each client card also
+  has a **Speed test** panel: pick a ratio-server URL (discovered servers are
+  suggested), a combined upload+download rate on a logarithmic 1 KiB/s–1 GiB/s
+  slider, and an upload:download preset, then **Start test**. The run goes through
+  that client's own SOCKS listener and route, so it exercises the same path and
+  payments as application traffic. The panel shows run state, transferred totals
+  and current rates, latency latest/median/p95 with probe and failure counts, and
+  the latest error. **Restart with these settings** replaces the active run and
+  resets its measurements; **Stop test** keeps totals and zeroes current rates.
+  Starting while the client is disabled is refused. Protocol and accounting
+  details are in [Traffic tests](traffic-tests.md).
+- **Traffic servers:** read-only view of every `monad-test-traffic` instance:
+  endpoint URL, active/total connections, and uploaded/downloaded bytes.
 - **Relays:** every instance, enable/disable and three independent admission
   controls, sessions with pause/accounting/traffic/tunnel counts, and only channels
   linked to those sessions. Paused sessions still count as linked. Below all relay
@@ -181,6 +193,10 @@ loop continues; automatic channel provisioning is useful for sustained traffic.
 6. Disable a client and close its channel on the relay page; inspect the result.
 7. Rotate SAT in Mints, then create another client channel.
 8. Restart relays, refresh tabs, and observe re-established routes and counters.
+9. Launch with `MONAD_DEMO_TRAFFIC_SERVER=1`, open a client card's **Speed test**
+   panel, start a low-rate run through the route, watch rates and latency settle,
+   then restart with a different ratio and stop. Check **Traffic servers** for the
+   server's own connection and byte counters.
 
 ## Automated browser validation
 

@@ -109,3 +109,76 @@ summary:focus-visible {
   outline: 2px solid #ffca80;
   outline-offset: 3px;
 }
+.traffic-panel {
+  margin: 1rem 0;
+  padding: 0.9rem 1rem;
+  border: 1px solid #3e6573;
+  border-radius: 8px;
+  background: #101820;
+}
+.traffic-panel h3 {
+  margin-top: 0;
+}
+.traffic-status {
+  margin: 0.4rem 0 0.8rem;
+}
+.traffic-state-stopped {
+  color: #aab9c8;
+}
+.traffic-state-starting,
+.traffic-state-reconnecting {
+  color: #ffca80;
+}
+.traffic-state-running {
+  color: #69dfc0;
+}
+.traffic-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 0.7rem;
+  margin-bottom: 0.8rem;
+}
+.traffic-metrics small {
+  color: #b9cddd;
+}
+.traffic-metric-value {
+  color: #e5edf5;
+  font-variant-numeric: tabular-nums;
+}
+.traffic-error {
+  color: #ffaaaa;
+  overflow-wrap: anywhere;
+}
+.traffic-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.9rem;
+}
+.traffic-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  color: #b9cddd;
+  font-size: 0.85rem;
+}
+.traffic-form input[type="text"] {
+  width: 18rem;
+  max-width: 100%;
+}
+.traffic-form input[type="range"] {
+  width: 11rem;
+  padding: 0;
+}
+.traffic-form select {
+  font: inherit;
+  padding: 0.6rem 0.8rem;
+  border-radius: 6px;
+  border: 1px solid #516478;
+  background: #10151c;
+  color: inherit;
+}
+.traffic-rate-value {
+  color: #e5edf5;
+  font-variant-numeric: tabular-nums;
+}
