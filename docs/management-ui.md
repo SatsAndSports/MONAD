@@ -51,9 +51,13 @@ bounded and transient, not a durable audit trail.
   net-after-fees earnings figure. Capacity and accepted channel balances use each
    channel's raw unit; session payments/balances are msat. A close request goes
    through the normal wallet close/recovery path. **Channel drains** groups eligible
-   Closed channels by process generation, relay, mint and unit. Select up to 1,024
-   channels in one group and use **Drain selected** for an exact, all-or-nothing
-   request. Reserved channels identify their drain instead of being selectable.
+   Closed channels by process generation, relay, mint and unit. The first selected
+   channel establishes the active group for the single top-level **Drain selected**
+   action. Select up to 1,024 channels from that group for an exact, all-or-nothing
+   request. Attempting to select another group leaves the current selection intact
+   and explains why relay, mint and unit cannot be mixed; **Clear selection** lets
+   the operator switch groups. Reserved channels identify their drain instead of
+   being selectable.
    Durable Prepared, Submitted, and Finalizing attempts offer **Resume drain**;
    Completed attempts remain visible without exposing output proofs or secrets.
    Selection is cleared when its process generation changes, and stale/offline

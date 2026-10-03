@@ -10,12 +10,38 @@ pre {
 .retired-state { color: #d6a2ff; }
 .drain-reserved { color: #79c9ff; }
 .drain-selection-summary { color: #b9cddd; }
+.drain-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .8rem;
+  margin: 1rem 0;
+  padding: .9rem;
+  border: 1px solid #3e6573;
+  border-radius: 8px;
+  background: #101820;
+}
+.drain-toolbar .drain-selection-summary { margin: 0 auto 0 0; }
+.drain-group-active { border-left: 3px solid #69dfc0; padding-left: .8rem; }
 #relay-drains h3 { margin-top: 1.4rem; }
 #relay-drains input[type="checkbox"] {
   width: 1.15rem;
   height: 1.15rem;
   accent-color: #69dfc0;
 }
+#drain-selection-warning {
+  max-width: min(34rem, calc(100vw - 2rem));
+  color: #e5edf5;
+  background: #17212b;
+  border: 1px solid #ffca80;
+  border-radius: 10px;
+  padding: 1.4rem;
+}
+#drain-selection-warning::backdrop { background: rgb(0 0 0 / .7); }
+#drain-selection-warning h2 { margin-top: 0; }
+#drain-selection-warning form { display: grid; gap: .8rem; }
+#drain-selection-warning .dialog-actions { display: flex; justify-content: flex-end; gap: .6rem; }
+#drain-selection-warning button { min-width: 5rem; }
 .unlink-pending { color: #ffca80; font-size: .85rem; }
 .missing-channel { color: #ffca80; font-size: .85rem; }
 .channel-panel {

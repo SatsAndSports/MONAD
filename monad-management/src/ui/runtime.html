@@ -35,5 +35,21 @@
         </ol>
       </section>
     </main>
+    <dialog
+      id="drain-selection-warning"
+      aria-labelledby="drain-selection-warning-title"
+      aria-describedby="drain-selection-warning-message"
+    >
+      <form method="dialog">
+        <h2 id="drain-selection-warning-title">
+          These channels cannot be drained together
+        </h2>
+        <p id="drain-selection-warning-message"></p>
+        <div class="dialog-actions">
+          <button id="clear-drain-selection" type="button">Clear selection</button>
+          <button type="submit">OK</button>
+        </div>
+      </form>
+    </dialog>
   </body>
 </html>
