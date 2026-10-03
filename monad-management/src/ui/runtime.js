@@ -9,7 +9,10 @@ document
 const root = document.querySelector("#instances"),
   summaryRoot = document.querySelector("#wallet-summary"),
   notice = document.querySelector("#notice"),
-  activity = document.querySelector("#activity");
+  activity = document.querySelector("#activity"),
+  drainSelectionWarning = document.querySelector("#drain-selection-warning"),
+  drainSelectionWarningMessage = document.querySelector("#drain-selection-warning-message"),
+  clearDrainSelection = document.querySelector("#clear-drain-selection");
 let processes = {},
   live = false;
 const pending = new Map(),
@@ -18,6 +21,14 @@ const pending = new Map(),
   summaryCards = new Map(),
   drainSelections = new Map();
 const MAX_DRAIN_CHANNELS = 1024;
+function clearSelectedDrainChannels() {
+  for (const selected of drainSelections.values()) selected.clear();
+}
+clearDrainSelection.onclick = () => {
+  clearSelectedDrainChannels();
+  drainSelectionWarning.close();
+  render();
+};
 function el(tag, text, cls) {
   const n = document.createElement(tag);
   if (text != null) n.textContent = text;
@@ -357,21 +368,70 @@ function relayDrains() {
     const selected = drainSelections.get(key);
     for (const id of [...selected]) if (!eligible.has(id)) selected.delete(id);
   }
+  const selectedGroups = [...drainSelections.entries()].filter(([, selected]) => selected.size);
+  const [activeEntry, ...conflictingEntries] = selectedGroups;
+  for (const [, selected] of conflictingEntries) selected.clear();
+  const activeKey = activeEntry?.[0], activeGroup = groups.get(activeKey),
+    activeSelection = activeEntry?.[1] || new Set();
+  const groupLabel = group => {
+    const channel = group.channels[0];
+    return `${channel.relay_name} · ${channel.mint_url} · ${channel.unit}`;
+  };
+  const toolbar = el("div", null, "drain-toolbar");
+  toolbar.append(el(
+    "p",
+    activeGroup
+      ? `${activeSelection.size} selected · Active group: ${groupLabel(activeGroup)}`
+      : "0 selected · Choose channels from one relay, mint, and unit",
+    "drain-selection-summary",
+  ));
+  const drainButton = activeGroup
+    ? button(
+        `Drain selected (${activeSelection.size})`,
+        activeGroup.process,
+        activeGroup.channels[0].relay_name,
+        "drain_channels",
+        {channel_ids:[...activeSelection].sort()},
+        activeSelection.size > 0 && activeSelection.size <= MAX_DRAIN_CHANNELS,
+      )
+    : el("button", "Drain selected (0)");
+  drainButton.type = "button";
+  if (!activeGroup) drainButton.disabled = true;
+  const clearButton = el("button", "Clear selection");
+  clearButton.type = "button";
+  clearButton.disabled = !activeGroup;
+  clearButton.onclick = () => {
+    clearSelectedDrainChannels();
+    render();
+  };
+  toolbar.append(drainButton, clearButton);
+  section.append(toolbar);
   for (const group of groups.values()) {
     group.channels.sort((a,b)=>a.channel_id.localeCompare(b.channel_id));
     const first = group.channels[0], selected = drainSelections.get(group.key) || new Set();
     drainSelections.set(group.key, selected);
     const heading = el("h3", `${first.relay_name} · ${first.mint_url} · ${first.unit}`);
-    const summary = el("p", `${selected.size} selected · maximum ${MAX_DRAIN_CHANNELS} channels per drain`);
-    summary.className = "drain-selection-summary";
     const rows = group.channels.map(channel => {
       const checkbox = el("input");
       checkbox.type = "checkbox";
       checkbox.checked = selected.has(channel.channel_id);
-      checkbox.disabled = !healthy(group.state) || (!checkbox.checked && selected.size >= MAX_DRAIN_CHANNELS) || instancePending(group.process, channel.relay_name, "drain_channels", {});
+      checkbox.disabled = !healthy(group.state) ||
+        (!checkbox.checked && group.key === activeKey && activeSelection.size >= MAX_DRAIN_CHANNELS) ||
+        instancePending(group.process, channel.relay_name, "drain_channels", {});
       checkbox.setAttribute("aria-label", `Select channel ${channel.channel_id}`);
       checkbox.onchange = event => {
         if (event.currentTarget.checked) {
+          if (activeGroup && activeKey !== group.key) {
+            event.currentTarget.checked = false;
+            drainSelectionWarningMessage.textContent =
+              `A drain must contain channels from the same relay, mint, and unit. ` +
+              `Your current selection is for ${groupLabel(activeGroup)}. ` +
+              `Clear the current selection before selecting channels from ${groupLabel(group)}.`;
+            if (typeof drainSelectionWarning.showModal === "function")
+              drainSelectionWarning.showModal();
+            else notice.textContent = drainSelectionWarningMessage.textContent;
+            return;
+          }
           if (selected.size >= MAX_DRAIN_CHANNELS) return;
           selected.add(channel.channel_id);
         } else selected.delete(channel.channel_id);
@@ -379,15 +439,9 @@ function relayDrains() {
       };
       return [checkbox, shortId(channel.channel_id), channelAmount(channel.balance_raw, channel.unit), channelAmount(channel.capacity_raw, channel.unit)];
     });
-    section.append(heading, summary, table(["Select", "Channel", `Paid (${first.unit})`, `Capacity (${first.unit})`], rows));
-    section.append(button(
-      `Drain selected (${selected.size})`,
-      group.process,
-      first.relay_name,
-      "drain_channels",
-      {channel_ids:[...selected].sort()},
-      selected.size > 0 && selected.size <= MAX_DRAIN_CHANNELS,
-    ));
+    const groupSection = el("section", null, group.key === activeKey ? "drain-group-active" : "");
+    groupSection.append(heading, table(["Select", "Channel", `Paid (${first.unit})`, `Capacity (${first.unit})`], rows));
+    section.append(groupSection);
   }
   if (!groups.size) section.append(el("p", "No eligible Closed channels."));
   section.append(el("h3", "Drain attempts"));

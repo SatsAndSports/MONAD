@@ -41,6 +41,7 @@ test("relay drain controls submit exact groups and resume durable attempts", asy
   const drains = page.locator("#relay-drains");
   await expect(drains.getByRole("heading", {name:"Channel drains"})).toBeVisible();
   await expect(drains.getByRole("checkbox")).toHaveCount(3);
+  await expect(drains.getByRole("button", {name:/Drain selected/})).toHaveCount(1);
   await expect(page.getByText("Drain reserved", {exact:false})).toBeVisible();
 
   await drains.getByRole("checkbox", {name:`Select channel ${"a".repeat(64)}`}).check();
@@ -75,6 +76,45 @@ test("relay drain controls submit exact groups and resume durable attempts", asy
   }]});
   await expect(resume).toHaveCount(0);
   await expect(drains.getByRole("cell", {name:"Completed", exact:true}).first()).toBeVisible();
+});
+
+test("drain selection explains and prevents mixing groups", async ({page}) => {
+  await setup(page);
+  await publish(page, {channels:[channel("a"), channel("b"), channel("c", "msat")], drains:[]});
+  const drains = page.locator("#relay-drains");
+  const sat = drains.getByRole("checkbox", {name:`Select channel ${"a".repeat(64)}`});
+  const msat = drains.getByRole("checkbox", {name:`Select channel ${"c".repeat(64)}`});
+
+  await sat.check();
+  await expect(drains.locator(".drain-selection-summary")).toContainText(
+    "1 selected · Active group: exit · http://mint · sat",
+  );
+  await msat.click();
+  await expect(msat).not.toBeChecked();
+  await expect(sat).toBeChecked();
+  const warning = page.getByRole("dialog", {
+    name:"These channels cannot be drained together",
+  });
+  await expect(warning).toBeVisible();
+  await expect(warning).toContainText(
+    "A drain must contain channels from the same relay, mint, and unit.",
+  );
+  await expect(warning).toContainText(
+    "Clear the current selection before selecting channels from exit · http://mint · msat.",
+  );
+  await warning.getByRole("button", {name:"OK"}).click();
+  await expect(warning).not.toBeVisible();
+
+  await msat.click();
+  await warning.getByRole("button", {name:"Clear selection"}).click();
+  await expect(warning).not.toBeVisible();
+  await expect(sat).not.toBeChecked();
+  await expect(drains.getByRole("button", {name:"Drain selected (0)"})).toBeDisabled();
+  await msat.check();
+  await expect(drains.locator(".drain-selection-summary")).toContainText(
+    "1 selected · Active group: exit · http://mint · msat",
+  );
+  await expect(drains.getByRole("button", {name:"Drain selected (1)"})).toBeEnabled();
 });
 
 test("drain selections clear on generation changes and stale sources disable actions", async ({page}) => {
