@@ -29,10 +29,12 @@ rand = "0.9"
 rusqlite = "0.31"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
+url = "2"
 cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cashu", default-features = false }
 cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "97ce73a17812b54157b65dae9d3a6801ac3ba236", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
 
 [dev-dependencies]
+monad-test-traffic = { path = "../monad-test-traffic" }
 tokio = { version = "1", features = ["test-util"] }
 axum = "0.8.9"
 tempfile = "3"

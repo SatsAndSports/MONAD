@@ -2427,6 +2427,7 @@ dependencies = [
  "monad-common",
  "monad-management",
  "monad-quic",
+ "monad-test-traffic",
  "quinn",
  "rand 0.9.3",
  "reqwest",
@@ -2438,6 +2439,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

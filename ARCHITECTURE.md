@@ -1,5 +1,22 @@
 # MONAD Architecture
 
+## Managed traffic tests
+
+Each configured client owns a command-driven traffic supervisor in its process
+task tree. Its bulk and latency streams connect through that client's SOCKS5
+listener, using the same route and payment path as ordinary application traffic.
+Run futures directly own all network operations; stopping, replacing, disabling,
+or shutting down drops those futures and their sockets before reporting completion.
+Management command cancellation cannot orphan a run. Run replacement publishes a
+fresh metrics object, preventing old work from changing the new run's statistics.
+
+The optional `monad-test-traffic` process upgrades HTTP/1.1 into an unpaced fixed-ratio
+stream. The client limits generated bulk work with a short token bucket and a
+bounded, rate/RTT-aware response window. Independent probe failures do not restart
+bulk traffic. Throughput is sampled at 5 Hz into a bounded rolling window; latency
+uses monotonic time with fractional-millisecond precision. Protocol, accounting,
+and API details are in [Traffic tests](docs/traffic-tests.md).
+
 ## Managed test-mint process
 
 `monad-test-mint` is an optional standalone host for the YAML `test_mints` entries.
