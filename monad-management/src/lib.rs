@@ -369,7 +369,7 @@ pub async fn serve_owned<L: axum::serve::Listener>(
                 let router = router.clone();
                 connections.push(async move {
                     let builder = Builder::new(TokioExecutor::new());
-                    let _ = builder.serve_connection(TokioIo::new(stream), TowerToHyperService::new(router)).await;
+                    let _ = builder.serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(router)).await;
                 }.boxed());
             }
         }

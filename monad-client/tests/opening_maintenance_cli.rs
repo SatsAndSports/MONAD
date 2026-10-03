@@ -214,6 +214,7 @@ async fn configured_runtime_excludes_opening_maintenance_during_startup_and_stea
     let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let config = MonadConfig {
         test_mints: Vec::new(),
+        traffic_servers: Vec::new(),
         relay_wallet: None,
         management: None,
         relays: vec![],
