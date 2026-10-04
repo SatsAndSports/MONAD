@@ -10,3 +10,9 @@ members = [
     "monad-test-traffic",
 ]
 resolver = "2"
+
+# Use the vendored h2 with `recv_release_connection_on_buffer` (see
+# vendor/h2/Cargo.toml). Required so paused CONNECT tunnels cannot starve
+# control streams through the shared HTTP/2 connection receive window.
+[patch.crates-io]
+h2 = { path = "vendor/h2" }
