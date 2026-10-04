@@ -1,5 +1,10 @@
 # Management API
 
+Configured clients support generation-bound `start_traffic_test` and
+`stop_traffic_test` actions. Both require the current `expected_run_id` as an
+additional traffic-run precondition. See [Traffic tests](traffic-tests.md) for
+strict argument schemas, snapshots, rate accounting, and lifecycle semantics.
+
 Relay wallet channel summaries include `last_linked_at_unix_ms` (nullable), stamped
 on successful links in the current relay-process lifetime. Browser refresh retains
 these times; a process restart loses them until channels are linked again. The UI

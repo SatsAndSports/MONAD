@@ -1,5 +1,22 @@
 # MONAD Architecture
 
+## Managed traffic tests
+
+Each configured client owns a command-driven traffic supervisor in its process
+task tree. Its bulk and latency streams connect through that client's SOCKS5
+listener, using the same route and payment path as ordinary application traffic.
+Run futures directly own all network operations; stopping, replacing, disabling,
+or shutting down drops those futures and their sockets before reporting completion.
+Management command cancellation cannot orphan a run. Run replacement publishes a
+fresh metrics object, preventing old work from changing the new run's statistics.
+
+The optional `monad-test-traffic` process upgrades HTTP/1.1 into an unpaced fixed-ratio
+stream. The client limits generated bulk work with a short token bucket and a
+bounded, rate/RTT-aware response window. Independent probe failures do not restart
+bulk traffic. Throughput is sampled at 5 Hz into a bounded rolling window; latency
+uses monotonic time with fractional-millisecond precision. Protocol, accounting,
+and API details are in [Traffic tests](docs/traffic-tests.md).
+
 ## Managed test-mint process
 
 `monad-test-mint` is an optional standalone host for the YAML `test_mints` entries.
@@ -709,6 +726,24 @@ Sessions start paused with zero balance. While paused:
 - The control stream is always usable (free)
 - `CONNECT` requests are rejected with HTTP 402
 - The session unpauses only when the remaining balance becomes strictly positive
+
+Control usability while paused is a transport-level invariant, not just a
+policy. Paused CONNECT tunnels stop consuming their H2 receive streams, and
+HTTP/2 multiplexes all streams over one connection whose flow control has a
+shared connection-level receive window in addition to each stream's window.
+If unread tunnel DATA were allowed to retain connection-level capacity, a full
+paused tunnel could starve the control stream and make payment recovery
+impossible. MONAD therefore builds against a vendored `h2` (`vendor/h2`) with
+`recv_release_connection_on_buffer` enabled on both the client and relay H2
+handshakes: connection-level receive capacity is returned as soon as a DATA
+frame is buffered, while stream-level capacity stays reserved until the proxy
+task consumes the bytes. A paused tunnel can fill only its own bounded stream
+window (buffering behavior and limits are unchanged from stock `h2`); the
+shared connection window — and therefore the control stream — stays alive.
+This mirrors the decoupled connection-flow-control approach used by gRPC's Go
+transport for the same reason. The full diagnosis, diff inventory, bounds
+analysis, vendoring mechanics, and related test inventory live in
+[docs/h2-flow-control.md](docs/h2-flow-control.md).
 
 ### Billing Formula
 

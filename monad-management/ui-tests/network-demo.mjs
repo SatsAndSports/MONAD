@@ -24,6 +24,7 @@ export async function startNetworkDemo({
   targetTopupMsats = 500,
   minimumTopupMsats = 500,
   mintProxy = false,
+  trafficServer = false,
 } = {}) {
   if (!Number.isSafeInteger(sats) || sats < 0 || sats > 100000000)
     throw Error("MONAD_DEMO_SATS must be 0..100000000");
@@ -66,13 +67,15 @@ export async function startNetworkDemo({
     socksReservation,
     socks2Reservation,
     mintReservation,
-    mintBackendReservation;
+    mintBackendReservation,
+    trafficReservation;
   try {
     apiReservation = await reserve(reserveTcpPort, managementPort);
     socksReservation = await reserve(reserveTcpPort, socksPort);
     socks2Reservation = await reserve(reserveTcpPort, socks2Port);
     mintReservation = await reserve(reserveTcpPort);
     if (mintProxy) mintBackendReservation = await reserve(reserveTcpPort);
+    if (trafficServer) trafficReservation = await reserve(reserveTcpPort);
   } catch (error) {
     await releaseReservations([...liveReservations]);
     throw error;
@@ -81,7 +84,8 @@ export async function startNetworkDemo({
     socks = socksReservation.port,
     socks2 = socks2Reservation.port,
     mintPort = mintReservation.port,
-    mintBackendPort = mintBackendReservation?.port ?? mintPort;
+    mintBackendPort = mintBackendReservation?.port ?? mintPort,
+    trafficPort = trafficReservation?.port;
   const url = `http://127.0.0.1:${api}`,
     mintUrl = `http://127.0.0.1:${mintPort}`;
   const children = [];
@@ -333,6 +337,12 @@ export async function startNetworkDemo({
       disabled_clients: ["second-client"],
     },
   };
+  if (trafficServer) {
+    config.traffic_servers = [
+      { name: "demo-traffic", listen: `127.0.0.1:${trafficPort}` },
+    ];
+    config.management.traffic_server_socket = socket("traffic");
+  }
   const route = [];
   const relayReservations = [];
   try {
@@ -375,9 +385,9 @@ export async function startNetworkDemo({
     await stop();
     throw error;
   }
-  let mint, clients, relays, management;
+  let mint, clients, relays, management, traffic;
   const essentialChildren = () =>
-    [mint, management, relays, clients].filter(Boolean);
+    [mint, management, relays, clients, traffic].filter(Boolean);
   async function wait(predicate, required) {
     const deadline = Date.now() + 30000;
     const requiredChildren = () => required ?? essentialChildren();
@@ -466,6 +476,14 @@ export async function startNetworkDemo({
       apiReservation,
     ]);
     await wait((s) => s.processes["test-mints"]?.online);
+    if (trafficServer) {
+      traffic = await launch(
+        "monad-test-traffic",
+        ["run", "--config", path],
+        [trafficReservation],
+      );
+      await wait((s) => s.processes["traffic-servers"]?.online);
+    }
     if (mintProxy) {
       await releaseReservation(mintReservation);
       await new Promise((resolve, reject) => {
@@ -507,6 +525,9 @@ export async function startNetworkDemo({
       stop,
       wait,
       targetUrl,
+      trafficServerUrl: trafficServer
+        ? `http://127.0.0.1:${trafficPort}`
+        : undefined,
       mintRequestCount: (pathname) => mintRequestCounts.get(pathname) ?? 0,
       armMintPostCommit(pathname) {
         if (!mintProxy) throw Error("Mint proxy is not enabled");
@@ -700,9 +721,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     channelFundingMsats: 1000000,
     targetTopupMsats: 100000,
     minimumTopupMsats: 50000,
+    trafficServer: process.env.MONAD_DEMO_TRAFFIC_SERVER === "1",
   });
   console.log(
-    `Clients: ${demo.url}/clients\nRelays: ${demo.url}/relays\nMints: ${demo.url}/mints\nSOCKS: 127.0.0.1:${demo.socks}\nTraffic target: ${demo.targetUrl}\nPrivate child logs: ${demo.logDirectory}\nEphemeral data/config: ${demo.directory}\nWallet starts with ${process.env.MONAD_DEMO_SATS ?? 1000000} test sats equivalent, split across SAT/MSAT and shared by both clients. Second client starts disabled.\nSAT entry / MSAT exit · 100-sat credit targets · 50-sat minimum topups · 1,000-sat channel budgets\nCommands: traffic | traffic-on | traffic-off | topup SATS | restart-relays | quit`,
+    `Clients: ${demo.url}/clients\nRelays: ${demo.url}/relays\nMints: ${demo.url}/mints${demo.trafficServerUrl ? `\nTraffic servers: ${demo.url}/traffic-servers\nRatio endpoint: ${demo.trafficServerUrl}` : ""}\nSOCKS: 127.0.0.1:${demo.socks}\nTraffic target: ${demo.targetUrl}\nPrivate child logs: ${demo.logDirectory}\nEphemeral data/config: ${demo.directory}\nWallet starts with ${process.env.MONAD_DEMO_SATS ?? 1000000} test sats equivalent, split across SAT/MSAT and shared by both clients. Second client starts disabled.\nSAT entry / MSAT exit · 100-sat credit targets · 50-sat minimum topups · 1,000-sat channel budgets\nCommands: traffic | traffic-on | traffic-off | topup SATS | restart-relays | quit`,
   );
   const input = createInterface({
     input: process.stdin,

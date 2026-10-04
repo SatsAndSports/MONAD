@@ -11,6 +11,7 @@ use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, Strea
 use monad_common::config::{ClientConfig, MonadConfig};
 use monad_common::session::RelayConnection;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -19,6 +20,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::management::{ClientFailure, ClientFailureStage};
+use crate::traffic_engine::TrafficController;
 
 const MAX_STARTUP_CONNECT_ATTEMPTS: u32 = 5;
 const INITIAL_RECONNECT_BACKOFF_MS: u64 = 250;
@@ -250,8 +252,43 @@ where
         );
     }
 
+    let traffic_controllers: std::collections::BTreeMap<String, TrafficController> =
+        prepared_clients
+            .iter()
+            .map(|prepared| {
+                let addr = prepared
+                    .listener
+                    .local_addr()
+                    .map(normalize_socks_self_connect)?;
+                Ok((prepared.client.name.clone(), TrafficController::new(addr)))
+            })
+            .collect::<std::io::Result<_>>()?;
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
+    for (name, controller) in &traffic_controllers {
+        let controller = controller.clone();
+        let controls = management.entry(name.clone()).or_default().clone();
+        let mut process_stop = shutdown_rx.clone();
+        tasks.spawn(async move {
+            controller
+                .serve_managed(
+                    async move {
+                        loop {
+                            if *process_stop.borrow_and_update() {
+                                break;
+                            }
+                            if process_stop.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    },
+                    controls,
+                )
+                .await;
+            Ok(())
+        });
+    }
     for prepared in &prepared_clients {
         let controls = management.entry(prepared.client.name.clone()).or_default();
         if let Some(settings) = &config.management {
@@ -284,6 +321,7 @@ where
             management.clone(),
             socks_listens,
             manager.managed_wallet(),
+            traffic_controllers.clone(),
         ));
         let mut stopped = shutdown_rx.clone();
         tasks.spawn(async move {
@@ -389,6 +427,23 @@ fn unix_ms_after(duration: Duration) -> u64 {
         .as_millis()
         .saturating_add(duration.as_millis())
         .min(u64::MAX as u128) as u64
+}
+
+/// The traffic engine connects back to the client's own SOCKS listener. If the
+/// listener is bound to an unspecified address, normalize it to loopback so the
+/// engine can self-connect.
+fn normalize_socks_self_connect(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            addr.port(),
+        ),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            addr.port(),
+        ),
+        _ => addr,
+    }
 }
 
 struct PreparedConfiguredClient {
@@ -1433,11 +1488,111 @@ mod tests {
             .collect();
         MonadConfig {
             test_mints: Vec::new(),
+            traffic_servers: Vec::new(),
             relay_wallet: None,
             client_wallet: None,
             management: None,
             relays: Vec::new(),
             clients,
+        }
+    }
+
+    #[test]
+    fn traffic_self_connect_normalizes_both_wildcard_families() {
+        assert_eq!(
+            normalize_socks_self_connect("0.0.0.0:1234".parse().unwrap()),
+            "127.0.0.1:1234".parse().unwrap()
+        );
+        assert_eq!(
+            normalize_socks_self_connect("[::]:1234".parse().unwrap()),
+            "[::1]:1234".parse().unwrap()
+        );
+        assert_eq!(
+            normalize_socks_self_connect("127.0.0.2:1234".parse().unwrap()),
+            "127.0.0.2:1234".parse().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_shutdown_awaits_two_active_traffic_owners_during_route_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("client.sock");
+        let mut config = test_config_with_clients(&["first", "second"]);
+        config.clients[0].socks = "0.0.0.0:0".into();
+        config.clients[1].socks = "[::]:0".into();
+        config.client_wallet=Some(serde_json::from_value(serde_json::json!({
+            "loose_db_path":dir.path().join("loose.db"),"channel_db_path":dir.path().join("channels.db"),
+            "sender_secret_hex":hex::encode([9;32])
+        })).unwrap());
+        config.management = Some(
+            serde_json::from_value(
+                serde_json::json!({"listen":"127.0.0.1:0","client_socket":socket}),
+            )
+            .unwrap(),
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_configured_client_until_shutdown_with_options(
+            config,
+            None,
+            SharedRouteRuntimeStats::default(),
+            ConfiguredClientRuntimeOptions {
+                route_setup_timeout: Duration::from_secs(60),
+            },
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        let ipc = monad_management::unix_client(socket.clone()).unwrap();
+        let view = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(r) = ipc.get("http://localhost/v1/snapshot").send().await {
+                    break r.json::<serde_json::Value>().await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for name in ["first", "second"] {
+            let response=ipc.post("http://localhost/v1/commands").json(&serde_json::json!({
+                "generation":view["generation"],"request_id":name,"instance":name,"action":"start_traffic_test",
+                "arguments":{"expected_run_id":0,"server_url":"http://localhost:8080","total_rate_bytes_per_second":1024,"upload_ratio":1,"download_ratio":1}
+            })).send().await.unwrap();
+            assert!(response.status().is_success());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let v: serde_json::Value = ipc
+                    .get("http://localhost/v1/snapshot")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if ["first", "second"]
+                    .iter()
+                    .all(|n| v["data"]["instances"][n]["traffic_test"]["run_id"] == 1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!socket.exists());
+        for name in ["first", "second"] {
+            let listen = view["data"]["instances"][name]["socks_listen"]
+                .as_str()
+                .unwrap();
+            let _rebound = TcpListener::bind(listen).await.unwrap();
         }
     }
 }

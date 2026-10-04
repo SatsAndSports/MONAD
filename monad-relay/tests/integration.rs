@@ -5841,6 +5841,110 @@ async fn test_session_overshoot_negative_balance_and_resume() {
 }
 
 #[tokio::test]
+async fn test_control_stream_survives_connection_window_blocked_by_paused_tunnel() {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    tokio::spawn(run_uppercase_server(target_listener));
+
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let (_in0, _out0, _paid0, rem0, paused0) =
+        control_handshake(&mut control_send, &mut control_recv).await;
+    assert!(paused0);
+    assert_eq!(rem0, 0);
+
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    let (_in1, _out1, _paid1, rem1, paused1) =
+        channel.link(&mut control_send, &mut control_recv).await;
+    assert_eq!(_paid1, 0);
+    assert_eq!(rem1, 0);
+    assert!(paused1);
+    let (_in1, _out1, _paid1, rem1, paused1) =
+        channel.pay(&mut control_send, &mut control_recv, 5).await;
+    assert!(!paused1);
+    assert_eq!(rem1, 5);
+
+    let mut h2 = conn.clone_send_request().await;
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("127.0.0.1:{}", target_addr.port()))
+        .body(())
+        .unwrap();
+    let (response_future, mut tunnel_send) = h2.send_request(request, false).unwrap();
+    let response = response_future.await.unwrap();
+    assert!(response.status().is_success());
+    let tunnel_recv = response.into_body();
+
+    // Spend the entire paid allowance and make the relay pause before it has
+    // consumed enough of this tunnel to notice that more DATA is queued.
+    tunnel_send.reserve_capacity(5);
+    wait_for_send_capacity(&mut tunnel_send).await.unwrap();
+    tunnel_send
+        .send_data(Bytes::from_static(b"12345"), false)
+        .unwrap();
+    let (_in2, out2, _paid2, rem2, paused2) =
+        expect_session_status(read_control_message(&mut control_recv).await);
+    assert!(paused2, "session should pause after spending all credit");
+    assert_eq!(out2, 5);
+    assert_eq!(rem2, 0);
+
+    // Queue enough DATA to occupy the shared connection-level receive window.
+    // This uses `send_data` directly: `wait_for_send_capacity` intentionally
+    // waits for stream-level capacity, which is also what the regression
+    // below is checking remains withheld.
+    for _ in 0..4 {
+        tunnel_send
+            .send_data(Bytes::from(vec![0; 16_383]), false)
+            .unwrap();
+    }
+    tunnel_send
+        .send_data(Bytes::from_static(b"6"), false)
+        .unwrap();
+
+    let relay_buffered = timeout(Duration::from_millis(100), async {
+        tunnel_send.reserve_capacity(1);
+        wait_for_send_capacity(&mut tunnel_send).await
+    })
+    .await;
+    assert!(
+        relay_buffered.is_err(),
+        "a full paused tunnel must not release its stream window early: {relay_buffered:?}"
+    );
+
+    // Control shares the 65,535-byte connection-level receive window with the
+    // tunnel DATA above. A tiny message can squeeze through h2's zero-window
+    // WINDOW_UPDATE recycle fragment by fragment; a ChannelLink-sized payload
+    // cannot complete in reasonable time unless connection-level capacity is
+    // returned as soon as the paused tunnel's DATA is buffered.
+    let large_payment = ClientMessage::ChannelPayment {
+        payment_json: format!(
+            "{{\"channel_id\":\"unknown\",\"balance\":1,\"padding\":\"{}\"}}",
+            "a".repeat(500_000)
+        ),
+    };
+    timeout(Duration::from_secs(2), async {
+        send_control_message(&mut control_send, &large_payment, false).await;
+        loop {
+            match read_control_message(&mut control_recv).await {
+                ServerMessage::Error { .. } => break,
+                // Pause-transition statuses may still be queued; skip them.
+                ServerMessage::SessionStatus { .. } => continue,
+                other => panic!("expected payment Error response, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("control must remain usable while paused DATA occupies the connection window");
+
+    drop(tunnel_send);
+    drop(tunnel_recv);
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_outbound_bytes_sent_after_pause_are_delivered_after_unpause() {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();

@@ -80,6 +80,7 @@ impl Aggregator {
             .route("/mints", get(mints))
             .route("/clients", get(runtime_page))
             .route("/relays", get(runtime_page))
+            .route("/traffic-servers", get(runtime_page))
             .route("/assets/runtime.js", get(runtime_js))
             .route("/assets/runtime.css", get(runtime_css))
             .route("/assets/mints.css", get(mints_css))

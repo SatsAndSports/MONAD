@@ -2,6 +2,7 @@ use crate::{
     loose_proof_wallet::LooseProofSummary,
     management::ClientManagement,
     sqlite_client_wallet::SqliteClientWallet,
+    traffic_engine::{TrafficController, TrafficRunParams},
     wallet::{MonadWallet, WalletChannel, WalletChannelState},
 };
 use monad_management::{Backend, Command};
@@ -12,6 +13,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartTraffic {
+    expected_run_id: u64,
+    server_url: String,
+    total_rate_bytes_per_second: u64,
+    upload_ratio: u8,
+    download_ratio: u8,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopTraffic {
+    expected_run_id: u64,
+}
 fn wallet_summary(
     proofs: &[LooseProofSummary],
     channels: &[WalletChannel],
@@ -61,6 +76,7 @@ pub struct ClientBackend {
     controls: BTreeMap<String, Arc<ClientManagement>>,
     socks_listens: BTreeMap<String, String>,
     wallet: Arc<SqliteClientWallet>,
+    traffic_controllers: BTreeMap<String, TrafficController>,
     inventory: tokio::sync::Mutex<Option<(Instant, Value)>>,
 }
 
@@ -69,11 +85,13 @@ impl ClientBackend {
         controls: BTreeMap<String, Arc<ClientManagement>>,
         socks_listens: BTreeMap<String, String>,
         wallet: Arc<SqliteClientWallet>,
+        traffic_controllers: BTreeMap<String, TrafficController>,
     ) -> Self {
         Self {
             controls,
             socks_listens,
             wallet,
+            traffic_controllers,
             inventory: Default::default(),
         }
     }
@@ -113,11 +131,20 @@ impl Backend for ClientBackend {
             .controls
             .iter()
             .map(|(name, c)| {
+                let traffic_test = self
+                    .traffic_controllers
+                    .get(name)
+                    .map(|controller| controller.snapshot())
+                    .unwrap_or_default();
                 (
                     name,
                     json!({
-            "socks_listen": self.socks_listens.get(name),
-            "controls": c.controls(), "runtime": c.runtime_snapshot(), "hops": c.hops(), "events": c.events.snapshot(),
+                        "socks_listen": self.socks_listens.get(name),
+                        "controls": c.controls(),
+                        "runtime": c.runtime_snapshot(),
+                        "hops": c.hops(),
+                        "events": c.events.snapshot(),
+                        "traffic_test": traffic_test,
                     }),
                 )
             })
@@ -139,6 +166,14 @@ impl Backend for ClientBackend {
                     .ok_or("enabled boolean required")?;
                 controls.set_enabled(enabled)?;
                 if !enabled {
+                    // Best-effort prompt stop only: the serve_managed controls
+                    // watch stops traffic authoritatively. Commands execute
+                    // concurrently, so a parallel start/stop may legitimately
+                    // change the run ID before this stop is processed; that
+                    // must not fail a disable that already took effect.
+                    if let Some(traffic) = self.traffic_controllers.get(&command.instance) {
+                        let _ = traffic.stop(traffic.snapshot().run_id).await;
+                    }
                     let mut changes = controls.changes();
                     loop {
                         changes.borrow_and_update();
@@ -199,6 +234,35 @@ impl Backend for ClientBackend {
                     }
                     changes.changed().await.map_err(|_| "client stopped")?;
                 }
+            }
+            "start_traffic_test" => {
+                let controller = self
+                    .traffic_controllers
+                    .get(&command.instance)
+                    .ok_or("client has no traffic controller")?;
+                if !controls.controls().enabled {
+                    return Err("client is disabled".into());
+                }
+                let args: StartTraffic = serde_json::from_value(command.arguments.clone())
+                    .map_err(|_| "invalid start traffic arguments")?;
+                let params = TrafficRunParams {
+                    server_url: args.server_url,
+                    total_rate_bytes_per_second: args.total_rate_bytes_per_second,
+                    upload_ratio: args.upload_ratio,
+                    download_ratio: args.download_ratio,
+                };
+                controller.start(params, args.expected_run_id).await?;
+                return Ok(json!({"traffic_test": controller.snapshot()}));
+            }
+            "stop_traffic_test" => {
+                let controller = self
+                    .traffic_controllers
+                    .get(&command.instance)
+                    .ok_or("client has no traffic controller")?;
+                let args: StopTraffic = serde_json::from_value(command.arguments.clone())
+                    .map_err(|_| "invalid stop traffic arguments")?;
+                controller.stop(args.expected_run_id).await?;
+                return Ok(json!({"traffic_test": controller.snapshot()}));
             }
             _ => return Err("unknown client action".into()),
         }
@@ -277,5 +341,187 @@ mod tests {
             wallet_summary(&[proof(u64::MAX), proof(1)], &[]).unwrap_err(),
             "available proof amount overflow"
         );
+    }
+
+    fn test_wallet() -> Arc<SqliteClientWallet> {
+        let dir = tempfile::tempdir().unwrap();
+        let loose_db = dir.path().join("loose.db");
+        let channel_db = dir.path().join("channels.db");
+        let loose =
+            crate::loose_proof_wallet::LooseProofWallet::open(&loose_db, "test-wallet").unwrap();
+        Arc::new(SqliteClientWallet::open(loose, &channel_db, &hex::encode([1u8; 32])).unwrap())
+    }
+
+    fn test_backend() -> (ClientBackend, TrafficController) {
+        let mut controls = BTreeMap::new();
+        controls.insert("test".into(), Arc::new(ClientManagement::default()));
+        let mut socks_listens = BTreeMap::new();
+        socks_listens.insert("test".into(), "127.0.0.1:0".into());
+        let mut traffic_controllers = BTreeMap::new();
+        let controller = TrafficController::new("127.0.0.1:1".parse().unwrap());
+        traffic_controllers.insert("test".into(), controller.clone());
+        (
+            ClientBackend::new(controls, socks_listens, test_wallet(), traffic_controllers),
+            controller,
+        )
+    }
+
+    fn command(instance: &str, action: &str, arguments: Value) -> Command {
+        Command {
+            generation: "test-gen".into(),
+            request_id: format!("{}-{}", action, rand::random::<u64>()),
+            instance: instance.into(),
+            action: action.into(),
+            arguments,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_traffic_test_validates_arguments() {
+        let (backend, _) = test_backend();
+        for mut arguments in [
+            json!({"server_url": "https://127.0.0.1:80", "total_rate_bytes_per_second": 1024, "upload_ratio": 1, "download_ratio": 1}),
+            json!({"server_url": "http://user@127.0.0.1:80", "total_rate_bytes_per_second": 1024, "upload_ratio": 1, "download_ratio": 1}),
+            json!({"server_url": "http://127.0.0.1:80?x=1", "total_rate_bytes_per_second": 1024, "upload_ratio": 1, "download_ratio": 1}),
+            json!({"server_url": "http://127.0.0.1:80", "total_rate_bytes_per_second": 512, "upload_ratio": 1, "download_ratio": 1}),
+            json!({"server_url": "http://127.0.0.1:80", "total_rate_bytes_per_second": 1024, "upload_ratio": 2, "download_ratio": 3}),
+            json!({"server_url": "http://127.0.0.1:80", "total_rate_bytes_per_second": 1024, "upload_ratio": 101, "download_ratio": 1}),
+        ] {
+            arguments["expected_run_id"] = json!(0);
+            let result = backend
+                .execute(&command("test", "start_traffic_test", arguments))
+                .await;
+            assert!(
+                result.is_err(),
+                "expected validation failure, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_traffic_test_shape() {
+        let (backend, _) = test_backend();
+        let snapshot = backend.snapshot().await.unwrap();
+        let instance = &snapshot["instances"]["test"];
+        assert!(instance["traffic_test"].is_object());
+        let traffic = &instance["traffic_test"];
+        assert!(traffic["revision"].is_u64());
+        assert!(traffic["run_id"].is_u64());
+        assert_eq!(traffic["state"], "stopped");
+        assert!(traffic["latency"].is_object());
+        assert!(traffic["latency"]["samples"].is_u64());
+        assert!(traffic["failures"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn traffic_arguments_reject_unknown_fields_and_wrong_shapes() {
+        let (backend, _) = test_backend();
+        for arguments in [
+            json!(null),
+            json!({}),
+            json!({"expected_run_id":0,"force":true}),
+            json!({"expected_run_id":"0"}),
+        ] {
+            assert!(backend
+                .execute(&command("test", "stop_traffic_test", arguments))
+                .await
+                .unwrap_err()
+                .contains("arguments"));
+        }
+        let args = json!({"expected_run_id":0,"server_url":"http://localhost","total_rate_bytes_per_second":1024,"upload_ratio":1,"download_ratio":1,"typo":true});
+        assert!(backend
+            .execute(&command("test", "start_traffic_test", args))
+            .await
+            .unwrap_err()
+            .contains("arguments"));
+    }
+
+    #[tokio::test]
+    async fn traffic_commands_serialize_concurrent_starts_and_stops() {
+        let (backend, controller) = test_backend();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let owner = controller.clone();
+        let owner = tokio::spawn(async move {
+            owner
+                .serve(async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        let backend = Arc::new(backend);
+        let mut tasks: tokio::task::JoinSet<Result<Value, String>> = tokio::task::JoinSet::new();
+        for i in 0u64..8 {
+            let backend = backend.clone();
+            let is_start = i % 2 == 0;
+            tasks.spawn(async move {
+                if is_start {
+                    let args = json!({
+                        "server_url": "http://127.0.0.1:8080",
+                        "total_rate_bytes_per_second": 1024,
+                        "upload_ratio": 1,
+                        "download_ratio": 1,
+                        "expected_run_id": 0,
+                    });
+                    backend
+                        .execute(&command("test", "start_traffic_test", args))
+                        .await
+                } else {
+                    backend
+                        .execute(&command(
+                            "test",
+                            "stop_traffic_test",
+                            json!({"expected_run_id":0}),
+                        ))
+                        .await
+                }
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let _ = result.unwrap();
+        }
+        // Final controller state must be coherent: stopped or a valid run id.
+        let snap = controller.snapshot();
+        assert_eq!(
+            snap.run_id, 1,
+            "only one start with expected run 0 may succeed"
+        );
+        // Stop once more to leave a deterministic stopped state.
+        backend
+            .execute(&command(
+                "test",
+                "stop_traffic_test",
+                json!({"expected_run_id":snap.run_id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(controller.snapshot().state, "stopped");
+        stop.send(()).unwrap();
+        owner.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disable_succeeds_when_best_effort_traffic_stop_cannot_be_delivered() {
+        let (backend, controller) = test_backend();
+        // Fill the controller command channel with requests whose waiters are
+        // then dropped, with no owner running. The best-effort stop inside
+        // disable cannot even be queued; disable must still succeed because
+        // the serve_managed controls watch is the authoritative traffic stop.
+        for i in 0..16u64 {
+            let mut start = Box::pin(controller.start(
+                TrafficRunParams {
+                    server_url: "http://127.0.0.1:8080".into(),
+                    total_rate_bytes_per_second: 1024,
+                    upload_ratio: 1,
+                    download_ratio: 1,
+                },
+                i,
+            ));
+            assert!(futures_util::FutureExt::now_or_never(&mut start).is_none());
+        }
+        let value = backend
+            .execute(&command("test", "set_enabled", json!({"enabled": false})))
+            .await
+            .unwrap();
+        assert_eq!(value["controls"]["enabled"], json!(false));
     }
 }

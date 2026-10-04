@@ -562,7 +562,13 @@ pub async fn relay_session_from_transport_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let h2_conn = server::handshake(stream)
+    // Return connection-level receive capacity as soon as DATA frames are
+    // buffered, while stream-level capacity stays reserved until the proxy
+    // task consumes them. Paused CONNECT tunnels can fill their own stream
+    // windows without starving the control stream that carries payments.
+    let h2_conn = server::Builder::new()
+        .recv_release_connection_on_buffer(true)
+        .handshake(stream)
         .await
         .map_err(|e| io::Error::other(format!("h2 handshake error: {e}")))?;
 

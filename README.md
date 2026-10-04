@@ -59,6 +59,12 @@ See [the combined demo guide](docs/management-ui.md) for detailed experiments an
 browser tests. Node 20+ and `curl` are used by the demo; production pages need only
 the Rust management binary and a browser.
 
+Configured clients also expose a managed speed/latency test. Run
+`cargo run -p monad-test-traffic -- run --config monad.yaml` for the ratio server,
+then use the **Speed test** panel on any client card (or the management commands
+described in [Traffic tests](docs/traffic-tests.md)). The **Traffic servers** page
+shows server endpoints, connections, and byte counters.
+
 The relay page keeps linked channels beside their sessions and places unlinked
 channels in a shared newest-first list below the relays. Closing remains visible;
 closed channels show compact final paid/capacity amounts without low-capacity red.

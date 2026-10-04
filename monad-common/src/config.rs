@@ -28,6 +28,8 @@ pub struct MonadConfig {
     pub clients: Vec<ClientConfig>,
     #[serde(default)]
     pub test_mints: Vec<TestMintConfig>,
+    #[serde(default)]
+    pub traffic_servers: Vec<TrafficServerConfig>,
 }
 
 impl MonadConfig {
@@ -112,8 +114,14 @@ impl MonadConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.relays.is_empty() && self.clients.is_empty() && self.test_mints.is_empty() {
-            anyhow::bail!("config must contain at least one relay, client, or test mint");
+        if self.relays.is_empty()
+            && self.clients.is_empty()
+            && self.test_mints.is_empty()
+            && self.traffic_servers.is_empty()
+        {
+            anyhow::bail!(
+                "config must contain at least one relay, client, test mint, or traffic server"
+            );
         }
 
         if !self.relays.is_empty() && self.relay_wallet.is_none() {
@@ -300,6 +308,18 @@ impl MonadConfig {
                 anyhow::bail!("test mints must use distinct listen addresses");
             }
         }
+        let mut traffic_names = HashSet::new();
+        let mut traffic_listeners = HashSet::new();
+        for server in &self.traffic_servers {
+            server.validate()?;
+            if !traffic_names.insert(&server.name) {
+                anyhow::bail!("duplicate traffic server name '{}'", server.name);
+            }
+            let addr: std::net::SocketAddr = server.listen.parse()?;
+            if addr.port() != 0 && !traffic_listeners.insert(addr) {
+                anyhow::bail!("traffic servers must use distinct listen addresses");
+            }
+        }
         if let Some(management) = &self.management {
             for name in management
                 .manual_funding_clients
@@ -310,16 +330,16 @@ impl MonadConfig {
                     anyhow::bail!("management references unknown client '{name}'");
                 }
             }
-            if management.relay_socket.is_some()
-                && management.relay_socket == management.client_socket
-            {
-                anyhow::bail!("management relay_socket and client_socket must be distinct");
-            }
-            if let Some(socket) = &management.test_mint_socket {
-                if management.relay_socket.as_ref() == Some(socket)
-                    || management.client_socket.as_ref() == Some(socket)
-                {
-                    anyhow::bail!("management test_mint_socket must be distinct from client and relay sockets");
+            let convenience_sockets = [
+                management.relay_socket.as_ref(),
+                management.client_socket.as_ref(),
+                management.test_mint_socket.as_ref(),
+                management.traffic_server_socket.as_ref(),
+            ];
+            let mut distinct = HashSet::new();
+            for socket in convenience_sockets.into_iter().flatten() {
+                if !distinct.insert(socket) {
+                    anyhow::bail!("management convenience socket paths must be pairwise distinct");
                 }
             }
             for path in management
@@ -327,6 +347,7 @@ impl MonadConfig {
                 .iter()
                 .chain(&management.client_socket)
                 .chain(&management.test_mint_socket)
+                .chain(&management.traffic_server_socket)
                 .chain(management.processes.values())
             {
                 if !Path::new(path).is_absolute() {
@@ -412,6 +433,8 @@ pub struct ManagementConfig {
     pub client_socket: Option<String>,
     #[serde(default)]
     pub test_mint_socket: Option<String>,
+    #[serde(default)]
+    pub traffic_server_socket: Option<String>,
     /// Named process Unix sockets consumed by the HTTP aggregator.
     #[serde(default)]
     pub processes: BTreeMap<String, String>,
@@ -419,6 +442,29 @@ pub struct ManagementConfig {
     pub manual_funding_clients: BTreeSet<String>,
     #[serde(default)]
     pub disabled_clients: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrafficServerConfig {
+    pub name: String,
+    pub listen: String,
+}
+
+impl TrafficServerConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.name.trim().is_empty() {
+            anyhow::bail!("traffic server name must be nonempty");
+        }
+        let addr: std::net::SocketAddr = self
+            .listen
+            .parse()
+            .map_err(|_| anyhow::anyhow!("traffic server listen must be an IP address and port"))?;
+        if !addr.ip().is_loopback() {
+            anyhow::bail!("traffic server listen must bind loopback");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, Deserialize)]
@@ -976,6 +1022,48 @@ management:
             .unwrap_err()
             .to_string()
             .contains("separate"));
+    }
+
+    #[test]
+    fn traffic_server_only_config_validates_listeners_and_management_socket() {
+        let yaml = r#"
+traffic_servers:
+  - name: first
+    listen: 127.0.0.1:0
+  - name: second
+    listen: 127.0.0.1:0
+management:
+  listen: 127.0.0.1:8090
+  traffic_server_socket: /tmp/traffic.sock
+"#;
+        let config: MonadConfig = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+
+        let duplicate_name: MonadConfig =
+            serde_yaml::from_str(&yaml.replace("name: second", "name: first")).unwrap();
+        assert!(duplicate_name.validate().is_err());
+        let duplicate_listen: MonadConfig =
+            serde_yaml::from_str(&yaml.replace("127.0.0.1:0", "127.0.0.1:3339")).unwrap();
+        assert!(duplicate_listen.validate().is_err());
+        let public: MonadConfig =
+            serde_yaml::from_str(&yaml.replace("127.0.0.1:0", "0.0.0.0:0")).unwrap();
+        assert!(public.validate().is_err());
+        let hostname: MonadConfig =
+            serde_yaml::from_str(&yaml.replace("127.0.0.1:0", "localhost:0")).unwrap();
+        assert!(hostname.validate().is_err());
+        let relative_socket: MonadConfig =
+            serde_yaml::from_str(&yaml.replace("/tmp/traffic.sock", "traffic.sock")).unwrap();
+        assert!(relative_socket.validate().is_err());
+        let socket_collision: MonadConfig = serde_yaml::from_str(&yaml.replace(
+            "traffic_server_socket: /tmp/traffic.sock",
+            "traffic_server_socket: /tmp/traffic.sock\n  client_socket: /tmp/traffic.sock",
+        ))
+        .unwrap();
+        assert!(socket_collision
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("pairwise distinct"));
     }
 
     #[test]
