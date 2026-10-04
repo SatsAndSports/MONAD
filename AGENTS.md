@@ -20,6 +20,10 @@ cargo run -p monad-quic -- ...
 
 ## Repo Shape
 
+- `vendor/h2`
+  - vendored `h2` 0.4.16 (`0.4.16+monad.1`) patched in via `[patch.crates-io]`
+  - adds opt-in `recv_release_connection_on_buffer`: connection-level H2 receive capacity returns when DATA is buffered; stream-level capacity still waits for consumption. Enabled on both MONAD H2 handshakes so paused CONNECT tunnels cannot starve the control stream. Full rationale, diff inventory, and vendoring mechanics: `docs/h2-flow-control.md`.
+  - standalone-testable: `cargo test --manifest-path vendor/h2/Cargo.toml` (note: packaged hpack fixture tests fail without the upstream fixture checkout; the stream/flow-control unit tests and `tests/paused_flow_control.rs` are the relevant ones)
 - `monad-common`
   - shared transport, protocol, and session code
   - `SecpNoiseStream` (`noise_secp256k1.rs`) — secp256k1 Noise transport with buffered writes and wire-byte logging
@@ -221,6 +225,7 @@ The test suite currently covers:
 - session repauses and resumes after second payment
 - session overshoot with negative balance and resume
 - underpayment stays paused until balance is positive
+- control stream stays usable while a paused tunnel holds a full H2 receive window (`test_control_stream_survives_connection_window_blocked_by_paused_tunnel`; vendored-h2 coverage in `vendor/h2/tests/paused_flow_control.rs` and `src/proto/streams/recv.rs` tests)
 - concurrent tunnels
 - nested 2-hop and 3-hop routes
 - IPv6 targets and IPv6 listeners

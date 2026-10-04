@@ -145,7 +145,14 @@ impl RelayConnection {
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (h2_client, h2_conn) = client::handshake(stream)
+        // Return connection-level receive capacity as soon as DATA frames are
+        // buffered, while stream-level capacity stays reserved until each
+        // stream is consumed. A paused CONNECT tunnel may therefore fill its
+        // own stream window without starving the shared connection window the
+        // control stream needs for payments.
+        let (h2_client, h2_conn) = client::Builder::new()
+            .recv_release_connection_on_buffer(true)
+            .handshake(stream)
             .await
             .map_err(|e| io::Error::other(format!("h2 handshake error: {e}")))?;
 

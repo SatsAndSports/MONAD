@@ -727,6 +727,24 @@ Sessions start paused with zero balance. While paused:
 - `CONNECT` requests are rejected with HTTP 402
 - The session unpauses only when the remaining balance becomes strictly positive
 
+Control usability while paused is a transport-level invariant, not just a
+policy. Paused CONNECT tunnels stop consuming their H2 receive streams, and
+HTTP/2 multiplexes all streams over one connection whose flow control has a
+shared connection-level receive window in addition to each stream's window.
+If unread tunnel DATA were allowed to retain connection-level capacity, a full
+paused tunnel could starve the control stream and make payment recovery
+impossible. MONAD therefore builds against a vendored `h2` (`vendor/h2`) with
+`recv_release_connection_on_buffer` enabled on both the client and relay H2
+handshakes: connection-level receive capacity is returned as soon as a DATA
+frame is buffered, while stream-level capacity stays reserved until the proxy
+task consumes the bytes. A paused tunnel can fill only its own bounded stream
+window (buffering behavior and limits are unchanged from stock `h2`); the
+shared connection window — and therefore the control stream — stays alive.
+This mirrors the decoupled connection-flow-control approach used by gRPC's Go
+transport for the same reason. The full diagnosis, diff inventory, bounds
+analysis, vendoring mechanics, and related test inventory live in
+[docs/h2-flow-control.md](docs/h2-flow-control.md).
+
 ### Billing Formula
 
 The amount due in millisats is computed as:
