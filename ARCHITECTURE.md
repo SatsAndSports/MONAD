@@ -669,6 +669,11 @@ At intermediate hops in a nested route, the inner hop connection is itself just 
 
 ## Control Protocol and Session Billing
 
+For the proposed implementation-independent replacement contract, see the
+[established-session control protocol review draft](docs/control-protocol.md).
+That draft explicitly separates target rules and open decisions from the current
+implementation; it is not yet a supported wire format.
+
 ### Wire Format
 
 Control messages are JSON objects, newline-delimited, exchanged over the H2 control stream (`POST /control`). Each message is a single compact JSON line terminated by `\n`. Blank lines are not protocol-significant and are ignored defensively by both sides' parsers.
