@@ -10,15 +10,15 @@ link/payment messages and `Ping`/`Pong` below are **not supported yet**.
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** express proposed
 requirements for the target protocol, not claims about current conformance.
 Items marked **Review decision** remain unresolved. This draft MUST NOT be
-treated as a finished interoperability specification until those decisions,
-especially response correlation, are resolved.
+treated as a finished interoperability specification until those decisions
+are resolved.
 
 ### Reading guide
 
 - **§3:** proposed message fields.
 - **§5:** link, payment, release and eviction semantics.
 - **§6–7:** client-first keyset removal and correlated liveness.
-- **§8:** the main unresolved acknowledgement/ordering decision.
+- **§8:** serialized requests and unambiguous response ordering without request IDs.
 - **§10–11:** example exchanges and differences from current code.
 - **§12:** review decisions and implementation/conformance checklist.
 
@@ -38,9 +38,10 @@ Principles:
 
 1. One operation has one wire representation. Funding belongs only in
    `ChannelLink`; subsequent payments cannot register funding.
-2. At most one state-changing client operation is outstanding per control stream.
-3. The relay is authoritative for accepted payments and session credit. A client
-   retains responsibility for its durable signed-payment history and funds.
+2. At most one serialized client request is outstanding per control stream.
+3. Relay reports are checked against the client's durable signed-payment history,
+   monotonic session-credit record, fixed pricing, and local byte counters. A relay
+   report MUST NOT cause the client to pay twice or surrender recorded credit.
 4. A state snapshot and a correlated liveness response serve different purposes.
 5. Wire rules do not prescribe a reducer, task architecture, database, or language.
 6. A failure or lost response is not proof that an operation had no effect.
@@ -62,6 +63,10 @@ Principles:
   existing data tunnels, and prevent new tunnels. It MUST NOT erase durable
   channel funding or accepted-payment history or initiate an on-mint close merely
   because control detached.
+- Unused credit in a terminated session may be lost; it is not automatically
+  transferred to a new session. A previously undelivered payment can indirectly
+  produce extra credit on a later session (§5.2), but that is not a refund of
+  credit already accepted into the terminated session.
 - A fatal error MAY be delivered before termination, but cleanup MUST NOT depend
   on successful delivery to an unresponsive peer.
 
@@ -108,6 +113,14 @@ values. Channel balances/capacities are in the channel's raw unit; session credi
 is in millisatoshis. No interpretation based on a field's apparent magnitude is
 permitted.
 
+JavaScript's ordinary `JSON.parse` uses binary64 numbers: its maximum safe integer
+is `2^53 - 1 = 9,007,199,254,740,991`. In millisatoshis that is
+**90,071.99254740991 BTC** (100,000,000,000 msat per BTC). Every nonnegative integer
+through `2^53` itself is representable, but `2^53 + 1` is not; hence the safe-integer
+limit is one less. This is far above normal channel amounts, but does not cover
+the full wire range. Implementations using JavaScript MUST preserve integer
+tokens losslessly rather than convert an already rounded Number to BigInt.
+
 All fields listed below are required unless explicitly stated otherwise.
 Only `SessionStatus.linked_channel` is nullable in these message schemas.
 
@@ -120,7 +133,7 @@ Only `SessionStatus.linked_channel` is nullable in these message schemas.
 | `ChannelLink` | `channel_id`, `balance_raw: u64` (MUST be 0), `signature`, `params: object`, `funding_proofs: nonempty array` | Register/relink a channel and acquire session ownership |
 | `ChannelPayment` | `channel_id`, `balance_raw: u64`, `signature` | Increase the channel's cumulative accepted payment and this session's credit by the accepted delta |
 | `ChannelUnlink` | `channel_id`, `final_balance_raw: u64` | Cooperatively finish using a retiring channel |
-| `GetSessionStatus` | None | Request an authoritative state snapshot |
+| `GetSessionStatus` | None | Request a relay-reported state snapshot |
 | `Ping` | `nonce: u64` | Request a correlated liveness response |
 
 `ChannelLink` and `ChannelPayment` use structured fields, not `payment_json`.
@@ -128,27 +141,32 @@ MONAD's `balance_raw` maps to the Spilman payment's `balance`; this is a wire
 field name, not a change to the signed commitment. The established Spilman
 signature and channel-ID derivation rules continue to apply.
 
-`params` is the complete channel-parameters object and `funding_proofs` the
-complete funding-proof list prescribed by that Spilman version. No new funding
-schema or signing preimage is defined here. Before finalization, the document
-MUST pin an exact external schema/reference and conformance vectors (D5).
+`params` is a JSON object containing the complete public channel parameters;
+`funding_proofs` is a nonempty JSON array of the complete funding proofs, not
+JSON-encoded strings. Their contents, signatures, and derivations follow the
+[Offline Spilman draft NUT](https://github.com/SatsAndSports/nuts/blob/offline-spillman-channel/XX.md)
+and its [published test vectors](https://github.com/SatsAndSports/nuts/blob/offline-spillman-channel/tests/XX-tests.md),
+as applicable to the established Spilman version. This document defines their
+placement and required presence in MONAD messages, not a second funding schema
+or a duplicate set of cryptographic vectors. Internal library objects containing
+derived secrets or cached mint metadata are not the public parameters object.
 
 ### 3.2 Relay → client
 
 | `type` | Additional fields | Purpose |
 | --- | --- | --- |
-| `SessionStatus` | See §3.3 | Authoritative state snapshot; also conveys link/payment success under the acknowledgement rule still to be resolved in D1 |
+| `SessionStatus` | See §3.3 | Initial relay state or response to the serialized client request (§8); client validation is required |
 | `ChannelEvicted` | `channel_id` | Notify that another session acquired this channel |
 | `ChannelReleaseRequested` | `channel_id` | Ask the client to finish outstanding payment work and release a retiring channel |
 | `ChannelUnlinked` | `channel_id`, `final_balance_raw: u64` | Confirm cooperative release |
-| `Error` | `code: string`, `message: string` | Machine-readable error code plus diagnostic text |
+| `Error` | `code: string`, `message: string` | Request rejection or fatal session error (§8–9) |
 | `Pong` | `nonce: u64` | Echo the corresponding Ping nonce |
 
-The three channel notifications all identify the channel explicitly. A client
+The three channel-specific messages all identify the channel explicitly. A client
 MUST NOT apply a delayed notification for channel A to its newer channel B.
 `message` in `Error` is diagnostic only; clients MUST NOT parse it for policy.
-Error-to-operation association requires the rules in §8/D1; an arbitrary Error
-MUST NOT be assumed to reject the currently outstanding operation.
+Nonfatal Error completes the outstanding serialized request. Unsolicited Error
+is permitted only for a fatal session error; it ends the session (§8–9).
 
 ### 3.3 `SessionStatus`
 
@@ -161,7 +179,7 @@ MUST NOT be assumed to reject the currently outstanding operation.
 | `active_out_rate` | Positive `u64`, outbound bytes per millisatoshi |
 | `session_total_in` | `u64`, cleartext bytes flowing from destination toward client |
 | `session_total_out` | `u64`, cleartext bytes flowing from client toward destination |
-| `total_paid_millisats` | `u64`, credit accepted for this session, accumulated across linked channels |
+| `total_paid_millisats` | `u64`, relay-reported credit accepted for this session, accumulated across linked channels; larger-than-expected credit is allowed (§5.2) |
 | `remaining_milli_sats` | `i64`, signed remaining credit |
 | `paused` | Boolean, whether paid data forwarding is paused |
 | `open_connects` | `u32`, currently open data CONNECTs |
@@ -197,7 +215,7 @@ Session state has independent dimensions:
 - Lifecycle: initializing, active, terminated.
 - Channel: unlinked or linked to one channel, optionally release-pending.
 - Credit: paused or forwarding, according to remaining credit.
-- Client operation slot: idle or awaiting link/payment/unlink outcome.
+- Client request slot: idle or awaiting link/payment/unlink/status-query outcome.
 
 Being unlinked does not itself discard existing session credit or require an
 immediate pause. A session can spend remaining credit after unlink or eviction,
@@ -218,9 +236,10 @@ The wire remaining value is clamped to the `i64` range if necessary, matching
 current behavior. Negative credit is permitted because forwarding/accounting
 may overshoot at chunk boundaries; it is not grounds to erase accepted payment.
 
-**Proposed scope:** receiver identity and active rates remain fixed for a session.
-Dynamic repricing needs an explicit cutover/accounting rule and is not silently
-introduced by a later snapshot. D6 asks reviewers to confirm this restriction.
+Receiver identity and active rates MUST remain fixed for the session. The client
+establishes the rates from the initial SessionStatus and MUST disconnect if a
+later status changes either rate. There is no in-session repricing in this
+protocol; different rates require a new session or a future protocol upgrade.
 
 New data CONNECTs are rejected while paused (currently HTTP 402); existing
 tunnels wait for credit rather than being charged as control traffic. Stream
@@ -243,7 +262,8 @@ on demand, not a promise of periodic refresh or success on the first request.
 
 For a stored channel:
 
-- Stored immutable funding and latest accepted payment remain authoritative.
+- The relay MUST preserve its stored immutable funding and latest accepted payment.
+  The client independently preserves its own signed-payment history (§5.2).
 - Supplied funding MUST agree with that record; a conflicting relink MUST be
   rejected rather than rewriting it or silently ignoring the conflict.
 - Relinking MUST NOT reset the accepted cumulative balance or credit its
@@ -258,7 +278,7 @@ channel merely because it was attempted. Channel ownership is exclusive across
 sessions: acquiring a channel owned elsewhere evicts the previous owner.
 
 Success is conveyed by `SessionStatus` naming the linked channel and its stored
-accepted balance, subject to D1. Repeating a link is not an idempotency-key replay:
+accepted balance, under §8. Repeating a link is not an idempotency-key replay:
 it can reacquire ownership and evict a different session. Clients MUST NOT
 automatically replay links in a way that causes ownership ping-pong.
 
@@ -285,20 +305,65 @@ double credit. A repeat/lower payment MUST NOT add credit. Current code has a
 `PAYMENT_NO_NEW_FUNDS` outcome for no increase, but validation can instead reject
 an invalid/lower payment as `PAYMENT_INVALID`; D4 must settle exact precedence.
 A failed ownership/balance comparison can report
-`PAYMENT_CONFLICT`. Success is reflected in `SessionStatus` under D1.
+`PAYMENT_CONFLICT`. Success is reflected in `SessionStatus` under §8, including
+both `linked_channel.balance_raw` and `total_paid_millisats`.
 
-If acceptance occurred but the response was lost, the client MUST reconcile
-the accepted balance rather than assume failure. It MUST NOT lower its durable
-signed balance to match an older snapshot. Credit belongs to the accepting
-session; a reconnect does not transfer an old session's remaining credit.
+#### Client records and ambiguous delivery
+
+The client MUST durably record the signed cumulative channel balance and payment
+before handing the payment to the transport. Persistence failure MUST prevent
+transmission. Cancellation, a failed write, or a lost response MUST NOT roll back
+that record: the relay may already possess the signature. The client MUST NOT
+lower its signed channel balance to match the relay's report.
+
+These are two distinct checks:
+
+- **Channel balance:** a relay report above the client's highest signed balance
+  for that channel is a protocol violation; the client MUST disconnect. A report
+  below the client's signed balance is allowed after ambiguous delivery. A rise
+  above the relay's previous report is allowed up to the client's signed balance.
+- **Session paid total:** the client maintains a monotonic session-credit record.
+  A payment-success response MUST credit at least the client's expected minimum.
+  A larger `total_paid_millisats` MUST be accepted as additional session credit,
+  raising that record; it MUST NOT be rejected merely for exceeding expectations.
+  This does not authorize a higher channel balance or an additional signature.
+
+For a newly signed balance `C_new`, let `C_old` be the client's durable signed
+balance before signing. The conservative minimum new credit is
+`raw_to_msats(C_new - C_old)`, not a delta calculated from a lower relay report.
+Before transmission the client records this increment once against the current
+session's expected paid total. Replaying the same signed payment MUST NOT count
+that increment twice. Previously signed but undelivered value can yield extra
+credit, but is not assumed to be available in the new session before confirmation.
+
+On a successful payment response, the client MUST reject a session paid total
+below its expected minimum and MUST NOT compensate by signing another payment.
+It updates its session-credit record to the larger reported total otherwise.
+Later responses MUST NOT reduce credit already recorded for that session.
+A request rejection does not prove that the signature was never received and
+MUST NOT roll back either record or trigger compensating payment. An unresolved
+or rejected payment cannot be treated as confirmed spendable credit; the client
+must reconcile the same payment or end the session before making further payments.
+
+The client sizes payments using fixed pricing, locally observed cleartext byte
+counts, and its monotonic session-credit record. Relay-reported byte counts,
+remaining balance, or paused state alone MUST NOT authorize additional payment.
+All amount conversions and additions MUST use checked exact arithmetic.
+
+Credit belongs to the accepting session; reconnecting does not transfer an old
+session's remaining credit. However, if an earlier payment was never accepted,
+the relay's lower stored channel balance makes a later cumulative payment credit
+more than the client's conservative minimum. The client accepts this bonus (§10).
 
 ### 5.3 Cooperative release and unlink
 
-This is a retirement handshake, not a general-purpose on-mint close operation:
+This is a retirement handshake, not a general-purpose on-mint close operation.
+The relay's notification does not occupy the client request slot; the unlink
+operation starts only when the client sends ChannelUnlink:
 
 1. Relay sends `ChannelReleaseRequested(A)`.
-2. Client stops originating new discretionary topups for A and resolves any
-   already outstanding link/payment before unlinking.
+2. Client records release-pending, stops originating new discretionary topups for
+   A, and resolves any outstanding serialized request before deciding to unlink.
 3. Client sends `ChannelUnlink(A, final_balance_raw)` only once its durable signed
    final balance has been acknowledged by the relay.
 4. Relay checks retirement eligibility, ownership and the exact accepted final
@@ -322,14 +387,15 @@ resolved. Clients must already scope each notification to its named channel.
 ### 5.4 Eviction
 
 On receiving `ChannelEvicted(A)`, a client MUST stop treating A as owned by this
-session. If its current channel is B, it MUST NOT clear B. The relay sends an
-authoritative status after eviction processing. Eviction alone does not end the
-session or erase its remaining credit.
+session. If its current channel is B, it MUST NOT clear B. The relay sends the
+ChannelEvicted notification without an unsolicited SessionStatus. Eviction alone
+does not end the session or erase its remaining credit.
 
 A payment racing a claim by another session must be serialized at the channel
 ownership/payment boundary: it is either accepted for its owner or rejected,
 never credited twice. The exact wire outcome for a pending operation superseded
-by eviction is part of D1/D3, not left to message-arrival guesses.
+by eviction follows §8: the notification cannot substitute for its terminal
+response. Release-specific races remain in D3.
 
 ## 6. Keyset-independent advertisements
 
@@ -382,8 +448,8 @@ credential.
 - Client MUST NOT reuse a nonce within the same control stream. A monotonic
   counter is sufficient; it MUST NOT wrap and reuse values.
 - Client MUST have at most one live probe outstanding. It MAY send a Ping while
-  a state-changing operation is outstanding; the two slots are independent.
-- Only a Pong matching the outstanding probe completes it. Unsolicited status,
+  a serialized client request is outstanding; the two slots are independent.
+- Only a Pong matching the outstanding probe completes it. Status responses,
   other messages, and late Pongs for expired probes MUST NOT complete a newer one.
 - A client MAY record ordinary received traffic as recent activity and avoid
   unnecessary probes, but cannot call that traffic the response to a sent Ping.
@@ -401,17 +467,25 @@ whether to defer timeout evaluation around known local work need an explicit
 implementation policy (D7). Ping need not be sent periodically: this draft does
 not require QUIC keep-alives or maintaining an otherwise idle transport forever.
 
-## 8. Ordering, responses, and the outstanding-operation slot
+## 8. Ordering, responses, and the serialized client request slot
 
-A state-changing operation occupies the client's single operation slot from
-submission until a **definitively associated** success/rejection/superseding
-outcome or session termination. A timeout alone MUST NOT free it for a different
-state-changing request on the same unresolved session.
+ChannelLink, ChannelPayment, and ChannelUnlink each begin with exactly one client
+message. GetSessionStatus is read-only but shares their single request slot
+because it also returns SessionStatus. The client MUST NOT submit another of
+these requests until it has consumed the complete response to the previous one.
+A timeout does not free the slot: the client must await the outcome or terminate
+the session. In particular, it cannot pipeline GetSessionStatus behind an
+unanswered payment to resolve uncertainty. Ping/Pong uses its independent slot.
 
-The relay MUST process state-changing requests in receive order, including
-validation outcomes, without overlapping their logical state transitions. It
-MAY forward/account data concurrently. This is an observable ordering contract,
-not a requirement to hold a mutex across I/O or use a particular task model.
+ChannelReleaseRequested is a notification, not a client operation. It does not
+occupy the slot or release ownership. ChannelUnlink begins only when the client
+decides to send it after resolving any current request. ChannelEvicted, byte
+accounting, and pause/resume changes likewise are not client requests.
+
+The relay MUST finish each request's logical transition and response sequence
+before executing the next serialized request. Data forwarding/accounting may
+continue concurrently. This is an observable ordering contract, not a mandated
+task architecture or a requirement to hold a mutex across I/O.
 
 | Request | Intended success | Rejection / other outcome |
 | --- | --- | --- |
@@ -421,43 +495,36 @@ not a requirement to hold a mutex across I/O or use a particular task model.
 | GetSessionStatus | Freshly generated SessionStatus | Session/protocol failure |
 | Ping(n) | Pong(n) | Session/protocol failure or local deadline |
 
-Relay-initiated SessionStatus, ChannelEvicted, ChannelReleaseRequested and
-applicable Error notifications can arrive without a request. They do not
-automatically consume or complete the client's operation slot. Messages already
-sent cannot be retracted after an ownership or accounting change.
+### D1 resolution — response discipline, without request IDs
 
-### Review decision D1 — do not mistake serialization for correlation
+- The initial SessionStatus is consumed before any client request. After that,
+  the relay MUST NOT send unsolicited SessionStatus, including on pause/resume,
+  eviction, release requests, or advertisement changes.
+- Link/payment/status-query success emits exactly one SessionStatus. Unlink
+  success emits the matching ChannelUnlinked followed by one SessionStatus.
+  The client MUST keep its slot occupied until that entire pair arrives.
+- Nonfatal Error MUST be the single terminal rejection response to the pending
+  request; it MUST NOT be followed by a generic status for that request. Fatal
+  errors end the session and MAY be unsolicited. Error fatality must be defined
+  by machine code, not inferred from diagnostic text or a delayed EOF (D4).
+- ChannelReleaseRequested and ChannelEvicted may interleave with a response,
+  but MUST NOT complete the request slot. A pending request superseded by eviction
+  still needs an explicit terminal response, or session termination. An accepted
+  payment must not be described as rejected merely because ownership changed
+  afterward.
+- Responses and notifications MUST be emitted in logical transition order. A
+  snapshot prepared before eviction cannot be emitted after its eviction
+  notification and thereby restore obsolete ownership. The unlink success pair
+  describes one release transition; later-transition notifications follow it.
+- An unexpected response type or extra SessionStatus is a protocol violation;
+  the client MUST disconnect. Paused clients can request fresh state when their
+  request slot is idle. No periodic status broadcast is required.
 
-With the current fields, an arbitrary next SessionStatus can be a queued
-unsolicited snapshot or a GetSessionStatus response rather than an operation
-acknowledgement. A relink to the same channel is especially ambiguous: the
-snapshot can look identical before and after. Unsolicited Error has a similar
-problem. Merely allowing one outstanding operation does **not** settle this.
-
-Resolve this before finalization. Alternatives for review:
-
-1. **Response-role discriminator, no general request IDs:** mark snapshots/errors
-   as unsolicited, link-result, payment-result, unlink-result, or status-query
-   result. The single operation slot plus channel/balance identifies the target;
-   scope notification errors explicitly. Define ordered/coherent result emission.
-2. **Strict barrier/emission rules with existing fields:** prohibit overlapping
-   status queries and operations and define how all pre-operation snapshots and
-   unrelated errors are distinguished or drained. Stream FIFO alone is not enough;
-   this option needs a convincing wire-level proof/transcript.
-3. **General request IDs:** clearer correlation, but outside the preferred minimal
-   direction and requires duplicate/replay semantics. IDs alone do not make
-   payment execution idempotent.
-
-Preferred direction for review is option 1 if existing fields cannot support an
-unambiguous contract. **No discriminator fields are silently added to §3 yet.**
-Thus §3 is a proposed inventory, not a complete implementable schema until D1 is
-resolved. Ping/Pong correlation solves only liveness, not operation acknowledgements.
-
-GetSessionStatus may be needed to reconcile an uncertain payment. D1 must decide
-when it is allowed alongside an outstanding operation and how its response is
-distinguished. It must also settle snapshots queued before newer snapshots:
-the wire must provide ordered state observations or an explicit revision rule,
-rather than relying on each client to guess which decreases are stale.
+Serialization alone would not distinguish a queued unsolicited status from a
+request response. Prohibiting those statuses, consuming every complete response,
+and giving notifications distinct types removes that ambiguity even for a
+same-channel relink. No general request ID or response-role field is needed.
+Correlation does not replace the payment-value checks in §5.2.
 
 ## 9. Errors, replay, and uncertain outcomes
 
@@ -493,8 +560,9 @@ mint HTTP transactions; the wallet's durable recovery obligations still apply.
 
 ## 10. Illustrative transcripts
 
-The arrows below show semantic outcomes, not a resolution of D1's wire markers.
-Symbols A/B stand for valid channel IDs; signatures/proofs are omitted here.
+The arrows below abbreviate fields; bracketed outcome labels are explanatory,
+not wire fields. Symbols A/B stand for valid channel IDs; signatures/proofs are
+omitted here. `paid` means `total_paid_millisats`.
 
 ### New session and payment
 
@@ -517,6 +585,28 @@ R -> C  [payment outcome] SessionStatus(linked=A, balance_raw=130,
                                        paid=raw_to_msats(30))
 ```
 
+### Ambiguous old payment yields bonus credit in a new session
+
+```text
+Channel A uses msat. Client persisted balance 100 before its previous send.
+The connection died; the client keeps 100, but the relay never accepted it (0).
+On a new session:
+R -> C  SessionStatus(linked=null, paid=0, paused=true)
+C -> R  ChannelLink(A, balance_raw=0, same immutable funding)
+R -> C  SessionStatus(linked=A, balance_raw=0, paid=0, paused=true)
+         Client does NOT lower its durable channel balance from 100 to 0.
+         Client persists signed balance 130 and expects at least 30 new msat.
+C -> R  ChannelPayment(A, balance_raw=130)
+R -> C  SessionStatus(linked=A, balance_raw=130, paid=130)
+         Client accepts 130 rather than rejecting it for exceeding 30.
+         Its session-credit record rises to 130; the bonus is 100 msat.
+```
+
+If the relay had accepted the old 100, the new session would receive only 30.
+Neither case permits a channel balance above the client's signed 130. A success
+response crediting less than the expected 30 is unacceptable. Repeating a status
+reporting 130 adds no further credit: it is a cumulative total, not a delta.
+
 ### Liveness while validation is pending
 
 ```text
@@ -537,7 +627,9 @@ R -> C  ChannelReleaseRequested(A)
 R -> C  [payment outcome] SessionStatus(linked=A, balance_raw=130)
 C -> R  ChannelUnlink(A, final_balance_raw=130)
 R -> C  ChannelUnlinked(A, final_balance_raw=130)
+         The request slot is STILL occupied.
 R -> C  SessionStatus(linked=null, credit preserved)
+         Only now may the client send its next serialized request.
 ```
 
 ## 11. Current implementation versus target
@@ -549,7 +641,9 @@ R -> C  SessionStatus(linked=null, credit preserved)
 | Relink funding | Client sends full funding; relay uses stored data and can ignore missing/conflicting supplied fields | Always require it and reject immutable conflicts |
 | Advertised keyset IDs | Relay-known preference list, including inactive IDs; not an acceptance allowlist | Client ignores first, then field removed |
 | Liveness | GetSessionStatus heartbeat; any server message clears the outstanding heartbeat | Correlated Ping/Pong; unrelated traffic does not acknowledge Ping |
-| Control operation correlation | Client uses local in-flight state and snapshot inference | Explicit, implementation-independent rule pending D1 |
+| Control operation correlation | Client uses local in-flight state and snapshot inference; unsolicited statuses exist | One serialized request including status queries; no unsolicited statuses after initialization; complete response sequences consumed |
+| Channel versus session balances | Rejects channel balances above locally signed values and session paid totals above locally authorized totals | Keep the channel upper bound; reject session shortchanging and accept larger session credit |
+| Pre-send bookkeeping | Driver increments its local session total after the send; wallet signing is a separate path | Durable signed channel record and expected session increment recorded before transmission; no rollback on uncertain delivery |
 | Input errors | Relay attempts Error and continues for decoder errors; client exits on decode failure | Strict fatal malformed-input handling proposed in D4 |
 | Execution | Relay reducer + effect interpreter; client imperative loop with inline wallet calls | No mandated architecture; only observable ordering/cleanup obligations |
 
@@ -571,21 +665,23 @@ Relevant source locations for checking this draft:
 
 | ID | Question |
 | --- | --- |
-| D1 | How are operation outcomes, queried snapshots, unsolicited snapshots/errors and superseded operations unambiguously distinguished without general request IDs? What snapshot freshness rule is guaranteed? |
+| D1 — resolved | §8 specifies one serialized request, no unsolicited generic statuses, dedicated notifications, and complete ordered responses without request IDs. |
 | D2 | What exact immutable funding equality applies to relinks, including proof ordering and auxiliary metadata? Which error reports a conflict? |
 | D3 | What are duplicate unlink, unlinked-session unlink, repeated release requests, and eviction-during-release semantics? |
 | D4 | Approve strict JSON parsing/unknown fields/fatal malformed input; specify every error's fatality, association, and whether any accepted state may already have changed. How is prohibited pipelining handled? |
-| D5 | Pin the complete external params/proof/signature/receiver encoding and test vectors. Confirm field sizes, line-size budget, integer representation and aggregate buffer limits. |
-| D6 | Confirm fixed session rates/receiver and advertisement-update rules. Distinguish new-channel admission from stored-channel relink when policy changes. |
+| D5 | Confirm MONAD field sizes, line-size budget, exact integer representation and aggregate buffer limits. Funding structure and cryptographic vectors are referenced from the draft NUT (§3.1), not duplicated here. |
+| D6 — partly resolved | Session rates and receiver are fixed. Set advertisement-update rules within solicited responses; distinguish new-channel admission from stored-channel relink when policy changes. |
 | D7 | Define operational probe deadlines around slow local work/relay effects, late/unsolicited Pong handling, rate limits, and resource bounds without requiring immediate preemption. |
 
 ### Ordered work under #125
 
-- [ ] Review this draft and resolve D1–D7; keep proposals distinguishable from facts.
+- [ ] Review this draft and resolve the remaining decisions; keep target rules distinguishable from current implementation.
 - [ ] Change clients to ignore advertised IDs, including mocks and harnesses (#91).
 - [ ] Remove the IDs and preference plumbing after that behavior is verified.
 - [ ] Implement the approved structured schemas, strict funding rules, and
   operation-outcome ordering/correlation contract.
+- [ ] Implement pre-send payment bookkeeping, channel upper-bound checks,
+  session-credit lower-bound checks, and monotonic acceptance of bonus credit.
 - [ ] Implement Ping/Pong and use it for correlated liveness instead of status queries.
 - [ ] Add conformance fixtures/transcripts and adversarial tests for both endpoints.
 - [ ] Coordinate the breaking protocol version update outside this document;
@@ -602,8 +698,14 @@ Relevant source locations for checking this draft:
   on payments; no accepted-balance reset or historical credit on relink.
 - Duplicate/lower/over-capacity payment; response loss; ownership races; no double
   credit; byte accounting continues during slow control work.
-- Unsolicited/stale status or notification before a pending result; same-channel
-  relink; old-channel notifications after replacement; exact result-slot completion.
+- Reject unsolicited/extra statuses; serialize status queries with payments;
+  same-channel relink; notifications before a pending result; no stale ownership
+  resurrection; hold the slot through the full unlink pair.
+- Crash/write failure after durable signing but before response; lower relay
+  channel balance; impossible higher channel balance causes disconnect; session
+  shortchanging rejected; bonus session credit accepted without double counting.
+- Fixed rates throughout the session; later rate changes cause disconnect;
+  relay pause/remaining reports alone cannot induce additional signatures.
 - Release with an outstanding payment, mismatched final balance, duplicate unlink,
   eviction during release and retained session credit.
 - Matching/late/wrong nonce, paused-session Ping, Ping behind slow validation,
