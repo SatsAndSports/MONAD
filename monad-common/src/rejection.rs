@@ -76,6 +76,17 @@ impl fmt::Display for Rejection {
 }
 impl std::error::Error for Rejection {}
 
+/// An unstructured HTTP CONNECT rejection, retaining its status for callers.
+#[derive(Debug)]
+pub struct ConnectRejection(pub http::StatusCode);
+
+impl fmt::Display for ConnectRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CONNECT rejected: {}", self.0)
+    }
+}
+impl std::error::Error for ConnectRejection {}
+
 /// Only a valid code/status pair is actionable. Unknown/malformed metadata is
 /// never interpreted as authorization to wait indefinitely.
 pub fn connect_error(status: http::StatusCode, headers: &http::HeaderMap) -> io::Error {
@@ -95,10 +106,7 @@ pub fn connect_error(status: http::StatusCode, headers: &http::HeaderMap) -> io:
             "invalid MONAD CONNECT rejection metadata",
         );
     }
-    io::Error::new(
-        io::ErrorKind::ConnectionRefused,
-        format!("CONNECT rejected: {status}"),
-    )
+    io::Error::new(io::ErrorKind::ConnectionRefused, ConnectRejection(status))
 }
 
 #[cfg(test)]

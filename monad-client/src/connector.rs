@@ -154,6 +154,7 @@ impl ConnectorRuntime {
 #[derive(Default)]
 struct RouteSetup {
     conns: Mutex<Vec<Arc<RelayConnection>>>,
+    suffix_rebuild: std::sync::atomic::AtomicBool,
 }
 
 impl RouteSetup {
@@ -521,6 +522,9 @@ async fn rebuild_route_internal(
     }
 
     let preserved_hops = old_hops.into_iter().take(start_hop_idx).collect::<Vec<_>>();
+    setup
+        .suffix_rebuild
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let mut rebuilt_suffix = chain_from_hop(
         Some(prefix_tail),
         route.clone(),
@@ -700,6 +704,50 @@ async fn open_next_hop_tunnel(
 trait HopTransport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> HopTransport for T {}
 
+// Retry only an explicit upstream gateway failure, before a Noise session or
+// payment task exists. Authentication, policy, funding and malformed responses
+// must not become retryable just because their io::ErrorKind is similar.
+async fn retry_suffix_connect<T, F, Fut>(mut connect: F) -> io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(deadline, connect())
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "suffix CONNECT retry window expired",
+                ))
+            }) {
+            Err(error)
+                if error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<monad_common::rejection::ConnectRejection>())
+                    .is_some_and(|e| e.0 == http::StatusCode::BAD_GATEWAY)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                if tokio::time::timeout_at(
+                    deadline,
+                    tokio::time::sleep(std::time::Duration::from_millis(250)),
+                )
+                .await
+                .is_err()
+                {
+                    return Err(error);
+                }
+                // Bound subsequent attempts as well as the backoff.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn hop_transport(
     hop: &RouteHop,
     runtime: &ConnectorRuntime,
@@ -772,17 +820,24 @@ fn chain_from_hop(
             let _episode = AdmissionEpisode(&runtime);
             loop {
                 let attempt = async {
-                    let mut stream = hop_transport(hop, &runtime, upstream.as_ref())
-                        .await
-                        .map_err(|e| {
-                            RouteRefusal::annotate(
-                                e,
-                                hop_idx.max(1),
-                                hop_idx + 1,
-                                "connect",
-                                hop_label.clone(),
-                            )
-                        })?;
+                    let transport = || hop_transport(hop, &runtime, upstream.as_ref());
+                    let mut stream = if setup
+                        .suffix_rebuild
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        retry_suffix_connect(transport).await
+                    } else {
+                        transport().await
+                    }
+                    .map_err(|e| {
+                        RouteRefusal::annotate(
+                            e,
+                            hop_idx.max(1),
+                            hop_idx + 1,
+                            "connect",
+                            hop_label.clone(),
+                        )
+                    })?;
                     let accepted =
                         noise_secp256k1::handshake_initiator_with_pubkey_and_server_accept(
                             &mut stream,
@@ -978,6 +1033,112 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::watch;
     use tokio::time::{sleep, timeout};
+
+    #[tokio::test]
+    async fn suffix_connect_retries_gateway_rejection_on_same_prefix() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (requests_tx, mut requests_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut h2 = h2::server::handshake(server_io).await.unwrap();
+            let mut attempts = 0;
+            while let Some(request) = h2.accept().await {
+                let (_, mut respond) = request.unwrap();
+                attempts += 1;
+                requests_tx.send(attempts).unwrap();
+                let status = if attempts == 1 { 502 } else { 200 };
+                respond
+                    .send_response(
+                        http::Response::builder().status(status).body(()).unwrap(),
+                        true,
+                    )
+                    .unwrap();
+            }
+        });
+        let (mut conn, driver) = RelayConnection::from_transport_stream(client_io, [42; 32])
+            .await
+            .unwrap();
+        conn.add_driver(driver);
+        conn.add_task(server);
+        let tunnel = retry_suffix_connect(|| conn.open_tunnel("example.com:443"))
+            .await
+            .unwrap();
+        assert_eq!(requests_rx.recv().await, Some(1));
+        assert_eq!(requests_rx.recv().await, Some(2));
+        assert_eq!(conn.session_id(), &[42; 32]);
+        drop(tunnel);
+        conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn suffix_connect_cancellation_awaits_owned_prefix_cleanup() {
+        let runtime = ConnectorRuntime::with_mock_wallet().unwrap();
+        let conn = Arc::new(test_relay_connection(55).await);
+        let child = tokio::spawn(std::future::pending::<()>());
+        let child_abort = child.abort_handle();
+        conn.add_task(child);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let attempt_runtime = runtime.clone();
+        let attempt = tokio::spawn(async move {
+            owned_setup(attempt_runtime, move |setup| async move {
+                setup.track(conn);
+                let mut entered_tx = Some(entered_tx);
+                retry_suffix_connect(|| {
+                    if let Some(tx) = entered_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    std::future::ready(Err(monad_common::rejection::connect_error(
+                        http::StatusCode::BAD_GATEWAY,
+                        &http::HeaderMap::new(),
+                    )))
+                })
+                .await
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+        attempt.abort();
+        assert!(matches!(attempt.await, Err(error) if error.is_cancelled()));
+        timeout(Duration::from_secs(1), runtime.wait_for_setup_cleanup())
+            .await
+            .unwrap();
+        assert!(child_abort.is_finished());
+    }
+
+    #[tokio::test]
+    async fn suffix_connect_retry_is_bounded_and_does_not_retry_other_errors() {
+        for status in [
+            http::StatusCode::FORBIDDEN,
+            http::StatusCode::PAYMENT_REQUIRED,
+            http::StatusCode::UNAUTHORIZED,
+        ] {
+            let mut attempts = 0;
+            let result: io::Result<()> = retry_suffix_connect(|| {
+                attempts += 1;
+                std::future::ready(Err(monad_common::rejection::connect_error(
+                    status,
+                    &http::HeaderMap::new(),
+                )))
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+        }
+        let mut attempts = 0;
+        let result: io::Result<()> = timeout(
+            Duration::from_secs(4),
+            retry_suffix_connect(|| {
+                attempts += 1;
+                std::future::ready(Err(monad_common::rejection::connect_error(
+                    http::StatusCode::BAD_GATEWAY,
+                    &http::HeaderMap::new(),
+                )))
+            }),
+        )
+        .await
+        .expect("retry must be bounded");
+        assert!(result.is_err());
+        assert!((2..=13).contains(&attempts));
+    }
 
     fn sample_pubkey(seed: u8) -> Secp256k1Pubkey {
         SecpTransportKeypair::from_secret_bytes(&[seed; 32])

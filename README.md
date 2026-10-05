@@ -868,7 +868,10 @@ fail while no route is published, then use the replacement route once it is
 connected. A first-hop failure triggers a full reconnect. Later-hop failures
 detach only channels tied to the old suffix sessions and try to rebuild from the
 failed hop, preserving the unaffected prefix when possible; suffix rebuild
-failure falls back to a full route reconnect. Failed or cancelled setup aborts and
+failure falls back to a full route reconnect. During suffix setup, transient
+CONNECT 502 responses are retried every 250 ms for up to three seconds per hop
+(within the overall setup budget), allowing a restarting relay time to return
+without discarding the prefix. Failed or cancelled setup aborts and
 awaits its owned payment and H2 tasks before detaching channels or retrying, so a
 completed compatible channel can be reused. The default setup budget is five
 seconds; cleanup can take longer if an in-flight mint call must finish. Library
