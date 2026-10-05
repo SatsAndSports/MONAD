@@ -16,7 +16,7 @@ are resolved.
 ### Reading guide
 
 - **§3:** proposed message fields.
-- **§5:** link, payment, release and eviction semantics.
+- **§5:** payment records, release/eviction semantics, and the client-action race table.
 - **§6–7:** client-first keyset removal and correlated liveness.
 - **§8:** serialized requests and unambiguous response ordering without request IDs.
 - **§10–11:** example exchanges and differences from current code.
@@ -328,25 +328,46 @@ These are two distinct checks:
   raising that record; it MUST NOT be rejected merely for exceeding expectations.
   This does not authorize a higher channel balance or an additional signature.
 
-For a newly signed balance `C_new`, let `C_old` be the client's durable signed
-balance before signing. The conservative minimum new credit is
-`raw_to_msats(C_new - C_old)`, not a delta calculated from a lower relay report.
-Before transmission the client records this increment once against the current
-session's expected paid total. Replaying the same signed payment MUST NOT count
-that increment twice. Previously signed but undelivered value can yield extra
-credit, but is not assumed to be available in the new session before confirmation.
+The client keeps three distinct records:
 
-On a successful payment response, the client MUST reject a session paid total
-below its expected minimum and MUST NOT compensate by signing another payment.
-It updates its session-credit record to the larger reported total otherwise.
-Later responses MUST NOT reduce credit already recorded for that session.
-A request rejection does not prove that the signature was never received and
-MUST NOT roll back either record or trigger compensating payment. An unresolved
-or rejected payment cannot be treated as confirmed spendable credit; the client
-must reconcile the same payment or end the session before making further payments.
+1. **Durable signed channel balance:** the highest cumulative balance it has
+   signed for each channel, preserved across sessions and payment rejections.
+2. **Confirmed session credit `P`:** the largest validated cumulative
+   `total_paid_millisats` for this session. It never decreases and is not reduced
+   by consumption; consumption reduces remaining credit, not total paid.
+3. **Pending payment expectation:** the channel, signed payment, and minimum
+   cumulative session credit required if that outstanding payment succeeds.
+   This expectation is not yet confirmed spendable credit.
+
+For a newly signed balance `C_new`, let `C_old` be the client's durable signed
+balance before signing. Before transmission, persist the new signed balance and
+record the pending expectation `P + raw_to_msats(C_new - C_old)`. The increment
+uses the client's signed history, not a lower relay-reported channel balance.
+A replay of the same pending payment retains its original expectation; it MUST
+NOT count the increment twice or recompute it as zero after signing. Previously
+signed value from another session can yield bonus credit but is not assumed
+available in this session before confirmation.
+
+On a successful payment response, the client MUST disconnect if the reported
+session paid total is below the pending expectation. Otherwise it sets `P` to
+the reported total (including any bonus) and resolves the pending expectation.
+All later status responses MUST report at least `P`; shortchanging is a protocol
+violation, not a reason to sign another payment.
+
+A matching ownership-loss rejection after eviction resolves the pending
+expectation as rejected without adding it to `P`. This does not roll back the
+durable signed channel balance or reduce confirmed session credit. The client
+can replace the channel and continue this session (§5.5 and §9). Other payment
+errors require their code-specific handling; ambiguous acceptance must be
+reconciled or the session ended before further payment. A timeout or notification
+alone MUST NOT resolve the pending expectation or free the request slot.
+
+No rejection revokes a signature already disclosed to the relay. Channel rollover
+preserves that financial exposure in the durable channel record; it is not a
+refund or proof that the signature cannot be redeemed.
 
 The client sizes payments using fixed pricing, locally observed cleartext byte
-counts, and its monotonic session-credit record. Relay-reported byte counts,
+counts, and its confirmed session credit `P`. Relay-reported byte counts,
 remaining balance, or paused state alone MUST NOT authorize additional payment.
 All amount conversions and additions MUST use checked exact arithmetic.
 
@@ -380,9 +401,25 @@ remaining credit, or by itself execute a mint transaction. After the success pai
 the client may link a replacement. Retirement prevents later reuse of the retired
 channel; ordinary control detach is a different operation.
 
-**Review decision D3:** specify whether an exact duplicate unlink is acknowledged
-after release, and how an unsolicited release request racing eviction/relink is
-resolved. Clients must already scope each notification to its named channel.
+The client maintains a release-pending set keyed by channel ID. For a currently
+linked channel or the target of an outstanding link, ChannelReleaseRequested
+adds that ID to the set; repeated requests are idempotent. The client continues
+processing its outstanding request. It attempts unlink when the slot is free,
+it still owns that channel, and the final signed balance is acknowledged.
+Release-pending does not authorize a lower final balance or cancel a payment.
+
+The relay MUST NOT reject an otherwise valid owner's crossing payment merely
+because release was requested. Retirement prevents new links but does not itself
+revoke existing ownership. If ownership is subsequently lost, §5.4 applies.
+
+If eviction or a successful replacement link releases the channel, no further
+unlink is needed for that ownership. Removing the pending unlink work MUST NOT
+erase the retirement record or signed-payment history. A notification naming
+an unrelated channel MUST NOT release the currently linked channel.
+
+**Review decision D3:** duplicate unlink acknowledgements, unlink from an already
+unlinked session, and eviction during an outstanding unlink remain to be settled.
+Link/payment races and repeated release notifications follow §5.5.
 
 ### 5.4 Eviction
 
@@ -395,7 +432,47 @@ A payment racing a claim by another session must be serialized at the channel
 ownership/payment boundary: it is either accepted for its owner or rejected,
 never credited twice. The exact wire outcome for a pending operation superseded
 by eviction follows §8: the notification cannot substitute for its terminal
-response. Release-specific races remain in D3.
+response. If payment acceptance wins, its success status MUST precede eviction.
+If eviction wins, ChannelEvicted MUST precede the nonfatal ownership-loss
+rejection (§9). Success for that outstanding payment after the matching eviction
+is a protocol violation; the client MUST disconnect. This does not prohibit
+payments following a later successful link that establishes new ownership.
+
+Eviction MUST NOT clear a matching outstanding request. It changes ownership,
+not whether a signed payment was accepted. A rejected payment following eviction
+does not by itself end the session; the client can roll over to another channel
+after consuming the rejection, retaining confirmed session credit.
+
+### 5.5 Notifications while a client request is outstanding
+
+This table describes **what the client should do next**, not the relay's internal
+processing. It assumes the notification names the request's channel A.
+
+| Outstanding request | Notification received | What the client should do next |
+| --- | --- | --- |
+| ChannelLink(A) | ChannelReleaseRequested(A) | Mark A release-pending and keep waiting for the link response. If linking succeeds, attempt unlink when its final balance is reconciled and the slot is free, rather than starting discretionary topups. If linking fails and A is not owned, no unlink is needed. |
+| ChannelPayment(A) | ChannelReleaseRequested(A) | Mark A release-pending and keep waiting for the payment response. After validated success, attempt ChannelUnlink(A) when the slot is free. On rejection, follow §9; do not unlink using an unacknowledged final balance. |
+| ChannelLink(A) | ChannelEvicted(A) | Stop treating the affected ownership of A as valid, but keep the link request outstanding. Wait for its explicit outcome; a later successful link may establish new ownership. Do not automatically send another link to fight the eviction. |
+| ChannelPayment(A) | ChannelEvicted(A) | Stop using A for further payments, retain its durable signed balance, and keep waiting for the payment rejection. After the matching ownership-loss rejection, resolve the pending expectation, clear the request slot, and select or provision another channel in this session. Preserve confirmed credit. |
+
+**Different channel IDs:** eviction of old channel B while ChannelLink(A) is
+pending clears only B's ownership; it does not cancel or complete Link(A).
+ChannelReleaseRequested(B) marks B release-pending. If Link(A) succeeds, replacement
+already releases B and no unlink of B is needed. If it fails and B is still
+owned, the client can unlink B once its final balance is reconciled. Neither
+notification authorizes unlinking A because B was named.
+
+**Same-channel relink:** eviction before a Link(A) response can concern ownership
+that existed before the relink. A later successful link response can legitimately
+establish new ownership. This differs from a stale snapshot resurrecting old
+ownership. If the link acquired A first and that new ownership was then evicted,
+the relay MUST send link success before eviction.
+
+**Retirement racing a link:** if acquisition precedes retirement, the relay sends
+link success before requesting release of that new ownership. If retirement
+precedes acquisition, it rejects the link as retired. A release notification for
+existing ownership may still precede a rejected same-channel relink; the client
+then proceeds with release of the ownership it still holds.
 
 ## 6. Keyset-independent advertisements
 
@@ -514,7 +591,8 @@ task architecture or a requirement to hold a mutex across I/O.
   afterward.
 - Responses and notifications MUST be emitted in logical transition order. A
   snapshot prepared before eviction cannot be emitted after its eviction
-  notification and thereby restore obsolete ownership. The unlink success pair
+  notification and thereby restore obsolete ownership. A later successful
+  same-channel relink can establish new ownership (§5.5). The unlink success pair
   describes one release transition; later-transition notifications follow it.
 - An unexpected response type or extra SessionStatus is a protocol violation;
   the client MUST disconnect. Paused clients can request fresh state when their
@@ -541,13 +619,48 @@ specified causal response contract. Machine codes use the uppercase wire names.
 | `LINK_KEYSET_REFRESH_RATE_LIMITED`, `LINK_KEYSET_REFRESH_BUSY`, `LINK_KEYSET_REFRESH_FAILED` | Temporary refresh obstacle; bounded/backed-off retry of unchanged funding may be appropriate |
 | `LINK_UNSUPPORTED_CASHU_SPILMAN_PROTOCOL_VERSION` | Incompatible session inputs; reconnection/reconfiguration policy needs D4 |
 | `LINK_KEYSET_VERSION_NOT_NEGOTIATED` | Fatal to this MONAD session; must not mark an otherwise valid wallet channel unusable globally |
-| `LINK_CHANNEL_RETIRED`, `CHANNEL_CLOSED`, `CHANNEL_EXPIRED` | Channel cannot be used as requested; preserve funds/recovery history |
+| `LINK_CHANNEL_RETIRED`, `CHANNEL_CLOSED`, `CHANNEL_EXPIRED` | Channel cannot be used as requested; preserve funds/recovery history; payment-time closed/expired rejection follows the replacement rules below |
 | `PAYMENT_WRONG_CHANNEL`, `PAYMENT_UNKNOWN_CHANNEL` | Reconcile link/ownership; do not infer accepted credit |
 | `PAYMENT_INVALID` | Invalid payment; no blind retry with newly signed funds |
 | `PAYMENT_NO_NEW_FUNDS` | No additional delta credited; can occur on replay after a lost response; reconcile status |
-| `PAYMENT_CONFLICT` | Ownership/accepted-state race; current client rebuilds the session; final required behavior needs D4 |
+| `PAYMENT_CONFLICT` | Baseline conflates ownership loss and accepted-state races; current client rebuilds. Target separates expected eviction from other conflicts as described below |
 | `CHANNEL_UNLINK_REJECTED` | Retirement/ownership/final-balance mismatch; must not pretend release succeeded |
 | `INTERNAL_ERROR` | No general no-side-effect guarantee; treat outcome as uncertain and reconcile |
+
+### Payment rejection policy
+
+The target adds **`PAYMENT_OWNERSHIP_LOST`**, a nonfatal terminal rejection for a
+payment that was not accepted because another session acquired its channel.
+This proposed code is not present at the inspected baseline. The relay MUST
+send ChannelEvicted for that channel before this rejection. The client correlates
+the notification with the outstanding payment's channel and then consumes the
+rejection before sending a replacement link. A generic PAYMENT_CONFLICT, an
+eviction for a different channel, or diagnostic error text is not a substitute.
+PAYMENT_OWNERSHIP_LOST without the required matching eviction is a protocol
+violation, not permission to provision another channel.
+
+| Payment outcome | Required client handling |
+| --- | --- |
+| Matching eviction followed by PAYMENT_OWNERSHIP_LOST | Resolve the expectation as rejected, preserving the signed channel record and confirmed session credit. Select or provision another channel and continue this session; do not disconnect solely for this expected rejection. |
+| CHANNEL_CLOSED or CHANNEL_EXPIRED rejection | Stop using the channel and preserve its signed/recovery history. Resolve the rejected expectation; replacement may continue in the same session without reducing confirmed credit. |
+| PAYMENT_NO_NEW_FUNDS | Once the request slot is free, reconcile with GetSessionStatus. Do not blindly sign a larger payment; the same payment may already have been accepted. |
+| PAYMENT_CONFLICT without the explicit ownership-loss outcome, PAYMENT_WRONG_CHANNEL, or PAYMENT_UNKNOWN_CHANNEL | Reconcile ownership and payment state before further payment; do not infer no acceptance or automatically provision a replacement from the code alone. |
+| PAYMENT_INVALID | Stop automatic payment attempts and report the validation failure. Fresh channel provisioning is not a repair for an invalid signature or malformed payment. |
+| INTERNAL_ERROR or otherwise ambiguous acceptance | Reconcile once the request slot is free. If the outcome cannot be established safely, end the session. |
+| Impossible channel balance, shortchanged success response, or contradictory response ordering | Disconnect for a protocol violation. |
+
+Resolving a rejection frees the wire request slot, but does not necessarily
+resolve financial uncertainty. For errors requiring reconciliation, retain the
+signed request and its original expected credit until a fresh status establishes
+acceptance with sufficient credit, or end the session. A missing response still
+occupies the slot, so a status query cannot be pipelined behind it (§8).
+
+Replacement funding is sized from confirmed credit, local usage, and the normal
+client payment policy. It MUST NOT blindly repeat the rejected amount as a
+compensating payment. Confirmed credit is neither discarded on eviction nor
+increased by a rejected pending expectation. If both release and eviction were
+observed for A, ownership loss removes the need to unlink A; the payment still
+requires its terminal response before rollover.
 
 No human-readable error text is a retry instruction. A response timeout,
 transport reset, or InternalError MUST NOT authorize new funding or changed
@@ -632,6 +745,41 @@ R -> C  SessionStatus(linked=null, credit preserved)
          Only now may the client send its next serialized request.
 ```
 
+### Eviction rejects a pending payment; the session continues
+
+```text
+Channel A uses msat. Client signed balance is 100; confirmed session paid P=50.
+         Client persists balance 130; pending success expectation is 50+30=80.
+C -> R  ChannelPayment(A, balance_raw=130)
+R -> C  ChannelEvicted(A)
+         Stop using A. Keep the payment request outstanding; do not link B yet.
+R -> C  Error(code=PAYMENT_OWNERSHIP_LOST)
+         Resolve the pending expectation as rejected; confirmed P remains 50.
+         A's durable signed balance stays 130. The session remains usable.
+         Select an eligible replacement B, provisioning only if necessary.
+C -> R  ChannelLink(B, balance_raw=0, complete params and proofs)
+R -> C  SessionStatus(linked=B, balance_raw=0, paid=50)
+         Future payments use retained credit and local usage, not the rejected
+         amount as an automatic retry. Existing data tunnels are not torn down
+         merely for this channel rollover; they remain subject to session credit.
+```
+
+If payment acceptance had won, the relay would instead send its success status
+with `paid >= 80` before ChannelEvicted(A). The client would retain that confirmed
+credit while replacing A. Eviction followed by payment success is forbidden.
+
+### Eviction during a same-channel relink
+
+```text
+This session already owns A and sends ChannelLink(A) again.
+C -> R  ChannelLink(A, balance_raw=0, same immutable funding)
+R -> C  ChannelEvicted(A)
+         The earlier ownership was lost. Keep the link request outstanding.
+R -> C  [link outcome] SessionStatus(linked=A, stored balance, credit unchanged)
+         The requested relink subsequently acquired A again; this is new
+         ownership, not an unsolicited stale status restoring the old ownership.
+```
+
 ## 11. Current implementation versus target
 
 | Topic | Baseline `7212537` | Target draft |
@@ -643,7 +791,8 @@ R -> C  SessionStatus(linked=null, credit preserved)
 | Liveness | GetSessionStatus heartbeat; any server message clears the outstanding heartbeat | Correlated Ping/Pong; unrelated traffic does not acknowledge Ping |
 | Control operation correlation | Client uses local in-flight state and snapshot inference; unsolicited statuses exist | One serialized request including status queries; no unsolicited statuses after initialization; complete response sequences consumed |
 | Channel versus session balances | Rejects channel balances above locally signed values and session paid totals above locally authorized totals | Keep the channel upper bound; reject session shortchanging and accept larger session credit |
-| Pre-send bookkeeping | Driver increments its local session total after the send; wallet signing is a separate path | Durable signed channel record and expected session increment recorded before transmission; no rollback on uncertain delivery |
+| Pre-send bookkeeping | Driver increments its local session total after the send; wallet signing is a separate path | Durable signed channel record, confirmed session credit, and pending expectation kept distinct; expected credit recorded before transmission |
+| Eviction during payment | Client eviction handling clears matching operation state; PAYMENT_CONFLICT rebuilds the session | Keep request outstanding through matching PAYMENT_OWNERSHIP_LOST; resolve rejected expectation, preserve signed history and confirmed credit, and roll over within the session |
 | Input errors | Relay attempts Error and continues for decoder errors; client exits on decode failure | Strict fatal malformed-input handling proposed in D4 |
 | Execution | Relay reducer + effect interpreter; client imperative loop with inline wallet calls | No mandated architecture; only observable ordering/cleanup obligations |
 
@@ -667,8 +816,8 @@ Relevant source locations for checking this draft:
 | --- | --- |
 | D1 — resolved | §8 specifies one serialized request, no unsolicited generic statuses, dedicated notifications, and complete ordered responses without request IDs. |
 | D2 | What exact immutable funding equality applies to relinks, including proof ordering and auxiliary metadata? Which error reports a conflict? |
-| D3 | What are duplicate unlink, unlinked-session unlink, repeated release requests, and eviction-during-release semantics? |
-| D4 | Approve strict JSON parsing/unknown fields/fatal malformed input; specify every error's fatality, association, and whether any accepted state may already have changed. How is prohibited pipelining handled? |
+| D3 — partly resolved | §5.5 settles link/payment notification races; repeated release requests set the same per-channel flag. Settle duplicate unlink, unlinked-session unlink, and eviction during an outstanding unlink. |
+| D4 — partly resolved | §9 defines nonfatal PAYMENT_OWNERSHIP_LOST and payment rejection handling. Complete error fatality/association rules, approve strict parsing, and settle prohibited pipelining. |
 | D5 | Confirm MONAD field sizes, line-size budget, exact integer representation and aggregate buffer limits. Funding structure and cryptographic vectors are referenced from the draft NUT (§3.1), not duplicated here. |
 | D6 — partly resolved | Session rates and receiver are fixed. Set advertisement-update rules within solicited responses; distinguish new-channel admission from stored-channel relink when policy changes. |
 | D7 | Define operational probe deadlines around slow local work/relay effects, late/unsolicited Pong handling, rate limits, and resource bounds without requiring immediate preemption. |
@@ -681,7 +830,10 @@ Relevant source locations for checking this draft:
 - [ ] Implement the approved structured schemas, strict funding rules, and
   operation-outcome ordering/correlation contract.
 - [ ] Implement pre-send payment bookkeeping, channel upper-bound checks,
-  session-credit lower-bound checks, and monotonic acceptance of bonus credit.
+  separate confirmed credit and pending expectations, session-credit lower-bound
+  checks, and monotonic acceptance of bonus credit.
+- [ ] Implement the client-action race table, deferred release flags, ordered
+  PAYMENT_OWNERSHIP_LOST rejection, and same-session channel rollover.
 - [ ] Implement Ping/Pong and use it for correlated liveness instead of status queries.
 - [ ] Add conformance fixtures/transcripts and adversarial tests for both endpoints.
 - [ ] Coordinate the breaking protocol version update outside this document;
@@ -708,6 +860,15 @@ Relevant source locations for checking this draft:
   relay pause/remaining reports alone cannot induce additional signatures.
 - Release with an outstanding payment, mismatched final balance, duplicate unlink,
   eviction during release and retained session credit.
+- All four link/payment × release/eviction cases, repeated release requests,
+  old-channel notifications during replacement, and legitimate same-channel
+  reacquisition after eviction (distinct from stale snapshot resurrection).
+- Eviction then ownership-loss rejection holds the request slot until Error,
+  preserves the signed balance and confirmed credit, resolves only the pending
+  expectation, and permits a new channel in the same session. Payment success
+  before eviction retains credited funds; success after eviction is rejected.
+- Generic conflict, unrelated-channel eviction, missing rejection, and internal
+  error cannot masquerade as the expected ownership-loss rollover outcome.
 - Matching/late/wrong nonce, paused-session Ping, Ping behind slow validation,
   and cancellation during local work. No false claim that any traffic proves a probe.
 - Client-first keyset removal with rotation, inactive stored funding, unavailable
