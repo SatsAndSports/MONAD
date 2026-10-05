@@ -608,6 +608,11 @@ Failure handling is deliberately scoped:
 - suffix rebuild preserves prefix sessions and channels before the failed hop for
   future streams
 - suffix rebuild failure falls back to a full route reconnect
+- During suffix setup, each CONNECT gets a three-second window with 250 ms
+  backoff for unstructured HTTP 502 responses. Retries occur before Noise and
+  funding, retain the existing prefix, and remain under setup cancellation,
+  prefix-failure monitoring, and the overall setup deadline. Other failures
+  keep their existing handling (including administrative admission waits).
 
 Route setup runs under an owned supervisor. Each H2 connection is registered
 immediately, and its payment task is attached before waiting for funded
