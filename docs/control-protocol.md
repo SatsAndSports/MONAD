@@ -1,585 +1,617 @@
-# Established-session control protocol — review draft
+# Established-session control protocol - review draft
 
 **Status: proposed contract, not the protocol currently implemented.**
 
 Tracking issue: [#125](https://github.com/SatsAndSports/MONAD/issues/125).
 Implementation baseline inspected: `7212537` (main after PR #118).
 This document changes no runtime behavior. **MUST**, **MUST NOT**, **SHOULD**, and
-**MAY** describe target requirements. Remaining review questions are collected
-at the end; this is not yet a finished interoperability specification.
+**MAY** describe target requirements. The client and relay must be updated
+together before this contract is selected.
 
-## 1. Scope and client-driven exchange
+## 1. Scope and lifecycle
 
-This contract covers messages on an established H2 `POST /control` stream.
-The session-protocol identifier **`h2-2026-10-06`** means HTTP/2 with this MONAD
-control contract. The updated client and relay support this identifier only:
-**no old `h2` fallback or backward-compatibility path**. Both endpoints must be
-updated together. This is a session-protocol selection in the Noise bootstrap,
-not a change to HTTP/2 or QUIC TLS ALPN. The bootstrap envelope can remain
-version 1; no separate control-protocol version field is needed.
+This contract covers messages on an established H2 `POST /control` stream. The
+session-protocol identifier **`h2-2026-10-06`** selects HTTP/2 with this MONAD
+control contract. Endpoints implementing this target MUST select only that
+identifier: there is no old `h2` fallback or compatibility path. This is Noise
+bootstrap session-protocol selection, not a change to HTTP/2 or QUIC TLS ALPN.
+The bootstrap envelope can remain version 1; no separate control version is
+needed.
 
 Noise, transport establishment, and bootstrap mechanics are otherwise outside
 this document. Authenticated relay identity, negotiated Spilman protocol, and
-negotiated keyset versions are inputs. Advisory extensions (§3.4) can evolve
-within this contract; new requests/responses or required semantics need explicit
+negotiated keyset versions are inputs. Optional notifications can evolve within
+this contract; new requests, responses, or required semantics need explicit
 capability negotiation or a new session-protocol identifier.
 
-### Requests and responses
+### 1.1 Initial state
 
-After the initial SessionStatus, the client may send Ping at any time. The relay
-MUST promptly return the matching Pong without waiting for slow request work.
-The other requests form one ordered pipeline:
+- At most one control stream is accepted per session. A second is rejected
+  without replacing the first.
+- The relay's first application message MUST be `SessionStatus`. The client MUST
+  consume it before sending any message, including Ping or extensions.
+- A new session is unlinked and paused, with zero credit and byte counters. A
+  stored channel's historical accepted balance is not credit for this session.
+- The initial status supplies the state and funding information defined in §3.3.
+- Control traffic remains available while paid data forwarding is paused.
 
-| Client request | Exactly one success response | Exactly one failure response |
-| --- | --- | --- |
-| ChannelLink | SessionStatus identifying the linked channel | Error |
-| ChannelPayment | SessionStatus reflecting accepted payment and session credit | Error |
-| ChannelUnlink | SessionStatus with linked_channel=null and credit preserved | Error |
-| GetSessionStatus | SessionStatus | Error |
-| Ping(nonce), independent of the pipeline | Pong(nonce) | Invalid input follows the fatal protocol-error rules |
+### 1.2 Termination
 
-The client MAY pipeline requests without waiting. The relay MUST execute them
-in receive order, finish each logical operation and fix its response before
-executing the next, and emit responses in the same order. A status describes
-its request's resulting state before later queued requests mutate it; it MUST
-NOT be regenerated from that later state when written. Data accounting may
-continue concurrently.
+Control EOF, reset, or loss ends the session; half-close is not a way to retain a
+data-only session. Termination MUST release linked ownership, terminate existing
+data tunnels, and prevent new ones. It MUST NOT erase durable funding or accepted
+payment history or initiate an on-mint close merely because control detached.
 
-The client keeps a FIFO of unanswered requests. Each valid SessionStatus or
-nonfatal Error answers its oldest entry. A failure does not cancel successors:
-each is evaluated against the state left by earlier operations. A failed link
-followed by a payment normally gives two errors; a failed redundant relink that
-preserves ownership may still be followed by a successful payment. There is no
-implicit batch transaction.
+Unused session credit is not transferred on reconnect; §5.2 distinguishes later
+bonus credit. Fatal-error delivery may precede termination, but cleanup MUST NOT
+depend on delivery to an unresponsive peer.
 
-Relays MUST support at least **five outstanding pipeline requests per session**,
-including the active request. Ping remains independently serviceable and does
-not use one of those positions. There is no advertised or negotiated window;
-normal clients are expected to have one or two outstanding requests. Relays may
-support more, using bounded buffering/backpressure beyond the minimum. No open
-session may silently discard, merge, or reorder requests or their responses.
-Queue/reducer implementation mechanics are not part of this contract.
+## 2. Framing, validation, and exact values
 
-Timeouts and notifications do not remove FIFO entries. A status query can be
-queued after a payment, but cannot overtake it or replace its missing response.
-Connection loss or fatal termination may leave several requests unanswered;
-exactly-one response does not guarantee delivery across failure. Preserve every
-signed payment and treat unconfirmed outcomes conservatively.
-
-ChannelReleaseRequested and ChannelEvicted are the two core relay-initiated
-advisory notifications. Clients MAY ignore both and rely on request results.
-Either endpoint may also send ExtensionNotification. None of these messages
-consumes a FIFO entry or requires a reply. Errors are self-contained. Apart
-from initialization, the relay MUST NOT send unsolicited SessionStatus or
-nonfatal Error. Recognized fatal errors end the session. There is no
-ChannelUnlinked message in the target protocol.
-
-## 2. Lifecycle, encoding, and validation
-
-### 2.1 Initial state and termination
-
-- At most one control stream is accepted per session; reject a second without
-  replacing the first.
-- The relay's first application message MUST be SessionStatus. The client MUST
-  consume it before sending any messages, including extensions.
-- A new session is unlinked, paused, with zero credit and byte counters. A stored
-  channel's historical balance is not automatically credit for this session.
-- Control traffic remains available while paused. Control half-close is not a
-  way to retain a data-only session: EOF, reset, or loss ends the session.
-- Termination MUST release linked ownership, terminate existing data tunnels,
-  and prevent new ones. It MUST NOT erase durable funding or accepted-payment
-  history or initiate an on-mint close merely because control detached.
-- Unused session credit may be lost on termination; it is not transferred on
-  reconnect. Previously unaccepted signatures can yield bonus credit later
-  (§5.2), which is different from refunding already accepted session credit.
-- Fatal-error delivery may precede termination, but cleanup MUST NOT depend on
-  delivering that error to an unresponsive peer.
-
-Even though the initial session has no credit, its first status is essential:
-it supplies the payment receiver, offered trusted mint/unit combinations and
-recovery windows, and session-wide pricing needed to begin funding. Offers are
-not an exhaustive allowlist of acceptable stored channels or funding keysets.
-
-### 2.2 Encoding
+### 2.1 Encoding and resource bound
 
 Each message is one UTF-8 JSON object terminated by LF (`0x0a`), with a required,
 case-sensitive `type`. H2 DATA boundaries have no application significance.
 Senders MUST NOT emit blank lines; receivers MAY ignore them. A final partial
 line is not a message and MUST NOT execute.
 
-Proposed maximum encoded line: **1,048,576 bytes excluding LF**, including
-funding data, matching the current decoder limit. Bound incomplete-message
-buffering too; oversize input must not cause repeated parsing or error loops.
+An encoded line MUST NOT exceed **1,048,576 bytes excluding LF**. Senders MUST
+enforce the limit before transmission, and receivers MUST bound incomplete-line
+buffering to the same limit. Oversize input is a fatal protocol error and must
+not cause repeated parsing or error loops.
+
+The bound applies to the complete JSON message, not to an H2 frame, control
+stream, or session. `ChannelLink` is normally the largest message because it
+carries every funding proof. Ordinary unrestricted power-of-two denominations
+need few proofs, but a small `maximum_amount_for_one_output` can make proof count
+linear in the raw funding amount. A Spilman construction can therefore be valid
+under its NUT yet too large for MONAD. Clients MUST account for this bound while
+constructing channels and SHOULD conservatively reject candidates that cannot fit
+before requesting funding. Encoded size, not a separate proof-count limit, is
+authoritative.
 
 Reject duplicate keys, unknown top-level types, wrong-direction core messages,
-missing required fields, unexpected top-level fields, and invalid types/ranges.
-Forbidden fields are forbidden even as `null`. Public parameters/proofs follow
-their referenced NUT schemas; extension payloads follow §3.4. An unknown
-extension name inside a valid envelope is not an unknown top-level type.
+missing required fields, unexpected top-level fields, and invalid types or
+ranges. Forbidden fields are forbidden even as `null`. Public parameters and
+proofs follow their referenced NUT schemas; extension payloads follow §3.5.
+Unknown extension names inside a valid envelope are not unknown top-level types.
 
-On malformed client input the relay SHOULD send CONTROL_INVALID_MESSAGE if
-practical and MUST terminate. Malformed relay input terminates the client
-session. These are target rules, not current decoder behavior.
+`Error.message` MUST fit within 4,096 UTF-8 bytes. JSON nesting, counting the root
+object as depth one, MUST NOT exceed 64; total object members plus array elements
+MUST NOT exceed 65,536. Senders enforce these bounds. A required response that
+cannot fit terminates the session rather than truncating structured state.
 
-### 2.3 Exact integers and implementation limits
+On malformed client input the relay SHOULD send `CONTROL_INVALID_MESSAGE` if
+practical and MUST terminate. Malformed relay input terminates the client. These
+are target rules, not current decoder behavior.
+
+### 2.2 Exact integers and supported ranges
 
 | Type | Wire representation |
 | --- | --- |
 | `u64` | JSON integer 0 through 18,446,744,073,709,551,615 |
 | `u32` | JSON integer 0 through 4,294,967,295 |
-| `i64` | JSON integer −9,223,372,036,854,775,808 through 9,223,372,036,854,775,807 |
+| `i64` | JSON integer -9,223,372,036,854,775,808 through 9,223,372,036,854,775,807 |
 | `channel_id` | Spilman channel identifier; currently 32 bytes as 64 lowercase hex characters |
 | `signature` | Spilman BIP-340 commitment signature; currently 64 bytes as 128 lowercase hex characters |
 | `unit` | Cashu unit string; current MONAD usage is `sat` or `msat` |
 
 Integer tokens use decimal integer notation, not fractional values. Channel
-balances/capacities use the channel's raw unit; session credit is in millisatoshis.
-All supported values, comparisons, conversions, and arithmetic MUST be exact.
-No unit inference from magnitude, silent rounding, truncation, or counter wrap.
+balances and capacities use the channel's raw unit; session credit uses
+millisatoshis. All supported values, comparisons, conversions, and intermediate
+arithmetic MUST be exact. There is no unit inference from magnitude, silent
+rounding, truncation, saturation, clamping, or counter wrap.
 
 Implementations MAY impose documented supported ranges smaller than the wire
-types. They MUST detect and explicitly reject unsupported values before applying
-them or authorizing payment; a local range failure must not alter signed history.
-Rejecting an unsupported response may end the session. Validate intermediate
-arithmetic too: exact inputs do not guarantee exact multiplication or billing.
-There is no requirement that every implementation handle the entire u64 range.
+types. They MUST reject unsupported request values before persistence, ownership,
+payment, or credit mutation, using `NUMERIC_LIMIT_EXCEEDED`. A local failure must
+not alter signed history. Relays MUST set operational limits that keep every
+status field, including exact `remaining_milli_sats`, representable. If exact
+accounting or a received response becomes unrepresentable despite those checks,
+the endpoint terminates rather than emitting or accepting an approximation.
 
-JavaScript's ordinary JSON.parse uses binary64. Number.MAX_SAFE_INTEGER is
-`2^53 - 1 = 9,007,199,254,740,991`, or **90,071.99254740991 BTC** in msat.
-All nonnegative integers through `2^53` itself are representable, but `2^53 + 1`
-is not. A JavaScript implementation may, for example, cap supported monetary
-values at **90,000 BTC = 9,000,000,000,000,000 msat**, enforce safe integer/range
-checks, and reject larger values rather than use a lossless full-u64 parser.
-Counters, nonces, and intermediate results need their own exactness checks.
-Converting an already rounded Number to BigInt does not restore precision.
+JavaScript's ordinary `JSON.parse` uses binary64. An implementation may cap
+monetary values at **90,000 BTC = 9,000,000,000,000,000 msat**, check every
+integer and intermediate result, and reject larger values rather than support the
+full `u64` range. Converting an already rounded `Number` to `BigInt` does not
+restore precision. Counters need their own exactness checks. Ping nonces are an
+exception to reduced local ranges: every endpoint MUST parse and echo the full
+`u64` range losslessly because Ping has no FIFO error response.
 
-### 2.4 Unexpected messages
+## 3. Messages and exchange
 
-After initialization, validate framing/envelopes before applying these rules:
+All listed fields are required. Only `linked_channel` is nullable among core
+fields. Optional extension payload members may contain null under their schema.
 
-| Incoming relay message | Client handling |
-| --- | --- |
-| SessionStatus or recognized nonfatal Error with pending requests | Validate against the oldest request; consume exactly that FIFO entry. Earlier snapshots need not reflect later requests already sent. |
-| Structurally valid SessionStatus or recognized nonfatal Error with an empty FIFO | Discard without state changes; SHOULD emit a rate-limited warning. Do not update pricing, ownership, credit, counter baselines, pending payments, or heartbeat/probe state. |
-| Response failing the oldest request's required checks | Terminate, rather than skip it and guess that the next message is the real response. |
-| Recognized fatal Error | Terminate regardless of FIFO state. |
-| Core advisory or valid extension notification | Handle or ignore as specified; never consume FIFO entries. |
-| Malformed input, unknown top-level type, wrong-direction core message, or unknown Error code | Terminate; unknown errors cannot safely be classified as nonfatal. |
-
-Empty-FIFO tolerance does not authorize unsolicited responses and does not
-apply before initialization. Warnings MUST be bounded/rate-limited and MUST NOT
-dump payments, extension payloads, or arbitrary peer diagnostic text.
-With pending requests, a plausible unsolicited status can be indistinguishable
-from a response. Clients check financial/request invariants without heuristic
-FIFO repair; correlation relies on relay response count and ordering. Pong uses
-its nonce rules, not this FIFO. Optional extensions cannot replace core responses.
-
-## 3. Message schemas
-
-All fields listed are required. Only linked_channel is nullable among the core
-fields; extension payload members may contain null according to their schema.
-
-### 3.1 Client → relay
+### 3.1 Client to relay
 
 | `type` | Additional fields | Meaning |
 | --- | --- | --- |
-| ChannelLink | `channel_id`, `zero_balance_signature`, `params: object`, `funding_proofs: nonempty array` | Register/relink funding and acquire ownership |
-| ChannelPayment | `channel_id`, `balance_raw: u64`, `signature` | Submit a cumulative signed channel payment |
-| ChannelUnlink | `channel_id` | Release linked ownership |
-| GetSessionStatus | None | Request a state snapshot |
-| Ping | `nonce: u64` | Request correlated liveness evidence |
-| ExtensionNotification | `name: string`, `data: object` | Optional advisory extension; no response |
+| `ChannelLink` | `channel_id`, `zero_balance_signature`, `params: object`, `funding_proofs: nonempty array` | Register or relink funding and acquire ownership |
+| `ChannelPayment` | `channel_id`, `balance_raw: u64`, `signature` | Submit a cumulative signed channel payment |
+| `ChannelUnlink` | `channel_id` | Release linked ownership |
+| `GetSessionStatus` | None | Request a state snapshot |
+| `Ping` | `nonce: u64` | Request correlated liveness evidence |
+| `ExtensionNotification` | `name: string`, `data: object` | Optional advisory extension; no response |
 
-These are structured objects, not payment_json strings. For ChannelLink,
-zero_balance_signature signs the **zero-balance Spilman commitment in the
-channel's unit**: zero sat or zero msat, as applicable. The zero is implicit;
-there is no balance_raw field on a link. For payments, balance_raw maps to the
-Spilman commitment's balance without changing the signed construction.
-ChannelUnlink has no final_balance_raw field and does not sign anything.
+These are structured objects, not `payment_json` strings. A link's
+`zero_balance_signature` signs the zero-balance Spilman commitment in the
+channel's unit; zero is implicit and `balance_raw` is forbidden. A payment's
+`balance_raw` maps directly to the Spilman commitment. Funding fields are
+forbidden on payments, even as null. Unlink has no final balance and signs
+nothing.
 
-The public parameters object, funding-proof array, signatures, and derivations
-follow the [Offline Spilman draft NUT](https://github.com/SatsAndSports/nuts/blob/offline-spillman-channel/XX.md)
-and its [published vectors](https://github.com/SatsAndSports/nuts/blob/offline-spillman-channel/tests/XX-tests.md),
-as applicable to the negotiated Spilman version. MONAD specifies their placement
-and presence, not another funding schema or duplicate cryptographic vectors.
-Internal objects containing derived secrets/cached metadata are not the public
-parameters object. Funding fields MUST NOT appear on payments, even as null.
+For negotiated Spilman protocol `2026-09-14` and keyset formats `v1` and `v2`,
+public parameters, proofs, signatures, and derivations follow the pinned
+[Offline Spilman draft NUT](https://github.com/SatsAndSports/nuts/blob/37f03c9c67303d4ae7f2254ff9470c2ecb83565c/XX.md)
+and its [published vectors](https://github.com/SatsAndSports/nuts/blob/37f03c9c67303d4ae7f2254ff9470c2ecb83565c/tests/XX-tests.md).
+MONAD defines their placement and presence, not a second funding schema. Internal
+objects containing secrets or cached metadata are not public parameters. Future
+versions require an explicit mapping to their immutable specifications and
+version-specific validation rules.
 
-### 3.2 Relay → client
+### 3.2 Relay to client
 
 | `type` | Additional fields | Meaning |
 | --- | --- | --- |
-| SessionStatus | §3.3 | Initial state or success response; client validation required |
-| ChannelEvicted | `channel_id`, `scope: "session" \| "relay"` | Advisory channel exclusion (§5.4) |
-| ChannelReleaseRequested | `channel_id` | Optional request to unlink when convenient |
-| Error | `code: string`, `message: string` | Request rejection or fatal session error (§8) |
-| Pong | `nonce: u64` | Echo a Ping nonce |
-| ExtensionNotification | `name: string`, `data: object` | Optional advisory extension; no response |
+| `SessionStatus` | §3.3 | Initial state or successful request result |
+| `ChannelEvicted` | `channel_id`, `scope: "session" \| "relay"` | Advisory exclusion (§5.4) |
+| `ChannelReleaseRequested` | `channel_id` | Advisory request to unlink when convenient (§5.3) |
+| `Error` | `code: string`, `message: string` | Request rejection or fatal session error (§6) |
+| `Pong` | `nonce: u64` | Correlated response to Ping (§3.4) |
+| `ExtensionNotification` | `name: string`, `data: object` | Optional advisory extension; no response |
 
-Notifications apply only to their named channel; an old-channel message cannot
-cancel a request or change ownership for a different channel. Error.message is
-diagnostic text, not an instruction to parse. Nonfatal Error completes the
-oldest unanswered request; only fatal Error may be unsolicited.
+`Error.message` is diagnostic text and MUST NOT be parsed for behavior. There is
+no `ChannelUnlinked` message.
 
 ### 3.3 SessionStatus
 
-| Field | Type / meaning |
+| Field | Type and meaning |
 | --- | --- |
-| receiver_pubkey | Current public payment receiver key in the negotiated Spilman encoding; may change (§4) |
-| advertisements | Map of mint URL → map of unit → funding_keyset_recovery_window_secs (u64) |
-| linked_channel | null or `{channel_id, balance_raw: u64, capacity_raw: u64, unit}` |
-| active_in_rate | Positive u64, inbound bytes per millisatoshi, fixed session-wide |
-| active_out_rate | Positive u64, outbound bytes per millisatoshi, fixed session-wide |
-| session_total_in | u64, cleartext bytes from destination toward client |
-| session_total_out | u64, cleartext bytes from client toward destination |
-| total_paid_millisats | u64, cumulative credit accepted into this session across channels; bonus credit allowed |
-| remaining_milli_sats | i64, signed remaining session credit |
-| paused | Boolean, whether paid data forwarding is paused |
-| open_connects | u32, currently open accepted H2 data CONNECT tunnels |
-| total_connects | u64, cumulative accepted H2 data CONNECT tunnels in this session |
+| `receiver_pubkey` | Current payment receiver key in the negotiated Spilman encoding; may rotate (§4) |
+| `advertisements` | Map of mint URL to map of unit to funding-keyset recovery-window seconds (`u64`) |
+| `linked_channel` | null or `{channel_id, balance_raw: u64, capacity_raw: u64, unit}` |
+| `active_in_rate` | Positive `u64`, inbound bytes per millisatoshi, fixed session-wide |
+| `active_out_rate` | Positive `u64`, outbound bytes per millisatoshi, fixed session-wide |
+| `session_total_in` | `u64`, cleartext bytes from destination toward client |
+| `session_total_out` | `u64`, cleartext bytes from client toward destination |
+| `total_paid_millisats` | `u64`, cumulative session credit; bonus credit allowed |
+| `remaining_milli_sats` | `i64`, exact signed remaining session credit |
+| `paused` | Boolean, whether paid data forwarding is paused |
+| `open_connects` | `u32`, currently open accepted H2 data CONNECT tunnels |
+| `total_connects` | `u64`, cumulative accepted H2 data CONNECT tunnels |
 
-Directions are from the client's perspective. Control bytes are not charged as
-data. CONNECT counts include TCP exits and QUIC-forwarded tunnels, regardless
-of whether the outer session uses TCP or QUIC. They count logical H2 CONNECTs,
-not pooled QUIC connections, packets, or the outer session itself.
+Directions are from the client's perspective. Control bytes are not charged.
+CONNECT counts include TCP exits and QUIC-forwarded tunnels and count logical H2
+CONNECTs, not packets, pooled QUIC connections, or the outer session.
+`total_connects` and `open_connects` increment when the relay accepts a CONNECT
+with a successful H2 response; target-connect rejection does not count.
+`open_connects` decrements exactly once when that tunnel terminates. Each status
+is one internally consistent snapshot, although accounting may advance
+immediately after its linearization point.
 
-For example, the advertisement map can be:
+An advertisement value is the mint/unit funding-keyset recovery window in
+seconds. There are no per-mint rates or concrete keyset IDs. Map order has no
+preference semantics and the map may be empty. It describes offered trusted
+mint/unit combinations, not every acceptable stored channel or funding ID.
 
-```json
-{"https://mint.example":{"sat":3600,"msat":7200}}
-```
+`linked_channel.balance_raw` is the relay's accepted cumulative channel balance,
+not the client's highest signed balance or total session credit. Clients validate
+its ID, unit, capacity, and balance against local records. No accepting/draining
+funding-state field exists; §5.5 uses an ordered request error.
 
-Each numeric value is that mint/unit's funding-keyset recovery window in seconds.
-There are **no per-mint pricing fields or concrete keyset IDs**. Rates exist only
-at session level. Map order carries no preference semantics; clients select
-among offers using local policy. The map may be empty. It describes offered
-trusted mint/unit combinations, not every acceptable stored channel or funding ID.
+### 3.4 Ordered requests and correlated liveness
 
-linked_channel.balance_raw is the relay's accepted cumulative channel balance,
-not the client's highest signed balance or the session's total paid credit.
-Validate its channel ID, unit, capacity, and balance against local records.
-No accepting/draining funding-state field is added; session funding refusal is
-communicated by SESSION_FUNDING_DISABLED on a link/payment request (§5.5).
+The relay sends exactly one success or failure response for each request:
 
-### 3.4 Bidirectional optional extensions
+| Request | Success | Failure |
+| --- | --- | --- |
+| `ChannelLink` | `SessionStatus` identifying the linked channel | `Error` |
+| `ChannelPayment` | `SessionStatus` reflecting accepted payment and credit | `Error` |
+| `ChannelUnlink` | `SessionStatus` with no linked channel and preserved credit | `Error` |
+| `GetSessionStatus` | `SessionStatus` | `Error` |
 
-After initialization either endpoint MAY send:
+The client MAY pipeline up to five requests. The relay MUST execute them in receive
+order, complete each logical operation and fix its response before executing the
+next, and emit responses in the same order. A status describes that request's
+result before later queued mutations; data accounting may continue concurrently.
+
+The client keeps a FIFO of unanswered requests. Each valid `SessionStatus` or
+nonfatal `Error` answers the oldest entry. Failure does not cancel successors;
+each is evaluated against the state left by earlier operations. There is no
+implicit batch transaction. Relays MUST support at least **five outstanding
+requests per session**, including the active request, using bounded buffering or
+backpressure beyond that minimum. They MUST NOT silently discard, merge, or
+reorder requests or responses.
+
+A client MUST NOT create a sixth unanswered request. If a relay receives one
+while five remain unanswered, behavior beyond the guaranteed window is not
+interoperable: a relay MAY support it, apply backpressure, or send bounded
+`CONTROL_INVALID_MESSAGE` and terminate. Prompt-Pong guarantees no longer apply
+after that client violation. The client limit keeps compliant ingress readable
+without an unbounded ordinary-request queue.
+
+Apart from the initial status, the relay MUST NOT send an unsolicited
+`SessionStatus` or nonfatal `Error`.
+
+Timeouts and notifications do not consume FIFO entries. A queued status request
+cannot overtake a payment or replace its missing response. Connection loss or
+fatal termination may leave requests unanswered; exactly-one response does not
+guarantee delivery across failure. Clients preserve every signed payment and
+treat unconfirmed outcomes conservatively.
+
+Ping and Pong are independent of that FIFO. Each carries a `u64` nonce. A client
+MUST NOT reuse or wrap a nonce and MUST have at most one live probe. Only its
+matching Pong completes it. Status, notifications, ordinary traffic, and wrong,
+duplicate, unsolicited, or late Pong do not complete a probe, change its
+deadline, update request state, or cancel recovery already selected after a
+timeout. Such Pong messages are discarded with an optional bounded warning; no
+nonce-history collection is required.
+
+While open, the relay MUST promptly process every valid Ping and enqueue one
+matching Pong despite slow validation or mint work. Ping consumes none of the
+five pipeline positions. This requires liveness progress but does not bypass
+earlier H2 bytes or promise zero latency. Paused and unlinked sessions permit
+probes; termination may prevent delivery.
+
+The relay retains at most one not-yet-enqueued Pong. Receiving another Ping while
+that slot is occupied violates the one-live-probe rule and is fatal
+`CONTROL_INVALID_MESSAGE`. Once the matching Pong is accepted by the H2 send
+stream, the slot is free. Control ingress, request buffering, and Pong output MUST
+remain bounded even if peer flow control blocks writes.
+
+Recommended policy is Ping after 5 seconds without valid relay control activity
+and a 15-second matching-Pong deadline. Ordinary valid traffic may defer creating
+a probe but cannot satisfy one already sent. Rebuild logic may demand fresh
+evidence. Client-local stalls must not be blamed on the peer. Pong proves only
+control-path responsiveness, not destination reachability or nonreceipt of an
+outstanding payment. No mandatory periodic Ping or QUIC keep-alive is imposed.
+
+### 3.5 Advisories and extensions
+
+Either endpoint MAY send:
 
 ```json
 {"type":"ExtensionNotification","name":"example.some_hint","data":{}}
 ```
 
-The envelope has exactly these required fields. name is a nonempty string and
-SHOULD be namespaced; data is an object whose members the extension defines.
-Unsupported names/payloads may be ignored after validating the envelope and
-framing limits. Malformed envelopes still follow §2's fatal parsing rules.
+The envelope has exactly those fields. `name` is nonempty and SHOULD be
+namespaced; `data` is an object. Unsupported names or payloads may be ignored
+after envelope and framing validation. Malformed envelopes remain fatal.
 
-Extensions MUST be optional: ignoring one must leave the core protocol correct.
-They cannot change required pricing, ownership, accounting, payment authorization,
-or response semantics. Sender progress must not depend on handling. They create
-no FIFO entry, satisfy no Ping, and require no acknowledgement. In particular,
-an unsupported client hint MUST NOT cause a relay Error or SessionStatus.
+Extensions are optional hints. Ignoring one must leave the core protocol
+correct; they cannot change pricing, ownership, accounting, authorization, or
+required response semantics. Sender progress cannot depend on handling. They
+create no FIFO entry, satisfy no Ping, require no acknowledgement, and may
+interleave with requests and probes subject to bounded resources. An unsupported
+hint MUST NOT elicit `Error` or `SessionStatus`. Required behavior changes need
+negotiation, not a mandatory instruction hidden in extension data.
 
-The same rules apply in both directions. Extensions may interleave with the
-pipeline and Ping, with bounded resources and preserved liveness progress.
-Unsupported-name warnings are optional, rate-limited, and payload-redacted.
-Arbitrary unknown top-level types are not extensions. Required behavior changes
-need negotiation under §1, not a mandatory instruction hidden in data.
+### 3.6 Unexpected messages
 
-## 4. Session accounting, pricing, and receiver changes
+After initialization, clients apply these rules after framing validation:
 
-Lifecycle, linked ownership, paid credit, and pending requests are distinct.
-Unlink or eviction does not discard credit; an unlinked session can spend what
+| Incoming relay message | Client handling |
+| --- | --- |
+| Valid `SessionStatus` or recognized nonfatal `Error` with pending requests | Validate against and consume exactly the oldest FIFO entry. |
+| Structurally valid `SessionStatus` or recognized nonfatal `Error` with an empty FIFO | Discard without state changes; SHOULD emit a bounded warning. |
+| Response failing the oldest request's required checks | Terminate rather than skip it and guess. |
+| Recognized fatal `Error` | Terminate regardless of FIFO state. |
+| Core advisory or valid extension | Handle or ignore as specified; never consume FIFO. |
+| Malformed input, unknown top-level type, wrong-direction core message, or unknown error code | Terminate. |
+
+Empty-FIFO tolerance applies only after initialization. Discarded messages change
+no state. Warnings MUST be rate-limited and redact payments, extension payloads,
+and arbitrary peer text. With pending work, clients validate financial invariants
+but never heuristically repair the FIFO.
+
+Control ingress may read Ping and later bytes while an earlier request is slow.
+Discovery of fatal input marks the session terminating at one serialized commit
+gate: committed operations retain fixed outcomes, while every uncommitted
+operation is cancelled and cannot mutate session, ownership, accepted-balance, or
+credit state. Harmless validation work or shared metadata-cache refresh may still
+finish. Already-fixed responses precede the fatal error when bounded delivery is
+practical; cleanup waits for neither.
+
+## 4. Session state, pricing, and advertisements
+
+Lifecycle, linked ownership, confirmed credit, and pending requests are distinct.
+Unlink or eviction does not discard credit; an unlinked session may spend what
 remains but needs a usable channel to add more.
 
 ```text
 due_msats = ceil(session_total_in / active_in_rate
                + session_total_out / active_out_rate)
-remaining = total_paid_millisats - due_msats
-paused = (remaining <= 0)
+remaining_milli_sats = total_paid_millisats - due_msats
+paused = (remaining_milli_sats <= 0)
 ```
 
-Round the sum once using exact arithmetic, not each direction separately.
-Clamp the wire remaining value to i64 range if necessary. Negative credit is
-permitted from chunk-boundary overshoot; it does not erase payment history.
-New CONNECTs are rejected while paused (currently HTTP 402); existing tunnels
-wait for credit. Ordinary transport failure or termination can still end them.
+Round the sum once using exact arithmetic, not each direction separately. The
+wire remaining value is exact and is never clamped. Negative credit is permitted
+from chunk-boundary overshoot and does not erase payment history. New CONNECTs
+MUST be rejected with HTTP 402 while paused; existing tunnels wait for credit.
+Ordinary transport failure or termination may still end them.
 
-The initial status establishes the two session-wide rates. They MUST NOT change
-in a later solicited status; the client disconnects if they do. Discarded
-empty-FIFO statuses cannot reprice anything. Different rates require a new
-session or a future explicitly negotiated protocol change.
+Bytes are charged when the next local layer accepts them: each successful partial
+write to the target counts outbound bytes, and each successful H2 DATA submission
+counts inbound bytes. Reads, buffered bytes, failed writes, control traffic, and
+encrypted transport overhead do not count. Implementations MUST split accounting
+into chunks no larger than **16,384 bytes**, check counter and billing
+representability before each write, and update the counter immediately after the
+accepted write. Each tunnel can have at most one in-flight chunk per direction
+after observing unpaused state. With `N` open tunnels, aggregate
+post-threshold overshoot is therefore bounded by `16,384 * N` bytes per direction
+and `32,768 * N` bytes combined, using checked arithmetic.
 
-**The advertised payment receiver key MAY change** in later solicited statuses.
-It is not the authenticated Noise relay identity, which remains the same for
-the session. A receiver-key update guides new channel provisioning; clients
-bind each channel to the receiver in its immutable public parameters. Rotation
-MUST NOT rewrite an existing channel or by itself invalidate its payments,
-accepted history, or relink eligibility. Other explicit admission/exclusion rules
-still apply. A pre-provisioned old-receiver channel is not automatically converted
-to the new receiver; its admission must be checked normally.
+The initial status fixes both rates. A changed rate in a later solicited status is
+fatal; different rates require a new session or future negotiation.
 
-Relay-scoped channel exclusions (§5.4) are keyed by **authenticated relay
-identity and channel ID**, not the rotating payment receiver key. Receiver
-rotation must not erase those exclusions or affect unrelated hosted identities.
+Each status advertises exactly one current payment receiver. It is not the
+authenticated Noise identity and MAY change in later solicited statuses. Clients
+use the current receiver for new provisioning, while each channel remains bound
+to the receiver in its immutable public parameters. Old receiver keys are not
+advertised.
+
+A client MAY try a locally stored channel with the same authenticated relay even
+when that channel names an older receiver. The relay first looks up `channel_id`:
+a channel is known only after successful validation and durable storage, never
+merely because a prior link was attempted. Relays SHOULD accept an otherwise
+valid known channel under its stored receiver and MUST retain the key material
+needed to operate and recover it. Refusing such a relink uses
+`LINK_CHANNEL_RETIRED` without erasing its record or recovery path. An unknown
+channel bound to a noncurrent receiver gets `LINK_RECEIVER_MISMATCH`.
+
+There is no grace period for unknown channels. Rotation can race local mint
+provisioning: if the receiver changes before first successful storage, the client
+MUST NOT retry that channel here and instead recovers its funding normally.
+Implementations should avoid needless rotation, but an earlier status does not
+guarantee later acceptance.
+
+Clients select active output keysets using local cache or mint metadata plus
+negotiated keyset-version constraints and the advertised recovery window.
+Inactive funding does not invalidate a stored channel. Missing advertised IDs
+cannot imply invalidity, and mint metadata cannot bypass relay trust, version,
+expiry, or recovery policy. Metadata refresh can be busy, rate-limited, or
+unavailable; retry unchanged immutable funding rather than provision replacement
+funds merely to avoid a transient refresh error.
+
+For unknown/new funding with channel expiry `E`, advertised recovery window `W`, and the
+funding keyset's optional final expiry `K`, admission requires no final expiry or
+`K >= E + W` under checked `u64` addition. Final expiry zero is always
+unacceptable; equality is acceptable; overflow of `E + W` is unacceptable. This
+predicate is for new-funding admission only and MUST NOT block restore, refund,
+close, or a valid stored relink.
 
 ## 5. Channel operations
 
 ### 5.1 Link and relink
 
-Every link, including a relink, MUST contain complete public params, nonempty
-funding_proofs, and a valid zero_balance_signature. A link cannot submit payment.
-The relay validates channel ID, receiver, signature, funding, unit/capacity,
-expiry/recovery policy, admission, and negotiated keyset-version constraints
-before ownership acquisition. Unknown funding IDs may invoke bounded metadata
-refresh, not a promise of immediate or periodic discovery.
+Before ownership acquisition, the relay determines known-versus-new status by
+`channel_id`, then validates receiver policy, signature, funding, unit, capacity,
+ordinary channel expiry, admission, negotiated versions, and exact numeric
+representability. Funding-keyset recovery-window admission applies only to
+unknown/new funding under §4, not stored relinks.
 
-Stored immutable funding and accepted payment history MUST be preserved.
-Supplied relink funding must agree semantically with that record; conflicts
-must be rejected rather than overwritten or ignored. Exact proof-order/auxiliary
-metadata equality remains a review question. Relinking never resets accepted
-balance or credits historical payments into the new session.
+For a relink, stored immutable funding is authoritative but the complete supplied
+funding MUST be semantically identical:
 
-A successful replacement link releases the old ownership, preserving session
-credit/counters. Failure alone must not detach the old channel. Only one session
-owns a channel at a time; acquisition elsewhere evicts the previous owner.
-Excluded channels cannot be reacquired within their exclusion scope. Permitted
-use in another session is not an instruction to reconnect and fight another owner.
+1. Parse and normalize public parameters, require equality of the channel-ID
+   parameter tuple, and recompute the claimed channel ID.
+2. Require the same proof count and positional equality of each proof's `amount`,
+   `keyset_id`, `secret`, and `C`. The deterministic secret's canonical UTF-8
+   bytes and the compressed point encoding are exact; proof order is signed and
+   is not set-like.
+3. Require funding `witness` and `p2pk_e` to be absent.
+4. For `v1` and `v2`, require DLEQ on every proof, derive the expected
+   deterministic `r`, require both submitted and stored `r` to equal it, and
+   verify the submitted `(e,s,r)`. Valid `e` and `s` need not be byte-identical.
+5. Validate the zero-balance signature against the stored channel. The signature
+   need not equal the original registration signature and is not evidence of
+   freshness because its signed message contains no session challenge.
+
+Any mismatch returns `LINK_FUNDING_CONFLICT` before ownership changes. Relink
+MUST NOT overwrite stored funding or accepted balance. Unknown funding IDs may
+invoke bounded metadata refresh; known stored relinks do not need mint I/O merely
+to establish immutable equality. Relinking never resets accepted balance or
+credits historical payment into the new session.
+
+A successful replacement link releases the old ownership while preserving
+session credit and counters. Failure alone does not detach the old channel. One
+session owns a channel at a time; acquisition elsewhere evicts the previous
+owner. Permission to use a channel elsewhere is not an instruction to repeatedly
+reacquire it and fight another owner.
 
 ### 5.2 Payments and client records
 
 Ownership must hold at acceptance. The relay verifies the cumulative signature
-against stored channel data, with:
+against stored data and atomically enforces:
 
 ```text
 0 <= B_old < B_new <= capacity_raw
 credited_msats = raw_to_msats(B_new - B_old)
 ```
 
-sat conversion multiplies by 1000; msat conversion is identity. Validate
-representability before committing. Ownership, accepted-balance comparison, and
-crediting must prevent double credit across concurrent sessions. Duplicate/lower
-payments add no credit. **PAYMENT_NO_NEW_FUNDS is an Error response**, not a
-successful status with a special flag; exact validation-error precedence for
-lower/invalid payments remains to be specified.
+Sat conversion multiplies by 1000; msat conversion is identity. All conversion
+and resulting session totals are checked before mutation. Ownership, accepted
+balance, and credit commit prevent double credit across concurrent sessions.
+Duplicate or lower payments return `PAYMENT_NO_NEW_FUNDS`, not a successful
+status.
 
 The client keeps three records:
 
-1. **Durable signed channel balance:** highest cumulative balance signed for
-   each channel. Persist the balance and payment before giving the signature to
-   transport. Persistence failure prevents transmission. Rejection, failed write,
-   cancellation, or lost response MUST NOT roll this record back.
+1. **Durable signed channel balance:** highest cumulative balance signed for each
+   channel. Persist balance and payment before exposing the signature to
+   transport. Rejection, write failure, cancellation, or lost response never
+   rolls this record back.
 2. **Confirmed session credit P:** largest validated cumulative paid total for
    this session. It never decreases; consumption reduces remaining credit, not P.
-3. **Per-request pending increments:** for a newly signed C_new, record
-   `d = raw_to_msats(C_new - C_old)`, using the client's prior durable signed
-   balance, not a lower relay report. Attach it to that request's FIFO entry.
-   It is not yet confirmed spendable credit.
+3. **Per-request pending increment:** for newly signed `C_new`, record
+   `d = raw_to_msats(C_new - C_old)` from the prior durable signed balance and
+   attach it to that request's FIFO entry. It is not yet spendable credit.
 
-Process responses in FIFO order. Payment success must report at least `P + d`,
-where P includes prior validated responses and their bonuses, but not later
-pending payments. Otherwise disconnect for shortchanging. Accept a larger total
-and raise P to it. All later solicited statuses must report at least P. An
-earlier snapshot need not include later requests already transmitted.
+A payment success MUST identify the submitted channel and report
+`balance_raw == B_new`. It must report at least `P + d`, where P includes prior
+validated responses and bonuses but excludes later pending payments. A smaller
+total is shortchanging and terminates the client. A larger total is bonus credit
+and raises P. Lower channel balances are allowed only in relink, query, or other
+reconciliation statuses. Later solicited statuses must report at least P.
 
-The relay's reported channel balance MUST NOT exceed what the client has signed
-for that channel; disconnect if it does. A lower relay balance is legitimate
-after uncertain delivery and MUST NOT lower the client's signed record. It can
-cause a later cumulative payment to credit more than expected, which the client
-accepts as a bonus. This does not transfer already accepted credit from a dead
-session.
+Reported channel balance MUST NOT exceed what the client signed. A lower relay
+balance is legitimate after uncertain delivery and never lowers the client's
+durable record. A later cumulative payment may then credit more than its pending
+increment; the client accepts that bonus. This does not transfer accepted credit
+from a dead session.
 
-A definitive replacement-eligible or session-funding-disabled rejection (§8)
-resolves only that request's pending increment as rejected, without increasing P.
-**Only the pending increase is undone, never the durable signed channel balance
-or previously confirmed credit.** A rejection cannot revoke a signature the relay possesses.
-Unknown acceptance requires reconciliation or session termination before new
-payments; already queued responses must still be handled in order.
+Any definitive payment rejection removes only that request's pending expected
+increment. It does not decrease P or the durable signed balance. Unknown
+acceptance requires reconciliation or session termination before originating
+another payment; already queued responses remain ordered. Retries retain the
+original accounting association and never count one signed increment twice.
 
-Retries must retain the original accounting association, neither attributing a
-signed increment twice nor forgetting an unresolved one. Each wire request still
-gets its own FIFO entry/response. A later reconciliation status includes effects
-of intervening requests and cannot be attributed solely to one uncertain payment.
+Replacement funding follows local policy rather than automatically repeating a
+rejected amount. An already queued replacement link MUST NOT trigger duplicate
+channel provisioning.
 
-Payment sizing uses fixed rates, local cleartext counts, and P, while tracking
-in-flight exposure to avoid funding the same target buffer twice. Relay-reported
-pause state, bytes, or remaining balance alone MUST NOT authorize more signatures.
+Payment sizing uses fixed rates, local cleartext counts, P, and in-flight
+exposure. Relay-reported pause, byte counts, or remaining credit alone MUST NOT
+authorize another signature.
 
-### 5.3 Optional release and unlink
+### 5.3 Release and unlink
 
-ChannelReleaseRequested means “please unlink when convenient.” The client MAY
-ignore it without protocol failure or invalidating otherwise valid payments.
-It neither cancels requests nor revokes ownership.
+`ChannelReleaseRequested` means “please unlink when convenient.” A client MAY
+ignore it without protocol failure or invalidating payments. It does not cancel
+requests or revoke ownership. A complying client may provision a replacement
+locally before unlinking; provisioning is distinct from sending a replacement
+link. Repeated hints are harmless, and an old-channel hint never unlinks a newer
+channel.
 
-The initial MONAD client policy is to comply at a safe opportunity: remember the
-channel ID, finish relevant outstanding work, and unlink if still owned. It may
-**provision the replacement channel first**, before unlinking, to reduce the gap;
-wallet provisioning is distinct from sending a replacement ChannelLink. Repeated
-release hints are harmless; old-channel hints must never unlink a newer channel.
+Any current owner may send `ChannelUnlink`; no release hint or other eligibility
+condition is required. The relay atomically verifies both session linkage and
+authoritative ownership, then releases the channel using stored state. Success is
+one `SessionStatus` with `linked_channel=null` and credit preserved. Duplicate,
+unowned, already evicted, already released, wrong-channel, or stale unlink gets
+nonfatal `CHANNEL_UNLINK_REJECTED`; success is not fabricated for idempotence.
 
-ChannelUnlink carries **only channel_id**. The relay checks ownership and release
-eligibility, releases the channel using its stored state, and returns one
-SessionStatus with linked_channel=null and paid credit preserved, or one Error.
-There is **no final-balance field or final-balance equality check**. Unlink does
-not certify agreement about signed payments, settle/refund funds, close on-mint,
-or erase history. The client retains and reconciles uncertain signatures through
-normal wallet recovery independently of unlink.
+Unlink has no final-balance equality check and does not certify payment agreement,
+settle or refund funds, close on-mint, or erase history. Uncertain signatures are
+reconciled through wallet recovery independently.
 
-Unlink can be pipelined after payment. Both requests execute and receive their
-own responses; unlink success cannot substitute for a payment acknowledgement.
-If eviction or replacement already released ownership, deferred unlink is not
-needed. Duplicate/unowned unlink and unlink-race outcomes remain review questions.
+Unlink, replacement, eviction, and exclusion MUST linearize under the same
+ownership authority. One unlink commit atomically clears session linkage and
+authoritative ownership; it succeeds only if it commits first. Later tunnel/task
+cleanup rechecks channel identity and linkage generation, cannot change the
+response outcome, and never releases a newer owner.
 
-### 5.4 Scoped advisory eviction
+### 5.4 Scoped eviction
 
-| Required scope | Meaning |
+| Scope | Meaning |
 | --- | --- |
-| `session` | No further links or payments for this channel in this session. Other sessions may use it under normal admission rules. |
-| `relay` | Permanent refusal of this channel's links/payments across all sessions for the authenticated relay identity, including after restart. |
+| `session` | No further links or payments for this channel in this session. Other sessions may use it normally. |
+| `relay` | Permanent refusal across all sessions for this authenticated relay identity, including after restart. |
 
-There is no default scope. Relay exclusion MUST be durable before announcement
-and remain effective across payment receiver-key changes. Session exclusion lasts
-until that session ends. Ownership transfer excludes the old owner with session
-scope. Neither scope affects other authenticated relay identities, erases channel
-history, initiates an on-mint close, or prevents appropriate fund recovery.
+There is no default scope. Relay exclusion is durable before announcement and
+survives payment-receiver changes. Session exclusion lasts until session end.
+Ownership transfer excludes the old owner with session scope. Neither scope
+affects other authenticated relay identities, erases history, initiates an
+on-mint close, or prevents appropriate recovery.
 
-Clients SHOULD avoid excluded channels but MAY ignore the notification and learn
-the restriction from a self-contained request Error. The relay removes affected
-ownership regardless of notification processing; confirmed session credit remains.
+Clients SHOULD avoid excluded channels but MAY ignore the advisory and learn the
+restriction from the request's self-contained error. The relay removes affected
+ownership regardless; confirmed credit remains.
 
-Exclusion and request commitment MUST be serialized. An uncommitted link/payment,
-including an in-flight one, is rejected once exclusion takes effect. Already
-committed requests retain success/credit, with their success responses before
-the eviction notification on that session's stream. No retroactive rejection,
-stale snapshot resurrection, or subsequent reacquisition within the scope.
+Exclusion and request commitment MUST serialize. An uncommitted link or payment,
+including in-flight work, is rejected once exclusion commits. An already
+committed request retains success and credit, with its success response ordered
+before the eviction advisory on that stream. There is no retroactive rejection,
+stale snapshot resurrection, or reacquisition within scope.
 
 ### 5.5 Session funding disabled
 
-The relay may permanently disable new funding **for this session** while leaving
-it open. An otherwise valid ChannelLink or ChannelPayment not yet committed then
-receives **SESSION_FUNDING_DISABLED**, one ordered nonfatal Error per request.
-This takes precedence over channel-scoped exclusion when both apply. Already
-committed operations retain their success and credit. Disabling funding itself
-MUST NOT remove existing linked ownership, discard paid credit, or tear down data
-tunnels; new/existing CONNECTs continue under normal credit and transport rules.
+The relay may permanently disable new funding for one open session. Every
+uncommitted link or payment then receives ordered nonfatal
+`SESSION_FUNDING_DISABLED`; this takes precedence over channel exclusion. Already
+committed operations retain success and credit. Disabling funding does not remove
+linked ownership, discard credit, or tear down data tunnels. New and existing
+CONNECTs continue under normal credit rules.
 
-Clients stop originating links/payments on this session. Another channel cannot
-restore funding here. Ping, GetSessionStatus, extensions, and eligible unlink
-remain available. The client may consume remaining credit rather than immediately
-abandon it; a different session is needed for further funding. Ordinary failure
-can still end delivery, and zero credit still pauses forwarding.
+The client stops originating links and payments on that session. Another channel
+cannot restore funding there. Ping, status queries, extensions, and unlink remain
+available. Remaining credit may be consumed; a different session is needed for
+more funding. No proactive notification or funding-state field is added, and the
+error is not permission to provision a replacement in the same session.
 
-No new proactive notification or funding-state field is introduced. The Error
-alone conveys the lifetime restriction and must not be treated as permission to
-provision replacement funding in the same session.
+## 6. Error codes and recovery
 
-## 6. Mint advertisements and keyset selection
+The table defines each code's machine meaning. Exact diagnostic strings are not
+standardized. Unknown codes are fatal. A nonfatal error answers only the oldest
+request; a fatal error ends the session and may leave later requests unanswered.
 
-Advertisements contain only mint → unit → recovery-window entries (§3.3).
-Pricing is fixed session-wide, never attached to those entries. Concrete funding
-keyset IDs remain in parameters/proofs; clients select active output keysets
-using their own cache/mint metadata and **negotiated keyset-version constraints**,
-with appropriate expiry/recovery windows. Inactive funding does not automatically
-invalidate stored channels. Missing advertised IDs cannot imply invalidity, and
-mint metadata does not bypass relay trust/version/expiry checks.
+Validation uses this precedence before any request mutation:
 
-Relay metadata refresh can be busy, rate-limited, or unavailable. Retries must
-preserve immutable funding rather than provision replacement funds just to dodge
-a transient metadata error. The implementation sequence remains client-first:
+1. Malformed envelope, wire type, or wire range is fatal
+   `CONTROL_INVALID_MESSAGE`; a valid value beyond a local supported range is
+   `NUMERIC_LIMIT_EXCEEDED`.
+2. Negotiated protocol or keyset-version invariant failures use their fatal link
+   codes. An internal/configuration failure at any stage is fatal `INTERNAL_ERROR`.
+3. `SESSION_FUNDING_DISABLED` precedes relay-scoped, then session-scoped,
+   exclusion.
+4. Channel association and strict ownership precede channel state and policy.
+5. A link checks, in order: stored terminal state; public parameters/channel ID,
+   unit, capacity, and ordinary expiry; receiver; admission/link-retirement
+   policy; mint/keyset trust, version, and recovery metadata; immutable relink
+   equality or new funding; then the zero-balance signature.
+6. A payment checks, in order: terminal state, numeric conversion, signature, and
+   monotonicity. `PAYMENT_NO_NEW_FUNDS` applies only after a valid signature; a
+   final atomic comparison loss is `PAYMENT_CONFLICT`.
 
-1. Make client selection/reuse ignore existing advertised IDs, including mocks.
-2. Verify cache-first behavior, stale/missing cache refresh, rotation, inactive
-   relinks, and no-compatible-keyset outcomes without needless rediscovery.
-3. Remove keyset_ids/preference plumbing and adopt the mint/unit map. Map order
-   does not retain the old array's preference semantics.
+The final commit rechecks every mutable predicate. No lower-priority result may
+hide a fatal failure already discovered.
 
-## 7. Correlated liveness
-
-Ping and Pong each carry a u64 nonce. The client MUST NOT reuse a nonce within
-the stream or wrap its counter. At most one live probe is outstanding, independent
-of pipeline requests. Only its matching Pong completes it; status, notifications,
-and late/wrong nonces do not. GetSessionStatus is for state, not liveness.
-
-While open, the relay MUST promptly process each valid Ping and enqueue one
-matching Pong, independently of slow validation/mint work. Such work must not
-block control reads or Pong handling within the supported pipeline capacity.
-This does not imply zero latency or bypassing earlier bytes on the H2 stream.
-Paused/unlinked sessions still permit probes. Termination may prevent delivery.
-
-**Recommended implementation defaults:** Ping after 5 seconds without valid
-relay control activity, with a 15-second deadline for the matching Pong. Ordinary
-valid traffic may defer initiating a probe but cannot satisfy one already sent.
-Rebuild logic can request fresh responsiveness evidence immediately, reusing a
-pending probe only if fresh enough for its purpose. These values are policy, not
-mandatory wire timings. Client-local stalls must not be mistaken for peer failure.
-
-Probes can serve as heartbeats/keep-alives for sessions intentionally retained,
-including prefix sessions during rebuild. No mandatory periodic Ping or separate
-QUIC keep-alive policy is imposed. Pong proves control-path responsiveness, not
-successful forwarding to every destination. Timeout authorizes local recovery,
-not assumptions that outstanding signatures were never received.
-
-## 8. Error codes and recovery
-
-Every Error has **code** and **message**. The table defines machine meaning and
-handling; **exact human-readable message strings are not standardized**. Clients
-MUST NOT parse them for retry, scope, or fatality. Core codes must be understood
-under the selected contract; unknown codes terminate under §2.4.
-
-Most names below exist at the inspected baseline; scoped exclusions and
-SESSION_FUNDING_DISABLED are proposed additions. “Reconcile” means no newly
-originated payment until uncertainty is resolved, while preserving already sent
-FIFO requests and durable signatures. Nonfatal rejection ends only its request;
-fatal failure ends the session. Remaining classification questions are explicit.
-
-| Code(s) | Applies to | Meaning and target handling |
+| Code | Applies to | Meaning and handling |
 | --- | --- | --- |
-| CONTROL_INVALID_MESSAGE | Malformed input | Fatal; bounded error delivery then cleanup. |
-| CHANNEL_ADMISSION_DISABLED | Link | Administrative admission refusal; nonfatal. Do not provision another channel to bypass policy. Unlike SESSION_FUNDING_DISABLED, this does not itself prohibit payments on an existing linked channel for the session lifetime. |
-| SESSION_FUNDING_DISABLED | Link/payment | Nonfatal lifetime session restriction (§5.5). Resolve rejected expectation without credit, preserve signed history/P, stop funding this session, and permit remaining traffic. |
-| CHANNEL_EVICTED_FROM_SESSION | Link/payment | Nonfatal session-scoped channel exclusion. Select another channel and continue; no preceding notification required. |
-| CHANNEL_RETIRED_AT_RELAY | Link/payment | Nonfatal permanent exclusion for this authenticated relay identity. Do not reuse the channel there; another channel may fund the session. |
-| LINK_INVALID_PAYMENT, LINK_INVALID_CHANNEL, LINK_RECEIVER_MISMATCH | Link | Invalid registration/funding/receiver; nonfatal request rejection. Correct the request, not blind replay. |
-| LINK_MINT_OR_KEYSET_UNACCEPTABLE, LINK_UNSUPPORTED_UNIT | Link | Funding/policy incompatibility; nonfatal. Not every such rejection is temporary metadata lag. |
-| LINK_KEYSET_REFRESH_RATE_LIMITED, LINK_KEYSET_REFRESH_BUSY, LINK_KEYSET_REFRESH_FAILED | Link | Nonfatal refresh obstacle; bounded/backed-off retry of unchanged funding may be appropriate. |
-| LINK_UNSUPPORTED_CASHU_SPILMAN_PROTOCOL_VERSION | Link | Incompatible negotiated inputs; final fatality/reconnect treatment remains under review. |
-| LINK_KEYSET_VERSION_NOT_NEGOTIATED | Link | Fatal to this session; do not mark an otherwise valid wallet channel globally unusable. |
-| LINK_CHANNEL_RETIRED | Link | Nonfatal link-only retirement; distinct from permanent link-and-payment relay exclusion. |
-| CHANNEL_CLOSED, CHANNEL_EXPIRED | Link/payment | Nonfatal unusable-channel rejection. Preserve history/recovery records; another channel may fund this session. |
-| PAYMENT_WRONG_CHANNEL, PAYMENT_UNKNOWN_CHANNEL | Payment | Nonfatal rejection; reconcile ownership/payment state, not blind replacement funding. |
-| PAYMENT_INVALID | Payment | Nonfatal validation rejection, but stop automatic payment attempts and report it. Fresh funding does not repair an invalid signature. |
-| PAYMENT_NO_NEW_FUNDS | Payment | **Error**, no additional credit. May follow replay; reconcile with an ordered status response rather than blindly signing more. |
-| PAYMENT_CONFLICT | Payment | Nonfatal state-comparison conflict requiring reconciliation. Scoped ownership loss uses the scoped codes instead. |
-| CHANNEL_UNLINK_REJECTED | Unlink | Nonfatal ownership/release-eligibility rejection; no final-balance check exists in the target. Do not pretend release succeeded. |
-| INTERNAL_ERROR | Request processing | Acceptance/side effects may be uncertain. Reconcile or terminate; exact fatality taxonomy remains under review. |
+| `CONTROL_INVALID_MESSAGE` | Malformed input | Fatal; bounded error delivery then cleanup. |
+| `NUMERIC_LIMIT_EXCEEDED` | FIFO request | Definitive nonfatal local-range rejection, valid only before any mutation. |
+| `CHANNEL_ADMISSION_DISABLED` | New link | Administrative refusal of unknown channels; nonfatal. Stored relinks and existing-channel payments are not disabled by this code alone. Do not provision another channel to bypass policy. |
+| `SESSION_FUNDING_DISABLED` | Link/payment | Nonfatal lifetime session restriction (§5.5); preserve signed history and confirmed credit. |
+| `CHANNEL_EVICTED_FROM_SESSION` | Link/payment | Nonfatal session-scoped exclusion; another channel may fund the session. |
+| `CHANNEL_RETIRED_AT_RELAY` | Link/payment | Nonfatal permanent exclusion for this authenticated relay identity. |
+| `LINK_INVALID_ZERO_BALANCE_SIGNATURE` | Link | The registration signature does not validate at balance zero; nonfatal correction, not blind replay. |
+| `LINK_INVALID_CHANNEL` | Link | Public parameters, channel ID, proof structure, capacity, or expiry are invalid and no more specific link code applies; nonfatal. |
+| `LINK_RECEIVER_MISMATCH` | New link | Unknown channel is not bound to the current advertised receiver; nonfatal. A failed attempt does not make it known. |
+| `LINK_FUNDING_CONFLICT` | Relink | Supplied immutable funding differs semantically from stored funding; nonfatal and no ownership change. |
+| `LINK_MINT_OR_KEYSET_UNACCEPTABLE`, `LINK_UNSUPPORTED_UNIT` | Link | Nonfatal funding or policy incompatibility; not necessarily transient metadata lag. |
+| `LINK_KEYSET_REFRESH_RATE_LIMITED`, `LINK_KEYSET_REFRESH_BUSY`, `LINK_KEYSET_REFRESH_FAILED` | Link | Nonfatal refresh obstacle; bounded retry of unchanged funding may be appropriate. |
+| `LINK_UNSUPPORTED_CASHU_SPILMAN_PROTOCOL_VERSION` | Link | Fatal if the bootstrap-selected Spilman protocol is not `2026-09-14` when link execution begins; this indicates corrupted or changed negotiated state, not a link field. |
+| `LINK_KEYSET_VERSION_NOT_NEGOTIATED` | Link | Fatal to this session; do not mark an otherwise valid wallet channel globally unusable. |
+| `LINK_CHANNEL_RETIRED` | Link | Nonfatal policy refusing a known channel's relink, including a stored old-receiver channel the relay declines to reuse; preserve its record and recovery path. Distinct from scoped exclusion. |
+| `CHANNEL_CLOSED`, `CHANNEL_EXPIRED` | Link/payment | Nonfatal unusable-channel rejection; preserve recovery history. |
+| `PAYMENT_WRONG_CHANNEL` | Payment | The session is not linked to the submitted ID; nonfatal. |
+| `PAYMENT_INVALID` | Payment | Nonfatal validation rejection; stop automatic payments and report it. Fresh funding does not repair the signature. |
+| `PAYMENT_NO_NEW_FUNDS` | Payment | Valid duplicate/lower cumulative payment; no credit. Reconcile with an ordered status before signing more. |
+| `PAYMENT_CONFLICT` | Payment | An otherwise valid payment lost the final atomic accepted-balance or ownership comparison; nonfatal reconciliation, with no credit from this request. |
+| `CHANNEL_UNLINK_REJECTED` | Unlink | Nonfatal strict-ownership rejection (§5.3). |
+| `INTERNAL_ERROR` | Request processing | Fatal because acceptance or side effects may be uncertain; preserve records and reconcile after reconnect. |
 
-When both channel exclusions apply, relay scope takes precedence. These Error
-responses identify the channel through the oldest FIFO request, without prior
-notification history. Malformed input remains fatal even if funding is disabled.
+Malformed input remains fatal even if funding is disabled. Genuine internal or
+configuration failures MUST NOT be disguised as peer-invalid payments. The old
+`LINK_NON_ZERO_BALANCE` code is removed: links have no balance field, so sending
+it is a schema error. The old `PAYMENT_UNKNOWN_CHANNEL` code is also removed: a
+locally linked ID without an authoritative record violates atomic ownership and
+is fatal `INTERNAL_ERROR`.
 
-The old LINK_NON_ZERO_BALANCE code is removed from the target: links have no
-balance_raw field. Sending that forbidden field is a schema error; an invalid
-zero_balance_signature is an invalid registration signature.
+Recovery follows §§3.4 and 5.1-5.3. Mint HTTP recovery remains the wallet's
+responsibility, not a guarantee supplied by a control error.
 
-Replacement-eligible rejection resolves only the pending increment. Existing
-confirmed credit remains and the signature stays in durable history. Replacement
-funding follows local usage/normal policy, not automatic repetition of the rejected
-amount. An existing queued replacement link must not cause duplicate provisioning.
-SESSION_FUNDING_DISABLED is not replacement-eligible within this session.
+## 7. Review status
 
-PAYMENT_NO_NEW_FUNDS and ambiguous errors require a fresh, ordered snapshot and
-careful attribution across intervening requests. A lost response cannot be skipped
-by a queued query. If acceptance cannot be established safely, end the session.
-Link replay may change ownership, payment replay never adds credit twice, and
-unlink replay semantics are still to be finalized. Mint HTTP recovery remains
-the wallet's responsibility, not a guarantee supplied by a control error.
+Finalization requires coordinated implementations, independent bindings, and
+conformance tests. New ambiguities must be resolved here, not with fallback.
 
-## 9. Illustrative transcripts
+## Appendix A. Illustrative transcripts
 
-Fields are abbreviated: A/B are channel IDs, `paid` means total_paid_millisats,
-and signatures/proofs are omitted. Outcome labels are explanatory, not wire fields.
+Fields are abbreviated. Outcome labels are explanatory and are not wire fields.
 
-### Pipelined link, payment, and failure
+### A.1 Pipelined link, payment, and failure
 
 ```text
 R -> C  SessionStatus(linked=null, paid=0, paused=true, receiver, offers, rates)
@@ -590,21 +622,18 @@ R -> C  [payment] SessionStatus(linked=A, balance_raw=100, paid=raw_to_msats(100
 ```
 
 The link snapshot cannot include the later payment. If admission failed and A
-was not already owned, the same pipeline instead produces:
+was not already owned, the same pipeline yields two independent errors:
 
 ```text
-R -> C  Error(CHANNEL_ADMISSION_DISABLED) # answers link only
-R -> C  Error(PAYMENT_WRONG_CHANNEL)      # independently answers payment
-C -> R  GetSessionStatus
-R -> C  SessionStatus(linked=null, paid=0)
+R -> C  Error(CHANNEL_ADMISSION_DISABLED) # link
+R -> C  Error(PAYMENT_WRONG_CHANNEL)      # payment
 ```
 
-### Ambiguous old payment and pipelined bonus credit
+### A.2 Ambiguous old payment and bonus credit
 
 ```text
-A uses msat. Client persisted/sent 100 in an old session that died.
-Relay never accepted it and stores 0; client does not roll its signed 100 back.
-In a new session:
+A uses msat. Client persisted and sent 100 in an old session that died.
+Relay never accepted it and stores 0; client retains its signed 100.
 C -> R  ChannelLink(A, zero_balance_signature, same immutable funding)
 R -> C  SessionStatus(linked=A, balance_raw=0, paid=0)
 C -> R  ChannelPayment(A, 130) # persist 130; minimum increment d1=30
@@ -612,166 +641,102 @@ C -> R  ChannelPayment(A, 150) # persist 150; minimum increment d2=20
 R -> C  SessionStatus(linked=A, balance_raw=130, paid=130)
          Validate against P(0)+30, accept bonus, set P=130.
 R -> C  SessionStatus(linked=A, balance_raw=150, paid=150)
-         Validate against P(130)+20, preserving the earlier bonus.
+         Validate against P(130)+20.
 ```
 
-If the relay had already accepted 100 in the old session, relink would report
-balance_raw=100 but paid=0; these new payments would credit 30 then 20. No old
-session credit transfers, and no report may exceed the client's signed balance.
+If the relay had accepted 100 previously, relink reports `balance_raw=100` but
+`paid=0`; the new payments credit 30 then 20. Old session credit does not transfer.
 
-### Optional release and simple unlink
+## Appendix B. Migration plan
 
-```text
-C -> R  ChannelPayment(A, 130)
-R -> C  ChannelReleaseRequested(A)
-         This client chooses to comply; another may ignore the request.
-         It may provision B locally while waiting, without linking B yet.
-R -> C  SessionStatus(linked=A, balance_raw=130, paid=...)
-C -> R  ChannelUnlink(A)
-R -> C  SessionStatus(linked=null, credit preserved)
-C -> R  ChannelLink(B, zero_balance_signature, complete params and proofs)
-R -> C  SessionStatus(linked=B, credit preserved)
-```
+The baseline below is descriptive; §§1-6 define the target if wording differs.
 
-There is no final balance in unlink, no equality check, and no ChannelUnlinked
-message. A client can pipeline unlink after payment; it must still interpret
-both responses separately and retain any uncertain signed payment.
-
-### Exclusion versus whole-session funding refusal
-
-```text
-Client signed A=100, confirmed P=50; it persists A=130 (pending increment 30).
-C -> R  ChannelPayment(A, 130)
-R -> C  ChannelEvicted(A, scope=session) # client may ignore
-R -> C  Error(CHANNEL_EVICTED_FROM_SESSION)
-         Pending increment rejected; P stays 50 and signed A stays 130.
-C -> R  ChannelLink(B, zero_balance_signature, complete params and proofs)
-R -> C  SessionStatus(linked=B, paid=50)
-```
-
-A relink of A in this session also fails. Relay-scoped exclusion uses
-CHANNEL_RETIRED_AT_RELAY and survives both restart and payment receiver rotation.
-If the response had instead been SESSION_FUNDING_DISABLED, the client would
-stop all links/payments here, keep consuming the existing credit, and not try B
-on this session. Neither rejection undoes a durable signed channel balance.
-
-### Bidirectional extensions and independent liveness
-
-```text
-C -> R  ChannelLink(A, ...)
-C -> R  ExtensionNotification(name=example.client_hint, data={})
-         Relay ignores the unsupported hint; no Error or response is sent.
-C -> R  ChannelPayment(A, 100)
-C -> R  Ping(42)
-         Link validation is still blocked on mint metadata.
-R -> C  Pong(42) # completes only the probe
-R -> C  ExtensionNotification(name=example.relay_hint, data={})
-         Client ignores it; FIFO still contains link, payment.
-R -> C  SessionStatus(linked=A, balance_raw=0)   # link
-R -> C  SessionStatus(linked=A, balance_raw=100) # payment
-R -> C  SessionStatus(...) # forbidden unsolicited response; FIFO now empty
-         Discard, rate-limit warning, change no state.
-```
-
-An invalid response while requests remained pending would terminate rather than
-be skipped. Unknown top-level types are not ignorable extensions.
-
-## 10. Current implementation versus target
-
-| Topic | Baseline `7212537` | Target |
+| Topic | Baseline `7212537` | Target section |
 | --- | --- | --- |
-| Session identifier | h2 | h2-2026-10-06 only; coordinated breaking update |
-| Link/payment encoding | Shared Payment in payment_json; link balance explicitly zero | Structured messages; link zero_balance_signature and no balance field |
-| Funding rules | Full funding sent by client; relay can ignore missing/conflicting relink data | Mandatory on every link; reject immutable conflicts; forbidden on payments even as null |
-| Unlink | final_balance_raw plus equality check; ChannelUnlinked then status | channel_id only; stored-state release; one status |
-| Advertisements | Ordered mint/unit entries with keyset IDs and rates | Mint → unit → recovery-window map, no IDs or ordering, pricing only at session level |
-| Receiver | Captured receiver key for the session | Advertised receiver may rotate; channel receiver immutable; authenticated relay scopes exclusions |
-| Client accounting | Rejects session paid above locally authorized total; updates local total after send | Pre-send signed history and per-request increments; accept bonus credit, reject shortchanging |
-| Control correlation | One client operation with snapshot inference; unsolicited statuses | FIFO pipelining, five-request minimum, exactly one response; no unsolicited statuses |
-| Liveness | GetSessionStatus heartbeat; any server message clears probe | Independent nonce Ping/Pong, prompt despite slow work; 5s idle/15s timeout recommended |
-| Proactive messages | Eviction without scope; client acts on release | Ignorable release/eviction, required scope, self-contained errors |
-| Funding refusal | Admission controls; no proposed lifetime funding-disabled outcome | SESSION_FUNDING_DISABLED preserves existing credit; no funding-state field |
-| Extensions/tolerance | No ExtensionNotification; snapshot updates infer completion | Bidirectional hints; empty-FIFO response discard without state change; invalid pending response fatal |
-| Architecture | Relay reducer/effect interpreter, client imperative loop | Only observable ordering/cleanup required; no prescribed queue/reducer redesign |
+| Session identifier | `h2` | §1: coordinated `h2-2026-10-06` switch |
+| Link/payment encoding | Shared `payment_json` | §3.1 and §5 |
+| Relink funding | Missing/conflicting submitted data can be ignored | §5.1 semantic equality |
+| Unlink | Final balance plus `ChannelUnlinked` | §5.3 strict ID-only unlink |
+| Advertisements/pricing | Ordered entries with keyset IDs and per-entry rates | §3.3 and §4 |
+| Receiver | Fixed for session/runtime identity | §4 stored-channel-safe rotation |
+| Client accounting | Local total updated after send | §5.2 pre-send durable accounting |
+| Correlation | One operation plus snapshot inference | §3.4 FIFO pipeline |
+| Liveness | Status heartbeat cleared by any message | §3.4 correlated Ping/Pong |
+| Proactive messages | Unscoped eviction and acted-on release | §3.5 and §5.3-5.4 advisories |
+| Funding refusal | Admission controls only | §5.5 lifetime session restriction |
+| Extensions/tolerance | No extension envelope; unsolicited statuses | §3.5-3.6 |
 
-Source references: monad-common/src/{bootstrap,protocol,control_codec}.rs;
-monad-relay/src/{session,session_fsm,control_driver,payments}.rs;
-monad-client/src/session_driver/{runtime,state,funding,payment}.rs and
-monad-client/src/sqlite_client_wallet.rs. Library convenience types do not define
-the proposed wire contract. Current error names are not all final target rules.
+Implementation order:
 
-## 11. Review decisions and implementation checklist
+1. Make client keyset selection and reuse independent of advertised IDs, then
+   remove preference plumbing and adopt the mint/unit map.
+2. Implement structured messages, strict framing, fixed pricing, receiver-key
+   retention, semantic relinks, ID-only unlink, and the error registry.
+3. Implement durable pre-send accounting, per-request increments, FIFO responses,
+   five-request capacity, exact numeric bounds, and bonus-credit handling.
+4. Implement advisories, scoped exclusions, session funding refusal, independent
+   Ping/Pong, and extensions without coupling them to FIFO progress.
+5. Coordinate the client/relay switch to `h2-2026-10-06`; add conformance coverage
+   before declaring the specification final.
 
-### Decisions
+Source baseline: `monad-common/src/{bootstrap,protocol,control_codec}.rs`,
+`monad-relay/src/{session,session_fsm,control_driver,payments}.rs`,
+`monad-client/src/session_driver/{runtime,state,funding,payment}.rs`, and
+`monad-client/src/sqlite_client_wallet.rs`. Convenience types do not define this
+wire contract.
 
-| ID | Status / remaining question |
-| --- | --- |
-| D1 — resolved | FIFO requests/responses, five-request minimum, one status/error per request, independent Ping/Pong. |
-| D2 — open | Exact semantic equality for relink funding, including proof ordering/auxiliary metadata; conflict error code. |
-| D3 — partly resolved | Unlink uses channel ID only and no balance check. Settle duplicate/unowned unlink, eligibility outside a release request, and unlink racing eviction. |
-| D4 — partly resolved | Scoped/lifetime funding errors, response tolerance, and extensions defined. Finish ambiguous/internal/version-error fatality, exact validation precedence, and local numeric-limit rejection coding. |
-| D5 — partly resolved | Smaller exact implementation ranges permitted; NUT supplies funding schemas/vectors. Confirm field/line/buffer budgets and aggregate limits. |
-| D6 — partly resolved | Fixed session pricing, unordered mint/unit map, receiver rotation permitted. Finalize admission policy updates versus stored-channel reuse, including pre-provisioned old-receiver channels. |
-| D7 — partly resolved | Prompt Pong and recommended 5s idle/15s timeout. Settle late/unsolicited Pong policy and implementation resource limits. |
+The contract specifies observable ordering, response, and cleanup behavior. It
+does not prescribe a queue, reducer, or client-control-loop architecture.
 
-### Implementation sequence
+## Appendix C. Conformance coverage
 
-- [ ] Resolve remaining questions and retain the current-versus-target distinction.
-- [ ] Make clients ignore advertised IDs first, including mocks/harnesses (#91);
-  validate cache/rotation/reuse behavior, then remove preference plumbing.
-- [ ] Implement the new structured messages, mint/unit map, session-wide pricing,
-  receiver updates, ID-only unlink, and self-contained error semantics.
-- [ ] Implement durable pre-send accounting, per-request increments, FIFO responses,
-  five-request capacity, and correct bonus-credit/rejection handling.
-- [ ] Implement optional release, scoped exclusions, lifetime session funding
-  refusal, and independent Ping/Pong/extension handling.
-- [ ] Coordinate client/relay switch to h2-2026-10-06 only; no legacy fallback.
-- [ ] Add conformance coverage; declare the specification final only after
-  target/implementation differences are closed.
+- §1: exact protocol selection, initial status, second-control rejection, paused
+  control availability, and teardown without erasing funding or closing on-mint.
+- §2: fragmentation/coalescing; exact 1 MiB inbound/outbound boundary; overlong
+  complete and partial lines; proof-heavy link preflight; parser complexity;
+  duplicate, unknown, wrong-direction, and forbidden-null fields; exact reduced
+  ranges and checked intermediates.
+- §3: five blocked outstanding requests with prompt Pong; a prohibited sixth;
+  mixed success/errors; failed redundant relink preserving ownership before a
+  successful queued payment; fixed snapshots and CONNECT count transitions;
+  empty-FIFO discard; fatal input behind pending requests; multiple unanswered
+  requests at termination; bounded redacted warnings.
+- §3.4: nonce freshness, paused probes, blocked-work Pong, wrong/late/duplicate
+  Pong, Ping flooding under blocked outbound flow control, local stalls, timeout
+  races, and no claim of destination reachability.
+- §3.5: ignored bidirectional extensions and advisories with no response, FIFO,
+  accounting, or liveness effect; malformed envelopes remain fatal.
+- §4: exact one-round billing; partial writes; per-tunnel and aggregate overshoot
+  bounds; counter exhaustion; fixed rates; TCP/QUIC accounting excluding pooled
+  connections; one current receiver; known-channel lookup before receiver checks;
+  old-receiver relink or explicit retirement; failed attempts creating no durable
+  recognition; rotation during provisioning rejecting and recovering an unknown channel;
+  recovery-window equality, zero, absence, and overflow; exclusions surviving
+  rotation and relay restart.
+- §5.1: complete relink data; normalized params; ordered proof-core equality;
+  witness and `p2pk_e` rejection; missing/mismatched deterministic DLEQ data;
+  valid non-identical `e,s`; replayable zero signature semantics; immutable
+  conflict before ownership mutation.
+- §5.2: pre-send crash/write failure; duplicate, lower, over-capacity, and numeric
+  failures; payment success below submitted `B_new`; shortchanging; bonus credit;
+  impossible relay balance; no rollback, duplicate provisioning, or double
+  credit; ambiguous acceptance and queued-response attribution.
+- §5.3: optional release ignored; replacement provisioning before unlink; strict
+  duplicate/unowned behavior; unlink despite differing signed and accepted
+  balances; payment then unlink; barrier-tested unlink versus replacement or
+  eviction; preserved credit and stale-cleanup safety.
+- §5.4-5.5: ignored notifications with self-contained errors; session exclusion;
+  durable relay exclusion scoped to authenticated identity; ordered funding
+  disablement preserving committed credit, linked state, and data traffic.
+- §6: the concrete precedence matrix, unknown codes, fatal negotiated-version or
+  internal errors behind pending work, pre-commit `NUMERIC_LIMIT_EXCEEDED`,
+  redacted diagnostics, and recovery that preserves every exposed signature.
+- Keyset rotation, inactive funding, unavailable metadata, bounded immutable
+  retries, and no redundant provisioning during preference removal.
 
-### Conformance coverage
-
-- Exact protocol selection with old h2 rejected; initial status before any
-  messages, second-control rejection, paused control availability, unconditional
-  teardown without erasing funding/history or implicitly closing on-mint.
-- Fragmentation/coalescing, maximum/overlong partial lines, duplicate/unknown
-  fields, malformed JSON, wrong direction, forbidden explicit-null fields.
-- Exact supported integers, documented reduced numeric ranges (including the
-  90,000 BTC msat example), checked intermediate arithmetic, no rounding/clamping
-  of unsupported values. No signed-history rollback on numeric failure.
-- Mandatory relink funding and zero_balance_signature; omitted balance field;
-  immutable conflict rejection; no funding on payments or historical relink credit.
-- Pre-send crash/write failure, duplicate/lower/over-capacity payments, impossible
-  relay channel balance, shortchanged success, bonus session credit, no double
-  credit, and preserved signatures after all rejections.
-- Pipeline mixed success/errors, failed link then payment, redundant relink
-  failure preserving ownership, status queries and unlink after payment, snapshot
-  timing, prior bonus credit carried into later expectations, five blocked
-  outstanding requests with prompt Ping, and fatal loss of multiple responses.
-- Empty-FIFO valid response discard without changes to pricing/credit/counters/
-  ownership/heartbeat; invalid pending responses and fatal/unknown errors end
-  the session; warnings rate-limited and payload-redacted.
-- Fixed rates across all mints/units, unordered map semantics, receiver updates
-  preserving old channel parameters/history, and exclusions surviving receiver
-  rotation. CONNECT counts include TCP and QUIC forwarding, not pooled connections.
-- Optional release ignored successfully, replacement provisioning before unlink,
-  ID-only unlink despite differing signed/accepted balances without declaring
-  payment agreement, and preserved session credit; finalize duplicate/race cases.
-- Notifications ignored while self-contained exclusion errors still allow
-  rollover; session exclusion forbids same-session reacquisition, relay exclusion
-  survives restart across all sessions of the authenticated identity, not others.
-- SESSION_FUNDING_DISABLED rejects uncommitted links/payments in order, preserves
-  committed credit/linked state/data, permits Ping/query/unlink, and does not cause
-  replacement funding attempts in that session or expose a funding-state field.
-- Bidirectional unsupported extension hints ignored without replies or FIFO
-  effects; malformed envelopes fatal; hint traffic cannot satisfy probes.
-- Nonce freshness, paused probes, prompt Pong during blocked work, local stalls,
-  cancellation, and fresh rebuild probes; no claim that Pong proves exit reachability.
-- Mint/keyset rotation, inactive funding, unavailable metadata, bounded immutable
-  retries, and no redundant channel provisioning during preference removal.
-
-Related investigations: [#119](https://github.com/SatsAndSports/MONAD/issues/119)
+Related investigations: [#91](https://github.com/SatsAndSports/MONAD/issues/91)
+(keyset advertisements), [#119](https://github.com/SatsAndSports/MONAD/issues/119)
 (prefix probes), [#121](https://github.com/SatsAndSports/MONAD/issues/121)
 (silent failures), [#122](https://github.com/SatsAndSports/MONAD/issues/122)
-(deterministic recovery), [#124](https://github.com/SatsAndSports/MONAD/issues/124)
+(deterministic recovery), and [#124](https://github.com/SatsAndSports/MONAD/issues/124)
 (resource bounds).
