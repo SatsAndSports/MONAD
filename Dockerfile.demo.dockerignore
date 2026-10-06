@@ -4,6 +4,11 @@
 !Cargo.toml
 !Cargo.lock
 !rust-toolchain.toml
+!vendor/
+!vendor/h2/
+!vendor/h2/**
+vendor/h2/target/
+vendor/h2/target/**
 !monad-*/
 !monad-*/Cargo.toml
 !monad-*/build.rs
