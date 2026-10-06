@@ -15,8 +15,9 @@ are resolved.
 
 ### Reading guide
 
+- **§1:** client-driven request/response contract.
 - **§3:** proposed message fields.
-- **§5:** payment records, release/eviction semantics, and the client-action race table.
+- **§5:** payment records, optional release, and scoped advisory eviction.
 - **§6–7:** client-first keyset removal and correlated liveness.
 - **§8:** serialized requests and unambiguous response ordering without request IDs.
 - **§10–11:** example exchanges and differences from current code.
@@ -45,6 +46,33 @@ Principles:
 4. A state snapshot and a correlated liveness response serve different purposes.
 5. Wire rules do not prescribe a reducer, task architecture, database, or language.
 6. A failure or lost response is not proof that an operation had no effect.
+
+### Client-driven exchange
+
+After consuming the initial SessionStatus, the client may send Ping at any time,
+including while another request is pending. The relay MUST promptly respond with
+the matching Pong without waiting for slow request processing (§7).
+
+The other requests share one slot. Each completes with **exactly one success
+message or exactly one Error**, never both:
+
+| Client request | Success | Failure |
+| --- | --- | --- |
+| ChannelLink | SessionStatus identifying the linked channel | Error |
+| ChannelPayment | SessionStatus reflecting accepted payment and session credit | Error |
+| ChannelUnlink | SessionStatus with linked_channel=null and session credit preserved | Error |
+| GetSessionStatus | SessionStatus | Error |
+| Ping(nonce), independent slot | Pong(nonce) | Invalid input follows the fatal protocol-error rules |
+
+The client MUST consume the response before sending another serialized request.
+There is no ChannelUnlinked message in the target protocol. Connection loss or
+session termination can leave a request unanswered; exactly-one response does
+not guarantee delivery across failure.
+
+ChannelReleaseRequested and ChannelEvicted are advisory notifications, not
+responses. A client MAY ignore both and rely entirely on request results. Errors
+MUST therefore be self-contained, without requiring a previously observed
+notification. There are no unsolicited SessionStatus messages after initialization.
 
 ## 2. Stream lifecycle and framing
 
@@ -156,13 +184,12 @@ derived secrets or cached mint metadata are not the public parameters object.
 | `type` | Additional fields | Purpose |
 | --- | --- | --- |
 | `SessionStatus` | See §3.3 | Initial relay state or response to the serialized client request (§8); client validation is required |
-| `ChannelEvicted` | `channel_id` | Notify that another session acquired this channel |
-| `ChannelReleaseRequested` | `channel_id` | Ask the client to finish outstanding payment work and release a retiring channel |
-| `ChannelUnlinked` | `channel_id`, `final_balance_raw: u64` | Confirm cooperative release |
+| `ChannelEvicted` | `channel_id`, `scope: "session" \| "relay"` | Advise that links/payments for this channel will be rejected within the stated scope (§5.4) |
+| `ChannelReleaseRequested` | `channel_id` | Optional request to release the channel when convenient |
 | `Error` | `code: string`, `message: string` | Request rejection or fatal session error (§8–9) |
 | `Pong` | `nonce: u64` | Echo the corresponding Ping nonce |
 
-The three channel-specific messages all identify the channel explicitly. A client
+The two advisory notifications identify the channel explicitly. A client
 MUST NOT apply a delayed notification for channel A to its newer channel B.
 `message` in `Error` is diagnostic only; clients MUST NOT parse it for policy.
 Nonfatal Error completes the outstanding serialized request. Unsolicited Error
@@ -278,9 +305,10 @@ channel merely because it was attempted. Channel ownership is exclusive across
 sessions: acquiring a channel owned elsewhere evicts the previous owner.
 
 Success is conveyed by `SessionStatus` naming the linked channel and its stored
-accepted balance, under §8. Repeating a link is not an idempotency-key replay:
-it can reacquire ownership and evict a different session. Clients MUST NOT
-automatically replay links in a way that causes ownership ping-pong.
+accepted balance, under §8. An evicted channel MUST NOT be reacquired within the
+exclusion scope (§5.4). A session-scoped eviction permits use in another session,
+subject to normal admission rules; it is not permission to automatically reconnect
+and fight another owner. Repeating a link is not an idempotency-key replay.
 
 ### 5.2 Payment
 
@@ -354,12 +382,13 @@ the reported total (including any bonus) and resolves the pending expectation.
 All later status responses MUST report at least `P`; shortchanging is a protocol
 violation, not a reason to sign another payment.
 
-A matching ownership-loss rejection after eviction resolves the pending
+A scoped channel-exclusion rejection (§9) resolves the pending
 expectation as rejected without adding it to `P`. This does not roll back the
 durable signed channel balance or reduce confirmed session credit. The client
-can replace the channel and continue this session (§5.5 and §9). Other payment
-errors require their code-specific handling; ambiguous acceptance must be
-reconciled or the session ended before further payment. A timeout or notification
+can replace the channel and continue this session, whether or not it processed
+an eviction notification. Other payment errors require their code-specific
+handling; ambiguous acceptance must be reconciled or the session ended before
+further payment. A timeout or notification
 alone MUST NOT resolve the pending expectation or free the request slot.
 
 No rejection revokes a signature already disclosed to the relay. Channel rollover
@@ -378,101 +407,78 @@ more than the client's conservative minimum. The client accepts this bonus (§10
 
 ### 5.3 Cooperative release and unlink
 
-This is a retirement handshake, not a general-purpose on-mint close operation.
-The relay's notification does not occupy the client request slot; the unlink
-operation starts only when the client sends ChannelUnlink:
+ChannelReleaseRequested means **“please unlink this channel when convenient.”**
+The client MAY ignore it. Ignoring it is not a protocol violation and does not
+itself revoke ownership or invalidate otherwise valid payments. The notification
+does not occupy or complete the client request slot.
 
-1. Relay sends `ChannelReleaseRequested(A)`.
-2. Client records release-pending, stops originating new discretionary topups for
-   A, and resolves any outstanding serialized request before deciding to unlink.
-3. Client sends `ChannelUnlink(A, final_balance_raw)` only once its durable signed
-   final balance has been acknowledged by the relay.
-4. Relay checks retirement eligibility, ownership and the exact accepted final
-   balance, and releases the channel.
-5. Relay sends `ChannelUnlinked(A, final_balance_raw)`, then `SessionStatus` with
-   no linked channel, as an ordered success pair.
+The intended initial MONAD client policy is to comply at the first safe
+opportunity: mark the named channel release-pending, finish the outstanding
+request, reconcile its final signed balance, and then send ChannelUnlink if it
+still owns the channel. A per-channel set makes repeated requests harmless.
+This is client policy, not a required reaction for interoperable clients.
 
-The client MUST NOT send an unlink with a lower invented final balance to get
-past unresolved payment history. Missing acknowledgement requires reconciliation
-or session termination, not a second conflicting signature.
+For a client choosing to comply:
 
-Unlink preserves session credit. It does not reset channel history, refund
-remaining credit, or by itself execute a mint transaction. After the success pair
-the client may link a replacement. Retirement prevents later reuse of the retired
-channel; ordinary control detach is a different operation.
+1. Send `ChannelUnlink(A, final_balance_raw)` only after the final signed balance
+   has been acknowledged and the serialized request slot is free.
+2. The relay checks release eligibility, ownership, and the exact final balance.
+3. On success it releases ownership and sends **one SessionStatus**, with
+   `linked_channel: null` and session paid credit preserved. On failure it sends
+   **one Error**. There is no separate ChannelUnlinked acknowledgement.
 
-The client maintains a release-pending set keyed by channel ID. For a currently
-linked channel or the target of an outstanding link, ChannelReleaseRequested
-adds that ID to the set; repeated requests are idempotent. The client continues
-processing its outstanding request. It attempts unlink when the slot is free,
-it still owns that channel, and the final signed balance is acknowledged.
-Release-pending does not authorize a lower final balance or cancel a payment.
+The client MUST NOT invent a lower final balance to force unlink success. A
+missing payment acknowledgement requires reconciliation, not another conflicting
+signature. Unlink does not reset channel history, refund session credit, or
+execute an on-mint close. Retirement may prevent subsequent links, but release
+request alone is not the relay-wide link-and-payment exclusion defined in §5.4.
 
-The relay MUST NOT reject an otherwise valid owner's crossing payment merely
-because release was requested. Retirement prevents new links but does not itself
-revoke existing ownership. If ownership is subsequently lost, §5.4 applies.
-
-If eviction or a successful replacement link releases the channel, no further
-unlink is needed for that ownership. Removing the pending unlink work MUST NOT
-erase the retirement record or signed-payment history. A notification naming
-an unrelated channel MUST NOT release the currently linked channel.
-
-**Review decision D3:** duplicate unlink acknowledgements, unlink from an already
-unlinked session, and eviction during an outstanding unlink remain to be settled.
-Link/payment races and repeated release notifications follow §5.5.
+If eviction or a successful replacement link already removed ownership, the
+client need not issue a deferred unlink. A notification about A must never cause
+unlinking B. **Review decision D3:** specify duplicate/unowned unlink outcomes
+and unlink racing eviction; all outcomes must obey the single-response rule.
 
 ### 5.4 Eviction
 
-On receiving `ChannelEvicted(A)`, a client MUST stop treating A as owned by this
-session. If its current channel is B, it MUST NOT clear B. The relay sends the
-ChannelEvicted notification without an unsolicited SessionStatus. Eviction alone
-does not end the session or erase its remaining credit.
+ChannelEvicted advises that this channel is excluded from further links and
+payments within a required scope:
 
-A payment racing a claim by another session must be serialized at the channel
-ownership/payment boundary: it is either accepted for its owner or rejected,
-never credited twice. The exact wire outcome for a pending operation superseded
-by eviction follows §8: the notification cannot substitute for its terminal
-response. If payment acceptance wins, its success status MUST precede eviction.
-If eviction wins, ChannelEvicted MUST precede the nonfatal ownership-loss
-rejection (§9). Success for that outstanding payment after the matching eviction
-is a protocol violation; the client MUST disconnect. This does not prohibit
-payments following a later successful link that establishes new ownership.
+| `scope` | Exclusion |
+| --- | --- |
+| `"session"` | This channel cannot be linked or paid again in this session. Other sessions may use it, subject to normal admission rules. |
+| `"relay"` | This relay permanently refuses further links and payments for this channel across all sessions, including after restart. |
 
-Eviction MUST NOT clear a matching outstanding request. It changes ownership,
-not whether a signed payment was accepted. A rejected payment following eviction
-does not by itself end the session; the client can roll over to another channel
-after consuming the rejection, retaining confirmed session credit.
+```json
+{"type":"ChannelEvicted","channel_id":"...","scope":"session"}
+```
 
-### 5.5 Notifications while a client request is outstanding
+The channel ID above is abbreviated. Scope is required, has no implicit default,
+and admits only these two values. “Relay” means the payment-receiving relay
+identity, not its hostname, process, or every identity sharing a wallet database.
+Relay-scoped exclusion MUST be durable before announcement and enforced across
+all sessions for that identity. Session-scoped exclusion lasts until that
+session ends. An ownership transfer to another session excludes the old owner
+with session scope. Neither scope erases funding/payment history, implies an
+on-mint close, or prevents appropriate fund recovery.
 
-This table describes **what the client should do next**, not the relay's internal
-processing. It assumes the notification names the request's channel A.
+The client SHOULD stop trying the excluded channel, but MAY ignore the
+notification and learn the same restriction from a request Error. The relay
+enforces exclusion and removes affected linked ownership regardless of
+notification processing. The notification neither completes an outstanding
+request nor proves its financial outcome.
+Confirmed session credit remains usable; another channel may fund the session.
 
-| Outstanding request | Notification received | What the client should do next |
-| --- | --- | --- |
-| ChannelLink(A) | ChannelReleaseRequested(A) | Mark A release-pending and keep waiting for the link response. If linking succeeds, attempt unlink when its final balance is reconciled and the slot is free, rather than starting discretionary topups. If linking fails and A is not owned, no unlink is needed. |
-| ChannelPayment(A) | ChannelReleaseRequested(A) | Mark A release-pending and keep waiting for the payment response. After validated success, attempt ChannelUnlink(A) when the slot is free. On rejection, follow §9; do not unlink using an unacknowledged final balance. |
-| ChannelLink(A) | ChannelEvicted(A) | Stop treating the affected ownership of A as valid, but keep the link request outstanding. Wait for its explicit outcome; a later successful link may establish new ownership. Do not automatically send another link to fight the eviction. |
-| ChannelPayment(A) | ChannelEvicted(A) | Stop using A for further payments, retain its durable signed balance, and keep waiting for the payment rejection. After the matching ownership-loss rejection, resolve the pending expectation, clear the request slot, and select or provision another channel in this session. Preserve confirmed credit. |
+**Cutoff rule:** exclusion and request commitment MUST be serialized. A link or
+payment not committed when exclusion takes effect MUST be rejected, including
+an in-flight request. An already committed request retains its success and
+credit, and its success response MUST precede the eviction notification on that
+session's stream. Never revoke an accepted payment retroactively. No later link
+can reacquire the channel within the excluded scope.
 
-**Different channel IDs:** eviction of old channel B while ChannelLink(A) is
-pending clears only B's ownership; it does not cancel or complete Link(A).
-ChannelReleaseRequested(B) marks B release-pending. If Link(A) succeeds, replacement
-already releases B and no unlink of B is needed. If it fails and B is still
-owned, the client can unlink B once its final balance is reconciled. Neither
-notification authorizes unlinking A because B was named.
-
-**Same-channel relink:** eviction before a Link(A) response can concern ownership
-that existed before the relink. A later successful link response can legitimately
-establish new ownership. This differs from a stale snapshot resurrecting old
-ownership. If the link acquired A first and that new ownership was then evicted,
-the relay MUST send link success before eviction.
-
-**Retirement racing a link:** if acquisition precedes retirement, the relay sends
-link success before requesting release of that new ownership. If retirement
-precedes acquisition, it rejects the link as retired. A release notification for
-existing ownership may still precede a rejected same-channel relink; the client
-then proceeds with release of the ownership it still holds.
+Request errors identify the scope independently (§9). A client that ignores both
+notifications can still finish each request, handle its Error, select another
+channel, and continue successfully. Notifications about an old channel cannot
+cancel a pending request concerning a different one.
 
 ## 6. Keyset-independent advertisements
 
@@ -533,10 +539,12 @@ credential.
 - Paused/unlinked sessions MUST still permit Ping/Pong.
 - GetSessionStatus is for snapshots; it MUST NOT be used as the correlated probe.
 
-Permission to send a Ping **does not require preemption**. A relay MAY finish
-slow link validation before responding to a later Ping. A client doing slow local
-wallet work may likewise delay reading a Pong. No immediate response-time
-guarantee or dedicated side channel is implied.
+The relay MUST process Ping and enqueue its Pong promptly, independently of
+slow link validation, mint access, or other serialized request work. Such work
+MUST NOT block control reads or Pong handling. “Immediately” means no deliberate
+wait for that work, not zero network latency or bypassing bytes already queued
+on the ordered H2 stream. This requires independent liveness progress, but does
+not prescribe a dedicated side channel or a particular task architecture.
 
 Timeout is a local recovery decision, not proof of permanent peer death or of
 non-acceptance of an outstanding payment. The timeout, probe interval, and
@@ -559,41 +567,29 @@ occupy the slot or release ownership. ChannelUnlink begins only when the client
 decides to send it after resolving any current request. ChannelEvicted, byte
 accounting, and pause/resume changes likewise are not client requests.
 
-The relay MUST finish each request's logical transition and response sequence
+The relay MUST finish each request's logical transition and single response
 before executing the next serialized request. Data forwarding/accounting may
 continue concurrently. This is an observable ordering contract, not a mandated
 task architecture or a requirement to hold a mutex across I/O.
-
-| Request | Intended success | Rejection / other outcome |
-| --- | --- | --- |
-| ChannelLink | SessionStatus naming acquired channel and accepted balance | Associated Error; fatal errors terminate |
-| ChannelPayment | SessionStatus reflecting accepted cumulative balance and session credit | Associated Error; ownership race may supersede it |
-| ChannelUnlink | Matching ChannelUnlinked followed by SessionStatus | Associated Error; release/eviction race needs D3 |
-| GetSessionStatus | Freshly generated SessionStatus | Session/protocol failure |
-| Ping(n) | Pong(n) | Session/protocol failure or local deadline |
 
 ### D1 resolution — response discipline, without request IDs
 
 - The initial SessionStatus is consumed before any client request. After that,
   the relay MUST NOT send unsolicited SessionStatus, including on pause/resume,
   eviction, release requests, or advertisement changes.
-- Link/payment/status-query success emits exactly one SessionStatus. Unlink
-  success emits the matching ChannelUnlinked followed by one SessionStatus.
-  The client MUST keep its slot occupied until that entire pair arrives.
+- Link/payment/unlink/status-query success emits exactly one SessionStatus, as
+  listed in §1. This one message completes the request after client validation.
 - Nonfatal Error MUST be the single terminal rejection response to the pending
   request; it MUST NOT be followed by a generic status for that request. Fatal
   errors end the session and MAY be unsolicited. Error fatality must be defined
   by machine code, not inferred from diagnostic text or a delayed EOF (D4).
-- ChannelReleaseRequested and ChannelEvicted may interleave with a response,
-  but MUST NOT complete the request slot. A pending request superseded by eviction
-  still needs an explicit terminal response, or session termination. An accepted
-  payment must not be described as rejected merely because ownership changed
-  afterward.
+- Advisory notifications may interleave with responses but MUST NOT complete
+  the request slot or be required to interpret an Error. A client may discard
+  both notification types and still follow the same request/response rules.
 - Responses and notifications MUST be emitted in logical transition order. A
   snapshot prepared before eviction cannot be emitted after its eviction
-  notification and thereby restore obsolete ownership. A later successful
-  same-channel relink can establish new ownership (§5.5). The unlink success pair
-  describes one release transition; later-transition notifications follow it.
+  notification and thereby restore obsolete ownership. Link/payment commitment
+  races follow the exclusion cutoff in §5.4; no same-scope reacquisition is allowed.
 - An unexpected response type or extra SessionStatus is a protocol violation;
   the client MUST disconnect. Paused clients can request fresh state when their
   request slot is idle. No periodic status broadcast is required.
@@ -627,24 +623,38 @@ specified causal response contract. Machine codes use the uppercase wire names.
 | `CHANNEL_UNLINK_REJECTED` | Retirement/ownership/final-balance mismatch; must not pretend release succeeded |
 | `INTERNAL_ERROR` | No general no-side-effect guarantee; treat outcome as uncertain and reconcile |
 
-### Payment rejection policy
+### Self-contained exclusion errors
 
-The target adds **`PAYMENT_OWNERSHIP_LOST`**, a nonfatal terminal rejection for a
-payment that was not accepted because another session acquired its channel.
-This proposed code is not present at the inspected baseline. The relay MUST
-send ChannelEvicted for that channel before this rejection. The client correlates
-the notification with the outstanding payment's channel and then consumes the
-rejection before sending a replacement link. A generic PAYMENT_CONFLICT, an
-eviction for a different channel, or diagnostic error text is not a substitute.
-PAYMENT_OWNERSHIP_LOST without the required matching eviction is a protocol
-violation, not permission to provision another channel.
+The target adds two nonfatal codes, usable for **both ChannelLink and
+ChannelPayment**. Neither exists at the inspected baseline:
+
+| Code | Meaning |
+| --- | --- |
+| `CHANNEL_EVICTED_FROM_SESSION` | This channel is excluded from this session; another session may use it under normal admission rules. |
+| `CHANNEL_RETIRED_AT_RELAY` | This relay identity permanently excludes this channel from links and payments across all sessions and restarts. |
+
+The outstanding request identifies the channel; no notification history or
+error-text parsing is required. The relay MUST enforce exclusion at the request
+commit boundary and return the scoped rejection for an otherwise valid excluded-channel request;
+relay scope takes precedence if both exclusions apply. An already committed
+payment MUST NOT be retroactively reclassified as rejected.
+
+The existing LINK_CHANNEL_RETIRED may still describe link-only retirement during
+cooperative release. It MUST NOT be confused with relay-scoped exclusion, which
+also refuses payments. Malformed requests still follow §2's protocol-error rules.
+
+For a rejected link, either scoped code completes the request and allows selection
+of another channel without ending the session. For a rejected payment, the same
+continuation preserves signed history and confirmed credit as described below.
+
+### Payment rejection policy
 
 | Payment outcome | Required client handling |
 | --- | --- |
-| Matching eviction followed by PAYMENT_OWNERSHIP_LOST | Resolve the expectation as rejected, preserving the signed channel record and confirmed session credit. Select or provision another channel and continue this session; do not disconnect solely for this expected rejection. |
+| CHANNEL_EVICTED_FROM_SESSION or CHANNEL_RETIRED_AT_RELAY | Resolve the expectation as rejected, preserving signed channel history and confirmed session credit. Record the exclusion scope; select or provision another channel and continue this session. No observed eviction notification is required. |
 | CHANNEL_CLOSED or CHANNEL_EXPIRED rejection | Stop using the channel and preserve its signed/recovery history. Resolve the rejected expectation; replacement may continue in the same session without reducing confirmed credit. |
 | PAYMENT_NO_NEW_FUNDS | Once the request slot is free, reconcile with GetSessionStatus. Do not blindly sign a larger payment; the same payment may already have been accepted. |
-| PAYMENT_CONFLICT without the explicit ownership-loss outcome, PAYMENT_WRONG_CHANNEL, or PAYMENT_UNKNOWN_CHANNEL | Reconcile ownership and payment state before further payment; do not infer no acceptance or automatically provision a replacement from the code alone. |
+| PAYMENT_CONFLICT, PAYMENT_WRONG_CHANNEL, or PAYMENT_UNKNOWN_CHANNEL | Reconcile ownership and payment state before further payment; do not infer no acceptance or automatically provision a replacement from the code alone. |
 | PAYMENT_INVALID | Stop automatic payment attempts and report the validation failure. Fresh channel provisioning is not a repair for an invalid signature or malformed payment. |
 | INTERNAL_ERROR or otherwise ambiguous acceptance | Reconcile once the request slot is free. If the outcome cannot be established safely, end the session. |
 | Impossible channel balance, shortchanged success response, or contradictory response ordering | Disconnect for a protocol violation. |
@@ -725,10 +735,10 @@ reporting 130 adds no further credit: it is a cumulative total, not a delta.
 ```text
 C -> R  ChannelLink(A, ...)
 C -> R  Ping(42)
-         Relay may still be awaiting mint metadata. Ping is not a preemption demand.
-R -> C  [link outcome] SessionStatus(...)
-         The status does NOT complete Ping(42).
+         Link validation remains blocked awaiting mint metadata.
 R -> C  Pong(42)
+         Pong completes only the probe, not the link request.
+R -> C  [link outcome] SessionStatus(...)
 ```
 
 ### Release races an already submitted payment
@@ -736,13 +746,12 @@ R -> C  Pong(42)
 ```text
 C -> R  ChannelPayment(A, balance_raw=130)
 R -> C  ChannelReleaseRequested(A)
-         Client stops new discretionary payments, waits for the outstanding result.
+         This client chooses to comply; another client may ignore the request.
+         Finish the outstanding payment before unlinking.
 R -> C  [payment outcome] SessionStatus(linked=A, balance_raw=130)
 C -> R  ChannelUnlink(A, final_balance_raw=130)
-R -> C  ChannelUnlinked(A, final_balance_raw=130)
-         The request slot is STILL occupied.
 R -> C  SessionStatus(linked=null, credit preserved)
-         Only now may the client send its next serialized request.
+         One success message completes unlink; the request slot is now free.
 ```
 
 ### Eviction rejects a pending payment; the session continues
@@ -751,9 +760,9 @@ R -> C  SessionStatus(linked=null, credit preserved)
 Channel A uses msat. Client signed balance is 100; confirmed session paid P=50.
          Client persists balance 130; pending success expectation is 50+30=80.
 C -> R  ChannelPayment(A, balance_raw=130)
-R -> C  ChannelEvicted(A)
-         Stop using A. Keep the payment request outstanding; do not link B yet.
-R -> C  Error(code=PAYMENT_OWNERSHIP_LOST)
+R -> C  ChannelEvicted(A, scope=session)
+         Client ignores this advisory message; the payment remains outstanding.
+R -> C  Error(code=CHANNEL_EVICTED_FROM_SESSION)
          Resolve the pending expectation as rejected; confirmed P remains 50.
          A's durable signed balance stays 130. The session remains usable.
          Select an eligible replacement B, provisioning only if necessary.
@@ -768,17 +777,21 @@ If payment acceptance had won, the relay would instead send its success status
 with `paid >= 80` before ChannelEvicted(A). The client would retain that confirmed
 credit while replacing A. Eviction followed by payment success is forbidden.
 
-### Eviction during a same-channel relink
+### Exclusion prevents same-scope reacquisition
 
 ```text
 This session already owns A and sends ChannelLink(A) again.
 C -> R  ChannelLink(A, balance_raw=0, same immutable funding)
-R -> C  ChannelEvicted(A)
-         The earlier ownership was lost. Keep the link request outstanding.
-R -> C  [link outcome] SessionStatus(linked=A, stored balance, credit unchanged)
-         The requested relink subsequently acquired A again; this is new
-         ownership, not an unsolicited stale status restoring the old ownership.
+         Session exclusion commits before the relink can acquire A.
+R -> C  ChannelEvicted(A, scope=session)
+R -> C  Error(code=CHANNEL_EVICTED_FROM_SESSION)
+         No request for A can reacquire it in this session.
+         A new session may use A, subject to normal admission rules.
 ```
+
+With `scope=relay`, the rejection is CHANNEL_RETIRED_AT_RELAY instead, and even a
+new session after relay restart cannot link or pay A at that relay identity.
+Neither outcome erases the stored payments or prevents fund recovery.
 
 ## 11. Current implementation versus target
 
@@ -788,11 +801,13 @@ R -> C  [link outcome] SessionStatus(linked=A, stored balance, credit unchanged)
 | Funding on payment | Non-null params/proofs rejected; Option decoding may treat explicit null as absent | Fields forbidden even as null |
 | Relink funding | Client sends full funding; relay uses stored data and can ignore missing/conflicting supplied fields | Always require it and reject immutable conflicts |
 | Advertised keyset IDs | Relay-known preference list, including inactive IDs; not an acceptance allowlist | Client ignores first, then field removed |
-| Liveness | GetSessionStatus heartbeat; any server message clears the outstanding heartbeat | Correlated Ping/Pong; unrelated traffic does not acknowledge Ping |
-| Control operation correlation | Client uses local in-flight state and snapshot inference; unsolicited statuses exist | One serialized request including status queries; no unsolicited statuses after initialization; complete response sequences consumed |
+| Liveness | GetSessionStatus heartbeat; any server message clears the outstanding heartbeat | Correlated Ping/Pong progressing independently of slow requests; unrelated traffic does not acknowledge Ping |
+| Control operation correlation | Client uses local in-flight state and snapshot inference; unsolicited statuses exist | One serialized request; exactly one SessionStatus or Error; no unsolicited statuses after initialization |
+| Unlink success | ChannelUnlinked followed by SessionStatus | One SessionStatus; ChannelUnlinked removed |
+| Proactive notifications | Eviction names a channel without scope; client reacts to release requests | Both advisory; required eviction scope and self-contained errors let a client ignore them |
 | Channel versus session balances | Rejects channel balances above locally signed values and session paid totals above locally authorized totals | Keep the channel upper bound; reject session shortchanging and accept larger session credit |
 | Pre-send bookkeeping | Driver increments its local session total after the send; wallet signing is a separate path | Durable signed channel record, confirmed session credit, and pending expectation kept distinct; expected credit recorded before transmission |
-| Eviction during payment | Client eviction handling clears matching operation state; PAYMENT_CONFLICT rebuilds the session | Keep request outstanding through matching PAYMENT_OWNERSHIP_LOST; resolve rejected expectation, preserve signed history and confirmed credit, and roll over within the session |
+| Eviction during payment | Client eviction handling clears matching operation state; PAYMENT_CONFLICT rebuilds the session | Request remains outstanding until response; scoped exclusion Error alone permits channel rollover with credit/history preserved |
 | Input errors | Relay attempts Error and continues for decoder errors; client exits on decode failure | Strict fatal malformed-input handling proposed in D4 |
 | Execution | Relay reducer + effect interpreter; client imperative loop with inline wallet calls | No mandated architecture; only observable ordering/cleanup obligations |
 
@@ -814,13 +829,13 @@ Relevant source locations for checking this draft:
 
 | ID | Question |
 | --- | --- |
-| D1 — resolved | §8 specifies one serialized request, no unsolicited generic statuses, dedicated notifications, and complete ordered responses without request IDs. |
+| D1 — resolved | §1/§8 specify one serialized request and exactly one success or Error; independent Ping/Pong and ignorable notifications need no general request IDs. |
 | D2 | What exact immutable funding equality applies to relinks, including proof ordering and auxiliary metadata? Which error reports a conflict? |
-| D3 — partly resolved | §5.5 settles link/payment notification races; repeated release requests set the same per-channel flag. Settle duplicate unlink, unlinked-session unlink, and eviction during an outstanding unlink. |
-| D4 — partly resolved | §9 defines nonfatal PAYMENT_OWNERSHIP_LOST and payment rejection handling. Complete error fatality/association rules, approve strict parsing, and settle prohibited pipelining. |
+| D3 — partly resolved | Release compliance is optional; §5.4 defines required eviction scope and the commit cutoff. Settle duplicate/unowned unlink and unlink racing eviction, with one response in all cases. |
+| D4 — partly resolved | §9 defines self-contained session/relay exclusion errors for links and payments. Complete other error fatality/association rules, approve strict parsing, and settle prohibited pipelining. |
 | D5 | Confirm MONAD field sizes, line-size budget, exact integer representation and aggregate buffer limits. Funding structure and cryptographic vectors are referenced from the draft NUT (§3.1), not duplicated here. |
 | D6 — partly resolved | Session rates and receiver are fixed. Set advertisement-update rules within solicited responses; distinguish new-channel admission from stored-channel relink when policy changes. |
-| D7 | Define operational probe deadlines around slow local work/relay effects, late/unsolicited Pong handling, rate limits, and resource bounds without requiring immediate preemption. |
+| D7 — partly resolved | Pong must progress promptly despite slow request processing. Define concrete deadlines, client-local work handling, late/unsolicited Pong policy, rate limits, and buffer bounds. |
 
 ### Ordered work under #125
 
@@ -832,9 +847,11 @@ Relevant source locations for checking this draft:
 - [ ] Implement pre-send payment bookkeeping, channel upper-bound checks,
   separate confirmed credit and pending expectations, session-credit lower-bound
   checks, and monotonic acceptance of bonus credit.
-- [ ] Implement the client-action race table, deferred release flags, ordered
-  PAYMENT_OWNERSHIP_LOST rejection, and same-session channel rollover.
-- [ ] Implement Ping/Pong and use it for correlated liveness instead of status queries.
+- [ ] Remove ChannelUnlinked; return one SessionStatus on unlink success.
+- [ ] Implement optional release handling, scoped exclusion enforcement and
+  persistence, self-contained errors, and same-session channel rollover.
+- [ ] Implement prompt Ping/Pong independent of slow request processing and use
+  it for correlated liveness instead of status queries.
 - [ ] Add conformance fixtures/transcripts and adversarial tests for both endpoints.
 - [ ] Coordinate the breaking protocol version update outside this document;
   do not silently reinterpret the old wire format as the new one.
@@ -851,8 +868,8 @@ Relevant source locations for checking this draft:
 - Duplicate/lower/over-capacity payment; response loss; ownership races; no double
   credit; byte accounting continues during slow control work.
 - Reject unsolicited/extra statuses; serialize status queries with payments;
-  same-channel relink; notifications before a pending result; no stale ownership
-  resurrection; hold the slot through the full unlink pair.
+  one success or Error per request, including unlink; no stale ownership
+  resurrection or reacquisition inside an exclusion scope.
 - Crash/write failure after durable signing but before response; lower relay
   channel balance; impossible higher channel balance causes disconnect; session
   shortchanging rejected; bonus session credit accepted without double counting.
@@ -860,16 +877,21 @@ Relevant source locations for checking this draft:
   relay pause/remaining reports alone cannot induce additional signatures.
 - Release with an outstanding payment, mismatched final balance, duplicate unlink,
   eviction during release and retained session credit.
-- All four link/payment × release/eviction cases, repeated release requests,
-  old-channel notifications during replacement, and legitimate same-channel
-  reacquisition after eviction (distinct from stale snapshot resurrection).
-- Eviction then ownership-loss rejection holds the request slot until Error,
+- A client ignoring both notifications still handles request responses correctly;
+  ignored release requests do not invalidate otherwise valid payments; optional
+  release flags are channel-scoped and repeated requests are harmless.
+- Exclusion rejection without any client notification history holds the slot until Error,
   preserves the signed balance and confirmed credit, resolves only the pending
   expectation, and permits a new channel in the same session. Payment success
   before eviction retains credited funds; success after eviction is rejected.
-- Generic conflict, unrelated-channel eviction, missing rejection, and internal
-  error cannot masquerade as the expected ownership-loss rollover outcome.
-- Matching/late/wrong nonce, paused-session Ping, Ping behind slow validation,
+- Required eviction scope; session exclusion permits other sessions but forbids
+  same-session relink; relay exclusion survives restart, covers all sessions for
+  the receiving identity, and does not affect other identities sharing storage.
+- Link/payment committed before exclusion succeeds; uncommitted requests fail
+  with the scoped code. Signed history, confirmed credit and recovery survive.
+- Generic conflict, missing rejection, and internal error cannot masquerade as a
+  scoped exclusion. Notifications alone do not complete requests.
+- Matching/late/wrong nonce, paused-session Ping, prompt Pong during blocked validation,
   and cancellation during local work. No false claim that any traffic proves a probe.
 - Client-first keyset removal with rotation, inactive stored funding, unavailable
   metadata and refresh rejection, without redundant channel provisioning.
