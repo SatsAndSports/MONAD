@@ -1,7 +1,8 @@
 # Public demo in Docker
 
 This runs the existing disposable network demo in one container: test mint,
-two QUIC relays, two SOCKS clients, management, and a local traffic target.
+two QUIC relays, two SOCKS clients, management, a managed ratio traffic server,
+and a local traffic target.
 It uses ordinary bridge networking with unrestricted outbound connectivity.
 Container loopback is separate from host loopback; no host networking, Docker
 socket, or host data mount is used.
@@ -60,6 +61,9 @@ curl --noproxy '' --socks5-hostname YOUR-DOMAIN:11080 https://example.com/
 Use `MONAD_DEMO_SATS` to change initial funding and `MONAD_DEMO_MANUAL=1` to start
 with manual provisioning. Public management controls and both SOCKS proxies are
 unauthenticated, with unrestricted destinations, as intended for this demo.
+The managed traffic server starts by default for the client-card speed test and
+the `/traffic-servers` page. Set `MONAD_DEMO_TRAFFIC_SERVER=0` before Compose to
+disable it. It listens only on container loopback and needs no published port.
 
 Interactive commands remain available:
 
@@ -102,9 +106,10 @@ capabilities. Three socat bridges run **inside** the container. The supervisor
 handles signals, reaps children, and shuts down if an essential process exits
 unexpectedly.
 
-The health check verifies all three managed processes are online; it does not
-require clients to remain enabled or funded. No automatic restart policy is set:
-restarting grants a new disposable purse, so restarts are explicit.
+The health check verifies clients, relays, the test mint, and the managed traffic
+server when enabled; it does not require clients to remain enabled or funded. No
+automatic restart policy is set: restarting grants a new disposable purse, so
+restarts are explicit.
 
 ## Local launcher options and verification
 
@@ -118,6 +123,8 @@ The normal launcher retains random-port/debug-binary defaults. Optional variable
   and process-limit snapshots. Without it, logs remain beside ephemeral demo data.
 - `MONAD_DEMO_FAIL_FAST=1`: shut down on unexpected service exit; enabled by the
   container supervisor.
+- `MONAD_DEMO_TRAFFIC_SERVER=1`: launch the managed ratio server; enabled by the
+  Compose demo and optional for the local launcher.
 
 Readiness has a 30-second absolute deadline and fails immediately when a required
 child exits. Shutdown aborts in-flight readiness work and terminates children
