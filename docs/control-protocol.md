@@ -16,7 +16,7 @@ are resolved.
 ### Reading guide
 
 - **§1:** client-driven request/response contract.
-- **§3:** proposed message fields.
+- **§3:** proposed message fields and bidirectional optional extensions.
 - **§5:** payment records, optional release, and scoped advisory eviction.
 - **§6–7:** client-first keyset removal and correlated liveness.
 - **§8:** pipelined requests and FIFO response correlation without request IDs.
@@ -30,10 +30,21 @@ of an already established MONAD session: their contents, meaning, legal timing,
 responses, and effect on session/channel state.
 
 Noise handshakes, identity exchange, transport establishment, and bootstrap
-negotiation are out of scope. The session is assumed to have established a
-compatible control-protocol version, receiver identity, and Cashu Spilman
-protocol/keyset-format constraints. These are inputs to this contract, not
-additional control messages.
+mechanics are out of scope. The negotiated MONAD/bootstrap version binds the
+core control contract; receiver identity and established Cashu Spilman
+protocol/keyset-format constraints are also inputs, not additional messages.
+
+At the inspected baseline, bootstrap selects version 1, the `h2` session
+protocol, Spilman version/keyset formats, pricing policy, and capabilities. There
+is **no separate control_protocol_version field**. This draft's breaking changes
+require a coordinated version update; they are not already negotiated by today's
+bootstrap. A separate control version field is not required by this proposal.
+
+Once both endpoints support this contract, optional advisory extensions (§3.4)
+can evolve without another version change. New requests, response types, or
+changes to required accounting, ownership, or other core semantics require an
+explicitly negotiated capability or a new protocol version. A request MUST NOT
+be used unless the sender understands its negotiated success/error contract.
 
 Principles:
 
@@ -65,18 +76,23 @@ one Error**, never both, in request order:
 | GetSessionStatus | SessionStatus | Error |
 | Ping(nonce), independent of the pipeline | Pong(nonce) | Invalid input follows the fatal protocol-error rules |
 
-The client matches each SessionStatus or nonfatal Error to the oldest unanswered
-request. Relays MUST support at least five outstanding pipeline requests,
-including the request being processed (§8). No window advertisement or negotiation
+While requests are outstanding, the client matches each valid SessionStatus or
+nonfatal Error to the oldest unanswered request. Relays MUST support at least
+five outstanding pipeline requests, including the request being processed (§8).
+No window advertisement or negotiation
 is needed; normal clients are expected to have only one or two outstanding.
 There is no ChannelUnlinked message in the target protocol. Connection loss or
 session termination can leave a request unanswered; exactly-one response does
 not guarantee delivery across failure.
 
-ChannelReleaseRequested and ChannelEvicted are advisory notifications, not
-responses. A client MAY ignore both and rely entirely on request results. Errors
+ChannelReleaseRequested and ChannelEvicted are the two core relay-initiated
+advisory notifications, not responses. A client MAY ignore both and rely on
+request results. Either endpoint may also send ExtensionNotification (§3.4),
+which requires no response and has no effect on FIFO correlation. Errors
 MUST therefore be self-contained, without requiring a previously observed
-notification. There are no unsolicited SessionStatus messages after initialization.
+notification. The relay MUST NOT send unsolicited SessionStatus or nonfatal Error
+after initialization. The client's tolerance for unmistakably unsolicited
+responses is defined in §8; it does not authorize the relay to send them.
 
 ## 2. Stream lifecycle and framing
 
@@ -85,7 +101,7 @@ notification. There are no unsolicited SessionStatus messages after initializati
 - A session MUST have at most one accepted control stream. A second control
   stream MUST be rejected without replacing the first.
 - The relay's first application message MUST be `SessionStatus`. The client MUST
-  wait for it before sending control requests.
+  wait for it before sending any control messages, including extensions.
 - A new session begins unlinked, paused, with zero paid credit and byte counters.
   A stored channel's accepted balance is not automatically credit for a new session.
 - Control traffic MUST remain permitted while the session is paused.
@@ -115,11 +131,14 @@ Endpoints MUST bound buffering of incomplete messages as well as complete lines.
 Oversize/incomplete input MUST NOT cause an infinite error loop or repeated
 processing of the same bytes.
 
-**Proposed strict parsing:** reject duplicate object keys, unknown message types,
+**Proposed strict parsing:** reject duplicate object keys, unknown top-level message types,
 wrong-direction messages, missing required fields, unexpected top-level fields,
 and invalid field types/ranges. `params` and proof objects have the extension
 rules of their referenced Spilman/Cashu schema, not arbitrary MONAD fields.
 Forbidden fields remain forbidden even if their JSON value is `null`.
+An unknown `name` inside a valid ExtensionNotification is not an unknown
+top-level type: its payload is ignorable under §3.4. Malformed envelopes remain
+protocol errors. Valid but unexpected response messages follow §8 instead.
 
 On malformed client input the relay SHOULD send `CONTROL_INVALID_MESSAGE` if
 practical and MUST end the session. On malformed relay input the client MUST end
@@ -154,7 +173,8 @@ the full wire range. Implementations using JavaScript MUST preserve integer
 tokens losslessly rather than convert an already rounded Number to BigInt.
 
 All fields listed below are required unless explicitly stated otherwise.
-Only `SessionStatus.linked_channel` is nullable in these message schemas.
+Only `SessionStatus.linked_channel` is nullable among the listed core fields.
+Extension payload members have their extension-defined types and may contain null.
 
 ## 3. Message inventory and proposed schemas
 
@@ -167,6 +187,7 @@ Only `SessionStatus.linked_channel` is nullable in these message schemas.
 | `ChannelUnlink` | `channel_id`, `final_balance_raw: u64` | Cooperatively finish using a retiring channel |
 | `GetSessionStatus` | None | Request a relay-reported state snapshot |
 | `Ping` | `nonce: u64` | Request a correlated liveness response |
+| `ExtensionNotification` | `name: string`, `data: object` | Optional advisory extension; no response and no FIFO entry (§3.4) |
 
 `ChannelLink` and `ChannelPayment` use structured fields, not `payment_json`.
 MONAD's `balance_raw` maps to the Spilman payment's `balance`; this is a wire
@@ -192,12 +213,14 @@ derived secrets or cached mint metadata are not the public parameters object.
 | `ChannelReleaseRequested` | `channel_id` | Optional request to release the channel when convenient |
 | `Error` | `code: string`, `message: string` | Request rejection or fatal session error (§8–9) |
 | `Pong` | `nonce: u64` | Echo the corresponding Ping nonce |
+| `ExtensionNotification` | `name: string`, `data: object` | Optional advisory extension; no response and no FIFO entry (§3.4) |
 
-The two advisory notifications identify the channel explicitly. A client
+The two core advisory notifications identify the channel explicitly. A client
 MUST NOT apply a delayed notification for channel A to its newer channel B.
 `message` in `Error` is diagnostic only; clients MUST NOT parse it for policy.
-Nonfatal Error completes the oldest unanswered pipeline request. Unsolicited Error
-is permitted only for a fatal session error; it ends the session (§8–9).
+Nonfatal Error completes the oldest unanswered pipeline request when one exists.
+The relay may send unsolicited Error only for a fatal session error; it ends
+the session (§8–9).
 
 ### 3.3 `SessionStatus`
 
@@ -239,6 +262,42 @@ for that channel, not the last submitted balance and not this session's total
 credit. `capacity_raw` is the channel's usable raw capacity. A client MUST check
 the returned channel ID, unit, and balance against its own durable channel data.
 
+### 3.4 Bidirectional optional extensions
+
+After the initial SessionStatus, **either client or relay** MAY send:
+
+```json
+{"type":"ExtensionNotification","name":"example.some_hint","data":{}}
+```
+
+`name` MUST be a nonempty string identifying the extension; names SHOULD be
+namespaced to avoid collisions. `data` MUST be a JSON object. The envelope has
+exactly these three required fields; the extension defines its payload members.
+
+- An endpoint MAY ignore any valid extension notification it does not support.
+  It need only validate the common envelope and JSON/framing limits; unsupported
+  payload members do not need an extension-specific decoder.
+- ExtensionNotification is neither a request nor a response. It MUST NOT create
+  or consume a FIFO entry, satisfy a Ping, or require an acknowledgement. In
+  particular, an unsupported client extension MUST NOT elicit a nonfatal Error
+  or SessionStatus from the relay, which would corrupt response correlation.
+- Extension semantics MUST be optional. Ignoring the message must leave the
+  core protocol correct. It MUST NOT change required pricing, accounting,
+  ownership, payment authorization, or response semantics, or carry a mandatory
+  instruction disguised as a hint. Sender progress MUST NOT depend on handling.
+- Both directions use the same envelope, framing/size limits, and permission to
+  ignore. Extensions may interleave with the request pipeline and Ping/Pong;
+  implementations must keep resource use bounded and preserve liveness progress.
+- Receivers MAY issue rate-limited diagnostic warnings for unsupported names,
+  without logging payloads. No protocol reply is required. Malformed envelopes
+  (such as missing name, non-object data, or invalid JSON) follow §2's fatal
+  parsing rules, not the ignorable-extension rule.
+
+This envelope provides forward-compatible advisory messages without making
+arbitrary unknown top-level types acceptable. Behavior-changing extensions need
+explicit negotiation as described in §1; simply placing them in `data` does not
+make them compatible.
+
 ## 4. Observable session model
 
 Session state has independent dimensions:
@@ -269,7 +328,8 @@ may overshoot at chunk boundaries; it is not grounds to erase accepted payment.
 
 Receiver identity and active rates MUST remain fixed for the session. The client
 establishes the rates from the initial SessionStatus and MUST disconnect if a
-later status changes either rate. There is no in-session repricing in this
+later solicited status changes either rate. Unsolicited empty-FIFO statuses are
+discarded under §8, never used to reprice. There is no in-session repricing in this
 protocol; different rates require a new session or a future protocol upgrade.
 
 New data CONNECTs are rejected while paused (currently HTTP 402); existing
@@ -389,8 +449,9 @@ is below this minimum. Otherwise it sets `P` to the reported total and resolves
 that payment's expectation. Do not include increments of later unanswered
 payments when validating an earlier response. A definitive rejection resolves
 only its own expectation; it does not pre-credit or cancel later requests.
-All later status responses MUST report at least `P`; shortchanging is a protocol
-violation, not a reason to sign another payment.
+All later solicited status responses MUST report at least `P`; shortchanging is
+a protocol violation, not a reason to sign another payment. Empty-FIFO unsolicited
+statuses are discarded without applying their values under §8.
 
 A scoped channel-exclusion rejection (§9) resolves the pending
 expectation as rejected without adding it to `P`. This does not roll back the
@@ -577,9 +638,10 @@ the same order. A success snapshot describes its request's resulting state,
 before later queued requests mutate it; it is not regenerated from that later
 state when eventually written to the wire. Data accounting can continue.
 
-The client maintains a FIFO of unanswered requests. Each SessionStatus or
-nonfatal Error consumes exactly its oldest entry. Ping/Pong and advisory
-notifications do not enter or consume this FIFO. The client MUST validate each
+The client maintains a FIFO of unanswered requests. While it is nonempty, each
+valid SessionStatus or nonfatal Error consumes exactly its oldest entry.
+Ping/Pong, core advisory notifications, and ExtensionNotification in either
+direction do not enter or consume this FIFO. The client MUST validate each
 response against that request, even if it has already sent a replacement link
 or a higher payment; an earlier snapshot is not invalid merely because it does
 not reflect those later requests.
@@ -628,21 +690,53 @@ and event consumption mechanics are not specified here.
   by machine code, not inferred from diagnostic text or a delayed EOF (D4).
 - Advisory notifications may interleave with responses but MUST NOT complete
   a FIFO entry or be required to interpret an Error. A client may discard
-  both notification types and still follow the same request/response rules.
+  both core notification types and unsupported extension notifications and still
+  follow the same request/response rules.
 - Responses and notifications MUST be emitted in logical transition order. A
   snapshot prepared before eviction cannot be emitted after its eviction
   notification and thereby restore obsolete ownership. Link/payment commitment
   races follow the exclusion cutoff in §5.4; no same-scope reacquisition is allowed.
-- An unexpected response type or extra SessionStatus is a protocol violation;
-  the client MUST disconnect. An extra response means one with no corresponding
-  FIFO entry; the protocol relies on the relay honoring response count and order.
-  Paused clients can queue status queries. No periodic status broadcast is required.
+- Unexpected-response handling follows the table below. The relay still MUST
+  honor response count and order. Paused clients can queue status queries; no
+  periodic status broadcast is required.
 
 Serialization alone would not distinguish a queued unsolicited status from a
 request response. Prohibiting those statuses, consuming every complete response,
 and giving notifications distinct types removes that ambiguity even for a
 same-channel relink. No general request ID or response-role field is needed.
 Correlation does not replace the payment-value checks in §5.2.
+
+### Unexpected messages and client tolerance
+
+These rules apply **after** the initial SessionStatus. Validate framing and the
+message envelope before deciding whether a message is ignorable.
+
+| Incoming relay message | Client handling |
+| --- | --- |
+| SessionStatus or recognized nonfatal Error with a nonempty request FIFO | Validate against the oldest request, then consume exactly that entry. |
+| Structurally valid SessionStatus or recognized nonfatal Error with an empty FIFO | Discard without applying its contents; SHOULD log a rate-limited warning. Do not change channel state, pricing, paid credit, byte-counter baselines, pending payment records, or heartbeat/probe state. |
+| Response that cannot validly answer the oldest request, including failed financial checks | Terminate the session; do not discard it and guess that the next message answers that request. |
+| Recognized fatal Error | Terminate, with or without outstanding requests. |
+| ChannelReleaseRequested or ChannelEvicted | May ignore under §5; never consume a FIFO entry. |
+| Valid ExtensionNotification | Handle if supported or ignore under §3.4; never consume a FIFO entry or require a response. |
+| Malformed input, unknown top-level type, or wrong-direction core message | Terminate under §2. |
+
+Unknown Error codes cannot safely be classified as nonfatal or associated with
+a request under this version. The client MUST terminate rather than apply the
+empty-FIFO exception to them. New error semantics require negotiation (§1).
+Pong continues to use its nonce-specific rules (§7), not the request FIFO.
+
+Ignoring an empty-FIFO response is defensive tolerance, not permission for
+unsolicited core responses. The exception does not apply before initialization
+or to malformed messages. Warnings MUST be bounded/rate-limited and MUST NOT
+dump payment payloads or arbitrary peer-supplied diagnostic text.
+
+With a nonempty FIFO, a plausible unsolicited SessionStatus can be
+indistinguishable from a real response. The client cannot detect every such
+violation without extra correlation metadata. It therefore checks the oldest
+request and financial invariants, never uses heuristic skipping to repair the
+FIFO, and relies on the relay's required response count and ordering. Extension
+notifications cannot substitute for required core responses.
 
 ## 9. Errors, replay, and uncertain outcomes
 
@@ -828,6 +922,29 @@ R -> C  Pong(42)
 R -> C  [link outcome] SessionStatus(...)
 ```
 
+### Bidirectional extensions do not affect response correlation
+
+```text
+The initial SessionStatus has already been consumed.
+C -> R  ChannelLink(A, ...)
+C -> R  ExtensionNotification(name=example.client_hint, data={})
+         Relay does not support this name and ignores it; no Error is sent.
+C -> R  ChannelPayment(A, 100)
+R -> C  ExtensionNotification(name=example.relay_hint, data={})
+         Client ignores this unknown extension; FIFO still contains link, payment.
+C -> R  Ping(42)
+R -> C  Pong(42)                            # completes only the probe
+R -> C  SessionStatus(linked=A, balance_raw=0)   # link response
+R -> C  SessionStatus(linked=A, balance_raw=100) # payment response
+         FIFO is now empty.
+R -> C  SessionStatus(...)                  # forbidden unsolicited core response
+         Client discards it, rate-limits a warning, and changes no session state.
+```
+
+If a status received while the FIFO was nonempty failed the oldest request's
+required checks, the client would terminate rather than skip it. An unknown
+top-level type is not an ignorable extension in either direction.
+
 ### Release races an already submitted payment
 
 ```text
@@ -897,6 +1014,9 @@ Neither outcome erases the stored payments or prevents fund recovery.
 | Pre-send bookkeeping | Driver increments its local session total after the send; wallet signing is a separate path | Durable signed history, confirmed credit, and per-request minimum increments recorded before transmission; responses checked in FIFO order |
 | Eviction during payment | Client eviction handling clears matching operation state; PAYMENT_CONFLICT rebuilds the session | Request remains outstanding until response; scoped exclusion Error alone permits channel rollover with credit/history preserved |
 | Input errors | Relay attempts Error and continues for decoder errors; client exits on decode failure | Strict fatal malformed-input handling proposed in D4 |
+| Unexpected core responses | Client infers operation completion from status and updates snapshots | Empty-FIFO valid status/nonfatal error discarded without state changes; invalid pending response or fatal error ends session |
+| Extensions | No ExtensionNotification message | Same optional envelope in both directions; unsupported names ignored, no response or FIFO effect |
+| Version binding | Bootstrap version plus session protocol/capabilities; no separate control version field | Core contract bound to negotiated MONAD version; advisory extensions compatible within that contract, required changes explicitly negotiated |
 | Execution | Relay reducer + effect interpreter; client imperative loop with inline wallet calls | No mandated architecture; only observable ordering/cleanup obligations |
 
 Relevant source locations for checking this draft:
@@ -920,7 +1040,7 @@ Relevant source locations for checking this draft:
 | D1 — resolved | §1/§8 allow pipelining with FIFO execution and exactly one ordered success or Error per request; minimum capacity five, no negotiated window, independent Ping/Pong. |
 | D2 | What exact immutable funding equality applies to relinks, including proof ordering and auxiliary metadata? Which error reports a conflict? |
 | D3 — partly resolved | Release compliance is optional; §5.4 defines required eviction scope and the commit cutoff. Settle duplicate/unowned unlink and unlink racing eviction, with one response in all cases. |
-| D4 — partly resolved | §9 defines self-contained session/relay exclusion errors for links and payments. Complete other error fatality/association rules and approve strict parsing; pipelining itself is permitted. |
+| D4 — partly resolved | §8 settles empty-FIFO tolerance versus fatal invalid pending responses; §3.4 defines bidirectional ignorable extensions. §9 defines scoped exclusion errors. Complete remaining error fatality/association rules and strict parsing details. |
 | D5 | Confirm MONAD field sizes, line-size budget, exact integer representation and aggregate buffer limits. Funding structure and cryptographic vectors are referenced from the draft NUT (§3.1), not duplicated here. |
 | D6 — partly resolved | Session rates and receiver are fixed. Set advertisement-update rules within solicited responses; distinguish new-channel admission from stored-channel relink when policy changes. |
 | D7 — partly resolved | Pong must progress promptly despite slow request processing. Define concrete deadlines, client-local work handling, late/unsolicited Pong policy, rate limits, and buffer bounds. |
@@ -940,6 +1060,8 @@ Relevant source locations for checking this draft:
   persistence, self-contained errors, and same-session channel rollover.
 - [ ] Implement prompt Ping/Pong independent of slow request processing and use
   it for correlated liveness instead of status queries.
+- [ ] Implement bidirectional ExtensionNotification without automatic responses
+  or FIFO effects, and empty-FIFO response tolerance without state changes.
 - [ ] Add conformance fixtures/transcripts and adversarial tests for both endpoints.
 - [ ] Coordinate the breaking protocol version update outside this document;
   do not silently reinterpret the old wire format as the new one.
@@ -955,7 +1077,9 @@ Relevant source locations for checking this draft:
   on payments; no accepted-balance reset or historical credit on relink.
 - Duplicate/lower/over-capacity payment; response loss; ownership races; no double
   credit; byte accounting continues during slow control work.
-- Reject unsolicited/extra statuses; order status queries with other requests;
+- Relay emits no unsolicited/extra statuses; client discards structurally valid
+  empty-FIFO statuses and recognized nonfatal errors without state changes;
+  invalid pending responses and fatal/unknown errors terminate. Order status queries;
   one success or Error per request, including unlink; no stale ownership
   resurrection or reacquisition inside an exclusion scope.
 - Crash/write failure after durable signing but before response; lower relay
@@ -989,6 +1113,16 @@ Relevant source locations for checking this draft:
   rejected entries do not cancel successors or reduce durable signed balances.
 - Pipelined payment then unlink, replacement link then payment, and status queries;
   fatal termination or cancellation retains every unanswered signed payment.
+- Unsupported ExtensionNotification names in both directions are ignored without
+  any response; extensions interleave with pipelines and Ping without consuming
+  entries or satisfying probes. No relay Error for an unsupported client hint.
+- Malformed extension envelope, invalid JSON, unknown top-level types, and
+  wrong-direction core messages terminate; unsupported payload members inside a
+  valid extension object are ignored. Framing/resource limits still apply.
+- Warning rate limits and payload redaction; unexpected empty-FIFO messages do
+  not change balances, ownership, pricing, counters, or heartbeat/probe state.
+- Version binding: advisory additions within the envelope need no version bump;
+  new required requests/responses or semantics are used only after negotiation.
 - Client-first keyset removal with rotation, inactive stored funding, unavailable
   metadata and refresh rejection, without redundant channel provisioning.
 
