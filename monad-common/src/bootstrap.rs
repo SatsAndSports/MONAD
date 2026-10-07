@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 pub const BOOTSTRAP_VERSION: u8 = 1;
-pub const SESSION_PROTOCOL_H2: &str = "h2";
+// Transitional advertisement-map protocol; not the complete stable contract.
+pub const SESSION_PROTOCOL_H2: &str = "h2-advertisements-2026-10-07";
 pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14: &str = "2026-09-14";
 pub const CASHU_SPILMAN_KEYSET_VERSION_V1: &str = "v1";
 pub const CASHU_SPILMAN_KEYSET_VERSION_V2: &str = "v2";
@@ -380,7 +381,7 @@ mod tests {
     #[test]
     fn old_capability_payload_defaults_new_blinded_flags_to_false() {
         let response = serde_json::json!({
-            "session_protocol": "h2",
+            "session_protocol": SESSION_PROTOCOL_H2,
             "capabilities": {
                 "direct_tcp_exit": true,
                 "nested_monad_over_tcp": true,
@@ -437,7 +438,7 @@ mod tests {
                 (
                     "1".to_string(),
                     json!({
-                        "session_protocols": ["h2"],
+                        "session_protocols": [SESSION_PROTOCOL_H2],
                         "cashu_spilman_protocol_keyset_versions": {
                             "2026-09-14": ["v1", "v2"]
                         },
@@ -451,9 +452,18 @@ mod tests {
     }
 
     #[test]
+    fn advertisement_map_protocol_rejects_legacy_and_unimplemented_full_contract() {
+        for protocol in ["h2", "h2-2026-10-06"] {
+            let mut hello = decode_v1_client_hello(&initial_client_hello()).unwrap();
+            hello.session_protocols = vec![protocol.to_string()];
+            assert!(validate_v1_client_hello(&hello).is_err());
+        }
+    }
+
+    #[test]
     fn v1_accepts_h2_among_other_protocols() {
         let hello = BootstrapV1ClientHello {
-            session_protocols: vec!["future".to_string(), "h2".to_string()],
+            session_protocols: vec!["future".to_string(), SESSION_PROTOCOL_H2.to_string()],
             cashu_spilman_protocol_keyset_versions:
                 supported_cashu_spilman_protocol_keyset_versions(),
             pricing_policies: vec![PRICING_POLICY_SESSION_CONSTANT.to_string()],

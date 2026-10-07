@@ -443,7 +443,7 @@ Today:
   clients
 - `MockWallet` remains for deterministic connector tests and stress/harness
   flows
-- default integration-test relays advertise a synthetic mint/keyset offer so
+- default integration-test relays advertise a synthetic mint/unit offer so
   intermediate hops can provision mock channels
 - route failures are handled at hop granularity:
   - first-hop failure triggers full reconnect

@@ -1096,8 +1096,8 @@ impl SqliteClientWallet {
         // capacity we want, selects loose proofs that can fund it after input
         // fees, and then asks the mint to swap those proofs into channel funding
         // outputs.  The output keyset info comes from the client's local mint
-        // keyset cache. Selection prefers relay-listed IDs and then falls back to
-        // any active keyset whose format was negotiated. The client cache is
+        // keyset cache. Selection uses active keysets whose versions were
+        // negotiated, ordered by ID. The client cache is
         // refreshed once before concluding no compatible output exists. If a
         // selected cached keyset becomes
         // stale before swap submission, the retry helper centralizes the safe
@@ -10660,7 +10660,7 @@ mod tests {
     }
 
     #[test]
-    fn active_output_keyset_selection_falls_back_from_inactive_preference() {
+    fn active_output_keyset_selection_skips_inactive_keys() {
         let old =
             test_keyset_id("0101010101010101010101010101010101010101010101010101010101010101");
         let new =

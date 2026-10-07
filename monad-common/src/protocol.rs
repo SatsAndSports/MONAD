@@ -6,26 +6,45 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Mint URL -> unit -> relay-known preferred keyset IDs.
+/// Internal mint-cache index: mint URL -> unit -> known keyset IDs.
 ///
 /// These IDs may include inactive mint keysets so existing channels funded by
-/// old keysets can still be re-linked, paid, and closed. A party creating a new
+/// old keysets can still be re-linked, paid, and closed. This is not advertised
+/// on the control stream. A party creating a new
 /// mint swap must query/refresh mint state and choose an active output keyset.
 pub type MintUnitKeysets = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
-/// Advertisement for a specific mint/unit pricing option.
-///
-/// `keyset_ids` are relay-known preferences for this mint/unit and may include
-/// inactive keysets. Clients may use another active keyset with a negotiated
-/// format; the relay validates and refreshes its cache when that channel links.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeysetAdvertisement {
+/// Mint URL -> supported unit -> funding-keyset recovery window in seconds.
+pub type MintUnitAdvertisements = BTreeMap<String, BTreeMap<String, u64>>;
+
+/// Local flattened payment option. Prices come from the session, not the map.
+#[derive(Debug, Clone)]
+pub struct PaymentOption {
     pub funding_keyset_recovery_window_secs: u64,
     pub mint_url: String,
     pub unit: String,
-    pub keyset_ids: Vec<String>,
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
+}
+
+/// Deterministic local traversal; map order is not a relay preference.
+pub fn advertisement_options(
+    advertisements: &MintUnitAdvertisements,
+    in_bytes_per_millisat: u64,
+    out_bytes_per_millisat: u64,
+) -> Vec<PaymentOption> {
+    advertisements
+        .iter()
+        .flat_map(|(mint_url, units)| {
+            units.iter().map(move |(unit, window)| PaymentOption {
+                mint_url: mint_url.clone(),
+                unit: unit.clone(),
+                funding_keyset_recovery_window_secs: *window,
+                in_bytes_per_millisat,
+                out_bytes_per_millisat,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,11 +115,13 @@ pub enum ServerMessage {
     SessionStatus {
         // --- Static/Advertisement Info ---
         receiver_pubkey: String,
-        advertisements: Vec<KeysetAdvertisement>,
+        advertisements: MintUnitAdvertisements,
 
         // --- Active Session Info ---
         linked_channel: Option<LinkedChannelStatus>,
+        #[serde(rename = "bytes_in_per_msat")]
         active_in_rate: u64,
+        #[serde(rename = "bytes_out_per_msat")]
         active_out_rate: u64,
 
         // --- Accounting Info ---
@@ -130,4 +151,65 @@ pub enum ServerMessage {
         code: ServerErrorCode,
         message: String,
     },
+}
+
+#[cfg(test)]
+mod advertisement_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn status_wire_has_only_mint_unit_windows_and_session_prices() {
+        let status = ServerMessage::SessionStatus {
+            receiver_pubkey: "receiver".into(),
+            advertisements: BTreeMap::from([
+                (
+                    "https://mint-b".into(),
+                    BTreeMap::from([("sat".into(), 123)]),
+                ),
+                (
+                    "https://mint-a".into(),
+                    BTreeMap::from([("sat".into(), 0), ("msat".into(), 86_400)]),
+                ),
+            ]),
+            linked_channel: None,
+            active_in_rate: 11,
+            active_out_rate: 22,
+            session_total_in: 0,
+            session_total_out: 0,
+            total_paid_millisats: 0,
+            remaining_milli_sats: 0,
+            paused: true,
+            open_connects: 0,
+            total_connects: 0,
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(
+            value["advertisements"],
+            json!({
+                "https://mint-a": {"sat": 0, "msat": 86400},
+                "https://mint-b": {"sat": 123}
+            })
+        );
+        assert_eq!(value["bytes_in_per_msat"], 11);
+        assert_eq!(value["bytes_out_per_msat"], 22);
+        assert!(value.get("active_in_rate").is_none());
+        assert!(value.get("active_out_rate").is_none());
+        let ServerMessage::SessionStatus { advertisements, .. } =
+            serde_json::from_value::<ServerMessage>(value.clone()).unwrap()
+        else {
+            panic!()
+        };
+        let options = advertisement_options(&advertisements, 11, 22);
+        assert_eq!(options.len(), 3);
+        assert!(options
+            .iter()
+            .all(|o| o.in_bytes_per_millisat == 11 && o.out_bytes_per_millisat == 22));
+        let mut empty = value.clone();
+        empty["advertisements"] = json!({});
+        assert!(serde_json::from_value::<ServerMessage>(empty).is_ok());
+        let mut legacy = value;
+        legacy["advertisements"] = json!([]);
+        assert!(serde_json::from_value::<ServerMessage>(legacy).is_err());
+    }
 }

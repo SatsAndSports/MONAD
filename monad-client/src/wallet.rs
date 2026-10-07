@@ -2,7 +2,7 @@ use monad_common::payment_units::{
     msats_to_raw_units as common_msats_to_raw_units,
     raw_units_to_msats as common_raw_units_to_msats,
 };
-use monad_common::protocol::KeysetAdvertisement;
+use monad_common::protocol::PaymentOption;
 use rand::RngCore;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,7 +24,7 @@ pub struct RelayPaymentOffer {
 impl RelayPaymentOffer {
     pub fn from_advertisement(
         receiver_pubkey: String,
-        advertisement: &KeysetAdvertisement,
+        advertisement: &PaymentOption,
         negotiated_keyset_versions: &BTreeSet<String>,
     ) -> Self {
         Self {
@@ -842,30 +842,18 @@ mod tests {
     }
 
     #[test]
-    fn advertised_keysets_do_not_affect_offers_selection_or_mock_provisioning() {
+    fn mint_unit_advertisements_need_no_keysets_for_selection_or_mock_provisioning() {
         let versions = BTreeSet::from(["v1".to_string()]);
-        let mut advertisement = KeysetAdvertisement {
-            mint_url: "https://mint".into(),
-            unit: "msat".into(),
-            funding_keyset_recovery_window_secs: 86_400,
-            keyset_ids: vec![],
-            in_bytes_per_millisat: 1,
-            out_bytes_per_millisat: 1,
-        };
-        let baseline =
-            RelayPaymentOffer::from_advertisement("receiver".into(), &advertisement, &versions);
-        for ids in [
-            vec![],
-            vec!["0000000000000002", "0000000000000001"],
-            vec!["0000000000000001", "0000000000000002"],
-            vec!["not-a-keyset"],
-        ] {
-            advertisement.keyset_ids = ids.into_iter().map(str::to_owned).collect();
+        let advertisements =
+            serde_json::from_str(r#"{"https://mint":{"sat":86400,"msat":86400}}"#).unwrap();
+        for advertisement in monad_common::protocol::advertisement_options(&advertisements, 11, 22)
+        {
             let candidate =
                 RelayPaymentOffer::from_advertisement("receiver".into(), &advertisement, &versions);
-            assert_eq!(candidate, baseline);
+            let mut stored = channel("chan-a");
+            stored.unit = candidate.unit.clone();
             assert_eq!(
-                select_channel(&[channel("chan-a")], &candidate, session(1), 0)
+                select_channel(&[stored], &candidate, session(1), 0)
                     .unwrap()
                     .channel_id,
                 "chan-a"
@@ -949,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn selector_allows_compatible_non_preferred_keyset() {
+    fn selector_allows_compatible_keyset() {
         let chosen = select_channel(&[channel("chan-a")], &offer("msat"), session(1), 0).unwrap();
 
         assert_eq!(chosen.channel_id, "chan-a");

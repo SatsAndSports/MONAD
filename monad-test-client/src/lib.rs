@@ -847,7 +847,12 @@ async fn start_auto_control(
                             warn!("{hop_label}: no negotiated keyset formats");
                             continue;
                         };
-                        let Some(advertisement) = advertisements.first() else {
+                        let options = monad_common::protocol::advertisement_options(
+                            &advertisements,
+                            active_in_rate,
+                            active_out_rate,
+                        );
+                        let Some(advertisement) = options.first() else {
                             warn!("{hop_label}: relay advertised no payment offers yet");
                             continue;
                         };

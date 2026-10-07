@@ -1,4 +1,4 @@
-use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus};
+use monad_common::protocol::{LinkedChannelStatus, PaymentOption};
 use monad_common::proxy::CleartextByteCounters;
 use monad_common::session::{RelayConnection, SessionPricing, SessionSpilmanInfo};
 use std::collections::BTreeSet;
@@ -61,7 +61,7 @@ impl From<&RelayConnection> for RelayConnectionHandles {
 #[derive(Debug, Clone)]
 pub(super) struct RelaySnapshot {
     pub(super) receiver_pubkey: String,
-    pub(super) advertisements: Vec<KeysetAdvertisement>,
+    pub(super) advertisements: Vec<PaymentOption>,
     pub(super) linked_channel: Option<LinkedChannelStatus>,
     pub(super) session_total_in: u64,
     pub(super) session_total_out: u64,

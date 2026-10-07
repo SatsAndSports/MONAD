@@ -121,8 +121,8 @@ from that cache, not when storing it.
 
 Consequences:
 
-- `SessionStatus` advertises configured trusted mint/unit options in relay preference order. Each ordered relay-known keyset list may be empty and is not an exhaustive accepted-ID allowlist.
-- the client prefers advertised active IDs, but may use another locally active keyset for the same mint/unit when its format was negotiated. When nonempty preferences are unavailable locally, it refreshes its own mint cache before using a fallback; it also refreshes before reporting that no compatible active keyset exists.
+- `SessionStatus` advertises configured trusted mint/unit recovery-window maps without keyset IDs or per-offer prices; prices are fixed session-wide. Map order conveys no preference.
+- the client selects active compatible keysets from its own mint metadata, ordered by ID, enforcing negotiated versions and recovery windows. It refreshes before reporting that no compatible active keyset exists. Existing-channel selection does not depend on advertised IDs or funding-keyset activity.
 - first-time `ChannelLink` accepts known keysets that belong to a trusted unit for that mint. If such a keyset is unknown, the relay first performs metadata-independent channel and proof-structure checks, then transparently uses its bounded refresh coordinator and retries the immutable link once.
 - stored channels relink using persisted funding without requiring current keyset metadata.
 - channel close and relay drain swaps start from the shared cache and refresh that mint into SQLite and memory for missing-cache warmup or if the mint rejects the swap with a keyset error.

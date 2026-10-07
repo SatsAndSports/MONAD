@@ -339,7 +339,7 @@ Responsibilities:
   - `CONNECT host:port`
 - proxy bytes between H2 streams and external TCP targets
 - populate a shared relay-wallet `SpilmanMintCache` from configured mint URLs, caching all keysets returned by those mints; trusted mint/unit policy comes from the relay's YAML config and is applied at advertisement/acceptance read sites
-- advertise receiver pubkey and trusted mints/keysets in `SessionStatus`
+- advertise receiver pubkey and trusted mint/unit recovery windows in `SessionStatus`
   (per-(mint, unit) rate configuration is planned; today every advertisement
   carries the session's global default rates)
 - load relay identity, wallet DB path, listen address, transport key, and mint policy from a per-relay entry in the shared YAML config file
@@ -689,10 +689,10 @@ Server to client (`ServerMessage`):
 - `SessionStatus { ... }` — primary state synchronization message; sent immediately after control stream establishment, in response to `GetSessionStatus`, and after accepted link/payment or eviction transitions. Fast-path byte accounting and repause do not independently push a snapshot. Contains:
   - `version`: Negotiated protocol version
   - `receiver_pubkey`: Server's secp256k1 key for Spilman
-  - `advertisements`: Ordered `(Mint, Unit, Rates)` options whose keyset ID lists are relay-known preferences and may be empty
+  - `advertisements`: Map of mint URL to unit to funding-keyset recovery-window seconds; no keyset IDs or per-offer prices
   - `linked_channel`: Relay-authoritative linked channel status (if any), including channel id, latest accepted raw balance, raw capacity, and unit
-  - `active_in_rate`: Rate currently being applied to inbound traffic
-  - `active_out_rate`: Rate currently being applied to outbound traffic
+  - `bytes_in_per_msat`: Fixed session-wide inbound price (bytes per millisatoshi)
+  - `bytes_out_per_msat`: Fixed session-wide outbound price (bytes per millisatoshi)
   - `session_total_in`: Total inbound bytes processed
   - `session_total_out`: Total outbound bytes processed
   - `total_paid_millisats`: Total payments received
@@ -723,9 +723,9 @@ Refresh does not invalidate old keysets by itself. The relay cache stores all ke
 
 Here, "bootstrap" means the MONAD-specific negotiation carried inside the two Noise handshake payloads before the post-handshake session begins.
 
-MONAD currently uses the Noise `NK` pattern instantiated with secp256k1 DH, ChaCha20-Poly1305 for transport encryption, BLAKE2s for hashing, and the fixed prologue `monad-noise-secp256k1-v1`. The client sends a bootstrap request in the first Noise handshake payload, the relay replies with an accept-or-reject payload in the second, and this bootstrap is intentionally strict rather than open-ended negotiation: the client maps each Cashu Spilman channel protocol version to its supported keyset-format versions, must offer `h2` and a mutually supported pricing policy, and the relay selects one session protocol, one Cashu Spilman protocol, and the full mutual keyset-format set or rejects the session before H2 starts. Today the only accepted post-handshake session protocol is `h2` (HTTP/2), `2026-09-14` supports keyset-format versions `v1` and `v2` and requires a nonempty intersection, and the only supported pricing policy is `session_constant`. Concrete mint keyset IDs remain relay advertisements on the post-H2 control stream; these bootstrap keyset-format versions are capability identifiers rather than mint keyset IDs.
+MONAD currently uses the Noise `NK` pattern instantiated with secp256k1 DH, ChaCha20-Poly1305 for transport encryption, BLAKE2s for hashing, and the fixed prologue `monad-noise-secp256k1-v1`. The client sends a bootstrap request in the first Noise handshake payload and the relay replies with an accept-or-reject payload in the second. The current session protocol is `h2-advertisements-2026-10-07`: a transitional HTTP/2 protocol with mint/unit advertisement maps, not full conformance with `h2-2026-10-06`. Neither legacy `h2` nor the unimplemented full contract is offered as fallback. Cashu Spilman `2026-09-14` supports keyset versions `v1` and `v2`, requiring a nonempty intersection. The supported pricing policy remains `session_constant`. Keyset versions are negotiated capability identifiers; concrete mint keyset IDs are selected from client-owned metadata and are not advertised.
 
-The `2026-09-14` version retains the canonical deterministic P2PK secret serialization introduced by `2026-08-29`, treats advertised keyset IDs as preferences, and replaces explicit client refresh requests with relay-side refresh during `ChannelLink`. It intentionally rejects earlier peers so mixed versions cannot disagree about channel authorization or keyset discovery.
+The `2026-09-14` Spilman version retains canonical deterministic P2PK secret serialization. Relay-side refresh during `ChannelLink` handles unknown funding keysets without an explicit client refresh request. The session-protocol identifier separately protects peers against incompatible advertisement wire shapes.
 
 This bootstrap sequence stays outside the explicit session FSM. The reducer-style
 state machine begins only after the initial `SessionStatus` has been sent.
@@ -926,7 +926,7 @@ The relay wallet manager owns a shared in-memory `SpilmanMintCache`. The cache s
 #### 2. Channel Linking
 The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs. If the bootstrap did not negotiate a supported Cashu Spilman channel protocol version and keyset-format set, the relay rejects linking immediately.
 
-Production hellos offer both `v1` (`00` keyset IDs) and `v2` (`01` keyset IDs). The relay selects the full nonempty intersection; clients validate selections against the actual hello. Session advertisements apply negotiated-version filtering in addition to trusted mint/unit policy and retain every configured mint/unit option even when its ordered relay-known preference list is empty. Preferences may include compatible inactive IDs and are not an exhaustive accepted-ID allowlist. The shared cache, channel close/drain output selection, and loose input proofs are unaffected.
+Production hellos offer both `v1` (`00` keyset IDs) and `v2` (`01` keyset IDs). The relay selects the full nonempty intersection; clients validate selections against the actual hello. Session advertisements expose trusted mint/unit policy and recovery windows independently of cached keysets and negotiated versions. New funding selection and channel acceptance enforce the negotiated version set. The shared cache, channel close/drain output selection, and loose input proofs are unaffected.
 
 Before persisting a new channel or changing ownership, `ChannelLink` checks its funding keyset version. Existing channels use authoritative stored funding, never caller-supplied replacement or omitted params. A mismatch yields `LinkKeysetVersionNotNegotiated`, releases the offending session's previous ownership, and ends its data/control streams after a bounded best-effort error send. Other MONAD sessions on the same QUIC connection remain usable. The client terminates its driver without invalidating the wallet channel.
 
