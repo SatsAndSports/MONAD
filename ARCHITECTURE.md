@@ -988,12 +988,11 @@ channel metadata.
   building zero-balance link payments, and signing incremental channel payments.
 - `MockWallet` remains available for deterministic tests and harnesses.
 
-Client channel opening is cache-first. Each opening call site prefers an active
-client output keyset from the relay's ordered advertised IDs, then may use any
-other locally active keyset for the same mint/unit whose format was negotiated.
-When the preference list is nonempty but unavailable locally, the client
-refreshes its own mint cache before using a non-preferred fallback. It also
-refreshes before concluding that no compatible active keyset exists. Before
+Client channel opening is cache-first. Each opening call site selects an active
+same-mint/unit keyset from client-owned metadata, enforcing negotiated versions
+and the recovery window and ordering candidates by ID. Relay-advertised IDs do
+not affect selection or refresh. The client refreshes before concluding that no
+compatible active keyset exists. Before
 submitting the opening swap, the loose-proof store atomically reserves the
 selected inputs and records the exact serialized prepared opening.
 The configured `channel_funding_token_target_msats` is a desired funding-token

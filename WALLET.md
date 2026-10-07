@@ -47,9 +47,8 @@ Matching keys are:
 - `receiver_pubkey`
 - `mint_url`
 - `unit`
-- a mutually negotiated keyset-format version; relay-advertised keyset IDs rank
-  otherwise compatible channels as preferences rather than forming an exhaustive
-  acceptance list
+- a mutually negotiated keyset version; eligible channels are ordered by channel
+  ID within their attachment category, independently of advertised keyset IDs
 
 Only `Open` channels are selectable.
 
@@ -285,11 +284,11 @@ The current session driver and both wallet implementations follow this model.
 
 Client channel opening is also cache-first.
 
-For a relay offer, `SqliteClientWallet` prefers an advertised active output
-keyset, then may use another locally active same-mint/unit keyset whose format was
-negotiated. It refreshes before using a non-preferred fallback when nonempty
-preferences are unavailable and before concluding that no compatible active
-keyset exists. The prepared opening and exact inputs are then atomically journaled
+For a relay offer, `SqliteClientWallet` selects a locally active same-mint/unit
+keyset whose version was negotiated and whose lifetime covers the recovery
+window. Candidates are ordered by ID. It refreshes before concluding that no
+compatible active keyset exists; advertised keyset IDs do not affect selection
+or refresh. The prepared opening and exact inputs are then atomically journaled
 and reserved before submission.
 
 An ambiguous submission first uses exact NUT-09 restore and exact-input NUT-07

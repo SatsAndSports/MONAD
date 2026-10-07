@@ -898,10 +898,9 @@ async fn start_auto_control(
                             receiver_pubkey: relay_offer.receiver_pubkey.clone(),
                             mint_url: relay_offer.mint_url.clone(),
                             unit: relay_offer.unit.clone(),
-                            keyset_id: relay_offer
-                                .preferred_keyset_ids
-                                .first()
-                                .cloned()
+                            keyset_id: wallet
+                                .get_channel(&new_channel_id)
+                                .map(|channel| channel.keyset_id)
                                 .unwrap_or_default(),
                             keyset_info_json: String::new(),
                             cashu_spilman_protocol_version: cashu_spilman_protocol_version.clone(),

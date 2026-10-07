@@ -177,7 +177,6 @@ async fn exercise() {
                 receiver_pubkey: secret.public_key().to_hex(),
                 mint_url: url.clone(),
                 unit: unit.into(),
-                preferred_keyset_ids: vec![initial[unit].clone()],
                 negotiated_keyset_versions: BTreeSet::from(["v1".into(), "v2".into()]),
                 in_bytes_per_millisat: 1,
                 out_bytes_per_millisat: 1,

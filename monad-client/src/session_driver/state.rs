@@ -194,11 +194,7 @@ pub(super) fn current_spilman_info(state: &DriverState) -> Option<SessionSpilman
         receiver_pubkey: snapshot.receiver_pubkey.clone(),
         mint_url: advertisement.mint_url.clone(),
         unit: advertisement.unit.clone(),
-        keyset_id: advertisement
-            .keyset_ids
-            .first()
-            .cloned()
-            .unwrap_or_default(),
+        keyset_id: String::new(),
         keyset_info_json: String::new(),
         cashu_spilman_protocol_version,
         cashu_spilman_keyset_versions,

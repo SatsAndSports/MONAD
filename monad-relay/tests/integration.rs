@@ -1821,7 +1821,6 @@ async fn assert_auto_close_worker_lifecycle(cancel: Option<bool>) {
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![keyset_id],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -2448,7 +2447,6 @@ impl DrainTestContext {
             receiver_pubkey: receiver_pubkey_hex,
             mint_url: mint_url.clone(),
             unit: "sat".to_string(),
-            preferred_keyset_ids: vec![keyset_id],
             negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
@@ -4158,7 +4156,6 @@ async fn test_expiring_funding_keyset_discovery_persistence_and_link_admission()
             receiver_pubkey: receiver.public_key().to_hex(),
             mint_url: url,
             unit: "sat".to_string(),
-            preferred_keyset_ids: vec![id.to_string()],
             negotiated_keyset_versions: versions,
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
@@ -4243,7 +4240,6 @@ async fn test_negotiated_keyset_link_enforcement_is_session_local() {
             receiver_pubkey: receiver.public_key().to_hex(),
             mint_url: url,
             unit: "sat".to_string(),
-            preferred_keyset_ids: vec![id],
             negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
@@ -6824,7 +6820,6 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![keyset_id],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -7061,7 +7056,6 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![old_keyset_id.clone()],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -7196,7 +7190,6 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![new_keyset_id.clone()],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -7329,7 +7322,6 @@ async fn test_channel_link_refreshes_and_accepts_new_keyset() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![new_keyset_id.clone()],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -7424,7 +7416,6 @@ async fn test_malformed_unknown_keyset_links_do_not_consume_refresh_budget() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![unknown_keyset_id],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -7473,7 +7464,6 @@ async fn test_malformed_unknown_keyset_links_do_not_consume_refresh_budget() {
     .await;
     let foreign_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
-        preferred_keyset_ids: vec![foreign_keyset_id],
         ..offer
     };
     let foreign_channel_id = foreign_wallet.pre_create_channel(1000).await.unwrap();
@@ -7560,7 +7550,6 @@ async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![unknown_keyset_id],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -12453,7 +12442,6 @@ async fn test_wallet_manager_drain_swap_combines_multiple_closed_channels() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![keyset_id],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -12538,7 +12526,6 @@ async fn test_wallet_manager_drain_swap_recovers_after_ambiguous_submission() {
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![keyset_id],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -13587,7 +13574,7 @@ async fn test_final_close_restore_checks_predecessor_then_successor_after_spent(
         2,
         "final restore must cover both immutable attempts"
     );
-    assert_eq!(ids[0], ctx.offer.preferred_keyset_ids[0]);
+    assert_eq!(ids[0], ctx.wallet.get_channel(&channel).unwrap().keyset_id);
     assert_ne!(ids[0], ids[1]);
     assert_eq!(
         ctx.payments.channel_state(&channel).unwrap(),
@@ -13721,7 +13708,6 @@ async fn test_wallet_manager_drain_keyset_rejection_refreshes_reprepares_and_ret
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![old_keyset_id.clone()],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -13882,7 +13868,7 @@ async fn test_wallet_manager_drain_retry_refresh_failure_preserves_rejection_and
     drop(conn);
 
     let stale_cache = ctx.wallet_manager.keyset_cache_snapshot();
-    let old_keyset_id = ctx.offer.preferred_keyset_ids[0].clone();
+    let old_keyset_id = ctx.wallet.get_channel(&channel_id).unwrap().keyset_id;
     let old_keyset = stale_cache
         .keysets
         .get(&ctx.mint_url)
@@ -14046,7 +14032,6 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![old_keyset_id.clone()],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -14097,7 +14082,6 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![new_keyset_id.clone()],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -14227,7 +14211,6 @@ async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_an
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![old_keyset_id.clone()],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,
@@ -14277,7 +14260,6 @@ async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_an
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
-        preferred_keyset_ids: vec![new_keyset_id.clone()],
         negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
         in_bytes_per_millisat: 1,
         out_bytes_per_millisat: 1,

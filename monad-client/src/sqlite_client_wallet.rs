@@ -3254,19 +3254,9 @@ impl SqliteClientWallet {
         expiry_timestamp: u64,
     ) -> Result<SelectedOutputKeyset, WalletError> {
         match self.select_output_keyset_from_cache(offer, expiry_timestamp)? {
-            OutputKeysetSelection::Selected(output_keyset)
-                if offer.preferred_keyset_ids.is_empty()
-                    || offer
-                        .preferred_keyset_ids
-                        .iter()
-                        .any(|id| id == &output_keyset.id) =>
-            {
+            OutputKeysetSelection::Selected(output_keyset) => {
                 return Ok(output_keyset);
             }
-            // The cache has a compatible fallback but not a preferred active
-            // keyset. Refresh once before using the fallback in case the relay
-            // knows about a newer active keyset than this client does.
-            OutputKeysetSelection::Selected(_) => {}
             OutputKeysetSelection::NoCompatibleActiveKeyset => {}
         }
 
@@ -4141,12 +4131,6 @@ where
         })
         .collect::<Vec<_>>();
     compatible_ids.sort();
-
-    for preferred_id in &offer.preferred_keyset_ids {
-        if compatible_ids.iter().any(|id| id == preferred_id) {
-            return Ok(OutputKeysetSelection::Selected(preferred_id.clone()));
-        }
-    }
 
     Ok(compatible_ids
         .into_iter()
@@ -5712,13 +5696,12 @@ mod tests {
         assert!(error.contains("decode upstream channel corrupt funding"));
     }
 
-    fn offer(mint_url: &str, receiver_pubkey: &str, keyset_id: &str) -> RelayPaymentOffer {
+    fn offer(mint_url: &str, receiver_pubkey: &str, _fixture_keyset_id: &str) -> RelayPaymentOffer {
         RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
             receiver_pubkey: receiver_pubkey.to_string(),
             mint_url: mint_url.to_string(),
             unit: "sat".to_string(),
-            preferred_keyset_ids: vec![keyset_id.to_string()],
             negotiated_keyset_versions: BTreeSet::from(["v1".to_string(), "v2".to_string()]),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
@@ -8199,9 +8182,7 @@ mod tests {
 
         let receiver_pubkey =
             "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
-        let mut offer = offer(&mint_url, &receiver_pubkey, &input_keyset_id);
-        offer.preferred_keyset_ids.push(output_keyset_id.clone());
-        assert_eq!(offer.preferred_keyset_ids[0], input_keyset_id);
+        let offer = offer(&mint_url, &receiver_pubkey, &input_keyset_id);
 
         let channel_id = wallet
             .provision_channel(&offer, amount_raw * 1000)
@@ -8283,7 +8264,6 @@ mod tests {
         let receiver_pubkey =
             "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
         let offer = offer(&mint_url, &receiver_pubkey, &output_keyset_id);
-        assert!(!offer.preferred_keyset_ids.contains(&input_keyset_id));
 
         let target_capacity_raw = 32u64;
         let target_capacity_msats = target_capacity_raw * 1000;
@@ -8691,7 +8671,6 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: prepared.mint_url.clone(),
             unit: "sat".to_string(),
-            preferred_keyset_ids: vec![prepared.keyset_id.clone()],
             negotiated_keyset_versions: BTreeSet::from(["v1".to_string()]),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
@@ -10344,7 +10323,7 @@ mod tests {
         let wallet =
             SqliteClientWallet::open(loose_wallet, &channel_db, &sender_secret_hex()).unwrap();
         let receiver_pubkey = "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2";
-        let mut offer = offer(&mint_url, receiver_pubkey, &initial_keyset_id);
+        let offer = offer(&mint_url, receiver_pubkey, &initial_keyset_id);
 
         wallet.ensure_offer_keysets_cached(&offer).unwrap();
         let output_keyset = wallet
@@ -10373,7 +10352,6 @@ mod tests {
 
         let successor_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
         assert_ne!(initial_keyset_id, successor_keyset_id);
-        offer.preferred_keyset_ids.push(successor_keyset_id.clone());
 
         let networking = FourSubmissionNetworking::new();
         let error = wallet
@@ -10474,7 +10452,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn output_keyset_selection_refreshes_for_new_relay_preference() {
+    async fn output_keyset_selection_is_cache_first_until_client_metadata_refreshes() {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint = mint_helper.mint();
         let first_keyset_id = mint_helper.keyset_id().to_string();
@@ -10514,9 +10492,17 @@ mod tests {
         assert_eq!(selected.id, first_keyset_id);
 
         let second_keyset_id = rotate_sat_keyset(&mint, 0).await.unwrap().to_string();
-        // The relay preference is newer, so refresh before falling back to the
-        // cached active keyset. The refresh reveals the preferred active ID.
+        // Rotation alone does not invalidate the client's cache. Relay offers
+        // no longer steer selection; mint rejection recovery refreshes metadata.
         let second_offer = offer(&mint_url, receiver_pubkey, &second_keyset_id);
+        let selected = wallet
+            .select_output_keyset_refreshing_client_first(
+                &second_offer,
+                SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+            )
+            .unwrap();
+        assert_eq!(selected.id, first_keyset_id);
+        wallet.refresh_client_keysets(&second_offer).unwrap();
         let selected = wallet
             .select_output_keyset_refreshing_client_first(
                 &second_offer,
@@ -10684,7 +10670,6 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),
-            preferred_keyset_ids: vec![old.to_string()],
             negotiated_keyset_versions: BTreeSet::from(["v1".to_string(), "v2".to_string()]),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
@@ -10731,7 +10716,6 @@ mod tests {
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "http://mint".to_string(),
                 unit: "sat".to_string(),
-                preferred_keyset_ids: vec![id.to_string()],
                 negotiated_keyset_versions: BTreeSet::from(["v1".to_string()]),
                 in_bytes_per_millisat: 1,
                 out_bytes_per_millisat: 1,
@@ -10763,7 +10747,6 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),
-            preferred_keyset_ids: vec![old.to_string(), other_unit.to_string()],
             negotiated_keyset_versions: BTreeSet::from(["v2".to_string()]),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
