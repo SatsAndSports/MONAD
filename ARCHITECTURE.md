@@ -669,6 +669,11 @@ At intermediate hops in a nested route, the inner hop connection is itself just 
 
 ## Control Protocol and Session Billing
 
+For the stable implementation-independent target contract, see the
+[established-session control protocol](docs/control-protocol.md). It is not yet a
+supported wire format; [issue #125](https://github.com/SatsAndSports/MONAD/issues/125)
+tracks implementation progress.
+
 ### Wire Format
 
 Control messages are JSON objects, newline-delimited, exchanged over the H2 control stream (`POST /control`). Each message is a single compact JSON line terminated by `\n`. Blank lines are not protocol-significant and are ignored defensively by both sides' parsers.
