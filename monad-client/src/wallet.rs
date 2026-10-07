@@ -615,12 +615,16 @@ impl MonadWallet for MockWallet {
             }
         };
         // Synthetic mint metadata owned by the mock wallet, not relay preferences.
-        let keyset_id = "0000000000000001".to_string();
-        if !offer.keyset_is_compatible(&keyset_id) {
-            return Err(WalletError::OfferMismatch(
-                "mock mint keyset version was not negotiated".to_string(),
-            ));
-        }
+        let keyset_id = [
+            "0000000000000001".to_string(),
+            format!("01{}", "11".repeat(32)),
+        ]
+        .into_iter()
+        .find(|id| offer.keyset_is_compatible(id))
+        .ok_or_else(|| WalletError::NoCompatibleActiveKeyset {
+            mint_url: offer.mint_url.clone(),
+            unit: offer.unit.clone(),
+        })?;
         let channel = WalletChannel {
             channel_id: channel_id.clone(),
             state: WalletChannelState::Open,
@@ -872,6 +876,21 @@ mod tests {
                 wallet.get_channel(&id).unwrap().keyset_id,
                 "0000000000000001"
             );
+        }
+    }
+
+    #[test]
+    fn mock_wallet_selects_its_own_keyset_for_each_negotiated_version() {
+        for (version, prefix) in [("v1", "00"), ("v2", "01")] {
+            let mut candidate = offer("msat");
+            candidate.negotiated_keyset_versions = BTreeSet::from([version.into()]);
+            let wallet = MockWallet::new();
+            let id = wallet.provision_channel(&candidate, 10_000).unwrap();
+            assert!(wallet
+                .get_channel(&id)
+                .unwrap()
+                .keyset_id
+                .starts_with(prefix));
         }
     }
 
