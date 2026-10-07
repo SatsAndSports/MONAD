@@ -121,7 +121,7 @@ from that cache, not when storing it.
 
 Consequences:
 
-- `SessionStatus` advertises configured trusted mint/unit maps whose values are `{ "funding_keyset_recovery_window_secs": ... }` objects, without keyset IDs or per-offer prices; prices are fixed session-wide. Map order conveys no preference.
+- `SessionStatus` advertises configured trusted mint/unit maps whose values contain `minimum_channel_lifetime_secs` and `funding_keyset_recovery_window_secs`, without keyset IDs or per-offer prices; prices are fixed session-wide. Map order conveys no preference. Both deadline gaps apply to first links and relinks, using relay time and stored funding for known channels.
 - the client selects active compatible keysets from its own mint metadata, ordered by ID, enforcing negotiated versions and recovery windows. It refreshes before reporting that no compatible active keyset exists. Existing-channel selection does not depend on advertised IDs or funding-keyset activity.
 - first-time `ChannelLink` accepts known keysets that belong to a trusted unit for that mint. If such a keyset is unknown, the relay first performs metadata-independent channel and proof-structure checks, then transparently uses its bounded refresh coordinator and retries the immutable link once.
 - stored channels relink using persisted funding without requiring current keyset metadata.

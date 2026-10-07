@@ -51,6 +51,9 @@ Matching keys are:
   ID within their attachment category, independently of advertised keyset IDs
 
 Only `Open` channels are selectable.
+Selection also requires the relay-advertised minimum remaining channel lifetime,
+including when reusing a channel attached to the same session. Skipping a
+too-short channel does not change its persisted state or recovery history.
 
 ### 2. Wallet backend
 

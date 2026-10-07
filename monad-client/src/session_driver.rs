@@ -151,6 +151,7 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             advertisements: vec![PaymentOption {
                 funding_keyset_recovery_window_secs: 86_400,
+                minimum_channel_lifetime_secs: 3600,
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
                 in_bytes_per_millisat: 1,
@@ -207,6 +208,7 @@ mod tests {
                                 "msat".into(),
                                 monad_common::protocol::MintUnitAdvertisement {
                                     funding_keyset_recovery_window_secs: 86_400,
+                                    minimum_channel_lifetime_secs: 3600,
                                 },
                             )]),
                         )]),
@@ -370,6 +372,7 @@ mod tests {
             "0000000000000002".to_string(),
             crate::wallet::RelayPaymentOffer {
                 funding_keyset_recovery_window_secs: 86_400,
+                minimum_channel_lifetime_secs: 3600,
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "https://mint".to_string(),
                 unit: "sat".to_string(),
@@ -971,6 +974,7 @@ mod tests {
             intended_channel_id: Some("exhausted".to_string()),
             intended_offer: Some(crate::wallet::RelayPaymentOffer {
                 funding_keyset_recovery_window_secs: 86_400,
+                minimum_channel_lifetime_secs: 3600,
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
@@ -982,6 +986,7 @@ mod tests {
                 receiver_pubkey: "receiver".to_string(),
                 advertisements: vec![PaymentOption {
                     funding_keyset_recovery_window_secs: 86_400,
+                    minimum_channel_lifetime_secs: 3600,
                     mint_url: "https://mint".to_string(),
                     unit: "msat".to_string(),
                     in_bytes_per_millisat: 1,

@@ -271,7 +271,7 @@ no `ChannelUnlinked` message.
 | Field | Type and meaning |
 | --- | --- |
 | `receiver_pubkey` | Current payment receiver key in the negotiated Spilman encoding; may rotate (§4) |
-| `advertisements` | Map of mint URL to map of supported unit (`sat` or `msat`) to `{funding_keyset_recovery_window_secs: u64}` |
+| `advertisements` | Map of mint URL to supported unit (`sat` or `msat`) to `{minimum_channel_lifetime_secs: u64, funding_keyset_recovery_window_secs: u64}` |
 | `linked_channel` | Nullable; `null` or `{channel_id, balance_raw: u64, capacity_raw: u64, unit}` |
 | `bytes_in_per_msat` | Positive `u64`, bytes from destination toward client per millisatoshi, fixed session-wide |
 | `bytes_out_per_msat` | Positive `u64`, bytes from client toward destination per millisatoshi, fixed session-wide |
@@ -296,17 +296,22 @@ failure after successful acceptance does not retrospectively increment
 terminates. Each status is one internally consistent snapshot, although
 accounting may advance immediately after its linearization point.
 
-Each advertisement value is an object with the required field
-`funding_keyset_recovery_window_secs`. This is the minimum interval from the
-channel's expiry to the funding keyset's final expiry (§4), not a minimum channel
-lifetime measured from now. For example:
+Each advertisement value has two required durations:
+
+- `minimum_channel_lifetime_secs`: minimum remaining time from link or relink
+  acceptance until the channel expires, reserving time for the relay to close
+  before the sender's refund activates.
+- `funding_keyset_recovery_window_secs`: minimum interval from channel expiry
+  until the funding keyset's optional final expiry, reserving time for recovery.
+
+These are distinct intervals, enforced as described in §4. For example:
 
 ```json
 {
   "advertisements": {
     "https://mint.example": {
-      "sat": {"funding_keyset_recovery_window_secs": 86400},
-      "msat": {"funding_keyset_recovery_window_secs": 86400}
+      "sat": {"minimum_channel_lifetime_secs": 3600, "funding_keyset_recovery_window_secs": 86400},
+      "msat": {"minimum_channel_lifetime_secs": 3600, "funding_keyset_recovery_window_secs": 86400}
     }
   },
   "bytes_in_per_msat": 1000,
@@ -501,12 +506,38 @@ expiry, or recovery policy. Metadata refresh can be busy, rate-limited, or
 unavailable; retry unchanged immutable funding rather than provision replacement
 funds merely to avoid a transient refresh error.
 
-For unknown/new funding with channel expiry `E`, advertised recovery window `W`, and the
-funding keyset's optional final expiry `K`, admission requires no final expiry or
-`K >= E + W` under checked `u64` addition. Final expiry zero is always
-unacceptable; equality is acceptable; overflow of `E + W` is unacceptable. This
-predicate is for new-funding admission only and MUST NOT block restore, refund,
-close, or a valid stored relink.
+### 4.1 Channel admission deadlines
+
+For every link or relink, let `T` be the relay's Unix time in seconds at acceptance,
+`E` the channel expiry, `L` the advertised minimum channel lifetime, `W` the
+advertised funding-keyset recovery window, and `K` the keyset's optional final
+expiry. The relay MUST enforce:
+
+```text
+E >= T + L
+K >= E + W   if K is present
+```
+
+Equality passes. Use checked `u64` addition; overflow in a required sum rejects
+admission. Absent `K` imposes no second deadline; explicit `K = 0` is always
+unacceptable. Known channels use stored channel parameters and funding metadata,
+not replacement values supplied by the client. Both gaps are checked on relink
+even though the original cryptographic funding validation need not be repeated.
+
+The relay's clock and policy at acceptance are authoritative. It MUST recheck
+remaining lifetime after slow validation or refresh work, immediately before
+ownership acquisition under the ownership authority. An earlier status does not
+guarantee later acceptance. Clients SHOULD avoid locally too-short channels and
+provision with a margin for clock differences and provisioning/network delays;
+they MUST NOT alter an already prepared channel's immutable expiry to retry it.
+
+Insufficient remaining lifetime returns nonfatal `CHANNEL_EXPIRED`; insufficient
+funding-keyset recovery time returns nonfatal `LINK_INVALID_CHANNEL`. Rejection
+does not remove existing ownership or previously accepted session payments.
+These are admission rules, not an additional ongoing payment cutoff: crossing
+an admission threshold alone does not detach a linked channel or erase credit.
+Relays must still schedule closure before the sender refund activates. Neither
+admission predicate blocks restore, refund, or close/recovery operations.
 
 ## 5. Channel operations
 
@@ -522,8 +553,8 @@ recomputing the channel ID; validating receiver, unit, capacity, expiry,
 admission, mint, keyset, proof structure, and signatures; requiring funding
 `witness` and `p2pk_e` to be absent; and, for `v1` and `v2`, requiring DLEQ on
 every proof, deriving the expected deterministic `r`, requiring the submitted
-`r` to equal it, and verifying `(e,s,r)`. Funding-keyset recovery-window
-admission applies only to this first registration. Unknown funding IDs may
+`r` to equal it, and verifying `(e,s,r)`. The two deadline checks in §4.1 apply
+to both first registration and relink. Unknown funding IDs may
 invoke bounded metadata refresh. The relay stores the immutable funding only
 after all validation succeeds.
 
@@ -535,7 +566,8 @@ normally reuse its stored record without mint I/O. Supplied relink data MUST NOT
 overwrite stored funding or accepted balance.
 
 Every relink still validates channel state and policy, bootstrap-negotiated
-keyset-version eligibility, exact numeric representability, and the supplied
+keyset-version eligibility, both admission deadlines (§4.1), exact numeric
+representability, and the supplied
 zero-balance signature against the stored channel before ownership changes. The
 signature need not equal the original registration signature and is not evidence
 of freshness because its signed message contains no session challenge.
@@ -685,8 +717,9 @@ Validation uses this precedence before any request mutation:
    policy first. An unknown channel then checks public parameters/channel ID,
    unit, capacity, ordinary expiry, receiver, admission, mint/keyset trust,
    version and recovery metadata, and funding. A known channel may use its stored
-   funding without comparing the submitted copy. Both paths finally check the
-   zero-balance signature.
+   funding without comparing the submitted copy, but must enforce both admission
+   deadlines from that stored funding. Both paths check the zero-balance signature
+   and recheck remaining lifetime before ownership acquisition.
 6. A payment checks, in order: terminal state, numeric conversion, signature, and
    monotonicity. `PAYMENT_NO_NEW_FUNDS` applies only after a valid signature; a
    final atomic comparison loss is `PAYMENT_CONFLICT`.
@@ -703,13 +736,13 @@ hide a fatal failure already discovered.
 | `CHANNEL_EVICTED_FROM_SESSION` | Link/payment | Nonfatal session-scoped exclusion; another channel may fund the session. |
 | `CHANNEL_RETIRED_AT_RELAY` | Link/payment | Nonfatal permanent exclusion for this authenticated relay identity. |
 | `LINK_INVALID_ZERO_BALANCE_SIGNATURE` | Link | The registration signature does not validate at balance zero; nonfatal correction, not blind replay. |
-| `LINK_INVALID_CHANNEL` | New link | Public parameters, channel ID, proof structure, capacity, or expiry are invalid and no more specific link code applies; nonfatal. |
+| `LINK_INVALID_CHANNEL` | Link/relink | Invalid new funding or insufficient funding-keyset recovery time (§4.1), where no more specific link code applies; nonfatal. |
 | `LINK_RECEIVER_MISMATCH` | New link | Unknown channel is not bound to the current advertised receiver; nonfatal. A failed attempt does not make it known. |
 | `LINK_MINT_OR_KEYSET_UNACCEPTABLE`, `LINK_UNSUPPORTED_UNIT` | Link | Nonfatal funding or policy incompatibility; not necessarily transient metadata lag. |
 | `LINK_KEYSET_REFRESH_RATE_LIMITED`, `LINK_KEYSET_REFRESH_BUSY`, `LINK_KEYSET_REFRESH_FAILED` | Link | Nonfatal refresh obstacle; bounded retry of unchanged funding may be appropriate. |
 | `LINK_KEYSET_VERSION_NOT_NEGOTIATED` | Link | Fatal to this session; do not mark an otherwise valid wallet channel globally unusable. |
 | `LINK_CHANNEL_RETIRED` | Link | Nonfatal policy refusing a known channel's relink, including a stored old-receiver channel the relay declines to reuse; preserve its record and recovery path. Distinct from scoped exclusion. |
-| `CHANNEL_CLOSED`, `CHANNEL_EXPIRED` | Link/payment | Nonfatal unusable-channel rejection; preserve recovery history. |
+| `CHANNEL_CLOSED`, `CHANNEL_EXPIRED` | Link/payment | Nonfatal unusable-channel rejection; `CHANNEL_EXPIRED` also covers insufficient remaining lifetime at link/relink admission (§4.1). Preserve recovery history. |
 | `PAYMENT_WRONG_CHANNEL` | Payment | The session is not linked to the submitted ID; nonfatal. |
 | `PAYMENT_INVALID` | Payment | Nonfatal validation rejection; stop automatic payments and report it. Fresh funding does not repair the signature. |
 | `PAYMENT_NO_NEW_FUNDS` | Payment | Valid duplicate/lower cumulative payment; no credit. Reconcile with an ordered status before signing more. |
@@ -799,7 +832,7 @@ If the relay had accepted 100 previously, relink reports `balance_raw=100` but
   CONNECT count transitions; empty-FIFO discard; fatal input behind pending
   requests; multiple unanswered requests at termination; bounded redacted
   warnings.
-- §3.3: advertisement objects with required recovery-window fields; no keyset IDs
+- §3.3: advertisement objects with both required deadline durations; no keyset IDs
   or per-offer prices; map-order independence; trusted offers present with empty
   metadata caches and unchanged by keyset rotation or negotiated versions.
 - §3.4: opaque string nonces, paused and concurrent Pings, same-nonce Pong
@@ -812,7 +845,9 @@ If the relay had accepted 100 previously, relink reports `balance_raw=100` but
   excluding pooled connections; one current receiver; known-channel lookup before receiver checks;
   old-receiver relink or explicit retirement; failed attempts creating no durable
   recognition; rotation during provisioning rejecting and recovering an unknown channel;
-  recovery-window equality, zero, absence, and overflow; exclusions surviving
+  both deadline boundaries, elapsed time during acceptance, keyset expiry zero,
+  absence and overflow; stored relink authority and ownership/payment preservation
+  on rejection; client lifetime selection with margin; exclusions surviving
   rotation and relay restart.
 - §5.1: strict first-registration Cashu V4 and deterministic DLEQ validation;
   failed attempts creating no durable recognition; known relinks using stored
