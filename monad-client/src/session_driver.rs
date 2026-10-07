@@ -137,7 +137,7 @@ mod tests {
     use super::PaymentPolicy;
     use crate::wallet::WalletError;
     use http::{Method, Request};
-    use monad_common::protocol::{KeysetAdvertisement, LinkedChannelStatus, ServerErrorCode};
+    use monad_common::protocol::{LinkedChannelStatus, PaymentOption, ServerErrorCode};
     use monad_common::proxy::CleartextByteCounters;
     use monad_common::session::SessionPricing;
     use std::io;
@@ -149,11 +149,10 @@ mod tests {
     fn snapshot(paused: bool) -> RelaySnapshot {
         RelaySnapshot {
             receiver_pubkey: "receiver".to_string(),
-            advertisements: vec![KeysetAdvertisement {
+            advertisements: vec![PaymentOption {
                 funding_keyset_recovery_window_secs: 86_400,
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
-                keyset_ids: vec!["0000000000000001".to_string()],
                 in_bytes_per_millisat: 1,
                 out_bytes_per_millisat: 1,
             }],
@@ -202,7 +201,15 @@ mod tests {
                     &mut send,
                     &ServerMessage::SessionStatus {
                         receiver_pubkey: "receiver".to_string(),
-                        advertisements: snapshot(true).advertisements,
+                        advertisements: std::collections::BTreeMap::from([(
+                            "https://mint".into(),
+                            std::collections::BTreeMap::from([(
+                                "msat".into(),
+                                monad_common::protocol::MintUnitAdvertisement {
+                                    funding_keyset_recovery_window_secs: 86_400,
+                                },
+                            )]),
+                        )]),
                         linked_channel: None,
                         active_in_rate: 1,
                         active_out_rate: 1,
@@ -366,7 +373,6 @@ mod tests {
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "https://mint".to_string(),
                 unit: "sat".to_string(),
-                preferred_keyset_ids: vec!["0000000000000001".to_string()],
                 negotiated_keyset_versions: std::collections::BTreeSet::from(["v1".to_string()]),
                 in_bytes_per_millisat: 1,
                 out_bytes_per_millisat: 1,
@@ -968,18 +974,16 @@ mod tests {
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
-                preferred_keyset_ids: vec!["keyset-a".to_string()],
                 negotiated_keyset_versions: std::collections::BTreeSet::from(["v1".to_string()]),
                 in_bytes_per_millisat: 1,
                 out_bytes_per_millisat: 1,
             }),
             relay_snapshot: Some(RelaySnapshot {
                 receiver_pubkey: "receiver".to_string(),
-                advertisements: vec![KeysetAdvertisement {
+                advertisements: vec![PaymentOption {
                     funding_keyset_recovery_window_secs: 86_400,
                     mint_url: "https://mint".to_string(),
                     unit: "msat".to_string(),
-                    keyset_ids: vec!["keyset-a".to_string()],
                     in_bytes_per_millisat: 1,
                     out_bytes_per_millisat: 1,
                 }],

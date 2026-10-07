@@ -2,7 +2,7 @@ use monad_common::payment_units::{
     msats_to_raw_units as common_msats_to_raw_units,
     raw_units_to_msats as common_raw_units_to_msats,
 };
-use monad_common::protocol::KeysetAdvertisement;
+use monad_common::protocol::PaymentOption;
 use rand::RngCore;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +16,6 @@ pub struct RelayPaymentOffer {
     pub receiver_pubkey: String,
     pub mint_url: String,
     pub unit: String,
-    pub preferred_keyset_ids: Vec<String>,
     pub negotiated_keyset_versions: BTreeSet<String>,
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
@@ -25,7 +24,7 @@ pub struct RelayPaymentOffer {
 impl RelayPaymentOffer {
     pub fn from_advertisement(
         receiver_pubkey: String,
-        advertisement: &KeysetAdvertisement,
+        advertisement: &PaymentOption,
         negotiated_keyset_versions: &BTreeSet<String>,
     ) -> Self {
         Self {
@@ -33,7 +32,6 @@ impl RelayPaymentOffer {
             funding_keyset_recovery_window_secs: advertisement.funding_keyset_recovery_window_secs,
             mint_url: advertisement.mint_url.clone(),
             unit: advertisement.unit.clone(),
-            preferred_keyset_ids: advertisement.keyset_ids.clone(),
             negotiated_keyset_versions: negotiated_keyset_versions.clone(),
             in_bytes_per_millisat: advertisement.in_bytes_per_millisat,
             out_bytes_per_millisat: advertisement.out_bytes_per_millisat,
@@ -52,13 +50,6 @@ impl RelayPaymentOffer {
                 self.negotiated_keyset_versions.contains("v2")
             }
         }
-    }
-
-    fn preference_rank(&self, keyset_id: &str) -> usize {
-        self.preferred_keyset_ids
-            .iter()
-            .position(|preferred| preferred == keyset_id)
-            .unwrap_or(usize::MAX)
     }
 }
 
@@ -298,12 +289,7 @@ pub fn select_channel(
         }
     }
 
-    let order = |a: &WalletChannel, b: &WalletChannel| {
-        offer
-            .preference_rank(&a.keyset_id)
-            .cmp(&offer.preference_rank(&b.keyset_id))
-            .then_with(|| a.channel_id.cmp(&b.channel_id))
-    };
+    let order = |a: &WalletChannel, b: &WalletChannel| a.channel_id.cmp(&b.channel_id);
     unattached.sort_by(order);
     same_session.sort_by(order);
 
@@ -628,17 +614,17 @@ impl MonadWallet for MockWallet {
                 break candidate;
             }
         };
-        let keyset_id = offer.preferred_keyset_ids.first().cloned().ok_or_else(|| {
-            WalletError::NoCompatibleActiveKeyset {
-                mint_url: offer.mint_url.clone(),
-                unit: offer.unit.clone(),
-            }
+        // Synthetic mint metadata owned by the mock wallet, not relay preferences.
+        let keyset_id = [
+            "0000000000000001".to_string(),
+            format!("01{}", "11".repeat(32)),
+        ]
+        .into_iter()
+        .find(|id| offer.keyset_is_compatible(id))
+        .ok_or_else(|| WalletError::NoCompatibleActiveKeyset {
+            mint_url: offer.mint_url.clone(),
+            unit: offer.unit.clone(),
         })?;
-        if !offer.keyset_is_compatible(&keyset_id) {
-            return Err(WalletError::OfferMismatch(
-                "preferred keyset format was not negotiated".to_string(),
-            ));
-        }
         let channel = WalletChannel {
             channel_id: channel_id.clone(),
             state: WalletChannelState::Open,
@@ -834,10 +820,6 @@ mod tests {
             receiver_pubkey: "receiver".to_string(),
             mint_url: "https://mint".to_string(),
             unit: unit.to_string(),
-            preferred_keyset_ids: vec![
-                "0000000000000001".to_string(),
-                "0000000000000002".to_string(),
-            ],
             negotiated_keyset_versions: BTreeSet::from(["v1".to_string()]),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
@@ -856,6 +838,47 @@ mod tests {
             capacity_msats: 10_000,
             current_signed_balance_msats: 0,
             expiry_timestamp: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn mint_unit_advertisements_need_no_keysets_for_selection_or_mock_provisioning() {
+        let versions = BTreeSet::from(["v1".to_string()]);
+        let advertisements =
+            serde_json::from_str(r#"{"https://mint":{"sat":{"funding_keyset_recovery_window_secs":86400},"msat":{"funding_keyset_recovery_window_secs":86400}}}"#).unwrap();
+        for advertisement in monad_common::protocol::advertisement_options(&advertisements, 11, 22)
+        {
+            let candidate =
+                RelayPaymentOffer::from_advertisement("receiver".into(), &advertisement, &versions);
+            let mut stored = channel("chan-a");
+            stored.unit = candidate.unit.clone();
+            assert_eq!(
+                select_channel(&[stored], &candidate, session(1), 0)
+                    .unwrap()
+                    .channel_id,
+                "chan-a"
+            );
+            let wallet = MockWallet::new();
+            let id = wallet.provision_channel(&candidate, 10_000).unwrap();
+            assert_eq!(
+                wallet.get_channel(&id).unwrap().keyset_id,
+                "0000000000000001"
+            );
+        }
+    }
+
+    #[test]
+    fn mock_wallet_selects_its_own_keyset_for_each_negotiated_version() {
+        for (version, prefix) in [("v1", "00"), ("v2", "01")] {
+            let mut candidate = offer("msat");
+            candidate.negotiated_keyset_versions = BTreeSet::from([version.into()]);
+            let wallet = MockWallet::new();
+            let id = wallet.provision_channel(&candidate, 10_000).unwrap();
+            assert!(wallet
+                .get_channel(&id)
+                .unwrap()
+                .keyset_id
+                .starts_with(prefix));
         }
     }
 
@@ -895,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn selector_prefers_advertised_keyset_within_attachment_category() {
+    fn selector_orders_channels_independently_of_keyset() {
         let chosen = select_channel(
             &[
                 WalletChannel {
@@ -904,30 +927,18 @@ mod tests {
                 },
                 channel("chan-a"),
             ],
-            &RelayPaymentOffer {
-                preferred_keyset_ids: vec!["0000000000000002".to_string()],
-                ..offer("msat")
-            },
+            &offer("msat"),
             session(1),
             0,
         )
         .unwrap();
 
-        assert_eq!(chosen.channel_id, "chan-z");
+        assert_eq!(chosen.channel_id, "chan-a");
     }
 
     #[test]
-    fn selector_allows_compatible_non_preferred_keyset() {
-        let chosen = select_channel(
-            &[channel("chan-a")],
-            &RelayPaymentOffer {
-                preferred_keyset_ids: Vec::new(),
-                ..offer("msat")
-            },
-            session(1),
-            0,
-        )
-        .unwrap();
+    fn selector_allows_compatible_keyset() {
+        let chosen = select_channel(&[channel("chan-a")], &offer("msat"), session(1), 0).unwrap();
 
         assert_eq!(chosen.channel_id, "chan-a");
     }

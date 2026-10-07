@@ -673,8 +673,15 @@ async fn start_huge_funding_control(
                     linked_channel,
                     remaining_milli_sats,
                     paused,
+                    active_in_rate,
+                    active_out_rate,
                     ..
                 } => {
+                    let advertisements = monad_common::protocol::advertisement_options(
+                        &advertisements,
+                        active_in_rate,
+                        active_out_rate,
+                    );
                     payment_stats
                         .status_updates_seen
                         .fetch_add(1, Ordering::Relaxed);

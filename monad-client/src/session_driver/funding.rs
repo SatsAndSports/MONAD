@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use monad_common::control_codec::send_json_line;
-use monad_common::protocol::{ClientMessage, KeysetAdvertisement, ServerErrorCode};
+use monad_common::protocol::{ClientMessage, PaymentOption, ServerErrorCode};
 use std::collections::BTreeSet;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,7 +102,7 @@ fn provisioning_offer_is_unavailable(error: &WalletError) -> bool {
 
 fn provision_from_advertisements<F>(
     receiver_pubkey: &str,
-    advertisements: &[KeysetAdvertisement],
+    advertisements: &[PaymentOption],
     versions: &BTreeSet<String>,
     mut provision: F,
 ) -> Result<Option<(String, RelayPaymentOffer)>, WalletError>
@@ -825,12 +825,11 @@ pub(super) async fn handle_control_detached(config: &SessionDriverConfig, state:
 mod tests {
     use super::*;
 
-    fn advertisement(mint_url: &str) -> KeysetAdvertisement {
-        KeysetAdvertisement {
+    fn advertisement(mint_url: &str) -> PaymentOption {
+        PaymentOption {
             funding_keyset_recovery_window_secs: 86_400,
             mint_url: mint_url.to_string(),
             unit: "sat".to_string(),
-            keyset_ids: Vec::new(),
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         }

@@ -154,7 +154,7 @@ pub(super) async fn run_session_driver(
                             );
                              let snapshot = RelaySnapshot {
                                     receiver_pubkey,
-                                    advertisements,
+                                    advertisements: monad_common::protocol::advertisement_options(&advertisements, active_in_rate, active_out_rate),
                                     linked_channel,
                                     session_total_in,
                                     session_total_out,
