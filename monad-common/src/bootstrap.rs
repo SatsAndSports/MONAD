@@ -4,8 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 pub const BOOTSTRAP_VERSION: u8 = 1;
-// Transitional advertisement-map protocol; not the complete stable contract.
-pub const SESSION_PROTOCOL_H2: &str = "h2-advertisements-2026-10-07";
+pub const SESSION_PROTOCOL_H2: &str = "h2-2026-10-07";
 pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14: &str = "2026-09-14";
 pub const CASHU_SPILMAN_KEYSET_VERSION_V1: &str = "v1";
 pub const CASHU_SPILMAN_KEYSET_VERSION_V2: &str = "v2";
@@ -452,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_map_protocol_rejects_legacy_and_unimplemented_full_contract() {
+    fn session_protocol_selection_requires_the_current_identifier() {
         for protocol in ["h2", "h2-2026-10-06"] {
             let mut hello = decode_v1_client_hello(&initial_client_hello()).unwrap();
             hello.session_protocols = vec![protocol.to_string()];

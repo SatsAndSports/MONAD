@@ -24,7 +24,7 @@ use monad_common::blinded_hop::resolve_blinded_hop_for_intro;
 use monad_common::control_codec::{send_json_line, try_decode_json_line};
 use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::protocol::{
-    ClientMessage, MintUnitAdvertisements, ServerErrorCode, ServerMessage,
+    ClientMessage, MintUnitAdvertisement, MintUnitAdvertisements, ServerErrorCode, ServerMessage,
 };
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::{clamp_i128_to_i64, SessionPricing};
@@ -392,7 +392,11 @@ impl SessionState {
             for unit in trusted_units {
                 advertisements.entry(mint_url.clone()).or_default().insert(
                     unit.clone(),
-                    self.payments.funding_keyset_recovery_window_secs(),
+                    MintUnitAdvertisement {
+                        funding_keyset_recovery_window_secs: self
+                            .payments
+                            .funding_keyset_recovery_window_secs(),
+                    },
                 );
             }
         }
@@ -1200,6 +1204,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn test_state() -> (SessionState, Arc<InMemoryRelayPayments>) {
+        test_state_with_cache(shared_spilman_mint_cache(SpilmanMintCache::default()))
+    }
+
+    fn test_state_with_cache(
+        cache: SharedSpilmanMintCache,
+    ) -> (SessionState, Arc<InMemoryRelayPayments>) {
         let payments = Arc::new(InMemoryRelayPayments::new());
         let state = SessionState::new(
             [1; 32],
@@ -1208,7 +1218,7 @@ mod tests {
                 session_registry: Arc::new(SessionRegistry::default()),
                 transport_key: SecpTransportKeypair::generate(),
                 receiver_pubkey_hex: "receiver".to_string(),
-                spilman_mint_cache: shared_spilman_mint_cache(SpilmanMintCache::default()),
+                spilman_mint_cache: cache,
                 trusted_mint_units: BTreeMap::from([(
                     "mint".to_string(),
                     BTreeSet::from(["sat".to_string()]),
@@ -1837,19 +1847,38 @@ mod tests {
 
     #[tokio::test]
     async fn status_advertises_trusted_units_independently_of_cached_keysets_and_versions() {
-        let (mut state, _) = test_state();
+        let cache = shared_spilman_mint_cache(SpilmanMintCache::default());
+        let (mut state, _) = test_state_with_cache(cache.clone());
+        state
+            .trusted_mint_units
+            .get_mut("mint")
+            .unwrap()
+            .insert("msat".into());
         let ServerMessage::SessionStatus { advertisements, .. } =
             state.session_status_message().await
         else {
             panic!()
         };
         assert_eq!(advertisements.len(), 1);
+        assert_eq!(advertisements["mint"].len(), 2);
         assert_eq!(
-            advertisements["mint"]["sat"],
+            advertisements["mint"]["sat"].funding_keyset_recovery_window_secs,
             state.payments.funding_keyset_recovery_window_secs()
         );
         let expected = advertisements;
         state.cashu_spilman_keyset_versions = Some(BTreeSet::from(["v2".to_string()]));
+        // Discovery/rotation changes the shared cache, not the advertised policy.
+        cache.write().unwrap().advertised.insert(
+            "mint".into(),
+            BTreeMap::from([(
+                "sat".into(),
+                vec!["0000000000000001".into(), format!("01{}", "11".repeat(32))],
+            )]),
+        );
+        cache.write().unwrap().advertised.insert(
+            "untrusted".into(),
+            BTreeMap::from([("sat".into(), vec!["0000000000000002".into()])]),
+        );
         let ServerMessage::SessionStatus { advertisements, .. } =
             state.session_status_message().await
         else {

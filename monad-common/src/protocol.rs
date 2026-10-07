@@ -14,8 +14,15 @@ use std::collections::BTreeMap;
 /// mint swap must query/refresh mint state and choose an active output keyset.
 pub type MintUnitKeysets = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
-/// Mint URL -> supported unit -> funding-keyset recovery window in seconds.
-pub type MintUnitAdvertisements = BTreeMap<String, BTreeMap<String, u64>>;
+/// Mint URL -> supported unit -> funding requirements.
+pub type MintUnitAdvertisements = BTreeMap<String, BTreeMap<String, MintUnitAdvertisement>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MintUnitAdvertisement {
+    /// Required interval between channel expiry and funding keyset final expiry.
+    pub funding_keyset_recovery_window_secs: u64,
+}
 
 /// Local flattened payment option. Prices come from the session, not the map.
 #[derive(Debug, Clone)]
@@ -39,7 +46,7 @@ pub fn advertisement_options(
             units.iter().map(move |(unit, window)| PaymentOption {
                 mint_url: mint_url.clone(),
                 unit: unit.clone(),
-                funding_keyset_recovery_window_secs: *window,
+                funding_keyset_recovery_window_secs: window.funding_keyset_recovery_window_secs,
                 in_bytes_per_millisat,
                 out_bytes_per_millisat,
             })
@@ -159,17 +166,74 @@ mod advertisement_tests {
     use serde_json::json;
 
     #[test]
+    fn advertisement_order_is_local_and_value_fields_are_explicit() {
+        let first: MintUnitAdvertisements = serde_json::from_str(r#"{
+            "mint-b":{"sat":{"funding_keyset_recovery_window_secs":7}},
+            "mint-a":{"sat":{"funding_keyset_recovery_window_secs":9},"msat":{"funding_keyset_recovery_window_secs":8}}
+        }"#).unwrap();
+        let reordered: MintUnitAdvertisements = serde_json::from_str(r#"{
+            "mint-a":{"msat":{"funding_keyset_recovery_window_secs":8},"sat":{"funding_keyset_recovery_window_secs":9}},
+            "mint-b":{"sat":{"funding_keyset_recovery_window_secs":7}}
+        }"#).unwrap();
+        let order = |ads: &MintUnitAdvertisements| {
+            advertisement_options(ads, 11, 22)
+                .into_iter()
+                .map(|o| (o.mint_url, o.unit, o.funding_keyset_recovery_window_secs))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&first), order(&reordered));
+        assert_eq!(
+            order(&first),
+            vec![
+                ("mint-a".into(), "msat".into(), 8),
+                ("mint-a".into(), "sat".into(), 9),
+                ("mint-b".into(), "sat".into(), 7)
+            ]
+        );
+        for invalid in [
+            json!(86400),
+            json!({}),
+            json!({"minimum_time_to_expiry":86400}),
+            json!({"funding_keyset_recovery_window_secs":86400, "keyset_ids":[]}),
+            json!({"funding_keyset_recovery_window_secs":86400, "bytes_in_per_msat":1}),
+        ] {
+            assert!(serde_json::from_value::<MintUnitAdvertisements>(
+                json!({"mint":{"sat":invalid}})
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn status_wire_has_only_mint_unit_windows_and_session_prices() {
         let status = ServerMessage::SessionStatus {
             receiver_pubkey: "receiver".into(),
             advertisements: BTreeMap::from([
                 (
                     "https://mint-b".into(),
-                    BTreeMap::from([("sat".into(), 123)]),
+                    BTreeMap::from([(
+                        "sat".into(),
+                        MintUnitAdvertisement {
+                            funding_keyset_recovery_window_secs: 123,
+                        },
+                    )]),
                 ),
                 (
                     "https://mint-a".into(),
-                    BTreeMap::from([("sat".into(), 0), ("msat".into(), 86_400)]),
+                    BTreeMap::from([
+                        (
+                            "sat".into(),
+                            MintUnitAdvertisement {
+                                funding_keyset_recovery_window_secs: 0,
+                            },
+                        ),
+                        (
+                            "msat".into(),
+                            MintUnitAdvertisement {
+                                funding_keyset_recovery_window_secs: 86_400,
+                            },
+                        ),
+                    ]),
                 ),
             ]),
             linked_channel: None,
@@ -187,8 +251,8 @@ mod advertisement_tests {
         assert_eq!(
             value["advertisements"],
             json!({
-                "https://mint-a": {"sat": 0, "msat": 86400},
-                "https://mint-b": {"sat": 123}
+                "https://mint-a": {"sat": {"funding_keyset_recovery_window_secs": 0}, "msat": {"funding_keyset_recovery_window_secs": 86400}},
+                "https://mint-b": {"sat": {"funding_keyset_recovery_window_secs": 123}}
             })
         );
         assert_eq!(value["bytes_in_per_msat"], 11);

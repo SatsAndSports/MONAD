@@ -6371,7 +6371,7 @@ async fn test_two_relays_share_one_wallet_manager_db() {
             .advertisements
             .iter()
             .find(|a| a.unit == "sat")
-            .expect("relay-a should advertise sat keyset"),
+            .expect("relay-a should advertise the sat unit"),
         &supported_cashu_spilman_keyset_versions(),
     );
     wallet_a
@@ -6412,7 +6412,7 @@ async fn test_two_relays_share_one_wallet_manager_db() {
             .advertisements
             .iter()
             .find(|a| a.unit == "sat")
-            .expect("relay-b should advertise sat keyset"),
+            .expect("relay-b should advertise the sat unit"),
         &supported_cashu_spilman_keyset_versions(),
     );
     wallet_b
@@ -6600,7 +6600,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
             .advertisements
             .iter()
             .find(|a| a.unit == "sat")
-            .expect("relay should advertise sat keyset"),
+            .expect("relay should advertise the sat unit"),
         &supported_cashu_spilman_keyset_versions(),
     );
 
@@ -6732,7 +6732,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
             .advertisements
             .iter()
             .find(|a| a.unit == "sat")
-            .expect("relay should advertise sat keyset before policy change"),
+            .expect("relay should advertise the sat unit before policy change"),
         &supported_cashu_spilman_keyset_versions(),
     );
 
@@ -6957,7 +6957,7 @@ async fn test_channel_link_rejects_known_keyset_unit_mismatch() {
         .advertisements
         .iter()
         .find(|ad| ad.unit == "sat")
-        .expect("relay should advertise accepted sat keyset");
+        .expect("relay should advertise the trusted sat unit");
     assert_eq!(advertised_sat.funding_keyset_recovery_window_secs, 86_400);
 
     wallet
@@ -7062,7 +7062,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         .advertisements
         .iter()
         .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
-        .expect("relay should advertise initial sat keyset");
+        .expect("relay should advertise the sat unit");
     assert_eq!(advertised_sat.funding_keyset_recovery_window_secs, 86_400);
 
     let old_channel_id = old_wallet.pre_create_channel(1000).await.unwrap();
@@ -7117,7 +7117,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         .advertisements
         .iter()
         .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
-        .expect("relay should still advertise stale sat keyset before reactive refresh");
+        .expect("relay should still advertise the sat unit before reactive refresh");
     assert_eq!(
         stale_advertised_sat.funding_keyset_recovery_window_secs,
         advertised_sat.funding_keyset_recovery_window_secs
@@ -7167,7 +7167,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         .advertisements
         .iter()
         .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
-        .expect("relay should advertise refreshed sat keysets");
+        .expect("relay should still advertise the sat unit after refresh");
     assert_eq!(
         refreshed_advertised_sat.funding_keyset_recovery_window_secs,
         advertised_sat.funding_keyset_recovery_window_secs
@@ -7592,7 +7592,7 @@ async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
 }
 
 /// A client whose keyset cache is fresher than the relay's must keep working
-/// after mint rotation: the stale relay still advertises only the old keyset,
+/// after mint rotation: the relay cache still knows only the old keyset,
 /// an existing old-keyset channel can be re-linked and paid (relay acceptance
 /// is "known + trusted unit", deliberately not active-gated), and data flows.
 /// A new channel uses the client's active compatible keyset despite the stale
@@ -7681,7 +7681,7 @@ async fn test_rotated_mint_stale_relay_falls_back_and_refreshes_on_link() {
         .advertisements
         .iter()
         .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
-        .expect("relay should advertise sat keyset");
+        .expect("relay should advertise the sat unit");
     assert_eq!(advertisement1.funding_keyset_recovery_window_secs, 86_400);
     let offer = RelayPaymentOffer::from_advertisement(
         receiver_pubkey_hex.clone(),
@@ -7789,7 +7789,7 @@ async fn test_rotated_mint_stale_relay_falls_back_and_refreshes_on_link() {
         .advertisements
         .iter()
         .find(|ad| ad.mint_url == mint_url && ad.unit == "sat")
-        .expect("stale relay should still advertise sat keyset");
+        .expect("stale relay should still advertise the sat unit");
     assert_eq!(
         advertisement2.funding_keyset_recovery_window_secs,
         advertisement1.funding_keyset_recovery_window_secs,
@@ -10611,7 +10611,7 @@ async fn test_configured_client_keyset_rotation_after_relay_cache_refresh() {
             .keyset_ids(&fixture.mint_url, "sat")
             .iter()
             .any(|keyset| keyset == &new_keyset_id),
-        "keyset rotation: refreshed relay cache should advertise the new active keyset"
+        "keyset rotation: refreshed relay cache should contain the new active keyset"
     );
     assert!(
         final_channels
@@ -11577,7 +11577,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
             .advertisements
             .iter()
             .find(|a| a.unit == "sat")
-            .expect("relay should advertise sat keyset"),
+            .expect("relay should advertise the sat unit"),
         &supported_cashu_spilman_keyset_versions(),
     );
 
@@ -11757,7 +11757,7 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
             .advertisements
             .iter()
             .find(|a| a.unit == "sat")
-            .expect("relay should advertise sat keyset"),
+            .expect("relay should advertise the sat unit"),
         &supported_cashu_spilman_keyset_versions(),
     );
 
@@ -11926,7 +11926,7 @@ async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
             .advertisements
             .iter()
             .find(|a| a.unit == "sat")
-            .expect("relay should advertise sat keyset"),
+            .expect("relay should advertise the sat unit"),
         &supported_cashu_spilman_keyset_versions(),
     );
 
@@ -12139,7 +12139,7 @@ async fn test_wallet_manager_close_channel_by_id() {
             .advertisements
             .iter()
             .find(|a| a.unit == "sat")
-            .expect("relay should advertise sat keyset"),
+            .expect("relay should advertise the sat unit"),
         &supported_cashu_spilman_keyset_versions(),
     );
 
@@ -12271,7 +12271,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
             .advertisements
             .iter()
             .find(|a| a.unit == "sat")
-            .expect("relay should advertise sat keyset"),
+            .expect("relay should advertise the sat unit"),
         &supported_cashu_spilman_keyset_versions(),
     );
 

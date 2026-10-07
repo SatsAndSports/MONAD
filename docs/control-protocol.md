@@ -4,13 +4,13 @@
 
 Tracking issue: [#125](https://github.com/SatsAndSports/MONAD/issues/125).
 This document changes no runtime behavior. **MUST**, **MUST NOT**, **SHOULD**, and
-**MAY** describe target requirements. The client and relay must be updated
-together before this contract is selected.
+**MAY** describe target requirements. Client and relay updates are coordinated;
+§7 describes pre-alpha implementation and conformance tracking.
 
 ## 1. Scope and lifecycle
 
 This contract covers messages on an established H2 `POST /control` stream. The
-session-protocol identifier **`h2-2026-10-06`** selects HTTP/2 with this MONAD
+session-protocol identifier **`h2-2026-10-07`** selects HTTP/2 with this MONAD
 control contract. Endpoints implementing this target MUST select only that
 identifier: there is no old `h2` fallback or compatibility path. This is Noise
 bootstrap session-protocol selection, not a change to HTTP/2 or QUIC TLS ALPN.
@@ -21,7 +21,8 @@ Noise, transport establishment, and bootstrap mechanics are otherwise outside
 this document. Authenticated relay identity, negotiated Spilman protocol, and
 negotiated keyset versions are inputs. Optional notifications can evolve within
 this contract; new requests, responses, or required semantics need explicit
-capability negotiation or a new session-protocol identifier.
+capability negotiation or a new session-protocol identifier after the pre-alpha
+development period described in §7.
 
 ### 1.1 Initial state
 
@@ -270,7 +271,7 @@ no `ChannelUnlinked` message.
 | Field | Type and meaning |
 | --- | --- |
 | `receiver_pubkey` | Current payment receiver key in the negotiated Spilman encoding; may rotate (§4) |
-| `advertisements` | Map of mint URL to map of supported unit (`sat` or `msat`) to funding-keyset recovery-window seconds (`u64`) |
+| `advertisements` | Map of mint URL to map of supported unit (`sat` or `msat`) to `{funding_keyset_recovery_window_secs: u64}` |
 | `linked_channel` | Nullable; `null` or `{channel_id, balance_raw: u64, capacity_raw: u64, unit}` |
 | `bytes_in_per_msat` | Positive `u64`, bytes from destination toward client per millisatoshi, fixed session-wide |
 | `bytes_out_per_msat` | Positive `u64`, bytes from client toward destination per millisatoshi, fixed session-wide |
@@ -295,8 +296,26 @@ failure after successful acceptance does not retrospectively increment
 terminates. Each status is one internally consistent snapshot, although
 accounting may advance immediately after its linearization point.
 
-An advertisement value is the mint/unit funding-keyset recovery window in
-seconds. There are no per-mint rates or concrete keyset IDs. Map order has no
+Each advertisement value is an object with the required field
+`funding_keyset_recovery_window_secs`. This is the minimum interval from the
+channel's expiry to the funding keyset's final expiry (§4), not a minimum channel
+lifetime measured from now. For example:
+
+```json
+{
+  "advertisements": {
+    "https://mint.example": {
+      "sat": {"funding_keyset_recovery_window_secs": 86400},
+      "msat": {"funding_keyset_recovery_window_secs": 86400}
+    }
+  },
+  "bytes_in_per_msat": 1000,
+  "bytes_out_per_msat": 500
+}
+```
+
+This fragment illustrates advertisements and session prices, not a complete
+`SessionStatus`. There are no per-mint rates or concrete keyset IDs. Map order has no
 preference semantics and the map may be empty. It describes offered trusted
 mint/unit combinations, not every acceptable stored channel or funding ID.
 MONAD defines only `sat` and `msat`, but neither endpoint is required to support
@@ -708,9 +727,11 @@ responsibility, not a guarantee supplied by a control error.
 
 ## 7. Stability and implementation tracking
 
-Sections 1-6 are the stable target contract. Runtime conformance is not implied
-until coordinated client and relay implementations select `h2-2026-10-06` and
-pass the required coverage in Appendix B.
+Sections 1-6 are the stable target contract for `h2-2026-10-07`. During pre-alpha
+development, implementations use this identifier while conformance work proceeds;
+its selection alone is not a claim that all requirements are implemented. Full
+conformance requires the coverage in Appendix B. Coordinated breaking changes
+are permitted during this development period.
 
 [Issue #125](https://github.com/SatsAndSports/MONAD/issues/125) is the sole live
 record of implementation progress, remaining work, and implementing PRs. This
@@ -778,6 +799,9 @@ If the relay had accepted 100 previously, relink reports `balance_raw=100` but
   CONNECT count transitions; empty-FIFO discard; fatal input behind pending
   requests; multiple unanswered requests at termination; bounded redacted
   warnings.
+- §3.3: advertisement objects with required recovery-window fields; no keyset IDs
+  or per-offer prices; map-order independence; trusted offers present with empty
+  metadata caches and unchanged by keyset rotation or negotiated versions.
 - §3.4: opaque string nonces, paused and concurrent Pings, same-nonce Pong
   responses, in-order and independent relay handling, local stalls, timeout
   races, and no claim of destination reachability.

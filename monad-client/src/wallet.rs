@@ -845,7 +845,7 @@ mod tests {
     fn mint_unit_advertisements_need_no_keysets_for_selection_or_mock_provisioning() {
         let versions = BTreeSet::from(["v1".to_string()]);
         let advertisements =
-            serde_json::from_str(r#"{"https://mint":{"sat":86400,"msat":86400}}"#).unwrap();
+            serde_json::from_str(r#"{"https://mint":{"sat":{"funding_keyset_recovery_window_secs":86400},"msat":{"funding_keyset_recovery_window_secs":86400}}}"#).unwrap();
         for advertisement in monad_common::protocol::advertisement_options(&advertisements, 11, 22)
         {
             let candidate =

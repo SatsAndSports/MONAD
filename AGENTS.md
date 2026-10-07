@@ -77,7 +77,7 @@ cargo run -p monad-quic -- ...
 ### Control Protocol
 
 - Wire format: JSON newline-delimited messages on the H2 control stream (`POST /control`)
-- Bootstrap: the two Noise handshake payloads negotiate the session version/capabilities and post-Noise session protocol (`h2-advertisements-2026-10-07` today), plus one Cashu Spilman protocol and the full mutual keyset-version set; today `2026-09-14` supports `v1` and `v2` and requires a nonempty intersection. The interim session identifier rejects legacy advertisement shapes without claiming the complete stable `h2-2026-10-06` contract.
+- Bootstrap: the two Noise handshake payloads negotiate the session version/capabilities and post-Noise session protocol (`h2-2026-10-07`), plus one Cashu Spilman protocol and the full mutual keyset-version set; today `2026-09-14` supports `v1` and `v2` and requires a nonempty intersection. Pre-alpha implementations use this identifier while conformance work continues, allowing coordinated breaking changes; issue #125 tracks remaining work.
 - Initial state: once the H2 control stream is established, the relay immediately sends a unified `SessionStatus` containing advertisements and initial state
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, integer-only via precomputed LCM

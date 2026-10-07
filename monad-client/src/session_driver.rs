@@ -203,7 +203,12 @@ mod tests {
                         receiver_pubkey: "receiver".to_string(),
                         advertisements: std::collections::BTreeMap::from([(
                             "https://mint".into(),
-                            std::collections::BTreeMap::from([("msat".into(), 86_400)]),
+                            std::collections::BTreeMap::from([(
+                                "msat".into(),
+                                monad_common::protocol::MintUnitAdvertisement {
+                                    funding_keyset_recovery_window_secs: 86_400,
+                                },
+                            )]),
                         )]),
                         linked_channel: None,
                         active_in_rate: 1,

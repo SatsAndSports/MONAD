@@ -596,13 +596,13 @@ Current coverage includes:
 
 ### Relay Keyset Handling
 
-Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. Advertisements are a map of mint URL to unit to funding-keyset recovery-window seconds, generated from trusted policy even when keyset metadata is absent. They contain no keyset IDs or per-offer prices. Session prices are `bytes_in_per_msat` and `bytes_out_per_msat`. Stored channels can relink and continue paying after a later policy change.
+Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. Advertisements map mint URL to unit to an object containing `funding_keyset_recovery_window_secs`, generated from trusted policy even when keyset metadata is absent. They contain no keyset IDs or per-offer prices. Session prices are `bytes_in_per_msat` and `bytes_out_per_msat`. Stored channels can relink and continue paying after a later policy change.
 
-**Coordinated upgrade:** clients and relays now negotiate
-`h2-advertisements-2026-10-07`. Older `h2` peers are rejected during bootstrap;
-upgrade both ends of every hop together. This intermediate protocol implements
-the advertisement changes, not the entire stable control contract. No database
-migration or reset is needed for this update.
+Clients and relays negotiate `h2-2026-10-07`. During pre-alpha development,
+upgrade both ends of every hop together as breaking changes bring the
+implementation into conformance with the control contract. Remaining work is
+tracked in [issue #125](https://github.com/SatsAndSports/MONAD/issues/125).
+No database migration or reset is needed for this advertisement update.
 
 When a first-time `ChannelLink` uses an unknown keyset for a configured trusted mint/unit, the relay performs metadata-independent structural checks, transparently invokes its bounded refresh coordinator, and retries the immutable link once. A successful refresh that still does not know the keyset produces a permanent `LinkMintOrKeysetUnacceptable` rejection. If cooldown, that relay coordinator's cross-mint capacity, timeout, or mint failure prevents a fresh decision, the relay returns a specific transient link error and the configured client preserves the channel and retries with backoff.
 
