@@ -30,22 +30,90 @@ capability negotiation or a new session-protocol identifier.
   without replacing the first.
 - The relay's first application message MUST be `SessionStatus`. The client MUST
   consume it before sending any message, including Ping or extensions.
-- A new session is unlinked and paused, with zero credit, byte counters, and
-  CONNECT counters. A stored channel's historical accepted balance is not credit
-  for this session.
+- A new session is unlinked and paused, with zero CONNECT counters.
 - The initial status supplies the state and funding information defined in §3.3.
-- Control traffic remains available while paid data forwarding is paused.
 
-### 1.2 Termination
+### 1.2 Payment channels and payments into a session
+
+A session can have at most one linked payment channel, and a payment channel can
+be linked to at most one session at a time. Over time, a session may receive
+payments from several successive channels, and a channel may pay into several
+successive sessions. Unlinking, replacing, or evicting a channel does not remove
+any payments already credited to the session.
+
+The relay's cumulative record of payments into a session,
+`total_paid_millisats`, starts at zero for every new session. Linking an existing
+channel does not credit its previously accepted payments to that session.
+
+For each valid, increasing payment on the linked channel, the relay advances the
+channel's accepted cumulative balance and adds the difference from its previous
+accepted balance to the session's paid total, converted to millisatoshis. This
+session total is monotonic: payments add to it; nothing subtracts from it.
+
+The client separately records the highest cumulative payment it has signed for
+each channel. After successful delivery and acknowledgement, the client's signed
+balance and the relay's accepted balance normally agree. An interrupted session
+can leave the client's record higher: the client may have signed and sent a
+payment that the relay never accepted. The client retains that signed record even
+when delivery is uncertain.
+
+If the client reuses that channel in a later session, a subsequent cumulative
+payment can therefore credit more than the client's newly signed increment. The
+relay calculates the increase from its own previously accepted balance, which
+may be lower than the client's previous signed balance.
+
+For example, suppose the client previously signed **100 msat**, but the relay
+accepted only **80 msat**. In a new session, linking the channel starts the
+session paid total at zero. If the client then signs **130 msat**, its newly
+signed increment is **30 msat**, but the relay accepts an increase of **50 msat**
+and credits that amount to the new session.
+
+A successful payment may increase the session paid total by more than the client
+expected, but never by less than its expected increment. The client accepts the
+larger total and uses it as its confirmed record when validating subsequent
+responses. §5.2 defines the precise signed and pending-payment records.
+
+### 1.3 Traffic counters
+
+Traffic directions are measured from the client's perspective:
+
+- **Outbound bytes** travel from the client toward a destination.
+- **Inbound bytes** travel from a destination toward the client.
+
+The relay maintains cumulative counters for both directions across all data
+CONNECT tunnels in the session. Both counters start at zero and only increase.
+Opening or closing a tunnel, or changing the linked payment channel, does not
+reset them.
+
+Only forwarded cleartext data bytes count. Control-stream traffic and encrypted
+transport overhead are excluded. Bytes count when the next local layer accepts
+them, rather than merely when the relay reads or buffers them: each successful
+partial write to the target counts outbound bytes, and each successful H2 DATA
+submission counts inbound bytes. Failed writes do not count.
+
+### 1.4 When data forwarding is enabled
+
+The relay calculates the amount due from the cumulative traffic counters and the
+session's fixed directional prices (§4). While the session's cumulative paid
+total exceeds that amount, paid data forwarding is unpaused across all its data
+CONNECT tunnels, subject to ordinary destination readiness and transport
+backpressure.
+
+When the amount due reaches or exceeds the paid total, paid data forwarding
+pauses. A subsequent accepted payment that restores positive credit unpauses
+forwarding. An unlinked session can continue using its existing credit but needs
+a linked channel to add more. The control stream remains available throughout.
+
+### 1.5 Termination
 
 Control EOF, reset, or loss ends the session; half-close is not a way to retain a
 data-only session. Termination MUST release linked ownership, terminate existing
 data tunnels, and prevent new ones. It MUST NOT erase durable funding or accepted
 payment history or initiate an on-mint close merely because control detached.
 
-Unused session credit is not transferred on reconnect; §5.2 distinguishes later
-bonus credit. Fatal-error delivery may precede termination, but cleanup MUST NOT
-depend on delivery to an unresponsive peer.
+Unused session credit is not transferred on reconnect. Fatal-error delivery may
+precede termination, but cleanup MUST NOT depend on delivery to an unresponsive
+peer.
 
 ## 2. Framing, validation, and exact values
 
@@ -201,14 +269,13 @@ no `ChannelUnlinked` message.
 | `bytes_out_per_msat` | Positive `u64`, bytes from client toward destination per millisatoshi, fixed session-wide |
 | `session_total_bytes_in` | `u64`, cleartext bytes from destination toward client |
 | `session_total_bytes_out` | `u64`, cleartext bytes from client toward destination |
-| `total_paid_millisats` | `u64`, cumulative session credit; bonus credit allowed |
+| `total_paid_millisats` | `u64`, cumulative payments credited to this session (§1.2) |
 | `remaining_milli_sats` | `i64`, exact signed remaining session credit |
 | `paused` | Boolean, whether paid data forwarding is paused |
 | `open_connects` | `u32`, currently open accepted H2 data CONNECT tunnels |
 | `total_connects` | `u64`, cumulative accepted H2 data CONNECT tunnels |
 | `failed_connects` | `u64`, cumulative H2 data CONNECT requests not accepted by the relay |
 
-Directions are from the client's perspective. Control bytes are not charged.
 CONNECT counts include TCP exits and QUIC-forwarded tunnels and count logical H2
 CONNECTs, not packets, pooled QUIC connections, or the outer session.
 `total_connects` and `open_connects` increment when the relay commits acceptance
@@ -346,9 +413,7 @@ practical; cleanup waits for neither.
 
 ## 4. Session state, pricing, and advertisements
 
-Lifecycle, linked ownership, confirmed credit, and pending requests are distinct.
-Unlink or eviction does not discard credit; an unlinked session may spend what
-remains but needs a usable channel to add more.
+The accounting and forwarding model in §§1.2-1.4 uses this exact calculation:
 
 ```text
 due_msats = ceil(session_total_bytes_in / bytes_in_per_msat
@@ -363,11 +428,8 @@ from chunk-boundary overshoot and does not erase payment history. New CONNECTs
 MUST be rejected with HTTP 402 while paused; existing tunnels wait for credit.
 Ordinary transport failure or termination may still end them.
 
-Bytes are charged when the next local layer accepts them: each successful partial
-write to the target counts outbound bytes, and each successful H2 DATA submission
-counts inbound bytes. Reads, buffered bytes, failed writes, control traffic, and
-encrypted transport overhead do not count. Implementations MUST check counter and
-billing representability before each write and update the counter immediately
+For the byte-accounting events defined in §1.3, implementations MUST check counter
+and billing representability before each write and update the counter immediately
 after the accepted write.
 
 Implementations choose their forwarding chunk sizes and in-flight limits. Larger
@@ -449,13 +511,11 @@ A mismatch in steps 1-4 returns `LINK_FUNDING_CONFLICT` before ownership changes
 an invalid step-5 signature returns `LINK_INVALID_ZERO_BALANCE_SIGNATURE`.
 Relink MUST NOT overwrite stored funding or accepted balance. Unknown funding
 IDs may invoke bounded metadata refresh; known stored relinks do not need mint
-I/O merely to establish immutable equality. Relinking never resets accepted
-balance or credits historical payment into the new session.
+I/O merely to establish immutable equality.
 
-A successful replacement link releases the old ownership while preserving
-session credit and counters. Failure alone does not detach the old channel. One
-session owns a channel at a time; acquisition elsewhere evicts the previous
-owner. Permission to use a channel elsewhere is not an instruction to repeatedly
+A successful replacement link releases the old ownership. Failure alone does not
+detach the old channel. Acquisition elsewhere evicts the previous owner.
+Permission to use a channel elsewhere is not an instruction to repeatedly
 reacquire it and fight another owner.
 
 ### 5.2 Payments and client records
@@ -480,24 +540,22 @@ The client keeps three records:
    channel. Persist balance and payment before exposing the signature to
    transport. Rejection, write failure, cancellation, or lost response never
    rolls this record back.
-2. **Confirmed session credit P:** largest validated cumulative paid total for
-   this session. It never decreases; consumption reduces remaining credit, not P.
+2. **Confirmed session paid total P:** largest validated cumulative paid total
+   for this session (§1.2).
 3. **Per-request pending increment:** for newly signed `C_new`, record
    `d = raw_to_msats(C_new - C_old)` from the prior durable signed balance and
    attach it to that request's FIFO entry. It is not yet spendable credit.
 
 A payment success MUST identify the submitted channel and report
 `balance_raw == B_new`. It must report at least `P + d`, where P includes prior
-validated responses and bonuses but excludes later pending payments. A smaller
-total is shortchanging and terminates the client. A larger total is bonus credit
-and raises P. Lower channel balances are allowed only in relink, query, or other
-reconciliation statuses. Later solicited statuses must report at least P.
+validated responses but excludes later pending payments. A smaller total is
+shortchanging and terminates the client. A larger total raises P. Lower channel
+balances are allowed only in relink, query, or other reconciliation statuses.
+Later solicited statuses must report at least P.
 
 Reported channel balance MUST NOT exceed what the client signed. A lower relay
 balance is legitimate after uncertain delivery and never lowers the client's
-durable record. A later cumulative payment may then credit more than its pending
-increment; the client accepts that bonus. This does not transfer accepted credit
-from a dead session.
+durable record, as explained in §1.2.
 
 Any definitive payment rejection removes only that request's pending expected
 increment. It does not decrease P or the durable signed balance. Unknown
@@ -666,7 +724,7 @@ R -> C  Error(CHANNEL_ADMISSION_DISABLED) # link
 R -> C  Error(PAYMENT_WRONG_CHANNEL)      # payment
 ```
 
-### A.2 Ambiguous old payment and bonus credit
+### A.2 Ambiguous old payment and a larger accepted increment
 
 ```text
 A uses msat. Client persisted and sent 100 in an old session that died.
@@ -676,7 +734,7 @@ R -> C  SessionStatus(linked=A, balance_raw=0, paid=0)
 C -> R  ChannelPayment(A, 130) # persist 130; minimum increment d1=30
 C -> R  ChannelPayment(A, 150) # persist 150; minimum increment d2=20
 R -> C  SessionStatus(linked=A, balance_raw=130, paid=130)
-         Validate against P(0)+30, accept bonus, set P=130.
+         Validate against P(0)+30, accept the larger total, set P=130.
 R -> C  SessionStatus(linked=A, balance_raw=150, paid=150)
          Validate against P(130)+20.
 ```
@@ -710,7 +768,7 @@ Implementation order:
 2. Implement structured messages, strict framing, fixed pricing, receiver-key
    retention, semantic relinks, ID-only unlink, and the error registry.
 3. Implement durable pre-send accounting, per-request increments, FIFO responses,
-   five-request capacity, exact numeric bounds, and bonus-credit handling.
+   five-request capacity, exact numeric bounds, and larger accepted increments.
 4. Implement advisories, scoped exclusions, session funding refusal, independent
    Ping/Pong, and extensions without coupling them to FIFO progress.
 5. Coordinate the client/relay switch to `h2-2026-10-06`; add conformance coverage
@@ -756,7 +814,8 @@ does not prescribe a queue, reducer, or client-control-loop architecture.
   deterministic DLEQ data; valid non-identical `e,s`; replayable zero signature
   semantics; immutable conflict before ownership mutation.
 - §5.2: pre-send crash/write failure; duplicate, lower, over-capacity, and numeric
-  failures; payment success below submitted `B_new`; shortchanging; bonus credit;
+  failures; payment success below submitted `B_new`; shortchanging; larger accepted
+  increments;
   impossible relay balance; no rollback, duplicate provisioning, or double
   credit; ambiguous acceptance and queued-response attribution.
 - §5.3: optional release ignored; replacement provisioning before unlink; strict
