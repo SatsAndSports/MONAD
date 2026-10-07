@@ -28,8 +28,10 @@ capability negotiation or a new session-protocol identifier.
 
 - At most one control stream is accepted per session. A second is rejected
   without replacing the first.
-- The relay's first application message MUST be `SessionStatus`. The client MUST
-  consume it before sending any message, including Ping or extensions.
+- The relay MUST send one initial `SessionStatus` after the control stream is
+  established and before processing any core client request.
+  `ExtensionNotification` messages may appear before it, but it is the relay's
+  first non-extension message.
 - A new session is unlinked and paused, with zero CONNECT counters.
 - The initial status supplies the state and funding information defined in §3.3.
 
@@ -66,7 +68,9 @@ For example, suppose the client previously signed **100 msat**, but the relay
 accepted only **80 msat**. In a new session, linking the channel starts the
 session paid total at zero. If the client then signs **130 msat**, its newly
 signed increment is **30 msat**, but the relay accepts an increase of **50 msat**
-and credits that amount to the new session.
+and credits that amount to the new session. For example, the payment that
+advanced the signed balance from 80 to 100 msat may have been lost when the old
+session terminated.
 
 A successful payment may increase the session paid total by more than the client
 expected, but never by less than its expected increment. The client accepts the
@@ -85,11 +89,10 @@ CONNECT tunnels in the session. Both counters start at zero and only increase.
 Opening or closing a tunnel, or changing the linked payment channel, does not
 reset them.
 
-Only forwarded cleartext data bytes count. Control-stream traffic and encrypted
-transport overhead are excluded. Bytes count when the next local layer accepts
-them, rather than merely when the relay reads or buffers them: each successful
-partial write to the target counts outbound bytes, and each successful H2 DATA
-submission counts inbound bytes. Failed writes do not count.
+Only payload bytes successfully forwarded through non-control CONNECT streams
+count. The control stream does not contribute to either counter. Each forwarded
+byte increments the counter for its direction exactly once; bytes that are only
+read or buffered but not forwarded do not count.
 
 ### 1.4 When data forwarding is enabled
 
@@ -141,10 +144,13 @@ candidates that cannot fit before requesting funding. Encoded size, not a
 separate proof-count limit, is authoritative.
 
 Reject duplicate keys, unknown top-level types, wrong-direction core messages,
-missing required fields, unexpected top-level fields, and invalid types or
-ranges. Forbidden fields are forbidden even as `null`. Public parameters and
-proofs follow their referenced NUT schemas; extension payloads follow §3.5.
-Unknown extension names inside a valid envelope are not unknown top-level types.
+missing required fields, unexpected top-level fields, and invalid outer field
+types or ranges. Forbidden fields are forbidden even as `null`. Senders MUST
+encode public parameters and proofs under their referenced NUT schemas. The relay
+MUST validate those nested schemas on first registration but MAY rely on its
+stored immutable record without parsing them for a known relink under §5.1.
+Extension payloads follow §3.5. Unknown extension names inside a valid envelope
+are not unknown top-level types.
 
 `Error.message` MUST fit within 4,096 UTF-8 bytes. JSON nesting, counting the root
 object as depth one, MUST NOT exceed 64; total object members plus array elements
@@ -189,9 +195,7 @@ integer and intermediate result, and reject larger values rather than support th
 full `u64` range. Some larger integers happen to be representable, but not every
 adjacent value is, and converting an already rounded `Number` to `BigInt` does
 not restore precision. The cap alone does not make multiplication, addition, or
-counters safe; each intermediate result needs its own exactness check. Ping
-nonces are an exception to reduced local ranges: every endpoint MUST parse and
-echo the full `u64` range losslessly because Ping has no FIFO error response.
+counters safe; each intermediate result needs its own exactness check.
 
 ### 2.3 Sensitive material
 
@@ -216,12 +220,11 @@ may contain null under their schema.
 | `ChannelPayment` | `channel_id`, `balance_raw: u64`, `signature` | Submit a cumulative signed channel payment |
 | `ChannelUnlink` | `channel_id` | Release linked ownership |
 | `GetSessionStatus` | None | Request a state snapshot |
-| `Ping` | `nonce: u64` | Request correlated liveness evidence |
+| `Ping` | `nonce: string` | Request correlated liveness evidence |
 | `ExtensionNotification` | `name: string`, `data: object` | Optional advisory extension; no response |
 
-These are structured objects, not `payment_json` strings. A link's
-`zero_balance_signature` signs the zero-balance Spilman commitment in the
-channel's unit; zero is implicit and `balance_raw` is forbidden. A payment's
+A link's `zero_balance_signature` signs the zero-balance Spilman commitment in
+the channel's unit; zero is implicit and `balance_raw` is forbidden. A payment's
 `balance_raw` maps directly to the Spilman commitment. Funding fields are
 forbidden on payments, even as null. Unlink has no final balance and signs
 nothing.
@@ -244,6 +247,11 @@ objects containing secrets or cached metadata are not public parameters. Future
 versions require an explicit mapping to their immutable specifications and
 version-specific validation rules.
 
+Noise bootstrap selects the Spilman protocol and mutually supported keyset
+versions; this control protocol uses that result and does not negotiate them.
+Today's bootstrap supports `v1` and `v2`. Future `v3` support requires bootstrap
+support and a version-specific mapping for any changed proof or signature shape.
+
 ### 3.2 Relay to client
 
 | `type` | Additional fields | Meaning |
@@ -252,7 +260,7 @@ version-specific validation rules.
 | `ChannelEvicted` | `channel_id`, `scope: "session" \| "relay"` | Advisory exclusion (§5.4) |
 | `ChannelReleaseRequested` | `channel_id` | Advisory request to unlink when convenient (§5.3) |
 | `Error` | `code: string`, `message: string` | Request rejection or fatal session error (§6) |
-| `Pong` | `nonce: u64` | Correlated response to Ping (§3.4) |
+| `Pong` | `nonce: string` | Correlated response to Ping (§3.4) |
 | `ExtensionNotification` | `name: string`, `data: object` | Optional advisory extension; no response |
 
 `Error.message` is diagnostic text and MUST NOT be parsed for behavior. There is
@@ -328,8 +336,7 @@ reorder requests or responses.
 A client MUST NOT create a sixth unanswered request. If a relay receives one
 while five remain unanswered, behavior beyond the guaranteed window is not
 interoperable: a relay MAY support it, apply backpressure, or send bounded
-`CONTROL_INVALID_MESSAGE` and terminate. Prompt Ping/Pong handling is no longer
-guaranteed after that client violation. The client limit keeps compliant ingress
+`CONTROL_INVALID_MESSAGE` and terminate. The client limit keeps compliant ingress
 readable without an unbounded ordinary-request queue.
 
 Apart from the initial status, the relay MUST NOT send an unsolicited
@@ -342,20 +349,20 @@ guarantee delivery across failure. Clients preserve every signed payment and
 treat unconfirmed outcomes conservatively.
 
 Ping and Pong are independent of that FIFO. A client MAY send Ping whenever it
-wants. Each carries a `u64` nonce, and the relay MUST respond as soon as practical
-with one Pong carrying the same nonce, including while ordinary validation or
-mint work is slow. Ping consumes none of the five pipeline positions. Multiple
-Pings are permitted; endpoints use normal bounded control-stream buffering and
-backpressure rather than a special one-probe rule.
+wants. Its nonce is an opaque JSON string; a client may encode a timestamp or any
+other locally useful value. The relay does not interpret it and MUST return one
+Pong containing the same decoded string. It SHOULD do so promptly. Each Pong
+answers one Ping occurrence.
 
-Each Ping occurrence requires exactly one Pong and each Pong answers one
-occurrence. Nonce reuse is not a protocol violation and does not change that
-one-for-one obligation.
+Ping consumes none of the five pipeline positions, and multiple Pings are
+permitted. A relay MAY process them in receive order with other control messages
+or separately. It need not search ahead in buffered input, interrupt active work,
+or provide zero-latency preemption. Normal bounded control-stream buffering and
+backpressure apply.
 
 Status, notifications, ordinary traffic, and a Pong with a different nonce do
 not answer a Ping, update request state, or cancel recovery already selected
-after a timeout. This liveness requirement does not bypass earlier H2 bytes or
-promise zero latency. Paused and unlinked sessions permit Ping; termination may
+after a timeout. Paused and unlinked sessions permit Ping; termination may
 prevent Pong delivery.
 
 Recommended policy is Ping after 5 seconds without valid relay control activity
@@ -377,6 +384,9 @@ The envelope has exactly those fields. `name` is nonempty and SHOULD be
 namespaced; `data` is an object. Unsupported names or payloads may be ignored
 after envelope and framing validation. Malformed envelopes remain fatal.
 
+Extension notifications may be sent at any time in either direction, including
+before the relay's initial `SessionStatus`.
+
 Extensions are optional hints. Ignoring one must leave the core protocol
 correct; they cannot change pricing, ownership, accounting, authorization, or
 required response semantics. Sender progress cannot depend on handling. They
@@ -387,7 +397,10 @@ negotiation, not a mandatory instruction hidden in extension data.
 
 ### 3.6 Unexpected messages
 
-After initialization, clients apply these rules after framing validation:
+Before the initial status, the client accepts valid extension notifications. The
+first non-extension relay message MUST be the initial `SessionStatus`; any other
+core relay message at that point is fatal. After initialization, clients apply
+these rules after framing validation:
 
 | Incoming relay message | Client handling |
 | --- | --- |
@@ -403,7 +416,6 @@ no state. Warnings MUST be rate-limited and redact payments, extension payloads,
 and arbitrary peer text. With pending work, clients validate financial invariants
 but never heuristically repair the FIFO.
 
-Control ingress may read Ping and later bytes while an earlier request is slow.
 Discovery of fatal input marks the session terminating at one serialized commit
 gate: committed operations retain fixed outcomes, while every uncommitted
 operation is cancelled and cannot mutate session, ownership, accepted-balance, or
@@ -429,8 +441,8 @@ MUST be rejected with HTTP 402 while paused; existing tunnels wait for credit.
 Ordinary transport failure or termination may still end them.
 
 For the byte-accounting events defined in §1.3, implementations MUST check counter
-and billing representability before each write and update the counter immediately
-after the accepted write.
+and billing representability before each bounded forwarding operation and update
+the counter immediately by the number of bytes successfully forwarded.
 
 Implementations choose their forwarding chunk sizes and in-flight limits. Larger
 chunks can increase the bytes forwarded after credit reaches zero and therefore
@@ -483,35 +495,32 @@ close, or a valid stored relink.
 ### 5.1 Link and relink
 
 Before ownership acquisition, the relay determines known-versus-new status by
-`channel_id`, then validates channel state and policy, public parameters, funding,
-unit, capacity, ordinary channel expiry, receiver policy, negotiated versions,
-the zero-balance signature, and exact numeric representability in the precedence
-defined by §6. Funding-keyset recovery-window admission applies only to
-unknown/new funding under §4, not stored relinks.
+`channel_id` and applies the precedence in §6.
 
-For a relink, stored immutable funding is authoritative but the complete supplied
-funding MUST be semantically identical:
+For an unknown channel, the relay MUST strictly validate the complete public
+parameters and Cashu V4 funding token under the bootstrap-negotiated Spilman
+protocol and keyset version before making the channel known. This includes
+recomputing the channel ID; validating receiver, unit, capacity, expiry,
+admission, mint, keyset, proof structure, and signatures; requiring funding
+`witness` and `p2pk_e` to be absent; and, for `v1` and `v2`, requiring DLEQ on
+every proof, deriving the expected deterministic `r`, requiring the submitted
+`r` to equal it, and verifying `(e,s,r)`. Funding-keyset recovery-window
+admission applies only to this first registration. Unknown funding IDs may
+invoke bounded metadata refresh. The relay stores the immutable funding only
+after all validation succeeds.
 
-1. Parse and normalize public parameters, require equality of the channel-ID
-   parameter tuple, and recompute the claimed channel ID.
-2. Decode the Cashu V4 funding token and require the same proof count and
-   positional equality of each proof's `amount`, `keyset_id`, `secret`, and `C`.
-   The deterministic secret's canonical UTF-8 bytes and the compressed point
-   encoding are exact; proof order within the token is signed and is not
-   set-like.
-3. Require funding `witness` and `p2pk_e` to be absent.
-4. For `v1` and `v2`, require DLEQ on every proof, derive the expected
-   deterministic `r`, require both submitted and stored `r` to equal it, and
-   verify the submitted `(e,s,r)`. Valid `e` and `s` need not be byte-identical.
-5. Validate the zero-balance signature against the stored channel. The signature
-   need not equal the original registration signature and is not evidence of
-   freshness because its signed message contains no session challenge.
+For a known channel, the relay's stored, previously validated immutable funding
+is authoritative. The client MUST still send the channel's original complete
+`params` and `funding_token` to keep one `ChannelLink` shape, but the relay MAY
+skip parsing, comparing, or cryptographically revalidating them and SHOULD
+normally reuse its stored record without mint I/O. Supplied relink data MUST NOT
+overwrite stored funding or accepted balance.
 
-A mismatch in steps 1-4 returns `LINK_FUNDING_CONFLICT` before ownership changes;
-an invalid step-5 signature returns `LINK_INVALID_ZERO_BALANCE_SIGNATURE`.
-Relink MUST NOT overwrite stored funding or accepted balance. Unknown funding
-IDs may invoke bounded metadata refresh; known stored relinks do not need mint
-I/O merely to establish immutable equality.
+Every relink still validates channel state and policy, bootstrap-negotiated
+keyset-version eligibility, exact numeric representability, and the supplied
+zero-balance signature against the stored channel before ownership changes. The
+signature need not equal the original registration signature and is not evidence
+of freshness because its signed message contains no session challenge.
 
 A successful replacement link releases the old ownership. Failure alone does not
 detach the old channel. Acquisition elsewhere evicts the previous owner.
@@ -654,10 +663,12 @@ Validation uses this precedence before any request mutation:
 3. `SESSION_FUNDING_DISABLED` precedes relay-scoped, then session-scoped,
    exclusion.
 4. Channel association and strict ownership precede channel state and policy.
-5. A link checks, in order: stored terminal state; public parameters/channel ID,
-   unit, capacity, and ordinary expiry; receiver; admission/link-retirement
-   policy; mint/keyset trust, version, and recovery metadata; immutable relink
-   equality or new funding; then the zero-balance signature.
+5. A link checks stored terminal state, ownership association, and applicable
+   policy first. An unknown channel then checks public parameters/channel ID,
+   unit, capacity, ordinary expiry, receiver, admission, mint/keyset trust,
+   version and recovery metadata, and funding. A known channel may use its stored
+   funding without comparing the submitted copy. Both paths finally check the
+   zero-balance signature.
 6. A payment checks, in order: terminal state, numeric conversion, signature, and
    monotonicity. `PAYMENT_NO_NEW_FUNDS` applies only after a valid signature; a
    final atomic comparison loss is `PAYMENT_CONFLICT`.
@@ -674,9 +685,8 @@ hide a fatal failure already discovered.
 | `CHANNEL_EVICTED_FROM_SESSION` | Link/payment | Nonfatal session-scoped exclusion; another channel may fund the session. |
 | `CHANNEL_RETIRED_AT_RELAY` | Link/payment | Nonfatal permanent exclusion for this authenticated relay identity. |
 | `LINK_INVALID_ZERO_BALANCE_SIGNATURE` | Link | The registration signature does not validate at balance zero; nonfatal correction, not blind replay. |
-| `LINK_INVALID_CHANNEL` | Link | Public parameters, channel ID, proof structure, capacity, or expiry are invalid and no more specific link code applies; nonfatal. |
+| `LINK_INVALID_CHANNEL` | New link | Public parameters, channel ID, proof structure, capacity, or expiry are invalid and no more specific link code applies; nonfatal. |
 | `LINK_RECEIVER_MISMATCH` | New link | Unknown channel is not bound to the current advertised receiver; nonfatal. A failed attempt does not make it known. |
-| `LINK_FUNDING_CONFLICT` | Relink | Supplied immutable funding differs semantically from stored funding; nonfatal and no ownership change. |
 | `LINK_MINT_OR_KEYSET_UNACCEPTABLE`, `LINK_UNSUPPORTED_UNIT` | Link | Nonfatal funding or policy incompatibility; not necessarily transient metadata lag. |
 | `LINK_KEYSET_REFRESH_RATE_LIMITED`, `LINK_KEYSET_REFRESH_BUSY`, `LINK_KEYSET_REFRESH_FAILED` | Link | Nonfatal refresh obstacle; bounded retry of unchanged funding may be appropriate. |
 | `LINK_KEYSET_VERSION_NOT_NEGOTIATED` | Link | Fatal to this session; do not mark an otherwise valid wallet channel globally unusable. |
@@ -750,7 +760,7 @@ The baseline below is descriptive; §§1-6 define the target if wording differs.
 | --- | --- | --- |
 | Session identifier | `h2` | §1: coordinated `h2-2026-10-06` switch |
 | Link/payment encoding | Shared `payment_json` | §3.1 structured messages and Cashu V4 funding token |
-| Relink funding | Missing/conflicting submitted data can be ignored | §5.1 semantic equality |
+| Relink funding | Funding may be omitted or ignored | §5.1 complete request shape with authoritative stored funding |
 | Unlink | Final balance plus `ChannelUnlinked` | §5.3 strict ID-only unlink |
 | Advertisements/pricing | Ordered entries with keyset IDs and per-entry rates | §3.3 and §4 |
 | Receiver | Fixed for session/runtime identity | §4 stored-channel-safe rotation |
@@ -766,7 +776,7 @@ Implementation order:
 1. Make client keyset selection and reuse independent of advertised IDs, then
    remove preference plumbing and adopt the mint/unit map.
 2. Implement structured messages, strict framing, fixed pricing, receiver-key
-   retention, semantic relinks, ID-only unlink, and the error registry.
+   retention, stored-funding relinks, ID-only unlink, and the error registry.
 3. Implement durable pre-send accounting, per-request increments, FIFO responses,
    five-request capacity, exact numeric bounds, and larger accepted increments.
 4. Implement advisories, scoped exclusions, session funding refusal, independent
@@ -785,34 +795,36 @@ does not prescribe a queue, reducer, or client-control-loop architecture.
 
 ## Appendix C. Conformance coverage
 
-- §1: exact protocol selection, initial status, second-control rejection, paused
-  control availability, and teardown without erasing funding or closing on-mint.
+- §1: exact protocol selection, extensions before initial status, second-control
+  rejection, paused control availability, and teardown without erasing funding
+  or closing on-mint.
 - §2: fragmentation/coalescing; exact 1 MiB inbound/outbound boundary; overlong
   complete and partial lines; proof-heavy Cashu V4 link preflight; parser
   complexity; duplicate, unknown, wrong-direction, and forbidden-null fields;
   exact reduced ranges and checked intermediates; sensitive-data redaction.
-- §3: five blocked outstanding requests with prompt Ping/Pong; a prohibited sixth;
-  mixed success/errors; failed redundant relink preserving ownership before a
+- §3: five blocked outstanding requests and a prohibited sixth; mixed
+  success/errors; failed redundant relink preserving ownership before a
   successful queued payment; fixed snapshots and successful, failed, and open
   CONNECT count transitions; empty-FIFO discard; fatal input behind pending
   requests; multiple unanswered requests at termination; bounded redacted
   warnings.
-- §3.4: paused and concurrent Pings, same-nonce Pong responses, blocked-work Pong,
-  Ping flooding under blocked outbound flow control, local stalls, timeout races,
-  and no claim of destination reachability.
+- §3.4: opaque string nonces, paused and concurrent Pings, same-nonce Pong
+  responses, in-order and independent relay handling, local stalls, timeout
+  races, and no claim of destination reachability.
 - §3.5: ignored bidirectional extensions and advisories with no response, FIFO,
   accounting, or liveness effect; malformed envelopes remain fatal.
-- §4: exact one-round billing; partial writes; configured chunk/in-flight
+- §4: exact one-round billing; partial forwarding; configured chunk/in-flight
   overshoot exposure; counter exhaustion; fixed rates; TCP/QUIC accounting
   excluding pooled connections; one current receiver; known-channel lookup before receiver checks;
   old-receiver relink or explicit retirement; failed attempts creating no durable
   recognition; rotation during provisioning rejecting and recovering an unknown channel;
   recovery-window equality, zero, absence, and overflow; exclusions surviving
   rotation and relay restart.
-- §5.1: complete relink data; Cashu V4 decoding; normalized params; ordered
-  proof-core equality; witness and `p2pk_e` rejection; missing/mismatched
-  deterministic DLEQ data; valid non-identical `e,s`; replayable zero signature
-  semantics; immutable conflict before ownership mutation.
+- §5.1: strict first-registration Cashu V4 and deterministic DLEQ validation;
+  failed attempts creating no durable recognition; known relinks using stored
+  immutable funding without mint I/O or redundant cryptographic validation;
+  supplied relink data never overwriting stored funding; replayable zero-signature
+  semantics and validation before ownership mutation.
 - §5.2: pre-send crash/write failure; duplicate, lower, over-capacity, and numeric
   failures; payment success below submitted `B_new`; shortchanging; larger accepted
   increments;
