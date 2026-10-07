@@ -20,6 +20,8 @@ pub type MintUnitAdvertisements = BTreeMap<String, BTreeMap<String, MintUnitAdve
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MintUnitAdvertisement {
+    /// Minimum remaining channel lifetime when a link or relink is accepted.
+    pub minimum_channel_lifetime_secs: u64,
     /// Required interval between channel expiry and funding keyset final expiry.
     pub funding_keyset_recovery_window_secs: u64,
 }
@@ -27,6 +29,7 @@ pub struct MintUnitAdvertisement {
 /// Local flattened payment option. Prices come from the session, not the map.
 #[derive(Debug, Clone)]
 pub struct PaymentOption {
+    pub minimum_channel_lifetime_secs: u64,
     pub funding_keyset_recovery_window_secs: u64,
     pub mint_url: String,
     pub unit: String,
@@ -44,6 +47,7 @@ pub fn advertisement_options(
         .iter()
         .flat_map(|(mint_url, units)| {
             units.iter().map(move |(unit, window)| PaymentOption {
+                minimum_channel_lifetime_secs: window.minimum_channel_lifetime_secs,
                 mint_url: mint_url.clone(),
                 unit: unit.clone(),
                 funding_keyset_recovery_window_secs: window.funding_keyset_recovery_window_secs,
@@ -168,12 +172,12 @@ mod advertisement_tests {
     #[test]
     fn advertisement_order_is_local_and_value_fields_are_explicit() {
         let first: MintUnitAdvertisements = serde_json::from_str(r#"{
-            "mint-b":{"sat":{"funding_keyset_recovery_window_secs":7}},
-            "mint-a":{"sat":{"funding_keyset_recovery_window_secs":9},"msat":{"funding_keyset_recovery_window_secs":8}}
+            "mint-b":{"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":7}},
+            "mint-a":{"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":9},"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":8}}
         }"#).unwrap();
         let reordered: MintUnitAdvertisements = serde_json::from_str(r#"{
-            "mint-a":{"msat":{"funding_keyset_recovery_window_secs":8},"sat":{"funding_keyset_recovery_window_secs":9}},
-            "mint-b":{"sat":{"funding_keyset_recovery_window_secs":7}}
+            "mint-a":{"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":8},"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":9}},
+            "mint-b":{"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":7}}
         }"#).unwrap();
         let order = |ads: &MintUnitAdvertisements| {
             advertisement_options(ads, 11, 22)
@@ -194,8 +198,10 @@ mod advertisement_tests {
             json!(86400),
             json!({}),
             json!({"minimum_time_to_expiry":86400}),
-            json!({"funding_keyset_recovery_window_secs":86400, "keyset_ids":[]}),
-            json!({"funding_keyset_recovery_window_secs":86400, "bytes_in_per_msat":1}),
+            json!({"funding_keyset_recovery_window_secs":86400}),
+            json!({"minimum_channel_lifetime_secs":3600}),
+            json!({"minimum_channel_lifetime_secs":3600, "funding_keyset_recovery_window_secs":86400, "keyset_ids":[]}),
+            json!({"minimum_channel_lifetime_secs":3600, "funding_keyset_recovery_window_secs":86400, "bytes_in_per_msat":1}),
         ] {
             assert!(serde_json::from_value::<MintUnitAdvertisements>(
                 json!({"mint":{"sat":invalid}})
@@ -214,6 +220,7 @@ mod advertisement_tests {
                     BTreeMap::from([(
                         "sat".into(),
                         MintUnitAdvertisement {
+                            minimum_channel_lifetime_secs: 3600,
                             funding_keyset_recovery_window_secs: 123,
                         },
                     )]),
@@ -224,12 +231,14 @@ mod advertisement_tests {
                         (
                             "sat".into(),
                             MintUnitAdvertisement {
+                                minimum_channel_lifetime_secs: 3600,
                                 funding_keyset_recovery_window_secs: 0,
                             },
                         ),
                         (
                             "msat".into(),
                             MintUnitAdvertisement {
+                                minimum_channel_lifetime_secs: 3600,
                                 funding_keyset_recovery_window_secs: 86_400,
                             },
                         ),
@@ -251,8 +260,8 @@ mod advertisement_tests {
         assert_eq!(
             value["advertisements"],
             json!({
-                "https://mint-a": {"sat": {"funding_keyset_recovery_window_secs": 0}, "msat": {"funding_keyset_recovery_window_secs": 86400}},
-                "https://mint-b": {"sat": {"funding_keyset_recovery_window_secs": 123}}
+                "https://mint-a": {"sat": {"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs": 0}, "msat": {"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs": 86400}},
+                "https://mint-b": {"sat": {"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs": 123}}
             })
         );
         assert_eq!(value["bytes_in_per_msat"], 11);
@@ -266,9 +275,9 @@ mod advertisement_tests {
         };
         let options = advertisement_options(&advertisements, 11, 22);
         assert_eq!(options.len(), 3);
-        assert!(options
-            .iter()
-            .all(|o| o.in_bytes_per_millisat == 11 && o.out_bytes_per_millisat == 22));
+        assert!(options.iter().all(|o| o.in_bytes_per_millisat == 11
+            && o.out_bytes_per_millisat == 22
+            && o.minimum_channel_lifetime_secs == 3600));
         let mut empty = value.clone();
         empty["advertisements"] = json!({});
         assert!(serde_json::from_value::<ServerMessage>(empty).is_ok());

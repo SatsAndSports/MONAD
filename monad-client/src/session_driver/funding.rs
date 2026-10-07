@@ -828,6 +828,7 @@ mod tests {
     fn advertisement(mint_url: &str) -> PaymentOption {
         PaymentOption {
             funding_keyset_recovery_window_secs: 86_400,
+            minimum_channel_lifetime_secs: 3600,
             mint_url: mint_url.to_string(),
             unit: "sat".to_string(),
             in_bytes_per_millisat: 1,

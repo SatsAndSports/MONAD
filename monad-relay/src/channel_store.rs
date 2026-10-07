@@ -213,22 +213,37 @@ impl ChannelStore {
 
     /// Set the owner of a channel to `session_id`. Returns the previous owner
     /// if it was a different session (i.e. an eviction).
+    #[cfg(test)]
     pub(crate) fn set_channel_owner(
         &self,
         channel_id: &str,
         session_id: [u8; 32],
     ) -> Result<Option<[u8; 32]>, String> {
-        let mut ownership = self.ownership_lock()?;
+        self.set_channel_owner_checked(channel_id, session_id, || Ok(()), |error| error)
+    }
+
+    /// Recheck admission while holding ownership authority, after potentially
+    /// blocking storage/retirement checks and immediately before changing owner.
+    pub(crate) fn set_channel_owner_checked<E>(
+        &self,
+        channel_id: &str,
+        session_id: [u8; 32],
+        check: impl FnOnce() -> Result<(), E>,
+        store_error: impl Fn(String) -> E,
+    ) -> Result<Option<[u8; 32]>, E> {
+        let mut ownership = self.ownership_lock().map_err(&store_error)?;
         if ownership.retired.contains(channel_id)
             || self
                 .metadata
                 .as_ref()
                 .map(|m| m.is_retired(channel_id))
-                .transpose()?
+                .transpose()
+                .map_err(&store_error)?
                 .unwrap_or(false)
         {
-            return Err("channel retired".into());
+            return Err(store_error("channel retired".into()));
         }
+        check()?;
         let evicted = match ownership.owners.get(channel_id).copied().flatten() {
             Some(owner) if owner != session_id => Some(owner),
             _ => None,
@@ -403,6 +418,60 @@ mod tests {
             balance,
             signature: "sig".to_string(),
         }
+    }
+
+    #[test]
+    fn delayed_ownership_commit_rechecks_lifetime_without_evicting_or_changing_balance() {
+        use monad_common::keyset_expiry::channel_covers_minimum_lifetime;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = ChannelStore::new(Arc::new(
+            SqliteStorage::open(db.path().to_str().unwrap()).unwrap(),
+        ));
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(10))
+            .unwrap();
+        store.set_channel_owner("chan", [1; 32]).unwrap();
+        let clock = Arc::new(AtomicU64::new(100));
+        let lock = store.ownership_lock().unwrap();
+        let (validated, ready) = std::sync::mpsc::channel();
+        let worker_store = store.clone();
+        let worker_clock = clock.clone();
+        let worker = std::thread::spawn(move || {
+            assert!(channel_covers_minimum_lifetime(
+                worker_clock.load(Ordering::SeqCst),
+                160,
+                60
+            ));
+            validated.send(()).unwrap();
+            worker_store.set_channel_owner_checked(
+                "chan",
+                [2; 32],
+                || {
+                    if channel_covers_minimum_lifetime(worker_clock.load(Ordering::SeqCst), 160, 60)
+                    {
+                        Ok(())
+                    } else {
+                        Err("expired at commit".to_string())
+                    }
+                },
+                |error| error,
+            )
+        });
+        ready.recv().unwrap();
+        clock.store(101, Ordering::SeqCst);
+        drop(lock);
+        assert_eq!(worker.join().unwrap(), Err("expired at commit".into()));
+        assert_eq!(store.ownership_lock().unwrap().owner("chan"), Some([1; 32]));
+        assert_eq!(
+            store
+                .get_channel("chan")
+                .unwrap()
+                .unwrap()
+                .latest_payment
+                .balance,
+            10
+        );
     }
 
     #[test]

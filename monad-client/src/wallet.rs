@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayPaymentOffer {
+    pub minimum_channel_lifetime_secs: u64,
     pub funding_keyset_recovery_window_secs: u64,
     pub receiver_pubkey: String,
     pub mint_url: String,
@@ -29,6 +30,7 @@ impl RelayPaymentOffer {
     ) -> Self {
         Self {
             receiver_pubkey,
+            minimum_channel_lifetime_secs: advertisement.minimum_channel_lifetime_secs,
             funding_keyset_recovery_window_secs: advertisement.funding_keyset_recovery_window_secs,
             mint_url: advertisement.mint_url.clone(),
             unit: advertisement.unit.clone(),
@@ -270,6 +272,11 @@ pub fn select_channel(
     for channel in channels {
         if channel.state != WalletChannelState::Open
             || channel.is_expired(now)
+            || !monad_common::keyset_expiry::channel_covers_minimum_lifetime(
+                now,
+                channel.expiry_timestamp,
+                offer.minimum_channel_lifetime_secs,
+            )
             || channel.current_signed_balance_msats >= channel.capacity_msats
         {
             continue;
@@ -817,6 +824,7 @@ mod tests {
     fn offer(unit: &str) -> RelayPaymentOffer {
         RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
+            minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: "receiver".to_string(),
             mint_url: "https://mint".to_string(),
             unit: unit.to_string(),
@@ -845,7 +853,7 @@ mod tests {
     fn mint_unit_advertisements_need_no_keysets_for_selection_or_mock_provisioning() {
         let versions = BTreeSet::from(["v1".to_string()]);
         let advertisements =
-            serde_json::from_str(r#"{"https://mint":{"sat":{"funding_keyset_recovery_window_secs":86400},"msat":{"funding_keyset_recovery_window_secs":86400}}}"#).unwrap();
+            serde_json::from_str(r#"{"https://mint":{"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400},"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400}}}"#).unwrap();
         for advertisement in monad_common::protocol::advertisement_options(&advertisements, 11, 22)
         {
             let candidate =
@@ -880,6 +888,29 @@ mod tests {
                 .keyset_id
                 .starts_with(prefix));
         }
+    }
+
+    #[test]
+    fn selector_checks_remaining_lifetime_on_reuse() {
+        let candidate = offer("msat");
+        let expiring = WalletChannel {
+            expiry_timestamp: 3700,
+            ..channel("old")
+        };
+        assert!(
+            select_channel(std::slice::from_ref(&expiring), &candidate, session(1), 100).is_some()
+        );
+        assert!(
+            select_channel(std::slice::from_ref(&expiring), &candidate, session(1), 101).is_none()
+        );
+        let attached = WalletChannel {
+            attached_session_id: Some(session(1)),
+            ..expiring
+        };
+        assert!(select_channel(&[attached], &candidate, session(1), 101).is_none());
+        assert!(
+            select_channel(&[channel("future")], &candidate, session(1), u64::MAX - 10).is_none()
+        );
     }
 
     #[test]

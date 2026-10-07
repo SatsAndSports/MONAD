@@ -1818,6 +1818,7 @@ async fn assert_auto_close_worker_lifecycle(cancel: Option<bool>) {
     .await;
     let offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -2444,6 +2445,7 @@ impl DrainTestContext {
         .await;
         let offer = RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
+            minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: receiver_pubkey_hex,
             mint_url: mint_url.clone(),
             unit: "sat".to_string(),
@@ -4133,6 +4135,23 @@ async fn test_expiring_funding_keyset_discovery_persistence_and_link_admission()
             Err(LinkError::InvalidChannel(_))
         ));
         assert!(strict.linked_channel_status(&channel).is_none());
+        let short_lifetime = manager
+            .spilman_payments_for_with_policy(
+                "expiry",
+                discovered.clone(),
+                trusted.clone(),
+                RelayChannelPolicyConfig {
+                    min_expiry_secs: 172_800,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(short_lifetime.minimum_channel_lifetime_secs(), 172_800);
+        assert_eq!(
+            short_lifetime.link_channel(&versions, [2; 32], &link),
+            Err(LinkError::ChannelExpired)
+        );
+        assert!(short_lifetime.linked_channel_status(&channel).is_none());
         let payments = manager
             .spilman_payments_for("expiry", discovered, trusted)
             .unwrap();
@@ -4154,9 +4173,18 @@ async fn test_expiring_funding_keyset_discovery_persistence_and_link_admission()
                 strict.link_channel(&versions, [2; 32], &relink.to_string()),
                 Err(LinkError::InvalidChannel(_))
             ));
+            if forged {
+                // Claiming a later expiry cannot bypass the stored expiry.
+                relink["params"]["expiry_timestamp"] = serde_json::json!(u64::MAX - 1);
+            }
+            assert_eq!(
+                short_lifetime.link_channel(&versions, [2; 32], &relink.to_string()),
+                Err(LinkError::ChannelExpired)
+            );
         }
         let offer = RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
+            minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: receiver.public_key().to_hex(),
             mint_url: url,
             unit: "sat".to_string(),
@@ -4241,6 +4269,7 @@ async fn test_negotiated_keyset_link_enforcement_is_session_local() {
         let channel = wallet.pre_create_channel(1000).await.unwrap();
         let offer = RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
+            minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: receiver.public_key().to_hex(),
             mint_url: url,
             unit: "sat".to_string(),
@@ -4617,11 +4646,10 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
     let _ = mint_shutdown.send(());
 }
 
-/// End-to-end test that the session payment driver marks a real Spilman channel
-/// unusable and reselects when the relay rejects its ChannelLink because the
-/// channel expiry is too soon for relay policy.
+/// The advertised minimum lets the driver skip a too-short real channel locally
+/// without marking its wallet record unusable or sending it to the relay.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_session_payment_driver_marks_expiry_too_soon_channel_and_reselects() {
+async fn test_session_payment_driver_skips_expiry_too_soon_channel_and_preserves_it() {
     let mint_helper = TestMintHelper::new().await.unwrap();
     let mint_url = "https://test-mint.invalid".to_string();
     let keyset_id = mint_helper.keyset_id().to_string();
@@ -4662,7 +4690,7 @@ async fn test_session_payment_driver_marks_expiry_too_soon_channel_and_reselects
 
     let storage = tempfile::NamedTempFile::new().unwrap();
     let transport_key = SecpTransportKeypair::generate();
-    let (server_addr, pubkey, relay_handle, shutdown_tx, _payments) = start_persistent_relay(
+    let (server_addr, pubkey, relay_handle, shutdown_tx, payments) = start_persistent_relay(
         "127.0.0.1:0".parse().unwrap(),
         &transport_key,
         receiver_secret,
@@ -4694,14 +4722,24 @@ async fn test_session_payment_driver_marks_expiry_too_soon_channel_and_reselects
 
     assert_eq!(
         wallet.get_channel(&expired_channel_id).unwrap().state,
-        WalletChannelState::Closing,
-        "expiry-too-soon channel should be marked globally unusable"
+        WalletChannelState::Open,
+        "local admission policy must not invalidate a recoverable channel"
+    );
+    assert!(payments
+        .linked_channel_status(&expired_channel_id)
+        .is_none());
+    assert_eq!(
+        wallet
+            .get_channel(&expired_channel_id)
+            .unwrap()
+            .current_signed_balance_msats,
+        0
     );
     let fallback = wallet.get_channel(&fallback_channel_id).unwrap();
     assert_eq!(fallback.state, WalletChannelState::Open);
     assert!(
         fallback.current_signed_balance_msats > 0,
-        "fallback channel should be linked and paid after relay rejects expired channel"
+        "fallback channel should be linked and paid after skipping the too-short channel"
     );
 
     driver_handle.abort();
@@ -6812,6 +6850,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
 
     let old_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
@@ -7047,6 +7086,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
     );
     let old_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -7185,6 +7225,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
     );
     let new_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
@@ -7317,6 +7358,7 @@ async fn test_channel_link_refreshes_and_accepts_new_keyset() {
     .await;
     let new_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -7414,6 +7456,7 @@ async fn test_malformed_unknown_keyset_links_do_not_consume_refresh_budget() {
     .await;
     let offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -7465,6 +7508,7 @@ async fn test_malformed_unknown_keyset_links_do_not_consume_refresh_budget() {
     .await;
     let foreign_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         ..offer
     };
     let foreign_channel_id = foreign_wallet.pre_create_channel(1000).await.unwrap();
@@ -7548,6 +7592,7 @@ async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
     .await;
     let offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url,
         unit: "sat".to_string(),
@@ -7946,6 +7991,7 @@ relays:
     listen: 127.0.0.1:0
     channel_policy:
       funding_keyset_recovery_window: 2d
+      min_expiry: 2h
     trusted_mints:
       - url: {}
         units: [sat]
@@ -7978,6 +8024,7 @@ relays:
     assert_eq!(status.advertisements.len(), 1);
     assert_eq!(status.advertisements[0].mint_url, mint_url);
     assert_eq!(status.advertisements[0].unit, "sat");
+    assert_eq!(status.advertisements[0].minimum_channel_lifetime_secs, 7200);
     assert_eq!(
         status.advertisements[0].funding_keyset_recovery_window_secs,
         172_800
@@ -7988,6 +8035,7 @@ relays:
         &supported_cashu_spilman_keyset_versions(),
     );
     assert_eq!(offer.funding_keyset_recovery_window_secs, 172_800);
+    assert_eq!(offer.minimum_channel_lifetime_secs, 7200);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -12441,6 +12489,7 @@ async fn test_wallet_manager_drain_swap_combines_multiple_closed_channels() {
     .await;
     let offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -12525,6 +12574,7 @@ async fn test_wallet_manager_drain_swap_recovers_after_ambiguous_submission() {
     .await;
     let offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -13707,6 +13757,7 @@ async fn test_wallet_manager_drain_keyset_rejection_refreshes_reprepares_and_ret
     .await;
     let offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -14031,6 +14082,7 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
     .await;
     let old_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -14081,6 +14133,7 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
     .await;
     let new_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -14210,6 +14263,7 @@ async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_an
     .await;
     let old_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex.clone(),
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),
@@ -14259,6 +14313,7 @@ async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_an
     .await;
     let new_offer = RelayPaymentOffer {
         funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
         mint_url: mint_url.clone(),
         unit: "sat".to_string(),

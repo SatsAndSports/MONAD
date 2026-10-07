@@ -64,6 +64,10 @@ pub trait RelayPayments: Send + Sync + 'static {
         monad_common::keyset_expiry::DEFAULT_RECOVERY_WINDOW_SECS
     }
 
+    fn minimum_channel_lifetime_secs(&self) -> u64 {
+        RelayChannelPolicyConfig::default().min_expiry_secs
+    }
+
     fn link_channel(
         &self,
         negotiated_versions: &BTreeSet<String>,
@@ -275,6 +279,7 @@ struct MonadHost {
 
 #[derive(Debug)]
 pub struct SpilmanRelayPayments {
+    minimum_channel_lifetime_secs: u64,
     funding_keyset_recovery_window_secs: u64,
     bridge: SpilmanBridge<MonadHost, PaymentContext>,
     store: ChannelStore,
@@ -293,6 +298,7 @@ impl SpilmanRelayPayments {
     ) -> Self {
         let funding_keyset_recovery_window_secs =
             channel_policy.funding_keyset_recovery_window_secs;
+        let minimum_channel_lifetime_secs = channel_policy.min_expiry_secs;
         let host = MonadHost {
             receiver_secret: receiver_secret.clone(),
             mint_cache: mint_cache.clone(),
@@ -302,6 +308,7 @@ impl SpilmanRelayPayments {
         };
         Self {
             bridge: SpilmanBridge::new(host),
+            minimum_channel_lifetime_secs,
             funding_keyset_recovery_window_secs,
             store,
             mint_cache,
@@ -608,6 +615,10 @@ impl RelayPayments for SpilmanRelayPayments {
         self.funding_keyset_recovery_window_secs
     }
 
+    fn minimum_channel_lifetime_secs(&self) -> u64 {
+        self.minimum_channel_lifetime_secs
+    }
+
     fn link_channel(
         &self,
         negotiated_versions: &BTreeSet<String>,
@@ -645,6 +656,22 @@ impl RelayPayments for SpilmanRelayPayments {
         if !keyset_version_is_negotiated(&id, negotiated_versions) {
             return Err(LinkError::KeysetVersionNotNegotiated);
         }
+
+        let channel_expiry = params["expiry_timestamp"]
+            .as_u64()
+            .ok_or_else(|| LinkError::InvalidChannel("missing expiry_timestamp".to_string()))?;
+        let check_lifetime = || {
+            if monad_common::keyset_expiry::channel_covers_minimum_lifetime(
+                cashu::util::unix_time(),
+                channel_expiry,
+                self.minimum_channel_lifetime_secs,
+            ) {
+                Ok(())
+            } else {
+                Err(LinkError::ChannelExpired)
+            }
+        };
+        check_lifetime()?;
 
         // Stored channel parameters and funding metadata are authoritative on
         // relink. Admission must fail before persistence or ownership changes.
@@ -713,6 +740,7 @@ impl RelayPayments for SpilmanRelayPayments {
             // Check the exact metadata validated by the bridge, not a separate
             // cache snapshot that could race a concurrent mint refresh.
             check_funding_expiry(&validated.funding.keyset_info_json)?;
+            check_lifetime()?;
             self.bridge.record_validated_new_channel(&validated);
             capacity
         };
@@ -726,16 +754,18 @@ impl RelayPayments for SpilmanRelayPayments {
             })?;
         let capacity_millisats = channel.unit.capacity_millisats(capacity_raw)?;
 
-        let evicted_session = self
-            .store
-            .set_channel_owner(&payment.channel_id, session_id)
-            .map_err(|error| {
+        let evicted_session = self.store.set_channel_owner_checked(
+            &payment.channel_id,
+            session_id,
+            check_lifetime,
+            |error| {
                 if error == "channel retired" {
                     LinkError::Retired
                 } else {
                     LinkError::Internal(error)
                 }
-            })?;
+            },
+        )?;
 
         Ok(LinkOutcome {
             channel_id: payment.channel_id,

@@ -393,6 +393,9 @@ impl SessionState {
                 advertisements.entry(mint_url.clone()).or_default().insert(
                     unit.clone(),
                     MintUnitAdvertisement {
+                        minimum_channel_lifetime_secs: self
+                            .payments
+                            .minimum_channel_lifetime_secs(),
                         funding_keyset_recovery_window_secs: self
                             .payments
                             .funding_keyset_recovery_window_secs(),

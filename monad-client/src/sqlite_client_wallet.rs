@@ -1087,11 +1087,7 @@ impl SqliteClientWallet {
             ));
         }
         self.ensure_offer_keysets_cached(offer)?;
-        #[cfg(not(feature = "funds-lifecycle-test"))]
-        let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
-        #[cfg(feature = "funds-lifecycle-test")]
-        let expiry_timestamp =
-            Self::now_seconds()? + lifecycle_test::lifetime(CHANNEL_EXPIRY_SECONDS);
+        let expiry_timestamp = Self::expiry_for_offer(offer)?;
         // Target-capacity provisioning computes the exact post-swap channel
         // capacity we want, selects loose proofs that can fund it after input
         // fees, and then asks the mint to swap those proofs into channel funding
@@ -2349,6 +2345,31 @@ impl SqliteClientWallet {
             .map_err(|e| WalletError::Backend(format!("system time before unix epoch: {e}")))
     }
 
+    fn expiry_for_offer(offer: &RelayPaymentOffer) -> Result<u64, WalletError> {
+        #[cfg(not(feature = "funds-lifecycle-test"))]
+        let preferred_lifetime = CHANNEL_EXPIRY_SECONDS;
+        #[cfg(feature = "funds-lifecycle-test")]
+        let preferred_lifetime = lifecycle_test::lifetime(CHANNEL_EXPIRY_SECONDS);
+        Self::opening_expiry(
+            Self::now_seconds()?,
+            preferred_lifetime,
+            offer.minimum_channel_lifetime_secs,
+        )
+    }
+
+    fn opening_expiry(now: u64, preferred_lifetime: u64, minimum: u64) -> Result<u64, WalletError> {
+        // Allow provisioning/network delay: 10% of the relay minimum, bounded
+        // to 1..=60 seconds. Never shorten our normal desired channel lifetime.
+        let margin = (minimum / 10).clamp(1, 60);
+        minimum
+            .checked_add(margin)
+            .and_then(|required| now.checked_add(preferred_lifetime.max(required)))
+            .filter(|expiry| i64::try_from(*expiry).is_ok())
+            .ok_or_else(|| {
+                WalletError::Backend("channel expiry exceeds supported timestamp range".into())
+            })
+    }
+
     fn submit_open_attempt_with_networking<N: OpeningRecoveryNetworking>(
         &self,
         attempt: &ClientOpenAttempt,
@@ -3536,11 +3557,7 @@ impl MonadWallet for SqliteClientWallet {
     ) -> Result<String, WalletError> {
         let funding_token_target_raw = msats_to_raw_units(&offer.unit, funding_token_target_msats)
             .map_err(|error| preflight_offer_error(offer, error))?;
-        #[cfg(not(feature = "funds-lifecycle-test"))]
-        let expiry_timestamp = Self::now_seconds()? + CHANNEL_EXPIRY_SECONDS;
-        #[cfg(feature = "funds-lifecycle-test")]
-        let expiry_timestamp =
-            Self::now_seconds()? + lifecycle_test::lifetime(CHANNEL_EXPIRY_SECONDS);
+        let expiry_timestamp = Self::expiry_for_offer(offer)?;
         // Plain provisioning consumes strict smallest-first inputs until their
         // post-input-fee value covers the funding-token target. If the mint
         // rejects the first open because our cached output keyset is stale, the
@@ -5699,6 +5716,7 @@ mod tests {
     fn offer(mint_url: &str, receiver_pubkey: &str, _fixture_keyset_id: &str) -> RelayPaymentOffer {
         RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
+            minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: receiver_pubkey.to_string(),
             mint_url: mint_url.to_string(),
             unit: "sat".to_string(),
@@ -5706,6 +5724,22 @@ mod tests {
             in_bytes_per_millisat: 1,
             out_bytes_per_millisat: 1,
         }
+    }
+
+    #[test]
+    fn opening_expiry_covers_minimum_with_bounded_margin_and_checked_arithmetic() {
+        assert_eq!(
+            SqliteClientWallet::opening_expiry(100, 86_400, 3600).unwrap(),
+            86_500
+        );
+        assert_eq!(
+            SqliteClientWallet::opening_expiry(100, 86_400, 172_800).unwrap(),
+            172_960
+        );
+        assert_eq!(SqliteClientWallet::opening_expiry(100, 8, 1).unwrap(), 108);
+        assert!(SqliteClientWallet::opening_expiry(100, 86_400, u64::MAX).is_err());
+        assert!(SqliteClientWallet::opening_expiry(u64::MAX, 86_400, 1).is_err());
+        assert!(SqliteClientWallet::opening_expiry(i64::MAX as u64, 86_400, 1).is_err());
     }
 
     fn selection_proof(id: &str, keyset_id: &str, amount_raw: u64) -> LooseProofRecord {
@@ -7928,7 +7962,9 @@ mod tests {
             "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2".to_string();
 
         let funding_token_target_msats = funding_token_target_raw * 1000;
-        let offer = offer(&mint_url, &receiver_pubkey, &keyset_id);
+        let mut offer = offer(&mint_url, &receiver_pubkey, &keyset_id);
+        offer.minimum_channel_lifetime_secs = 2 * CHANNEL_EXPIRY_SECONDS;
+        let expected_lifetime = offer.minimum_channel_lifetime_secs + 60;
         let before_open = SqliteClientWallet::now_seconds().unwrap();
         let channel_id = wallet
             .provision_channel(&offer, funding_token_target_msats)
@@ -7969,12 +8005,12 @@ mod tests {
         let stored_expiry = u64::try_from(stored_expiry).unwrap();
         assert_eq!(channel.expiry_timestamp, stored_expiry);
         assert!(
-            stored_expiry >= before_open + CHANNEL_EXPIRY_SECONDS,
-            "stored expiry should be no earlier than before_open + CHANNEL_EXPIRY_SECONDS"
+            stored_expiry >= before_open + expected_lifetime,
+            "stored expiry must cover the relay minimum plus margin"
         );
         assert!(
-            stored_expiry <= after_open + CHANNEL_EXPIRY_SECONDS,
-            "stored expiry should be no later than after_open + CHANNEL_EXPIRY_SECONDS"
+            stored_expiry <= after_open + expected_lifetime,
+            "stored expiry must use the advertised minimum plus bounded margin"
         );
 
         // Surplus reserved input should come back as plain loose change.
@@ -8668,6 +8704,7 @@ mod tests {
         };
         let offer = RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
+            minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: "receiver".to_string(),
             mint_url: prepared.mint_url.clone(),
             unit: "sat".to_string(),
@@ -10667,6 +10704,7 @@ mod tests {
             test_keyset_id("0202020202020202020202020202020202020202020202020202020202020202");
         let offer = RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
+            minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),
@@ -10713,6 +10751,7 @@ mod tests {
             let bridge = SpilmanClientBridge::new(host, NoopClientNetworking);
             let offer = RelayPaymentOffer {
                 funding_keyset_recovery_window_secs: 86_400,
+                minimum_channel_lifetime_secs: 3600,
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "http://mint".to_string(),
                 unit: "sat".to_string(),
@@ -10744,6 +10783,7 @@ mod tests {
             test_keyset_id("0202020202020202020202020202020202020202020202020202020202020202");
         let offer = RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
+            minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: "receiver".to_string(),
             mint_url: "http://mint".to_string(),
             unit: "sat".to_string(),

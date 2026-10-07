@@ -596,7 +596,7 @@ Current coverage includes:
 
 ### Relay Keyset Handling
 
-Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. Advertisements map mint URL to unit to an object containing `funding_keyset_recovery_window_secs`, generated from trusted policy even when keyset metadata is absent. They contain no keyset IDs or per-offer prices. Session prices are `bytes_in_per_msat` and `bytes_out_per_msat`. Stored channels can relink and continue paying after a later policy change.
+Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. Advertisements map mint URL to unit to an object containing `minimum_channel_lifetime_secs` and `funding_keyset_recovery_window_secs`, generated from trusted policy even when keyset metadata is absent. They contain no keyset IDs or per-offer prices. Session prices are `bytes_in_per_msat` and `bytes_out_per_msat`. Stored channels may relink after a trust-policy change, but every relink must satisfy the current admission deadlines.
 
 Clients and relays negotiate `h2-2026-10-07`. During pre-alpha development,
 upgrade both ends of every hop together as breaking changes bring the
@@ -719,8 +719,19 @@ clients:
 
 The pricing fields are required for every relay entry and must be greater than zero.
 
-`channel_policy` is optional. `min_expiry` rejects newly linked channels that do
-not have enough time left before expiry. `min_capacity` and
+`channel_policy` is optional. `min_expiry` (default `1h`) is advertised as
+`minimum_channel_lifetime_secs` and enforced on both first links and stored
+relinks. The channel must expire at least that far into the relay's future.
+If the funding keyset has a final expiry, it must be at least
+`funding_keyset_recovery_window` (default `24h`) after channel expiry. Equality
+passes; timestamp overflow fails. Clients skip locally too-short stored channels
+and provision for at least the greater of their usual 24-hour lifetime or the
+advertised minimum plus a margin (10% of the minimum, bounded to 1–60 seconds).
+Long delays or clock skew can still cause admission rejection; prepared expiries
+are immutable. These checks do not erase accepted payments or block recovery.
+The new lifetime advertisement field is required: update clients and relays
+together under `h2-2026-10-07`; no database reset is needed.
+`min_capacity` and
 `max_amount_per_output` use explicit `sat` or `msat` suffixes and are converted
 to the linked channel's raw unit before validation.
 `expiring_channels.close_before_expiry` controls when existing `Open` /

@@ -108,6 +108,16 @@ cargo run -p monad-quic -- ...
 
 ### Established-Channel Recovery
 
+Channel admission advertises both `minimum_channel_lifetime_secs` (from relay
+`channel_policy.min_expiry`) and `funding_keyset_recovery_window_secs`. Every link
+and relink checks `channel_expiry >= relay_now + minimum_lifetime` and, when the
+funding keyset has a final expiry, `final_expiry >= channel_expiry + recovery_window`.
+Equality passes; required-sum overflow and explicit zero keyset expiry reject.
+Stored funding is authoritative on relink; lifetime is rechecked under ownership
+authority before acquisition. Clients skip too-short stored channels and provision
+with a 1–60 second margin over the relay minimum while preserving their normal
+24-hour target. Admission rules do not block close/refund/restore or erase credit.
+
 - `SqliteClientWallet::recover_channel_funds(access, channel_id, mint_connection)` requires matching exclusive maintenance authority and per-channel singleflight; it is separate from startup/manual opening recovery.
 - Refund journal v2 binds normalized loose DB, `wallet_name`, and sender. It retains immutable preparation, execution history and any rejected predecessor through `prepared`, `submitting`, `finalizing`, and `completed`. Pending recovery exposes `Closing` and excludes reuse.
 - Restore submitted outputs before clock/state checks. Each invocation permits at most two submissions per immutable request, with restore/state gates. Only an initial structured HTTP 4xx `12002` without earlier uncertainty permits one durable changed-output-keyset successor; cancellation or ambiguous replay rejection cannot authorize one.
