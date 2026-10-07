@@ -1,9 +1,8 @@
-# Established-session control protocol - review draft
+# Established-session control protocol
 
-**Status: proposed contract, not the protocol currently implemented.**
+**Status: stable target contract; implementation in progress.**
 
 Tracking issue: [#125](https://github.com/SatsAndSports/MONAD/issues/125).
-Implementation baseline inspected: `7212537` (main after PR #118).
 This document changes no runtime behavior. **MUST**, **MUST NOT**, **SHOULD**, and
 **MAY** describe target requirements. The client and relay must be updated
 together before this contract is selected.
@@ -707,10 +706,22 @@ authoritative record violates atomic ownership and is fatal `INTERNAL_ERROR`.
 Recovery follows §§3.4 and 5.1-5.3. Mint HTTP recovery remains the wallet's
 responsibility, not a guarantee supplied by a control error.
 
-## 7. Review status
+## 7. Stability and implementation tracking
 
-Finalization requires coordinated implementations, independent bindings, and
-conformance tests. New ambiguities must be resolved here, not with fallback.
+Sections 1-6 are the stable target contract. Runtime conformance is not implied
+until coordinated client and relay implementations select `h2-2026-10-06` and
+pass the required coverage in Appendix B.
+
+[Issue #125](https://github.com/SatsAndSports/MONAD/issues/125) is the sole live
+record of implementation progress, remaining work, and implementing PRs. This
+document defines behavior and required conformance coverage; it does not track
+which items are complete. Tests provide executable evidence for completed issue
+items.
+
+The contract specifies observable ordering, response, and cleanup behavior. It
+does not prescribe a queue, reducer, or client-control-loop architecture. Any
+change to protocol semantics belongs here before implementation status is
+updated; new required semantics follow the versioning rule in §1.
 
 ## Appendix A. Illustrative transcripts
 
@@ -752,48 +763,7 @@ R -> C  SessionStatus(linked=A, balance_raw=150, paid=150)
 If the relay had accepted 100 previously, relink reports `balance_raw=100` but
 `paid=0`; the new payments credit 30 then 20. Old session credit does not transfer.
 
-## Appendix B. Migration plan
-
-The baseline below is descriptive; §§1-6 define the target if wording differs.
-
-| Topic | Baseline `7212537` | Target section |
-| --- | --- | --- |
-| Session identifier | `h2` | §1: coordinated `h2-2026-10-06` switch |
-| Link/payment encoding | Shared `payment_json` | §3.1 structured messages and Cashu V4 funding token |
-| Relink funding | Funding may be omitted or ignored | §5.1 complete request shape with authoritative stored funding |
-| Unlink | Final balance plus `ChannelUnlinked` | §5.3 strict ID-only unlink |
-| Advertisements/pricing | Ordered entries with keyset IDs and per-entry rates | §3.3 and §4 |
-| Receiver | Fixed for session/runtime identity | §4 stored-channel-safe rotation |
-| Client accounting | Local total updated after send | §5.2 pre-send durable accounting |
-| Correlation | One operation plus snapshot inference | §3.4 FIFO pipeline |
-| Liveness | Status heartbeat cleared by any message | §3.4 correlated Ping/Pong |
-| Proactive messages | Unscoped eviction and acted-on release | §3.5 and §5.3-5.4 advisories |
-| Funding refusal | Admission controls only | §5.5 lifetime session restriction |
-| Extensions/tolerance | No extension envelope; unsolicited statuses | §3.5-3.6 |
-
-Implementation order:
-
-1. Make client keyset selection and reuse independent of advertised IDs, then
-   remove preference plumbing and adopt the mint/unit map.
-2. Implement structured messages, strict framing, fixed pricing, receiver-key
-   retention, stored-funding relinks, ID-only unlink, and the error registry.
-3. Implement durable pre-send accounting, per-request increments, FIFO responses,
-   five-request capacity, exact numeric bounds, and larger accepted increments.
-4. Implement advisories, scoped exclusions, session funding refusal, independent
-   Ping/Pong, and extensions without coupling them to FIFO progress.
-5. Coordinate the client/relay switch to `h2-2026-10-06`; add conformance coverage
-   before declaring the specification final.
-
-Source baseline: `monad-common/src/{bootstrap,protocol,control_codec}.rs`,
-`monad-relay/src/{session,session_fsm,control_driver,payments}.rs`,
-`monad-client/src/session_driver/{runtime,state,funding,payment}.rs`, and
-`monad-client/src/sqlite_client_wallet.rs`. Convenience types do not define this
-wire contract.
-
-The contract specifies observable ordering, response, and cleanup behavior. It
-does not prescribe a queue, reducer, or client-control-loop architecture.
-
-## Appendix C. Conformance coverage
+## Appendix B. Conformance coverage
 
 - §1: exact protocol selection, extensions before initial status, second-control
   rejection, paused control availability, and teardown without erasing funding

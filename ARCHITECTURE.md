@@ -669,10 +669,10 @@ At intermediate hops in a nested route, the inner hop connection is itself just 
 
 ## Control Protocol and Session Billing
 
-For the proposed implementation-independent replacement contract, see the
-[established-session control protocol review draft](docs/control-protocol.md).
-That draft explicitly separates target rules and open decisions from the current
-implementation; it is not yet a supported wire format.
+For the stable implementation-independent target contract, see the
+[established-session control protocol](docs/control-protocol.md). It is not yet a
+supported wire format; [issue #125](https://github.com/SatsAndSports/MONAD/issues/125)
+tracks implementation progress.
 
 ### Wire Format
 
