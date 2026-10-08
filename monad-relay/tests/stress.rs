@@ -1007,6 +1007,7 @@ async fn start_huge_funding_control(
                         "{hop_label}: release requested for non-active stress channel {channel_id}"
                     );
                 }
+                ServerMessage::Pong { .. } => {}
                 ServerMessage::Error { code, message } => {
                     if matches!(code, ServerErrorCode::PaymentNoNewFunds) {
                         payment_stats

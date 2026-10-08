@@ -307,7 +307,7 @@ Important types:
   - wraps an H2 `SendStream + RecvStream` pair as a bidirectional async stream
   - allows another Noise+H2 session to run on top of an existing CONNECT tunnel
 - `ClientMessage` / `ServerMessage` (`protocol.rs`)
-  - wire protocol enums for the control stream (ChannelLink, ChannelPayment, GetSessionStatus, ChannelEvicted, SessionStatus, Error)
+  - wire protocol enums for the control stream (ChannelLink, ChannelPayment, ChannelUnlink, GetSessionStatus, Ping, SessionStatus, ChannelEvicted, ChannelReleaseRequested, Pong, Error)
   - `MintUnitAdvertisements` plus `LinkedChannelStatus` for mint offers and relay-authoritative linked-channel sync
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established secp Noise+H2 session
@@ -690,10 +690,12 @@ Control messages are JSON objects, newline-delimited, exchanged over the H2 cont
 Client to server (`ClientMessage`):
 - `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0, funding proofs, sufficient capacity for the relay's configured channel policy, and an expiry at least `channel_policy.min_expiry` in the future
 - `ChannelPayment { payment_json }` — increment session balance; requires a Spilman `Payment` signature for a higher balance than previously seen for this channel
+- `ChannelUnlink { channel_id }` — release linked channel ownership
 - `GetSessionStatus` — request a fresh session status snapshot
+- `Ping { nonce }` — request correlated control-path liveness evidence without requesting a status
 
 Server to client (`ServerMessage`):
-- `SessionStatus { ... }` — primary state synchronization message; sent immediately after control stream establishment, in response to `GetSessionStatus`, and after accepted link/payment or eviction transitions. Fast-path byte accounting and repause do not independently push a snapshot. Contains:
+- `SessionStatus { ... }` — primary state synchronization message; sent immediately after control stream establishment, in response to `GetSessionStatus`, and after accepted link/payment/unlink or eviction transitions. Fast-path byte accounting and repause do not independently push a snapshot. Contains:
   - `version`: Negotiated protocol version
   - `receiver_pubkey`: Server's secp256k1 key for Spilman
   - `advertisements`: Map of mint URL to unit to `{minimum_channel_lifetime_secs, funding_keyset_recovery_window_secs}`; no keyset IDs or per-offer prices
@@ -707,6 +709,8 @@ Server to client (`ServerMessage`):
   - `paused`: Boolean indicating if traffic is currently blocked
 - `SessionStatus { ... linked_channel: Some(...) ... }` — authoritative relay state after a successful link or payment
 - `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
+- `ChannelReleaseRequested { channel_id }` — advisory request to retire and unlink a channel when convenient
+- `Pong { nonce }` — correlated response to one `Ping`; it does not request state, consume a request response, or authorize another payment
 - `Error { code, message }` — relay-initiated error or rejection
 
 ### Relay Keyset Refresh
@@ -1973,7 +1977,7 @@ This is specific to the echo test pattern (sequential write-all then read-all on
 
 These values are generous for testing. Production tuning will depend on expected relay traffic patterns.
 
-MONAD deliberately uses no QUIC keep-alives: idle connections are meant to die and be re-established on demand (the pool evicts a dead connection on the next failed stream open and reconnects fresh). Both sides set a 20s QUIC idle timeout, which also bounds silent peer-death detection at the transport layer. Above QUIC, the client's session heartbeat (status request after 5s idle, 15s timeout) provides MONAD-level detection of an unresponsive session, so active sessions keep their transport warm without transport-level keep-alives.
+MONAD deliberately uses no QUIC keep-alives: idle connections are meant to die and be re-established on demand (the pool evicts a dead connection on the next failed stream open and reconnects fresh). Both sides set a 20s QUIC idle timeout, which also bounds silent peer-death detection at the transport layer. Above QUIC, the client's session heartbeat (correlated `Ping` after 5s without valid relay control activity, 15s matching-`Pong` deadline) provides MONAD-level detection of an unresponsive session, so active sessions keep their transport warm without transport-level keep-alives.
 
 Relay connection and stream sessions are directly owned futures beneath the
 listener. Graceful shutdown drains them or drops them at its deadline; abrupt
