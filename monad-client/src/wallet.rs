@@ -40,18 +40,30 @@ impl RelayPaymentOffer {
         }
     }
 
+    pub fn keyset_selection_policy(&self) -> cdk_spilman::KeysetSelectionPolicy {
+        let mut allowed = Vec::new();
+        if self
+            .negotiated_keyset_versions
+            .contains(monad_common::bootstrap::CASHU_SPILMAN_KEYSET_VERSION_V1)
+        {
+            allowed.push(cdk_spilman::KeysetVersion::V1);
+        }
+        if self
+            .negotiated_keyset_versions
+            .contains(monad_common::bootstrap::CASHU_SPILMAN_KEYSET_VERSION_V2)
+        {
+            allowed.push(cdk_spilman::KeysetVersion::V2);
+        }
+        cdk_spilman::KeysetSelectionPolicy {
+            allowed_versions: allowed.into(),
+        }
+    }
+
     pub fn keyset_is_compatible(&self, keyset_id: &str) -> bool {
         let Ok(id) = keyset_id.parse::<cashu::nuts::Id>() else {
             return false;
         };
-        match id.get_version() {
-            cashu::nuts::nut02::KeySetVersion::Version00 => {
-                self.negotiated_keyset_versions.contains("v1")
-            }
-            cashu::nuts::nut02::KeySetVersion::Version01 => {
-                self.negotiated_keyset_versions.contains("v2")
-            }
-        }
+        self.keyset_selection_policy().allowed_versions.allows(id)
     }
 }
 
@@ -888,6 +900,50 @@ mod tests {
                 .keyset_id
                 .starts_with(prefix));
         }
+    }
+
+    #[test]
+    fn negotiated_versions_map_to_fixed_keyset_selection_policy() {
+        use cdk_spilman::{KeysetVersion, KeysetVersions};
+
+        let cases: &[(&[&str], KeysetVersions)] = &[
+            (&[], KeysetVersions::from(Vec::<KeysetVersion>::new())),
+            (
+                &["v3", "unknown"],
+                KeysetVersions::from(Vec::<KeysetVersion>::new()),
+            ),
+            (&["v1"], KeysetVersions::V1),
+            (&["v2"], KeysetVersions::V2),
+            (&["v1", "v2"], KeysetVersions::V1_AND_V2),
+            (&["v2", "v1", "v1"], KeysetVersions::V1_AND_V2),
+            (&["v1", "unknown"], KeysetVersions::V1),
+        ];
+        for (versions, expected) in cases {
+            let mut candidate = offer("msat");
+            candidate.negotiated_keyset_versions =
+                versions.iter().map(|version| version.to_string()).collect();
+            assert_eq!(
+                candidate.keyset_selection_policy().allowed_versions,
+                *expected
+            );
+        }
+    }
+
+    #[test]
+    fn keyset_compatibility_follows_explicit_negotiated_versions() {
+        let v1_id = format!("00{}", "01".repeat(7));
+        let v2_id = format!("01{}", "02".repeat(32));
+        for (version, expected_v1, expected_v2) in [("v1", true, false), ("v2", false, true)] {
+            let mut candidate = offer("msat");
+            candidate.negotiated_keyset_versions = BTreeSet::from([version.to_string()]);
+            assert_eq!(candidate.keyset_is_compatible(&v1_id), expected_v1);
+            assert_eq!(candidate.keyset_is_compatible(&v2_id), expected_v2);
+            assert!(!candidate.keyset_is_compatible("other"));
+        }
+        let mut candidate = offer("msat");
+        candidate.negotiated_keyset_versions = BTreeSet::from(["unknown".to_string()]);
+        assert!(!candidate.keyset_is_compatible(&v1_id));
+        assert!(!candidate.keyset_is_compatible(&v2_id));
     }
 
     #[test]

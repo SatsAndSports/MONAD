@@ -4130,10 +4130,11 @@ where
     let unit = parse_currency_unit(&offer.unit)?;
     let recovery_window_secs = recovery_window_secs.max(offer.funding_keyset_recovery_window_secs);
     let active_ids = bridge.cached_active_keyset_ids(&offer.mint_url, &unit);
+    let policy = offer.keyset_selection_policy();
     let mut compatible_ids = active_ids
         .into_iter()
+        .filter(|id| policy.allowed_versions.allows(*id))
         .map(|id| id.to_string())
-        .filter(|id| offer.keyset_is_compatible(id))
         .filter(|id| {
             cached_keyset_info_json(bridge, &offer.mint_url, id)
                 .ok()
