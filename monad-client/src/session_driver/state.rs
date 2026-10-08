@@ -54,7 +54,7 @@ impl From<&RelayConnection> for RelayConnectionHandles {
 // and the relay-reported linked channel), but it prioritizes its own local byte
 // counters and locally authorized session-paid total when sizing payments.
 //
-// In particular, the client does not use relay `session_total_in` for payment
+// In particular, the client does not use relay `session_total_bytes_in` for payment
 // math, because inbound bytes may legitimately be observed by the relay before
 // the client has drained them locally. The field is still retained for
 // diagnostics and relay-state visibility.
@@ -63,8 +63,8 @@ pub(super) struct RelaySnapshot {
     pub(super) receiver_pubkey: String,
     pub(super) advertisements: Vec<PaymentOption>,
     pub(super) linked_channel: Option<LinkedChannelStatus>,
-    pub(super) session_total_in: u64,
-    pub(super) session_total_out: u64,
+    pub(super) session_total_bytes_in: u64,
+    pub(super) session_total_bytes_out: u64,
     pub(super) total_paid_millisats: u64,
     pub(super) remaining_milli_sats: i64,
     pub(super) paused: bool,
@@ -148,12 +148,12 @@ pub(super) fn state_summary(state: &DriverState, counters: &CleartextByteCounter
     let relay_in = state
         .relay_snapshot
         .as_ref()
-        .map(|snapshot| snapshot.session_total_in.to_string())
+        .map(|snapshot| snapshot.session_total_bytes_in.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let relay_out = state
         .relay_snapshot
         .as_ref()
-        .map(|snapshot| snapshot.session_total_out.to_string())
+        .map(|snapshot| snapshot.session_total_bytes_out.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let local_remaining = super::payment::compute_estimated_remaining(state, counters)
         .map(|remaining| remaining.to_string())
@@ -429,8 +429,8 @@ pub(super) fn apply_session_status(state: &mut DriverState, snapshot: RelaySnaps
 pub(super) fn session_status_is_stale(state: &DriverState, snapshot: &RelaySnapshot) -> bool {
     state.relay_snapshot.as_ref().is_some_and(|previous| {
         snapshot.total_paid_millisats < previous.total_paid_millisats
-            || snapshot.session_total_in < previous.session_total_in
-            || snapshot.session_total_out < previous.session_total_out
+            || snapshot.session_total_bytes_in < previous.session_total_bytes_in
+            || snapshot.session_total_bytes_out < previous.session_total_bytes_out
             || matches!((&previous.linked_channel, &snapshot.linked_channel), (Some(old),Some(new))
                 if old.channel_id == new.channel_id && new.balance_raw < old.balance_raw)
     })
@@ -449,8 +449,8 @@ mod acknowledgement_tests {
                 capacity_raw: 30000,
                 unit: "msat".into(),
             }),
-            session_total_in: 0,
-            session_total_out: 0,
+            session_total_bytes_in: 0,
+            session_total_bytes_out: 0,
             total_paid_millisats: balance_raw,
             remaining_milli_sats: -21,
             paused: true,
@@ -462,8 +462,8 @@ mod acknowledgement_tests {
             receiver_pubkey: String::new(),
             advertisements: vec![],
             linked_channel: None,
-            session_total_in: 0,
-            session_total_out: 0,
+            session_total_bytes_in: 0,
+            session_total_bytes_out: 0,
             total_paid_millisats: paid_millisats,
             remaining_milli_sats: -21,
             paused: true,

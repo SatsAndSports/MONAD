@@ -2769,20 +2769,21 @@ struct TestSessionStatus {
     linked_channel: Option<monad_common::protocol::LinkedChannelStatus>,
     active_in_rate: u64,
     active_out_rate: u64,
-    session_total_in: u64,
-    session_total_out: u64,
+    session_total_bytes_in: u64,
+    session_total_bytes_out: u64,
     total_paid_millisats: u64,
     remaining_milli_sats: i64,
     paused: bool,
     open_connects: u32,
     total_connects: u64,
+    failed_connects: u64,
 }
 
 impl TestSessionStatus {
     fn as_tuple(&self) -> (u64, u64, u64, i64, bool) {
         (
-            self.session_total_in,
-            self.session_total_out,
+            self.session_total_bytes_in,
+            self.session_total_bytes_out,
             self.total_paid_millisats,
             self.remaining_milli_sats,
             self.paused,
@@ -2826,6 +2827,31 @@ impl ControlSessionHarness {
         request_session_status_status(&mut self.send, &mut self.recv).await
     }
 
+    async fn wait_for_connect_counts(
+        &mut self,
+        open_connects: u32,
+        total_connects: u64,
+        failed_connects: u64,
+    ) -> TestSessionStatus {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let status = self.get_status().await;
+                if status.open_connects == open_connects
+                    && status.total_connects == total_connects
+                    && status.failed_connects == failed_connects
+                {
+                    return status;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for CONNECT counts open={open_connects} total={total_connects} failed={failed_connects}"
+            )
+        })
+    }
+
     async fn expect_error(&mut self) -> (ServerErrorCode, String) {
         match read_control_message(&mut self.recv).await {
             ServerMessage::Error { code, message } => (code, message),
@@ -2858,13 +2884,15 @@ async fn wait_for_session_totals(
 
     loop {
         let status = request_session_status_status(h2_send, h2_recv).await;
-        if status.session_total_in == expected_in && status.session_total_out == expected_out {
+        if status.session_total_bytes_in == expected_in
+            && status.session_total_bytes_out == expected_out
+        {
             return Ok(status.as_tuple());
         }
 
         if tokio::time::Instant::now() >= deadline {
-            let actual_in = status.session_total_in;
-            let actual_out = status.session_total_out;
+            let actual_in = status.session_total_bytes_in;
+            let actual_out = status.session_total_bytes_out;
             let remaining = status.remaining_milli_sats;
             let paused = status.paused;
             return Err(format!(
@@ -2881,13 +2909,14 @@ fn expect_session_status_struct(message: ServerMessage) -> TestSessionStatus {
             linked_channel,
             active_in_rate,
             active_out_rate,
-            session_total_in,
-            session_total_out,
+            session_total_bytes_in,
+            session_total_bytes_out,
             total_paid_millisats,
             remaining_milli_sats,
             paused,
             open_connects,
             total_connects,
+            failed_connects,
             ..
         } => TestSessionStatus {
             advertisements: monad_common::protocol::advertisement_options(
@@ -2898,13 +2927,14 @@ fn expect_session_status_struct(message: ServerMessage) -> TestSessionStatus {
             linked_channel,
             active_in_rate,
             active_out_rate,
-            session_total_in,
-            session_total_out,
+            session_total_bytes_in,
+            session_total_bytes_out,
             total_paid_millisats,
             remaining_milli_sats,
             paused,
             open_connects,
             total_connects,
+            failed_connects,
         },
         other => panic!("expected SessionStatus, got {other:?}"),
     }
@@ -3172,6 +3202,23 @@ async fn tunnel_roundtrip(
     result
 }
 
+async fn connect_response_status(
+    h2_client: &mut client::SendRequest<Bytes>,
+    target_authority: &str,
+) -> http::StatusCode {
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(target_authority)
+        .body(())
+        .unwrap();
+    let (response_future, h2_send) = h2_client.send_request(request, false).unwrap();
+    let response = response_future.await.unwrap();
+    let status = response.status();
+    drop(h2_send);
+    drop(response);
+    status
+}
+
 async fn open_connect_tunnel(
     h2_client: &mut client::SendRequest<Bytes>,
     target_authority: &str,
@@ -3321,10 +3368,15 @@ async fn test_session_starts_paused() {
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
 
-    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
-        control_handshake(&mut h2_send, &mut h2_recv).await;
-    assert_eq!(session_total_in, 0);
-    assert_eq!(session_total_out, 0);
+    let (
+        session_total_bytes_in,
+        session_total_bytes_out,
+        _total_paid,
+        remaining_milli_sats,
+        paused,
+    ) = control_handshake(&mut h2_send, &mut h2_recv).await;
+    assert_eq!(session_total_bytes_in, 0);
+    assert_eq!(session_total_bytes_out, 0);
     assert_eq!(remaining_milli_sats, 0);
     assert!(paused);
 
@@ -5945,10 +5997,15 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
     assert_eq!(result, b"DONE");
 
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
-        expect_session_status(read_control_message(&mut control_recv).await);
-    assert_eq!(session_total_out, 10);
-    assert_eq!(session_total_in, 4);
+    let (
+        session_total_bytes_in,
+        session_total_bytes_out,
+        _total_paid,
+        remaining_milli_sats,
+        paused,
+    ) = expect_session_status(read_control_message(&mut control_recv).await);
+    assert_eq!(session_total_bytes_out, 10);
+    assert_eq!(session_total_bytes_in, 4);
     assert_eq!(remaining_milli_sats, 1);
     assert!(!paused);
 
@@ -6045,10 +6102,15 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     assert_eq!(result, b"DONE");
 
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
-        expect_session_status(read_control_message(&mut control_recv).await);
-    assert_eq!(session_total_out, 10);
-    assert_eq!(session_total_in, 4);
+    let (
+        session_total_bytes_in,
+        session_total_bytes_out,
+        _total_paid,
+        remaining_milli_sats,
+        paused,
+    ) = expect_session_status(read_control_message(&mut control_recv).await);
+    assert_eq!(session_total_bytes_out, 10);
+    assert_eq!(session_total_bytes_in, 4);
     assert_eq!(remaining_milli_sats, 1);
     assert!(!paused);
 
@@ -6252,10 +6314,15 @@ async fn test_outbound_bytes_sent_after_pause_are_delivered_after_unpause() {
     assert_eq!(result, b"DONE");
 
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
-        expect_session_status(read_control_message(&mut control_recv).await);
-    assert_eq!(session_total_out, 20);
-    assert_eq!(session_total_in, 4);
+    let (
+        session_total_bytes_in,
+        session_total_bytes_out,
+        _total_paid,
+        remaining_milli_sats,
+        paused,
+    ) = expect_session_status(read_control_message(&mut control_recv).await);
+    assert_eq!(session_total_bytes_out, 20);
+    assert_eq!(session_total_bytes_in, 4);
     assert_eq!(remaining_milli_sats, 1);
     assert!(!paused);
 
@@ -6372,10 +6439,15 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     assert_eq!(result, b"DONE");
 
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
-        expect_session_status(read_control_message(&mut control_recv).await);
-    assert_eq!(session_total_out, 10);
-    assert_eq!(session_total_in, 4);
+    let (
+        session_total_bytes_in,
+        session_total_bytes_out,
+        _total_paid,
+        remaining_milli_sats,
+        paused,
+    ) = expect_session_status(read_control_message(&mut control_recv).await);
+    assert_eq!(session_total_bytes_out, 10);
+    assert_eq!(session_total_bytes_in, 4);
     assert_eq!(remaining_milli_sats, 1);
     assert!(!paused);
 
@@ -6479,10 +6551,15 @@ async fn test_inbound_bytes_pushed_after_pause_are_delivered_after_unpause() {
     assert_eq!(result, b"DONE");
 
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    let (session_total_in, session_total_out, _total_paid, remaining_milli_sats, paused) =
-        expect_session_status(read_control_message(&mut control_recv).await);
-    assert_eq!(session_total_out, 10);
-    assert_eq!(session_total_in, 4);
+    let (
+        session_total_bytes_in,
+        session_total_bytes_out,
+        _total_paid,
+        remaining_milli_sats,
+        paused,
+    ) = expect_session_status(read_control_message(&mut control_recv).await);
+    assert_eq!(session_total_bytes_out, 10);
+    assert_eq!(session_total_bytes_in, 4);
     assert_eq!(remaining_milli_sats, 1);
     assert!(!paused);
 
@@ -14757,7 +14834,7 @@ async fn test_session_status_reflects_manager_keyset_refresh_mid_session() {
 }
 
 #[tokio::test]
-async fn test_session_status_reports_open_and_total_connect_counts() {
+async fn test_session_status_reports_connect_count_transitions() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -14772,6 +14849,7 @@ async fn test_session_status_reports_open_and_total_connect_counts() {
     });
 
     let (server_addr, pubkey) = start_monad_relay().await;
+    let (quic_target_addr, quic_target_pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let (control_send, control_recv) = open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
     let mut control = ControlSessionHarness {
@@ -14779,50 +14857,93 @@ async fn test_session_status_reports_open_and_total_connect_counts() {
         recv: control_recv,
     };
 
-    let initial = control.get_status().await;
-    assert_eq!(initial.open_connects, 0);
-    assert_eq!(initial.total_connects, 0);
+    control.wait_for_connect_counts(0, 0, 0).await;
 
     let mut h2 = conn.clone_send_request().await;
     let target = format!("127.0.0.1:{}", target_addr.port());
 
     let (mut tunnel1_send, tunnel1_recv) = open_connect_tunnel(&mut h2, &target).await;
-    let status1 = control.get_status().await;
-    assert_eq!(status1.open_connects, 1);
-    assert_eq!(status1.total_connects, 1);
+    control.wait_for_connect_counts(1, 1, 0).await;
 
     let (mut tunnel2_send, tunnel2_recv) = open_connect_tunnel(&mut h2, &target).await;
-    let status2 = control.get_status().await;
-    assert_eq!(status2.open_connects, 2);
-    assert_eq!(status2.total_connects, 2);
+    control.wait_for_connect_counts(2, 2, 0).await;
 
     let _ = tunnel1_send.send_data(Bytes::new(), true);
     drop(tunnel1_send);
     drop(tunnel1_recv);
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let status = control.get_status().await;
-            if status.open_connects == 1 && status.total_connects == 2 {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("open CONNECT count should drop after first tunnel closes");
+    control.wait_for_connect_counts(1, 2, 0).await;
 
     let _ = tunnel2_send.send_data(Bytes::new(), true);
     drop(tunnel2_send);
     drop(tunnel2_recv);
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let status = control.get_status().await;
-            if status.open_connects == 0 && status.total_connects == 2 {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("open CONNECT count should drop to zero after all tunnels close");
+    control.wait_for_connect_counts(0, 2, 0).await;
+
+    let quic_authority = format!("127.0.0.1:{}", quic_target_addr.port());
+    let quic_request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&quic_authority)
+        .header(
+            monad_relay::session::QUIC_SECP256K1_PUBKEY_HEADER,
+            quic_target_pubkey.to_hex(),
+        )
+        .body(())
+        .unwrap();
+    let (quic_response, quic_send) = h2.send_request(quic_request, false).unwrap();
+    let quic_response = quic_response.await.unwrap();
+    assert_eq!(quic_response.status(), http::StatusCode::OK);
+    control.wait_for_connect_counts(1, 3, 0).await;
+
+    drop(quic_send);
+    drop(quic_response.into_body());
+    control.wait_for_connect_counts(0, 3, 0).await;
+
+    control.close().await;
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_session_status_reports_failed_connect_transitions() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = listener.local_addr().unwrap();
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let mut control = ControlSessionHarness::open(&conn).await;
+    let initial = control.handshake().await;
+    assert!(initial.paused);
+    assert_eq!(initial.open_connects, 0);
+    assert_eq!(initial.total_connects, 0);
+    assert_eq!(initial.failed_connects, 0);
+
+    let mut h2 = conn.clone_send_request().await;
+    let target = format!("127.0.0.1:{}", target_addr.port());
+    assert_eq!(
+        connect_response_status(&mut h2, &target).await,
+        http::StatusCode::PAYMENT_REQUIRED
+    );
+    control.wait_for_connect_counts(0, 0, 1).await;
+
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    channel.link(&mut control.send, &mut control.recv).await;
+    let (_in, _out, _paid, _remaining, paused) = channel
+        .pay(&mut control.send, &mut control.recv, TEST_SESSION_PAYMENT)
+        .await;
+    assert!(!paused);
+
+    assert_eq!(
+        connect_response_status(&mut h2, "host:0").await,
+        http::StatusCode::BAD_REQUEST
+    );
+    control.wait_for_connect_counts(0, 0, 2).await;
+
+    let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_addr = closed_listener.local_addr().unwrap();
+    drop(closed_listener);
+    assert_eq!(
+        connect_response_status(&mut h2, &closed_addr.to_string()).await,
+        http::StatusCode::BAD_GATEWAY
+    );
+    control.wait_for_connect_counts(0, 0, 3).await;
 
     control.close().await;
     drop(h2);
@@ -14855,7 +14976,7 @@ async fn test_client_cleartext_accounting_matches_relay_single_hop() {
     assert_eq!(expected_out, b"hello single-hop accounting".len() as u64);
     assert_eq!(expected_in, b"HELLO SINGLE-HOP ACCOUNTING".len() as u64);
 
-    let (session_total_in, session_total_out, _paid, _remaining, _paused) =
+    let (session_total_bytes_in, session_total_bytes_out, _paid, _remaining, _paused) =
         wait_for_session_totals(
             &mut control_send,
             &mut control_recv,
@@ -14864,8 +14985,8 @@ async fn test_client_cleartext_accounting_matches_relay_single_hop() {
         )
         .await
         .expect("single-hop QUIC accounting should converge to exact totals");
-    assert_eq!(session_total_in, expected_in);
-    assert_eq!(session_total_out, expected_out);
+    assert_eq!(session_total_bytes_in, expected_in);
+    assert_eq!(session_total_bytes_out, expected_out);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -14896,7 +15017,7 @@ async fn test_client_cleartext_accounting_matches_relay_single_hop_tcp() {
     assert_eq!(expected_out, b"hello tcp accounting".len() as u64);
     assert_eq!(expected_in, b"HELLO TCP ACCOUNTING".len() as u64);
 
-    let (session_total_in, session_total_out, _paid, _remaining, _paused) =
+    let (session_total_bytes_in, session_total_bytes_out, _paid, _remaining, _paused) =
         wait_for_session_totals(
             &mut control_send,
             &mut control_recv,
@@ -14905,8 +15026,8 @@ async fn test_client_cleartext_accounting_matches_relay_single_hop_tcp() {
         )
         .await
         .expect("single-hop TCP accounting should converge to exact totals");
-    assert_eq!(session_total_in, expected_in);
-    assert_eq!(session_total_out, expected_out);
+    assert_eq!(session_total_bytes_in, expected_in);
+    assert_eq!(session_total_bytes_out, expected_out);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -14962,7 +15083,7 @@ async fn test_client_cleartext_accounting_aggregates_multiple_tunnels() {
         (b"FIRST AGGREGATE TUNNEL".len() + b"SECOND AGGREGATE".len()) as u64
     );
 
-    let (session_total_in, session_total_out, _paid, _remaining, _paused) =
+    let (session_total_bytes_in, session_total_bytes_out, _paid, _remaining, _paused) =
         wait_for_session_totals(
             &mut control_send,
             &mut control_recv,
@@ -14971,8 +15092,8 @@ async fn test_client_cleartext_accounting_aggregates_multiple_tunnels() {
         )
         .await
         .expect("multi-stream accounting should converge to aggregate totals");
-    assert_eq!(session_total_in, expected_in);
-    assert_eq!(session_total_out, expected_out);
+    assert_eq!(session_total_bytes_in, expected_in);
+    assert_eq!(session_total_bytes_out, expected_out);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -15104,7 +15225,7 @@ async fn test_client_cleartext_accounting_matches_relay_nested_sessions() {
     assert_eq!(child_expected_out, b"nested accounting".len() as u64);
     assert_eq!(child_expected_in, b"NESTED ACCOUNTING".len() as u64);
 
-    let (child_session_total_in, child_session_total_out, _paid, _remaining, _paused) =
+    let (child_session_total_bytes_in, child_session_total_bytes_out, _paid, _remaining, _paused) =
         wait_for_session_totals(
             &mut child_control_send,
             &mut child_control_recv,
@@ -15113,11 +15234,11 @@ async fn test_client_cleartext_accounting_matches_relay_nested_sessions() {
         )
         .await
         .expect("nested child TCP accounting should converge to exact totals");
-    assert_eq!(child_session_total_in, child_expected_in);
-    assert_eq!(child_session_total_out, child_expected_out);
+    assert_eq!(child_session_total_bytes_in, child_expected_in);
+    assert_eq!(child_session_total_bytes_out, child_expected_out);
 
     let (parent_expected_in, parent_expected_out) = parent_conn.local_session_totals();
-    let (parent_session_total_in, parent_session_total_out, _paid, _remaining, _paused) =
+    let (parent_session_total_bytes_in, parent_session_total_bytes_out, _paid, _remaining, _paused) =
         wait_for_session_totals(
             &mut parent_control_send,
             &mut parent_control_recv,
@@ -15126,8 +15247,8 @@ async fn test_client_cleartext_accounting_matches_relay_nested_sessions() {
         )
         .await
         .expect("nested parent TCP accounting should converge to exact totals");
-    assert_eq!(parent_session_total_in, parent_expected_in);
-    assert_eq!(parent_session_total_out, parent_expected_out);
+    assert_eq!(parent_session_total_bytes_in, parent_expected_in);
+    assert_eq!(parent_session_total_bytes_out, parent_expected_out);
 
     let _ = child_control_send.send_data(Bytes::new(), true);
     let _ = parent_control_send.send_data(Bytes::new(), true);
@@ -15172,7 +15293,7 @@ async fn test_client_cleartext_accounting_matches_relay_nested_quic_sessions() {
     assert_eq!(child_expected_out, b"nested quic accounting".len() as u64);
     assert_eq!(child_expected_in, b"NESTED QUIC ACCOUNTING".len() as u64);
 
-    let (child_session_total_in, child_session_total_out, _paid, _remaining, _paused) =
+    let (child_session_total_bytes_in, child_session_total_bytes_out, _paid, _remaining, _paused) =
         wait_for_session_totals(
             &mut child_control_send,
             &mut child_control_recv,
@@ -15181,11 +15302,11 @@ async fn test_client_cleartext_accounting_matches_relay_nested_quic_sessions() {
         )
         .await
         .expect("nested child QUIC accounting should converge to exact totals");
-    assert_eq!(child_session_total_in, child_expected_in);
-    assert_eq!(child_session_total_out, child_expected_out);
+    assert_eq!(child_session_total_bytes_in, child_expected_in);
+    assert_eq!(child_session_total_bytes_out, child_expected_out);
 
     let (parent_expected_in, parent_expected_out) = parent_conn.local_session_totals();
-    let (parent_session_total_in, parent_session_total_out, _paid, _remaining, _paused) =
+    let (parent_session_total_bytes_in, parent_session_total_bytes_out, _paid, _remaining, _paused) =
         wait_for_session_totals(
             &mut parent_control_send,
             &mut parent_control_recv,
@@ -15194,8 +15315,8 @@ async fn test_client_cleartext_accounting_matches_relay_nested_quic_sessions() {
         )
         .await
         .expect("nested parent QUIC accounting should converge to exact totals");
-    assert_eq!(parent_session_total_in, parent_expected_in);
-    assert_eq!(parent_session_total_out, parent_expected_out);
+    assert_eq!(parent_session_total_bytes_in, parent_expected_in);
+    assert_eq!(parent_session_total_bytes_out, parent_expected_out);
 
     let _ = child_control_send.send_data(Bytes::new(), true);
     let _ = parent_control_send.send_data(Bytes::new(), true);
@@ -15251,16 +15372,17 @@ async fn test_client_tunnel_helper_updates_session_accounting() {
     assert_eq!(expected_out, request.len() as u64);
     assert_eq!(expected_in, response.len() as u64);
 
-    let (session_total_in, session_total_out, paid, remaining, paused) = wait_for_session_totals(
-        &mut control_send,
-        &mut control_recv,
-        expected_in,
-        expected_out,
-    )
-    .await
-    .expect("tunnel helper accounting should converge to exact totals");
-    assert_eq!(session_total_in, expected_in);
-    assert_eq!(session_total_out, expected_out);
+    let (session_total_bytes_in, session_total_bytes_out, paid, remaining, paused) =
+        wait_for_session_totals(
+            &mut control_send,
+            &mut control_recv,
+            expected_in,
+            expected_out,
+        )
+        .await
+        .expect("tunnel helper accounting should converge to exact totals");
+    assert_eq!(session_total_bytes_in, expected_in);
+    assert_eq!(session_total_bytes_out, expected_out);
     assert_eq!(paid, TEST_SESSION_PAYMENT);
     assert_eq!(remaining, TEST_SESSION_PAYMENT as i64 - 11);
     assert!(!paused);

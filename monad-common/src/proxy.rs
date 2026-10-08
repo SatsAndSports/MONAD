@@ -16,7 +16,7 @@ use tracing::{debug, info};
 
 /// Per-session cleartext byte counters for a MONAD relay session.
 ///
-/// Semantics mirror the relay-side `session_total_in` / `session_total_out`
+/// Semantics mirror the relay-side `session_total_bytes_in` / `session_total_bytes_out`
 /// accounting used for billing:
 /// - `outbound`: cleartext CONNECT payload bytes sent from the client side of
 ///   the session toward the target

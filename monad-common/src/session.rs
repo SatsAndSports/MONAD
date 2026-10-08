@@ -92,10 +92,14 @@ impl SessionPricing {
     /// `ceil(in_bytes / in_bytes_per_millisat + out_bytes / out_bytes_per_millisat)`
     ///
     /// Implemented with integer-only arithmetic via the precomputed LCM.
-    pub fn amount_due_millisats(&self, session_total_in: u64, session_total_out: u64) -> u128 {
+    pub fn amount_due_millisats(
+        &self,
+        session_total_bytes_in: u64,
+        session_total_bytes_out: u64,
+    ) -> u128 {
         let lcm = self.pricing_lcm as u128;
-        let due_units = session_total_in as u128 * (lcm / self.in_bytes_per_millisat as u128)
-            + session_total_out as u128 * (lcm / self.out_bytes_per_millisat as u128);
+        let due_units = session_total_bytes_in as u128 * (lcm / self.in_bytes_per_millisat as u128)
+            + session_total_bytes_out as u128 * (lcm / self.out_bytes_per_millisat as u128);
         due_units.div_ceil(lcm)
     }
 }
@@ -126,7 +130,7 @@ pub struct RelayConnection {
     /// Bootstrap-negotiated Cashu Spilman keyset-format versions for this session.
     cashu_spilman_keyset_versions: Arc<RwLock<Option<BTreeSet<String>>>>,
     /// Client-side cleartext byte counters for this relay session.
-    /// Semantics intentionally mirror the relay's `session_total_in/out`
+    /// Semantics intentionally mirror the relay's `session_total_bytes_in/out`
     /// billing counters for CONNECT payload bytes and are read by the client
     /// session driver when estimating current spend between relay status updates
     /// and sizing proactive payments.

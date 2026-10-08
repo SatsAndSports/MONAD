@@ -702,11 +702,14 @@ Server to client (`ServerMessage`):
   - `linked_channel`: Relay-authoritative linked channel status (if any), including channel id, latest accepted raw balance, raw capacity, and unit
   - `bytes_in_per_msat`: Fixed session-wide inbound price (bytes per millisatoshi)
   - `bytes_out_per_msat`: Fixed session-wide outbound price (bytes per millisatoshi)
-  - `session_total_in`: Total inbound bytes processed
-  - `session_total_out`: Total outbound bytes processed
+  - `session_total_bytes_in`: Total inbound bytes processed
+  - `session_total_bytes_out`: Total outbound bytes processed
   - `total_paid_millisats`: Total payments received
   - `remaining_milli_sats`: Current session balance
   - `paused`: Boolean indicating if traffic is currently blocked
+  - `open_connects`: Currently open accepted CONNECT tunnels
+  - `total_connects`: Cumulative accepted CONNECT tunnels
+  - `failed_connects`: Cumulative CONNECT requests the relay did not accept
 - `SessionStatus { ... linked_channel: Some(...) ... }` — authoritative relay state after a successful link or payment
 - `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
 - `ChannelReleaseRequested { channel_id }` — advisory request to retire and unlink a channel when convenient
@@ -771,7 +774,7 @@ analysis, vendoring mechanics, and related test inventory live in
 The amount due in millisats is computed as:
 
 ```text
-amount_due = ceil(session_total_in / in_bytes_per_millisat + session_total_out / out_bytes_per_millisat)
+amount_due = ceil(session_total_bytes_in / in_bytes_per_millisat + session_total_bytes_out / out_bytes_per_millisat)
 ```
 
 The remaining balance is derived from totals:
@@ -803,7 +806,7 @@ The relay remains authoritative for:
 
 - which channel is currently linked
 - the latest accepted linked-channel balance
-- the accepted session-total baseline (`session_total_in`, `session_total_out`, `total_paid_millisats`)
+- the accepted session-total baseline (`session_total_bytes_in`, `session_total_bytes_out`, `total_paid_millisats`)
 - whether the session is currently paused
 
 The client combines that authoritative baseline with its own local cleartext byte counters to estimate current spend between relay status updates. A small periodic timer in the control loop checks those counters and can trigger proactive `ChannelPayment` updates before the relay sends another `SessionStatus`.
@@ -909,12 +912,21 @@ reducer.
 Instead, active proxy tasks update the session byte counters directly under the
 per-session mutex as soon as possible:
 
-- increment `session_total_in` / `session_total_out`
+- increment `session_total_bytes_in` / `session_total_bytes_out`
 - recompute paused state
 - notify the pause watcher if the pause state changed
 
 This keeps the hot data path low-latency while still allowing the control FSM to
 handle the more complex protocol transitions.
+
+### CONNECT Counters
+
+The relay commits CONNECT acceptance only when it submits the successful H2
+response; that transition increments `open_connects` and `total_connects`. Every
+pre-acceptance rejection or setup/stream failure instead increments
+`failed_connects` exactly once, including pause, policy, malformed target,
+upstream-connect, and response-delivery failures. Closing an accepted tunnel
+decrements `open_connects` exactly once and never changes `failed_connects`.
 
 ### Session ID
 

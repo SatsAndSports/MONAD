@@ -158,8 +158,8 @@ mod tests {
                 out_bytes_per_millisat: 1,
             }],
             linked_channel: None,
-            session_total_in: 0,
-            session_total_out: 0,
+            session_total_bytes_in: 0,
+            session_total_bytes_out: 0,
             total_paid_millisats: if paused { 0 } else { 10 },
             remaining_milli_sats: if paused { 0 } else { 10 },
             paused,
@@ -215,13 +215,14 @@ mod tests {
                         linked_channel: None,
                         active_in_rate: 1,
                         active_out_rate: 1,
-                        session_total_in: 0,
-                        session_total_out: 0,
+                        session_total_bytes_in: 0,
+                        session_total_bytes_out: 0,
                         total_paid_millisats: 0,
                         remaining_milli_sats: 0,
                         paused: true,
                         open_connects: 0,
                         total_connects: 0,
+                        failed_connects: 0,
                     },
                 )
                 .await
@@ -351,8 +352,8 @@ mod tests {
                     capacity_raw: 100,
                     unit: "msat".to_string(),
                 }),
-                session_total_in: 0,
-                session_total_out: 0,
+                session_total_bytes_in: 0,
+                session_total_bytes_out: 0,
                 total_paid_millisats: 0,
                 remaining_milli_sats: 0,
                 paused: true,
@@ -495,8 +496,8 @@ mod tests {
                     capacity_raw: 100,
                     unit: "msat".to_string(),
                 }),
-                session_total_in: 0,
-                session_total_out: 0,
+                session_total_bytes_in: 0,
+                session_total_bytes_out: 0,
                 total_paid_millisats: 0,
                 remaining_milli_sats: 0,
                 paused: true,
@@ -519,7 +520,7 @@ mod tests {
         counters.note_outbound(4);
         let state = DriverState {
             relay_snapshot: Some(RelaySnapshot {
-                session_total_out: 5,
+                session_total_bytes_out: 5,
                 ..snapshot(true)
             }),
             ..DriverState::default()
@@ -528,9 +529,9 @@ mod tests {
         let err =
             validate_session_status_baseline_against_local_counters(&state, &counters).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err
-            .to_string()
-            .contains("relay reported session_total_out=5 above client local outbound total=4"));
+        assert!(err.to_string().contains(
+            "relay reported session_total_bytes_out=5 above client local outbound total=4"
+        ));
     }
 
     #[test]
@@ -813,7 +814,7 @@ mod tests {
         counters.note_outbound(6);
         let state = DriverState {
             relay_snapshot: Some(RelaySnapshot {
-                session_total_out: 2,
+                session_total_bytes_out: 2,
                 total_paid_millisats: 20,
                 ..snapshot(true)
             }),
@@ -998,8 +999,8 @@ mod tests {
                     capacity_raw: 100,
                     unit: "msat".to_string(),
                 }),
-                session_total_in: 0,
-                session_total_out: 99,
+                session_total_bytes_in: 0,
+                session_total_bytes_out: 99,
                 total_paid_millisats: 100,
                 remaining_milli_sats: 1,
                 paused: false,

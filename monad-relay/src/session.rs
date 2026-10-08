@@ -34,7 +34,7 @@ use monad_quic::client::ClientAuthMode;
 use monad_quic::stream::{STREAM_KIND_SECP_NOISE, STREAM_KIND_TWEAKED_NOISE};
 use std::collections::{BTreeSet, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -96,13 +96,15 @@ impl ControlState {
 struct SessionCounters {
     open_connects: AtomicU32,
     total_connects: AtomicU64,
+    failed_connects: AtomicU64,
 }
 
 impl SessionCounters {
-    fn snapshot(&self) -> (u32, u64) {
+    fn snapshot(&self) -> (u32, u64, u64) {
         (
             self.open_connects.load(Ordering::Relaxed),
             self.total_connects.load(Ordering::Relaxed),
+            self.failed_connects.load(Ordering::Relaxed),
         )
     }
 
@@ -116,6 +118,12 @@ impl SessionCounters {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         (open_connects, total_connects)
+    }
+
+    fn connect_failed(&self) -> u64 {
+        self.failed_connects
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
     }
 
     fn connect_closed(&self) -> (u32, u64) {
@@ -160,10 +168,10 @@ pub(crate) struct SessionMonitor {
 impl SessionMonitor {
     pub(crate) async fn snapshot(&self, id: [u8; 32]) -> serde_json::Value {
         let billing = self.billing.lock().await;
-        let (active, total) = self.counters.snapshot();
+        let (active, total, _) = self.counters.snapshot();
         serde_json::json!({
-            "session_id": hex::encode(id), "inbound_bytes": billing.state.session_total_in,
-            "outbound_bytes": billing.state.session_total_out,
+            "session_id": hex::encode(id), "inbound_bytes": billing.state.session_total_bytes_in,
+            "outbound_bytes": billing.state.session_total_bytes_out,
             "total_paid_msats": billing.state.total_paid_millisats,
             "remaining_msats": billing.remaining_milli_sats().to_string(),
             "paused": billing.state.paused, "linked_channel_id": billing.state.linked_channel_id,
@@ -184,8 +192,8 @@ impl SessionState {
         let state = Self {
             billing: Arc::new(Mutex::new(BillingState {
                 state: ServerSessionState {
-                    session_total_in: 0,
-                    session_total_out: 0,
+                    session_total_bytes_in: 0,
+                    session_total_bytes_out: 0,
                     total_paid_millisats: 0,
                     paused: true,
                     linked_channel_id: None,
@@ -389,7 +397,7 @@ impl SessionState {
 
     pub(crate) async fn session_status_message(&self) -> ServerMessage {
         let billing = self.billing.lock().await;
-        let (open_connects, total_connects) = self.counters.snapshot();
+        let (open_connects, total_connects, failed_connects) = self.counters.snapshot();
 
         let mut advertisements = MintUnitAdvertisements::new();
         for (mint_url, trusted_units) in &self.trusted_mint_units {
@@ -418,13 +426,14 @@ impl SessionState {
                 .and_then(|channel_id| self.payments.linked_channel_status(channel_id)),
             active_in_rate: billing.pricing.in_bytes_per_millisat,
             active_out_rate: billing.pricing.out_bytes_per_millisat,
-            session_total_in: billing.state.session_total_in,
-            session_total_out: billing.state.session_total_out,
+            session_total_bytes_in: billing.state.session_total_bytes_in,
+            session_total_bytes_out: billing.state.session_total_bytes_out,
             total_paid_millisats: billing.state.total_paid_millisats,
             remaining_milli_sats: clamp_i128_to_i64(billing.remaining_milli_sats()),
             paused: billing.state.paused,
             open_connects,
             total_connects,
+            failed_connects,
         }
     }
 
@@ -494,6 +503,10 @@ impl SessionState {
         self.counters.connect_opened()
     }
 
+    fn connect_failed(&self) -> u64 {
+        self.counters.connect_failed()
+    }
+
     pub(crate) fn connect_closed(&self) -> (u32, u64) {
         self.counters.connect_closed()
     }
@@ -520,6 +533,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Drop for RelaySession<S
 struct ConnectHandler {
     state: SessionState,
     quic_pool: Option<QuicPool>,
+    accepted: AtomicBool,
+}
+
+impl Drop for ConnectHandler {
+    fn drop(&mut self) {
+        if !self.accepted.load(Ordering::Relaxed) {
+            self.state.connect_failed();
+        }
+    }
 }
 
 const CONNECT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -771,6 +793,7 @@ impl ConnectHandler {
         let state = self.state.clone();
         let session_id = self.state.session_id;
         let (open_connects, total_connects) = state.connect_opened();
+        self.accepted.store(true, Ordering::Relaxed);
         info!(
             "CONNECT opened: {authority} ({label}) | session_id={} open_connects={} total_connects={}",
             hex::encode(session_id),
@@ -934,6 +957,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
                             let handler = ConnectHandler {
                                 state: self.state.clone(),
                                 quic_pool: self.quic_pool.clone(),
+                                accepted: AtomicBool::new(false),
                             };
                             children.push(Box::pin(handler.handle_connect(request, respond)));
                         }
@@ -1323,7 +1347,7 @@ mod tests {
                 "aborted session is still registered"
             );
             assert_eq!(payments.owner_of("abort-owned"), None);
-            assert_eq!(state.counters.snapshot(), (0, 1));
+            assert_eq!(state.counters.snapshot(), (0, 1, 0));
             let mut byte = [0];
             assert_eq!(
                 timeout(Duration::from_secs(2), target.read(&mut byte))
@@ -1647,7 +1671,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(dropped.load(Ordering::SeqCst));
-            assert_eq!(state.counters.snapshot(), (0, 1));
+            assert_eq!(state.counters.snapshot(), (0, 1, 0));
             drivers.shutdown().await;
         }
     }
@@ -1759,7 +1783,7 @@ mod tests {
                     .unwrap()
                     .is_err());
             }
-            assert_eq!(state.counters.snapshot(), (0, 0));
+            assert_eq!(state.counters.snapshot(), (0, 0, 1));
             assert!(!state.session_registry.terminate(&state.session_id));
             client_driver.abort();
             let _ = client_driver.await;
@@ -1801,7 +1825,7 @@ mod tests {
         .await
         .unwrap();
         result.unwrap();
-        assert_eq!(state.counters.snapshot(), (0, 1));
+        assert_eq!(state.counters.snapshot(), (0, 1, 0));
         drivers.shutdown().await;
     }
 
@@ -1846,6 +1870,7 @@ mod tests {
             let handler = ConnectHandler {
                 state: state.clone(),
                 quic_pool: None,
+                accepted: AtomicBool::new(false),
             };
             handler
                 .proxy_tunnel(&mut respond, request, target, "target:80", "gated")
@@ -1859,7 +1884,8 @@ mod tests {
             } else {
                 assert_eq!(response.unwrap().status(), StatusCode::PAYMENT_REQUIRED);
             }
-            assert_eq!(state.counters.snapshot(), (0, 0));
+            drop(handler);
+            assert_eq!(state.counters.snapshot(), (0, 0, 1));
             use tokio::io::AsyncReadExt;
             assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
             drivers.shutdown().await;

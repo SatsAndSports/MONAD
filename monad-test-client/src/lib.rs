@@ -792,13 +792,14 @@ async fn start_auto_control(
                     linked_channel,
                     active_in_rate,
                     active_out_rate,
-                    session_total_in,
-                    session_total_out,
+                    session_total_bytes_in,
+                    session_total_bytes_out,
                     total_paid_millisats,
                     remaining_milli_sats,
                     paused,
                     open_connects,
                     total_connects,
+                    failed_connects,
                     ..
                 } => {
                     last_status_received_at = Instant::now();
@@ -806,8 +807,8 @@ async fn start_auto_control(
                     *pricing_handle.write().await = Some(pricing);
 
                     if status_request_in_flight {
-                        let due_now =
-                            pricing.amount_due_millisats(session_total_in, session_total_out);
+                        let due_now = pricing
+                            .amount_due_millisats(session_total_bytes_in, session_total_bytes_out);
                         let linked_summary = linked_channel
                             .as_ref()
                             .map(|channel| {
@@ -821,14 +822,15 @@ async fn start_auto_control(
                             })
                             .unwrap_or_else(|| "none".to_string());
                         info!(
-                            "{hop_label} | open_connects={} total_connects={} paused={paused} remaining={}msat paid={}msat due={}msat totals(in={}, out={}) linked={}",
+                            "{hop_label} | open_connects={} total_connects={} failed_connects={} paused={paused} remaining={}msat paid={}msat due={}msat totals(in={}, out={}) linked={}",
                             open_connects,
                             total_connects,
+                            failed_connects,
                             remaining_milli_sats,
                             total_paid_millisats,
                             due_now,
-                            session_total_in,
-                            session_total_out,
+                            session_total_bytes_in,
+                            session_total_bytes_out,
                             linked_summary,
                         );
                         if let Some(started_at) = last_status_requested_at.take() {

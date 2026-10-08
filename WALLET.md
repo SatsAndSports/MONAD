@@ -191,8 +191,8 @@ The wallet thinks in exact cumulative channel balance.
 
 When the relay reports:
 
-- `session_total_in`
-- `session_total_out`
+- `session_total_bytes_in`
+- `session_total_bytes_out`
 - `total_paid_millisats`
 - `linked_channel.balance_raw`
 - `linked_channel.capacity_raw`
