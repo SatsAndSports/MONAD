@@ -55,6 +55,22 @@ The client is authoritative for local intent and local authorization:
 The client does not treat its local estimate as accepted relay state. It uses
 that estimate only to decide when and how much to pay.
 
+## Numeric Limits And Forwarding Reservations
+
+MONAD currently caps session accounting at 90,000 BTC
+(`9_000_000_000_000_000` msat). Relay channel capacity, accepted payment
+deltas, and `total_paid_millisats` are checked before durable payment or credit
+mutation. Requests outside the supported range fail with
+`NUMERIC_LIMIT_EXCEEDED` and do not advance the relay-authoritative channel
+balance.
+
+The relay computes `ceil(bytes_in / in_rate + bytes_out / out_rate)` with exact
+integer quotient/remainder arithmetic. Before forwarding a bounded chunk, each
+proxy direction reserves billable bytes against session totals plus every other
+active reservation. Concurrent tunnels therefore cannot spend the same credit;
+partial frames pause at the credit boundary and resume after payment, while
+unforwarded reservations are released on errors and cancellation.
+
 ## Spilman Sans-IO Layering
 
 MONAD uses upstream `cdk-spilman` as the protocol core and keeps runtime

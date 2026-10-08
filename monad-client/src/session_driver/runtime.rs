@@ -186,8 +186,18 @@ pub(super) async fn run_session_driver(
                             failed_connects,
                         } => {
                             let previous_paid = state.relay_snapshot.as_ref().map(|s| s.total_paid_millisats).unwrap_or(0);
-                            let pricing = SessionPricing::new(active_in_rate, active_out_rate);
+                            let pricing = SessionPricing::try_new(active_in_rate, active_out_rate)
+                                .map_err(|error| io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("protocol violation: invalid relay session pricing: {error}"),
+                                ))?;
                             validate_session_pricing(&mut state.established_pricing, pricing)?;
+                            if total_paid_millisats > monad_common::billing::MAX_SESSION_ACCOUNTING_MILLISATS {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "protocol violation: relay total_paid_millisats exceeds MONAD accounting limit",
+                                ));
+                            }
                             let due_now = pricing.amount_due_millisats(session_total_bytes_in, session_total_bytes_out);
                             info!(
                                 "{} session status: open_connects={} total_connects={} failed_connects={} paused={} balance={} paid={} due={} linked={:?} intended={} op={:?} blocked={:?} local_remaining={:?}",

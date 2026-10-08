@@ -9,6 +9,7 @@ use cdk_spilman::{
     ClosingData, Payment, PaymentProof, PreparedClose, SelectedOutputKeyset,
     SpilmanAsyncKeysetRefresher, SpilmanBridge, SpilmanHost,
 };
+use monad_common::billing::MAX_SESSION_ACCOUNTING_MILLISATS;
 use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
 use sha2::{Digest, Sha256};
@@ -75,6 +76,21 @@ pub trait RelayPayments: Send + Sync + 'static {
         session_id: [u8; 32],
         expected_channel_id: &str,
         payment_json: &str,
+    ) -> Result<PaymentOutcome, ChannelPaymentError> {
+        self.apply_channel_payment_with_limit(
+            session_id,
+            expected_channel_id,
+            payment_json,
+            MAX_SESSION_ACCOUNTING_MILLISATS,
+        )
+    }
+
+    fn apply_channel_payment_with_limit(
+        &self,
+        session_id: [u8; 32],
+        expected_channel_id: &str,
+        payment_json: &str,
+        max_delta_millisats: u64,
     ) -> Result<PaymentOutcome, ChannelPaymentError>;
 
     fn linked_channel_status(&self, channel_id: &str) -> Option<LinkedChannelStatus>;
@@ -116,6 +132,7 @@ pub enum LinkError {
     NonZeroLinkBalance,
     ChannelExpired,
     ChannelClosed,
+    NumericLimitExceeded,
     Internal(String),
 }
 
@@ -142,6 +159,7 @@ impl fmt::Display for LinkError {
             Self::NonZeroLinkBalance => write!(f, "link balance must be zero"),
             Self::ChannelExpired => write!(f, "channel expired"),
             Self::ChannelClosed => write!(f, "channel closed"),
+            Self::NumericLimitExceeded => write!(f, "numeric limit exceeded"),
             Self::Internal(s) => write!(f, "internal error: {s}"),
         }
     }
@@ -171,6 +189,7 @@ impl LinkError {
             Self::NonZeroLinkBalance => ServerErrorCode::LinkNonZeroBalance,
             Self::ChannelExpired => ServerErrorCode::ChannelExpired,
             Self::ChannelClosed => ServerErrorCode::ChannelClosed,
+            Self::NumericLimitExceeded => ServerErrorCode::NumericLimitExceeded,
             Self::Internal(_) => ServerErrorCode::InternalError,
         }
     }
@@ -184,6 +203,7 @@ pub enum ChannelPaymentError {
     NoNewFunds,
     ChannelClosed,
     Conflict,
+    NumericLimitExceeded,
     Internal(String),
 }
 
@@ -196,6 +216,7 @@ impl fmt::Display for ChannelPaymentError {
             Self::NoNewFunds => write!(f, "no new funds"),
             Self::ChannelClosed => write!(f, "channel closed"),
             Self::Conflict => write!(f, "payment state conflict"),
+            Self::NumericLimitExceeded => write!(f, "numeric limit exceeded"),
             Self::Internal(s) => write!(f, "internal error: {s}"),
         }
     }
@@ -212,6 +233,7 @@ impl ChannelPaymentError {
             Self::NoNewFunds => ServerErrorCode::PaymentNoNewFunds,
             Self::ChannelClosed => ServerErrorCode::ChannelClosed,
             Self::Conflict => ServerErrorCode::PaymentConflict,
+            Self::NumericLimitExceeded => ServerErrorCode::NumericLimitExceeded,
             Self::Internal(_) => ServerErrorCode::InternalError,
         }
     }
@@ -232,21 +254,34 @@ impl ChannelUnit {
         }
     }
 
+    pub(crate) fn max_balance_raw(self) -> u64 {
+        match self {
+            Self::Msat => MAX_SESSION_ACCOUNTING_MILLISATS,
+            Self::Sat => MAX_SESSION_ACCOUNTING_MILLISATS / 1000,
+        }
+    }
+
     pub(crate) fn capacity_millisats(self, capacity_raw: u64) -> Result<u64, LinkError> {
+        if capacity_raw > self.max_balance_raw() {
+            return Err(LinkError::NumericLimitExceeded);
+        }
         match self {
             Self::Msat => Ok(capacity_raw),
             Self::Sat => capacity_raw
                 .checked_mul(1000)
-                .ok_or_else(|| LinkError::InvalidChannel("capacity overflow".to_string())),
+                .ok_or(LinkError::NumericLimitExceeded),
         }
     }
 
     pub(crate) fn delta_millisats(self, delta_raw: u64) -> Result<u64, ChannelPaymentError> {
+        if delta_raw > self.max_balance_raw() {
+            return Err(ChannelPaymentError::NumericLimitExceeded);
+        }
         match self {
             Self::Msat => Ok(delta_raw),
             Self::Sat => delta_raw
                 .checked_mul(1000)
-                .ok_or_else(|| ChannelPaymentError::Internal("delta overflow".to_string())),
+                .ok_or(ChannelPaymentError::NumericLimitExceeded),
         }
     }
 
@@ -648,6 +683,11 @@ impl RelayPayments for SpilmanRelayPayments {
             .ok_or_else(|| LinkError::InvalidChannel("missing keyset_id".to_string()))?
             .parse()
             .map_err(|e| LinkError::InvalidChannel(format!("invalid keyset_id: {e}")))?;
+        let unit = ChannelUnit::from_str(
+            params["unit"]
+                .as_str()
+                .ok_or_else(|| LinkError::InvalidChannel("missing unit".to_string()))?,
+        )?;
         if !keyset_version_is_negotiated(&id, negotiated_versions) {
             return Err(LinkError::KeysetVersionNotNegotiated);
         }
@@ -692,14 +732,19 @@ impl RelayPayments for SpilmanRelayPayments {
             check_funding_expiry(&channel.funding.keyset_info_json)?;
             // Relink validates the zero-balance registration signature without
             // mutating the relay-authoritative latest accepted balance.
-            self.bridge
+            let capacity = self
+                .bridge
                 .validate_existing_channel_funding(
                     &payment.channel_id,
                     payment.balance,
                     &payment.signature,
                 )
                 .map_err(map_link_bridge_error)?
-                .capacity
+                .capacity;
+            if capacity > unit.max_balance_raw() {
+                return Err(LinkError::NumericLimitExceeded);
+            }
+            capacity
         } else {
             if self.known_keyset_unit_mismatch(&params, &id) {
                 return Err(LinkError::MintOrKeysetNotAcceptable);
@@ -732,6 +777,9 @@ impl RelayPayments for SpilmanRelayPayments {
                         map_link_bridge_error(error)
                     })?;
             let capacity = validated.capacity;
+            if capacity > unit.max_balance_raw() {
+                return Err(LinkError::NumericLimitExceeded);
+            }
             // Check the exact metadata validated by the bridge, not a separate
             // cache snapshot that could race a concurrent mint refresh.
             check_funding_expiry(&validated.funding.keyset_info_json)?;
@@ -769,11 +817,12 @@ impl RelayPayments for SpilmanRelayPayments {
         })
     }
 
-    fn apply_channel_payment(
+    fn apply_channel_payment_with_limit(
         &self,
         session_id: [u8; 32],
         expected_channel_id: &str,
         payment_json: &str,
+        max_delta_millisats: u64,
     ) -> Result<PaymentOutcome, ChannelPaymentError> {
         let payment: Payment = serde_json::from_str(payment_json)
             .map_err(|e| ChannelPaymentError::InvalidPayment(e.to_string()))?;
@@ -799,6 +848,9 @@ impl RelayPayments for SpilmanRelayPayments {
         if state_kind != ChannelState::Open {
             return Err(ChannelPaymentError::ChannelClosed);
         }
+        if payment.balance > unit.max_balance_raw() {
+            return Err(ChannelPaymentError::NumericLimitExceeded);
+        }
 
         let validation = self
             .bridge
@@ -813,9 +865,15 @@ impl RelayPayments for SpilmanRelayPayments {
         if validation.balance <= previous_balance {
             return Err(ChannelPaymentError::NoNewFunds);
         }
+        let delta_raw = validation.balance - previous_balance;
+        let delta_millisats = unit.delta_millisats(delta_raw)?;
+        if delta_millisats > max_delta_millisats {
+            return Err(ChannelPaymentError::NumericLimitExceeded);
+        }
 
-        // Record only after validation and monotonicity checks; the stored
-        // balance is the relay-authoritative baseline for future payments.
+        // Record only after validation, monotonicity, unit conversion, and
+        // session-credit headroom checks; the stored balance is the
+        // relay-authoritative baseline for future payments.
         self.store
             .compare_owned_payment(
                 &payment.channel_id,
@@ -833,10 +891,9 @@ impl RelayPayments for SpilmanRelayPayments {
                 }
             })?;
 
-        let delta_raw = validation.balance - previous_balance;
         Ok(PaymentOutcome {
             channel_id: payment.channel_id,
-            delta_millisats: unit.delta_millisats(delta_raw)?,
+            delta_millisats,
         })
     }
 
@@ -1409,11 +1466,12 @@ pub mod testing {
             })
         }
 
-        fn apply_channel_payment(
+        fn apply_channel_payment_with_limit(
             &self,
             session_id: [u8; 32],
             expected_channel_id: &str,
             payment_json: &str,
+            max_delta_millisats: u64,
         ) -> Result<PaymentOutcome, ChannelPaymentError> {
             let parsed =
                 ParsedPayment::parse(payment_json).map_err(ChannelPaymentError::InvalidPayment)?;
@@ -1452,12 +1510,18 @@ pub mod testing {
                     "wrong receiver".to_string(),
                 ));
             }
+            if parsed.balance > record.unit.max_balance_raw() {
+                return Err(ChannelPaymentError::NumericLimitExceeded);
+            }
             if parsed.balance <= record.latest_balance {
                 return Err(ChannelPaymentError::NoNewFunds);
             }
 
             let delta_raw = parsed.balance - record.latest_balance;
             let delta_millisats = record.unit.delta_millisats(delta_raw)?;
+            if delta_millisats > max_delta_millisats {
+                return Err(ChannelPaymentError::NumericLimitExceeded);
+            }
             record.latest_balance = parsed.balance;
 
             Ok(PaymentOutcome {
@@ -1725,10 +1789,7 @@ pub mod testing {
                 )
                 .unwrap_err();
 
-            assert_eq!(
-                error,
-                LinkError::InvalidChannel("capacity overflow".to_string())
-            );
+            assert_eq!(error, LinkError::NumericLimitExceeded);
             assert_eq!(
                 payments.inner.lock().unwrap().channels["chan"].owner,
                 Some(session(1))
@@ -1898,33 +1959,42 @@ pub mod testing {
                     &payment_json("chan", 0, Some(u64::MAX), Some("sat")),
                 )
                 .unwrap_err();
-            assert_eq!(
-                err,
-                LinkError::InvalidChannel("capacity overflow".to_string())
-            );
+            assert_eq!(err, LinkError::NumericLimitExceeded);
         }
 
         #[test]
-        fn delta_overflow_is_rejected() {
+        fn payment_limit_is_checked_before_balance_mutation() {
             let payments = InMemoryRelayPayments::new();
             payments
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(u64::MAX / 1000), Some("sat")),
+                    &payment_json("chan", 0, Some(10), Some("msat")),
                 )
                 .unwrap();
             let err = payments
-                .apply_channel_payment(
+                .apply_channel_payment_with_limit(
                     session(1),
                     "chan",
-                    &payment_json("chan", u64::MAX, None, None),
+                    &payment_json("chan", 5, None, None),
+                    3,
                 )
                 .unwrap_err();
+            assert_eq!(err, ChannelPaymentError::NumericLimitExceeded);
             assert_eq!(
-                err,
-                ChannelPaymentError::Internal("delta overflow".to_string())
+                payments.inner.lock().unwrap().channels["chan"].latest_balance,
+                0
             );
+
+            let accepted = payments
+                .apply_channel_payment_with_limit(
+                    session(1),
+                    "chan",
+                    &payment_json("chan", 3, None, None),
+                    3,
+                )
+                .unwrap();
+            assert_eq!(accepted.delta_millisats, 3);
         }
 
         #[test]

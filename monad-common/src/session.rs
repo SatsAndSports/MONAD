@@ -19,45 +19,17 @@ use crate::h2stream::H2ConnectStream;
 use crate::proxy::CleartextByteCounters;
 
 // ---------------------------------------------------------------------------
-// Shared math helpers
-// ---------------------------------------------------------------------------
-
-fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        let tmp = a % b;
-        a = b;
-        b = tmp;
-    }
-    a
-}
-
-/// Compute the LCM of two `u64` values, saturating on overflow.
-pub fn lcm_u64(a: u64, b: u64) -> u64 {
-    if a == 0 || b == 0 {
-        return 0;
-    }
-    (a / gcd_u64(a, b)).saturating_mul(b)
-}
-
-/// Clamp an `i128` to the `i64` range for wire representation.
-pub fn clamp_i128_to_i64(value: i128) -> i64 {
-    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
-}
-
-// ---------------------------------------------------------------------------
-// SessionPricing — local persisted pricing with precomputed LCM
+// SessionPricing — validated directional session rates
 // ---------------------------------------------------------------------------
 
 /// Local session pricing metadata, persisted on both client and relay.
 ///
-/// Constructed from the wire `SessionStatus` message. Includes the
-/// precomputed LCM of the two directional rates so billing math can
-/// use integer arithmetic without recomputing it per chunk.
+/// Constructed from validated configuration or the wire `SessionStatus` message.
+/// Amount-due calculations use exact integer quotient/remainder arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionPricing {
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
-    pub pricing_lcm: u64,
 }
 
 /// Spilman session metadata fetched by the client after receiving `SessionStatus`.
@@ -73,17 +45,23 @@ pub struct SessionSpilmanInfo {
 }
 
 impl SessionPricing {
-    /// Create a `SessionPricing` from the raw directional rates.
-    ///
-    /// Computes and caches `lcm(in_bytes_per_millisat, out_bytes_per_millisat)`.
+    /// Create validated `SessionPricing` from raw directional rates.
+    pub fn try_new(
+        in_bytes_per_millisat: u64,
+        out_bytes_per_millisat: u64,
+    ) -> Result<Self, crate::billing::PricingError> {
+        crate::billing::amount_due_millisats(0, 0, in_bytes_per_millisat, out_bytes_per_millisat)?;
+        Ok(Self {
+            in_bytes_per_millisat,
+            out_bytes_per_millisat,
+        })
+    }
+
+    /// Create `SessionPricing` from rates already validated by configuration or
+    /// test setup. Use [`Self::try_new`] for untrusted wire input.
     pub fn new(in_bytes_per_millisat: u64, out_bytes_per_millisat: u64) -> Self {
-        let in_rate = in_bytes_per_millisat.max(1);
-        let out_rate = out_bytes_per_millisat.max(1);
-        Self {
-            in_bytes_per_millisat: in_rate,
-            out_bytes_per_millisat: out_rate,
-            pricing_lcm: lcm_u64(in_rate, out_rate),
-        }
+        Self::try_new(in_bytes_per_millisat, out_bytes_per_millisat)
+            .expect("session pricing rates must be positive")
     }
 
     /// Compute the total amount due in millisats for the given byte totals.
@@ -91,16 +69,30 @@ impl SessionPricing {
     /// Uses the formula:
     /// `ceil(in_bytes / in_bytes_per_millisat + out_bytes / out_bytes_per_millisat)`
     ///
-    /// Implemented with integer-only arithmetic via the precomputed LCM.
+    /// Implemented with exact integer quotient/remainder arithmetic.
     pub fn amount_due_millisats(
         &self,
         session_total_bytes_in: u64,
         session_total_bytes_out: u64,
     ) -> u128 {
-        let lcm = self.pricing_lcm as u128;
-        let due_units = session_total_bytes_in as u128 * (lcm / self.in_bytes_per_millisat as u128)
-            + session_total_bytes_out as u128 * (lcm / self.out_bytes_per_millisat as u128);
-        due_units.div_ceil(lcm)
+        crate::billing::amount_due_millisats(
+            session_total_bytes_in,
+            session_total_bytes_out,
+            self.in_bytes_per_millisat,
+            self.out_bytes_per_millisat,
+        )
+        .expect("SessionPricing rates are validated positive")
+    }
+
+    /// Compute exact remaining session credit for the given totals.
+    pub fn remaining_milli_sats(
+        &self,
+        total_paid_millisats: u64,
+        session_total_bytes_in: u64,
+        session_total_bytes_out: u64,
+    ) -> i128 {
+        total_paid_millisats as i128
+            - self.amount_due_millisats(session_total_bytes_in, session_total_bytes_out) as i128
     }
 }
 
@@ -529,6 +521,26 @@ fn is_expected_h2_teardown_error(error: &h2::Error) -> bool {
         || message.contains("stream closed because of a broken pipe")
         || message.contains("error 0")
         || message.contains("connection closed")
+}
+
+#[cfg(test)]
+mod pricing_tests {
+    use super::SessionPricing;
+
+    #[test]
+    fn checked_pricing_rejects_zero_rates() {
+        assert!(SessionPricing::try_new(0, 1).is_err());
+        assert!(SessionPricing::try_new(1, 0).is_err());
+        assert!(SessionPricing::try_new(0, 0).is_err());
+        assert!(SessionPricing::try_new(1, 1).is_ok());
+    }
+
+    #[test]
+    fn pricing_reports_exact_combined_due() {
+        let pricing = SessionPricing::try_new(3, 3).unwrap();
+        assert_eq!(pricing.amount_due_millisats(5, 5), 4);
+        assert_eq!(pricing.remaining_milli_sats(10, 5, 5), 6);
+    }
 }
 
 #[cfg(test)]

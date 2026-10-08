@@ -587,8 +587,16 @@ pub(super) async fn maybe_progress_payment(
         return Ok(());
     }
 
+    // A relay-authoritative paused/nonpositive session needs funding even if
+    // the local estimate is stale or includes a payment whose acceptance is
+    // still ambiguous. Size the refill from the relay baseline in that case.
+    let payment_baseline_remaining = if snapshot.paused || snapshot.remaining_milli_sats <= 0 {
+        snapshot.remaining_milli_sats
+    } else {
+        estimated_remaining
+    };
     let plan = match plan_payment_topup(
-        estimated_remaining,
+        payment_baseline_remaining,
         config.payment_policy.target_topup_buffer_msats,
         config.payment_policy.minimum_topup_msats,
         linked_channel,
@@ -646,6 +654,16 @@ pub(super) async fn maybe_progress_payment(
         next_balance_raw,
     ) {
         Ok(payment_json) => {
+            let next_local_session_paid_msats = state
+                .local_session_paid_msats
+                .checked_add(authorized_delta_msats)
+                .filter(|total| *total <= monad_common::billing::MAX_SESSION_ACCOUNTING_MILLISATS)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "local session payment total exceeds MONAD accounting limit",
+                    )
+                })?;
             info!(
                 "{} sending ChannelPayment for {}: remaining={} target={} reaches_capacity={} next_balance_raw={} | {}",
                 config.hop_label,
@@ -657,9 +675,7 @@ pub(super) async fn maybe_progress_payment(
                 state_summary(state, &config.conn.cleartext_byte_counters)
             );
             send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await?;
-            state.local_session_paid_msats = state
-                .local_session_paid_msats
-                .saturating_add(authorized_delta_msats);
+            state.local_session_paid_msats = next_local_session_paid_msats;
             set_payment_in_flight(state, intended_channel_id.clone(), next_balance_raw);
             if let Some((owner, hop)) = &config.management {
                 hop.paying(owner, intended_channel_id);

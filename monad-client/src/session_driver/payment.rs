@@ -241,9 +241,8 @@ pub(super) fn compute_estimated_remaining(
     let pricing = state.established_pricing?;
     let (local_inbound, local_outbound) = counters.snapshot();
     let estimated_due = pricing.amount_due_millisats(local_inbound, local_outbound);
-    Some(
-        (state.local_session_paid_msats as i128 - estimated_due as i128)
-            .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+    monad_common::billing::remaining_milli_sats_to_wire(
+        state.local_session_paid_msats as i128 - estimated_due as i128,
     )
 }
 

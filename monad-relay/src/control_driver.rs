@@ -53,7 +53,10 @@ impl<'a> ControlDriver<'a> {
                 }
             }
             SessionEffect::SendStatus => {
-                let status = self.state.session_status_message().await;
+                let Some(status) = self.state.session_status_message().await else {
+                    self.state.terminate();
+                    return Ok(true);
+                };
                 send_control_message(self.h2_send, &status).await?;
             }
             SessionEffect::RunLinkValidation { payment_json } => {
@@ -69,7 +72,8 @@ impl<'a> ControlDriver<'a> {
             } => {
                 pending.push_back(SessionEvent::PaymentValidationFinished(
                     self.state
-                        .apply_channel_payment(&expected_channel_id, &payment_json),
+                        .apply_channel_payment(&expected_channel_id, &payment_json)
+                        .await,
                 ));
             }
             SessionEffect::NotifySessionEvicted {

@@ -57,6 +57,20 @@ pub(crate) enum ByteDirection {
     Outbound,
 }
 
+impl From<ByteDirection> for monad_common::billing::BillingDirection {
+    fn from(direction: ByteDirection) -> Self {
+        match direction {
+            ByteDirection::Inbound => Self::Inbound,
+            ByteDirection::Outbound => Self::Outbound,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionAccountingError {
+    CounterOverflow,
+}
+
 pub(crate) fn step(
     mut state: ServerSessionState,
     event: SessionEvent,
@@ -150,9 +164,23 @@ pub(crate) fn step(
         }
         SessionEvent::PaymentValidationFinished(result) => match result {
             Ok(outcome) => {
-                state.total_paid_millisats = state
+                let Some(total_paid_millisats) = state
                     .total_paid_millisats
-                    .saturating_add(outcome.delta_millisats);
+                    .checked_add(outcome.delta_millisats)
+                else {
+                    state.terminated = true;
+                    return (
+                        state,
+                        vec![
+                            SessionEffect::SendControl(ServerMessage::Error {
+                                code: monad_common::protocol::ServerErrorCode::InternalError,
+                                message: "session accounting overflow".into(),
+                            }),
+                            SessionEffect::EndSession,
+                        ],
+                    );
+                };
+                state.total_paid_millisats = total_paid_millisats;
                 let pause_changed = refresh_pause_state(&mut state, pricing);
                 let mut effects = Vec::new();
                 if let Some(paused) = pause_changed {
@@ -194,19 +222,25 @@ pub(crate) fn apply_accounted_bytes(
     pricing: SessionPricing,
     direction: ByteDirection,
     bytes: usize,
-) -> (ServerSessionState, Option<bool>) {
+) -> Result<(ServerSessionState, Option<bool>), SessionAccountingError> {
+    let bytes = u64::try_from(bytes).map_err(|_| SessionAccountingError::CounterOverflow)?;
     match direction {
         ByteDirection::Inbound => {
-            state.session_total_bytes_in = state.session_total_bytes_in.saturating_add(bytes as u64)
+            state.session_total_bytes_in = state
+                .session_total_bytes_in
+                .checked_add(bytes)
+                .ok_or(SessionAccountingError::CounterOverflow)?;
         }
         ByteDirection::Outbound => {
-            state.session_total_bytes_out =
-                state.session_total_bytes_out.saturating_add(bytes as u64)
+            state.session_total_bytes_out = state
+                .session_total_bytes_out
+                .checked_add(bytes)
+                .ok_or(SessionAccountingError::CounterOverflow)?;
         }
     }
 
     let pause_changed = refresh_pause_state(&mut state, pricing);
-    (state, pause_changed)
+    Ok((state, pause_changed))
 }
 
 fn refresh_pause_state(state: &mut ServerSessionState, pricing: SessionPricing) -> Option<bool> {
@@ -216,15 +250,18 @@ fn refresh_pause_state(state: &mut ServerSessionState, pricing: SessionPricing) 
 }
 
 pub(crate) fn remaining_milli_sats(state: &ServerSessionState, pricing: SessionPricing) -> i128 {
-    let amount_due =
-        pricing.amount_due_millisats(state.session_total_bytes_in, state.session_total_bytes_out);
-    state.total_paid_millisats as i128 - amount_due as i128
+    pricing.remaining_milli_sats(
+        state.total_paid_millisats,
+        state.session_total_bytes_in,
+        state.session_total_bytes_out,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_accounted_bytes, step, ByteDirection, ServerSessionState, SessionEffect, SessionEvent,
+        apply_accounted_bytes, step, ByteDirection, ServerSessionState, SessionAccountingError,
+        SessionEffect, SessionEvent,
     };
     use crate::payments::{ChannelPaymentError, LinkOutcome, PaymentOutcome};
     use monad_common::protocol::ServerMessage;
@@ -563,14 +600,31 @@ mod tests {
             SessionPricing::new(1, 1),
             ByteDirection::Outbound,
             4,
-        );
+        )
+        .unwrap();
         assert_eq!(next.session_total_bytes_out, 4);
         assert_eq!(pause_changed, None);
 
         let (next, pause_changed) =
-            apply_accounted_bytes(next, SessionPricing::new(1, 1), ByteDirection::Outbound, 6);
+            apply_accounted_bytes(next, SessionPricing::new(1, 1), ByteDirection::Outbound, 6)
+                .unwrap();
         assert_eq!(next.session_total_bytes_out, 10);
         assert_eq!(pause_changed, Some(true));
         assert!(next.paused);
+    }
+
+    #[test]
+    fn byte_accounting_rejects_counter_overflow_without_mutation() {
+        let mut current = state();
+        current.session_total_bytes_out = u64::MAX;
+        let error = apply_accounted_bytes(
+            current.clone(),
+            SessionPricing::new(1, 1),
+            ByteDirection::Outbound,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(error, SessionAccountingError::CounterOverflow);
+        assert_eq!(current.session_total_bytes_out, u64::MAX);
     }
 }

@@ -314,7 +314,9 @@ Important types:
   - manages H2 client, driver handles, task handles, session pricing, session ID
   - stores fetched `SessionSpilmanInfo` (mint, keyset, receiver pubkey, negotiated Cashu Spilman protocol and keyset-format versions) for the active channel
 - `SessionPricing` (`session.rs`)
-  - local billing metadata with precomputed LCM for integer-only arithmetic
+  - validated directional billing rates
+- exact session billing (`billing.rs`)
+  - integer quotient/remainder amount-due calculation, remaining-credit conversion, billable-headroom grants, and MONAD's operational 90,000 BTC accounting cap
 - `proxy_bidirectional` (`proxy.rs`)
   - shared generic bidirectional proxy used by client tunnels
 - `Ed25519Pubkey` / `QuicCertIdentity` (`quic_cert_identity.rs`)
@@ -783,16 +785,18 @@ The remaining balance is derived from totals:
 remaining = total_paid_millisats - amount_due
 ```
 
-This is implemented with integer-only arithmetic via a precomputed `lcm(in_rate, out_rate)` and `u128` intermediate values to avoid overflow.
+This is implemented in `monad-common/src/billing.rs` with integer quotient/remainder arithmetic. The combined rational sum is rounded up once; no direction is rounded separately, no floating point is used, and no LCM is saturated. Rates must be positive.
 
-### Chunk-Boundary Overshoot
+MONAD's relay currently supports session accounting up to 90,000 BTC (`9_000_000_000_000_000` msat). Channel capacity, payment deltas, and session-paid totals are checked against that cap and per-unit raw limits before durable payment or credit mutation. Over-limit requests receive `NUMERIC_LIMIT_EXCEEDED`; unexpected accounting counter exhaustion terminates the session rather than emitting an approximate status.
 
-The balance can go negative between billing checks (a proxy chunk may push usage past the paid amount). When the relay detects nonpositive balance, it pauses the session and wakes pause-aware proxy tasks. The client detects the need for more funding from its local counters or a later requested/transition-driven `SessionStatus`, then sends another payment to resume.
+### Reserved Forwarding Headroom
+
+Before each bounded proxy write, the relay reserves the exact number of billable bytes currently affordable under the session totals plus all other active reservations. Reservations are serialized under the session billing mutex, so simultaneous tunnels cannot spend the same credit. A large H2 frame may therefore pause mid-frame at the credit boundary and resume after payment. Actual forwarded prefixes are committed, while unforwarded reservation remains are released on errors and cancellation.
 
 ### Two Pricing Structures
 
 - **Wire**: `ServerMessage::SessionStatus` carries the active rates and the list of alternatives. This is what crosses the network.
-- **Local**: `SessionPricing` (in `monad-common/src/session.rs`) includes the precomputed LCM of the active rates. Both client and relay construct this from the active rates in `SessionStatus` for billing math.
+- **Local**: `SessionPricing` (in `monad-common/src/session.rs`) stores the validated active rates. Both client and relay construct this from the active rates in `SessionStatus`; the relay uses configured positive rates.
 
 ### Client Auto-Funding
 
@@ -909,15 +913,17 @@ Important effects include:
 Per-byte accounting is intentionally not routed through the main control/session
 reducer.
 
-Instead, active proxy tasks update the session byte counters directly under the
-per-session mutex as soon as possible:
+Instead, active proxy tasks reserve billable headroom and update session byte
+counters directly around the per-session billing mutex:
 
-- increment `session_total_bytes_in` / `session_total_bytes_out`
-- recompute paused state
-- notify the pause watcher if the pause state changed
+- grant no more bytes than the shared paid headroom across all active tunnels
+- increment `session_total_bytes_in` / `session_total_bytes_out` only by the actual forwarded prefix
+- release unforwarded reservations on errors and cancellation
+- recompute paused state and notify pause/billing watchers on transitions
 
-This keeps the hot data path low-latency while still allowing the control FSM to
-handle the more complex protocol transitions.
+This keeps the hot data path low-latency while preventing concurrent tunnels
+from spending the same credit. The control FSM still handles the more complex
+protocol transitions.
 
 ### CONNECT Counters
 

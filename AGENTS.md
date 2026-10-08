@@ -29,7 +29,7 @@ cargo run -p monad-quic -- ...
   - `SecpNoiseStream` (`noise_secp256k1.rs`) — secp256k1 Noise transport with buffered writes and wire-byte logging
   - `H2ConnectStream` (`h2stream.rs`)
 - `ClientMessage` / `ServerMessage` wire protocol, `MintUnitAdvertisements`, local `PaymentOption`, `LinkedChannelStatus` (`protocol.rs`)
-  - `RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`, billing math (`session.rs`)
+  - `RelayConnection`, `SessionPricing`, `SessionSpilmanInfo` (`session.rs`); exact billing arithmetic and operational caps (`billing.rs`)
   - `proxy_bidirectional` shared proxy (`proxy.rs`)
   - `QuicCertIdentity`, Ed25519 key derivation for QUIC certificate plumbing (`quic_cert_identity.rs`)
   - `Secp256k1Pubkey` (32-byte x-only, implied even Y), `SecpTransportKeypair`, transport auth helpers (`secp_identity.rs`)
@@ -81,9 +81,9 @@ cargo run -p monad-quic -- ...
 - Bootstrap: the two Noise handshake payloads negotiate the session version/capabilities and post-Noise session protocol (`h2-2026-10-07`), plus one Cashu Spilman protocol and the full mutual keyset-version set; today `2026-09-14` supports `v1` and `v2` and requires a nonempty intersection. Pre-alpha implementations use this identifier while conformance work continues, allowing coordinated breaking changes; issue #125 tracks remaining work.
 - Initial state: once the H2 control stream is established, the relay immediately sends a unified `SessionStatus` containing advertisements and initial state
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
-- Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, integer-only via precomputed LCM
+- Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, exact integer quotient/remainder arithmetic in `monad-common/src/billing.rs`; rates must be positive and unsupported numeric ranges reject with `NUMERIC_LIMIT_EXCEEDED` before mutation
 - `CONNECT` rejected with 402 while paused
-- Balance can go negative (chunk-boundary overshoot); session repauses
+- Relay forwarding reserves exact billable headroom before each bounded operation, so simultaneous tunnels cannot spend the same credit; partial frames can pause mid-frame and resume after payment
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
 - `SessionStatus` uses `session_total_bytes_in/out` and reports `open_connects`, `total_connects`, and `failed_connects`; successful response submission commits acceptance, any pre-acceptance rejection/failure increments failed exactly once, and accepted-tunnel close decrements open exactly once
 - `Ping { nonce }` requests one correlated `Pong { nonce }` for control-path liveness; it does not request status or consume an ordinary request response
@@ -236,7 +236,10 @@ The test suite currently covers:
 - CONNECT rejected while paused (402)
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
-- session overshoot with negative balance and resume
+- mid-frame credit-boundary pause and resume without negative relay session balance
+- concurrent tunnel reservations sharing one paid headroom
+- exact quotient/remainder billing boundaries and zero-rate rejection
+- pre-mutation `NUMERIC_LIMIT_EXCEEDED` preserving relay channel balance
 - underpayment stays paused until balance is positive
 - control stream stays usable while a paused tunnel holds a full H2 receive window (`test_control_stream_survives_connection_window_blocked_by_paused_tunnel`; vendored-h2 coverage in `vendor/h2/tests/paused_flow_control.rs` and `src/proto/streams/recv.rs` tests)
 - concurrent tunnels
@@ -330,7 +333,7 @@ The test suite currently covers:
 - `stress-payment-buffered` should usually keep one linked channel per session and produce many proactive topups with little or no relink activity.
 - `stress-payment-relink` should usually produce many successful relinks with little or no link failures and only rare pauses.
 - `stress-chaos-rebuild` should recover after each relay restart, report no suffix rebuild failures/fallbacks, and keep channel record growth bounded by the number of full reconnect generations.
-- small amounts of pause/recovery activity can still be acceptable because chunk-boundary overshoot is allowed, but repeated control errors, repeated `payment_no_new_funds`, or non-zero `channel_link_failures` are warning signs worth investigating.
+- small amounts of pause/recovery activity can still be acceptable at bounded chunk/credit boundaries, but repeated control errors, repeated `payment_no_new_funds`, repeated `NUMERIC_LIMIT_EXCEEDED`, or non-zero `channel_link_failures` are warning signs worth investigating.
 
 If you change routing, transport, or SOCKS behavior, extend tests rather than weakening them.
 

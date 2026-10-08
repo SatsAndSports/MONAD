@@ -803,7 +803,15 @@ async fn start_auto_control(
                     ..
                 } => {
                     last_status_received_at = Instant::now();
-                    let pricing = SessionPricing::new(active_in_rate, active_out_rate);
+                    let pricing = match SessionPricing::try_new(active_in_rate, active_out_rate) {
+                        Ok(pricing) => pricing,
+                        Err(error) => {
+                            warn!(
+                                "{hop_label}: protocol violation: invalid relay session pricing: {error}"
+                            );
+                            break;
+                        }
+                    };
                     *pricing_handle.write().await = Some(pricing);
 
                     if status_request_in_flight {
