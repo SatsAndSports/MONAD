@@ -10,9 +10,11 @@ channels and `Err` for lookup failures. This API update requires no database res
 Use the relay management action `request_channel_unlink` with
 `{"channel_id": "..."}` before `close_channel` for a linked channel. Retirement
 persists across relay restarts and prevents relinking. The client finishes any
-outstanding payment acknowledgement and releases the channel; its remaining
-session credit stays usable. Close the channel separately after it is unlinked.
-Automatic replacement channel provisioning occurs when the session pauses.
+outstanding payment acknowledgement and sends an ID-only unlink request; its
+remaining session credit stays usable. Success is one authoritative session
+status with no linked channel. Close the channel separately after it is
+unlinked. Automatic replacement channel provisioning occurs when the session
+pauses.
 See [relay management actions](docs/management-api.md#relay-actions).
 
 The cooperative unlink messages require coordinated client and relay updates;

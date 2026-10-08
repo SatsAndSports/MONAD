@@ -3217,6 +3217,61 @@ fn mock_wallet_channel(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn test_owner_can_unlink_without_release_hint_and_gets_single_status() {
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
+    let initial = control_handshake_status(&mut h2_send, &mut h2_recv).await;
+    assert!(initial.linked_channel.is_none());
+
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    let channel_id = channel.channel_id.clone();
+    channel.link(&mut h2_send, &mut h2_recv).await;
+    let (_in, _out, paid, remaining, paused) = channel.pay(&mut h2_send, &mut h2_recv, 1_000).await;
+    assert_eq!(paid, 1_000);
+    assert_eq!(remaining, 1_000);
+    assert!(!paused);
+
+    send_control_message(
+        &mut h2_send,
+        &ClientMessage::ChannelUnlink {
+            channel_id: channel_id.clone(),
+        },
+        false,
+    )
+    .await;
+    let unlinked = expect_session_status_struct(read_control_message(&mut h2_recv).await);
+    assert!(unlinked.linked_channel.is_none());
+    assert_eq!(unlinked.total_paid_millisats, 1_000);
+    assert_eq!(unlinked.remaining_milli_sats, 1_000);
+    assert!(!unlinked.paused);
+    assert!(
+        timeout(
+            Duration::from_millis(100),
+            read_control_message(&mut h2_recv)
+        )
+        .await
+        .is_err(),
+        "successful unlink must emit exactly one SessionStatus"
+    );
+
+    send_control_message(
+        &mut h2_send,
+        &ClientMessage::ChannelUnlink { channel_id },
+        false,
+    )
+    .await;
+    let (code, _) = ControlSessionHarness {
+        send: h2_send,
+        recv: h2_recv,
+    }
+    .expect_error()
+    .await;
+    assert_eq!(code, ServerErrorCode::ChannelUnlinkRejected);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_session_starts_paused() {
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
