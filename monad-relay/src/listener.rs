@@ -354,9 +354,10 @@ pub async fn discover_spilman_mint_cache_with_storage(
     let mut cache = SpilmanMintCache::default();
 
     for mint_url in trusted_mint_units.keys() {
-        let keysets = fetch_all_keysets_from_mint(mint_url)
+        let discovery = fetch_all_keysets_from_mint(mint_url)
             .await
             .map_err(|e| io::Error::other(format!("discover keysets from {mint_url}: {e}")))?;
+        let keysets = discovery.keysets;
         if let Some(storage) = storage {
             cache_relay_keysets(storage, mint_url, &keysets)
                 .map_err(|e| io::Error::other(format!("cache keysets from {mint_url}: {e}")))?;

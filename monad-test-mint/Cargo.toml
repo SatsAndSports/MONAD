@@ -1,6 +1,6 @@
 [package]
 name = "monad-test-mint"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
 
@@ -28,4 +28,4 @@ tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 monad-client = { path = "../monad-client" }
 monad-relay = { path = "../monad-relay" }
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "97ce73a17812b54157b65dae9d3a6801ac3ba236", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "22de9a78fc7c314cf04f0817a5bbe156cc41c734", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }

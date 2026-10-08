@@ -1413,7 +1413,8 @@ impl RelayWalletManager {
         &self,
         mint_url: &str,
     ) -> Result<Vec<MintKeysetWithKeys>, String> {
-        let keysets = fetch_all_keysets_from_mint(mint_url).await?;
+        let discovery = fetch_all_keysets_from_mint(mint_url).await?;
+        let keysets = discovery.keysets;
         cache_relay_keysets(self.storage.as_ref(), mint_url, &keysets)?;
         Ok(keysets)
     }
@@ -1450,7 +1451,7 @@ impl RelayWalletManager {
     ) -> Result<SharedSpilmanMintCache, String> {
         let mut refreshed = SpilmanMintCache::default();
         for mint_url in trusted_mint_units.keys() {
-            let keysets = fetch_all_keysets_from_mint(mint_url).await?;
+            let keysets = fetch_all_keysets_from_mint(mint_url).await?.keysets;
             cache_relay_keysets(self.storage.as_ref(), mint_url, &keysets)?;
             merge_keysets_into_cache(&mut refreshed, mint_url, &keysets);
         }
