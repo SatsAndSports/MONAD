@@ -106,10 +106,7 @@ fn try_decode_json_line_with_limit<T: DeserializeOwned>(
                 serde_json::from_slice(line)
                     .map_err(|_| invalid_control_message("invalid JSON message"))
             })
-            .map_err(|error| {
-                buf.clear();
-                error
-            })?;
+            .inspect_err(|_| buf.clear())?;
         return Ok(Some(message));
     }
 }
