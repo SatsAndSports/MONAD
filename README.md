@@ -600,9 +600,12 @@ Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated
 
 Clients and relays negotiate `h2-2026-10-07`. During pre-alpha development,
 upgrade both ends of every hop together as breaking changes bring the
-implementation into conformance with the control contract. Remaining work is
-tracked in [issue #125](https://github.com/SatsAndSports/MONAD/issues/125).
-No database migration or reset is needed for this advertisement update.
+implementation into conformance with the control contract. Control framing
+enforces the contract's 1 MiB line limit, duplicate-key and parser-complexity
+rejection, and fatal malformed-input cleanup; the relay attempts one bounded
+generic `CONTROL_INVALID_MESSAGE` before teardown. Remaining work is tracked in
+[issue #125](https://github.com/SatsAndSports/MONAD/issues/125). No database
+migration or reset is needed for this advertisement update.
 
 When a first-time `ChannelLink` uses an unknown keyset for a configured trusted mint/unit, the relay performs metadata-independent structural checks, transparently invokes its bounded refresh coordinator, and retries the immutable link once. A successful refresh that still does not know the keyset produces a permanent `LinkMintOrKeysetUnacceptable` rejection. If cooldown, that relay coordinator's cross-mint capacity, timeout, or mint failure prevents a fresh decision, the relay returns a specific transient link error and the configured client preserves the channel and retries with backoff.
 

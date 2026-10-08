@@ -41,7 +41,7 @@ use monad_common::bootstrap::{
     BootstrapCapabilities, BootstrapClientHello, BootstrapV1ClientHello, BOOTSTRAP_VERSION,
     CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14, PRICING_POLICY_SESSION_CONSTANT,
 };
-use monad_common::control_codec::{encode_json_line, try_decode_json_line};
+use monad_common::control_codec::{encode_json_line, try_decode_json_line, MAX_CONTROL_LINE_LEN};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise_secp256k1;
 use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
@@ -2711,6 +2711,39 @@ async fn send_control_message(
     h2_send.send_data(frame, end_stream).unwrap();
 }
 
+async fn send_raw_control_bytes(
+    h2_send: &mut h2::SendStream<Bytes>,
+    bytes: &[u8],
+    end_stream: bool,
+) {
+    const RAW_CONTROL_CHUNK_LEN: usize = 16 * 1024;
+    let mut chunks = bytes.chunks(RAW_CONTROL_CHUNK_LEN).peekable();
+    while let Some(chunk) = chunks.next() {
+        h2_send.reserve_capacity(chunk.len());
+        wait_for_send_capacity(h2_send).await.unwrap();
+        let end_this_chunk = end_stream && chunks.peek().is_none();
+        h2_send
+            .send_data(Bytes::copy_from_slice(chunk), end_this_chunk)
+            .unwrap();
+    }
+    if bytes.is_empty() && end_stream {
+        h2_send.send_data(Bytes::new(), true).unwrap();
+    }
+}
+
+async fn expect_control_stream_closed(h2_recv: &mut h2::RecvStream) {
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(2), h2_recv.data())
+            .await
+            .expect("control stream did not close promptly");
+        match next {
+            None => break,
+            Some(Ok(bytes)) if bytes.is_empty() => continue,
+            other => panic!("expected control stream EOF, got {other:?}"),
+        }
+    }
+}
+
 async fn read_control_message(h2_recv: &mut h2::RecvStream) -> ServerMessage {
     let mut response_buf = Vec::new();
 
@@ -3258,6 +3291,67 @@ async fn test_second_control_stream_rejected() {
     drop(first_recv);
     drop(h2);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_malformed_control_input_sends_one_bounded_error_and_terminates() {
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
+    let (_in0, _out0, _paid0, _rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
+    assert!(paused0);
+
+    send_raw_control_bytes(
+        &mut h2_send,
+        b"not-json\n{\"type\":\"GetSessionStatus\"}\n",
+        false,
+    )
+    .await;
+
+    let (code, message) = match read_control_message(&mut h2_recv).await {
+        ServerMessage::Error { code, message } => (code, message),
+        other => panic!("expected Error, got {other:?}"),
+    };
+    assert_eq!(code, ServerErrorCode::ControlInvalidMessage);
+    assert_eq!(message, "invalid control message");
+    expect_control_stream_closed(&mut h2_recv).await;
+
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_oversize_control_input_sends_one_bounded_error_and_terminates() {
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
+    let (_in0, _out0, _paid0, _rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
+    assert!(paused0);
+
+    send_raw_control_bytes(&mut h2_send, &vec![b'x'; MAX_CONTROL_LINE_LEN + 1], false).await;
+
+    let (code, message) = match read_control_message(&mut h2_recv).await {
+        ServerMessage::Error { code, message } => (code, message),
+        other => panic!("expected Error, got {other:?}"),
+    };
+    assert_eq!(code, ServerErrorCode::ControlInvalidMessage);
+    assert_eq!(message, "invalid control message");
+    expect_control_stream_closed(&mut h2_recv).await;
+
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_final_partial_control_line_is_not_executed() {
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
+    let (_in0, _out0, _paid0, _rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
+    assert!(paused0);
+
+    send_raw_control_bytes(&mut h2_send, b"{\"type\":\"GetSessionStatus\"}", true).await;
+
+    expect_control_stream_closed(&mut h2_recv).await;
     conn.shutdown().await;
 }
 
