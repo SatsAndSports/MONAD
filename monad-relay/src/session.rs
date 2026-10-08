@@ -21,7 +21,9 @@ use h2::{server, RecvStream};
 use http::{Method, Request, Response, StatusCode};
 use monad_common::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
 use monad_common::blinded_hop::resolve_blinded_hop_for_intro;
-use monad_common::control_codec::{send_json_line, try_decode_json_line};
+use monad_common::control_codec::{
+    send_json_line, try_decode_json_line, CONTROL_INVALID_MESSAGE_TEXT,
+};
 use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::protocol::{
     ClientMessage, MintUnitAdvertisement, MintUnitAdvertisements, ServerErrorCode, ServerMessage,
@@ -519,6 +521,7 @@ struct ConnectHandler {
 }
 
 const CONNECT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CONTROL_INVALID_MESSAGE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct RelaySessionConfig {
@@ -1087,14 +1090,19 @@ async fn handle_control_stream(
                                 let message = match try_decode_json_line::<ClientMessage>(&mut buf) {
                                     Ok(Some(message)) => message,
                                     Ok(None) => break,
-                                    Err(e) => {
-                                        warn!("control: invalid message: {e}");
+                                    Err(_) => {
+                                        warn!("control: invalid client message");
                                         let err_msg = ServerMessage::Error {
                                             code: ServerErrorCode::ControlInvalidMessage,
-                                            message: format!("invalid message: {e}"),
+                                            message: CONTROL_INVALID_MESSAGE_TEXT.to_string(),
                                         };
-                                        send_control_message(&mut h2_send, &err_msg).await?;
-                                        continue;
+                                        let _ = tokio::time::timeout(
+                                            CONTROL_INVALID_MESSAGE_SEND_TIMEOUT,
+                                            send_control_message(&mut h2_send, &err_msg),
+                                        )
+                                        .await;
+                                        terminate_session = true;
+                                        break;
                                     }
                                 };
 
