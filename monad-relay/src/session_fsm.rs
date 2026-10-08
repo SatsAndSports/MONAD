@@ -4,8 +4,8 @@ use monad_common::session::SessionPricing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerSessionState {
-    pub session_total_in: u64,
-    pub session_total_out: u64,
+    pub session_total_bytes_in: u64,
+    pub session_total_bytes_out: u64,
     pub total_paid_millisats: u64,
     pub paused: bool,
     pub linked_channel_id: Option<String>,
@@ -197,10 +197,11 @@ pub(crate) fn apply_accounted_bytes(
 ) -> (ServerSessionState, Option<bool>) {
     match direction {
         ByteDirection::Inbound => {
-            state.session_total_in = state.session_total_in.saturating_add(bytes as u64)
+            state.session_total_bytes_in = state.session_total_bytes_in.saturating_add(bytes as u64)
         }
         ByteDirection::Outbound => {
-            state.session_total_out = state.session_total_out.saturating_add(bytes as u64)
+            state.session_total_bytes_out =
+                state.session_total_bytes_out.saturating_add(bytes as u64)
         }
     }
 
@@ -215,7 +216,8 @@ fn refresh_pause_state(state: &mut ServerSessionState, pricing: SessionPricing) 
 }
 
 pub(crate) fn remaining_milli_sats(state: &ServerSessionState, pricing: SessionPricing) -> i128 {
-    let amount_due = pricing.amount_due_millisats(state.session_total_in, state.session_total_out);
+    let amount_due =
+        pricing.amount_due_millisats(state.session_total_bytes_in, state.session_total_bytes_out);
     state.total_paid_millisats as i128 - amount_due as i128
 }
 
@@ -230,8 +232,8 @@ mod tests {
 
     fn state() -> ServerSessionState {
         ServerSessionState {
-            session_total_in: 0,
-            session_total_out: 0,
+            session_total_bytes_in: 0,
+            session_total_bytes_out: 0,
             total_paid_millisats: 0,
             paused: true,
             linked_channel_id: None,
@@ -278,8 +280,8 @@ mod tests {
     fn link_accept_releases_previous_channel_before_status() {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());
-        current.session_total_in = 11;
-        current.session_total_out = 13;
+        current.session_total_bytes_in = 11;
+        current.session_total_bytes_out = 13;
         current.total_paid_millisats = 29;
         current.paused = false;
         let accounting = current.clone();
@@ -295,8 +297,14 @@ mod tests {
         );
 
         assert_eq!(next.linked_channel_id.as_deref(), Some("chan-b"));
-        assert_eq!(next.session_total_in, accounting.session_total_in);
-        assert_eq!(next.session_total_out, accounting.session_total_out);
+        assert_eq!(
+            next.session_total_bytes_in,
+            accounting.session_total_bytes_in
+        );
+        assert_eq!(
+            next.session_total_bytes_out,
+            accounting.session_total_bytes_out
+        );
         assert_eq!(next.total_paid_millisats, accounting.total_paid_millisats);
         assert_eq!(next.paused, accounting.paused);
         assert!(matches!(
@@ -435,8 +443,8 @@ mod tests {
     fn unlink_success_clears_link_and_confirms() {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());
-        current.session_total_in = 11;
-        current.session_total_out = 13;
+        current.session_total_bytes_in = 11;
+        current.session_total_bytes_out = 13;
         current.total_paid_millisats = 29;
         current.paused = false;
         let accounting = current.clone();
@@ -448,8 +456,14 @@ mod tests {
         );
 
         assert_eq!(next.linked_channel_id, None);
-        assert_eq!(next.session_total_in, accounting.session_total_in);
-        assert_eq!(next.session_total_out, accounting.session_total_out);
+        assert_eq!(
+            next.session_total_bytes_in,
+            accounting.session_total_bytes_in
+        );
+        assert_eq!(
+            next.session_total_bytes_out,
+            accounting.session_total_bytes_out
+        );
         assert_eq!(next.total_paid_millisats, accounting.total_paid_millisats);
         assert_eq!(next.paused, accounting.paused);
         assert!(matches!(effects.as_slice(), [SessionEffect::SendStatus]));
@@ -550,12 +564,12 @@ mod tests {
             ByteDirection::Outbound,
             4,
         );
-        assert_eq!(next.session_total_out, 4);
+        assert_eq!(next.session_total_bytes_out, 4);
         assert_eq!(pause_changed, None);
 
         let (next, pause_changed) =
             apply_accounted_bytes(next, SessionPricing::new(1, 1), ByteDirection::Outbound, 6);
-        assert_eq!(next.session_total_out, 10);
+        assert_eq!(next.session_total_bytes_out, 10);
         assert_eq!(pause_changed, Some(true));
         assert!(next.paused);
     }

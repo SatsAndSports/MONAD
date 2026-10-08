@@ -135,13 +135,14 @@ pub enum ServerMessage {
         active_out_rate: u64,
 
         // --- Accounting Info ---
-        session_total_in: u64,
-        session_total_out: u64,
+        session_total_bytes_in: u64,
+        session_total_bytes_out: u64,
         total_paid_millisats: u64,
         remaining_milli_sats: i64,
         paused: bool,
         open_connects: u32,
         total_connects: u64,
+        failed_connects: u64,
     },
 
     /// Another session claimed the channel; this session is now Unlinked.
@@ -247,13 +248,14 @@ mod advertisement_tests {
             linked_channel: None,
             active_in_rate: 11,
             active_out_rate: 22,
-            session_total_in: 0,
-            session_total_out: 0,
+            session_total_bytes_in: 0,
+            session_total_bytes_out: 0,
             total_paid_millisats: 0,
             remaining_milli_sats: 0,
             paused: true,
             open_connects: 0,
             total_connects: 0,
+            failed_connects: 0,
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(
@@ -265,8 +267,13 @@ mod advertisement_tests {
         );
         assert_eq!(value["bytes_in_per_msat"], 11);
         assert_eq!(value["bytes_out_per_msat"], 22);
+        assert_eq!(value["session_total_bytes_in"], 0);
+        assert_eq!(value["session_total_bytes_out"], 0);
+        assert_eq!(value["failed_connects"], 0);
         assert!(value.get("active_in_rate").is_none());
         assert!(value.get("active_out_rate").is_none());
+        assert!(value.get("session_total_in").is_none());
+        assert!(value.get("session_total_out").is_none());
         let ServerMessage::SessionStatus { advertisements, .. } =
             serde_json::from_value::<ServerMessage>(value.clone()).unwrap()
         else {
@@ -280,6 +287,25 @@ mod advertisement_tests {
         let mut empty = value.clone();
         empty["advertisements"] = json!({});
         assert!(serde_json::from_value::<ServerMessage>(empty).is_ok());
+
+        for (legacy_name, current_name) in [
+            ("session_total_in", "session_total_bytes_in"),
+            ("session_total_out", "session_total_bytes_out"),
+        ] {
+            let mut legacy_names = value.clone();
+            let object = legacy_names.as_object_mut().unwrap();
+            let legacy_value = object.remove(current_name).unwrap();
+            object.insert(legacy_name.into(), legacy_value);
+            assert!(serde_json::from_value::<ServerMessage>(legacy_names).is_err());
+        }
+        let mut missing_failed = value.clone();
+        missing_failed
+            .as_object_mut()
+            .unwrap()
+            .remove("failed_connects")
+            .unwrap();
+        assert!(serde_json::from_value::<ServerMessage>(missing_failed).is_err());
+
         let mut legacy = value;
         legacy["advertisements"] = json!([]);
         assert!(serde_json::from_value::<ServerMessage>(legacy).is_err());
@@ -320,13 +346,14 @@ mod advertisement_tests {
             linked_channel: None,
             active_in_rate: 1,
             active_out_rate: 1,
-            session_total_in: 0,
-            session_total_out: 0,
+            session_total_bytes_in: 0,
+            session_total_bytes_out: 0,
             total_paid_millisats: 0,
             remaining_milli_sats: 0,
             paused: true,
             open_connects: 0,
             total_connects: 0,
+            failed_connects: 0,
         })
         .unwrap();
         status["unexpected"] = json!(null);

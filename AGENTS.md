@@ -85,6 +85,7 @@ cargo run -p monad-quic -- ...
 - `CONNECT` rejected with 402 while paused
 - Balance can go negative (chunk-boundary overshoot); session repauses
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
+- `SessionStatus` uses `session_total_bytes_in/out` and reports `open_connects`, `total_connects`, and `failed_connects`; successful response submission commits acceptance, any pre-acceptance rejection/failure increments failed exactly once, and accepted-tunnel close decrements open exactly once
 - `Ping { nonce }` requests one correlated `Pong { nonce }` for control-path liveness; it does not request status or consume an ordinary request response
 - `Error { code, message }` for relay-initiated rejections and notifications
 - `ChannelLink { payment_json }` links a Spilman channel to the session; relay validates and then sends an authoritative `SessionStatus` on success or `Error` on failure. A first-time link using an unknown keyset for a trusted mint/unit must pass metadata-independent structural checks before it invokes the bounded relay refresh coordinator and retries the immutable link once. Stored relinks bypass refresh. Only one session can own a channel at a time.
@@ -239,6 +240,7 @@ The test suite currently covers:
 - underpayment stays paused until balance is positive
 - control stream stays usable while a paused tunnel holds a full H2 receive window (`test_control_stream_survives_connection_window_blocked_by_paused_tunnel`; vendored-h2 coverage in `vendor/h2/tests/paused_flow_control.rs` and `src/proto/streams/recv.rs` tests)
 - concurrent tunnels
+- SessionStatus CONNECT counters for TCP/QUIC acceptance, close, paused rejection, malformed targets, and destination failure
 - nested 2-hop and 3-hop routes
 - IPv6 targets and IPv6 listeners
 - mixed-family hop chains

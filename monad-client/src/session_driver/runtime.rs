@@ -176,23 +176,25 @@ pub(super) async fn run_session_driver(
                             linked_channel,
                             active_in_rate,
                             active_out_rate,
-                            session_total_in,
-                            session_total_out,
+                            session_total_bytes_in,
+                            session_total_bytes_out,
                             total_paid_millisats,
                             remaining_milli_sats,
                             paused,
                             open_connects,
                             total_connects,
+                            failed_connects,
                         } => {
                             let previous_paid = state.relay_snapshot.as_ref().map(|s| s.total_paid_millisats).unwrap_or(0);
                             let pricing = SessionPricing::new(active_in_rate, active_out_rate);
                             validate_session_pricing(&mut state.established_pricing, pricing)?;
-                            let due_now = pricing.amount_due_millisats(session_total_in, session_total_out);
+                            let due_now = pricing.amount_due_millisats(session_total_bytes_in, session_total_bytes_out);
                             info!(
-                                "{} session status: open_connects={} total_connects={} paused={} balance={} paid={} due={} linked={:?} intended={} op={:?} blocked={:?} local_remaining={:?}",
+                                "{} session status: open_connects={} total_connects={} failed_connects={} paused={} balance={} paid={} due={} linked={:?} intended={} op={:?} blocked={:?} local_remaining={:?}",
                                 config.hop_label,
                                 open_connects,
                                 total_connects,
+                                failed_connects,
                                 paused,
                                 remaining_milli_sats,
                                 total_paid_millisats,
@@ -207,8 +209,8 @@ pub(super) async fn run_session_driver(
                                     receiver_pubkey,
                                     advertisements: monad_common::protocol::advertisement_options(&advertisements, active_in_rate, active_out_rate),
                                     linked_channel,
-                                    session_total_in,
-                                    session_total_out,
+                                    session_total_bytes_in,
+                                    session_total_bytes_out,
                                     total_paid_millisats,
                                     remaining_milli_sats,
                                     paused,

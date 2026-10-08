@@ -211,12 +211,12 @@ pub(super) fn validate_session_status_baseline_against_local_counters(
     };
     let (_local_inbound, local_outbound) = counters.snapshot();
 
-    if snapshot.session_total_out > local_outbound {
+    if snapshot.session_total_bytes_out > local_outbound {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "protocol violation: relay reported session_total_out={} above client local outbound total={}",
-                snapshot.session_total_out, local_outbound,
+                "protocol violation: relay reported session_total_bytes_out={} above client local outbound total={}",
+                snapshot.session_total_bytes_out, local_outbound,
             ),
         ));
     }

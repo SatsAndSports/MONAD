@@ -42,7 +42,7 @@ The relay is authoritative for accepted session state:
 - whether the session is paused
 - which channel is currently linked
 - the latest accepted linked-channel raw balance
-- accepted session totals (`session_total_in`, `session_total_out`)
+- accepted session totals (`session_total_bytes_in`, `session_total_bytes_out`)
 - accepted session payment total (`total_paid_millisats`)
 
 The client is authoritative for local intent and local authorization:
@@ -342,7 +342,7 @@ status update as a payment baseline.
 
 1. Active pricing is immutable after first status.
 2. Relay `linked_channel.balance_raw` must never exceed the client's own locally signed balance for that same channel.
-3. Relay `session_total_out` must never exceed the client's locally observed outbound total.
+3. Relay `session_total_bytes_out` must never exceed the client's locally observed outbound total.
 4. Relay `total_paid_millisats` must never exceed the client's locally authorized payment total.
 
 These checks live with the private `payment` module in
