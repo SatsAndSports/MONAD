@@ -17,6 +17,7 @@ pub(crate) enum SessionEvent {
     ClientChannelUnlink { channel_id: String },
     UnlinkValidationFinished { result: Result<(), String> },
     ClientGetSessionStatus,
+    ClientPing { nonce: String },
     ClientChannelLink { payment_json: String },
     LinkValidationFinished(Result<LinkOutcome, LinkError>),
     ClientChannelPayment { payment_json: String },
@@ -91,6 +92,9 @@ pub(crate) fn step(
             })],
         },
         SessionEvent::ClientGetSessionStatus => vec![SessionEffect::SendStatus],
+        SessionEvent::ClientPing { nonce } => {
+            vec![SessionEffect::SendControl(ServerMessage::Pong { nonce })]
+        }
         SessionEvent::ClientChannelLink { payment_json } => {
             vec![SessionEffect::RunLinkValidation { payment_json }]
         }
@@ -233,6 +237,25 @@ mod tests {
             linked_channel_id: None,
             terminated: false,
         }
+    }
+
+    #[test]
+    fn ping_echoes_nonce_without_session_mutation() {
+        let current = state();
+        let (next, effects) = step(
+            current.clone(),
+            SessionEvent::ClientPing {
+                nonce: "opaque-τ-17".to_string(),
+            },
+            SessionPricing::new(1, 1),
+        );
+
+        assert_eq!(next, current);
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::SendControl(ServerMessage::Pong { nonce })]
+                if nonce == "opaque-τ-17"
+        ));
     }
 
     #[test]

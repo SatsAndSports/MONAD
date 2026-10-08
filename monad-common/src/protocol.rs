@@ -111,6 +111,8 @@ pub enum ClientMessage {
     ChannelUnlink { channel_id: String },
     /// Request a fresh session status snapshot.
     GetSessionStatus,
+    /// Request correlated control-path liveness evidence.
+    Ping { nonce: String },
 }
 
 /// Messages sent from server to client on the control channel.
@@ -148,6 +150,10 @@ pub enum ServerMessage {
     },
     ChannelReleaseRequested {
         channel_id: String,
+    },
+    /// Correlated response to a client Ping.
+    Pong {
+        nonce: String,
     },
 
     /// Server-initiated error or notification
@@ -325,5 +331,38 @@ mod advertisement_tests {
         .unwrap();
         status["unexpected"] = json!(null);
         assert!(serde_json::from_value::<ServerMessage>(status).is_err());
+    }
+
+    #[test]
+    fn ping_and_pong_preserve_opaque_nonce_and_reject_extra_fields() {
+        let nonce = "probe-τ-001".to_string();
+        let ping = serde_json::to_value(ClientMessage::Ping {
+            nonce: nonce.clone(),
+        })
+        .unwrap();
+        assert_eq!(ping, json!({"type":"Ping","nonce":nonce}));
+        assert!(serde_json::from_value::<ClientMessage>(ping).is_ok());
+
+        let pong = serde_json::to_value(ServerMessage::Pong {
+            nonce: nonce.clone(),
+        })
+        .unwrap();
+        assert_eq!(pong, json!({"type":"Pong","nonce":nonce}));
+        assert!(serde_json::from_value::<ServerMessage>(pong.clone()).is_ok());
+
+        assert!(
+            serde_json::from_value::<ServerMessage>(json!({"type":"Ping","nonce":nonce})).is_err()
+        );
+        assert!(serde_json::from_value::<ClientMessage>(pong).is_err());
+
+        for invalid in [
+            json!({"type":"Ping","nonce":"probe","extra":null}),
+            json!({"type":"Ping","nonce":1}),
+            json!({"type":"Pong","nonce":"probe","extra":null}),
+            json!({"type":"Pong","nonce":1}),
+        ] {
+            assert!(serde_json::from_value::<ClientMessage>(invalid.clone()).is_err());
+            assert!(serde_json::from_value::<ServerMessage>(invalid).is_err());
+        }
     }
 }

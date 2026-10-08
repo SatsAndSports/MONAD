@@ -1038,6 +1038,7 @@ async fn start_auto_control(
                         funding.reset();
                     }
                 }
+                ServerMessage::Pong { .. } => {}
                 ServerMessage::Error { code, message } => {
                     if is_recoverable_funding_error(&code) {
                         warn!(

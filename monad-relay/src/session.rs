@@ -1120,6 +1120,14 @@ async fn handle_control_stream(
                                         )
                                         .await?;
                                     }
+                                    ClientMessage::Ping { nonce } => {
+                                        terminate_session = process_session_event(
+                                            &state,
+                                            SessionEvent::ClientPing { nonce },
+                                            &mut h2_send,
+                                        )
+                                        .await?;
+                                    }
                                     ClientMessage::ChannelLink { payment_json } => {
                                         terminate_session = process_session_event(
                                             &state,

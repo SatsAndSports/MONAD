@@ -3217,6 +3217,50 @@ fn mock_wallet_channel(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn test_ping_pong_tracks_nonce_without_consuming_status_request() {
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
+    let initial = control_handshake_status(&mut h2_send, &mut h2_recv).await;
+    assert!(initial.paused);
+    assert!(initial.linked_channel.is_none());
+
+    send_control_message(
+        &mut h2_send,
+        &ClientMessage::Ping {
+            nonce: "paused-probe-τ".to_string(),
+        },
+        false,
+    )
+    .await;
+    send_control_message(&mut h2_send, &ClientMessage::GetSessionStatus, false).await;
+
+    match read_control_message(&mut h2_recv).await {
+        ServerMessage::Pong { nonce } => assert_eq!(nonce, "paused-probe-τ"),
+        other => panic!("expected Pong before status response, got {other:?}"),
+    }
+    let status = expect_session_status_struct(read_control_message(&mut h2_recv).await);
+    assert!(status.paused);
+    assert!(status.linked_channel.is_none());
+
+    for nonce in ["first", "second"] {
+        send_control_message(
+            &mut h2_send,
+            &ClientMessage::Ping {
+                nonce: nonce.to_string(),
+            },
+            false,
+        )
+        .await;
+        match read_control_message(&mut h2_recv).await {
+            ServerMessage::Pong { nonce: got } => assert_eq!(got, nonce),
+            other => panic!("expected repeated Pong, got {other:?}"),
+        }
+    }
+    conn.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_owner_can_unlink_without_release_hint_and_gets_single_status() {
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
