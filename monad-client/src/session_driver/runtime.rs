@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 use tokio::time::{self, Duration, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
-use super::funding::{apply_channel_evicted, apply_server_error};
+use super::funding::{apply_channel_evicted, apply_channel_unlinked, apply_server_error};
 use super::funding::{handle_control_detached, run_funding_cycle};
 use super::payment::{
     compute_estimated_remaining, validate_linked_channel_balance_against_wallet,
@@ -15,7 +15,7 @@ use super::payment::{
 };
 use super::state::{
     apply_session_status, publish_pricing, publish_spilman_info, signal_ready, state_summary,
-    DriverState, RelaySnapshot, SessionDriverConfig,
+    ControlOpInFlight, DriverState, RelaySnapshot, SessionDriverConfig,
 };
 
 fn payment_conflict_error(code: &ServerErrorCode, hop_label: &str) -> Option<io::Error> {
@@ -68,6 +68,24 @@ impl ControlHeartbeat {
 
         HeartbeatAction::None
     }
+}
+
+async fn apply_driver_session_status(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    snapshot: RelaySnapshot,
+) -> bool {
+    let confirmed_unlink_channel = match (&state.control_op_in_flight, &snapshot.linked_channel) {
+        (Some(ControlOpInFlight::Unlink { channel_id }), linked) if !matches!(linked, Some(linked) if linked.channel_id == *channel_id) => {
+            Some(channel_id.clone())
+        }
+        _ => None,
+    };
+    let resolved_payment = apply_session_status(state, snapshot);
+    if let Some(channel_id) = confirmed_unlink_channel {
+        apply_channel_unlinked(config, state, channel_id).await;
+    }
+    resolved_payment
 }
 
 pub(super) async fn run_session_driver(
@@ -165,7 +183,7 @@ pub(super) async fn run_session_driver(
                              if super::state::session_status_is_stale(&state, &snapshot) {
                                  continue;
                              }
-                             let resolved = apply_session_status(&mut state, snapshot);
+                              let resolved = apply_driver_session_status(&config, &mut state, snapshot).await;
                             publish_pricing(&config, pricing).await;
                             publish_spilman_info(&config, &state).await;
                              if let Err(error) = validate_linked_channel_balance_against_wallet(
@@ -224,15 +242,6 @@ pub(super) async fn run_session_driver(
                                 channel_id,
                             )
                             .await?;
-                            false
-                        }
-                        ServerMessage::ChannelUnlinked { channel_id, .. } => {
-                            super::funding::apply_channel_unlinked(
-                                &config,
-                                &mut state,
-                                channel_id,
-                            )
-                            .await;
                             false
                         }
                         ServerMessage::Error { code, message } => {

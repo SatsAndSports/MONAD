@@ -105,7 +105,7 @@ pub(super) struct DriverState {
     pub(super) control_op_in_flight: Option<ControlOpInFlight>,
     /// Channels the relay has politely asked to retire. The client stops
     /// creating payments on them, awaits acknowledgement of any in-flight
-    /// payment, then sends `ChannelUnlink` with the final signed balance.
+    /// payment, then sends an ID-only `ChannelUnlink`.
     pub(super) release_requested_channels: BTreeSet<String>,
     pub(super) funding_retry_not_before: Option<Instant>,
     pub(super) funding_blocked_reason: Option<FundingBlockedReason>,
@@ -456,6 +456,20 @@ mod acknowledgement_tests {
             paused: true,
         }
     }
+
+    fn unlinked_status(paid_millisats: u64) -> RelaySnapshot {
+        RelaySnapshot {
+            receiver_pubkey: String::new(),
+            advertisements: vec![],
+            linked_channel: None,
+            session_total_in: 0,
+            session_total_out: 0,
+            total_paid_millisats: paid_millisats,
+            remaining_milli_sats: -21,
+            paused: true,
+        }
+    }
+
     #[test]
     fn unsolicited_pause_status_does_not_acknowledge_pending_payment() {
         let mut state = DriverState::default();
@@ -484,6 +498,22 @@ mod acknowledgement_tests {
         assert!(state.control_op_in_flight.is_some());
         apply_session_status(&mut state, status("new", 0));
         assert!(state.control_op_in_flight.is_none());
+    }
+
+    #[test]
+    fn unlinked_status_acknowledges_pending_unlink() {
+        let mut state = DriverState::default();
+        set_unlink_in_flight(&mut state, "channel".into());
+        assert!(!apply_session_status(&mut state, unlinked_status(1000)));
+        assert!(state.control_op_in_flight.is_none());
+    }
+
+    #[test]
+    fn status_still_linking_channel_does_not_acknowledge_unlink() {
+        let mut state = DriverState::default();
+        set_unlink_in_flight(&mut state, "channel".into());
+        assert!(!apply_session_status(&mut state, status("channel", 1000)));
+        assert!(state.control_op_in_flight.is_some());
     }
 
     #[test]

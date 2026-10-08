@@ -299,37 +299,16 @@ impl ChannelStore {
                 .unwrap_or(false))
     }
 
-    pub(crate) fn unlink_channel(
-        &self,
-        session: [u8; 32],
-        channel_id: &str,
-        final_balance: u64,
-    ) -> Result<(), String> {
+    pub(crate) fn unlink_channel(&self, session: [u8; 32], channel_id: &str) -> Result<(), String> {
         let mut ownership = self.ownership_lock()?;
-        if !ownership.retired.contains(channel_id)
-            && !self
-                .metadata
-                .as_ref()
-                .map(|m| m.is_retired(channel_id))
-                .transpose()?
-                .unwrap_or(false)
-        {
-            return Err("channel release was not requested".into());
-        }
-        let balance = self
-            .storage
-            .get_balance(channel_id)
-            .ok_or("missing channel payment")?;
-        if balance.balance != final_balance {
-            return Err("final channel balance mismatch".into());
-        }
-        if let Some(owner) = ownership.owners.get(channel_id).copied().flatten() {
-            if owner != session {
-                return Err("channel is owned by another session".into());
+        match ownership.owners.get(channel_id).copied().flatten() {
+            Some(owner) if owner == session => {
+                ownership.owners.insert(channel_id.to_owned(), None);
+                Ok(())
             }
-            ownership.owners.insert(channel_id.to_owned(), None);
+            Some(_) => Err("channel is owned by another session".into()),
+            None => Err("channel is not owned by this session".into()),
         }
-        Ok(())
     }
 
     pub(crate) fn mark_channel_closing(
@@ -536,16 +515,35 @@ mod tests {
             .compare_owned_payment("chan", owner, &payment_proof(42), payment_proof(50))
             .unwrap();
 
-        // Unlink requires the correct owner and final balance.
-        assert!(store.unlink_channel(other, "chan", 50).is_err());
-        assert!(store.unlink_channel(owner, "chan", 49).is_err());
-        store.unlink_channel(owner, "chan", 50).unwrap();
+        // Unlink requires the current owner and is not idempotent.
+        assert!(store.unlink_channel(other, "chan").is_err());
+        store.unlink_channel(owner, "chan").unwrap();
+        assert!(store.unlink_channel(owner, "chan").is_err());
         assert!(store.is_retired("chan").unwrap());
         assert!(store.set_channel_owner("chan", other).is_err());
 
         // Unlinked retirement allows closure; linked retirement does not.
         store.retire_channel("chan", true).unwrap();
         assert!(store.set_channel_owner("chan", owner).is_err());
+    }
+
+    #[test]
+    fn active_owned_channel_can_unlink_without_retirement_or_balance_proof() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let storage = Arc::new(SqliteStorage::open(temp.path().to_str().unwrap()).unwrap());
+        let store = ChannelStore::new(storage);
+        let owner = [3u8; 32];
+        let other = [4u8; 32];
+        store
+            .save_funding("chan", dummy_funding("chan"), payment_proof(0))
+            .unwrap();
+        store.record_payment("chan", payment_proof(42)).unwrap();
+        store.set_channel_owner("chan", owner).unwrap();
+
+        assert!(store.unlink_channel(other, "chan").is_err());
+        store.unlink_channel(owner, "chan").unwrap();
+        assert!(store.unlink_channel(owner, "chan").is_err());
+        assert!(!store.is_retired("chan").unwrap());
     }
 
     #[test]

@@ -129,11 +129,12 @@ including after a relay restart — and then delivers `ChannelReleaseRequested` 
 the owning session. Payments from the current owner remain valid while pending.
 The client stops creating new payments on the channel, marks it unusable in its
 wallet (retaining close/recovery records), waits for its outstanding payment to
-be acknowledged, and replies `ChannelUnlink` with its cumulative signed balance.
-The relay validates that balance against its accepted balance, releases
-ownership, and confirms `ChannelUnlinked` plus a fresh `SessionStatus`. Remaining
-session credit survives, so traffic keeps flowing while unlinked; the client
-links a replacement once the relay reports the session paused. `close_channel` is separate:
+be acknowledged, and sends an ID-only `ChannelUnlink`. The relay verifies that
+the exact session owns the channel, releases ownership using its stored payment
+state, and confirms with one authoritative `SessionStatus` whose linked channel
+is null; rejection is one nonfatal `CHANNEL_UNLINK_REJECTED`. Remaining session
+credit survives, so traffic keeps flowing while unlinked; the client links a
+replacement once the relay reports the session paused. `close_channel` is separate:
 it is rejected while any session owns the channel, and it retires the channel
 atomically to reserve it against a concurrent relink.
 The new control messages require coordinated client and relay updates; older

@@ -923,7 +923,7 @@ async fn start_auto_control(
                         continue;
                     };
 
-                    if let Some(linked) = linked_channel {
+                    if let Some(ref linked) = linked_channel {
                         if linked.channel_id == current_channel_id && !paused {
                             funding.mark_funded();
                         }
@@ -934,7 +934,7 @@ async fn start_auto_control(
                                 &wallet,
                                 &current_channel_id,
                                 &current_offer,
-                                &linked,
+                                linked,
                             ) {
                                 Ok(Some(payment_json)) => {
                                     if let Err(err) = send_control_message(
@@ -984,6 +984,11 @@ async fn start_auto_control(
                         }
                     }
 
+                    if linked_channel.is_none() && funding.has_active_channel() {
+                        info!("{hop_label}: relay confirmed unlink; provisioning a replacement");
+                        funding.reset();
+                    }
+
                     let is_usable = funding.is_funded() && !paused;
                     if is_usable && !was_usable {
                         info!("{hop_label}: hop is healthy and funded");
@@ -1008,21 +1013,12 @@ async fn start_auto_control(
                     info!(
                         "{hop_label}: relay requested release of channel {channel_id}; unlinking"
                     );
-                    if let Ok(channel) = wallet.get_channel(&channel_id) {
+                    if wallet.get_channel(&channel_id).is_ok() {
                         let _ = wallet.mark_channel_unusable(&channel_id);
-                        let final_balance_raw = match channel.unit.as_str() {
-                            "msat" => channel.current_signed_balance_msats,
-                            "sat" => channel.current_signed_balance_msats.div_ceil(1000),
-                            other => {
-                                warn!("{hop_label}: unsupported unit {other} for unlink");
-                                channel.current_signed_balance_msats
-                            }
-                        };
                         if let Err(err) = send_control_message(
                             &mut h2_send,
                             &ClientMessage::ChannelUnlink {
                                 channel_id: channel_id.clone(),
-                                final_balance_raw,
                             },
                         )
                         .await
@@ -1041,10 +1037,6 @@ async fn start_auto_control(
                         );
                         funding.reset();
                     }
-                }
-                ServerMessage::ChannelUnlinked { channel_id, .. } => {
-                    info!("{hop_label}: relay confirmed unlink of channel {channel_id}");
-                    funding.reset();
                 }
                 ServerMessage::Error { code, message } => {
                     if is_recoverable_funding_error(&code) {

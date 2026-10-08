@@ -237,12 +237,12 @@ request must not be used to replace it. Inspect hop funding/error state.
 `request_channel_unlink` retires the channel in the relay's persisted wallet, so
 it cannot be relinked — including after a relay restart — while any in-flight
 payment from the current owner is still accepted. The client stops creating new
-payments, waits for its outstanding payment to be acknowledged, then sends
-`ChannelUnlink` with its cumulative signed balance. The relay verifies that
-balance, releases ownership, and confirms with `ChannelUnlinked` plus an
-authoritative `SessionStatus` showing no linked channel. Remaining session
-credit survives; the client links a replacement later according to its
-provisioning policy. Wallet channel summaries expose `retired: true/false`.
+payments, waits for its outstanding payment to be acknowledged, then sends an
+ID-only `ChannelUnlink`. The relay verifies ownership from its authoritative
+stored state, releases it, and confirms with one authoritative `SessionStatus`
+showing no linked channel. Remaining session credit survives; the client links a
+replacement later according to its provisioning policy. Wallet channel summaries
+expose `retired: true/false`.
 Closing an unlinked channel first retires it (idempotent) and requires no
 session to own it, which also reserves it against a concurrent relink.
 

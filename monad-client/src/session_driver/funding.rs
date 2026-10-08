@@ -464,10 +464,10 @@ pub(super) async fn apply_channel_release_requested(
     maybe_send_channel_unlink(config, state, h2_send).await
 }
 
-/// Send `ChannelUnlink` for a retirement-pending channel once no payment or
-/// link operation on it is still in flight. The final balance is the wallet's
-/// cumulative signed balance, which the relay verifies against its accepted
-/// balance before releasing ownership.
+/// Send ID-only `ChannelUnlink` for a retirement-pending channel once no
+/// payment or link operation on it is still in flight. The relay verifies
+/// authoritative ownership using its stored state; the request carries no
+/// final-balance claim.
 pub(super) async fn maybe_send_channel_unlink(
     config: &SessionDriverConfig,
     state: &mut DriverState,
@@ -482,42 +482,16 @@ pub(super) async fn maybe_send_channel_unlink(
     if !release_is_pending(state, &intended) {
         return Ok(());
     }
-    // The relay reports this channel as still linked only until it confirms the
-    // unlink. Do not confuse a stale status with an outstanding operation.
-    let channel = match config.wallet.get_channel(&intended) {
-        Ok(channel) => channel,
-        Err(error) => {
-            warn!(
-                "{} cannot unlink retiring channel {}: {error}",
-                config.hop_label, intended
-            );
-            abandon_intended_channel(config, state, intended, false).await;
-            return Ok(());
-        }
-    };
-    let final_balance_raw = match channel_signed_balance_raw(&channel) {
-        Ok(balance) => balance,
-        Err(error) => {
-            warn!(
-                "{} cannot compute final balance for retiring channel {}: {error}",
-                config.hop_label, intended
-            );
-            abandon_intended_channel(config, state, intended, false).await;
-            return Ok(());
-        }
-    };
     info!(
-        "{} sending ChannelUnlink for {} final_balance_raw={} | {}",
+        "{} sending ChannelUnlink for {} | {}",
         config.hop_label,
         intended,
-        final_balance_raw,
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
     send_control_message(
         h2_send,
         &ClientMessage::ChannelUnlink {
             channel_id: intended.clone(),
-            final_balance_raw,
         },
     )
     .await?;
@@ -525,10 +499,10 @@ pub(super) async fn maybe_send_channel_unlink(
     Ok(())
 }
 
-/// The relay confirmed the cooperative unlink: ownership is released and the
-/// channel moved to its retired, unlinked state. Abandon the local intended
-/// channel state; the session keeps its remaining credit and may link a
-/// replacement according to provisioning policy.
+/// The authoritative unlink response status removed the pending channel. The
+/// relay has released ownership; abandon the local intended channel state. The
+/// session keeps its remaining credit and may link a replacement according to
+/// provisioning policy.
 pub(super) async fn apply_channel_unlinked(
     config: &SessionDriverConfig,
     state: &mut DriverState,
@@ -764,10 +738,10 @@ pub(super) async fn apply_server_error(
     }
 
     if code == ServerErrorCode::ChannelUnlinkRejected {
-        // The relay could not accept our final balance for the retiring
-        // channel. It remains retired relay-side, so it must not be reused
-        // locally either. Abandon the intended channel; session ownership on
-        // the relay is released when this session detaches.
+        // Unlink responses are ordered and nonfatal. The relay could not
+        // commit this release under its ownership authority, so do not claim
+        // success locally. Abandon the intended channel; if it is still
+        // relay-owned, ordinary detach/reconnect cleanup can release it later.
         warn!(
             "{} channel unlink rejected | {}",
             config.hop_label,

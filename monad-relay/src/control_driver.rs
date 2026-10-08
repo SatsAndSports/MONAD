@@ -30,16 +30,9 @@ impl<'a> ControlDriver<'a> {
         pending: &mut VecDeque<SessionEvent>,
     ) -> io::Result<bool> {
         match effect {
-            SessionEffect::RunUnlinkValidation {
-                channel_id,
-                final_balance_raw,
-            } => {
-                let result = self.state.unlink_channel(&channel_id, final_balance_raw);
-                pending.push_back(SessionEvent::UnlinkValidationFinished {
-                    channel_id,
-                    final_balance_raw,
-                    result,
-                });
+            SessionEffect::RunUnlinkValidation { channel_id } => {
+                let result = self.state.unlink_channel(&channel_id);
+                pending.push_back(SessionEvent::UnlinkValidationFinished { result });
             }
             SessionEffect::SendControl(message) => {
                 if matches!(

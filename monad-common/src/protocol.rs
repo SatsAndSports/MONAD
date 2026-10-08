@@ -96,7 +96,7 @@ pub enum ServerErrorCode {
 
 /// Messages sent from client to server on the control channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ClientMessage {
     /// Link a Spilman channel to this session.
     ///
@@ -107,18 +107,15 @@ pub enum ClientMessage {
     ///
     /// The payload is a serialized `cdk_spilman::Payment` JSON object.
     ChannelPayment { payment_json: String },
-    /// Stop using a retiring channel after all signed payments are acknowledged.
-    ChannelUnlink {
-        channel_id: String,
-        final_balance_raw: u64,
-    },
+    /// Release linked ownership of a channel after all signed payments are acknowledged.
+    ChannelUnlink { channel_id: String },
     /// Request a fresh session status snapshot.
     GetSessionStatus,
 }
 
 /// Messages sent from server to client on the control channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ServerMessage {
     /// Consolidated session accounting and state synchronization message.
     /// Sent immediately after control stream establishment and whenever the
@@ -151,10 +148,6 @@ pub enum ServerMessage {
     },
     ChannelReleaseRequested {
         channel_id: String,
-    },
-    ChannelUnlinked {
-        channel_id: String,
-        final_balance_raw: u64,
     },
 
     /// Server-initiated error or notification
@@ -284,5 +277,53 @@ mod advertisement_tests {
         let mut legacy = value;
         legacy["advertisements"] = json!([]);
         assert!(serde_json::from_value::<ServerMessage>(legacy).is_err());
+    }
+
+    #[test]
+    fn channel_unlink_is_id_only_and_rejects_legacy_fields() {
+        let unlink = ClientMessage::ChannelUnlink {
+            channel_id: "a".repeat(64),
+        };
+        let value = serde_json::to_value(&unlink).unwrap();
+        assert_eq!(
+            value,
+            json!({"type":"ChannelUnlink","channel_id":"a".repeat(64)})
+        );
+        assert!(serde_json::from_value::<ClientMessage>(value).is_ok());
+
+        let legacy = json!({
+            "type":"ChannelUnlink",
+            "channel_id":"a".repeat(64),
+            "final_balance_raw":0
+        });
+        assert!(serde_json::from_value::<ClientMessage>(legacy).is_err());
+    }
+
+    #[test]
+    fn server_wire_rejects_removed_unlink_ack_and_unknown_fields() {
+        assert!(serde_json::from_value::<ServerMessage>(json!({
+            "type":"ChannelUnlinked",
+            "channel_id":"a".repeat(64),
+            "final_balance_raw":0
+        }))
+        .is_err());
+
+        let mut status = serde_json::to_value(ServerMessage::SessionStatus {
+            receiver_pubkey: "receiver".into(),
+            advertisements: BTreeMap::new(),
+            linked_channel: None,
+            active_in_rate: 1,
+            active_out_rate: 1,
+            session_total_in: 0,
+            session_total_out: 0,
+            total_paid_millisats: 0,
+            remaining_milli_sats: 0,
+            paused: true,
+            open_connects: 0,
+            total_connects: 0,
+        })
+        .unwrap();
+        status["unexpected"] = json!(null);
+        assert!(serde_json::from_value::<ServerMessage>(status).is_err());
     }
 }

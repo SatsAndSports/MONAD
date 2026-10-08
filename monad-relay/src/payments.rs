@@ -52,12 +52,7 @@ pub trait RelayPayments: Send + Sync + 'static {
     fn is_retired(&self, _channel_id: &str) -> Result<bool, String> {
         Ok(false)
     }
-    fn unlink_channel(
-        &self,
-        _session: [u8; 32],
-        _channel_id: &str,
-        _balance: u64,
-    ) -> Result<(), String> {
+    fn unlink_channel(&self, _session: [u8; 32], _channel_id: &str) -> Result<(), String> {
         Err("channel unlink unsupported".into())
     }
     fn funding_keyset_recovery_window_secs(&self) -> u64 {
@@ -866,13 +861,8 @@ impl RelayPayments for SpilmanRelayPayments {
     fn is_retired(&self, channel_id: &str) -> Result<bool, String> {
         self.store.is_retired(channel_id)
     }
-    fn unlink_channel(
-        &self,
-        session: [u8; 32],
-        channel_id: &str,
-        balance: u64,
-    ) -> Result<(), String> {
-        self.store.unlink_channel(session, channel_id, balance)
+    fn unlink_channel(&self, session: [u8; 32], channel_id: &str) -> Result<(), String> {
+        self.store.unlink_channel(session, channel_id)
     }
 }
 
@@ -1497,6 +1487,22 @@ pub mod testing {
             }
         }
 
+        fn unlink_channel(&self, session: [u8; 32], channel_id: &str) -> Result<(), String> {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| "payment lock poisoned".to_string())?;
+            let record = inner
+                .channels
+                .get_mut(channel_id)
+                .ok_or_else(|| "channel is not owned by this session".to_string())?;
+            if record.owner != Some(session) {
+                return Err("channel is not owned by this session".to_string());
+            }
+            record.owner = None;
+            Ok(())
+        }
+
         fn channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String> {
             let inner = self
                 .inner
@@ -1678,6 +1684,23 @@ pub mod testing {
                 .unwrap();
             assert_eq!(outcome.evicted_session, None);
             assert_eq!(outcome.capacity_millisats, 10);
+        }
+
+        #[test]
+        fn unlink_requires_current_owner_and_is_not_idempotent() {
+            let payments = InMemoryRelayPayments::new();
+            payments
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &payment_json("chan", 0, Some(10), Some("msat")),
+                )
+                .unwrap();
+
+            assert!(payments.unlink_channel(session(2), "chan").is_err());
+            payments.unlink_channel(session(1), "chan").unwrap();
+            assert_eq!(payments.owner_of("chan"), None);
+            assert!(payments.unlink_channel(session(1), "chan").is_err());
         }
 
         #[test]
