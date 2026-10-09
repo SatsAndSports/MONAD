@@ -201,6 +201,9 @@ not restore precision. Any reduced-range cap alone does not make multiplication,
 addition, or counters safe; each intermediate result needs its own exactness
 check.
 
+MONAD's concrete choices within these protocol allowances are recorded in the
+[Intentional Accounting Profile](../ARCHITECTURE.md#intentional-accounting-profile).
+
 ### 2.3 Sensitive material
 
 Funding tokens contain bearer proofs and secret material. Implementations MUST

@@ -96,8 +96,10 @@ struct SessionCounters {
     failed_connects: AtomicU64,
 }
 
-/// Actual cleartext bytes forwarded during this session. Keeping these hot
-/// counters independent avoids serializing data streams just to record traffic.
+/// Actual cleartext bytes forwarded during this session. `Relaxed` operations
+/// are sufficient because these counters do not publish other memory. They count
+/// physical traffic, so `u64` exhaustion is operationally unreachable; unlike
+/// client-supplied payments, they intentionally have no numeric preflight.
 #[derive(Debug, Default)]
 struct SessionByteCounters {
     inbound: AtomicU64,
@@ -538,9 +540,11 @@ impl SessionState {
     }
 
     /// Perform one nonblocking transport operation, then record its actual byte
-    /// count and refresh pause state in the same poll. Cancellation/drop cannot
-    /// interpose after a successful write. An already-started bounded chunk may
-    /// take credit negative.
+    /// count and refresh pause state in the same poll. The transport poll is
+    /// intentionally outside the billing mutex; pause enforcement tolerates a
+    /// concurrent snapshot that temporarily favors the client. Cancellation/drop
+    /// cannot interpose after a successful write, and an already-started bounded
+    /// chunk may take credit negative.
     pub(crate) fn poll_accounted_forward(
         &self,
         direction: ByteDirection,
@@ -2566,6 +2570,24 @@ mod tests {
                 .remaining_milli_sats(state.bytes.snapshot()),
             -3
         );
+    }
+
+    #[test]
+    fn transport_poll_runs_without_billing_lock() {
+        let (state, _) = test_state();
+        {
+            let mut billing = state.billing.lock().unwrap();
+            billing.state.total_paid_millisats = 10;
+            billing.state.paused = false;
+        }
+        let result = state.poll_accounted_forward(ByteDirection::Outbound, 5, || {
+            assert!(state.billing.try_lock().is_ok());
+            Poll::Ready(Ok(5))
+        });
+
+        assert!(matches!(result, Poll::Ready(Ok((5, false)))));
+        assert_eq!(state.bytes.outbound.load(Ordering::Relaxed), 5);
+        assert!(!state.billing.lock().unwrap().state.paused);
     }
 
     #[test]
