@@ -627,6 +627,9 @@ async fn provision_and_send_link(
     Ok(channel_id)
 }
 
+// Rust/Clippy currently under-reports captured variables in this large spawned
+// control future; keep the explicit capture context warning-free.
+#[allow(unused_mut, unused_variables)]
 async fn start_huge_funding_control(
     conn: &RelayConnection,
     hop_label: &str,
@@ -1051,6 +1054,7 @@ async fn start_huge_funding_control(
                     );
                 }
                 ServerMessage::Pong { .. } => {}
+                ServerMessage::ExtensionNotification(_) => {}
                 ServerMessage::Error { code, message } => {
                     if matches!(code, ServerErrorCode::PaymentNoNewFunds) {
                         payment_stats

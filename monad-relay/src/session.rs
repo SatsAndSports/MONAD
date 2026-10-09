@@ -1167,7 +1167,10 @@ async fn read_control_requests(
             .map_err(io::Error::other)?;
         buf.extend_from_slice(&data);
         while let Some(message) = try_decode_json_line::<ClientMessage>(&mut buf)? {
-            let slot = if matches!(message, ClientMessage::Ping { .. }) {
+            let slot = if matches!(
+                message,
+                ClientMessage::Ping { .. } | ClientMessage::ExtensionNotification(_)
+            ) {
                 None
             } else {
                 Some(
@@ -1257,6 +1260,10 @@ async fn handle_control_stream(
                                             &mut h2_send,
                                         )
                                         .await?;
+                                    }
+                                    ClientMessage::ExtensionNotification(_) => {
+                                        // Optional hints must not elicit responses,
+                                        // consume an ordinary permit, or mutate state.
                                     }
                                     ClientMessage::ChannelLink { payment_json } => {
                                         terminate_session = process_session_event(
@@ -1872,23 +1879,27 @@ mod tests {
         drivers.shutdown().await;
     }
 
+    async fn next_server_message(recv: &mut h2::RecvStream, buf: &mut Vec<u8>) -> ServerMessage {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(message) = try_decode_json_line(buf).unwrap() {
+                    return message;
+                }
+                let bytes = recv.data().await.unwrap().unwrap();
+                recv.flow_control().release_capacity(bytes.len()).unwrap();
+                buf.extend_from_slice(&bytes);
+            }
+        })
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn five_large_requests_buffer_while_response_is_flow_blocked() {
         use monad_common::control_exchange::{Attribution, ControlExchange, PendingRequest};
         use tokio::time::{timeout, Duration};
         async fn next(recv: &mut h2::RecvStream, buf: &mut Vec<u8>) -> ServerMessage {
-            timeout(Duration::from_secs(3), async {
-                loop {
-                    if let Some(message) = try_decode_json_line(buf).unwrap() {
-                        return message;
-                    }
-                    let bytes = recv.data().await.unwrap().unwrap();
-                    recv.flow_control().release_capacity(bytes.len()).unwrap();
-                    buf.extend_from_slice(&bytes);
-                }
-            })
-            .await
-            .unwrap()
+            next_server_message(recv, buf).await
         }
         let (state, payments) = test_state();
         let (send, recv, mut client_send, mut client_recv, mut drivers) = test_h2_streams(64).await;
@@ -2028,7 +2039,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingress_backpressures_sixth_ordinary_request_but_ping_uses_no_slot() {
+    async fn ingress_backpressures_sixth_ordinary_request_but_probes_use_no_slot() {
+        use monad_common::protocol::ExtensionNotification;
         use tokio::time::{timeout, Duration};
         let (_send, recv, mut client_send, _client_recv, mut drivers) =
             test_h2_streams(65535).await;
@@ -2047,6 +2059,16 @@ mod tests {
         )
         .await
         .unwrap();
+        let relaxed_extension = ClientMessage::ExtensionNotification(ExtensionNotification {
+            name: "example.relaxed".into(),
+            rest: serde_json::Map::from_iter([
+                ("data".into(), serde_json::json!({"anything": [1, null]})),
+                ("future_member".into(), serde_json::Value::Null),
+            ]),
+        });
+        send_json_line(&mut client_send, &relaxed_extension)
+            .await
+            .unwrap();
         let mut held = Vec::new();
         for _ in 0..5 {
             let request = timeout(Duration::from_secs(2), requests.recv())
@@ -2062,6 +2084,15 @@ mod tests {
             .unwrap();
         assert!(matches!(ping.message, ClientMessage::Ping { .. }));
         assert!(ping.slot.is_none());
+        let extension = timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            extension.message,
+            ClientMessage::ExtensionNotification(_)
+        ));
+        assert!(extension.slot.is_none());
         send_json_line(&mut client_send, &ClientMessage::GetSessionStatus)
             .await
             .unwrap();
@@ -2076,6 +2107,64 @@ mod tests {
         assert!(matches!(sixth.message, ClientMessage::GetSessionStatus));
         reader.abort();
         let _ = reader.await;
+        drivers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relaxed_extension_is_ignored_without_response_or_state_mutation() {
+        let (state, payments) = test_state();
+        let (send, recv, mut client_send, mut client_recv, mut drivers) =
+            test_h2_streams(65535).await;
+        let (events, event_rx) = mpsc::unbounded_channel();
+        state.attach_control(events).await.unwrap();
+        let control = tokio::spawn(handle_control_stream(send, recv, state.clone(), event_rx));
+        let mut buf = Vec::new();
+        let initial = next_server_message(&mut client_recv, &mut buf).await;
+        assert!(matches!(initial, ServerMessage::SessionStatus { .. }));
+        let relaxed_extension = Bytes::from_static(
+            br#"{"type":"ExtensionNotification","name":"example.ignored","anything":[1,null],"future_member":{"relaxed":true}}
+"#,
+        );
+        let mut typed_decode_buf = relaxed_extension.to_vec();
+        let decoded: ClientMessage = try_decode_json_line(&mut typed_decode_buf)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(decoded, ClientMessage::ExtensionNotification(_)));
+        client_send.send_data(relaxed_extension, false).unwrap();
+        client_send
+            .send_data(
+                Bytes::from_static(
+                    b"{\"type\":\"Ping\",\"nonce\":\"extension-had-no-response\"}\n",
+                ),
+                false,
+            )
+            .unwrap();
+        let pong = next_server_message(&mut client_recv, &mut buf).await;
+        assert!(
+            matches!(&pong, ServerMessage::Pong { nonce } if nonce == "extension-had-no-response"),
+            "valid extension must be ignored and never answered; got {pong:?}"
+        );
+        client_send
+            .send_data(
+                Bytes::from_static(b"{\"type\":\"ExtensionNotification\",\"name\":\"\"}\n"),
+                false,
+            )
+            .unwrap();
+        let error = next_server_message(&mut client_recv, &mut buf).await;
+        assert!(matches!(
+            error,
+            ServerMessage::Error {
+                code: ServerErrorCode::ControlInvalidMessage,
+                ..
+            }
+        ));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), control)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(state.is_terminated());
+        assert!(payments.owner_of("example.ignored").is_none());
         drivers.shutdown().await;
     }
 

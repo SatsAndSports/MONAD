@@ -94,6 +94,9 @@ impl ControlExchange {
             }
         }
         if !self.initialized {
+            if let ServerMessage::ExtensionNotification(_) = message {
+                return Ok(Attribution::Notification);
+            }
             let ServerMessage::SessionStatus {
                 total_paid_millisats,
                 ..
@@ -209,6 +212,39 @@ mod tests {
             Attribution::InitialStatus
         );
         exchange
+    }
+
+    fn extension(name: &str) -> ServerMessage {
+        ServerMessage::ExtensionNotification(crate::protocol::ExtensionNotification {
+            name: name.into(),
+            rest: serde_json::Map::from_iter([(
+                "arbitrary".into(),
+                serde_json::json!({"optional": null}),
+            )]),
+        })
+    }
+
+    #[test]
+    fn extensions_are_notifications_before_and_after_initialization() {
+        let mut exchange = ControlExchange::default();
+        assert_eq!(
+            exchange.observe(&extension("before")).unwrap(),
+            Attribution::Notification
+        );
+        assert_eq!(
+            exchange.observe(&status(3, None)).unwrap(),
+            Attribution::InitialStatus
+        );
+        exchange.enqueue(PendingRequest::Status).unwrap();
+        assert_eq!(
+            exchange.observe(&extension("after")).unwrap(),
+            Attribution::Notification
+        );
+        assert_eq!(exchange.pending_len(), 1);
+        assert_eq!(
+            exchange.observe(&status(3, None)).unwrap(),
+            Attribution::Response(PendingRequest::Status)
+        );
     }
 
     #[test]

@@ -395,6 +395,20 @@ mod tests {
                     .unwrap();
                 let mut tasks = tokio::task::JoinSet::new();
                 tasks.spawn(async move { while h2.accept().await.is_some() {} });
+                send_json_line(
+                    &mut send,
+                    &ServerMessage::ExtensionNotification(
+                        monad_common::protocol::ExtensionNotification {
+                            name: "example.before_initial".into(),
+                            rest: serde_json::Map::from_iter([(
+                                "anything".into(),
+                                serde_json::json!({"optional": null}),
+                            )]),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
                 send_json_line(&mut send, &status(0, false, 0))
                     .await
                     .unwrap();
@@ -408,6 +422,20 @@ mod tests {
                     &ServerMessage::Pong {
                         nonce: "interleaved".into(),
                     },
+                )
+                .await
+                .unwrap();
+                send_json_line(
+                    &mut send,
+                    &ServerMessage::ExtensionNotification(
+                        monad_common::protocol::ExtensionNotification {
+                            name: "example.between_requests".into(),
+                            rest: serde_json::Map::from_iter([
+                                ("data".into(), serde_json::json!([1, null])),
+                                ("future_member".into(), serde_json::json!(false)),
+                            ]),
+                        },
+                    ),
                 )
                 .await
                 .unwrap();

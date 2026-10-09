@@ -311,6 +311,9 @@ pub(super) async fn run_session_driver(
                         ServerMessage::Pong { .. } => {
                             continue;
                         }
+                        ServerMessage::ExtensionNotification(_) => {
+                            continue;
+                        }
                         ServerMessage::Error { code, message } => {
                             warn!(
                                 "{} control error: code={:?} message={} | {}",
