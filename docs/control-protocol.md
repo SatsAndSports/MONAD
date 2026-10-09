@@ -190,12 +190,15 @@ JavaScript's ordinary `JSON.parse` uses IEEE-754 binary64 numbers, whose 53 bits
 of integer precision represent every integer only through
 `2^53 - 1 = 9,007,199,254,740,991`. Interpreted as millisatoshis, that exact
 safe-integer limit is **90,071.99254740991 BTC**. An implementation may therefore
-use the round lower cap **90,000 BTC = 9,000,000,000,000,000 msat**, check every
-integer and intermediate result, and reject larger values rather than support the
-full `u64` range. Some larger integers happen to be representable, but not every
+choose the round lower cap **90,000 BTC = 9,000,000,000,000,000 msat**, check
+every integer and intermediate result, and reject larger values rather than
+support the full `u64` range. **That 90,000 BTC value is only an example of an
+optional implementation limit; this protocol does not require or recommend that
+particular cap.** Some larger integers happen to be representable, but not every
 adjacent value is, and converting an already rounded `Number` to `BigInt` does
-not restore precision. The cap alone does not make multiplication, addition, or
-counters safe; each intermediate result needs its own exactness check.
+not restore precision. Any reduced-range cap alone does not make multiplication,
+addition, or counters safe; each intermediate result needs its own exactness
+check.
 
 ### 2.3 Sensitive material
 
@@ -462,6 +465,15 @@ wire remaining value is exact and is never clamped. Negative credit is permitted
 from chunk-boundary overshoot and does not erase payment history. New CONNECTs
 MUST be rejected with HTTP 402 while paused; existing tunnels wait for credit.
 Ordinary transport failure or termination may still end them.
+
+A client decides what to pay from its own records: locally observed cleartext
+bytes in each direction plus its signed and accepted-payment history. Relay
+traffic counters are diagnostic and are not proof that the client has received
+or counted those bytes. `total_paid_millisats` is the relay's claim of accepted
+credit; a client may reconcile that claim only upward against its own record of
+accepted or otherwise unexpected credit. It MUST NOT use the relay's claimed
+traffic totals or remaining balance to reduce the client's own paid-credit
+record or to infer an obligation to pay for bytes the client has not observed.
 
 For the byte-accounting events defined in §1.3, implementations MUST check counter
 and billing representability before each bounded forwarding operation and update

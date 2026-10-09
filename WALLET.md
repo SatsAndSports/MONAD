@@ -202,7 +202,7 @@ the driver does this:
 
 1. chooses a target positive remaining session balance
 2. reads its own local cleartext byte counters and estimates the current
-   remaining session balance against the latest authoritative relay baseline
+   remaining session balance against the latest relay-reported baseline
 3. computes the requested delta in millisats from that local estimate
 4. converts that delta into raw channel units
 5. computes:
@@ -242,7 +242,7 @@ Purpose:
 - keep concurrent client-side session drivers from accidentally reusing one
   channel at the same time
 
-This is local MONAD policy metadata, not relay-authoritative protocol state.
+This is local MONAD policy metadata, not relay-reported protocol state.
 
 ## Rejections and Channel Retirement
 
@@ -278,7 +278,7 @@ balance, the driver should:
 2. locally detach it
 3. select or provision another channel
 4. send `ChannelLink`
-5. wait for the next relay-authoritative `SessionStatus`
+5. wait for the next relay-reported `SessionStatus`
 6. retry payment against the new linked channel
 
 The current session driver and both wallet implementations follow this model.

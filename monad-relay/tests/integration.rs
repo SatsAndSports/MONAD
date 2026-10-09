@@ -3065,12 +3065,7 @@ impl SessionPaymentChannel {
     }
 
     fn capacity_units(&self) -> u64 {
-        match self.unit {
-            "sat" => TEST_CHANNEL_CAPACITY_UNITS
-                .min(monad_common::billing::MAX_SESSION_ACCOUNTING_MILLISATS / 1000),
-            _ => TEST_CHANNEL_CAPACITY_UNITS
-                .min(monad_common::billing::MAX_SESSION_ACCOUNTING_MILLISATS),
-        }
+        TEST_CHANNEL_CAPACITY_UNITS
     }
 
     fn link_json(&self) -> String {
@@ -6039,7 +6034,7 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
 }
 
 #[tokio::test]
-async fn test_session_mid_chunk_credit_boundary_and_resume() {
+async fn test_session_overshoot_negative_balance_and_resume() {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -6088,30 +6083,19 @@ async fn test_session_mid_chunk_credit_boundary_and_resume() {
         .unwrap();
 
     let (_in2, out2, _paid2, rem2, paused2) =
-        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 5)
-            .await
-            .expect("first half of the frame should commit before credit runs out");
-    assert_eq!(out2, 5);
-    assert_eq!(rem2, 0);
-    assert!(paused2);
-
-    channel.pay(&mut control_send, &mut control_recv, 5).await;
-    let (_in3, out3, _paid3, rem3, paused3) =
         wait_for_session_totals(&mut control_send, &mut control_recv, 0, 10)
             .await
-            .expect("second half of the frame should commit after top-up");
-    assert_eq!(out3, 10);
-    assert_eq!(rem3, 0);
-    assert!(paused3);
+            .expect("the whole bounded frame may overshoot paid credit");
+    assert_eq!(out2, 10);
+    assert_eq!(rem2, -5);
+    assert!(paused2);
+
+    let (_in3, _out3, _paid3, rem3, paused3) =
+        channel.pay(&mut control_send, &mut control_recv, 10).await;
+    assert_eq!(rem3, 5);
+    assert!(!paused3);
 
     let _ = release_tx.send(());
-    let stalled = tokio::time::timeout(std::time::Duration::from_millis(100), h2_recv.data()).await;
-    assert!(
-        stalled.is_err(),
-        "inbound response should wait for credit after the outbound allowance is exhausted"
-    );
-
-    channel.pay(&mut control_send, &mut control_recv, 5).await;
 
     let result = tokio::time::timeout(std::time::Duration::from_millis(500), async {
         let mut result = Vec::new();
@@ -6364,7 +6348,7 @@ async fn test_outbound_bytes_sent_after_pause_are_delivered_after_unpause() {
 }
 
 #[tokio::test]
-async fn test_session_underpayment_stays_paused_until_positive() {
+async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -6413,20 +6397,16 @@ async fn test_session_underpayment_stays_paused_until_positive() {
         .unwrap();
 
     let (_in2, out2, _paid2, rem2, paused2) =
-        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 5)
+        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 10)
             .await
-            .expect("first five bytes should commit before credit runs out");
-    assert_eq!(out2, 5);
-    assert_eq!(rem2, 0);
+            .expect("the whole bounded frame may overshoot paid credit");
+    assert_eq!(out2, 10);
+    assert_eq!(rem2, -5);
     assert!(paused2);
 
-    channel.pay(&mut control_send, &mut control_recv, 4).await;
-    let (_in3, out3, _paid3, rem3, paused3) =
-        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 9)
-            .await
-            .expect("four underpayment bytes should commit without unpausing");
-    assert_eq!(out3, 9);
-    assert_eq!(rem3, 0);
+    let (_in3, _out3, _paid3, rem3, paused3) =
+        channel.pay(&mut control_send, &mut control_recv, 4).await;
+    assert_eq!(rem3, -1);
     assert!(paused3);
 
     let mut h2_for_paused_connect = conn.clone_send_request().await;
@@ -6444,12 +6424,8 @@ async fn test_session_underpayment_stays_paused_until_positive() {
     drop(paused_response);
     drop(h2_for_paused_connect);
 
-    channel.pay(&mut control_send, &mut control_recv, 6).await;
-    let (_in4, out4, _paid4, rem4, paused4) =
-        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 10)
-            .await
-            .expect("final outbound byte should commit after balance becomes positive");
-    assert_eq!(out4, 10);
+    let (_in4, _out4, _paid4, rem4, paused4) =
+        channel.pay(&mut control_send, &mut control_recv, 6).await;
     assert_eq!(rem4, 5);
     assert!(!paused4);
 
@@ -6493,7 +6469,7 @@ async fn test_session_underpayment_stays_paused_until_positive() {
 }
 
 #[tokio::test]
-async fn test_inbound_bytes_wait_for_credit_and_are_delivered_after_unpause() {
+async fn test_inbound_bytes_pushed_after_pause_are_delivered_after_unpause() {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -6542,24 +6518,16 @@ async fn test_inbound_bytes_wait_for_credit_and_are_delivered_after_unpause() {
         .unwrap();
 
     let (_in2, out2, _paid2, rem2, paused2) =
-        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 5)
+        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 10)
             .await
-            .expect("first five bytes should commit before credit runs out");
-    assert_eq!(out2, 5);
-    assert_eq!(rem2, 0);
+            .expect("the whole bounded frame may overshoot paid credit");
+    assert_eq!(out2, 10);
+    assert_eq!(rem2, -5);
     assert!(paused2);
 
     let _ = release_tx.send(());
 
-    channel.cumulative_balance_units = channel.cumulative_balance_units.saturating_add(10);
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelPayment {
-            payment_json: channel.payment_json(),
-        },
-        false,
-    )
-    .await;
+    channel.pay(&mut control_send, &mut control_recv, 10).await;
 
     let (_in3, _out3, _paid3, rem3, paused3) =
         wait_for_session_totals(&mut control_send, &mut control_recv, 4, 10)
@@ -14930,7 +14898,7 @@ async fn test_session_status_reports_connect_count_transitions() {
 }
 
 #[tokio::test]
-async fn test_concurrent_tunnels_share_billing_headroom() {
+async fn test_concurrent_tunnels_may_overshoot_shared_credit() {
     async fn hold_target(listener: TcpListener) -> std::net::SocketAddr {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -14970,21 +14938,21 @@ async fn test_concurrent_tunnels_share_billing_headroom() {
         .unwrap();
 
     let (_in1, out1, _paid1, remaining1, paused1) =
-        wait_for_session_totals(&mut control.send, &mut control.recv, 0, 5)
+        wait_for_session_totals(&mut control.send, &mut control.recv, 0, 20)
             .await
-            .expect("tunnels should share the first five billable bytes");
-    assert_eq!(out1, 5);
-    assert_eq!(remaining1, 0);
+            .expect("both bounded tunnel frames may complete after starting with credit");
+    assert_eq!(out1, 20);
+    assert_eq!(remaining1, -15);
     assert!(paused1);
 
-    channel.pay(&mut control.send, &mut control.recv, 15).await;
+    channel.pay(&mut control.send, &mut control.recv, 20).await;
     let (_in2, out2, _paid2, remaining2, paused2) =
         wait_for_session_totals(&mut control.send, &mut control.recv, 0, 20)
             .await
-            .expect("top-up should release both pending tunnel frames");
+            .expect("top-up should restore positive credit");
     assert_eq!(out2, 20);
-    assert_eq!(remaining2, 0);
-    assert!(paused2);
+    assert_eq!(remaining2, 5);
+    assert!(!paused2);
 
     control.close().await;
     drop(tunnel_a_send);

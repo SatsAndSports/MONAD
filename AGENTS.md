@@ -83,7 +83,7 @@ cargo run -p monad-quic -- ...
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, exact integer quotient/remainder arithmetic in `monad-common/src/billing.rs`; rates must be positive and unsupported numeric ranges reject with `NUMERIC_LIMIT_EXCEEDED` before mutation
 - `CONNECT` rejected with 402 while paused
-- Relay forwarding reserves exact billable headroom before each bounded operation, so simultaneous tunnels cannot spend the same credit; partial frames can pause mid-frame and resume after payment
+- A bounded forwarding operation that starts with positive credit may complete and take the session balance negative; the relay records the actual bytes exactly, then pauses subsequent forwarding until payment restores positive credit
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
 - `SessionStatus` uses `session_total_bytes_in/out` and reports `open_connects`, `total_connects`, and `failed_connects`; successful response submission commits acceptance, any pre-acceptance rejection/failure increments failed exactly once, and accepted-tunnel close decrements open exactly once
 - `Ping { nonce }` requests one correlated `Pong { nonce }` for control-path liveness; it does not request status or consume an ordinary request response
@@ -91,7 +91,7 @@ cargo run -p monad-quic -- ...
 - `ChannelLink { payment_json }` links a Spilman channel to the session; relay validates and then sends an authoritative `SessionStatus` on success or `Error` on failure. A first-time link using an unknown keyset for a trusted mint/unit must pass metadata-independent structural checks before it invokes the bounded relay refresh coordinator and retries the immutable link once. Stored relinks bypass refresh. Only one session can own a channel at a time.
 - Negotiated keyset versions constrain channel funding, not advertisements, loose input proofs, or shared close/drain caches. `ChannelLink` checks stored funding on relink before ownership changes; `LinkKeysetVersionNotNegotiated` is fatal only to the offending MONAD session, with bounded error delivery and unconditional ownership/data cleanup. The client preserves wallet channel usability.
 - `ChannelPayment { payment_json }` increments the session balance based on the delta of the channel's max balance seen.
-- `SessionStatus.linked_channel` carries the relay-authoritative linked channel id, latest accepted raw balance, raw capacity, and unit.
+- `SessionStatus.linked_channel` carries the relay-reported linked channel id, latest accepted raw balance, raw capacity, and unit.
 - control-stream detach fully ends the session: linked ownership is released, active streams are torn down, and new streams are no longer accepted.
 - Session ID is the Noise handshake hash (32 bytes, identical on both sides)
 - Relay keyset handling: the relay wallet manager owns one shared in-memory `SpilmanMintCache` plus SQLite persistence. The memory cache stores all keysets returned by configured mints (all units, active and inactive). Session advertisements are trusted mint → unit → recovery-window maps independent of that cache and negotiated versions; no IDs or per-offer prices are sent. Wire prices are fixed session-wide `bytes_in_per_msat` and `bytes_out_per_msat`. Incoming channel acceptance still enforces trust and negotiated versions. There is no explicit client refresh operation. Startup discovery remains, while channel close and relay drain swaps are cache-first and refresh that mint into SQLite + the shared cache for missing-cache warmup or if a swap retry path sees a mint keyset error.
@@ -99,7 +99,7 @@ cargo run -p monad-quic -- ...
 ### Current Client Runtime State
 
 - `monad-client` library now has a wallet abstraction, `SqliteClientWallet`, `LooseProofWallet`, and per-session payment driver.
-- client steady-state control/payment behavior now lives in a direct imperative control loop in `session_driver.rs`; the relay stays authoritative for linked channel / accepted balance / pause state, while the client uses its local cleartext counters to size payments against the latest authoritative relay baseline.
+- client steady-state control/payment behavior now lives in a direct imperative control loop in `session_driver.rs`; relay reports describe linked channel, accepted balance, and pause state, while the client uses its own local cleartext counters and payment records to size payments. An unexpectedly higher relay-reported `total_paid_millisats` may only increase the client's credit record, never decrease it.
 - channel-payment sizing now follows an explicit target/minimum-topup policy in that control loop: the client computes a local estimated remaining balance, clamps the desired refill to at least the configured minimum topup, then caps it at the linked channel's remaining raw capacity.
 - the main client uses correlated Ping/Pong for liveness and no longer needs frequent `GetSessionStatus` polling for payment sizing; the relay stress harness and `monad-test-client` still poll periodically for load generation, health checks, and observability.
 - `SqliteClientWallet` provisions real upstream Spilman channels from loose proofs, stores MONAD channel metadata, and uses cache-first active output-keyset selection from client-owned metadata, ordered by ID with negotiated-version and recovery-window checks. It refreshes before reporting no compatible active keyset. The session driver traverses mint/unit offers in deterministic local order after explicitly safe offer-local failures, but stops after reservation, persistence, or ambiguous submission failures. It gives every upstream HTTP request an explicit 15-second timeout. Live ambiguous opening recovery may restore and replay an immutable request once, with at most one `12002` successor; startup/manual recovery is restore-only. Stale-input export groups by mint/unit, atomically transitions all attempts represented by a token before output, reports partial success, retains reservations, and never finalizes openings. Recovery alone finalizes delayed completions or marks exported attempts `ExternallySpent` after conclusive spent evidence. Ambiguous evidence remains unresolved and reserved. Retryable mint keyset errors still refresh and retry through the wallet's bounded immutable-request rules.
@@ -236,8 +236,8 @@ The test suite currently covers:
 - CONNECT rejected while paused (402)
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
-- mid-frame credit-boundary pause and resume without negative relay session balance
-- concurrent tunnel reservations sharing one paid headroom
+- session overshoot with negative balance and resume
+- concurrent bounded tunnel operations overshooting shared credit
 - exact quotient/remainder billing boundaries and zero-rate rejection
 - pre-mutation `NUMERIC_LIMIT_EXCEEDED` preserving relay channel balance
 - underpayment stays paused until balance is positive

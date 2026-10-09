@@ -57,15 +57,6 @@ pub(crate) enum ByteDirection {
     Outbound,
 }
 
-impl From<ByteDirection> for monad_common::billing::BillingDirection {
-    fn from(direction: ByteDirection) -> Self {
-        match direction {
-            ByteDirection::Inbound => Self::Inbound,
-            ByteDirection::Outbound => Self::Outbound,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionAccountingError {
     CounterOverflow,

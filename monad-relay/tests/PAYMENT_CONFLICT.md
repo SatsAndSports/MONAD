@@ -118,7 +118,7 @@ wallet databases, payment JSON, or raw mint artifacts.
 
 Both recipes passed. Proactive topups dominate; buffered mode stays on one channel
 per session, while every relink-mode session relinks. The two pause events in each
-run recover normally and are consistent with bounded mid-frame credit boundaries.
+run recover normally and are consistent with bounded chunk overshoot.
 
 ### Configured-client chaos
 

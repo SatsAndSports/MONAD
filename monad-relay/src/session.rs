@@ -167,9 +167,6 @@ pub(crate) struct SessionState {
     control: Arc<Mutex<ControlState>>,
     counters: Arc<SessionCounters>,
     pause_tx: watch::Sender<bool>,
-    billing_version_tx: watch::Sender<u64>,
-    reserved_bytes_in: Arc<AtomicU64>,
-    reserved_bytes_out: Arc<AtomicU64>,
     termination: CancellationToken,
     session_id: [u8; 32],
     payments: Arc<dyn RelayPayments>,
@@ -210,7 +207,6 @@ impl SessionState {
 
     fn new(session_id: [u8; 32], config: &RelaySessionConfig) -> Self {
         let (pause_tx, _) = watch::channel(true);
-        let (billing_version_tx, _) = watch::channel(0_u64);
         let termination = CancellationToken::new();
         config
             .session_registry
@@ -233,9 +229,6 @@ impl SessionState {
             control: Arc::new(Mutex::new(ControlState::default())),
             counters: Arc::new(SessionCounters::default()),
             pause_tx,
-            billing_version_tx,
-            reserved_bytes_in: Arc::new(AtomicU64::new(0)),
-            reserved_bytes_out: Arc::new(AtomicU64::new(0)),
             termination,
             session_id,
             payments: config.payments.clone(),
@@ -264,16 +257,6 @@ impl SessionState {
 
     pub(crate) fn pause_receiver(&self) -> watch::Receiver<bool> {
         self.pause_tx.subscribe()
-    }
-
-    pub(crate) fn billing_version_receiver(&self) -> watch::Receiver<u64> {
-        self.billing_version_tx.subscribe()
-    }
-
-    fn notify_billing_changed(&self) {
-        self.billing_version_tx.send_modify(|version| {
-            *version = version.wrapping_add(1);
-        });
     }
 
     pub(crate) fn termination_token(&self) -> CancellationToken {
@@ -393,9 +376,7 @@ impl SessionState {
     ) -> Result<crate::payments::PaymentOutcome, crate::payments::ChannelPaymentError> {
         let max_delta_millisats = {
             let billing = self.billing.lock().await;
-            let Some(headroom) = monad_common::billing::MAX_SESSION_ACCOUNTING_MILLISATS
-                .checked_sub(billing.state.total_paid_millisats)
-            else {
+            let Some(headroom) = u64::MAX.checked_sub(billing.state.total_paid_millisats) else {
                 return Err(crate::payments::ChannelPaymentError::NumericLimitExceeded);
             };
             headroom
@@ -511,151 +492,40 @@ impl SessionState {
         self.session_registry.deregister_control(&self.session_id);
     }
 
-    fn reserved_counter(&self, direction: ByteDirection) -> &AtomicU64 {
-        match direction {
-            ByteDirection::Inbound => self.reserved_bytes_in.as_ref(),
-            ByteDirection::Outbound => self.reserved_bytes_out.as_ref(),
-        }
-    }
-
-    /// Reserve billable headroom for one bounded forwarding operation.
-    ///
-    /// The billing mutex serializes concurrent reservers. Releases are atomic
-    /// and may happen from `Drop` during cancellation; a release racing a new
-    /// reservation can only make that reservation conservative.
-    pub(crate) async fn reserve_bytes(
+    pub(crate) async fn note_outbound_bytes(
         &self,
-        direction: ByteDirection,
-        requested_bytes: usize,
-    ) -> usize {
-        let Ok(requested_bytes) = u64::try_from(requested_bytes) else {
-            self.terminate();
-            return 0;
-        };
-        if requested_bytes == 0 {
-            return 0;
-        }
-
-        let billing = self.billing.lock().await;
-        let reserved_in = self.reserved_bytes_in.load(Ordering::Relaxed);
-        let reserved_out = self.reserved_bytes_out.load(Ordering::Relaxed);
-        let effective_in = billing
-            .state
-            .session_total_bytes_in
-            .checked_add(reserved_in);
-        let effective_out = billing
-            .state
-            .session_total_bytes_out
-            .checked_add(reserved_out);
-        let (Some(effective_in), Some(effective_out)) = (effective_in, effective_out) else {
-            drop(billing);
-            self.terminate();
-            return 0;
-        };
-
-        let grant = monad_common::billing::max_additional_billable_bytes(
-            effective_in,
-            effective_out,
-            billing.pricing.in_bytes_per_millisat,
-            billing.pricing.out_bytes_per_millisat,
-            billing.state.total_paid_millisats,
-            direction.into(),
-            requested_bytes,
-        )
-        .expect("session pricing rates are validated positive");
-        if grant == 0 {
-            return 0;
-        }
-
-        let reserved = self.reserved_counter(direction);
-        if reserved
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(grant)
-            })
-            .is_err()
-        {
-            drop(billing);
-            self.terminate();
-            return 0;
-        }
-        usize::try_from(grant).expect("grant is bounded by the usize request")
-    }
-
-    pub(crate) fn release_reserved_bytes(&self, direction: ByteDirection, bytes: usize) {
-        let Ok(bytes) = u64::try_from(bytes) else {
-            self.terminate();
-            return;
-        };
-        if bytes == 0 {
-            return;
-        }
-        if self
-            .reserved_counter(direction)
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(bytes)
-            })
-            .is_err()
-        {
-            self.terminate();
-            return;
-        }
-        self.notify_billing_changed();
-    }
-
-    #[cfg(test)]
-    fn reserved_byte_counts(&self) -> (u64, u64) {
-        (
-            self.reserved_bytes_in.load(Ordering::Relaxed),
-            self.reserved_bytes_out.load(Ordering::Relaxed),
-        )
-    }
-
-    pub(crate) async fn commit_reserved_bytes(
-        &self,
-        direction: ByteDirection,
-        granted_bytes: usize,
-        actual_bytes: usize,
+        bytes: usize,
     ) -> Result<bool, SessionAccountingError> {
-        if actual_bytes > granted_bytes {
-            self.terminate();
-            return Err(SessionAccountingError::CounterOverflow);
-        }
-        self.release_reserved_bytes(direction, granted_bytes - actual_bytes);
+        self.note_bytes(bytes, ByteDirection::Outbound).await
+    }
 
+    pub(crate) async fn note_inbound_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<bool, SessionAccountingError> {
+        self.note_bytes(bytes, ByteDirection::Inbound).await
+    }
+
+    async fn note_bytes(
+        &self,
+        bytes: usize,
+        direction: ByteDirection,
+    ) -> Result<bool, SessionAccountingError> {
         let mut billing = self.billing.lock().await;
-        // Move the whole grant out of reserved headroom while committing the
-        // actual forwarded prefix. The uncommitted remainder was already
-        // released above; this second subtraction accounts for actual bytes.
-        if actual_bytes > 0 {
-            let actual_u64 =
-                u64::try_from(actual_bytes).map_err(|_| SessionAccountingError::CounterOverflow)?;
-            if self
-                .reserved_counter(direction)
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    current.checked_sub(actual_u64)
-                })
-                .is_err()
-            {
-                drop(billing);
-                self.terminate();
-                return Err(SessionAccountingError::CounterOverflow);
-            }
-        }
-
-        let (next_state, pause_changed) = apply_accounted_bytes(
-            billing.state.clone(),
-            billing.pricing,
-            direction,
-            actual_bytes,
-        )?;
+        let (next_state, pause_changed) =
+            match apply_accounted_bytes(billing.state.clone(), billing.pricing, direction, bytes) {
+                Ok(result) => result,
+                Err(error) => {
+                    drop(billing);
+                    self.terminate();
+                    return Err(error);
+                }
+            };
         billing.state = next_state;
         if let Some(paused) = pause_changed {
             let _ = self.pause_tx.send_replace(paused);
         }
-        let paused = billing.state.paused;
-        drop(billing);
-        self.notify_billing_changed();
-        Ok(paused)
+        Ok(billing.state.paused)
     }
 
     // Control-stream state.
@@ -1433,7 +1303,6 @@ async fn process_session_event(
             billing.state = next_state;
             effects
         };
-        state.notify_billing_changed();
 
         for effect in effects {
             if driver.interpret(effect, &mut pending).await? {
@@ -1923,7 +1792,6 @@ mod tests {
                 })
                 .unwrap();
             assert!(dropped.load(Ordering::SeqCst));
-            assert_eq!(state.reserved_byte_counts(), (0, 0));
             assert_eq!(state.counters.snapshot(), (0, 1, 0));
             drivers.shutdown().await;
         }
@@ -2044,47 +1912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reservations_share_headroom_and_release_exactly() {
-        let (state, _) = test_state();
-        {
-            let mut billing = state.billing.lock().await;
-            billing.state.total_paid_millisats = 5;
-            billing.state.paused = false;
-        }
-
-        let (grant_a, grant_b) = tokio::join!(
-            state.reserve_bytes(ByteDirection::Outbound, 10),
-            state.reserve_bytes(ByteDirection::Outbound, 10),
-        );
-        assert_eq!(grant_a + grant_b, 5);
-        assert!(grant_a == 5 || grant_b == 5);
-        assert_eq!(state.reserved_byte_counts(), (0, 5));
-
-        state
-            .commit_reserved_bytes(ByteDirection::Outbound, 5, 3)
-            .await
-            .unwrap();
-        assert_eq!(state.reserved_byte_counts(), (0, 0));
-        assert_eq!(state.billing.lock().await.state.session_total_bytes_out, 3);
-
-        let grant = state.reserve_bytes(ByteDirection::Outbound, 10).await;
-        assert_eq!(grant, 2);
-        state.release_reserved_bytes(ByteDirection::Outbound, grant);
-        assert_eq!(state.reserved_byte_counts(), (0, 0));
-
-        let grant = state.reserve_bytes(ByteDirection::Inbound, 10).await;
-        assert_eq!(grant, 2);
-        let paused = state
-            .commit_reserved_bytes(ByteDirection::Inbound, grant, grant)
-            .await
-            .unwrap();
-        assert!(paused);
-        assert_eq!(state.reserved_byte_counts(), (0, 0));
-        assert_eq!(state.reserve_bytes(ByteDirection::Inbound, 1).await, 0);
-    }
-
-    #[tokio::test]
-    async fn termination_commits_partial_target_write_and_releases_reservation() {
+    async fn termination_commits_partial_target_write() {
         use tokio::time::{timeout, Duration};
 
         #[derive(Debug)]
@@ -2167,7 +1995,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.billing.lock().await.state.session_total_bytes_out, 3);
-        assert_eq!(state.reserved_byte_counts(), (0, 0));
         assert_eq!(state.counters.snapshot(), (0, 1, 0));
         drivers.shutdown().await;
     }
@@ -2179,8 +2006,7 @@ mod tests {
             .link_channel(r#"{"channel_id":"limited","balance":0,"capacity":10,"unit":"msat"}"#)
             .unwrap();
         state.billing.lock().await.state.linked_channel_id = Some(link.channel_id.clone());
-        state.billing.lock().await.state.total_paid_millisats =
-            monad_common::billing::MAX_SESSION_ACCOUNTING_MILLISATS;
+        state.billing.lock().await.state.total_paid_millisats = u64::MAX;
 
         let error = state
             .apply_channel_payment(

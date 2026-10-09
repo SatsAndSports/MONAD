@@ -587,16 +587,8 @@ pub(super) async fn maybe_progress_payment(
         return Ok(());
     }
 
-    // A relay-authoritative paused/nonpositive session needs funding even if
-    // the local estimate is stale or includes a payment whose acceptance is
-    // still ambiguous. Size the refill from the relay baseline in that case.
-    let payment_baseline_remaining = if snapshot.paused || snapshot.remaining_milli_sats <= 0 {
-        snapshot.remaining_milli_sats
-    } else {
-        estimated_remaining
-    };
     let plan = match plan_payment_topup(
-        payment_baseline_remaining,
+        estimated_remaining,
         config.payment_policy.target_topup_buffer_msats,
         config.payment_policy.minimum_topup_msats,
         linked_channel,
@@ -657,7 +649,6 @@ pub(super) async fn maybe_progress_payment(
             let next_local_session_paid_msats = state
                 .local_session_paid_msats
                 .checked_add(authorized_delta_msats)
-                .filter(|total| *total <= monad_common::billing::MAX_SESSION_ACCOUNTING_MILLISATS)
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -676,7 +667,12 @@ pub(super) async fn maybe_progress_payment(
             );
             send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await?;
             state.local_session_paid_msats = next_local_session_paid_msats;
-            set_payment_in_flight(state, intended_channel_id.clone(), next_balance_raw);
+            set_payment_in_flight(
+                state,
+                intended_channel_id.clone(),
+                next_balance_raw,
+                authorized_delta_msats,
+            );
             if let Some((owner, hop)) = &config.management {
                 hop.paying(owner, intended_channel_id);
             }
@@ -730,11 +726,35 @@ pub(super) async fn apply_channel_evicted(
     abandon_intended_channel(config, state, channel_id, false).await;
 }
 
+fn is_definitive_payment_rejection(code: &ServerErrorCode) -> bool {
+    matches!(
+        code,
+        ServerErrorCode::PaymentWrongChannel
+            | ServerErrorCode::PaymentUnknownChannel
+            | ServerErrorCode::PaymentInvalid
+            | ServerErrorCode::PaymentNoNewFunds
+            | ServerErrorCode::PaymentConflict
+            | ServerErrorCode::NumericLimitExceeded
+            | ServerErrorCode::ChannelClosed
+    )
+}
+
 pub(super) async fn apply_server_error(
     config: &SessionDriverConfig,
     state: &mut DriverState,
     code: ServerErrorCode,
 ) {
+    if is_definitive_payment_rejection(&code) {
+        if let Some(ControlOpInFlight::Payment {
+            authorized_delta_msats,
+            ..
+        }) = &state.control_op_in_flight
+        {
+            state.local_session_paid_msats = state
+                .local_session_paid_msats
+                .saturating_sub(*authorized_delta_msats);
+        }
+    }
     clear_control_op(state);
 
     if code == ServerErrorCode::ChannelAdmissionDisabled {

@@ -1,7 +1,6 @@
 //! Server-side proxy helpers.
 
 use crate::session::SessionState;
-use crate::session_fsm::ByteDirection;
 use bytes::Bytes;
 use h2::{RecvStream, SendStream};
 use monad_common::h2stream::wait_for_send_capacity;
@@ -12,6 +11,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 pub use monad_common::proxy::proxy_bidirectional;
+
+fn accounting_error(error: crate::session_fsm::SessionAccountingError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::QuotaExceeded,
+        format!("session accounting limit exceeded: {error:?}"),
+    )
+}
 
 struct TunnelAccounting<'a> {
     state: &'a SessionState,
@@ -36,37 +42,6 @@ impl Drop for TunnelAccounting<'_> {
             self.inbound,
             self.outbound as u128 + self.inbound as u128
         );
-    }
-}
-
-struct ByteReservation {
-    state: SessionState,
-    direction: ByteDirection,
-    granted_bytes: usize,
-}
-
-impl ByteReservation {
-    async fn commit(mut self, actual_bytes: usize) -> io::Result<bool> {
-        let result = self
-            .state
-            .commit_reserved_bytes(self.direction, self.granted_bytes, actual_bytes)
-            .await;
-        self.granted_bytes = 0;
-        result.map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::QuotaExceeded,
-                format!("session accounting limit exceeded: {error:?}"),
-            )
-        })
-    }
-}
-
-impl Drop for ByteReservation {
-    fn drop(&mut self) {
-        if self.granted_bytes != 0 {
-            self.state
-                .release_reserved_bytes(self.direction, self.granted_bytes);
-        }
     }
 }
 
@@ -105,65 +80,11 @@ async fn wait_until_unpaused_or_terminated(
     }
 }
 
-async fn reserve_forwarding_bytes(
-    state: &SessionState,
-    direction: ByteDirection,
-    requested_bytes: usize,
-    paused_rx: &mut watch::Receiver<bool>,
-    billing_version_rx: &mut watch::Receiver<u64>,
-    termination: &CancellationToken,
-    proxy_cancel: &CancellationToken,
-) -> io::Result<ByteReservation> {
-    loop {
-        wait_until_unpaused_or_terminated(paused_rx, termination, proxy_cancel).await?;
-        let granted_bytes = state.reserve_bytes(direction, requested_bytes).await;
-        if granted_bytes != 0 {
-            return Ok(ByteReservation {
-                state: state.clone(),
-                direction,
-                granted_bytes,
-            });
-        }
-
-        tokio::select! {
-            _ = termination.cancelled() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "session terminated",
-                ));
-            }
-            _ = proxy_cancel.cancelled() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "proxy direction ended",
-                ));
-            }
-            changed = billing_version_rx.changed() => {
-                changed.map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "session billing channel closed unexpectedly",
-                    )
-                })?;
-            }
-            changed = paused_rx.changed() => {
-                changed.map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "session pause channel closed unexpectedly",
-                    )
-                })?;
-            }
-        }
-    }
-}
-
 /// Proxy bytes bidirectionally while enforcing per-session payment pauses.
 ///
-/// Byte accounting stays on the fast path here rather than flowing through the
-/// main control/session reducer. Each bounded forwarding operation reserves
-/// exact billing headroom first, so simultaneous tunnels cannot spend the same
-/// remaining credit. Reservations release on every error and cancellation path.
+/// A bounded forwarding operation that starts while credit is positive may
+/// complete and take the balance negative. The actual forwarded bytes are
+/// counted exactly, then subsequent forwarding waits for more credit.
 pub(crate) async fn proxy_bidirectional_accounted<T>(
     mut h2_send: SendStream<Bytes>,
     mut h2_recv: RecvStream,
@@ -177,8 +98,6 @@ where
     let (mut target_read, mut target_write) = tokio::io::split(target);
     let mut paused_rx_a = state.pause_receiver();
     let mut paused_rx_b = state.pause_receiver();
-    let mut billing_version_rx_a = state.billing_version_receiver();
-    let mut billing_version_rx_b = state.billing_version_receiver();
     let termination_a = state.termination_token();
     let termination_b = state.termination_token();
     let proxy_cancel_a = CancellationToken::new();
@@ -223,23 +142,11 @@ where
                 }
 
                 let pending_len = pending.as_ref().expect("pending data").len();
-                let reservation = reserve_forwarding_bytes(
-                    &state,
-                    ByteDirection::Outbound,
-                    pending_len,
-                    &mut paused_rx_a,
-                    &mut billing_version_rx_a,
-                    &termination_a,
-                    &proxy_cancel_a,
-                )
-                .await?;
-                let granted_bytes = reservation.granted_bytes;
                 let mut written = 0;
                 let mut write_result = Ok(());
-
-                while written < granted_bytes {
+                while written < pending_len {
                     let buf = pending.as_ref().expect("pending data");
-                    let write = target_write.write(&buf[written..granted_bytes]);
+                    let write = target_write.write(&buf[written..]);
                     tokio::select! {
                         biased;
                         _ = termination_a.cancelled() => {
@@ -275,7 +182,7 @@ where
                     }
                 }
 
-                let commit_result = reservation.commit(written).await;
+                let commit_result = state.note_outbound_bytes(written).await;
                 if written != 0 {
                     let _ = h2_recv.flow_control().release_capacity(written);
                 }
@@ -296,7 +203,7 @@ where
                                 "tunnel outbound counter overflow",
                             )
                         })?;
-                let paused = commit_result?;
+                let paused = commit_result.map_err(accounting_error)?;
                 if paused {
                     state.push_status().await;
                 }
@@ -325,42 +232,27 @@ where
     let target_to_h2 = async {
         let result: io::Result<()> = async {
             let mut buf = vec![0u8; 16384];
-            let mut pending = Bytes::new();
             loop {
-                if pending.is_empty() {
-                    wait_until_unpaused_or_terminated(
-                        &mut paused_rx_b,
-                        &termination_b,
-                        &proxy_cancel_b,
-                    )
-                    .await?;
-
-                    match tokio::select! {
-                        _ = termination_b.cancelled() => Ok(0),
-                        _ = proxy_cancel_b.cancelled() => Ok(0),
-                        read = target_read.read(&mut buf) => read,
-                    } {
-                        Ok(0) => {
-                            debug!("target read EOF");
-                            break;
-                        }
-                        Ok(n) => pending = Bytes::copy_from_slice(&buf[..n]),
-                        Err(e) => return Err(e),
-                    }
-                }
-
-                let reservation = reserve_forwarding_bytes(
-                    &state,
-                    ByteDirection::Inbound,
-                    pending.len(),
+                wait_until_unpaused_or_terminated(
                     &mut paused_rx_b,
-                    &mut billing_version_rx_b,
                     &termination_b,
                     &proxy_cancel_b,
                 )
                 .await?;
-                let granted_bytes = reservation.granted_bytes;
-                let data = pending.split_to(granted_bytes);
+
+                let n = match tokio::select! {
+                    _ = termination_b.cancelled() => Ok(0),
+                    _ = proxy_cancel_b.cancelled() => Ok(0),
+                    read = target_read.read(&mut buf) => read,
+                } {
+                    Ok(0) => {
+                        debug!("target read EOF");
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(e) => return Err(e),
+                };
+                let data = Bytes::copy_from_slice(&buf[..n]);
 
                 h2_send.reserve_capacity(data.len());
                 tokio::select! {
@@ -380,19 +272,24 @@ where
                         result?;
                     }
                 }
+                let data_len = data.len();
                 h2_send
                     .send_data(data, false)
                     .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
-                let paused = reservation.commit(granted_bytes).await?;
-                accounting.inbound = accounting
-                    .inbound
-                    .checked_add(granted_bytes as u64)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::QuotaExceeded,
-                            "tunnel inbound counter overflow",
-                        )
-                    })?;
+                let paused = state
+                    .note_inbound_bytes(data_len)
+                    .await
+                    .map_err(accounting_error)?;
+                accounting.inbound =
+                    accounting
+                        .inbound
+                        .checked_add(data_len as u64)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::QuotaExceeded,
+                                "tunnel inbound counter overflow",
+                            )
+                        })?;
                 if paused {
                     state.push_status().await;
                 }
@@ -411,8 +308,8 @@ where
     };
 
     // Join rather than try_join so an error in one direction cancels the other
-    // direction's operation but still lets that direction release reservations
-    // and commit any already-delivered write prefix before returning.
+    // direction's operation but still lets that direction commit any
+    // already-delivered write prefix before returning.
     let (outbound_result, inbound_result) = tokio::join!(h2_to_target, target_to_h2);
     let is_session_termination = |error: &io::Error| {
         error.kind() == io::ErrorKind::ConnectionAborted

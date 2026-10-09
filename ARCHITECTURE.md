@@ -308,7 +308,7 @@ Important types:
   - allows another Noise+H2 session to run on top of an existing CONNECT tunnel
 - `ClientMessage` / `ServerMessage` (`protocol.rs`)
   - wire protocol enums for the control stream (ChannelLink, ChannelPayment, ChannelUnlink, GetSessionStatus, Ping, SessionStatus, ChannelEvicted, ChannelReleaseRequested, Pong, Error)
-  - `MintUnitAdvertisements` plus `LinkedChannelStatus` for mint offers and relay-authoritative linked-channel sync
+  - `MintUnitAdvertisements` plus `LinkedChannelStatus` for mint offers and relay-reported linked-channel sync
 - `RelayConnection` (`session.rs`)
   - client-side handle to an established secp Noise+H2 session
   - manages H2 client, driver handles, task handles, session pricing, session ID
@@ -316,7 +316,7 @@ Important types:
 - `SessionPricing` (`session.rs`)
   - validated directional billing rates
 - exact session billing (`billing.rs`)
-  - integer quotient/remainder amount-due calculation, remaining-credit conversion, billable-headroom grants, and MONAD's operational 90,000 BTC accounting cap
+  - integer quotient/remainder amount-due calculation and exact remaining-credit conversion
 - `proxy_bidirectional` (`proxy.rs`)
   - shared generic bidirectional proxy used by client tunnels
 - `Ed25519Pubkey` / `QuicCertIdentity` (`quic_cert_identity.rs`)
@@ -334,7 +334,7 @@ Responsibilities:
 - run one payment/session driver per relay session
 - keep a shared wallet across relay sessions
 - select or provision channels, send `ChannelLink`, and send incremental
-  `ChannelPayment` messages using relay-authoritative linked-channel sync from
+  `ChannelPayment` messages using relay-reported linked-channel sync from
   `SessionStatus`
 
 ### `monad-relay`
@@ -712,7 +712,7 @@ Server to client (`ServerMessage`):
   - `open_connects`: Currently open accepted CONNECT tunnels
   - `total_connects`: Cumulative accepted CONNECT tunnels
   - `failed_connects`: Cumulative CONNECT requests the relay did not accept
-- `SessionStatus { ... linked_channel: Some(...) ... }` — authoritative relay state after a successful link or payment
+- `SessionStatus { ... linked_channel: Some(...) ... }` — relay-reported state after a successful link or payment
 - `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
 - `ChannelReleaseRequested { channel_id }` — advisory request to retire and unlink a channel when convenient
 - `Pong { nonce }` — correlated response to one `Ping`; it does not request state, consume a request response, or authorize another payment
@@ -787,11 +787,11 @@ remaining = total_paid_millisats - amount_due
 
 This is implemented in `monad-common/src/billing.rs` with integer quotient/remainder arithmetic. The combined rational sum is rounded up once; no direction is rounded separately, no floating point is used, and no LCM is saturated. Rates must be positive.
 
-MONAD's relay currently supports session accounting up to 90,000 BTC (`9_000_000_000_000_000` msat). Channel capacity, payment deltas, and session-paid totals are checked against that cap and per-unit raw limits before durable payment or credit mutation. Over-limit requests receive `NUMERIC_LIMIT_EXCEEDED`; unexpected accounting counter exhaustion terminates the session rather than emitting an approximate status.
+Channel capacity, payment deltas, session-paid totals, byte counters, and CONNECT counters use checked arithmetic against their actual storage and wire limits. Over-limit requests receive `NUMERIC_LIMIT_EXCEEDED` before durable mutation where that rejection is still possible; unexpected accounting counter exhaustion terminates the session rather than emitting an approximate status.
 
-### Reserved Forwarding Headroom
+### Chunk-Boundary Overshoot
 
-Before each bounded proxy write, the relay reserves the exact number of billable bytes currently affordable under the session totals plus all other active reservations. Reservations are serialized under the session billing mutex, so simultaneous tunnels cannot spend the same credit. A large H2 frame may therefore pause mid-frame at the credit boundary and resume after payment. Actual forwarded prefixes are committed, while unforwarded reservation remains are released on errors and cancellation.
+A bounded forwarding operation that starts while the session has positive credit may complete even when that takes the balance negative. The relay counts the actual forwarded prefix exactly, pauses subsequent forwarding while credit is nonpositive, and resumes after payment. Simultaneous tunnels can therefore overshoot together by their in-flight bounded operations; MONAD does not serialize forwarding to prevent that financial overshoot.
 
 ### Two Pricing Structures
 
@@ -806,18 +806,16 @@ The client stores each channel's expiry timestamp in local channel metadata and 
 
 Relay channel policy is configured per relay. Duration fields such as `min_expiry` and `expiring_channels.close_before_expiry` accept human-readable strings like `3600s`, `60m`, `2h`, or `1d`. Capacity fields require explicit `sat` or `msat` suffixes; MONAD stores them internally as millisats and converts to the channel's raw unit before returning upstream Spilman `ChannelPolicy` values. Close-to-expiry detection currently reports `Open` and `Closing` channels whose expiry timestamp is inside `expiring_channels.close_before_expiry`; `expiring_channels.auto_close` is opt-in config for the periodic close worker.
 
-The relay remains authoritative for:
+The relay controls whether it forwards traffic and reports:
 
-- which channel is currently linked
-- the latest accepted linked-channel balance
-- the accepted session-total baseline (`session_total_bytes_in`, `session_total_bytes_out`, `total_paid_millisats`)
-- whether the session is currently paused
+- which channel it believes is currently linked
+- the latest channel balance it has accepted
+- its traffic and accepted-payment totals
+- whether it is currently pausing forwarding
 
-The client combines that authoritative baseline with its own local cleartext byte counters to estimate current spend between relay status updates. A small periodic timer in the control loop checks those counters and can trigger proactive `ChannelPayment` updates before the relay sends another `SessionStatus`.
+These reports are claims, not a substitute for client-side records. The client uses its own local cleartext byte counters and its signed/accepted-payment history to estimate current spend and size payments. It may reconcile an unexpectedly higher relay-reported `total_paid_millisats` upward as extra accepted credit, but it does not use relay traffic totals or remaining-balance claims to reduce its own records or infer a payment obligation.
 
-The client still only treats the relay as authoritative for accepted state. The
-local estimate is used to decide how much to pay, not whether a link or payment
-has already been accepted.
+The client uses the relay's acceptance responses to learn whether a link or payment was accepted; local estimates are used to decide how much to pay, not whether acceptance already occurred.
 
 The developer stress harness in `monad-relay/tests/stress.rs` can also run alternate payment policies on top of the same wire protocol. Unlike the main client, those stress modes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load:
 - transport-focused mode with one huge prefunding payment per hop session
@@ -840,7 +838,7 @@ wire framing and `msat` / `sat` conversions.
 
 That loop keeps small local state for:
 
-- the latest relay-authoritative session snapshot
+- the latest relay-reported session snapshot
 - immutable session pricing
 - the client's intended active channel / offer
 - session-local excluded channels
@@ -851,7 +849,7 @@ On each relay control message, and on a small periodic timer tick, the loop can:
 
 - reconcile the relay-linked channel against the client's intended channel
 - ensure a channel is selected/provisioned and linked when funding needs it
-- size payments from the client's own cleartext byte counters using the latest authoritative relay baseline
+- size payments from the client's own cleartext byte counters using the latest relay-reported baseline
 - react to `ChannelEvicted`
 - classify relay `Error` messages into channel-invalidating vs non-rejecting outcomes
 - end the local session on control detach
@@ -913,16 +911,15 @@ Important effects include:
 Per-byte accounting is intentionally not routed through the main control/session
 reducer.
 
-Instead, active proxy tasks reserve billable headroom and update session byte
-counters directly around the per-session billing mutex:
+Instead, active proxy tasks update session byte counters directly around the
+per-session billing mutex:
 
-- grant no more bytes than the shared paid headroom across all active tunnels
+- forward each bounded operation that starts while credit is positive, even if it takes the balance negative
 - increment `session_total_bytes_in` / `session_total_bytes_out` only by the actual forwarded prefix
-- release unforwarded reservations on errors and cancellation
-- recompute paused state and notify pause/billing watchers on transitions
+- recompute paused state and notify pause watchers on transitions
 
-This keeps the hot data path low-latency while preventing concurrent tunnels
-from spending the same credit. The control FSM still handles the more complex
+This keeps the hot data path low-latency without serializing tunnels against a
+shared prepaid-byte budget. The control FSM still handles the more complex
 protocol transitions.
 
 ### CONNECT Counters

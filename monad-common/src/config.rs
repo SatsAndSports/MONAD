@@ -152,21 +152,6 @@ impl MonadConfig {
                     "client_wallet.channel_funding_token_target_msats must be greater than zero"
                 );
             }
-            for (name, value) in [
-                (
-                    "channel_funding_token_target_msats",
-                    client_wallet.channel_funding_token_target_msats,
-                ),
-                (
-                    "target_topup_buffer_msats",
-                    client_wallet.target_topup_buffer_msats,
-                ),
-                ("minimum_topup_msats", client_wallet.minimum_topup_msats),
-            ] {
-                if value > crate::billing::MAX_SESSION_ACCOUNTING_MILLISATS {
-                    anyhow::bail!("client_wallet.{name} exceeds MONAD's session accounting limit");
-                }
-            }
         }
 
         let mut relay_names = HashSet::new();
@@ -1297,20 +1282,6 @@ management:
         let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("channel_funding_token_target_msats"));
-    }
-
-    #[test]
-    fn client_payment_values_above_accounting_cap_are_rejected() {
-        let yaml = minimal_config_yaml().replace(
-            &format!("sender_secret_hex: \"{ZERO_SECRET}\""),
-            &format!(
-                "sender_secret_hex: \"{ZERO_SECRET}\"\n  target_topup_buffer_msats: {}",
-                crate::billing::MAX_SESSION_ACCOUNTING_MILLISATS + 1
-            ),
-        );
-        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("target_topup_buffer_msats"));
     }
 
     #[test]

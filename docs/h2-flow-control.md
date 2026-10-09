@@ -300,10 +300,10 @@ fix.
 
 - Pause/resume billing semantics, `monad-relay/tests/integration.rs`:
   - `test_session_repauses_and_resumes_after_second_payment`
-  - `test_session_mid_chunk_credit_boundary_and_resume`
-  - `test_session_underpayment_stays_paused_until_positive`
+  - `test_session_overshoot_negative_balance_and_resume`
+  - `test_session_overshoot_underpayment_stays_paused_until_positive`
   - `test_outbound_bytes_sent_after_pause_are_delivered_after_unpause`
-  - `test_inbound_bytes_wait_for_credit_and_are_delivered_after_unpause`
+  - `test_inbound_bytes_pushed_after_pause_are_delivered_after_unpause`
     (bytes queued during a pause are delivered intact after unpause)
   - `test_managed_client_exhaustion_waits_then_resumes_same_session`
 - Zero-window / control-liveness unit tests:

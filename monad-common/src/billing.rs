@@ -7,23 +7,10 @@
 
 use thiserror::Error;
 
-/// Maximum session payment or billed amount supported by MONAD, in millisats.
-///
-/// The value is the round 90,000 BTC cap permitted by the control protocol. It
-/// keeps every status integer exact for ordinary JSON consumers and leaves
-/// substantial headroom below the `i64` wire range.
-pub const MAX_SESSION_ACCOUNTING_MILLISATS: u64 = 9_000_000_000_000_000;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PricingError {
     #[error("billing rates must be positive: in={in_rate}, out={out_rate}")]
     ZeroRate { in_rate: u64, out_rate: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BillingDirection {
-    Inbound,
-    Outbound,
 }
 
 fn amount_due_millisats_unchecked(
@@ -94,63 +81,6 @@ pub fn remaining_milli_sats(
         out_bytes_per_millisat,
     )?;
     Ok(total_paid_millisats as i128 - due as i128)
-}
-
-/// Return the largest additional byte count in one direction whose combined
-/// amount due does not exceed `total_paid_millisats`.
-///
-/// `session_total_*` must already include any reserved but uncommitted bytes.
-pub fn max_additional_billable_bytes(
-    session_total_bytes_in: u64,
-    session_total_bytes_out: u64,
-    in_bytes_per_millisat: u64,
-    out_bytes_per_millisat: u64,
-    total_paid_millisats: u64,
-    direction: BillingDirection,
-    requested_bytes: u64,
-) -> Result<u64, PricingError> {
-    amount_due_millisats(
-        session_total_bytes_in,
-        session_total_bytes_out,
-        in_bytes_per_millisat,
-        out_bytes_per_millisat,
-    )?;
-
-    let due = |additional: u64| -> Option<u128> {
-        let (candidate_in, candidate_out) = match direction {
-            BillingDirection::Inbound => (
-                session_total_bytes_in.checked_add(additional)?,
-                session_total_bytes_out,
-            ),
-            BillingDirection::Outbound => (
-                session_total_bytes_in,
-                session_total_bytes_out.checked_add(additional)?,
-            ),
-        };
-        amount_due_millisats(
-            candidate_in,
-            candidate_out,
-            in_bytes_per_millisat,
-            out_bytes_per_millisat,
-        )
-        .ok()
-    };
-
-    if due(0).is_none_or(|due| due > total_paid_millisats as u128) {
-        return Ok(0);
-    }
-
-    let mut low = 0;
-    let mut high = requested_bytes;
-    while low < high {
-        let mid = low + (high - low) / 2 + 1;
-        if due(mid).is_some_and(|due| due <= total_paid_millisats as u128) {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    Ok(low)
 }
 
 /// Convert exact remaining credit to the signed wire field without
@@ -266,67 +196,6 @@ mod tests {
                 "bytes=({bytes_in},{bytes_out}) rates=({in_rate},{out_rate})"
             );
         }
-    }
-
-    #[test]
-    fn max_additional_bytes_is_exact_and_monotonic() {
-        let grant =
-            max_additional_billable_bytes(0, 0, 2, 3, 5, BillingDirection::Outbound, 100).unwrap();
-        assert_eq!(grant, 15);
-        assert_eq!(amount_due_millisats(0, grant, 2, 3).unwrap(), 5);
-        assert_eq!(amount_due_millisats(0, grant + 1, 2, 3).unwrap(), 6);
-
-        let mut previous = 0;
-        for paid in 0..20 {
-            let grant =
-                max_additional_billable_bytes(3, 4, 3, 5, paid, BillingDirection::Inbound, 50)
-                    .unwrap();
-            assert!(grant >= previous);
-            let base_due = amount_due_millisats(3, 4, 3, 5).unwrap();
-            if base_due > paid as u128 {
-                assert_eq!(grant, 0);
-                continue;
-            }
-            assert!(amount_due_millisats(3 + grant, 4, 3, 5).unwrap() <= paid as u128);
-            if grant < 50 {
-                assert!(amount_due_millisats(3 + grant + 1, 4, 3, 5).unwrap() > paid as u128);
-            }
-            previous = grant;
-        }
-    }
-
-    #[test]
-    fn max_additional_bytes_accounts_for_both_directions_and_overflow() {
-        assert_eq!(
-            max_additional_billable_bytes(1, 1, 2, 2, 1, BillingDirection::Outbound, 10,).unwrap(),
-            0
-        );
-        assert_eq!(
-            max_additional_billable_bytes(
-                u64::MAX,
-                0,
-                1,
-                1,
-                u64::MAX,
-                BillingDirection::Outbound,
-                u64::MAX,
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            max_additional_billable_bytes(
-                u64::MAX,
-                0,
-                u64::MAX,
-                1,
-                2,
-                BillingDirection::Outbound,
-                u64::MAX,
-            )
-            .unwrap(),
-            1
-        );
     }
 
     #[test]

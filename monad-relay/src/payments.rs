@@ -9,7 +9,6 @@ use cdk_spilman::{
     ClosingData, Payment, PaymentProof, PreparedClose, SelectedOutputKeyset,
     SpilmanAsyncKeysetRefresher, SpilmanBridge, SpilmanHost,
 };
-use monad_common::billing::MAX_SESSION_ACCOUNTING_MILLISATS;
 use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
 use sha2::{Digest, Sha256};
@@ -81,7 +80,7 @@ pub trait RelayPayments: Send + Sync + 'static {
             session_id,
             expected_channel_id,
             payment_json,
-            MAX_SESSION_ACCOUNTING_MILLISATS,
+            u64::MAX,
         )
     }
 
@@ -256,8 +255,8 @@ impl ChannelUnit {
 
     pub(crate) fn max_balance_raw(self) -> u64 {
         match self {
-            Self::Msat => MAX_SESSION_ACCOUNTING_MILLISATS,
-            Self::Sat => MAX_SESSION_ACCOUNTING_MILLISATS / 1000,
+            Self::Msat => i64::MAX as u64,
+            Self::Sat => u64::MAX / 1000,
         }
     }
 

@@ -241,11 +241,11 @@ Implemented today:
 - QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, configured client routes, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
 - Noise-payload bootstrap: MONAD uses the Noise `NK` pattern over secp256k1 with ChaCha20-Poly1305 and BLAKE2s; the client maps each supported Cashu Spilman channel protocol version to its supported keyset-format versions in the first handshake payload, and the relay selects one protocol plus the full mutual keyset-format set before H2 starts. Today `2026-09-14` supports `v1` and `v2` and requires a nonempty intersection, alongside `h2` and `session_constant` pricing
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
-- session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, exact totals-based billing with directional pricing, reserved concurrent forwarding headroom, pause/resume enforcement, open/total/failed CONNECT counters, `ChannelLink`, `ChannelPayment`, `ChannelEvicted`, and correlated Ping/Pong liveness
-- relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
+- session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, exact totals-based billing with directional pricing, bounded chunk overshoot with pause/resume enforcement, open/total/failed CONNECT counters, `ChannelLink`, `ChannelPayment`, `ChannelEvicted`, and correlated Ping/Pong liveness
+- relay-reported linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - in-process relay wallet manager: multiple hosted relays can share one SQLite-backed relay wallet database while keeping distinct Cashu receiver keys / wallet names
-- client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments, with periodic local cleartext-counter checks sizing payments against the latest authoritative relay baseline
+- client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments, with periodic local cleartext-counter checks sizing payments from client-side byte and payment records
 - client wallet library path: `SqliteClientWallet` manages Spilman channels, `LooseProofWallet` stores spendable Cashu proofs, and `session_driver` handles per-session linking and payments; `MockWallet` remains for tests and connector harnesses
 - blinded-hop routing over QUIC: `CONNECT blinded.monad.invalid:443`, tweak-prefixed QUIC forwarded sessions, `RouteHop` / `Route` connector support, public-key-only blinded-path construction, and parity-aware reverse-tweak key recovery for MONAD's x-only secp256k1 identity model
 - integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
@@ -397,7 +397,7 @@ YAML order; add `--client <name>` to run only one entry.
 
 `client_wallet.channel_funding_token_target_msats` controls the desired funding-token value for each newly provisioned channel. Cashu input fees are selected in addition to this target; output fees and deterministic channel outputs can make usable channel capacity lower. The default is `1000000` msats.
 
-`client_wallet.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `client_wallet.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats. These client payment settings and each session's accepted relay accounting are limited to 90,000 BTC (`9_000_000_000_000_000` msat).
+`client_wallet.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `client_wallet.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats. Payment sizing uses the client's own byte and payment records; an unexpectedly higher relay-reported accepted-payment total can only increase the client's credit estimate.
 
 Admin/recovery commands can use the configured singleton `client_wallet`:
 
@@ -564,8 +564,8 @@ Current coverage includes:
 - CONNECT rejected while paused (402)
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
-- mid-frame credit-boundary pause and resume without negative relay session balance
-- concurrent tunnel reservations sharing one paid headroom
+- session overshoot with negative balance and resume
+- concurrent bounded tunnel operations overshooting shared credit
 - exact billing boundaries, zero-rate rejection, and pre-mutation numeric-limit errors
 - underpayment stays paused until balance is positive
 - multiple simultaneous tunnels
