@@ -3000,6 +3000,7 @@ async fn open_two_control_sessions(
 }
 
 async fn assert_evicted_then_status(
+    send: &mut h2::SendStream<Bytes>,
     recv: &mut h2::RecvStream,
     expected_channel_id: &str,
 ) -> TestSessionStatus {
@@ -3013,7 +3014,8 @@ async fn assert_evicted_then_status(
         other => panic!("expected ChannelEvicted, got {other:?}"),
     }
 
-    expect_session_status_struct(read_control_message(recv).await)
+    // Eviction is an advisory only. Query explicitly for a new snapshot.
+    request_session_status_status(send, recv).await
 }
 
 async fn fund_session(conn: &RelayConnection, milli_sats: u64) {
@@ -3149,28 +3151,14 @@ impl SessionPaymentChannel {
         )
         .await;
 
-        // Data-path pause statuses can be queued around the payment response.
-        // Skip those stale snapshots until the relay-authoritative response for
-        // this exact cumulative balance arrives.
-        for _ in 0..8 {
-            let status = expect_session_status_struct(read_control_message(h2_recv).await);
-            if status.linked_channel.as_ref().is_some_and(|linked| {
-                linked.channel_id == self.channel_id
-                    && linked.balance_raw == self.cumulative_balance_units
-            }) {
-                status.assert_linked_channel(
-                    &self.channel_id,
-                    self.cumulative_balance_units,
-                    self.capacity_units(),
-                    self.unit,
-                );
-                return status.as_tuple();
-            }
-        }
-        panic!(
-            "payment response for channel {} balance {} did not arrive",
-            self.channel_id, self.cumulative_balance_units
-        )
+        let status = expect_session_status_struct(read_control_message(h2_recv).await);
+        status.assert_linked_channel(
+            &self.channel_id,
+            self.cumulative_balance_units,
+            self.capacity_units(),
+            self.unit,
+        );
+        status.as_tuple()
     }
 }
 
@@ -3398,6 +3386,60 @@ async fn test_session_starts_paused() {
     drop(h2_send);
     drop(h2_recv);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_data_pause_does_not_push_an_unsolicited_control_response() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = target.local_addr().unwrap();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let target_task = tokio::spawn(async move {
+        let (mut socket, _) = target.accept().await.unwrap();
+        let mut data = [0; 10];
+        socket.read_exact(&mut data).await.unwrap();
+        let _ = received_tx.send(());
+        let _ = stop_rx.await;
+    });
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (send, recv) = open_funded_control(&conn, 5).await;
+    let mut control = ControlSessionHarness { send, recv };
+    let mut h2 = conn.clone_send_request().await;
+    let (mut send, recv) = open_connect_tunnel(&mut h2, &addr.to_string()).await;
+    send.send_data(Bytes::from_static(b"0123456789"), false)
+        .unwrap();
+    timeout(Duration::from_secs(2), received_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    send_control_message(
+        &mut control.send,
+        &ClientMessage::Ping {
+            nonce: "pause-barrier".into(),
+        },
+        false,
+    )
+    .await;
+    assert!(
+        matches!(read_control_message(&mut control.recv).await,ServerMessage::Pong { nonce } if nonce=="pause-barrier")
+    );
+    assert!(timeout(
+        Duration::from_millis(50),
+        read_control_message(&mut control.recv)
+    )
+    .await
+    .is_err());
+    let status = control.get_status().await;
+    assert!(status.paused);
+    assert_eq!(status.session_total_bytes_out, 10);
+    assert_eq!(status.remaining_milli_sats, -5);
+    let _ = stop_tx.send(());
+    target_task.await.unwrap();
+    drop((send, recv));
+    control.close().await;
+    drop(h2);
     conn.shutdown().await;
 }
 
@@ -5290,7 +5332,7 @@ async fn test_channel_eviction_clears_linked_channel() {
     let _ = channel_a.link(&mut send_a, &mut recv_a).await;
     let _ = channel_b.link(&mut send_b, &mut recv_b).await;
 
-    let eviction_status = assert_evicted_then_status(&mut recv_a, "shared").await;
+    let eviction_status = assert_evicted_then_status(&mut send_a, &mut recv_a, "shared").await;
     assert_eq!(eviction_status.linked_channel, None);
     assert!(eviction_status.paused);
 
@@ -5339,7 +5381,8 @@ async fn test_channel_eviction_preserves_existing_session_balance() {
         Some("shared-funded")
     );
 
-    let eviction_status = assert_evicted_then_status(&mut recv_a, "shared-funded").await;
+    let eviction_status =
+        assert_evicted_then_status(&mut send_a, &mut recv_a, "shared-funded").await;
     assert_eq!(eviction_status.linked_channel, None);
     assert_eq!(eviction_status.total_paid_millisats, paid_before_eviction);
     assert_eq!(
@@ -5983,7 +6026,9 @@ async fn test_session_repauses_and_resumes_after_second_payment() {
     }
 
     let (_in2, out2, _paid2, rem2, paused2) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 5)
+            .await
+            .unwrap();
     assert!(paused2, "session should re-pause after credit is exhausted");
     assert_eq!(out2, 5);
     assert_eq!(rem2, 0);
@@ -6178,7 +6223,9 @@ async fn test_control_stream_survives_connection_window_blocked_by_paused_tunnel
         .send_data(Bytes::from_static(b"12345"), false)
         .unwrap();
     let (_in2, out2, _paid2, rem2, paused2) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 5)
+            .await
+            .unwrap();
     assert!(paused2, "session should pause after spending all credit");
     assert_eq!(out2, 5);
     assert_eq!(rem2, 0);
@@ -6283,7 +6330,9 @@ async fn test_outbound_bytes_sent_after_pause_are_delivered_after_unpause() {
     }
 
     let (_in2, out2, _paid2, rem2, paused2) =
-        expect_session_status(read_control_message(&mut control_recv).await);
+        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 5)
+            .await
+            .unwrap();
     assert!(
         paused2,
         "session should pause after exhausting initial credit"

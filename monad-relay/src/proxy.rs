@@ -100,9 +100,8 @@ where
             // bounded DATA frame is held here, including on a slow target.
             let _ = h2_recv.flow_control().release_capacity(data.len());
             let mut written = 0;
-            let mut pause_changed = false;
             while written < data.len() {
-                let (n, changed) = poll_fn(|cx| {
+                let (n, _) = poll_fn(|cx| {
                     state.poll_accounted_forward(
                         ByteDirection::Outbound,
                         data.len() - written,
@@ -120,10 +119,6 @@ where
                 // A tunnel total is bounded by the corresponding checked
                 // session total. These additions cannot overflow.
                 accounting.outbound += n as u64;
-                pause_changed |= changed;
-            }
-            if pause_changed {
-                state.push_status().await;
             }
         }
         target_write.shutdown().await?;
@@ -154,11 +149,8 @@ where
             let Poll::Ready(result) = result else {
                 unreachable!("H2 send_data is synchronous")
             };
-            let (_, pause_changed) = result?;
+            let _ = result?;
             accounting.inbound += n as u64;
-            if pause_changed {
-                state.push_status().await;
-            }
         }
         h2_send
             .send_data(Bytes::new(), true)

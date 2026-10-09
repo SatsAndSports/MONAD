@@ -697,7 +697,7 @@ Client to server (`ClientMessage`):
 - `Ping { nonce }` — request correlated control-path liveness evidence without requesting a status
 
 Server to client (`ServerMessage`):
-- `SessionStatus { ... }` — primary state synchronization message; sent immediately after control stream establishment, in response to `GetSessionStatus`, and after accepted link/payment/unlink or eviction transitions. Fast-path byte accounting and repause do not independently push a snapshot. Contains:
+- `SessionStatus { ... }` — primary state synchronization message; sent once after control stream establishment, then as the ordered response to successful link/payment/unlink or `GetSessionStatus` requests. Fast-path byte accounting, pause transitions, and eviction do not push snapshots. Contains:
   - `version`: Negotiated protocol version
   - `receiver_pubkey`: Server's secp256k1 key for Spilman
   - `advertisements`: Map of mint URL to unit to `{minimum_channel_lifetime_secs, funding_keyset_recovery_window_secs}`; no keyset IDs or per-offer prices
@@ -717,6 +717,36 @@ Server to client (`ServerMessage`):
 - `ChannelReleaseRequested { channel_id }` — advisory request to retire and unlink a channel when convenient
 - `Pong { nonce }` — correlated response to one `Ping`; it does not request state, consume a request response, or authorize another payment
 - `Error { code, message }` — relay-initiated error or rejection
+
+### Ordered Control Exchanges
+
+The relay owns a bounded decoder future and one serialized executor inside the
+control task. Five ordinary request permits include active validation and
+response submission; excess requests are backpressured. A separate 16-envelope
+queue bounds probe buffering. Framing still limits each line to 1 MiB; the reader
+can hold one additional decoded message while awaiting admission plus its
+bounded framing buffer. Task teardown drops both futures and their queued work.
+
+Every request goes through `SessionEvent` → reducer → effects → `ControlDriver`.
+Ping follows that same path and emits Pong, but consumes no ordinary permit.
+Responses are fixed/submitted before the next ordinary operation executes.
+Advisories can interleave at operation boundaries and consume no response slot.
+
+`monad-common/src/control_exchange.rs` provides the client FIFO used by the main
+client, test client, and stress harness. It rejects a sixth outstanding request,
+requires initial status before other core messages, attributes each ordinary
+response to the oldest request, and rejects mismatched channel/balance results.
+Each paid-total floor uses the prior confirmed total plus only the current
+payment's newly signed increment, never a later pending payment. Extra credit
+raises the confirmed floor; shortchanging is fatal. Ordinary empty-FIFO
+responses are ignored without state changes (the main client warns once per
+session); recognized fatal errors terminate regardless of the FIFO.
+
+The main funding policy still sends channel operations serially. Local counters
+now also trigger exhausted-channel reselection; it does not wait for an
+unsolicited pause snapshot. Ping/Pong retains its independent nonce liveness
+tracking. Extension envelopes and the complete stable error registry remain
+separate conformance work.
 
 ### Relay Keyset Refresh
 

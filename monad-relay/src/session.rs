@@ -86,10 +86,6 @@ impl ControlState {
         self.control_attached = false;
         self.control_tx = None;
     }
-
-    fn sender(&self) -> Option<mpsc::UnboundedSender<ServerMessage>> {
-        self.control_tx.clone()
-    }
 }
 
 /// Lightweight observability counters that do not participate in billing.
@@ -558,23 +554,6 @@ impl SessionState {
     }
 
     // Control-stream state.
-
-    async fn push_message(&self, message: ServerMessage) {
-        let tx = {
-            let control = self.control.lock().await;
-            control.sender()
-        };
-
-        if let Some(tx) = tx {
-            let _ = tx.send(message);
-        }
-    }
-
-    pub(crate) async fn push_status(&self) {
-        if let Some(status) = self.session_status_message().await {
-            self.push_message(status).await;
-        }
-    }
 
     // Observability counters.
 
@@ -1167,17 +1146,62 @@ pub(crate) async fn send_control_message(
 }
 
 /// Handle a long-lived control stream for one paid relay session.
+struct InboundControlRequest {
+    message: ClientMessage,
+    // Held through validation, snapshot construction, and response submission.
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+async fn read_control_requests(
+    mut recv: h2::RecvStream,
+    requests: mpsc::Sender<InboundControlRequest>,
+) -> io::Result<()> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(
+        monad_common::control_exchange::MAX_PENDING_REQUESTS,
+    ));
+    let mut buf = Vec::new();
+    while let Some(data) = recv.data().await {
+        let data = data.map_err(|_| io::Error::other("control receive failure"))?;
+        recv.flow_control()
+            .release_capacity(data.len())
+            .map_err(io::Error::other)?;
+        buf.extend_from_slice(&data);
+        while let Some(message) = try_decode_json_line::<ClientMessage>(&mut buf)? {
+            let slot = if matches!(message, ClientMessage::Ping { .. }) {
+                None
+            } else {
+                Some(
+                    slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(io::Error::other)?,
+                )
+            };
+            requests
+                .send(InboundControlRequest { message, slot })
+                .await
+                .map_err(|_| io::Error::other("control executor closed"))?;
+        }
+    }
+    // An unterminated final line is never executed.
+    Ok(())
+}
+
 async fn handle_control_stream(
     mut h2_send: h2::SendStream<Bytes>,
-    mut h2_recv: h2::RecvStream,
+    h2_recv: h2::RecvStream,
     state: SessionState,
     mut events: mpsc::UnboundedReceiver<ServerMessage>,
 ) -> io::Result<()> {
     info!("control channel opened");
     let termination = state.termination_token();
+    // Five ordinary requests including the active operation. Probes use no
+    // ordinary slot; the separate envelope bound backpressures probe floods.
+    let (request_tx, mut requests) = mpsc::channel(16);
+    let reader = read_control_requests(h2_recv, request_tx);
 
     let result = async {
-        let mut buf = Vec::new();
         // Bootstrap stays outside the explicit steady-state session FSM. After the
         // pre-H2 Noise bootstrap selected the session protocol, we immediately send
         // the initial SessionStatus before entering the reducer-driven control loop.
@@ -1204,40 +1228,16 @@ async fn handle_control_stream(
                                 if terminate_session {
                                     break;
                                 }
-                            } else {
+                            } else if matches!(message, ServerMessage::ChannelReleaseRequested { .. }) {
                                 send_control_message(&mut h2_send, &message).await?;
                             }
                         }
                         None => break,
                     }
                 }
-                maybe_chunk = h2_recv.data() => {
-                    match maybe_chunk {
-                        Some(Ok(data)) => {
-                            let len = data.len();
-                            let _ = h2_recv.flow_control().release_capacity(len);
-                            buf.extend_from_slice(&data);
-
-                            loop {
-                                let message = match try_decode_json_line::<ClientMessage>(&mut buf) {
-                                    Ok(Some(message)) => message,
-                                    Ok(None) => break,
-                                    Err(_) => {
-                                        warn!("control: invalid client message");
-                                        let err_msg = ServerMessage::Error {
-                                            code: ServerErrorCode::ControlInvalidMessage,
-                                            message: CONTROL_INVALID_MESSAGE_TEXT.to_string(),
-                                        };
-                                        let _ = tokio::time::timeout(
-                                            CONTROL_INVALID_MESSAGE_SEND_TIMEOUT,
-                                            send_control_message(&mut h2_send, &err_msg),
-                                        )
-                                        .await;
-                                        terminate_session = true;
-                                        break;
-                                    }
-                                };
-
+                request = requests.recv() => {
+                    match request {
+                        Some(InboundControlRequest { message, slot }) => {
                                 match message {
                                     ClientMessage::ChannelUnlink { channel_id } => {
                                         terminate_session = process_session_event(&state, SessionEvent::ClientChannelUnlink {channel_id}, &mut h2_send).await?;
@@ -1276,14 +1276,7 @@ async fn handle_control_stream(
                                     }
                                 }
 
-                                if terminate_session {
-                                    break;
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            debug!("control h2 recv error: {e}");
-                            break;
+                                drop(slot);
                         }
                         None => {
                             debug!("control channel closed by client");
@@ -1300,11 +1293,35 @@ async fn handle_control_stream(
 
         Ok(())
     };
-    let result = tokio::select! {
-        biased;
-        _ = termination.cancelled() => Ok(()),
-        result = result => result,
+    let result = {
+        tokio::pin!(reader, result);
+        tokio::select! {
+            biased;
+            _ = termination.cancelled() => Ok(()),
+            ingress = &mut reader => match ingress {
+                Ok(()) => tokio::select! {
+                    _ = termination.cancelled() => Ok(()),
+                    result = &mut result => result,
+                },
+                Err(error) => Err(error),
+            },
+            result = &mut result => result,
+        }
     };
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData)
+    {
+        let error = ServerMessage::Error {
+            code: ServerErrorCode::ControlInvalidMessage,
+            message: CONTROL_INVALID_MESSAGE_TEXT.into(),
+        };
+        let _ = tokio::time::timeout(
+            CONTROL_INVALID_MESSAGE_SEND_TIMEOUT,
+            send_control_message(&mut h2_send, &error),
+        )
+        .await;
+    }
 
     // Cleanup must run even when a control write or reducer effect fails.
     let _ = process_session_event(&state, SessionEvent::ControlDetached, &mut h2_send).await;
@@ -1852,6 +1869,246 @@ mod tests {
             .unwrap();
         assert_eq!(payments.owner_of("owned"), None);
         assert!(!state.control.lock().await.control_attached);
+        drivers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn five_large_requests_buffer_while_response_is_flow_blocked() {
+        use monad_common::control_exchange::{Attribution, ControlExchange, PendingRequest};
+        use tokio::time::{timeout, Duration};
+        async fn next(recv: &mut h2::RecvStream, buf: &mut Vec<u8>) -> ServerMessage {
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(message) = try_decode_json_line(buf).unwrap() {
+                        return message;
+                    }
+                    let bytes = recv.data().await.unwrap().unwrap();
+                    recv.flow_control().release_capacity(bytes.len()).unwrap();
+                    buf.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let (state, payments) = test_state();
+        let (send, recv, mut client_send, mut client_recv, mut drivers) = test_h2_streams(64).await;
+        let (events, event_rx) = mpsc::unbounded_channel();
+        state.attach_control(events.clone()).await.unwrap();
+        let control = tokio::spawn(handle_control_stream(send, recv, state.clone(), event_rx));
+        let payload = |balance| {
+            serde_json::json!({"channel_id":"queued", "balance":balance,
+            "padding":"x".repeat(200_000)})
+            .to_string()
+        };
+        let messages = [
+            ClientMessage::ChannelLink { payment_json: serde_json::json!({"channel_id":"queued","balance":0,"capacity":100,"unit":"msat","padding":"x".repeat(200_000)}).to_string() },
+            ClientMessage::Ping { nonce: "between-link-and-payment".into() },
+            ClientMessage::ChannelPayment { payment_json: payload(10) },
+            ClientMessage::ChannelPayment { payment_json: payload(10) },
+            ClientMessage::ChannelPayment { payment_json: payload(15) },
+            ClientMessage::ChannelUnlink { channel_id: "queued".into() },
+        ];
+        // Do not consume response capacity yet. H2 may enqueue the initial
+        // status using the first 64 bytes; the following response then blocks.
+        // Ingress must still accept all five requests.
+        for message in messages {
+            timeout(
+                Duration::from_secs(3),
+                send_json_line(&mut client_send, &message),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        assert_eq!(
+            payments
+                .linked_channel_status("queued")
+                .unwrap()
+                .balance_raw,
+            0,
+            "later payments must not execute while the first response is blocked"
+        );
+        let mut buf = Vec::new();
+        let mut exchange = ControlExchange::default();
+        assert_eq!(
+            exchange
+                .observe(&next(&mut client_recv, &mut buf).await)
+                .unwrap(),
+            Attribution::InitialStatus
+        );
+        let expectations = [
+            PendingRequest::Link {
+                channel_id: "queued".into(),
+            },
+            PendingRequest::Payment {
+                channel_id: "queued".into(),
+                balance_raw: 10,
+                minimum_increment_msats: 10,
+            },
+            PendingRequest::Payment {
+                channel_id: "queued".into(),
+                balance_raw: 10,
+                minimum_increment_msats: 0,
+            },
+            PendingRequest::Payment {
+                channel_id: "queued".into(),
+                balance_raw: 15,
+                minimum_increment_msats: 5,
+            },
+            PendingRequest::Unlink {
+                channel_id: "queued".into(),
+            },
+        ];
+        for expected in &expectations {
+            exchange.enqueue(expected.clone()).unwrap();
+        }
+        for (i, expected) in expectations.into_iter().enumerate() {
+            if i == 1 {
+                let pong = next(&mut client_recv, &mut buf).await;
+                assert!(
+                    matches!(&pong, ServerMessage::Pong { nonce } if nonce == "between-link-and-payment")
+                );
+                assert_eq!(exchange.observe(&pong).unwrap(), Attribution::Notification);
+            }
+            let response = next(&mut client_recv, &mut buf).await;
+            match &response {
+                ServerMessage::SessionStatus {
+                    total_paid_millisats,
+                    linked_channel,
+                    ..
+                } => {
+                    assert_eq!(*total_paid_millisats, [0, 10, 10, 15, 15][i]);
+                    if i == 0 {
+                        assert_eq!(linked_channel.as_ref().unwrap().balance_raw, 0);
+                    }
+                }
+                ServerMessage::Error { code, .. } if i == 2 => {
+                    assert_eq!(*code, ServerErrorCode::PaymentNoNewFunds)
+                }
+                other => panic!("unexpected reply {other:?}"),
+            }
+            assert_eq!(
+                exchange.observe(&response).unwrap(),
+                Attribution::Response(expected)
+            );
+        }
+        assert!(exchange.is_empty());
+        assert_eq!(payments.owner_of("queued"), None);
+        events
+            .send(ServerMessage::ChannelEvicted {
+                channel_id: "queued".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            next(&mut client_recv, &mut buf).await,
+            ServerMessage::ChannelEvicted { .. }
+        ));
+        send_json_line(
+            &mut client_send,
+            &ClientMessage::Ping {
+                nonce: "after-advisory".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                next(&mut client_recv, &mut buf).await,
+                ServerMessage::Pong { .. }
+            ),
+            "eviction must not push a status"
+        );
+        state.terminate();
+        timeout(Duration::from_secs(3), control)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drivers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ingress_backpressures_sixth_ordinary_request_but_ping_uses_no_slot() {
+        use tokio::time::{timeout, Duration};
+        let (_send, recv, mut client_send, _client_recv, mut drivers) =
+            test_h2_streams(65535).await;
+        let (tx, mut requests) = mpsc::channel(16);
+        let reader = tokio::spawn(read_control_requests(recv, tx));
+        for _ in 0..5 {
+            send_json_line(&mut client_send, &ClientMessage::GetSessionStatus)
+                .await
+                .unwrap();
+        }
+        send_json_line(
+            &mut client_send,
+            &ClientMessage::Ping {
+                nonce: "free-slot".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            let request = timeout(Duration::from_secs(2), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(request.slot.is_some());
+            held.push(request);
+        }
+        let ping = timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ping.message, ClientMessage::Ping { .. }));
+        assert!(ping.slot.is_none());
+        send_json_line(&mut client_send, &ClientMessage::GetSessionStatus)
+            .await
+            .unwrap();
+        assert!(timeout(Duration::from_millis(50), requests.recv())
+            .await
+            .is_err());
+        drop(held.pop());
+        let sixth = timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(sixth.message, ClientMessage::GetSessionStatus));
+        reader.abort();
+        let _ = reader.await;
+        drivers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_input_cancels_queued_work_behind_blocked_initial_status() {
+        let (state, payments) = test_state();
+        let (send, recv, mut client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
+        let (events, event_rx) = mpsc::unbounded_channel();
+        state.attach_control(events).await.unwrap();
+        let control = tokio::spawn(handle_control_stream(send, recv, state.clone(), event_rx));
+        send_json_line(
+            &mut client_send,
+            &ClientMessage::ChannelLink {
+                payment_json:
+                    r#"{"channel_id":"must-not-run","balance":0,"capacity":100,"unit":"msat"}"#
+                        .into(),
+            },
+        )
+        .await
+        .unwrap();
+        client_send
+            .send_data(Bytes::from_static(b"not-json\n"), false)
+            .unwrap();
+        let result = tokio::time::timeout(
+            CONTROL_INVALID_MESSAGE_SEND_TIMEOUT + std::time::Duration::from_secs(2),
+            control,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(payments.linked_channel_status("must-not-run").is_none());
+        assert!(state.is_terminated());
         drivers.shutdown().await;
     }
 

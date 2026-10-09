@@ -121,8 +121,9 @@ pub enum ClientMessage {
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum ServerMessage {
     /// Consolidated session accounting and state synchronization message.
-    /// Sent immediately after control stream establishment and whenever the
-    /// session state changes (balance, link, pricing).
+    /// Sent once at control-stream establishment, then only as an ordered
+    /// success response to an ordinary client request. Advisories and Pong do
+    /// not consume ordinary response positions.
     SessionStatus {
         // --- Static/Advertisement Info ---
         receiver_pubkey: String,

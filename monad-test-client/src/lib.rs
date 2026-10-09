@@ -2,6 +2,9 @@ use anyhow::{anyhow, Result};
 use monad_client::socks;
 use monad_client::wallet::{MockWallet, MonadWallet, RelayPaymentOffer, WalletError};
 use monad_common::control_codec::{send_json_line, try_decode_json_line};
+use monad_common::control_exchange::{
+    Attribution, ControlExchange, PendingRequest, MAX_PENDING_REQUESTS,
+};
 use monad_common::noise_secp256k1;
 use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::quic_cert_identity::QuicCertIdentity;
@@ -720,6 +723,7 @@ async fn start_auto_control(
         let mut last_status_requested_at: Option<Instant> = None;
         let mut was_usable = false;
         let mut status_request_in_flight = false;
+        let mut exchange = ControlExchange::default();
         // This polling path is primarily for health checks and observability.
         // Unlike the main client, the test harness still sends periodic
         // `GetSessionStatus` requests so it can detect stalled control channels
@@ -742,14 +746,14 @@ async fn start_auto_control(
                             );
                             break;
                         }
-                        if status_request_in_flight {
+                        if status_request_in_flight || !exchange.is_initialized() || exchange.pending_len() == MAX_PENDING_REQUESTS {
                             continue;
                         }
                         info!(
                             "{hop_label}: sending health check status poll (timeout {:?})",
                             config.status_timeout
                         );
-                        if let Err(err) = send_control_message(&mut h2_send, &ClientMessage::GetSessionStatus).await {
+                        if let Err(err) = send_control_message(&mut h2_send, &ClientMessage::GetSessionStatus, &mut exchange, PendingRequest::Status).await {
                             report_hop_failure(
                                 &failure_tx,
                                 hop_idx,
@@ -785,6 +789,14 @@ async fn start_auto_control(
                 }
             };
 
+            let attribution = match exchange.observe(&message) {
+                Ok(Attribution::Unsolicited) => continue,
+                Ok(attribution) => attribution,
+                Err(error) => {
+                    report_hop_failure(&failure_tx, hop_idx, epoch, error.to_string());
+                    break;
+                }
+            };
             match message {
                 ServerMessage::SessionStatus {
                     receiver_pubkey,
@@ -814,7 +826,7 @@ async fn start_auto_control(
                     };
                     *pricing_handle.write().await = Some(pricing);
 
-                    if status_request_in_flight {
+                    if matches!(attribution, Attribution::Response(PendingRequest::Status)) {
                         let due_now = pricing
                             .amount_due_millisats(session_total_bytes_in, session_total_bytes_out);
                         let linked_summary = linked_channel
@@ -850,6 +862,9 @@ async fn start_auto_control(
                         status_request_in_flight = false;
                     }
 
+                    if !exchange.is_empty() {
+                        continue;
+                    }
                     if funding.needs_channel() {
                         let Some(negotiated_keyset_versions) =
                             cashu_spilman_keyset_versions.as_ref()
@@ -897,6 +912,10 @@ async fn start_auto_control(
                         if let Err(err) = send_control_message(
                             &mut h2_send,
                             &ClientMessage::ChannelLink { payment_json },
+                            &mut exchange,
+                            PendingRequest::Link {
+                                channel_id: new_channel_id.clone(),
+                            },
                         )
                         .await
                         {
@@ -950,6 +969,17 @@ async fn start_auto_control(
                                     if let Err(err) = send_control_message(
                                         &mut h2_send,
                                         &ClientMessage::ChannelPayment { payment_json },
+                                        &mut exchange,
+                                        PendingRequest::Payment {
+                                            channel_id: current_channel_id.clone(),
+                                            balance_raw: linked.capacity_raw,
+                                            minimum_increment_msats:
+                                                monad_common::payment_units::raw_units_to_msats(
+                                                    &linked.unit,
+                                                    linked.capacity_raw - linked.balance_raw,
+                                                )
+                                                .expect("mock capacity fits"),
+                                        },
                                     )
                                     .await
                                     {
@@ -1018,6 +1048,19 @@ async fn start_auto_control(
                         "{hop_label}: linked channel evicted: {evicted_channel_id}; recovering in-session"
                     );
                     funding.reset();
+                    if exchange.pending_len() < MAX_PENDING_REQUESTS {
+                        if let Err(error) = send_control_message(
+                            &mut h2_send,
+                            &ClientMessage::GetSessionStatus,
+                            &mut exchange,
+                            PendingRequest::Status,
+                        )
+                        .await
+                        {
+                            report_hop_failure(&failure_tx, hop_idx, epoch, error.to_string());
+                            break;
+                        }
+                    }
                 }
                 ServerMessage::ChannelReleaseRequested { channel_id } => {
                     info!(
@@ -1028,6 +1071,10 @@ async fn start_auto_control(
                         if let Err(err) = send_control_message(
                             &mut h2_send,
                             &ClientMessage::ChannelUnlink {
+                                channel_id: channel_id.clone(),
+                            },
+                            &mut exchange,
+                            PendingRequest::Unlink {
                                 channel_id: channel_id.clone(),
                             },
                         )
@@ -1132,7 +1179,10 @@ fn build_payment_to_capacity(
 async fn send_control_message(
     h2_send: &mut h2::SendStream<bytes::Bytes>,
     message: &ClientMessage,
+    exchange: &mut ControlExchange,
+    request: PendingRequest,
 ) -> io::Result<()> {
+    exchange.enqueue(request)?;
     send_json_line(h2_send, message).await
 }
 

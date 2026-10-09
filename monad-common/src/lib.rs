@@ -4,6 +4,7 @@ pub mod blinded_hop;
 pub mod bootstrap;
 pub mod config;
 pub mod control_codec;
+pub mod control_exchange;
 pub mod h2stream;
 pub mod keyset_expiry;
 pub mod mint_error;
