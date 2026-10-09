@@ -404,6 +404,13 @@ payment record and signed wallet history, records the error, and ends that
 session rather than sending replacement funds there. The relay may still be
 able to claim the signed amount despite reporting rejection.
 
+Numeric-limit failures are reported explicitly: the client checks its proposed
+session total before signing, and the relay checks both paid-total and signed
+remaining-credit limits before recording a payment. Transport accounting checks
+representability and records each successful write in the same poll, including
+partial writes followed by task cancellation. These are numeric safeguards, not
+a monetary cap or a prohibition on negative-balance overshoot.
+
 Admin/recovery commands can use the configured singleton `client_wallet`:
 
 ```bash

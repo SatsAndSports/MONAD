@@ -143,7 +143,9 @@ mod tests {
         assert_due(4, 5, 5, 3, 3);
         // Fractional contributions of 2/3 and 1/4 sum to 11/12.
         assert_due(1, 2, 1, 3, 4);
-        // Fractional contributions of 3/4 and 1/2 sum to exactly one.
+        // Fractional contributions of 3/4 and 1/4 sum to exactly one.
+        assert_due(1, 3, 1, 4, 4);
+        // Fractional contributions of 3/4 and 1/2 sum to 5/4.
         assert_due(2, 3, 1, 4, 2);
         // Fractional contributions of 3/4 and 3/4 sum to 3/2.
         assert_due(2, 3, 3, 4, 4);
@@ -153,10 +155,28 @@ mod tests {
 
     #[test]
     fn supports_asymmetric_and_extreme_inputs() {
+        assert_due(2 * u64::MAX as u128, u64::MAX, u64::MAX, 1, 1);
+        assert_due(2, u64::MAX - 1, u64::MAX - 2, u64::MAX, u64::MAX - 1);
         assert_due(5, 5, 11, 2, 7);
         assert_due(3, u64::MAX, u64::MAX, u64::MAX, u64::MAX - 1);
         assert_due(1, u64::MAX, 0, u64::MAX, 1);
         assert_due(2, u64::MAX, 1, u64::MAX, u64::MAX);
+    }
+
+    #[test]
+    fn direction_symmetry_and_monotonicity() {
+        for a in 1..=12 {
+            for b in 1..=12 {
+                for x in 0..40 {
+                    for y in 0..40 {
+                        let due = amount_due_millisats(x, y, a, b).unwrap();
+                        assert_eq!(due, amount_due_millisats(y, x, b, a).unwrap());
+                        assert!(due <= amount_due_millisats(x + 1, y, a, b).unwrap());
+                        assert!(due <= amount_due_millisats(x, y + 1, a, b).unwrap());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

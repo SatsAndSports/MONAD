@@ -605,6 +605,11 @@ balance, and credit commit prevent double credit across concurrent sessions.
 Duplicate or lower payments return `PAYMENT_NO_NEW_FUNDS`, not a successful
 status.
 
+Locally detectable numeric limits, including the proposed session payment-total
+addition, MUST be checked before creating and durably recording a new signature.
+Once signed or exposed, payment history is never rolled back to recover from a
+later local check or relay rejection.
+
 The client keeps three records:
 
 1. **Durable signed channel balance:** highest cumulative balance signed for each

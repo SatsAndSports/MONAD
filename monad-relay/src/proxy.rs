@@ -1,23 +1,17 @@
 //! Server-side proxy helpers.
 
 use crate::session::SessionState;
+use crate::session_fsm::ByteDirection;
 use bytes::Bytes;
 use h2::{RecvStream, SendStream};
 use monad_common::h2stream::wait_for_send_capacity;
-use std::io;
+use std::{future::poll_fn, io, pin::Pin, task::Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 pub use monad_common::proxy::proxy_bidirectional;
-
-fn accounting_error(error: crate::session_fsm::SessionAccountingError) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::QuotaExceeded,
-        format!("session accounting limit exceeded: {error:?}"),
-    )
-}
 
 struct TunnelAccounting<'a> {
     state: &'a SessionState,
@@ -34,13 +28,8 @@ impl Drop for TunnelAccounting<'_> {
         };
         info!(
             "tunnel closed: {} | session_id={} open_connects={} total_connects={} outbound={} inbound={} total={}",
-            self.label,
-            hex::encode(self.state.session_id()),
-            open_connects,
-            total_connects,
-            self.outbound,
-            self.inbound,
-            self.outbound as u128 + self.inbound as u128
+            self.label, hex::encode(self.state.session_id()), open_connects, total_connects,
+            self.outbound, self.inbound, self.outbound as u128 + self.inbound as u128
         );
     }
 }
@@ -48,46 +37,31 @@ impl Drop for TunnelAccounting<'_> {
 async fn wait_until_unpaused_or_terminated(
     paused_rx: &mut watch::Receiver<bool>,
     termination: &CancellationToken,
-    proxy_cancel: &CancellationToken,
 ) -> io::Result<()> {
     loop {
         if !*paused_rx.borrow() {
             return Ok(());
         }
-
         tokio::select! {
             _ = termination.cancelled() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "session terminated",
-                ));
-            }
-            _ = proxy_cancel.cancelled() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "proxy direction ended",
-                ));
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "session terminated"));
             }
             changed = paused_rx.changed() => {
-                changed.map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "session pause channel closed unexpectedly",
-                    )
-                })?;
+                changed.map_err(|_| io::Error::new(
+                    io::ErrorKind::BrokenPipe, "session pause channel closed unexpectedly",
+                ))?;
             }
         }
     }
 }
 
-/// Proxy bytes bidirectionally while enforcing per-session payment pauses.
+/// Proxy with exact accounting and chunk-boundary payment pauses.
 ///
-/// A bounded forwarding operation that starts while credit is positive may
-/// complete and take the balance negative. The actual forwarded bytes are
-/// counted exactly, then subsequent forwarding waits for more credit.
-/// Counted write prefixes are settled on write errors and cooperative
-/// cancellation. Dropping this future can bypass the asynchronous settlement;
-/// it is not an accounting flush barrier for task abort or process death.
+/// An operation started with positive credit may finish and take credit negative.
+/// Numeric preflight and the successful write count commit in one synchronous
+/// poll, before task cancellation/drop can intervene. No billing lock is held
+/// while waiting for transport readiness and no prepaid bytes are reserved.
+/// This is in-memory accounting, not a process-crash-durable traffic journal.
 pub(crate) async fn proxy_bidirectional_accounted<T>(
     mut h2_send: SendStream<Bytes>,
     mut h2_recv: RecvStream,
@@ -103,8 +77,7 @@ where
     let mut paused_rx_b = state.pause_receiver();
     let termination_a = state.termination_token();
     let termination_b = state.termination_token();
-    let proxy_cancel_a = CancellationToken::new();
-    let proxy_cancel_b = proxy_cancel_a.clone();
+    let termination = state.termination_token();
     let mut accounting = TunnelAccounting {
         state: &state,
         label,
@@ -113,221 +86,95 @@ where
     };
 
     let h2_to_target = async {
-        let result: io::Result<()> = async {
-            let mut pending: Option<Bytes> = None;
-            loop {
-                if pending.is_none() {
-                    wait_until_unpaused_or_terminated(
-                        &mut paused_rx_a,
-                        &termination_a,
-                        &proxy_cancel_a,
+        loop {
+            wait_until_unpaused_or_terminated(&mut paused_rx_a, &termination_a).await?;
+            let data = match h2_recv.data().await {
+                Some(Ok(data)) => data,
+                Some(Err(error)) => {
+                    return Err(io::Error::other(format!("h2 recv error: {error}")))
+                }
+                None => break,
+            };
+            // Restore the original stream-capacity timing: consumption by this
+            // proxy releases the frame before the target write. At most one
+            // bounded DATA frame is held here, including on a slow target.
+            let _ = h2_recv.flow_control().release_capacity(data.len());
+            let mut written = 0;
+            let mut pause_changed = false;
+            while written < data.len() {
+                let (n, changed) = poll_fn(|cx| {
+                    state.poll_accounted_forward(
+                        ByteDirection::Outbound,
+                        data.len() - written,
+                        || Pin::new(&mut target_write).poll_write(cx, &data[written..]),
                     )
-                    .await?;
-
-                    match tokio::select! {
-                        _ = termination_a.cancelled() => None,
-                        _ = proxy_cancel_a.cancelled() => None,
-                        item = h2_recv.data() => item,
-                    } {
-                        Some(Ok(data)) if data.is_empty() => {
-                            let _ = h2_recv.flow_control().release_capacity(0);
-                            continue;
-                        }
-                        Some(Ok(data)) => pending = Some(data),
-                        Some(Err(e)) => {
-                            return Err(io::Error::other(format!("h2 recv error: {e}")));
-                        }
-                        None => {
-                            debug!("h2 recv stream ended");
-                            break;
-                        }
-                    }
+                })
+                .await?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "target write returned zero",
+                    ));
                 }
-
-                let pending_len = pending.as_ref().expect("pending data").len();
-                let mut written = 0;
-                let mut write_result = Ok(());
-                while written < pending_len {
-                    let buf = pending.as_ref().expect("pending data");
-                    let write = target_write.write(&buf[written..]);
-                    tokio::select! {
-                        biased;
-                        _ = termination_a.cancelled() => {
-                            write_result = Err(io::Error::new(
-                                io::ErrorKind::ConnectionAborted,
-                                "session terminated",
-                            ));
-                            break;
-                        }
-                        _ = proxy_cancel_a.cancelled() => {
-                            write_result = Err(io::Error::new(
-                                io::ErrorKind::ConnectionAborted,
-                                "proxy direction ended",
-                            ));
-                            break;
-                        }
-                        result = write => {
-                            match result {
-                                Ok(0) => {
-                                    write_result = Err(io::Error::new(
-                                        io::ErrorKind::WriteZero,
-                                        "target write returned zero",
-                                    ));
-                                    break;
-                                }
-                                Ok(n) => written += n,
-                                Err(e) => {
-                                    write_result = Err(e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let commit_result = state.note_outbound_bytes(written).await;
-                if written != 0 {
-                    let _ = h2_recv.flow_control().release_capacity(written);
-                }
-                let mut remainder = pending.take().expect("pending data");
-                if written != 0 {
-                    let _ = remainder.split_to(written);
-                }
-                if !remainder.is_empty() {
-                    pending = Some(remainder);
-                }
-                accounting.outbound =
-                    accounting
-                        .outbound
-                        .checked_add(written as u64)
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::QuotaExceeded,
-                                "tunnel outbound counter overflow",
-                            )
-                        })?;
-                let paused = commit_result.map_err(accounting_error)?;
-                if paused {
-                    state.push_status().await;
-                }
-                write_result?;
+                written += n;
+                // A tunnel total is bounded by the corresponding checked
+                // session total. These additions cannot overflow.
+                accounting.outbound += n as u64;
+                pause_changed |= changed;
             }
-
-            tokio::select! {
-                _ = termination_a.cancelled() => Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "session terminated",
-                )),
-                _ = proxy_cancel_a.cancelled() => Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "proxy direction ended",
-                )),
-                result = target_write.shutdown() => result,
+            if pause_changed {
+                state.push_status().await;
             }
         }
-        .await;
-        if result.is_err() {
-            proxy_cancel_a.cancel();
-        }
-        result
+        target_write.shutdown().await?;
+        Ok::<(), io::Error>(())
     };
 
     let target_to_h2 = async {
-        let result: io::Result<()> = async {
-            let mut buf = vec![0u8; 16384];
-            loop {
-                wait_until_unpaused_or_terminated(
-                    &mut paused_rx_b,
-                    &termination_b,
-                    &proxy_cancel_b,
-                )
-                .await?;
-
-                let n = match tokio::select! {
-                    _ = termination_b.cancelled() => Ok(0),
-                    _ = proxy_cancel_b.cancelled() => Ok(0),
-                    read = target_read.read(&mut buf) => read,
-                } {
-                    Ok(0) => {
-                        debug!("target read EOF");
-                        break;
-                    }
-                    Ok(n) => n,
-                    Err(e) => return Err(e),
-                };
-                let data = Bytes::copy_from_slice(&buf[..n]);
-
-                h2_send.reserve_capacity(data.len());
-                tokio::select! {
-                    _ = termination_b.cancelled() => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "session terminated",
-                        ));
-                    }
-                    _ = proxy_cancel_b.cancelled() => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "proxy direction ended",
-                        ));
-                    }
-                    result = wait_for_send_capacity(&mut h2_send) => {
-                        result?;
-                    }
-                }
-                let data_len = data.len();
-                h2_send
-                    .send_data(data, false)
-                    .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
-                let paused = state
-                    .note_inbound_bytes(data_len)
-                    .await
-                    .map_err(accounting_error)?;
-                accounting.inbound =
-                    accounting
-                        .inbound
-                        .checked_add(data_len as u64)
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::QuotaExceeded,
-                                "tunnel inbound counter overflow",
-                            )
-                        })?;
-                if paused {
-                    state.push_status().await;
-                }
+        let mut buf = vec![0u8; 16384];
+        loop {
+            wait_until_unpaused_or_terminated(&mut paused_rx_b, &termination_b).await?;
+            let n = target_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
             }
-
-            h2_send
-                .send_data(Bytes::new(), true)
-                .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
-            Ok(())
+            let data = Bytes::copy_from_slice(&buf[..n]);
+            h2_send.reserve_capacity(n);
+            wait_for_send_capacity(&mut h2_send).await?;
+            // send_data is synchronous and all-or-nothing. The numeric check,
+            // enqueue, and byte accounting have no intervening suspension.
+            let result = state.poll_accounted_forward(ByteDirection::Inbound, n, || {
+                Poll::Ready(
+                    h2_send
+                        .send_data(data, false)
+                        .map(|()| n)
+                        .map_err(|error| io::Error::other(format!("h2 send error: {error}"))),
+                )
+            });
+            let Poll::Ready(result) = result else {
+                unreachable!("H2 send_data is synchronous")
+            };
+            let (_, pause_changed) = result?;
+            accounting.inbound += n as u64;
+            if pause_changed {
+                state.push_status().await;
+            }
         }
-        .await;
-        if result.is_err() {
-            proxy_cancel_b.cancel();
-        }
-        result
+        h2_send
+            .send_data(Bytes::new(), true)
+            .map_err(|error| io::Error::other(format!("h2 send error: {error}")))?;
+        Ok::<(), io::Error>(())
     };
 
-    // Join rather than try_join so an error in one direction cancels the other
-    // direction's operation but still lets that direction commit any
-    // already-delivered write prefix before returning.
-    let (outbound_result, inbound_result) = tokio::join!(h2_to_target, target_to_h2);
-    let is_session_termination = |error: &io::Error| {
-        error.kind() == io::ErrorKind::ConnectionAborted
-            && error.to_string() == "session terminated"
+    // Completed writes are already counted even when this drops a direction
+    // mid-operation. Normal EOF still preserves the other half of the tunnel.
+    let result = tokio::select! {
+        biased;
+        _ = termination.cancelled() => return Ok(()),
+        result = async { tokio::try_join!(h2_to_target, target_to_h2) } => result,
     };
-    let result = match (outbound_result, inbound_result) {
-        (Err(error), other) | (other, Err(error)) if is_session_termination(&error) => {
-            drop(other);
-            Ok(())
-        }
-        (outbound_result, inbound_result) => outbound_result.and(inbound_result),
-    };
-    if let Err(e) = &result {
-        debug!("proxy {label} ended with error: {e}");
+    if let Err(error) = &result {
+        debug!("proxy {label} ended with error: {error}");
     }
-
-    result
+    result.map(|_| ())
 }

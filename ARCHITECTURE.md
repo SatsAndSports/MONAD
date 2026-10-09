@@ -787,7 +787,7 @@ remaining = total_paid_millisats - amount_due
 
 This is implemented in `monad-common/src/billing.rs` with integer quotient/remainder arithmetic. The combined rational sum is rounded up once; no direction is rounded separately, no floating point is used, and no LCM is saturated. Rates must be positive.
 
-Channel capacity, payment deltas, session-paid totals, byte counters, and CONNECT counters use checked arithmetic against their actual storage and wire limits. Over-limit requests receive `NUMERIC_LIMIT_EXCEEDED` before durable mutation where that rejection is still possible; unexpected accounting counter exhaustion terminates the session rather than emitting an approximate status.
+Channel capacity, payment deltas, session-paid totals, byte counters, and CONNECT counters use checked arithmetic against their actual storage and wire limits. Payment admission checks both `u64` paid-total headroom and `i64` remaining-credit headroom before the durable channel-balance update. Over-limit requests receive `NUMERIC_LIMIT_EXCEEDED`; unrepresentable data accounting terminates before the transport operation rather than forwarding uncountable bytes. No optional monetary cap is imposed.
 
 ### Chunk-Boundary Overshoot
 
@@ -854,7 +854,7 @@ On each relay control message, and on a small periodic timer tick, the loop can:
 
 - reconcile the relay-linked channel against the client's intended channel
 - ensure a channel is selected/provisioned and linked when funding needs it
-- size payments from the client's own cleartext byte counters using the latest relay-reported baseline
+- size payments from the client's own cleartext byte counters and pessimistic payment record, reconciled only upward for extra relay-reported credit
 - react to `ChannelEvicted`
 - classify relay `Error` messages into channel-invalidating vs non-rejecting outcomes
 - end the local session on control detach
@@ -927,12 +927,18 @@ This keeps the hot data path low-latency without serializing tunnels against a
 shared prepaid-byte budget. The control FSM still handles the more complex
 protocol transitions.
 
-The counted target-write loop records a partial prefix when a write fails or
-cooperative cancellation is polled to completion. Abruptly dropping the proxy
-future (including dropping the owning session's child futures) can bypass the
-async counter update; this is not a guarantee of final-prefix accounting after
-task abort or process death. Transport write success also does not prove that
-the remote application consumed the bytes.
+The short synchronous billing critical section spans numeric preflight, one
+nonblocking transport write/enqueue, and its actual-byte accounting update.
+The lock is released before returning `Pending` and never crosses an await.
+Concurrent operations therefore cannot race the numeric headroom, and dropping
+or aborting a proxy cannot lose a completed-write prefix. This is not a
+prepaid-byte reservation or a credit limit on a chunk already in flight.
+H2 stream receive capacity is released when the proxy consumes a DATA frame,
+before its target write, preserving the original buffering/backpressure policy.
+Traffic counters remain in-memory, not crash-durable. Transport write success
+also does not prove that the remote application consumed the bytes. Payment,
+channel ownership, and CONNECT snapshots still have separate synchronization;
+this change does not complete internally consistent SessionStatus snapshots.
 
 ### CONNECT Counters
 
@@ -994,8 +1000,9 @@ the production relay or client.
 - **Credit Calculation**: The relay tracks the `max_balance_seen` for every channel ID.
 - **Delta**: `credit_millisats = (new_balance - max_balance_seen) * unit_multiplier`.
 
-#### 5. Relay-Authoritative Linked-Channel Sync
-Every `SessionStatus` carries the relay's authoritative view of the currently linked channel.
+#### 5. Relay-Reported Linked-Channel Sync
+Every `SessionStatus` carries the relay's report of the currently linked channel,
+which the client checks against its wallet records.
 
 The client uses that to learn:
 
@@ -1006,7 +1013,7 @@ The client uses that to learn:
 
 The client driver then computes the next requested cumulative balance from:
 
-- the locally authorized payment total
+- the pessimistic local payment total, increased for extra relay-reported credit
 - the client's cleartext byte counters and immutable session pricing
 - target positive remaining balance
 - relay-reported `linked_channel.balance_raw`

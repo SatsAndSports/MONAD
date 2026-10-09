@@ -535,23 +535,31 @@ mod tests {
     }
 
     #[test]
-    fn validate_session_status_baseline_rejects_relay_paid_above_local_authorized_total() {
+    fn relay_paid_credit_only_reconciles_upward() {
         let counters = CleartextByteCounters::default();
-        let state = DriverState {
-            relay_snapshot: Some(RelaySnapshot {
-                total_paid_millisats: 11,
-                ..snapshot(true)
-            }),
+        let mut state = DriverState {
             local_session_paid_msats: 10,
+            established_pricing: Some(SessionPricing::new(1, 1)),
             ..DriverState::default()
         };
-
-        let err =
-            validate_session_status_baseline_against_local_counters(&state, &counters).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains(
-            "relay reported total_paid_millisats=11 above client locally authorized total=10"
-        ));
+        for (reported, expected) in [(9, 10), (11, 11), (11, 11), (8, 11), (15, 15)] {
+            super::state::apply_session_status(
+                &mut state,
+                RelaySnapshot {
+                    total_paid_millisats: reported,
+                    // Relay traffic/remaining claims do not size payments.
+                    session_total_bytes_in: 999,
+                    remaining_milli_sats: -999,
+                    ..snapshot(true)
+                },
+            );
+            validate_session_status_baseline_against_local_counters(&state, &counters).unwrap();
+            assert_eq!(state.local_session_paid_msats, expected);
+            assert_eq!(
+                super::payment::compute_estimated_remaining(&state, &counters).unwrap(),
+                Some(expected as i64)
+            );
+        }
     }
 
     #[test]
@@ -824,7 +832,7 @@ mod tests {
         };
 
         assert_eq!(
-            super::payment::compute_estimated_remaining(&state, &counters),
+            super::payment::compute_estimated_remaining(&state, &counters).unwrap(),
             Some(10)
         );
     }
@@ -841,7 +849,7 @@ mod tests {
         };
 
         assert_eq!(
-            super::payment::compute_estimated_remaining(&state, &counters),
+            super::payment::compute_estimated_remaining(&state, &counters).unwrap(),
             Some(9)
         );
     }
@@ -946,6 +954,141 @@ mod tests {
         assert!(!server_error_rejects_intended_channel(&code));
     }
 
+    #[test]
+    fn unavailable_pricing_and_unrepresentable_estimates_are_distinct() {
+        let counters = CleartextByteCounters::default();
+        let mut state = DriverState::default();
+        assert_eq!(
+            super::payment::compute_estimated_remaining(&state, &counters).unwrap(),
+            None
+        );
+        state.established_pricing = Some(SessionPricing::new(1, 1));
+        state.local_session_paid_msats = i64::MAX as u64 + 1;
+        assert_eq!(
+            super::payment::compute_estimated_remaining(&state, &counters)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        state.local_session_paid_msats = 0;
+        counters.note_outbound(usize::MAX);
+        counters.note_inbound(usize::MAX);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            super::payment::compute_estimated_remaining(&state, &counters)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(target_pointer_width = "64")]
+    async fn numeric_preflight_fails_before_signing_or_sending() {
+        use super::state::{RelayConnectionHandles, SessionDriverConfig};
+        use crate::wallet::{
+            MockWallet, MonadWallet, RelayPaymentOffer, WalletChannel, WalletChannelState,
+        };
+        for invalid_estimate in [false, true] {
+            let wallet = Arc::new(MockWallet::new());
+            wallet
+                .insert_channel(WalletChannel {
+                    channel_id: "channel".into(),
+                    state: WalletChannelState::Open,
+                    receiver_pubkey: "receiver".into(),
+                    mint_url: "https://mint".into(),
+                    unit: "msat".into(),
+                    keyset_id: "keyset-a".into(),
+                    attached_session_id: Some([0; 32]),
+                    capacity_msats: u64::MAX,
+                    current_signed_balance_msats: 0,
+                    expiry_timestamp: u64::MAX,
+                })
+                .unwrap();
+            let counters = CleartextByteCounters::default();
+            // Fits i64 as an estimate, but the proposed refill overflows u64.
+            if !invalid_estimate {
+                counters.note_outbound(usize::try_from(i64::MAX as u64 + 1).unwrap());
+            }
+            let mut state = DriverState {
+                intended_channel_id: Some("channel".into()),
+                intended_offer: Some(RelayPaymentOffer {
+                    funding_keyset_recovery_window_secs: 86_400,
+                    minimum_channel_lifetime_secs: 3600,
+                    receiver_pubkey: "receiver".into(),
+                    mint_url: "https://mint".into(),
+                    unit: "msat".into(),
+                    negotiated_keyset_versions: std::collections::BTreeSet::from(["v1".into()]),
+                    in_bytes_per_millisat: 1,
+                    out_bytes_per_millisat: 1,
+                }),
+                relay_snapshot: Some(RelaySnapshot {
+                    linked_channel: Some(LinkedChannelStatus {
+                        channel_id: "channel".into(),
+                        balance_raw: 0,
+                        capacity_raw: u64::MAX,
+                        unit: "msat".into(),
+                    }),
+                    ..snapshot(false)
+                }),
+                local_session_paid_msats: u64::MAX - 10,
+                established_pricing: Some(SessionPricing::new(1, 1)),
+                ..Default::default()
+            };
+            let config = SessionDriverConfig {
+                wallet: wallet.clone(),
+                conn: RelayConnectionHandles {
+                    session_id: [0; 32],
+                    pricing_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                    spilman_info_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                    cashu_spilman_protocol_version_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                    cashu_spilman_keyset_versions_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                    cleartext_byte_counters: counters,
+                },
+                hop_label: "test".into(),
+                payment_policy: PaymentPolicy {
+                    target_topup_buffer_msats: u64::MAX,
+                    ..Default::default()
+                },
+                management: None,
+            };
+            let (client, _server) = tokio::io::duplex(64);
+            let (mut h2, connection) = h2::client::handshake(client).await.unwrap();
+            let driver = tokio::spawn(connection);
+            let (_, mut send) = h2
+                .send_request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("http://monad/control")
+                        .body(())
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            let error =
+                super::funding::maybe_progress_payment(&config, &mut state, &mut send, false)
+                    .await
+                    .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains(if invalid_estimate {
+                "remaining credit"
+            } else {
+                "payment total"
+            }));
+            assert_eq!(wallet.successful_payment_build_count("channel").unwrap(), 0);
+            assert_eq!(
+                wallet
+                    .get_channel("channel")
+                    .unwrap()
+                    .current_signed_balance_msats,
+                0
+            );
+            assert_eq!(state.local_session_paid_msats, u64::MAX - 10);
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+
     #[tokio::test]
     async fn rejection_never_rolls_back_locally_recorded_payment() {
         use super::state::{set_payment_in_flight, RelayConnectionHandles, SessionDriverConfig};
@@ -987,7 +1130,7 @@ mod tests {
             super::funding::apply_server_error(&config, &mut state, code.clone()).await;
             assert_eq!(state.local_session_paid_msats, 2000, "{code:?}");
             assert_eq!(
-                super::payment::compute_estimated_remaining(&state, &counters),
+                super::payment::compute_estimated_remaining(&state, &counters).unwrap(),
                 Some(1900),
                 "{code:?} must not authorize replacement payment"
             );

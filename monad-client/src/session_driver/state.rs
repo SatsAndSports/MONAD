@@ -155,9 +155,11 @@ pub(super) fn state_summary(state: &DriverState, counters: &CleartextByteCounter
         .as_ref()
         .map(|snapshot| snapshot.session_total_bytes_out.to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let local_remaining = super::payment::compute_estimated_remaining(state, counters)
-        .map(|remaining| remaining.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let local_remaining = match super::payment::compute_estimated_remaining(state, counters) {
+        Ok(Some(remaining)) => remaining.to_string(),
+        Ok(None) => "unknown".to_string(),
+        Err(_) => "out of range".to_string(),
+    };
     format!(
         "paused={} remaining={} local_remaining={} relay_in={} relay_out={} relay_linked={} intended={} op={:?} blocked={:?} ready={}",
         paused,
@@ -423,6 +425,11 @@ pub(super) fn apply_session_status(state: &mut DriverState, snapshot: RelaySnaps
         return false;
     }
     let resolved_payment = clear_resolved_control_op_on_status(state, &snapshot);
+    // Extra relay-reported credit can reduce future payments, never increase
+    // them. A lower report cannot revoke locally recorded signed exposure.
+    state.local_session_paid_msats = state
+        .local_session_paid_msats
+        .max(snapshot.total_paid_millisats);
     state.relay_snapshot = Some(snapshot);
     resolved_payment
 }

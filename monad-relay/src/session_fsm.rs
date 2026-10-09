@@ -60,6 +60,7 @@ pub(crate) enum ByteDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionAccountingError {
     CounterOverflow,
+    RemainingOutOfRange,
 }
 
 pub(crate) fn step(
@@ -230,6 +231,9 @@ pub(crate) fn apply_accounted_bytes(
         }
     }
 
+    if i64::try_from(remaining_milli_sats(&state, pricing)).is_err() {
+        return Err(SessionAccountingError::RemainingOutOfRange);
+    }
     let pause_changed = refresh_pause_state(&mut state, pricing);
     Ok((state, pause_changed))
 }

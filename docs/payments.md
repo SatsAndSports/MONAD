@@ -69,7 +69,7 @@ Signed wallet history remains available for recovery and subsequent sessions.
 MONAD does not impose the control protocol's optional 90,000 BTC example cap.
 Relay channel capacity, accepted payment deltas, and `total_paid_millisats` are
 checked against actual storage and wire limits before durable payment or credit
-mutation. Requests outside those limits fail with `NUMERIC_LIMIT_EXCEEDED` and
+mutation, including the signed `i64` remaining-credit field. Requests outside those limits fail with `NUMERIC_LIMIT_EXCEEDED` and
 do not advance the relay's recorded channel balance.
 
 The relay computes `ceil(bytes_in / in_rate + bytes_out / out_rate)` with exact
@@ -367,7 +367,8 @@ status update as a payment baseline.
 1. Active pricing is immutable after first status.
 2. Relay `linked_channel.balance_raw` must never exceed the client's own locally signed balance for that same channel.
 3. Relay `session_total_bytes_out` must never exceed the client's locally observed outbound total.
-4. Relay `total_paid_millisats` must never exceed the client's locally authorized payment total.
+4. A higher relay `total_paid_millisats` increases the client's local credit record; a lower report never decreases it or the signed history.
+5. Unavailable initial pricing and an unrepresentable local estimate are distinct: the latter ends the session with a numeric error. Session-total overflow is checked before wallet signing/persistence.
 
 These checks live with the private `payment` module in
 `monad-client/src/session_driver.rs`.

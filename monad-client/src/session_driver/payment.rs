@@ -221,29 +221,28 @@ pub(super) fn validate_session_status_baseline_against_local_counters(
         ));
     }
 
-    if snapshot.total_paid_millisats > state.local_session_paid_msats {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "protocol violation: relay reported total_paid_millisats={} above client locally authorized total={}",
-                snapshot.total_paid_millisats, state.local_session_paid_msats,
-            ),
-        ));
-    }
-
     Ok(())
 }
 
 pub(super) fn compute_estimated_remaining(
     state: &DriverState,
     counters: &CleartextByteCounters,
-) -> Option<i64> {
-    let pricing = state.established_pricing?;
+) -> io::Result<Option<i64>> {
+    let Some(pricing) = state.established_pricing else {
+        return Ok(None);
+    };
     let (local_inbound, local_outbound) = counters.snapshot();
     let estimated_due = pricing.amount_due_millisats(local_inbound, local_outbound);
     monad_common::billing::remaining_milli_sats_to_wire(
         state.local_session_paid_msats as i128 - estimated_due as i128,
     )
+    .map(Some)
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local session remaining credit exceeds i64 range",
+        )
+    })
 }
 
 pub(super) fn server_error_invalidates_channel(code: &ServerErrorCode) -> bool {

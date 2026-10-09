@@ -11832,8 +11832,91 @@ clients:
     let _ = mint_shutdown_tx.send(());
 }
 
-/// End-to-end test that the relay can unilaterally close a funded Spilman
-/// channel and that further payments on that channel are rejected.
+/// Numeric admission rejects before the real signed-payment SQLite CAS.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_numeric_payment_rejection_preserves_sqlite_balance_and_signature() {
+    let mint = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_owned();
+    let keyset_id = mint.keyset_id().to_string();
+    let keyset_info = mint.keyset_info_json().unwrap();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey = receiver_secret.public_key().to_hex();
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let path = temp_db.path().to_str().unwrap();
+    let (_, _, relay, shutdown, payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &SecpTransportKeypair::generate(),
+        receiver_secret,
+        path,
+        mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info, true),
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".into()]))]),
+    )
+    .await
+    .unwrap();
+    let wallet = TestSigningWallet::new(
+        mint.mint(),
+        receiver_pubkey.clone(),
+        mint_url.clone(),
+        keyset_id,
+        keyset_info,
+    )
+    .await;
+    let channel = wallet.pre_create_channel(1000).await.unwrap();
+    let session = [42; 32];
+    let offer = RelayPaymentOffer {
+        receiver_pubkey,
+        mint_url,
+        unit: "sat".into(),
+        funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    wallet.attach_channel_to_session(&channel, session).unwrap();
+    payments
+        .link_channel(
+            &supported_cashu_spilman_keyset_versions(),
+            session,
+            &wallet.build_link_request(&channel, &offer).unwrap(),
+        )
+        .unwrap();
+    let signed = wallet
+        .build_channel_payment(&channel, &offer, 0, 10)
+        .unwrap();
+    let before = SqliteStorage::open(path)
+        .unwrap()
+        .get_balance(&channel)
+        .unwrap();
+    assert_eq!(
+        payments
+            .apply_channel_payment_with_limit(session, &channel, &signed, 9999)
+            .unwrap_err(),
+        monad_relay::payments::ChannelPaymentError::NumericLimitExceeded
+    );
+    let after = SqliteStorage::open(path)
+        .unwrap()
+        .get_balance(&channel)
+        .unwrap();
+    assert_eq!(after.balance, before.balance);
+    assert_eq!(after.signature, before.signature);
+    let accepted = payments
+        .apply_channel_payment_with_limit(session, &channel, &signed, 10000)
+        .unwrap();
+    assert_eq!(accepted.delta_millisats, 10000);
+    assert_eq!(
+        SqliteStorage::open(path)
+            .unwrap()
+            .get_balance(&channel)
+            .unwrap()
+            .balance,
+        10
+    );
+    payments.release_channel_ownership(session, &channel);
+    let _ = shutdown.send(());
+    relay.await.unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
