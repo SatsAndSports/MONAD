@@ -3,8 +3,49 @@
 //! These are exchanged over the H2 control stream (POST /control).
 //! The data channels use H2 CONNECT directly and don't need these types.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+
+/// Optional advisory extension envelope. The only constrained member is one
+/// nonempty string `name`; optional and unknown members are preserved verbatim.
+/// A supplied `type` member is extension data and is preserved after decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionNotification {
+    pub name: String,
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Serialize for ExtensionNotification {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut object = serde_json::Map::with_capacity(self.rest.len() + 2);
+        object.insert("type".into(), "ExtensionNotification".into());
+        object.insert("name".into(), self.name.clone().into());
+        for (key, value) in &self.rest {
+            if key != "type" && key != "name" {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        serde_json::Value::Object(object).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensionNotification {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut object = serde_json::Map::deserialize(deserializer)?;
+        let Some(serde_json::Value::String(name)) = object.remove("name") else {
+            return Err(serde::de::Error::missing_field("name"));
+        };
+        if name.is_empty() {
+            return Err(serde::de::Error::custom(
+                "extension notification name must be nonempty",
+            ));
+        }
+        // Duplicate names are already rejected by the control codec's structural
+        // pre-pass; a second serialized name cannot survive to typed decoding.
+        object.remove("type");
+        Ok(Self { name, rest: object })
+    }
+}
 
 /// Internal mint-cache index: mint URL -> unit -> known keyset IDs.
 ///
@@ -114,6 +155,9 @@ pub enum ClientMessage {
     GetSessionStatus,
     /// Request correlated control-path liveness evidence.
     Ping { nonce: String },
+    /// Optional advisory extension; never answered and never ordinary work.
+    #[serde(untagged)]
+    ExtensionNotification(ExtensionNotification),
 }
 
 /// Messages sent from server to client on the control channel.
@@ -164,12 +208,83 @@ pub enum ServerMessage {
         code: ServerErrorCode,
         message: String,
     },
+    /// Optional advisory extension; never answered and never a FIFO response.
+    #[serde(untagged)]
+    ExtensionNotification(ExtensionNotification),
 }
 
 #[cfg(test)]
 mod advertisement_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn extension_serialization_has_unique_members() {
+        let message = ClientMessage::ExtensionNotification(ExtensionNotification {
+            name: "example.relaxed".into(),
+            rest: serde_json::Map::from_iter([
+                ("data".into(), json!({"anything": [1, null]})),
+                ("future_member".into(), serde_json::Value::Null),
+            ]),
+        });
+        let bytes = crate::control_codec::encode_json_line(&message).unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("\"type\":\"ExtensionNotification\""));
+        assert_eq!(text.matches("\"name\"").count(), 1);
+        assert_eq!(text.matches("\"type\"").count(), 1);
+        assert!(text.contains("\"data\":{\"anything\":[1,null]}"));
+        assert!(text.contains("\"future_member\":null"));
+    }
+
+    #[test]
+    fn decode_exact_raw_relaxed_extension() {
+        let raw = r#"{"type":"ExtensionNotification","name":"example.ignored","anything":[1,null],"future_member":{"relaxed":true}}"#;
+        let message: ClientMessage = serde_json::from_str(raw).unwrap();
+        assert!(matches!(message, ClientMessage::ExtensionNotification(_)));
+    }
+
+    #[test]
+    fn relaxed_extension_requires_only_one_nonempty_name() {
+        let rich = json!({"type":"ExtensionNotification","name":"example.hint","data":{"nested":[1,null]},"extra":null,"future":false});
+        for valid in [
+            json!({"type":"ExtensionNotification","name":"example.hint"}),
+            rich.clone(),
+        ] {
+            for client in [false, true] {
+                let extension = if client {
+                    let ClientMessage::ExtensionNotification(extension) =
+                        serde_json::from_value(valid.clone()).unwrap()
+                    else {
+                        panic!("valid client extension must decode: {valid}");
+                    };
+                    extension
+                } else {
+                    let ServerMessage::ExtensionNotification(extension) =
+                        serde_json::from_value(valid.clone()).unwrap()
+                    else {
+                        panic!("valid server extension must decode: {valid}");
+                    };
+                    extension
+                };
+                assert_eq!(extension.name, "example.hint");
+                assert!(!extension.rest.contains_key("name"));
+                if valid == rich {
+                    assert_eq!(extension.rest.len(), 3);
+                }
+            }
+        }
+
+        for invalid in [
+            json!({"type":"ExtensionNotification"}),
+            json!({"type":"ExtensionNotification","name":""}),
+            json!({"type":"ExtensionNotification","name":null}),
+            json!({"type":"ExtensionNotification","name":7}),
+            json!({"type":"ExtensionNotification","name":{"nested":true}}),
+        ] {
+            assert!(serde_json::from_value::<ServerMessage>(invalid.clone()).is_err());
+            assert!(serde_json::from_value::<ClientMessage>(invalid).is_err());
+        }
+    }
 
     #[test]
     fn advertisement_order_is_local_and_value_fields_are_explicit() {

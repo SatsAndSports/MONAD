@@ -71,8 +71,8 @@ submitted channel and cumulative balance, and credit at least the previously
 confirmed total plus that request's newly signed increment. Earlier query
 responses exclude later queued payments. Shortchanging or a mismatched reply
 ends the session rather than being skipped as stale. An ordinary response with
-an empty FIFO is discarded without changing local records. Pong and advisories
-never consume request slots.
+an empty FIFO is discarded without changing local records. Pong, extension
+notifications, and advisories never consume request slots.
 
 The main client retains serialized funding and uses local estimated credit for
 exhausted-channel reselection instead of waiting for an unsolicited pause

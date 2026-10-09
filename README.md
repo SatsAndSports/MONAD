@@ -244,6 +244,7 @@ Implemented today:
 - session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, exact totals-based billing with directional pricing, bounded chunk overshoot with pause/resume enforcement, open/total/failed CONNECT counters, `ChannelLink`, `ChannelPayment`, `ChannelEvicted`, and correlated Ping/Pong liveness
 - relay-reported linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
 - ordered control exchanges: one initial `SessionStatus`, then one status/error per ordinary request in FIFO order, with up to five requests outstanding. Pause and eviction no longer push statuses; use `GetSessionStatus` for an explicit snapshot. Ping/Pong and advisories may interleave without consuming request responses.
+- relaxed extension notifications: either side may send `ExtensionNotification` with one nonempty string `name`; `data` and any other members are optional and unconstrained. Current runtimes ignore them without a response, FIFO slot, or state change.
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - in-process relay wallet manager: multiple hosted relays can share one SQLite-backed relay wallet database while keeping distinct Cashu receiver keys / wallet names
 - client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments, with periodic local cleartext-counter checks sizing payments from client-side byte and payment records

@@ -717,6 +717,7 @@ Server to client (`ServerMessage`):
 - `ChannelReleaseRequested { channel_id }` — advisory request to retire and unlink a channel when convenient
 - `Pong { nonce }` — correlated response to one `Ping`; it does not request state, consume a request response, or authorize another payment
 - `Error { code, message }` — relay-initiated error or rejection
+- `ExtensionNotification { name, ... }` — optional advisory hint with one nonempty string name; `data` and any other members are unconstrained, ignored by current runtimes, and never answered
 
 ### Ordered Control Exchanges
 
@@ -727,10 +728,12 @@ queue bounds probe buffering. Framing still limits each line to 1 MiB; the reade
 can hold one additional decoded message while awaiting admission plus its
 bounded framing buffer. Task teardown drops both futures and their queued work.
 
-Every request goes through `SessionEvent` → reducer → effects → `ControlDriver`.
-Ping follows that same path and emits Pong, but consumes no ordinary permit.
-Responses are fixed/submitted before the next ordinary operation executes.
-Advisories can interleave at operation boundaries and consume no response slot.
+Every ordinary request goes through `SessionEvent` → reducer → effects →
+`ControlDriver`. Ping follows that same path and emits Pong; extension
+notifications are ignored without entering the reducer. Neither consumes an
+ordinary permit. Responses are fixed/submitted before the next ordinary
+operation executes. Advisories can interleave at operation boundaries and
+consume no response slot.
 
 `monad-common/src/control_exchange.rs` provides the client FIFO used by the main
 client, test client, and stress harness. It rejects a sixth outstanding request,
@@ -745,8 +748,9 @@ session); recognized fatal errors terminate regardless of the FIFO.
 The main funding policy still sends channel operations serially. Local counters
 now also trigger exhausted-channel reselection; it does not wait for an
 unsolicited pause snapshot. Ping/Pong retains its independent nonce liveness
-tracking. Extension envelopes and the complete stable error registry remain
-separate conformance work.
+tracking. Extension envelopes are accepted bidirectionally and preserved as
+uninterpreted hints; the complete stable error registry remains separate
+conformance work.
 
 ### Relay Keyset Refresh
 

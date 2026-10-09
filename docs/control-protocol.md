@@ -224,7 +224,7 @@ may contain null under their schema.
 | `ChannelUnlink` | `channel_id` | Release linked ownership |
 | `GetSessionStatus` | None | Request a state snapshot |
 | `Ping` | `nonce: string` | Request correlated liveness evidence |
-| `ExtensionNotification` | `name: string`, `data: object` | Optional advisory extension; no response |
+| `ExtensionNotification` | `name: string`; optional and unknown members allowed | Optional advisory extension; no response |
 
 A link's `zero_balance_signature` signs the zero-balance Spilman commitment in
 the channel's unit; zero is implicit and `balance_raw` is forbidden. A payment's
@@ -264,7 +264,7 @@ support and a version-specific mapping for any changed proof or signature shape.
 | `ChannelReleaseRequested` | `channel_id` | Advisory request to unlink when convenient (§5.3) |
 | `Error` | `code: string`, `message: string` | Request rejection or fatal session error (§6) |
 | `Pong` | `nonce: string` | Correlated response to Ping (§3.4) |
-| `ExtensionNotification` | `name: string`, `data: object` | Optional advisory extension; no response |
+| `ExtensionNotification` | `name: string`; optional and unknown members allowed | Optional advisory extension; no response |
 
 `Error.message` is diagnostic text and MUST NOT be parsed for behavior. There is
 no `ChannelUnlinked` message.
@@ -409,12 +409,17 @@ outstanding payment. No mandatory periodic Ping or QUIC keep-alive is imposed.
 Either endpoint MAY send:
 
 ```json
-{"type":"ExtensionNotification","name":"example.some_hint","data":{}}
+{"type":"ExtensionNotification","name":"example.some_hint","data":{},"future_member":null}
 ```
 
-The envelope has exactly those fields. `name` is nonempty and SHOULD be
-namespaced; `data` is an object. Unsupported names or payloads may be ignored
-after envelope and framing validation. Malformed envelopes remain fatal.
+The envelope's only constrained member is exactly one `name` field containing a
+nonempty JSON string; it SHOULD be namespaced. `data` is optional and has no
+required type or meaning. Additional known or unknown members are allowed with
+any names and JSON values, except that duplicate JSON object keys remain invalid
+at every level. A `type` or second `name` member inside extension data is data,
+not an alternate core message or extension identity. Unsupported names or
+payloads may be ignored after envelope and framing validation. Missing, empty,
+null, nonstring, or duplicate names are malformed and fatal.
 
 Extension notifications may be sent at any time in either direction, including
 before the relay's initial `SessionStatus`.
@@ -866,8 +871,9 @@ If the relay had accepted 100 previously, relink reports `balance_raw=100` but
 - §3.4: opaque string nonces, paused and concurrent Pings, same-nonce Pong
   responses, in-order and independent relay handling, local stalls, timeout
   races, and no claim of destination reachability.
-- §3.5: ignored bidirectional extensions and advisories with no response, FIFO,
-  accounting, or liveness effect; malformed envelopes remain fatal.
+- §3.5: ignored bidirectional extensions with one nonempty name, absent `data`,
+  arbitrary additional members, no response/FIFO/accounting/liveness effect, and
+  malformed names or envelopes remaining fatal.
 - §4: exact one-round billing; partial forwarding; configured chunk/in-flight
   overshoot exposure; counter exhaustion; fixed rates; TCP/QUIC accounting
   excluding pooled connections; one current receiver; known-channel lookup before receiver checks;

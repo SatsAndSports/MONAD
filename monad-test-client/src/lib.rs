@@ -698,6 +698,9 @@ where
     Ok(Arc::new(conn))
 }
 
+// Rust/Clippy currently under-reports captured variables in this large spawned
+// control future; keep the explicit capture context warning-free.
+#[allow(unused_mut, unused_variables)]
 async fn start_auto_control(
     conn: &RelayConnection,
     hop_idx: usize,
@@ -1096,6 +1099,7 @@ async fn start_auto_control(
                     }
                 }
                 ServerMessage::Pong { .. } => {}
+                ServerMessage::ExtensionNotification(_) => {}
                 ServerMessage::Error { code, message } => {
                     if is_recoverable_funding_error(&code) {
                         warn!(
