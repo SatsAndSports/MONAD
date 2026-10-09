@@ -1046,9 +1046,10 @@ async fn start_auto_control(
                 }
                 ServerMessage::ChannelEvicted {
                     channel_id: evicted_channel_id,
+                    scope,
                 } => {
                     warn!(
-                        "{hop_label}: linked channel evicted: {evicted_channel_id}; recovering in-session"
+                        "{hop_label}: linked channel evicted with {scope:?} scope: {evicted_channel_id}; recovering in-session"
                     );
                     funding.reset();
                     if exchange.pending_len() < MAX_PENDING_REQUESTS {
@@ -1134,13 +1135,11 @@ fn is_channel_resetting_error(code: &ServerErrorCode) -> bool {
         code,
         ServerErrorCode::PaymentNoNewFunds
             | ServerErrorCode::PaymentWrongChannel
-            | ServerErrorCode::PaymentUnknownChannel
             | ServerErrorCode::ChannelExpired
             | ServerErrorCode::ChannelClosed
             | ServerErrorCode::LinkReceiverMismatch
             | ServerErrorCode::LinkUnsupportedUnit
             | ServerErrorCode::LinkMintOrKeysetUnacceptable
-            | ServerErrorCode::LinkNonZeroBalance
     )
 }
 

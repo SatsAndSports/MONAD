@@ -40,14 +40,7 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 pub fn is_fatal_error(code: &ServerErrorCode) -> bool {
-    // Current registry; the complete stable error-schema migration is separate.
-    matches!(
-        code,
-        ServerErrorCode::ControlInvalidMessage
-            | ServerErrorCode::InternalError
-            | ServerErrorCode::LinkKeysetVersionNotNegotiated
-            | ServerErrorCode::PaymentConflict
-    )
+    code.is_fatal()
 }
 
 impl ControlExchange {
@@ -357,6 +350,25 @@ mod tests {
     }
 
     #[test]
+    fn payment_conflict_is_an_ordered_nonfatal_response() {
+        let mut exchange = initialized(100);
+        exchange.enqueue(payment(110, 10)).unwrap();
+        exchange.enqueue(PendingRequest::Status).unwrap();
+        let conflict = ServerMessage::Error {
+            code: ServerErrorCode::PaymentConflict,
+            message: "conflict".into(),
+        };
+        assert_eq!(
+            exchange.observe(&conflict).unwrap(),
+            Attribution::Response(payment(110, 10))
+        );
+        assert_eq!(
+            exchange.observe(&status(100, Some(("A", 100)))).unwrap(),
+            Attribution::Response(PendingRequest::Status)
+        );
+    }
+
+    #[test]
     fn lower_paid_query_or_unlink_response_is_fatal() {
         for request in [
             PendingRequest::Status,
@@ -379,6 +391,7 @@ mod tests {
             },
             ServerMessage::ChannelEvicted {
                 channel_id: "A".into(),
+                scope: crate::protocol::ChannelEvictionScope::Session,
             },
             ServerMessage::Error {
                 code: ServerErrorCode::PaymentInvalid,

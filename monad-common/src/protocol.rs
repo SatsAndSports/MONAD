@@ -107,33 +107,51 @@ pub struct LinkedChannelStatus {
     pub unit: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ServerErrorCode {
-    ChannelAdmissionDisabled,
     ControlInvalidMessage,
-    LinkInvalidPayment,
+    NumericLimitExceeded,
+    ChannelAdmissionDisabled,
+    SessionFundingDisabled,
+    ChannelEvictedFromSession,
+    ChannelRetiredAtRelay,
+    LinkInvalidZeroBalanceSignature,
     LinkInvalidChannel,
     LinkReceiverMismatch,
     LinkMintOrKeysetUnacceptable,
     LinkKeysetRefreshRateLimited,
     LinkKeysetRefreshBusy,
     LinkKeysetRefreshFailed,
-    LinkUnsupportedCashuSpilmanProtocolVersion,
     LinkKeysetVersionNotNegotiated,
     LinkUnsupportedUnit,
-    LinkNonZeroBalance,
+    LinkChannelRetired,
     ChannelExpired,
     ChannelClosed,
     PaymentWrongChannel,
-    PaymentUnknownChannel,
     PaymentInvalid,
     PaymentNoNewFunds,
     PaymentConflict,
-    NumericLimitExceeded,
-    InternalError,
-    LinkChannelRetired,
     ChannelUnlinkRejected,
+    InternalError,
+}
+
+impl ServerErrorCode {
+    pub fn is_fatal(self) -> bool {
+        matches!(
+            self,
+            Self::ControlInvalidMessage
+                | Self::LinkKeysetVersionNotNegotiated
+                | Self::InternalError
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelEvictionScope {
+    Session,
+    Relay,
 }
 
 /// Messages sent from client to server on the control channel.
@@ -194,6 +212,7 @@ pub enum ServerMessage {
     /// Another session claimed the channel; this session is now Unlinked.
     ChannelEvicted {
         channel_id: String,
+        scope: ChannelEvictionScope,
     },
     ChannelReleaseRequested {
         channel_id: String,
@@ -493,6 +512,152 @@ mod advertisement_tests {
             })
         );
         assert!(serde_json::from_value::<ServerMessage>(value).is_ok());
+    }
+
+    #[test]
+    fn server_error_registry_matches_stable_codes_and_fatality() {
+        let cases = [
+            (
+                ServerErrorCode::ControlInvalidMessage,
+                "CONTROL_INVALID_MESSAGE",
+                true,
+            ),
+            (
+                ServerErrorCode::NumericLimitExceeded,
+                "NUMERIC_LIMIT_EXCEEDED",
+                false,
+            ),
+            (
+                ServerErrorCode::ChannelAdmissionDisabled,
+                "CHANNEL_ADMISSION_DISABLED",
+                false,
+            ),
+            (
+                ServerErrorCode::SessionFundingDisabled,
+                "SESSION_FUNDING_DISABLED",
+                false,
+            ),
+            (
+                ServerErrorCode::ChannelEvictedFromSession,
+                "CHANNEL_EVICTED_FROM_SESSION",
+                false,
+            ),
+            (
+                ServerErrorCode::ChannelRetiredAtRelay,
+                "CHANNEL_RETIRED_AT_RELAY",
+                false,
+            ),
+            (
+                ServerErrorCode::LinkInvalidZeroBalanceSignature,
+                "LINK_INVALID_ZERO_BALANCE_SIGNATURE",
+                false,
+            ),
+            (
+                ServerErrorCode::LinkInvalidChannel,
+                "LINK_INVALID_CHANNEL",
+                false,
+            ),
+            (
+                ServerErrorCode::LinkReceiverMismatch,
+                "LINK_RECEIVER_MISMATCH",
+                false,
+            ),
+            (
+                ServerErrorCode::LinkMintOrKeysetUnacceptable,
+                "LINK_MINT_OR_KEYSET_UNACCEPTABLE",
+                false,
+            ),
+            (
+                ServerErrorCode::LinkUnsupportedUnit,
+                "LINK_UNSUPPORTED_UNIT",
+                false,
+            ),
+            (
+                ServerErrorCode::LinkKeysetRefreshRateLimited,
+                "LINK_KEYSET_REFRESH_RATE_LIMITED",
+                false,
+            ),
+            (
+                ServerErrorCode::LinkKeysetRefreshBusy,
+                "LINK_KEYSET_REFRESH_BUSY",
+                false,
+            ),
+            (
+                ServerErrorCode::LinkKeysetRefreshFailed,
+                "LINK_KEYSET_REFRESH_FAILED",
+                false,
+            ),
+            (
+                ServerErrorCode::LinkKeysetVersionNotNegotiated,
+                "LINK_KEYSET_VERSION_NOT_NEGOTIATED",
+                true,
+            ),
+            (
+                ServerErrorCode::LinkChannelRetired,
+                "LINK_CHANNEL_RETIRED",
+                false,
+            ),
+            (ServerErrorCode::ChannelClosed, "CHANNEL_CLOSED", false),
+            (ServerErrorCode::ChannelExpired, "CHANNEL_EXPIRED", false),
+            (
+                ServerErrorCode::PaymentWrongChannel,
+                "PAYMENT_WRONG_CHANNEL",
+                false,
+            ),
+            (ServerErrorCode::PaymentInvalid, "PAYMENT_INVALID", false),
+            (
+                ServerErrorCode::PaymentNoNewFunds,
+                "PAYMENT_NO_NEW_FUNDS",
+                false,
+            ),
+            (ServerErrorCode::PaymentConflict, "PAYMENT_CONFLICT", false),
+            (
+                ServerErrorCode::ChannelUnlinkRejected,
+                "CHANNEL_UNLINK_REJECTED",
+                false,
+            ),
+            (ServerErrorCode::InternalError, "INTERNAL_ERROR", true),
+        ];
+
+        for (code, wire, fatal) in cases {
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(wire));
+            assert_eq!(code.is_fatal(), fatal, "{code:?}");
+        }
+        for removed in [
+            "LINK_INVALID_PAYMENT",
+            "LINK_UNSUPPORTED_CASHU_SPILMAN_PROTOCOL_VERSION",
+            "LINK_NON_ZERO_BALANCE",
+            "PAYMENT_UNKNOWN_CHANNEL",
+            "UNKNOWN_FUTURE_CODE",
+        ] {
+            assert!(serde_json::from_value::<ServerErrorCode>(json!(removed)).is_err());
+        }
+    }
+
+    #[test]
+    fn channel_evicted_requires_stable_scope() {
+        for scope in [ChannelEvictionScope::Session, ChannelEvictionScope::Relay] {
+            let value = serde_json::to_value(ServerMessage::ChannelEvicted {
+                channel_id: "a".repeat(64),
+                scope,
+            })
+            .unwrap();
+            assert_eq!(
+                value["scope"],
+                json!(match scope {
+                    ChannelEvictionScope::Session => "session",
+                    ChannelEvictionScope::Relay => "relay",
+                })
+            );
+            assert!(serde_json::from_value::<ServerMessage>(value).is_ok());
+        }
+        for invalid in [
+            json!({"type":"ChannelEvicted","channel_id":"a".repeat(64)}),
+            json!({"type":"ChannelEvicted","channel_id":"a".repeat(64),"scope":null}),
+            json!({"type":"ChannelEvicted","channel_id":"a".repeat(64),"scope":"global"}),
+        ] {
+            assert!(serde_json::from_value::<ServerMessage>(invalid).is_err());
+        }
     }
 
     #[test]

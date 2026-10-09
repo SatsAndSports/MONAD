@@ -3008,8 +3008,9 @@ async fn assert_evicted_then_status(
         .await
         .expect("expected eviction event");
     match evicted {
-        ServerMessage::ChannelEvicted { channel_id } => {
+        ServerMessage::ChannelEvicted { channel_id, scope } => {
             assert_eq!(channel_id, expected_channel_id);
+            assert_eq!(scope, monad_common::protocol::ChannelEvictionScope::Session);
         }
         other => panic!("expected ChannelEvicted, got {other:?}"),
     }
@@ -3635,7 +3636,7 @@ async fn test_non_zero_channel_link_is_rejected_and_does_not_link_session() {
     .await;
 
     let (code, message) = control.expect_error().await;
-    assert_eq!(code, ServerErrorCode::LinkNonZeroBalance);
+    assert_eq!(code, ServerErrorCode::LinkInvalidChannel);
     assert!(
         message.contains("link balance must be zero"),
         "unexpected error: {message}"
@@ -5842,7 +5843,7 @@ async fn test_failed_replacement_preserves_link_ownership_and_credit() {
     .await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::Error { code, .. } => {
-            assert_eq!(code, ServerErrorCode::LinkInvalidPayment);
+            assert_eq!(code, ServerErrorCode::LinkInvalidChannel);
         }
         other => panic!("expected rejected replacement, got {other:?}"),
     }
@@ -7791,7 +7792,7 @@ async fn test_malformed_unknown_keyset_links_do_not_consume_refresh_budget() {
             ServerErrorCode::LinkInvalidChannel
         } else {
             payment["funding_proofs"][0]["id"] = serde_json::json!(known_keyset_id);
-            ServerErrorCode::LinkInvalidPayment
+            ServerErrorCode::LinkInvalidChannel
         };
         send_control_message(
             &mut control_send,

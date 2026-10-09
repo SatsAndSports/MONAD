@@ -126,9 +126,9 @@ mod tests {
     use super::payment::{
         channel_signed_balance_raw, exclude_on_wallet_error, plan_payment_topup,
         raw_amount_to_msats, reconcile_payment_topup, requested_delta_msats,
-        server_error_rejects_intended_channel, validate_linked_channel_balance_against_wallet,
-        validate_session_pricing, validate_session_status_baseline_against_local_counters,
-        PaymentTopupPlan,
+        server_error_invalidates_channel, server_error_rejects_intended_channel,
+        validate_linked_channel_balance_against_wallet, validate_session_pricing,
+        validate_session_status_baseline_against_local_counters, PaymentTopupPlan,
     };
     use super::state::{
         current_spilman_info, pre_ready_blocked_error, relay_confirms_intended_channel,
@@ -634,6 +634,19 @@ mod tests {
             state.funding_retry_not_before,
             Some(now + LINK_REFRESH_RETRY_COOLDOWN)
         );
+    }
+
+    #[test]
+    fn exclusions_and_invalid_zero_signature_reject_without_global_invalidation() {
+        for code in [
+            ServerErrorCode::LinkInvalidZeroBalanceSignature,
+            ServerErrorCode::ChannelEvictedFromSession,
+            ServerErrorCode::ChannelRetiredAtRelay,
+            ServerErrorCode::LinkChannelRetired,
+        ] {
+            assert!(server_error_rejects_intended_channel(&code));
+            assert!(!server_error_invalidates_channel(&code));
+        }
     }
 
     #[test]
@@ -1319,7 +1332,6 @@ mod tests {
             ServerErrorCode::PaymentInvalid,
             ServerErrorCode::PaymentNoNewFunds,
             ServerErrorCode::PaymentWrongChannel,
-            ServerErrorCode::PaymentUnknownChannel,
             ServerErrorCode::PaymentConflict,
             ServerErrorCode::NumericLimitExceeded,
             ServerErrorCode::ChannelClosed,
@@ -1332,7 +1344,7 @@ mod tests {
                 ..Default::default()
             };
             set_payment_in_flight(&mut state, "channel".into(), 2000);
-            super::funding::apply_server_error(&config, &mut state, code.clone()).await;
+            super::funding::apply_server_error(&config, &mut state, code).await;
             assert_eq!(state.local_session_paid_msats, 2000, "{code:?}");
             assert_eq!(
                 super::payment::compute_estimated_remaining(&state, &counters).unwrap(),

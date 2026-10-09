@@ -410,6 +410,10 @@ Each solicited status must report at least the paid total expected at its FIFO
 position. A status for an earlier query is not charged with a later queued
 payment; a short-paid payment response ends the session. Empty-FIFO ordinary
 responses are discarded, while recognized fatal errors still end the session.
+The protocol-fatal registry entries are `CONTROL_INVALID_MESSAGE`,
+`LINK_KEYSET_VERSION_NOT_NEGOTIATED`, and `INTERNAL_ERROR`; other registered
+errors answer one ordered request. `ChannelEvicted` advisories carry an explicit
+`session` or `relay` scope, with ownership transfer currently emitting `session`.
 
 Numeric-limit failures are reported explicitly: the client checks its proposed
 session total before signing, and the relay checks both paid-total and signed

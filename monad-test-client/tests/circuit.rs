@@ -300,6 +300,7 @@ async fn channel_evicted_does_not_force_rebuild_when_control_stays_healthy() {
         &session_id,
         ServerMessage::ChannelEvicted {
             channel_id: "synthetic-evict".to_string(),
+            scope: monad_common::protocol::ChannelEvictionScope::Session,
         }
     ));
 

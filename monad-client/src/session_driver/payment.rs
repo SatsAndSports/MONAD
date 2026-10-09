@@ -252,7 +252,6 @@ pub(super) fn server_error_invalidates_channel(code: &ServerErrorCode) -> bool {
             | ServerErrorCode::LinkReceiverMismatch
             | ServerErrorCode::LinkMintOrKeysetUnacceptable
             | ServerErrorCode::LinkUnsupportedUnit
-            | ServerErrorCode::LinkNonZeroBalance
             | ServerErrorCode::ChannelExpired
             | ServerErrorCode::ChannelClosed
     )
@@ -260,4 +259,11 @@ pub(super) fn server_error_invalidates_channel(code: &ServerErrorCode) -> bool {
 
 pub(super) fn server_error_rejects_intended_channel(code: &ServerErrorCode) -> bool {
     server_error_invalidates_channel(code)
+        || matches!(
+            code,
+            ServerErrorCode::LinkInvalidZeroBalanceSignature
+                | ServerErrorCode::ChannelEvictedFromSession
+                | ServerErrorCode::ChannelRetiredAtRelay
+                | ServerErrorCode::LinkChannelRetired
+        )
 }
