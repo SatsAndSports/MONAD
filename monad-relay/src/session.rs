@@ -1310,27 +1310,7 @@ async fn handle_control_stream(
                     _ = termination.cancelled() => Ok(()),
                     result = &mut result => result,
                 },
-                Err(error) => {
-                    // The malformed line has already poisoned this reader. Give the
-                    // serialized executor a bounded chance to emit already queued
-                    // responses (notably Pong) before the bounded fatal reply. A
-                    // blocked initial response cancels the executor instead of
-                    // waiting for a new terminal deadline.
-                    {
-                        let mut grace =
-                            std::pin::pin!(tokio::time::sleep(std::time::Duration::from_millis(
-                                50
-                            )));
-                        let _ = tokio::time::timeout(CONTROL_INVALID_MESSAGE_SEND_TIMEOUT, async {
-                            tokio::select! {
-                                _ = &mut grace => {}
-                                _ = &mut result => {}
-                            }
-                        })
-                        .await;
-                    }
-                    Err(error)
-                }
+                Err(error) => Err(error),
             },
             result = &mut result => result,
         }
@@ -2154,7 +2134,7 @@ mod tests {
         client_send
             .send_data(
                 Bytes::from_static(
-                    b"{\"type\":\"Ping\",\"nonce\":\"extension-had-no-response\"}\n{\"type\":\"ExtensionNotification\",\"name\":\"\"}\n",
+                    b"{\"type\":\"Ping\",\"nonce\":\"extension-had-no-response\"}\n",
                 ),
                 false,
             )
@@ -2164,6 +2144,12 @@ mod tests {
             matches!(&pong, ServerMessage::Pong { nonce } if nonce == "extension-had-no-response"),
             "valid extension must be ignored and never answered; got {pong:?}"
         );
+        client_send
+            .send_data(
+                Bytes::from_static(b"{\"type\":\"ExtensionNotification\",\"name\":\"\"}\n"),
+                false,
+            )
+            .unwrap();
         let error = next_server_message(&mut client_recv, &mut buf).await;
         assert!(matches!(
             error,
