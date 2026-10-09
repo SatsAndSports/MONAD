@@ -85,6 +85,9 @@ async fn wait_until_unpaused_or_terminated(
 /// A bounded forwarding operation that starts while credit is positive may
 /// complete and take the balance negative. The actual forwarded bytes are
 /// counted exactly, then subsequent forwarding waits for more credit.
+/// Counted write prefixes are settled on write errors and cooperative
+/// cancellation. Dropping this future can bypass the asynchronous settlement;
+/// it is not an accounting flush barrier for task abort or process death.
 pub(crate) async fn proxy_bidirectional_accounted<T>(
     mut h2_send: SendStream<Bytes>,
     mut h2_recv: RecvStream,

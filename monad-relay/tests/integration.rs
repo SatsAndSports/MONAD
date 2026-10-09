@@ -5008,11 +5008,10 @@ async fn test_session_payment_driver_skips_expiry_too_soon_channel_and_preserves
     let _ = relay_handle.await;
 }
 
-/// End-to-end test that the session payment driver marks a channel unusable
-/// and reselects to another channel when the relay rejects a payment with
-/// `ChannelClosed`.
+/// A rejected signed payment ends the session without buying replacement
+/// credit. Channel-specific diagnostics survive for subsequent sessions.
 #[tokio::test]
-async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
+async fn test_session_payment_rejection_preserves_signature_and_ends_session() {
     let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
     let payment_receiver_secret = cashu::nuts::SecretKey::generate();
     let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
@@ -5040,7 +5039,7 @@ async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
         .unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
+    let (driver_handle, ready_rx, failure_rx) = start_session_payment_driver(
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
@@ -5066,30 +5065,30 @@ async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
 
     // Send exactly the remaining balance worth of outbound data. The relay
     // proxies it, then pauses. The driver tries to top up the now-closed
-    // channel, gets ChannelClosed, marks it unusable, and reselects.
+    // channel, gets ChannelClosed, marks it unusable, and ends this session.
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_counting_server(upper_listener, 1000, b"OK"));
     let mut tunnel = conn.open_tunnel(&upper_addr.to_string()).await.unwrap();
     tunnel.write_all(&[b'x'; 1000]).await.unwrap();
     tunnel.shutdown().await.unwrap();
-    let mut result = Vec::new();
-    tunnel.read_to_end(&mut result).await.unwrap();
-    assert_eq!(result, b"OK");
-
-    timeout(Duration::from_secs(3), async {
-        loop {
-            let first_state = wallet.get_channel("a-first").unwrap().state;
-            let second_linked = wallet.last_link_payload("b-second").unwrap().is_some();
-            let second_paid = wallet.last_payment_payload("b-second").unwrap().is_some();
-            if first_state != WalletChannelState::Open && second_linked && second_paid {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("driver should mark first channel unusable and reselect second channel");
+    timeout(Duration::from_secs(3), driver_handle)
+        .await
+        .expect("payment rejection must end the driver without waiting for heartbeat failure")
+        .unwrap();
+    assert!(
+        *failure_rx.borrow(),
+        "route recovery should observe failure"
+    );
+    let signed = wallet.get_channel("a-first").unwrap();
+    assert!(signed.current_signed_balance_msats > 1000);
+    let payment: serde_json::Value =
+        serde_json::from_str(&wallet.last_payment_payload("a-first").unwrap().unwrap()).unwrap();
+    assert_eq!(
+        payment["balance"].as_u64().unwrap() * 1000,
+        signed.current_signed_balance_msats,
+        "rejected signature and signed high-water mark must be retained"
+    );
 
     assert_eq!(
         wallet.get_channel("a-first").unwrap().state,
@@ -5097,16 +5096,15 @@ async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
         "closed channel should be marked unusable"
     );
     assert!(
-        wallet.last_link_payload("b-second").unwrap().is_some(),
-        "second channel should be linked"
+        wallet.last_link_payload("b-second").unwrap().is_none(),
+        "rejection must not trigger replacement funding in this session"
     );
     assert!(
-        wallet.last_payment_payload("b-second").unwrap().is_some(),
-        "second channel should receive a payment"
+        wallet.last_payment_payload("b-second").unwrap().is_none(),
+        "no payment should be sent on the second channel"
     );
 
-    driver_handle.abort();
-    let _ = driver_handle.await;
+    drop(tunnel);
     conn.shutdown().await;
     let _ = mint_shutdown.send(());
 }

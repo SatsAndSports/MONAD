@@ -667,12 +667,7 @@ pub(super) async fn maybe_progress_payment(
             );
             send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await?;
             state.local_session_paid_msats = next_local_session_paid_msats;
-            set_payment_in_flight(
-                state,
-                intended_channel_id.clone(),
-                next_balance_raw,
-                authorized_delta_msats,
-            );
+            set_payment_in_flight(state, intended_channel_id.clone(), next_balance_raw);
             if let Some((owner, hop)) = &config.management {
                 hop.paying(owner, intended_channel_id);
             }
@@ -726,35 +721,14 @@ pub(super) async fn apply_channel_evicted(
     abandon_intended_channel(config, state, channel_id, false).await;
 }
 
-fn is_definitive_payment_rejection(code: &ServerErrorCode) -> bool {
-    matches!(
-        code,
-        ServerErrorCode::PaymentWrongChannel
-            | ServerErrorCode::PaymentUnknownChannel
-            | ServerErrorCode::PaymentInvalid
-            | ServerErrorCode::PaymentNoNewFunds
-            | ServerErrorCode::PaymentConflict
-            | ServerErrorCode::NumericLimitExceeded
-            | ServerErrorCode::ChannelClosed
-    )
-}
-
 pub(super) async fn apply_server_error(
     config: &SessionDriverConfig,
     state: &mut DriverState,
     code: ServerErrorCode,
 ) {
-    if is_definitive_payment_rejection(&code) {
-        if let Some(ControlOpInFlight::Payment {
-            authorized_delta_msats,
-            ..
-        }) = &state.control_op_in_flight
-        {
-            state.local_session_paid_msats = state
-                .local_session_paid_msats
-                .saturating_sub(*authorized_delta_msats);
-        }
-    }
+    // Rejection does not revoke a signed payment. Retain the pessimistic local
+    // payment record: the relay may still claim those funds. The runtime ends
+    // the session after recording any channel-specific consequences below.
     clear_control_op(state);
 
     if code == ServerErrorCode::ChannelAdmissionDisabled {

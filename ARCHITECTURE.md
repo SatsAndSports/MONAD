@@ -817,6 +817,11 @@ These reports are claims, not a substitute for client-side records. The client u
 
 The client uses the relay's acceptance responses to learn whether a link or payment was accepted; local estimates are used to decide how much to pay, not whether acceptance already occurred.
 
+A rejected signed/sent payment remains in the client's pessimistic payment
+record: the error cannot revoke the signature or prove that the relay will not
+claim it. The main client retains that record, applies channel-specific error
+handling, and ends the session without triggering replacement funding there.
+
 The developer stress harness in `monad-relay/tests/stress.rs` can also run alternate payment policies on top of the same wire protocol. Unlike the main client, those stress modes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load:
 - transport-focused mode with one huge prefunding payment per hop session
 - buffered payment mode with frequent `SessionStatus` polling and repeated `ChannelPayment` topups on one linked channel
@@ -921,6 +926,13 @@ per-session billing mutex:
 This keeps the hot data path low-latency without serializing tunnels against a
 shared prepaid-byte budget. The control FSM still handles the more complex
 protocol transitions.
+
+The counted target-write loop records a partial prefix when a write fails or
+cooperative cancellation is polled to completion. Abruptly dropping the proxy
+future (including dropping the owning session's child futures) can bypass the
+async counter update; this is not a guarantee of final-prefix accounting after
+task abort or process death. Transport write success also does not prove that
+the remote application consumed the bytes.
 
 ### CONNECT Counters
 

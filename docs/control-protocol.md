@@ -628,11 +628,16 @@ Reported channel balance MUST NOT exceed what the client signed. A lower relay
 balance is legitimate after uncertain delivery and never lowers the client's
 durable record, as explained in §1.2.
 
-Any definitive payment rejection removes only that request's pending expected
-increment. It does not decrease P or the durable signed balance. Unknown
-acceptance requires reconciliation or session termination before originating
-another payment; already queued responses remain ordered. Retries retain the
-original accounting association and never count one signed increment twice.
+A payment rejection resolves the request's FIFO entry, but MUST NOT subtract
+the signed/sent amount from the client's pessimistic local payment record, P,
+or the durable signed channel balance. Even an explicit rejection cannot revoke
+a signature already exposed to the relay: it may still claim those funds.
+The client retains that exposure and MUST NOT interpret the rejection as budget
+for a replacement payment. It MAY end the session and use the error code to
+guide subsequent sessions. Unknown acceptance requires reconciliation or session
+termination before originating another payment; already queued responses remain
+ordered. Retries retain the original accounting association and never count one
+signed increment twice.
 
 Replacement funding follows local policy rather than automatically repeating a
 rejected amount. An already queued replacement link MUST NOT trigger duplicate

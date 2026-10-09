@@ -78,7 +78,6 @@ pub(super) enum ControlOpInFlight {
     Payment {
         channel_id: String,
         balance_raw: u64,
-        authorized_delta_msats: u64,
     },
     Unlink {
         channel_id: String,
@@ -291,16 +290,10 @@ pub(super) fn set_link_in_flight(
     state.control_op_in_flight = Some(ControlOpInFlight::Link { channel_id });
 }
 
-pub(super) fn set_payment_in_flight(
-    state: &mut DriverState,
-    channel_id: String,
-    balance_raw: u64,
-    authorized_delta_msats: u64,
-) {
+pub(super) fn set_payment_in_flight(state: &mut DriverState, channel_id: String, balance_raw: u64) {
     state.control_op_in_flight = Some(ControlOpInFlight::Payment {
         channel_id,
         balance_raw,
-        authorized_delta_msats,
     });
 }
 
@@ -481,7 +474,7 @@ mod acknowledgement_tests {
     #[test]
     fn unsolicited_pause_status_does_not_acknowledge_pending_payment() {
         let mut state = DriverState::default();
-        set_payment_in_flight(&mut state, "channel".into(), 3527, 1);
+        set_payment_in_flight(&mut state, "channel".into(), 3527);
         for snapshot in [
             status("channel", 3010),
             status("other", 3527),
@@ -527,7 +520,7 @@ mod acknowledgement_tests {
     #[test]
     fn queued_pre_payment_snapshot_cannot_roll_back_acknowledged_balance() {
         let mut state = DriverState::default();
-        set_payment_in_flight(&mut state, "channel".into(), 1000, 1);
+        set_payment_in_flight(&mut state, "channel".into(), 1000);
         assert!(apply_session_status(&mut state, status("channel", 1000)));
         assert!(!apply_session_status(&mut state, status("channel", 500)));
         assert_eq!(
@@ -541,7 +534,7 @@ mod acknowledgement_tests {
                 .balance_raw,
             1000
         );
-        set_payment_in_flight(&mut state, "channel".into(), 1651, 1);
+        set_payment_in_flight(&mut state, "channel".into(), 1651);
         assert!(!apply_session_status(&mut state, status("channel", 500)));
         assert!(state.control_op_in_flight.is_some());
         assert!(apply_session_status(&mut state, status("channel", 1651)));

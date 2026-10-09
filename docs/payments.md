@@ -58,6 +58,12 @@ relay-reported `total_paid_millisats` can increase the client's credit estimate,
 but relay traffic totals or remaining-balance claims must not reduce the
 client's own byte or payment records.
 
+Rejection does not revoke a signed payment. The client keeps the signed/sent
+amount in its pessimistic local payment record even after an explicit rejection.
+The main session driver records channel-specific consequences and ends the
+session on a payment rejection, rather than purchasing replacement credit there.
+Signed wallet history remains available for recovery and subsequent sessions.
+
 ## Numeric Limits And Overshoot Accounting
 
 MONAD does not impose the control protocol's optional 90,000 BTC example cap.

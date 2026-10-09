@@ -300,7 +300,18 @@ pub(super) async fn run_session_driver(
                             if let Some(error) = payment_conflict_error(&code, &config.hop_label) {
                                 return Err(error);
                             }
+                            let payment_pending = matches!(
+                                state.control_op_in_flight,
+                                Some(super::state::ControlOpInFlight::Payment { .. })
+                            );
+                            let rejection_code = format!("{code:?}");
                             apply_server_error(&config, &mut state, code).await;
+                            if payment_pending {
+                                return Err(io::Error::other(format!(
+                                    "{} payment rejected ({rejection_code}); signed payment retained",
+                                    config.hop_label,
+                                )));
+                            }
                             false
                         }
                     };

@@ -946,6 +946,54 @@ mod tests {
         assert!(!server_error_rejects_intended_channel(&code));
     }
 
+    #[tokio::test]
+    async fn rejection_never_rolls_back_locally_recorded_payment() {
+        use super::state::{set_payment_in_flight, RelayConnectionHandles, SessionDriverConfig};
+        use crate::wallet::MockWallet;
+
+        let counters = CleartextByteCounters::default();
+        counters.note_outbound(100);
+        let config = SessionDriverConfig {
+            wallet: Arc::new(MockWallet::new()),
+            conn: RelayConnectionHandles {
+                session_id: [0; 32],
+                pricing_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                spilman_info_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                cashu_spilman_protocol_version_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                cashu_spilman_keyset_versions_handle: Arc::new(tokio::sync::RwLock::new(None)),
+                cleartext_byte_counters: counters.clone(),
+            },
+            hop_label: "test".into(),
+            payment_policy: PaymentPolicy::default(),
+            management: None,
+        };
+        for code in [
+            ServerErrorCode::PaymentInvalid,
+            ServerErrorCode::PaymentNoNewFunds,
+            ServerErrorCode::PaymentWrongChannel,
+            ServerErrorCode::PaymentUnknownChannel,
+            ServerErrorCode::PaymentConflict,
+            ServerErrorCode::NumericLimitExceeded,
+            ServerErrorCode::ChannelClosed,
+            ServerErrorCode::InternalError,
+        ] {
+            let mut state = DriverState {
+                local_session_paid_msats: 2000,
+                established_pricing: Some(SessionPricing::new(1, 1)),
+                relay_snapshot: Some(snapshot(true)),
+                ..Default::default()
+            };
+            set_payment_in_flight(&mut state, "channel".into(), 2000);
+            super::funding::apply_server_error(&config, &mut state, code.clone()).await;
+            assert_eq!(state.local_session_paid_msats, 2000, "{code:?}");
+            assert_eq!(
+                super::payment::compute_estimated_remaining(&state, &counters),
+                Some(1900),
+                "{code:?} must not authorize replacement payment"
+            );
+        }
+    }
+
     #[test]
     fn maybe_progress_payment_keeps_exhausted_channel_until_relay_pauses() {
         use super::state::{RelayConnectionHandles, SessionDriverConfig};

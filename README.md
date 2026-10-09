@@ -399,6 +399,11 @@ YAML order; add `--client <name>` to run only one entry.
 
 `client_wallet.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `client_wallet.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats. Payment sizing uses the client's own byte and payment records; an unexpectedly higher relay-reported accepted-payment total can only increase the client's credit estimate.
 
+If a relay rejects a signed/sent payment, the client preserves its pessimistic
+payment record and signed wallet history, records the error, and ends that
+session rather than sending replacement funds there. The relay may still be
+able to claim the signed amount despite reporting rejection.
+
 Admin/recovery commands can use the configured singleton `client_wallet`:
 
 ```bash
