@@ -58,9 +58,9 @@ async fn wait_until_unpaused_or_terminated(
 /// Proxy with exact accounting and chunk-boundary payment pauses.
 ///
 /// An operation started with positive credit may finish and take credit negative.
-/// Numeric preflight and the successful write count commit in one synchronous
-/// poll, before task cancellation/drop can intervene. No billing lock is held
-/// while waiting for transport readiness and no prepaid bytes are reserved.
+/// The successful write count commits in the same synchronous poll, before task
+/// cancellation/drop can intervene. No billing lock is held while polling the
+/// transport and no prepaid bytes are reserved.
 /// This is in-memory accounting, not a process-crash-durable traffic journal.
 pub(crate) async fn proxy_bidirectional_accounted<T>(
     mut h2_send: SendStream<Bytes>,
@@ -136,8 +136,8 @@ where
             let data = Bytes::copy_from_slice(&buf[..n]);
             h2_send.reserve_capacity(n);
             wait_for_send_capacity(&mut h2_send).await?;
-            // send_data is synchronous and all-or-nothing. The numeric check,
-            // enqueue, and byte accounting have no intervening suspension.
+            // send_data is synchronous and all-or-nothing. The enqueue and byte
+            // accounting have no intervening suspension.
             let result = state.poll_accounted_forward(ByteDirection::Inbound, n, || {
                 Poll::Ready(
                     h2_send
