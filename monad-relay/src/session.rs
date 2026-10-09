@@ -492,10 +492,10 @@ impl SessionState {
             .and_then(|channel_id| self.payments.linked_channel_status(channel_id));
         let (open_connects, total_connects, failed_connects) = self.counters.snapshot();
 
-        // Read hot traffic counters immediately before the payment snapshot.
-        // Concurrent traffic after this point is reflected in a later status.
-        let bytes = self.bytes.snapshot();
+        // Serialize the traffic snapshot with payment and pause state. Concurrent
+        // traffic after this point is reflected in a later status.
         let billing = self.billing.lock().unwrap();
+        let bytes = self.bytes.snapshot();
         let Some(remaining_milli_sats) = monad_common::billing::remaining_milli_sats_to_wire(
             billing.remaining_milli_sats(bytes),
         ) else {
@@ -572,8 +572,8 @@ impl SessionState {
         };
         self.bytes.record(direction, actual_bytes_u64);
 
-        let bytes = self.bytes.snapshot();
         let mut billing = self.billing.lock().unwrap();
+        let bytes = self.bytes.snapshot();
         let pricing = billing.pricing;
         let pause_changed = refresh_pause_state(&mut billing.state, pricing, bytes);
         if let Some(paused) = pause_changed {
@@ -1380,11 +1380,10 @@ async fn process_session_event(
     let mut driver = ControlDriver::new(state, h2_send);
 
     while let Some(event) = pending.pop_front() {
-        // Traffic is sampled before payment state so concurrent forwarding is
-        // allowed to make a payment's pause decision temporarily generous.
-        let bytes = state.bytes.snapshot();
         let effects = {
             let mut billing = state.billing.lock().unwrap();
+            // Serialize the traffic snapshot with payment-driven pause changes.
+            let bytes = state.bytes.snapshot();
             let (next_state, effects) = step(billing.state.clone(), event, billing.pricing, bytes);
             billing.state = next_state;
             effects
