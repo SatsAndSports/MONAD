@@ -190,10 +190,9 @@ pub(crate) fn step(
             if state.linked_channel_id.as_deref() == Some(channel_id.as_str()) {
                 state.linked_channel_id = None;
             }
-            vec![
-                SessionEffect::SendControl(ServerMessage::ChannelEvicted { channel_id }),
-                SessionEffect::SendStatus,
-            ]
+            vec![SessionEffect::SendControl(ServerMessage::ChannelEvicted {
+                channel_id,
+            })]
         }
         SessionEvent::ControlDetached => {
             state.terminated = true;
@@ -428,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_clears_link_and_emits_status() {
+    fn eviction_clears_link_and_emits_only_advisory() {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());
 
@@ -445,7 +444,6 @@ mod tests {
             effects.as_slice(),
             [
                 SessionEffect::SendControl(ServerMessage::ChannelEvicted { channel_id }),
-                SessionEffect::SendStatus,
             ] if channel_id == "chan-a"
         ));
     }

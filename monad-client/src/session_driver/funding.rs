@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use monad_common::control_codec::send_json_line;
+use monad_common::control_exchange::PendingRequest;
 use monad_common::protocol::{ClientMessage, PaymentOption, ServerErrorCode};
 use std::collections::BTreeSet;
 use std::io;
@@ -143,6 +144,9 @@ async fn send_channel_link(
         channel_id,
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
+    state.exchange.enqueue(PendingRequest::Link {
+        channel_id: channel_id.clone(),
+    })?;
     send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await?;
     set_link_in_flight(state, channel_id.clone(), channel.keyset_id, offer);
     if let Some((owner, hop)) = &config.management {
@@ -210,7 +214,13 @@ pub(super) async fn maybe_ensure_linked_channel(
     state: &mut DriverState,
     h2_send: &mut h2::SendStream<Bytes>,
 ) -> io::Result<()> {
-    if state.terminated || state.funding_blocked_reason.is_some() || !session_is_paused(state) {
+    if state.terminated || state.funding_blocked_reason.is_some() {
+        return Ok(());
+    }
+    if !session_is_paused(state)
+        && compute_estimated_remaining(state, &config.conn.cleartext_byte_counters)?
+            .is_none_or(|remaining| remaining > 0)
+    {
         return Ok(());
     }
     let Some(versions) = state
@@ -488,6 +498,9 @@ pub(super) async fn maybe_send_channel_unlink(
         intended,
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
+    state.exchange.enqueue(PendingRequest::Unlink {
+        channel_id: intended.clone(),
+    })?;
     send_control_message(
         h2_send,
         &ClientMessage::ChannelUnlink {
@@ -610,7 +623,7 @@ pub(super) async fn maybe_progress_payment(
 
     let (_requested_delta_msats, planned_next_balance_raw, _reaches_capacity) = match plan {
         PaymentTopupPlan::NoPaymentNeeded => return Ok(()),
-        PaymentTopupPlan::ExhaustedChannel if !snapshot.paused => return Ok(()),
+        PaymentTopupPlan::ExhaustedChannel if estimated_remaining > 0 => return Ok(()),
         PaymentTopupPlan::ExhaustedChannel => {
             warn!(
                 "{} abandoning exhausted channel {}: balance_raw={} capacity_raw={} | {}",
@@ -651,6 +664,10 @@ pub(super) async fn maybe_progress_payment(
             )
         })?;
 
+    let minimum_increment_msats = monad_common::payment_units::raw_units_to_msats(
+        &linked_channel.unit,
+        next_balance_raw - signed_balance_raw,
+    )?;
     match config.wallet.build_channel_payment(
         &intended_channel_id,
         &intended_offer,
@@ -658,6 +675,11 @@ pub(super) async fn maybe_progress_payment(
         next_balance_raw,
     ) {
         Ok(payment_json) => {
+            state.exchange.enqueue(PendingRequest::Payment {
+                channel_id: intended_channel_id.clone(),
+                balance_raw: next_balance_raw,
+                minimum_increment_msats,
+            })?;
             info!(
                 "{} sending ChannelPayment for {}: remaining={} target={} reaches_capacity={} next_balance_raw={} | {}",
                 config.hop_label,
@@ -708,6 +730,11 @@ pub(super) async fn run_funding_cycle(
     h2_send: &mut h2::SendStream<Bytes>,
     skip_for_resolved_payment: bool,
 ) -> io::Result<()> {
+    // Funding remains deliberately serialized; the shared exchange supports
+    // the five-request window for pipelined callers without guessing replies.
+    if !state.exchange.is_empty() {
+        return Ok(());
+    }
     maybe_send_channel_unlink(config, state, h2_send).await?;
     maybe_ensure_linked_channel(config, state, h2_send).await?;
     maybe_progress_payment(config, state, h2_send, skip_for_resolved_payment).await?;

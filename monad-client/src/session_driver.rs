@@ -339,6 +339,183 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn driver_attributes_responses_and_rejects_shortchanging_without_rollback() {
+        use crate::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
+        use monad_common::control_codec::{send_json_line, try_decode_json_line};
+        use monad_common::protocol::{ClientMessage, ServerMessage};
+        fn status(paid: u64, linked: bool, balance: u64) -> ServerMessage {
+            serde_json::from_value(serde_json::json!({
+                "type":"SessionStatus", "receiver_pubkey":"receiver",
+                "advertisements":{"https://mint":{"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400}}},
+                "linked_channel":if linked { serde_json::json!({"channel_id":"channel","balance_raw":balance,"capacity_raw":1000,"unit":"msat"}) } else { serde_json::Value::Null },
+                "bytes_in_per_msat":1,"bytes_out_per_msat":1,"session_total_bytes_in":0,"session_total_bytes_out":0,
+                "total_paid_millisats":paid,"remaining_milli_sats":paid,"paused":paid==0,
+                "open_connects":0,"total_connects":0,"failed_connects":0
+            })).unwrap()
+        }
+        async fn next(recv: &mut h2::RecvStream, buf: &mut Vec<u8>) -> ClientMessage {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(message) = try_decode_json_line(buf).unwrap() {
+                        return message;
+                    }
+                    let data = recv.data().await.unwrap().unwrap();
+                    recv.flow_control().release_capacity(data.len()).unwrap();
+                    buf.extend_from_slice(&data);
+                }
+            })
+            .await
+            .unwrap()
+        }
+        for shortchange in [true, false] {
+            let wallet = Arc::new(MockWallet::new());
+            wallet
+                .insert_channel(WalletChannel {
+                    channel_id: "channel".into(),
+                    state: WalletChannelState::Open,
+                    receiver_pubkey: "receiver".into(),
+                    mint_url: "https://mint".into(),
+                    unit: "msat".into(),
+                    keyset_id: "0000000000000001".into(),
+                    attached_session_id: None,
+                    capacity_msats: 1000,
+                    current_signed_balance_msats: 0,
+                    expiry_timestamp: u64::MAX,
+                })
+                .unwrap();
+            let (client, server) = tokio::io::duplex(4096);
+            let (stop, stopped) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut h2 = h2::server::handshake(server).await.unwrap();
+                let (request, mut response) = h2.accept().await.unwrap().unwrap();
+                let mut recv = request.into_body();
+                let mut send = response
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                let mut tasks = tokio::task::JoinSet::new();
+                tasks.spawn(async move { while h2.accept().await.is_some() {} });
+                send_json_line(&mut send, &status(0, false, 0))
+                    .await
+                    .unwrap();
+                let mut buf = Vec::new();
+                assert!(matches!(
+                    next(&mut recv, &mut buf).await,
+                    ClientMessage::ChannelLink { .. }
+                ));
+                send_json_line(
+                    &mut send,
+                    &ServerMessage::Pong {
+                        nonce: "interleaved".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                send_json_line(&mut send, &status(0, true, 0))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    next(&mut recv, &mut buf).await,
+                    ClientMessage::ChannelPayment { .. }
+                ));
+                send_json_line(
+                    &mut send,
+                    &ServerMessage::ChannelReleaseRequested {
+                        channel_id: "other".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                send_json_line(
+                    &mut send,
+                    &status(if shortchange { 9 } else { 10 }, true, 10),
+                )
+                .await
+                .unwrap();
+                if !shortchange {
+                    // Neither empty-FIFO response may mutate state or terminate.
+                    send_json_line(&mut send, &status(0, true, 0))
+                        .await
+                        .unwrap();
+                    send_json_line(
+                        &mut send,
+                        &ServerMessage::Error {
+                            code: ServerErrorCode::ChannelClosed,
+                            message: "untrusted".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    send_json_line(
+                        &mut send,
+                        &ServerMessage::ChannelReleaseRequested {
+                            channel_id: "channel".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(
+                        next(&mut recv, &mut buf).await,
+                        ClientMessage::ChannelUnlink { .. }
+                    ));
+                    send_json_line(&mut send, &status(10, false, 0))
+                        .await
+                        .unwrap();
+                    send_json_line(
+                        &mut send,
+                        &ServerMessage::Error {
+                            code: ServerErrorCode::ControlInvalidMessage,
+                            message: "fatal even without requests".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                // Keep the stream alive so only protocol handling ends the driver.
+                let _ = stopped.await;
+                tasks.shutdown().await;
+            });
+            let (mut conn, driver) =
+                monad_common::session::RelayConnection::from_transport_stream(client, [1; 32])
+                    .await
+                    .unwrap();
+            conn.set_cashu_spilman_keyset_versions(Some(std::collections::BTreeSet::from([
+                "v1".into()
+            ])))
+            .await;
+            conn.add_driver(driver);
+            let (handle, ready, failed) = super::start_session_payment_driver(
+                &conn,
+                wallet.clone(),
+                "ordered test",
+                PaymentPolicy {
+                    target_topup_buffer_msats: 10,
+                    minimum_topup_msats: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), handle)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(*failed.borrow());
+            assert_eq!(ready.await.is_err(), shortchange);
+            assert_eq!(
+                wallet
+                    .get_channel("channel")
+                    .unwrap()
+                    .current_signed_balance_msats,
+                10
+            );
+            assert_eq!(wallet.successful_payment_build_count("channel").unwrap(), 1);
+            let _ = stop.send(());
+            server.await.unwrap();
+            conn.shutdown().await;
+        }
+    }
+
     #[test]
     fn relay_confirms_active_channel_matches_ids() {
         let state = DriverState {
@@ -1138,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_progress_payment_keeps_exhausted_channel_until_relay_pauses() {
+    fn exhausted_channel_reselection_uses_local_credit_without_unsolicited_status() {
         use super::state::{RelayConnectionHandles, SessionDriverConfig};
         use crate::wallet::{MockWallet, MonadWallet, WalletChannelState};
 
@@ -1201,7 +1378,7 @@ mod tests {
             ..DriverState::default()
         };
         let counters = CleartextByteCounters::default();
-        counters.note_outbound(101);
+        counters.note_outbound(99);
         let config = SessionDriverConfig {
             wallet: wallet.clone(),
             conn: RelayConnectionHandles {
@@ -1249,9 +1426,7 @@ mod tests {
                 0
             );
 
-            let snapshot = state.relay_snapshot.as_mut().unwrap();
-            snapshot.paused = true;
-            snapshot.remaining_milli_sats = 0;
+            config.conn.cleartext_byte_counters.note_outbound(2);
             super::funding::maybe_progress_payment(&config, &mut state, &mut h2_send, false).await
         });
 

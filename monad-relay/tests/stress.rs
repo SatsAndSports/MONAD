@@ -570,7 +570,10 @@ async fn run_stream_echo(
 async fn send_control_message(
     h2_send: &mut h2::SendStream<bytes::Bytes>,
     message: &ClientMessage,
+    exchange: &mut monad_common::control_exchange::ControlExchange,
+    request: monad_common::control_exchange::PendingRequest,
 ) -> io::Result<()> {
+    exchange.enqueue(request)?;
     send_json_line(h2_send, message).await
 }
 
@@ -601,6 +604,7 @@ async fn provision_and_send_link(
     offer: &RelayPaymentOffer,
     channel_capacity_msats: u64,
     h2_send: &mut h2::SendStream<bytes::Bytes>,
+    exchange: &mut monad_common::control_exchange::ControlExchange,
 ) -> io::Result<String> {
     let channel_id = wallet
         .provision_channel(offer, channel_capacity_msats)
@@ -611,7 +615,15 @@ async fn provision_and_send_link(
     let payment_json = wallet
         .build_link_request(&channel_id, offer)
         .map_err(|e| io::Error::other(format!("failed to build stress link request: {e}")))?;
-    send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await?;
+    send_control_message(
+        h2_send,
+        &ClientMessage::ChannelLink { payment_json },
+        exchange,
+        monad_common::control_exchange::PendingRequest::Link {
+            channel_id: channel_id.clone(),
+        },
+    )
+    .await?;
     Ok(channel_id)
 }
 
@@ -639,14 +651,16 @@ async fn start_huge_funding_control(
         let mut saw_pause_once = false;
         let mut successful_links = 0u64;
         let mut counted_relinked_session = false;
+        let mut exchange = monad_common::control_exchange::ControlExchange::default();
         let mut status_interval = tokio::time::interval(payment.status_poll_interval);
         status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             let maybe_message = tokio::select! {
                 _ = status_interval.tick(), if payment.mode != StressPaymentMode::Transport => {
+                    if !exchange.is_initialized() || exchange.pending_len() == monad_common::control_exchange::MAX_PENDING_REQUESTS { continue; }
                     payment_stats.status_polls_sent.fetch_add(1, Ordering::Relaxed);
-                    if let Err(err) = send_control_message(&mut h2_send, &ClientMessage::GetSessionStatus).await {
+                    if let Err(err) = send_control_message(&mut h2_send, &ClientMessage::GetSessionStatus, &mut exchange, monad_common::control_exchange::PendingRequest::Status).await {
                         payment_stats.control_errors.fetch_add(1, Ordering::Relaxed);
                         println!("{hop_label}: failed to request stress SessionStatus: {err}");
                         break;
@@ -666,6 +680,15 @@ async fn start_huge_funding_control(
                 }
             };
 
+            match exchange.observe(&message) {
+                Ok(monad_common::control_exchange::Attribution::Unsolicited) => continue,
+                Ok(_) => {}
+                Err(error) => {
+                    payment_stats.control_errors.fetch_add(1, Ordering::Relaxed);
+                    println!("{hop_label}: {error}");
+                    break;
+                }
+            }
             match message {
                 ServerMessage::SessionStatus {
                     receiver_pubkey,
@@ -718,6 +741,9 @@ async fn start_huge_funding_control(
                     let Some(current_offer) = offer.as_ref() else {
                         continue;
                     };
+                    if !exchange.is_empty() {
+                        continue;
+                    }
 
                     if active_channel_id.is_none() && link_in_flight.is_none() {
                         match provision_and_send_link(
@@ -726,6 +752,7 @@ async fn start_huge_funding_control(
                             current_offer,
                             payment.channel_capacity_msats,
                             &mut h2_send,
+                            &mut exchange,
                         )
                         .await
                         {
@@ -858,6 +885,7 @@ async fn start_huge_funding_control(
                                             current_offer,
                                             payment.channel_capacity_msats,
                                             &mut h2_send,
+                                            &mut exchange,
                                         )
                                         .await
                                         {
@@ -922,6 +950,17 @@ async fn start_huge_funding_control(
                                     if let Err(err) = send_control_message(
                                         &mut h2_send,
                                         &ClientMessage::ChannelPayment { payment_json },
+                                        &mut exchange,
+                                        monad_common::control_exchange::PendingRequest::Payment {
+                                            channel_id: current_channel_id.clone(),
+                                            balance_raw: next_target_raw,
+                                            minimum_increment_msats:
+                                                monad_common::payment_units::raw_units_to_msats(
+                                                    &linked.unit,
+                                                    next_target_raw - base_balance_raw,
+                                                )
+                                                .expect("stress payment fits"),
+                                        },
                                     )
                                     .await
                                     {
@@ -988,6 +1027,10 @@ async fn start_huge_funding_control(
                         if let Err(err) = send_control_message(
                             &mut h2_send,
                             &ClientMessage::ChannelUnlink {
+                                channel_id: channel_id.clone(),
+                            },
+                            &mut exchange,
+                            monad_common::control_exchange::PendingRequest::Unlink {
                                 channel_id: channel_id.clone(),
                             },
                         )

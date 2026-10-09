@@ -243,6 +243,7 @@ Implemented today:
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
 - session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, exact totals-based billing with directional pricing, bounded chunk overshoot with pause/resume enforcement, open/total/failed CONNECT counters, `ChannelLink`, `ChannelPayment`, `ChannelEvicted`, and correlated Ping/Pong liveness
 - relay-reported linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
+- ordered control exchanges: one initial `SessionStatus`, then one status/error per ordinary request in FIFO order, with up to five requests outstanding. Pause and eviction no longer push statuses; use `GetSessionStatus` for an explicit snapshot. Ping/Pong and advisories may interleave without consuming request responses.
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - in-process relay wallet manager: multiple hosted relays can share one SQLite-backed relay wallet database while keeping distinct Cashu receiver keys / wallet names
 - client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments, with periodic local cleartext-counter checks sizing payments from client-side byte and payment records
@@ -403,6 +404,11 @@ If a relay rejects a signed/sent payment, the client preserves its pessimistic
 payment record and signed wallet history, records the error, and ends that
 session rather than sending replacement funds there. The relay may still be
 able to claim the signed amount despite reporting rejection.
+
+Each solicited status must report at least the paid total expected at its FIFO
+position. A status for an earlier query is not charged with a later queued
+payment; a short-paid payment response ends the session. Empty-FIFO ordinary
+responses are discarded, while recognized fatal errors still end the session.
 
 Numeric-limit failures are reported explicitly: the client checks its proposed
 session total before signing, and the relay checks both paid-total and signed

@@ -64,6 +64,21 @@ The main session driver records channel-specific consequences and ends the
 session on a payment rejection, rather than purchasing replacement credit there.
 Signed wallet history remains available for recovery and subsequent sessions.
 
+Ordinary replies are attributed through the shared bounded control FIFO. After
+the initial status, each link/payment/unlink/query gets one ordered status or
+error; pause and eviction do not push statuses. Payment success must match the
+submitted channel and cumulative balance, and credit at least the previously
+confirmed total plus that request's newly signed increment. Earlier query
+responses exclude later queued payments. Shortchanging or a mismatched reply
+ends the session rather than being skipped as stale. An ordinary response with
+an empty FIFO is discarded without changing local records. Pong and advisories
+never consume request slots.
+
+The main client retains serialized funding and uses local estimated credit for
+exhausted-channel reselection instead of waiting for an unsolicited pause
+report. Polling harnesses explicitly request snapshots and track those requests
+in the same FIFO. Ping remains on the relay decoder/reducer/resolver path.
+
 ## Numeric Limits And Overshoot Accounting
 
 MONAD does not impose the control protocol's optional 90,000 BTC example cap.

@@ -365,6 +365,12 @@ interoperable: a relay MAY support it, apply backpressure, or send bounded
 `CONTROL_INVALID_MESSAGE` and terminate. The client limit keeps compliant ingress
 readable without an unbounded ordinary-request queue.
 
+For example, a `GetSessionStatus` queued before a `ChannelPayment` returns the
+pre-payment paid total. That earlier reply is not compared against the later
+payment's increment. The payment's own success response and subsequent statuses
+must meet the paid-total floor defined in §5.2. Interleaved Pong or advisories
+do not change this attribution or floor.
+
 Apart from the initial status, the relay MUST NOT send an unsolicited
 `SessionStatus` or nonfatal `Error`.
 

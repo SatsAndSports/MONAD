@@ -85,6 +85,7 @@ cargo run -p monad-quic -- ...
 - `CONNECT` rejected with 402 while paused
 - A bounded forwarding operation that starts with positive credit may complete and take the session balance negative; the relay records the actual bytes exactly, then pauses subsequent forwarding until payment restores positive credit
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
+- After the initial status, ordinary requests (link/payment/unlink/status query) have exactly one ordered status/error response. Five active/queued request permits bound relay execution; excess input is backpressured. Ping still uses the decoder → reducer → resolver path but no ordinary slot. Pause/eviction do not push status; eviction/release remain advisories. The shared `control_exchange.rs` client FIFO rejects response mismatches and short-paid responses, discards ordinary empty-FIFO responses, and preserves independent Pong correlation. Main channel funding remains serialized and uses local credit for exhaustion/reselection.
 - `SessionStatus` uses `session_total_bytes_in/out` and reports `open_connects`, `total_connects`, and `failed_connects`; successful response submission commits acceptance, any pre-acceptance rejection/failure increments failed exactly once, and accepted-tunnel close decrements open exactly once
 - `Ping { nonce }` requests one correlated `Pong { nonce }` for control-path liveness; it does not request status or consume an ordinary request response
 - `Error { code, message }` for relay-initiated rejections and notifications
