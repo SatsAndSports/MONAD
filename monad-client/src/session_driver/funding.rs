@@ -800,7 +800,14 @@ pub(super) async fn apply_server_error(
             if server_error_invalidates_channel(&code) {
                 let _ = config.wallet.mark_channel_unusable(&channel_id);
             }
-            abandon_intended_channel(config, state, channel_id, false).await;
+            let exclude_for_session = matches!(
+                code,
+                ServerErrorCode::LinkInvalidZeroBalanceSignature
+                    | ServerErrorCode::ChannelEvictedFromSession
+                    | ServerErrorCode::ChannelRetiredAtRelay
+                    | ServerErrorCode::LinkChannelRetired
+            );
+            abandon_intended_channel(config, state, channel_id, exclude_for_session).await;
             return;
         }
     }

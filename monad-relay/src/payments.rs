@@ -118,6 +118,7 @@ pub enum LinkError {
     Retired,
     AdmissionDisabled,
     InvalidPayment(String),
+    InvalidZeroBalanceSignature(String),
     InvalidChannel(String),
     MintOrKeysetNotAcceptable,
     UnknownTrustedKeyset { mint_url: String, unit: String },
@@ -141,6 +142,9 @@ impl fmt::Display for LinkError {
             Self::Retired => write!(f, "channel retired; new links are disabled"),
             Self::AdmissionDisabled => write!(f, "relay is not accepting new channels"),
             Self::InvalidPayment(s) => write!(f, "invalid payment: {s}"),
+            Self::InvalidZeroBalanceSignature(s) => {
+                write!(f, "invalid zero-balance signature: {s}")
+            }
             Self::InvalidChannel(s) => write!(f, "invalid channel: {s}"),
             Self::MintOrKeysetNotAcceptable => write!(f, "mint or keyset not acceptable"),
             Self::UnknownTrustedKeyset { .. } => write!(f, "trusted mint keyset is unknown"),
@@ -171,7 +175,10 @@ impl LinkError {
         match self {
             Self::Retired => ServerErrorCode::LinkChannelRetired,
             Self::AdmissionDisabled => ServerErrorCode::ChannelAdmissionDisabled,
-            Self::InvalidPayment(_) => ServerErrorCode::LinkInvalidPayment,
+            Self::InvalidPayment(_) => ServerErrorCode::LinkInvalidChannel,
+            Self::InvalidZeroBalanceSignature(_) => {
+                ServerErrorCode::LinkInvalidZeroBalanceSignature
+            }
             Self::InvalidChannel(_) => ServerErrorCode::LinkInvalidChannel,
             Self::MintOrKeysetNotAcceptable | Self::UnknownTrustedKeyset { .. } => {
                 ServerErrorCode::LinkMintOrKeysetUnacceptable
@@ -180,12 +187,10 @@ impl LinkError {
             Self::KeysetRefreshBusy => ServerErrorCode::LinkKeysetRefreshBusy,
             Self::KeysetRefreshFailed(_) => ServerErrorCode::LinkKeysetRefreshFailed,
             Self::KeysetVersionNotNegotiated => ServerErrorCode::LinkKeysetVersionNotNegotiated,
-            Self::UnsupportedCashuSpilmanProtocolVersion => {
-                ServerErrorCode::LinkUnsupportedCashuSpilmanProtocolVersion
-            }
+            Self::UnsupportedCashuSpilmanProtocolVersion => ServerErrorCode::InternalError,
             Self::ReceiverKeyMismatch => ServerErrorCode::LinkReceiverMismatch,
             Self::UnsupportedUnit(_) => ServerErrorCode::LinkUnsupportedUnit,
-            Self::NonZeroLinkBalance => ServerErrorCode::LinkNonZeroBalance,
+            Self::NonZeroLinkBalance => ServerErrorCode::LinkInvalidChannel,
             Self::ChannelExpired => ServerErrorCode::ChannelExpired,
             Self::ChannelClosed => ServerErrorCode::ChannelClosed,
             Self::NumericLimitExceeded => ServerErrorCode::NumericLimitExceeded,
@@ -227,7 +232,7 @@ impl ChannelPaymentError {
     pub(crate) fn code(&self) -> ServerErrorCode {
         match self {
             Self::WrongChannel => ServerErrorCode::PaymentWrongChannel,
-            Self::UnknownChannel => ServerErrorCode::PaymentUnknownChannel,
+            Self::UnknownChannel => ServerErrorCode::InternalError,
             Self::InvalidPayment(_) => ServerErrorCode::PaymentInvalid,
             Self::NoNewFunds => ServerErrorCode::PaymentNoNewFunds,
             Self::ChannelClosed => ServerErrorCode::ChannelClosed,
@@ -1136,11 +1141,11 @@ fn amount_msats_to_raw_ceil(amount_msats: u64, unit: &str) -> Option<u64> {
 
 fn map_link_bridge_error(err: BridgeError) -> LinkError {
     match err {
-        BridgeError::InvalidRequest(s)
-        | BridgeError::ValidationFailed(s)
-        | BridgeError::InvalidSignature(s)
-        | BridgeError::ServerMisconfigured(s)
-        | BridgeError::Internal(s) => LinkError::InvalidPayment(s),
+        BridgeError::InvalidSignature(s) => LinkError::InvalidZeroBalanceSignature(s),
+        BridgeError::ServerMisconfigured(s) | BridgeError::Internal(s) => LinkError::Internal(s),
+        BridgeError::InvalidRequest(s) | BridgeError::ValidationFailed(s) => {
+            LinkError::InvalidPayment(s)
+        }
         BridgeError::ChannelClosing => LinkError::ChannelClosed,
         BridgeError::CapacityTooSmall { .. }
         | BridgeError::MaxAmountExceeded { .. }
@@ -1151,7 +1156,7 @@ fn map_link_bridge_error(err: BridgeError) -> LinkError {
         BridgeError::MintOrKeysetNotAcceptable => LinkError::MintOrKeysetNotAcceptable,
         BridgeError::ExpiryTooSoon { .. } => LinkError::ChannelExpired,
         BridgeError::ChannelClosed => LinkError::ChannelClosed,
-        BridgeError::UnknownChannel => LinkError::InvalidPayment(err.to_string()),
+        BridgeError::UnknownChannel => LinkError::Internal(err.to_string()),
         BridgeError::InsufficientBalance { .. } => LinkError::InvalidPayment(err.to_string()),
         BridgeError::BalanceMismatch { .. } => LinkError::InvalidPayment(err.to_string()),
     }
@@ -1162,17 +1167,18 @@ fn map_payment_bridge_error(err: BridgeError) -> ChannelPaymentError {
         BridgeError::ChannelClosed | BridgeError::ChannelClosing => {
             ChannelPaymentError::ChannelClosed
         }
-        BridgeError::UnknownChannel => ChannelPaymentError::UnknownChannel,
+        BridgeError::UnknownChannel => ChannelPaymentError::Internal(err.to_string()),
         BridgeError::InsufficientBalance {
             balance,
             amount_due,
         } if balance == amount_due => ChannelPaymentError::NoNewFunds,
+        BridgeError::ServerMisconfigured(s) | BridgeError::Internal(s) => {
+            ChannelPaymentError::Internal(s)
+        }
         BridgeError::InvalidRequest(s)
         | BridgeError::ValidationFailed(s)
         | BridgeError::InvalidSignature(s)
-        | BridgeError::UnsupportedUnit(s)
-        | BridgeError::ServerMisconfigured(s)
-        | BridgeError::Internal(s) => ChannelPaymentError::InvalidPayment(s),
+        | BridgeError::UnsupportedUnit(s) => ChannelPaymentError::InvalidPayment(s),
         BridgeError::CapacityTooSmall { .. }
         | BridgeError::ExpiryTooSoon { .. }
         | BridgeError::MaxAmountExceeded { .. }
@@ -1189,7 +1195,11 @@ fn map_payment_bridge_error(err: BridgeError) -> ChannelPaymentError {
 
 #[cfg(test)]
 mod link_error_tests {
-    use super::{map_link_bridge_error, BridgeError, LinkError};
+    use super::{
+        map_link_bridge_error, map_payment_bridge_error, BridgeError, ChannelPaymentError,
+        LinkError,
+    };
+    use monad_common::protocol::ServerErrorCode;
 
     #[test]
     fn closing_channel_link_is_permanently_rejected() {
@@ -1197,6 +1207,46 @@ mod link_error_tests {
             map_link_bridge_error(BridgeError::ChannelClosing),
             LinkError::ChannelClosed
         );
+    }
+
+    #[test]
+    fn bridge_internal_failures_are_not_reported_as_peer_invalid() {
+        assert_eq!(
+            ChannelPaymentError::UnknownChannel.code(),
+            ServerErrorCode::InternalError
+        );
+        assert!(matches!(
+            map_link_bridge_error(BridgeError::Internal("database".into())),
+            LinkError::Internal(_)
+        ));
+        assert!(matches!(
+            map_link_bridge_error(BridgeError::ServerMisconfigured("receiver".into())),
+            LinkError::Internal(_)
+        ));
+        assert!(matches!(
+            map_payment_bridge_error(BridgeError::Internal("database".into())),
+            ChannelPaymentError::Internal(_)
+        ));
+        assert!(matches!(
+            map_payment_bridge_error(BridgeError::ServerMisconfigured("receiver".into())),
+            ChannelPaymentError::Internal(_)
+        ));
+        assert!(matches!(
+            map_link_bridge_error(BridgeError::UnknownChannel),
+            LinkError::Internal(_)
+        ));
+        assert!(matches!(
+            map_payment_bridge_error(BridgeError::UnknownChannel),
+            ChannelPaymentError::Internal(_)
+        ));
+    }
+
+    #[test]
+    fn link_signature_failure_has_stable_specific_code() {
+        assert!(matches!(
+            map_link_bridge_error(BridgeError::InvalidSignature("bad signature".into())),
+            LinkError::InvalidZeroBalanceSignature(_)
+        ));
     }
 }
 

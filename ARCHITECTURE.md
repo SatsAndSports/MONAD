@@ -713,7 +713,7 @@ Server to client (`ServerMessage`):
   - `total_connects`: Cumulative accepted CONNECT tunnels
   - `failed_connects`: Cumulative CONNECT requests the relay did not accept
 - `SessionStatus { ... linked_channel: Some(...) ... }` — relay-reported state after a successful link or payment
-- `ChannelEvicted { channel_id }` — notification that another session has claimed this channel; the current session is now `Unlinked` but preserves its current balance
+- `ChannelEvicted { channel_id, scope }` — scoped (`session` or `relay`) exclusion advisory. Current ownership transfer emits `session`; the old session becomes `Unlinked` but preserves its current balance
 - `ChannelReleaseRequested { channel_id }` — advisory request to retire and unlink a channel when convenient
 - `Pong { nonce }` — correlated response to one `Ping`; it does not request state, consume a request response, or authorize another payment
 - `Error { code, message }` — relay-initiated error or rejection
@@ -749,8 +749,10 @@ The main funding policy still sends channel operations serially. Local counters
 now also trigger exhausted-channel reselection; it does not wait for an
 unsolicited pause snapshot. Ping/Pong retains its independent nonce liveness
 tracking. Extension envelopes are accepted bidirectionally and preserved as
-uninterpreted hints; the complete stable error registry remains separate
-conformance work.
+uninterpreted hints. Error codes use the exact stable registry; only
+`CONTROL_INVALID_MESSAGE`, `LINK_KEYSET_VERSION_NOT_NEGOTIATED`, and
+`INTERNAL_ERROR` are protocol-fatal. A client may still end a session as local
+recovery policy after a nonfatal rejection such as `PAYMENT_CONFLICT`.
 
 ### Relay Keyset Refresh
 

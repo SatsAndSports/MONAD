@@ -1016,9 +1016,11 @@ async fn start_huge_funding_control(
                         }
                     }
                 }
-                ServerMessage::ChannelEvicted { channel_id } => {
+                ServerMessage::ChannelEvicted { channel_id, scope } => {
                     payment_stats.control_errors.fetch_add(1, Ordering::Relaxed);
-                    println!("{hop_label}: stress funding channel evicted: {channel_id}");
+                    println!(
+                        "{hop_label}: stress funding channel evicted with {scope:?} scope: {channel_id}"
+                    );
                     break;
                 }
                 ServerMessage::ChannelReleaseRequested { channel_id } => {

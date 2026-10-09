@@ -27,6 +27,11 @@ fn payment_conflict_error(code: &ServerErrorCode, hop_label: &str) -> Option<io:
     })
 }
 
+fn funding_disabled_error(code: &ServerErrorCode, hop_label: &str) -> Option<io::Error> {
+    (*code == ServerErrorCode::SessionFundingDisabled)
+        .then(|| io::Error::other(format!("{hop_label} funding disabled for this session")))
+}
+
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_TICK: Duration = Duration::from_secs(1);
@@ -180,8 +185,10 @@ pub(super) async fn run_session_driver(
                     let observed_at = Instant::now();
                     let attribution = state.exchange.observe(&message).map_err(|error| {
                         if let ServerMessage::Error { code, .. } = &message {
-                            payment_conflict_error(code, &config.hop_label).unwrap_or_else(||
-                                io::Error::new(io::ErrorKind::InvalidData, format!("fatal control error: {code:?}")))
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("fatal control error: {code:?}"),
+                            )
                         } else { error }
                     })?;
                     if attribution == Attribution::Unsolicited {
@@ -289,9 +296,9 @@ pub(super) async fn run_session_driver(
                             }
                             resolved
                         }
-                        ServerMessage::ChannelEvicted { channel_id } => {
+                        ServerMessage::ChannelEvicted { channel_id, scope } => {
                             warn!(
-                                "{} channel {channel_id} evicted from this session | {}",
+                                "{} channel {channel_id} evicted with {scope:?} scope | {}",
                                 config.hop_label,
                                 state_summary(&state, &config.conn.cleartext_byte_counters)
                             );
@@ -322,8 +329,11 @@ pub(super) async fn run_session_driver(
                                 message,
                                 state_summary(&state, &config.conn.cleartext_byte_counters)
                             );
-                            if code == monad_common::protocol::ServerErrorCode::LinkKeysetVersionNotNegotiated {
+                            if code.is_fatal() {
                                 return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+                            }
+                            if let Some(error) = funding_disabled_error(&code, &config.hop_label) {
+                                return Err(error);
                             }
                             if let Some(error) = payment_conflict_error(&code, &config.hop_label) {
                                 return Err(error);
@@ -437,10 +447,21 @@ mod tests {
     #[test]
     fn payment_conflict_terminates_session_for_route_rebuild() {
         let error = payment_conflict_error(&ServerErrorCode::PaymentConflict, "hop 2/3")
-            .expect("payment conflict must be fatal to this session");
+            .expect("payment conflict policy must rebuild this session");
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(error.to_string().contains("rebuilding session"));
         assert!(payment_conflict_error(&ServerErrorCode::PaymentNoNewFunds, "hop 2/3").is_none());
+    }
+
+    #[test]
+    fn funding_disabled_terminates_session_for_route_rebuild() {
+        let error = funding_disabled_error(&ServerErrorCode::SessionFundingDisabled, "hop 2/3")
+            .expect("funding-disabled policy must rebuild this session");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("funding disabled"));
+        assert!(
+            funding_disabled_error(&ServerErrorCode::ChannelAdmissionDisabled, "hop 2/3").is_none()
+        );
     }
 
     fn heartbeat_session_id() -> [u8; 32] {

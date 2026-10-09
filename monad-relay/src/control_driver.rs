@@ -7,7 +7,7 @@
 use crate::session::{send_control_message, SessionState};
 use crate::session_fsm::{SessionEffect, SessionEvent};
 use bytes::Bytes;
-use monad_common::protocol::{ServerErrorCode, ServerMessage};
+use monad_common::protocol::ServerMessage;
 use std::collections::VecDeque;
 use std::io;
 
@@ -35,13 +35,7 @@ impl<'a> ControlDriver<'a> {
                 pending.push_back(SessionEvent::UnlinkValidationFinished { result });
             }
             SessionEffect::SendControl(message) => {
-                if matches!(
-                    &message,
-                    ServerMessage::Error {
-                        code: ServerErrorCode::LinkKeysetVersionNotNegotiated,
-                        ..
-                    }
-                ) {
+                if matches!(&message, ServerMessage::Error { code, .. } if code.is_fatal()) {
                     // Never let a reset or exhausted control window prevent EndSession.
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_millis(250),

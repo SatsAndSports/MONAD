@@ -1,5 +1,5 @@
 use crate::payments::{ChannelPaymentError, LinkError, LinkOutcome, PaymentOutcome};
-use monad_common::protocol::ServerMessage;
+use monad_common::protocol::{ChannelEvictionScope, ServerErrorCode, ServerMessage};
 use monad_common::session::SessionPricing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,15 +14,28 @@ pub(crate) struct ServerSessionState {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionEvent {
-    ClientChannelUnlink { channel_id: String },
-    UnlinkValidationFinished { result: Result<(), String> },
+    ClientChannelUnlink {
+        channel_id: String,
+    },
+    UnlinkValidationFinished {
+        result: Result<(), String>,
+    },
     ClientGetSessionStatus,
-    ClientPing { nonce: String },
-    ClientChannelLink { payment_json: String },
+    ClientPing {
+        nonce: String,
+    },
+    ClientChannelLink {
+        payment_json: String,
+    },
     LinkValidationFinished(Result<LinkOutcome, LinkError>),
-    ClientChannelPayment { payment_json: String },
+    ClientChannelPayment {
+        payment_json: String,
+    },
     PaymentValidationFinished(Result<PaymentOutcome, ChannelPaymentError>),
-    ChannelEvicted { channel_id: String },
+    ChannelEvicted {
+        channel_id: String,
+        scope: ChannelEvictionScope,
+    },
     ControlDetached,
 }
 
@@ -61,6 +74,32 @@ pub(crate) enum ByteDirection {
 pub(crate) enum SessionAccountingError {
     CounterOverflow,
     RemainingOutOfRange,
+}
+
+fn error_effects(
+    state: &mut ServerSessionState,
+    code: ServerErrorCode,
+    mut message: String,
+) -> Vec<SessionEffect> {
+    let fatal = code.is_fatal();
+    if code == ServerErrorCode::InternalError {
+        message = "internal request processing error".into();
+    }
+    let mut effects = Vec::new();
+    if fatal {
+        state.terminated = true;
+        if let Some(channel_id) = state.linked_channel_id.take() {
+            effects.push(SessionEffect::ReleaseLinkedChannelOwnership { channel_id });
+        }
+    }
+    effects.push(SessionEffect::SendControl(ServerMessage::Error {
+        code,
+        message,
+    }));
+    if fatal {
+        effects.push(SessionEffect::EndSession);
+    }
+    effects
 }
 
 pub(crate) fn step(
@@ -123,23 +162,7 @@ pub(crate) fn step(
                 effects.push(SessionEffect::SendStatus);
                 effects
             }
-            Err(LinkError::KeysetVersionNotNegotiated) => {
-                state.terminated = true;
-                let mut effects = Vec::new();
-                if let Some(channel_id) = state.linked_channel_id.take() {
-                    effects.push(SessionEffect::ReleaseLinkedChannelOwnership { channel_id });
-                }
-                effects.push(SessionEffect::SendControl(ServerMessage::Error {
-                    code: LinkError::KeysetVersionNotNegotiated.code(),
-                    message: LinkError::KeysetVersionNotNegotiated.to_string(),
-                }));
-                effects.push(SessionEffect::EndSession);
-                effects
-            }
-            Err(err) => vec![SessionEffect::SendControl(ServerMessage::Error {
-                code: err.code(),
-                message: err.to_string(),
-            })],
+            Err(err) => error_effects(&mut state, err.code(), err.to_string()),
         },
         SessionEvent::ClientChannelPayment { payment_json } => {
             if let Some(expected_channel_id) = state.linked_channel_id.clone() {
@@ -161,16 +184,12 @@ pub(crate) fn step(
                     .checked_add(outcome.delta_millisats)
                 else {
                     state.terminated = true;
-                    return (
-                        state,
-                        vec![
-                            SessionEffect::SendControl(ServerMessage::Error {
-                                code: monad_common::protocol::ServerErrorCode::InternalError,
-                                message: "session accounting overflow".into(),
-                            }),
-                            SessionEffect::EndSession,
-                        ],
+                    let effects = error_effects(
+                        &mut state,
+                        ServerErrorCode::InternalError,
+                        "session accounting overflow".into(),
                     );
+                    return (state, effects);
                 };
                 state.total_paid_millisats = total_paid_millisats;
                 let pause_changed = refresh_pause_state(&mut state, pricing);
@@ -181,17 +200,15 @@ pub(crate) fn step(
                 effects.push(SessionEffect::SendStatus);
                 effects
             }
-            Err(err) => vec![SessionEffect::SendControl(ServerMessage::Error {
-                code: err.code(),
-                message: err.to_string(),
-            })],
+            Err(err) => error_effects(&mut state, err.code(), err.to_string()),
         },
-        SessionEvent::ChannelEvicted { channel_id } => {
+        SessionEvent::ChannelEvicted { channel_id, scope } => {
             if state.linked_channel_id.as_deref() == Some(channel_id.as_str()) {
                 state.linked_channel_id = None;
             }
             vec![SessionEffect::SendControl(ServerMessage::ChannelEvicted {
                 channel_id,
+                scope,
             })]
         }
         SessionEvent::ControlDetached => {
@@ -257,8 +274,8 @@ mod tests {
         apply_accounted_bytes, step, ByteDirection, ServerSessionState, SessionAccountingError,
         SessionEffect, SessionEvent,
     };
-    use crate::payments::{ChannelPaymentError, LinkOutcome, PaymentOutcome};
-    use monad_common::protocol::ServerMessage;
+    use crate::payments::{ChannelPaymentError, LinkError, LinkOutcome, PaymentOutcome};
+    use monad_common::protocol::{ChannelEvictionScope, ServerErrorCode, ServerMessage};
     use monad_common::session::SessionPricing;
 
     fn state() -> ServerSessionState {
@@ -427,6 +444,33 @@ mod tests {
     }
 
     #[test]
+    fn internal_link_and_payment_failures_release_ownership_and_end_session() {
+        for event in [
+            SessionEvent::LinkValidationFinished(Err(LinkError::Internal("storage".into()))),
+            SessionEvent::PaymentValidationFinished(Err(ChannelPaymentError::Internal(
+                "storage".into(),
+            ))),
+        ] {
+            let mut current = state();
+            current.linked_channel_id = Some("chan-a".into());
+            let (next, effects) = step(current, event, SessionPricing::new(1, 1));
+
+            assert!(next.terminated);
+            assert_eq!(next.linked_channel_id, None);
+            assert!(matches!(
+                effects.as_slice(),
+                [
+                    SessionEffect::ReleaseLinkedChannelOwnership { channel_id },
+                    SessionEffect::SendControl(ServerMessage::Error { code, message }),
+                    SessionEffect::EndSession,
+                ] if channel_id == "chan-a"
+                    && *code == ServerErrorCode::InternalError
+                    && message == "internal request processing error"
+            ));
+        }
+    }
+
+    #[test]
     fn eviction_clears_link_and_emits_only_advisory() {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());
@@ -435,6 +479,7 @@ mod tests {
             current,
             SessionEvent::ChannelEvicted {
                 channel_id: "chan-a".to_string(),
+                scope: ChannelEvictionScope::Session,
             },
             SessionPricing::new(1, 1),
         );
@@ -443,8 +488,8 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [
-                SessionEffect::SendControl(ServerMessage::ChannelEvicted { channel_id }),
-            ] if channel_id == "chan-a"
+                SessionEffect::SendControl(ServerMessage::ChannelEvicted { channel_id, scope }),
+            ] if channel_id == "chan-a" && *scope == ChannelEvictionScope::Session
         ));
     }
 

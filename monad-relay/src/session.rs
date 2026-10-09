@@ -26,7 +26,8 @@ use monad_common::control_codec::{
 };
 use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::protocol::{
-    ClientMessage, MintUnitAdvertisement, MintUnitAdvertisements, ServerErrorCode, ServerMessage,
+    ChannelEvictionScope, ClientMessage, MintUnitAdvertisement, MintUnitAdvertisements,
+    ServerErrorCode, ServerMessage,
 };
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::SessionPricing;
@@ -402,7 +403,10 @@ impl SessionState {
     pub(crate) fn notify_session_evicted(&self, target_session_id: &[u8; 32], channel_id: String) {
         let _ = self.session_registry.notify(
             target_session_id,
-            ServerMessage::ChannelEvicted { channel_id },
+            ServerMessage::ChannelEvicted {
+                channel_id,
+                scope: ChannelEvictionScope::Session,
+            },
         );
     }
 
@@ -1221,10 +1225,10 @@ async fn handle_control_stream(
                 maybe_event = events.recv() => {
                     match maybe_event {
                         Some(message) => {
-                            if let ServerMessage::ChannelEvicted { channel_id } = message {
+                            if let ServerMessage::ChannelEvicted { channel_id, scope } = message {
                                 terminate_session = process_session_event(
                                     &state,
-                                    SessionEvent::ChannelEvicted { channel_id },
+                                    SessionEvent::ChannelEvicted { channel_id, scope },
                                     &mut h2_send,
                                 )
                                 .await?;
@@ -2008,6 +2012,7 @@ mod tests {
         events
             .send(ServerMessage::ChannelEvicted {
                 channel_id: "queued".into(),
+                scope: ChannelEvictionScope::Session,
             })
             .unwrap();
         assert!(matches!(
