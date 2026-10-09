@@ -161,16 +161,17 @@ Where `LinkedChannelStatus` contains:
 - `capacity_raw`
 - `unit`
 
-This means the client should trust the relay for:
+The relay reports these fields, which the client checks against local records:
 
 - which channel is linked
 - the latest accepted linked-channel balance
 - the linked channel's capacity
 - the unit in which that raw balance is expressed
 
-The relay remains the authoritative baseline for linked-channel state and
-accepted session totals, but the client now combines that baseline with its own
-local cleartext byte counters when sizing payments.
+The client sizes payments from its own local cleartext counters and pessimistic
+payment record. A higher reported session-paid total can increase that record;
+a lower total never decreases it. Relay byte totals and remaining-credit claims
+do not substitute for local traffic measurements.
 
 On the server side, steady-state control/session handling is now modeled as an
 explicit reducer-style FSM after bootstrap. The Noise-payload bootstrap handles
@@ -202,12 +203,13 @@ the driver does this:
 
 1. chooses a target positive remaining session balance
 2. reads its own local cleartext byte counters and estimates the current
-   remaining session balance against the latest authoritative relay baseline
+   remaining session balance from its own payment/credit record
 3. computes the requested delta in millisats from that local estimate
 4. converts that delta into raw channel units
 5. computes:
    - `next_balance_raw = linked_channel.balance_raw + requested_delta_raw`
-6. asks the wallet to build a payment for that exact next balance
+6. checks that the proposed session payment total is representable, then asks
+   the wallet to build a payment for that exact next balance
 
 More precisely, payment planning now follows this policy:
 
@@ -242,7 +244,7 @@ Purpose:
 - keep concurrent client-side session drivers from accidentally reusing one
   channel at the same time
 
-This is local MONAD policy metadata, not relay-authoritative protocol state.
+This is local MONAD policy metadata, not relay-reported protocol state.
 
 ## Rejections and Channel Retirement
 
@@ -278,7 +280,7 @@ balance, the driver should:
 2. locally detach it
 3. select or provision another channel
 4. send `ChannelLink`
-5. wait for the next relay-authoritative `SessionStatus`
+5. wait for the next relay-reported `SessionStatus`
 6. retry payment against the new linked channel
 
 The current session driver and both wallet implementations follow this model.

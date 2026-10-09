@@ -53,7 +53,31 @@ The client is authoritative for local intent and local authorization:
 - local cleartext byte counters observed by the client transport path
 
 The client does not treat its local estimate as accepted relay state. It uses
-that estimate only to decide when and how much to pay.
+that estimate only to decide when and how much to pay. An unexpectedly higher
+relay-reported `total_paid_millisats` can increase the client's credit estimate,
+but relay traffic totals or remaining-balance claims must not reduce the
+client's own byte or payment records.
+
+Rejection does not revoke a signed payment. The client keeps the signed/sent
+amount in its pessimistic local payment record even after an explicit rejection.
+The main session driver records channel-specific consequences and ends the
+session on a payment rejection, rather than purchasing replacement credit there.
+Signed wallet history remains available for recovery and subsequent sessions.
+
+## Numeric Limits And Overshoot Accounting
+
+MONAD does not impose the control protocol's optional 90,000 BTC example cap.
+Relay channel capacity, accepted payment deltas, and `total_paid_millisats` are
+checked against actual storage and wire limits before durable payment or credit
+mutation, including the signed `i64` remaining-credit field. Requests outside those limits fail with `NUMERIC_LIMIT_EXCEEDED` and
+do not advance the relay's recorded channel balance.
+
+The relay computes `ceil(bytes_in / in_rate + bytes_out / out_rate)` with exact
+integer quotient/remainder arithmetic. A bounded forwarding operation that
+starts with positive credit may complete and take the balance negative. Actual
+forwarded bytes are counted exactly, subsequent forwarding pauses while credit
+is nonpositive, and simultaneous tunnels may overshoot together by their
+in-flight bounded operations.
 
 ## Spilman Sans-IO Layering
 
@@ -275,7 +299,7 @@ For one relay session, the client funding flow is:
 5. Attach that channel locally to the session id.
 6. Send `ChannelLink { payment_json }`.
 7. Wait for a relay `SessionStatus` that confirms the linked channel.
-8. Use relay-authoritative state plus local cleartext counters to decide whether a `ChannelPayment` is needed.
+8. Use relay-reported state plus local cleartext counters to decide whether a `ChannelPayment` is needed.
 9. Ask the wallet to build a payment for an exact next cumulative balance.
 10. Send `ChannelPayment { payment_json }`.
 11. Repeat as more balance is needed.
@@ -343,7 +367,8 @@ status update as a payment baseline.
 1. Active pricing is immutable after first status.
 2. Relay `linked_channel.balance_raw` must never exceed the client's own locally signed balance for that same channel.
 3. Relay `session_total_bytes_out` must never exceed the client's locally observed outbound total.
-4. Relay `total_paid_millisats` must never exceed the client's locally authorized payment total.
+4. A higher relay `total_paid_millisats` increases the client's local credit record; a lower report never decreases it or the signed history.
+5. Unavailable initial pricing and an unrepresentable local estimate are distinct: the latter ends the session with a numeric error. Session-total overflow is checked before wallet signing/persistence.
 
 These checks live with the private `payment` module in
 `monad-client/src/session_driver.rs`.
@@ -380,5 +405,5 @@ When reviewing future changes, verify at least:
 
 - single-hop and nested funding still work
 - timer-driven payments do not duplicate in-flight payments
-- relay-authoritative linked-channel sync still gates payment construction
+- relay-reported linked-channel sync still gates payment construction
 - control detach still releases local and relay ownership cleanly

@@ -190,12 +190,15 @@ JavaScript's ordinary `JSON.parse` uses IEEE-754 binary64 numbers, whose 53 bits
 of integer precision represent every integer only through
 `2^53 - 1 = 9,007,199,254,740,991`. Interpreted as millisatoshis, that exact
 safe-integer limit is **90,071.99254740991 BTC**. An implementation may therefore
-use the round lower cap **90,000 BTC = 9,000,000,000,000,000 msat**, check every
-integer and intermediate result, and reject larger values rather than support the
-full `u64` range. Some larger integers happen to be representable, but not every
+choose the round lower cap **90,000 BTC = 9,000,000,000,000,000 msat**, check
+every integer and intermediate result, and reject larger values rather than
+support the full `u64` range. **That 90,000 BTC value is only an example of an
+optional implementation limit; this protocol does not require or recommend that
+particular cap.** Some larger integers happen to be representable, but not every
 adjacent value is, and converting an already rounded `Number` to `BigInt` does
-not restore precision. The cap alone does not make multiplication, addition, or
-counters safe; each intermediate result needs its own exactness check.
+not restore precision. Any reduced-range cap alone does not make multiplication,
+addition, or counters safe; each intermediate result needs its own exactness
+check.
 
 ### 2.3 Sensitive material
 
@@ -463,6 +466,15 @@ from chunk-boundary overshoot and does not erase payment history. New CONNECTs
 MUST be rejected with HTTP 402 while paused; existing tunnels wait for credit.
 Ordinary transport failure or termination may still end them.
 
+A client decides what to pay from its own records: locally observed cleartext
+bytes in each direction plus its signed and accepted-payment history. Relay
+traffic counters are diagnostic and are not proof that the client has received
+or counted those bytes. `total_paid_millisats` is the relay's claim of accepted
+credit; a client may reconcile that claim only upward against its own record of
+accepted or otherwise unexpected credit. It MUST NOT use the relay's claimed
+traffic totals or remaining balance to reduce the client's own paid-credit
+record or to infer an obligation to pay for bytes the client has not observed.
+
 For the byte-accounting events defined in §1.3, implementations MUST check counter
 and billing representability before each bounded forwarding operation and update
 the counter immediately by the number of bytes successfully forwarded.
@@ -593,6 +605,11 @@ balance, and credit commit prevent double credit across concurrent sessions.
 Duplicate or lower payments return `PAYMENT_NO_NEW_FUNDS`, not a successful
 status.
 
+Locally detectable numeric limits, including the proposed session payment-total
+addition, MUST be checked before creating and durably recording a new signature.
+Once signed or exposed, payment history is never rolled back to recover from a
+later local check or relay rejection.
+
 The client keeps three records:
 
 1. **Durable signed channel balance:** highest cumulative balance signed for each
@@ -616,11 +633,16 @@ Reported channel balance MUST NOT exceed what the client signed. A lower relay
 balance is legitimate after uncertain delivery and never lowers the client's
 durable record, as explained in §1.2.
 
-Any definitive payment rejection removes only that request's pending expected
-increment. It does not decrease P or the durable signed balance. Unknown
-acceptance requires reconciliation or session termination before originating
-another payment; already queued responses remain ordered. Retries retain the
-original accounting association and never count one signed increment twice.
+A payment rejection resolves the request's FIFO entry, but MUST NOT subtract
+the signed/sent amount from the client's pessimistic local payment record, P,
+or the durable signed channel balance. Even an explicit rejection cannot revoke
+a signature already exposed to the relay: it may still claim those funds.
+The client retains that exposure and MUST NOT interpret the rejection as budget
+for a replacement payment. It MAY end the session and use the error code to
+guide subsequent sessions. Unknown acceptance requires reconciliation or session
+termination before originating another payment; already queued responses remain
+ordered. Retries retain the original accounting association and never count one
+signed increment twice.
 
 Replacement funding follows local policy rather than automatically repeating a
 rejected amount. An already queued replacement link MUST NOT trigger duplicate

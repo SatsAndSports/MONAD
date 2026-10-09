@@ -567,13 +567,14 @@ pub(super) async fn maybe_progress_payment(
         return Ok(());
     };
     let Some(estimated_remaining) =
-        compute_estimated_remaining(state, &config.conn.cleartext_byte_counters)
+        compute_estimated_remaining(state, &config.conn.cleartext_byte_counters)?
     else {
         return Ok(());
     };
     let should_pay = snapshot.paused
         || snapshot.remaining_milli_sats <= 0
-        || estimated_remaining < config.payment_policy.target_topup_buffer_msats as i64;
+        || i128::from(estimated_remaining)
+            < i128::from(config.payment_policy.target_topup_buffer_msats);
     if linked_channel.channel_id != intended_channel_id || !should_pay {
         if linked_channel.channel_id != intended_channel_id {
             info!(
@@ -639,6 +640,17 @@ pub(super) async fn maybe_progress_payment(
         reconcile_payment_topup(planned_next_balance_raw, signed_balance_raw, linked_channel)
             .map_err(|e| io::Error::other(format!("payment delta conversion failed: {e}")))?;
 
+    // This is a local numeric preflight, before the wallet signs/persists.
+    let next_local_session_paid_msats = state
+        .local_session_paid_msats
+        .checked_add(authorized_delta_msats)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local session payment total exceeds u64 range",
+            )
+        })?;
+
     match config.wallet.build_channel_payment(
         &intended_channel_id,
         &intended_offer,
@@ -657,9 +669,7 @@ pub(super) async fn maybe_progress_payment(
                 state_summary(state, &config.conn.cleartext_byte_counters)
             );
             send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await?;
-            state.local_session_paid_msats = state
-                .local_session_paid_msats
-                .saturating_add(authorized_delta_msats);
+            state.local_session_paid_msats = next_local_session_paid_msats;
             set_payment_in_flight(state, intended_channel_id.clone(), next_balance_raw);
             if let Some((owner, hop)) = &config.management {
                 hop.paying(owner, intended_channel_id);
@@ -719,6 +729,9 @@ pub(super) async fn apply_server_error(
     state: &mut DriverState,
     code: ServerErrorCode,
 ) {
+    // Rejection does not revoke a signed payment. Retain the pessimistic local
+    // payment record: the relay may still claim those funds. The runtime ends
+    // the session after recording any channel-specific consequences below.
     clear_control_op(state);
 
     if code == ServerErrorCode::ChannelAdmissionDisabled {

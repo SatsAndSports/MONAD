@@ -1,10 +1,11 @@
 //! Server-side proxy helpers.
 
 use crate::session::SessionState;
+use crate::session_fsm::ByteDirection;
 use bytes::Bytes;
 use h2::{RecvStream, SendStream};
 use monad_common::h2stream::wait_for_send_capacity;
-use std::io;
+use std::{future::poll_fn, io, pin::Pin, task::Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -21,11 +22,14 @@ struct TunnelAccounting<'a> {
 
 impl Drop for TunnelAccounting<'_> {
     fn drop(&mut self) {
-        let (open_connects, total_connects) = self.state.connect_closed();
+        let Some((open_connects, total_connects)) = self.state.connect_closed() else {
+            self.state.terminate();
+            return;
+        };
         info!(
             "tunnel closed: {} | session_id={} open_connects={} total_connects={} outbound={} inbound={} total={}",
             self.label, hex::encode(self.state.session_id()), open_connects, total_connects,
-            self.outbound, self.inbound, self.outbound.saturating_add(self.inbound)
+            self.outbound, self.inbound, self.outbound as u128 + self.inbound as u128
         );
     }
 }
@@ -38,31 +42,26 @@ async fn wait_until_unpaused_or_terminated(
         if !*paused_rx.borrow() {
             return Ok(());
         }
-
         tokio::select! {
             _ = termination.cancelled() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "session terminated",
-                ));
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "session terminated"));
             }
             changed = paused_rx.changed() => {
-                changed.map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "session pause channel closed unexpectedly",
-                    )
-                })?;
+                changed.map_err(|_| io::Error::new(
+                    io::ErrorKind::BrokenPipe, "session pause channel closed unexpectedly",
+                ))?;
             }
         }
     }
 }
 
-/// Proxy bytes bidirectionally while enforcing per-session payment pauses.
+/// Proxy with exact accounting and chunk-boundary payment pauses.
 ///
-/// Byte accounting stays on the fast path here rather than flowing through the
-/// main control/session reducer so the active data path can update counters as
-/// soon as possible.
+/// An operation started with positive credit may finish and take credit negative.
+/// Numeric preflight and the successful write count commit in one synchronous
+/// poll, before task cancellation/drop can intervene. No billing lock is held
+/// while waiting for transport readiness and no prepaid bytes are reserved.
+/// This is in-memory accounting, not a process-crash-durable traffic journal.
 pub(crate) async fn proxy_bidirectional_accounted<T>(
     mut h2_send: SendStream<Bytes>,
     mut h2_recv: RecvStream,
@@ -89,33 +88,44 @@ where
     let h2_to_target = async {
         loop {
             wait_until_unpaused_or_terminated(&mut paused_rx_a, &termination_a).await?;
-
-            match tokio::select! {
-                _ = termination_a.cancelled() => None,
-                item = h2_recv.data() => item,
-            } {
-                Some(Ok(data)) => {
-                    let len = data.len();
-                    let _ = h2_recv.flow_control().release_capacity(len);
-
-                    target_write.write_all(&data).await?;
-                    accounting.outbound = accounting.outbound.saturating_add(len as u64);
-
-                    let paused = state.note_outbound_bytes(len).await;
-                    if paused {
-                        state.push_status().await;
-                    }
+            let data = match h2_recv.data().await {
+                Some(Ok(data)) => data,
+                Some(Err(error)) => {
+                    return Err(io::Error::other(format!("h2 recv error: {error}")))
                 }
-                Some(Err(e)) => {
-                    return Err(io::Error::other(format!("h2 recv error: {e}")));
+                None => break,
+            };
+            // Restore the original stream-capacity timing: consumption by this
+            // proxy releases the frame before the target write. At most one
+            // bounded DATA frame is held here, including on a slow target.
+            let _ = h2_recv.flow_control().release_capacity(data.len());
+            let mut written = 0;
+            let mut pause_changed = false;
+            while written < data.len() {
+                let (n, changed) = poll_fn(|cx| {
+                    state.poll_accounted_forward(
+                        ByteDirection::Outbound,
+                        data.len() - written,
+                        || Pin::new(&mut target_write).poll_write(cx, &data[written..]),
+                    )
+                })
+                .await?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "target write returned zero",
+                    ));
                 }
-                None => {
-                    debug!("h2 recv stream ended");
-                    break;
-                }
+                written += n;
+                // A tunnel total is bounded by the corresponding checked
+                // session total. These additions cannot overflow.
+                accounting.outbound += n as u64;
+                pause_changed |= changed;
+            }
+            if pause_changed {
+                state.push_status().await;
             }
         }
-
         target_write.shutdown().await?;
         Ok::<(), io::Error>(())
     };
@@ -124,52 +134,47 @@ where
         let mut buf = vec![0u8; 16384];
         loop {
             wait_until_unpaused_or_terminated(&mut paused_rx_b, &termination_b).await?;
-
-            match tokio::select! {
-                _ = termination_b.cancelled() => Ok(0),
-                read = target_read.read(&mut buf) => read,
-            } {
-                Ok(0) => {
-                    debug!("target read EOF");
-                    break;
-                }
-                Ok(n) => {
-                    let data = Bytes::copy_from_slice(&buf[..n]);
-
-                    h2_send.reserve_capacity(data.len());
-                    wait_for_send_capacity(&mut h2_send).await?;
+            let n = target_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let data = Bytes::copy_from_slice(&buf[..n]);
+            h2_send.reserve_capacity(n);
+            wait_for_send_capacity(&mut h2_send).await?;
+            // send_data is synchronous and all-or-nothing. The numeric check,
+            // enqueue, and byte accounting have no intervening suspension.
+            let result = state.poll_accounted_forward(ByteDirection::Inbound, n, || {
+                Poll::Ready(
                     h2_send
                         .send_data(data, false)
-                        .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
-                    accounting.inbound = accounting.inbound.saturating_add(n as u64);
-
-                    let paused = state.note_inbound_bytes(n).await;
-                    if paused {
-                        state.push_status().await;
-                    }
-                }
-                Err(e) => {
-                    return Err(e);
-                }
+                        .map(|()| n)
+                        .map_err(|error| io::Error::other(format!("h2 send error: {error}"))),
+                )
+            });
+            let Poll::Ready(result) = result else {
+                unreachable!("H2 send_data is synchronous")
+            };
+            let (_, pause_changed) = result?;
+            accounting.inbound += n as u64;
+            if pause_changed {
+                state.push_status().await;
             }
         }
-
         h2_send
             .send_data(Bytes::new(), true)
-            .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
+            .map_err(|error| io::Error::other(format!("h2 send error: {error}")))?;
         Ok::<(), io::Error>(())
     };
 
-    // Cancellation covers writes, shutdown, and H2 capacity as well as reads.
-    // Normal EOF still waits for the other direction (TCP half-close).
+    // Completed writes are already counted even when this drops a direction
+    // mid-operation. Normal EOF still preserves the other half of the tunnel.
     let result = tokio::select! {
         biased;
         _ = termination.cancelled() => return Ok(()),
         result = async { tokio::try_join!(h2_to_target, target_to_h2) } => result,
     };
-    if let Err(e) = &result {
-        debug!("proxy {label} ended with error: {e}");
+    if let Err(error) = &result {
+        debug!("proxy {label} ended with error: {error}");
     }
-
     result.map(|_| ())
 }

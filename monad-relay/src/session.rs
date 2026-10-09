@@ -29,13 +29,14 @@ use monad_common::protocol::{
     ClientMessage, MintUnitAdvertisement, MintUnitAdvertisements, ServerErrorCode, ServerMessage,
 };
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
-use monad_common::session::{clamp_i128_to_i64, SessionPricing};
+use monad_common::session::SessionPricing;
 use monad_quic::client::ClientAuthMode;
 use monad_quic::stream::{STREAM_KIND_SECP_NOISE, STREAM_KIND_TWEAKED_NOISE};
 use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as BillingMutex};
+use std::task::Poll;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -108,40 +109,62 @@ impl SessionCounters {
         )
     }
 
-    fn connect_opened(&self) -> (u32, u64) {
-        let open_connects = self
-            .open_connects
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        let total_connects = self
-            .total_connects
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        (open_connects, total_connects)
+    fn connect_acceptance_available(&self) -> bool {
+        self.open_connects.load(Ordering::Relaxed) != u32::MAX
+            && self.total_connects.load(Ordering::Relaxed) != u64::MAX
     }
 
-    fn connect_failed(&self) -> u64 {
-        self.failed_connects
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1)
-    }
-
-    fn connect_closed(&self) -> (u32, u64) {
+    fn connect_opened(&self) -> Option<(u32, u64)> {
         let open_connects = self
             .open_connects
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(1))
+                current.checked_add(1)
             })
-            .map(|previous| previous.saturating_sub(1))
-            .unwrap_or(0);
+            .ok()
+            .map(|previous| previous + 1)?;
+        let total_connects = match self.total_connects.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_add(1),
+        ) {
+            Ok(previous) => previous + 1,
+            Err(_) => {
+                let _ = self.open_connects.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |current| current.checked_sub(1),
+                );
+                return None;
+            }
+        };
+        Some((open_connects, total_connects))
+    }
+
+    fn connect_failed(&self) -> Option<u64> {
+        self.failed_connects
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+            .map(|previous| previous + 1)
+    }
+
+    fn connect_closed(&self) -> Option<(u32, u64)> {
+        let open_connects = self
+            .open_connects
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            })
+            .ok()
+            .map(|previous| previous - 1)?;
         let total_connects = self.total_connects.load(Ordering::Relaxed);
-        (open_connects, total_connects)
+        Some((open_connects, total_connects))
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct SessionState {
-    billing: Arc<Mutex<BillingState>>,
+    billing: Arc<BillingMutex<BillingState>>,
     control: Arc<Mutex<ControlState>>,
     counters: Arc<SessionCounters>,
     pause_tx: watch::Sender<bool>,
@@ -161,13 +184,13 @@ pub(crate) struct SessionState {
 /// Snapshot-only handles have no back-reference to the registry/session owner.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMonitor {
-    billing: Arc<Mutex<BillingState>>,
+    billing: Arc<BillingMutex<BillingState>>,
     counters: Arc<SessionCounters>,
 }
 
 impl SessionMonitor {
     pub(crate) async fn snapshot(&self, id: [u8; 32]) -> serde_json::Value {
-        let billing = self.billing.lock().await;
+        let billing = self.billing.lock().unwrap();
         let (active, total, _) = self.counters.snapshot();
         serde_json::json!({
             "session_id": hex::encode(id), "inbound_bytes": billing.state.session_total_bytes_in,
@@ -190,7 +213,7 @@ impl SessionState {
             .session_registry
             .register_session(session_id, termination.clone());
         let state = Self {
-            billing: Arc::new(Mutex::new(BillingState {
+            billing: Arc::new(BillingMutex::new(BillingState {
                 state: ServerSessionState {
                     session_total_bytes_in: 0,
                     session_total_bytes_out: 0,
@@ -200,8 +223,8 @@ impl SessionState {
                     terminated: false,
                 },
                 pricing: SessionPricing::new(
-                    config.in_bytes_per_millisat.max(1),
-                    config.out_bytes_per_millisat.max(1),
+                    config.in_bytes_per_millisat,
+                    config.out_bytes_per_millisat,
                 ),
             })),
             control: Arc::new(Mutex::new(ControlState::default())),
@@ -347,15 +370,28 @@ impl SessionState {
         }
     }
 
-    pub(crate) fn apply_channel_payment(
+    pub(crate) async fn apply_channel_payment(
         &self,
         expected_channel_id: &str,
         payment_json: &str,
     ) -> Result<crate::payments::PaymentOutcome, crate::payments::ChannelPaymentError> {
-        let result = self.payments.apply_channel_payment(
+        let max_delta_millisats = {
+            let billing = self.billing.lock().unwrap();
+            let remaining = billing.remaining_milli_sats();
+            if i64::try_from(remaining).is_err() {
+                return Err(crate::payments::ChannelPaymentError::NumericLimitExceeded);
+            }
+            // Both wire fields must fit *before* the channel balance is stored.
+            // Concurrent data accounting only decreases remaining credit, so
+            // using this snapshot is conservative for the payment increment.
+            let wire_headroom = (i64::MAX as i128 - remaining) as u64;
+            (u64::MAX - billing.state.total_paid_millisats).min(wire_headroom)
+        };
+        let result = self.payments.apply_channel_payment_with_limit(
             self.session_id,
             expected_channel_id,
             payment_json,
+            max_delta_millisats,
         )?;
         self.session_registry.events.record(
             "payment_accepted",
@@ -395,8 +431,15 @@ impl SessionState {
 
     // Billing state and status snapshots.
 
-    pub(crate) async fn session_status_message(&self) -> ServerMessage {
-        let billing = self.billing.lock().await;
+    pub(crate) async fn session_status_message(&self) -> Option<ServerMessage> {
+        let billing = self.billing.lock().unwrap();
+        let Some(remaining_milli_sats) =
+            monad_common::billing::remaining_milli_sats_to_wire(billing.remaining_milli_sats())
+        else {
+            drop(billing);
+            self.terminate();
+            return None;
+        };
         let (open_connects, total_connects, failed_connects) = self.counters.snapshot();
 
         let mut advertisements = MintUnitAdvertisements::new();
@@ -416,7 +459,7 @@ impl SessionState {
             }
         }
 
-        ServerMessage::SessionStatus {
+        Some(ServerMessage::SessionStatus {
             receiver_pubkey: self.receiver_pubkey_hex.clone(),
             advertisements,
             linked_channel: billing
@@ -429,16 +472,16 @@ impl SessionState {
             session_total_bytes_in: billing.state.session_total_bytes_in,
             session_total_bytes_out: billing.state.session_total_bytes_out,
             total_paid_millisats: billing.state.total_paid_millisats,
-            remaining_milli_sats: clamp_i128_to_i64(billing.remaining_milli_sats()),
+            remaining_milli_sats,
             paused: billing.state.paused,
             open_connects,
             total_connects,
             failed_connects,
-        }
+        })
     }
 
     async fn is_paused(&self) -> bool {
-        let billing = self.billing.lock().await;
+        let billing = self.billing.lock().unwrap();
         billing.state.paused || billing.state.terminated
     }
 
@@ -455,28 +498,63 @@ impl SessionState {
         self.session_registry.deregister_control(&self.session_id);
     }
 
-    pub(crate) async fn note_outbound_bytes(&self, bytes: usize) -> bool {
-        self.note_bytes(bytes, true).await
-    }
-
-    pub(crate) async fn note_inbound_bytes(&self, bytes: usize) -> bool {
-        self.note_bytes(bytes, false).await
-    }
-
-    async fn note_bytes(&self, bytes: usize, outbound: bool) -> bool {
-        let mut billing = self.billing.lock().await;
-        let direction = if outbound {
-            ByteDirection::Outbound
-        } else {
-            ByteDirection::Inbound
+    /// Check representability, perform one nonblocking transport operation, and
+    /// commit its actual byte count in the same poll. No guard survives Pending
+    /// or an await. Cancellation/drop cannot interpose after a successful write.
+    /// This lock is numeric accounting only: it never reserves prepaid credit
+    /// and does not stop an already-started chunk from taking credit negative.
+    pub(crate) fn poll_accounted_forward(
+        &self,
+        direction: ByteDirection,
+        maximum_bytes: usize,
+        forward: impl FnOnce() -> Poll<io::Result<usize>>,
+    ) -> Poll<io::Result<(usize, bool)>> {
+        let mut billing = self.billing.lock().unwrap();
+        let candidate = match apply_accounted_bytes(
+            billing.state.clone(),
+            billing.pricing,
+            direction,
+            maximum_bytes,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.terminate();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("session accounting limit exceeded before forwarding: {error:?}"),
+                )));
+            }
         };
-        let (next_state, pause_changed) =
-            apply_accounted_bytes(billing.state.clone(), billing.pricing, direction, bytes);
+        let actual_bytes = match forward() {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(actual)) if actual <= maximum_bytes => actual,
+            Poll::Ready(Ok(_)) => {
+                self.terminate();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transport reported more bytes than offered",
+                )));
+            }
+        };
+        let (next_state, pause_changed) = if actual_bytes == maximum_bytes {
+            candidate
+        } else {
+            // Totals and due are monotone in actual_bytes; the maximum passed
+            // the check while this same lock was held.
+            apply_accounted_bytes(
+                billing.state.clone(),
+                billing.pricing,
+                direction,
+                actual_bytes,
+            )
+            .expect("actual prefix fits the preflight bound")
+        };
         billing.state = next_state;
         if let Some(paused) = pause_changed {
             let _ = self.pause_tx.send_replace(paused);
         }
-        billing.state.paused
+        Poll::Ready(Ok((actual_bytes, pause_changed.is_some())))
     }
 
     // Control-stream state.
@@ -493,21 +571,26 @@ impl SessionState {
     }
 
     pub(crate) async fn push_status(&self) {
-        let status = self.session_status_message().await;
-        self.push_message(status).await;
+        if let Some(status) = self.session_status_message().await {
+            self.push_message(status).await;
+        }
     }
 
     // Observability counters.
 
-    pub(crate) fn connect_opened(&self) -> (u32, u64) {
+    fn connect_acceptance_available(&self) -> bool {
+        self.counters.connect_acceptance_available()
+    }
+
+    pub(crate) fn connect_opened(&self) -> Option<(u32, u64)> {
         self.counters.connect_opened()
     }
 
-    fn connect_failed(&self) -> u64 {
+    fn connect_failed(&self) -> Option<u64> {
         self.counters.connect_failed()
     }
 
-    pub(crate) fn connect_closed(&self) -> (u32, u64) {
+    pub(crate) fn connect_closed(&self) -> Option<(u32, u64)> {
         self.counters.connect_closed()
     }
 }
@@ -538,8 +621,8 @@ struct ConnectHandler {
 
 impl Drop for ConnectHandler {
     fn drop(&mut self) {
-        if !self.accepted.load(Ordering::Relaxed) {
-            self.state.connect_failed();
+        if !self.accepted.load(Ordering::Relaxed) && self.state.connect_failed().is_none() {
+            self.state.terminate();
         }
     }
 }
@@ -616,6 +699,14 @@ impl ConnectHandler {
         if self.state.is_paused().await {
             let resp = Response::builder()
                 .status(StatusCode::PAYMENT_REQUIRED)
+                .body(())
+                .unwrap();
+            let _ = respond.send_response(resp, true);
+            return;
+        }
+        if !self.state.connect_acceptance_available() {
+            let resp = Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
                 .body(())
                 .unwrap();
             let _ = respond.send_response(resp, true);
@@ -783,6 +874,14 @@ impl ConnectHandler {
                 respond.send_reset(h2::Reason::CANCEL);
                 return Ok(None);
             }
+            if !self.state.connect_acceptance_available() {
+                let resp = Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(())
+                    .unwrap();
+                respond.send_response(resp, true)?;
+                return Ok(None);
+            }
             let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
             respond.send_response(resp, false).map(Some)
         })?;
@@ -792,8 +891,11 @@ impl ConnectHandler {
         let (_, h2_recv) = request.into_parts();
         let state = self.state.clone();
         let session_id = self.state.session_id;
-        let (open_connects, total_connects) = state.connect_opened();
         self.accepted.store(true, Ordering::Relaxed);
+        let Some((open_connects, total_connects)) = state.connect_opened() else {
+            state.terminate();
+            return Ok(());
+        };
         info!(
             "CONNECT opened: {authority} ({label}) | session_id={} open_connects={} total_connects={}",
             hex::encode(session_id),
@@ -1022,7 +1124,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
         // Drop every child synchronously before releasing session authority.
         // No join is necessary: none of these futures runs in another task.
         drop(children);
-        if self.state.billing.lock().await.state.terminated {
+        let terminated = self.state.billing.lock().unwrap().state.terminated;
+        if terminated {
             // Flush queued control errors without letting a peer delay teardown indefinitely.
             self.h2_conn.graceful_shutdown();
             let _ = tokio::time::timeout(
@@ -1078,7 +1181,10 @@ async fn handle_control_stream(
         // Bootstrap stays outside the explicit steady-state session FSM. After the
         // pre-H2 Noise bootstrap selected the session protocol, we immediately send
         // the initial SessionStatus before entering the reducer-driven control loop.
-        let initial_status = state.session_status_message().await;
+        let Some(initial_status) = state.session_status_message().await else {
+            state.terminate();
+            return Ok(());
+        };
         send_control_message(&mut h2_send, &initial_status).await?;
 
         let mut terminate_session = false;
@@ -1222,7 +1328,7 @@ async fn process_session_event(
 
     while let Some(event) = pending.pop_front() {
         let effects = {
-            let mut billing = state.billing.lock().await;
+            let mut billing = state.billing.lock().unwrap();
             let (next_state, effects) = step(billing.state.clone(), event, billing.pricing);
             billing.state = next_state;
             effects
@@ -1292,8 +1398,8 @@ mod tests {
                     r#"{"channel_id":"abort-owned","balance":0,"capacity":100,"unit":"msat"}"#,
                 )
                 .unwrap();
-            state.billing.lock().await.state.linked_channel_id = Some(link.channel_id);
-            state.billing.lock().await.state.paused = false;
+            state.billing.lock().unwrap().state.linked_channel_id = Some(link.channel_id);
+            state.billing.lock().unwrap().state.paused = false;
             state.update_pause_watch(false);
             let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let (client_io, server_io) = tokio::io::duplex(4096);
@@ -1325,7 +1431,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let (mut target, _) = target.accept().await.unwrap();
-            state.billing.lock().await.state.paused = true;
+            state.billing.lock().unwrap().state.paused = true;
             state.update_pause_watch(true);
             match finish {
                 "abort" => task.abort(),
@@ -1359,6 +1465,44 @@ mod tests {
             client_driver.abort();
             let _ = client_driver.await;
         }
+    }
+
+    #[test]
+    fn connect_counters_reject_overflow_without_wrapping() {
+        let (state, _) = test_state();
+        state
+            .counters
+            .open_connects
+            .store(u32::MAX, Ordering::Relaxed);
+        assert!(!state.connect_acceptance_available());
+        assert_eq!(state.connect_opened(), None);
+        assert_eq!(
+            state.counters.open_connects.load(Ordering::Relaxed),
+            u32::MAX
+        );
+
+        state.counters.open_connects.store(0, Ordering::Relaxed);
+        state
+            .counters
+            .total_connects
+            .store(u64::MAX, Ordering::Relaxed);
+        assert!(!state.connect_acceptance_available());
+        assert_eq!(state.connect_opened(), None);
+        assert_eq!(state.counters.open_connects.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            state.counters.total_connects.load(Ordering::Relaxed),
+            u64::MAX
+        );
+
+        state
+            .counters
+            .failed_connects
+            .store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(state.connect_failed(), None);
+
+        state.counters.open_connects.store(1, Ordering::Relaxed);
+        assert_eq!(state.connect_closed(), Some((0, u64::MAX)));
+        assert_eq!(state.connect_closed(), None);
     }
 
     #[test]
@@ -1520,7 +1664,7 @@ mod tests {
         let channel_a = r#"{"channel_id":"replace-a","balance":0,"capacity":100,"unit":"msat"}"#;
         let channel_b = r#"{"channel_id":"replace-b","balance":0,"capacity":100,"unit":"msat"}"#;
         let linked_a = state.link_channel(channel_a).unwrap();
-        state.billing.lock().await.state.linked_channel_id = Some(linked_a.channel_id);
+        state.billing.lock().unwrap().state.linked_channel_id = Some(linked_a.channel_id);
         let (mut send, _recv, _client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
 
         let mut replacement = Box::pin(process_session_event(
@@ -1540,7 +1684,7 @@ mod tests {
             state
                 .billing
                 .lock()
-                .await
+                .unwrap()
                 .state
                 .linked_channel_id
                 .as_deref(),
@@ -1556,7 +1700,7 @@ mod tests {
         drivers.shutdown().await;
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum BlockedOperation {
         Write,
         Shutdown,
@@ -1633,8 +1777,13 @@ mod tests {
             BlockedOperation::H2Capacity,
         ] {
             let (state, _) = test_state();
+            {
+                let mut billing = state.billing.lock().unwrap();
+                billing.state.total_paid_millisats = 1000;
+                billing.state.paused = false;
+            }
             state.update_pause_watch(false);
-            state.connect_opened();
+            state.connect_opened().unwrap();
             let (send, recv, mut client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
             let (entered, entered_rx) = tokio::sync::oneshot::channel();
             let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1664,11 +1813,13 @@ mod tests {
                 }
             })
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{operation:?} did not enter its gate: {error}"));
             state.terminate();
             timeout(Duration::from_secs(2), &mut proxy)
                 .await
-                .unwrap()
+                .unwrap_or_else(|error| {
+                    panic!("{operation:?} did not exit on termination: {error}")
+                })
                 .unwrap();
             assert!(dropped.load(Ordering::SeqCst));
             assert_eq!(state.counters.snapshot(), (0, 1, 0));
@@ -1684,7 +1835,7 @@ mod tests {
         let link = state
             .link_channel(r#"{"channel_id":"owned","balance":0,"capacity":100,"unit":"msat"}"#)
             .unwrap();
-        state.billing.lock().await.state.linked_channel_id = Some(link.channel_id);
+        state.billing.lock().unwrap().state.linked_channel_id = Some(link.channel_id);
         let (send, recv, _client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
         let (tx, rx) = mpsc::unbounded_channel();
         state.attach_control(tx).await.unwrap();
@@ -1709,7 +1860,7 @@ mod tests {
         use tokio::time::{timeout, Duration};
         for wait_for_deadline in [false, true] {
             let (state, _) = test_state();
-            state.billing.lock().await.state.paused = false;
+            state.billing.lock().unwrap().state.paused = false;
             state.update_pause_watch(false);
             // A bound UDP socket that observes but never answers QUIC Initials is
             // a deterministic setup gate, not an unroutable-host timing assumption.
@@ -1791,12 +1942,406 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_partial_write_survives_termination_drop_and_abort() {
+        use tokio::time::{timeout, Duration};
+
+        #[derive(Debug)]
+        struct PartialWriteTarget {
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+
+        impl AsyncRead for PartialWriteTarget {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl AsyncWrite for PartialWriteTarget {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                    return std::task::Poll::Ready(Ok(buf.len().min(3)));
+                }
+                std::task::Poll::Pending
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        for finish in ["terminate", "drop", "abort"] {
+            let (state, _) = test_state();
+            {
+                let mut billing = state.billing.lock().unwrap();
+                billing.state.total_paid_millisats = 10;
+                billing.state.paused = false;
+            }
+            state.update_pause_watch(false);
+            state.connect_opened().unwrap();
+            let (send, recv, mut client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
+            let (entered, entered_rx) = tokio::sync::oneshot::channel();
+            let target = PartialWriteTarget {
+                entered: Some(entered),
+            };
+            client_send
+                .send_data(Bytes::from_static(b"0123456789"), false)
+                .unwrap();
+            let mut proxy = Box::pin(proxy::proxy_bidirectional_accounted(
+                send,
+                recv,
+                target,
+                "partial-write",
+                state.clone(),
+            ));
+            if finish == "abort" {
+                let task = tokio::spawn(proxy);
+                timeout(Duration::from_secs(2), entered_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    result = &mut proxy => panic!("proxy completed before partial write: {result:?}"),
+                    result = entered_rx => result.unwrap(),
+                }
+            }).await.unwrap();
+                // Counts are already current while the next write is blocked.
+                assert_eq!(
+                    state.billing.lock().unwrap().state.session_total_bytes_out,
+                    3
+                );
+                if finish == "terminate" {
+                    state.terminate();
+                    timeout(Duration::from_secs(2), &mut proxy)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                drop(proxy);
+            }
+            assert_eq!(
+                state.billing.lock().unwrap().state.session_total_bytes_out,
+                3
+            );
+            assert_eq!(state.counters.snapshot(), (0, 1, 0));
+            drivers.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn session_payment_limit_rejects_before_balance_mutation() {
+        let (state, payments) = test_state();
+        let link = state
+            .link_channel(r#"{"channel_id":"limited","balance":0,"capacity":10,"unit":"msat"}"#)
+            .unwrap();
+        state.billing.lock().unwrap().state.linked_channel_id = Some(link.channel_id.clone());
+        state.billing.lock().unwrap().state.total_paid_millisats = u64::MAX;
+        // Keep remaining credit representable so this exercises u64 paid-total
+        // exhaustion independently of the i64 remaining-credit check.
+        state.billing.lock().unwrap().state.session_total_bytes_out = u64::MAX;
+
+        let error = state
+            .apply_channel_payment(
+                "limited",
+                r#"{"channel_id":"limited","balance":1,"signature":"sig"}"#,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            crate::payments::ChannelPaymentError::NumericLimitExceeded
+        );
+        assert_eq!(
+            payments
+                .linked_channel_status("limited")
+                .unwrap()
+                .balance_raw,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_checks_signed_remaining_limit_before_acceptance() {
+        for (unit, scale) in [("msat", 1_u64), ("sat", 1000)] {
+            let (state, payments) = test_state();
+            let link =
+                format!(r#"{{"channel_id":"bounded","balance":0,"capacity":10,"unit":"{unit}"}}"#);
+            state.link_channel(&link).unwrap();
+            {
+                let mut billing = state.billing.lock().unwrap();
+                billing.state.total_paid_millisats = i64::MAX as u64 - scale;
+                billing.state.linked_channel_id = Some("bounded".into());
+            }
+            let before = payments.linked_channel_status("bounded").unwrap();
+            let rejected = state
+                .apply_channel_payment("bounded", r#"{"channel_id":"bounded","balance":2}"#)
+                .await;
+            assert_eq!(
+                rejected.unwrap_err(),
+                crate::payments::ChannelPaymentError::NumericLimitExceeded
+            );
+            assert_eq!(payments.linked_channel_status("bounded").unwrap(), before);
+            assert_eq!(
+                state.billing.lock().unwrap().state.total_paid_millisats,
+                i64::MAX as u64 - scale
+            );
+            let accepted = state
+                .apply_channel_payment("bounded", r#"{"channel_id":"bounded","balance":1}"#)
+                .await
+                .unwrap();
+            let mut billing = state.billing.lock().unwrap();
+            let (next, _) = step(
+                billing.state.clone(),
+                SessionEvent::PaymentValidationFinished(Ok(accepted)),
+                billing.pricing,
+            );
+            billing.state = next;
+            assert_eq!(billing.remaining_milli_sats(), i64::MAX as i128);
+        }
+    }
+
+    #[test]
+    fn forwarding_numeric_preflight_prevents_transport_side_effects() {
+        for direction in [ByteDirection::Inbound, ByteDirection::Outbound] {
+            let (state, _) = test_state();
+            {
+                let mut billing = state.billing.lock().unwrap();
+                billing.pricing = SessionPricing::new(u64::MAX, u64::MAX);
+                match direction {
+                    ByteDirection::Inbound => billing.state.session_total_bytes_in = u64::MAX,
+                    ByteDirection::Outbound => billing.state.session_total_bytes_out = u64::MAX,
+                }
+            }
+            let result = state.poll_accounted_forward(direction, 1, || {
+                panic!("overflow must reject before transport poll")
+            });
+            assert!(matches!(result, Poll::Ready(Err(_))));
+            assert!(state.is_terminated());
+        }
+        let (state, _) = test_state();
+        state.billing.lock().unwrap().state.session_total_bytes_out = i64::MAX as u64;
+        assert!(matches!(
+            state.poll_accounted_forward(ByteDirection::Outbound, 2, || panic!(
+                "i64 range preflight"
+            )),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(
+            state.billing.lock().unwrap().state.session_total_bytes_out,
+            i64::MAX as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_limits_are_representation_bounds_not_optional_policy_caps() {
+        let (state, payments) = test_state();
+        let too_large_sat_balance = i64::MAX as u64 / 1000 + 1;
+        state.link_channel(&format!(r#"{{"channel_id":"sat-limit","balance":0,"capacity":{too_large_sat_balance},"unit":"sat"}}"#)).unwrap();
+        assert_eq!(
+            state
+                .apply_channel_payment(
+                    "sat-limit",
+                    &format!(r#"{{"channel_id":"sat-limit","balance":{too_large_sat_balance}}}"#)
+                )
+                .await
+                .unwrap_err(),
+            crate::payments::ChannelPaymentError::NumericLimitExceeded
+        );
+        assert_eq!(
+            payments
+                .linked_channel_status("sat-limit")
+                .unwrap()
+                .balance_raw,
+            0
+        );
+
+        let large_msats = 9_000_000_000_000_001_u64;
+        state
+            .link_channel(&format!(
+                r#"{{"channel_id":"large","balance":0,"capacity":{large_msats},"unit":"msat"}}"#
+            ))
+            .unwrap();
+        assert_eq!(
+            state
+                .apply_channel_payment(
+                    "large",
+                    &format!(r#"{{"channel_id":"large","balance":{large_msats}}}"#)
+                )
+                .await
+                .unwrap()
+                .delta_millisats,
+            large_msats
+        );
+    }
+
+    #[test]
+    fn pending_and_failed_transport_polls_do_not_charge_or_hold_accounting_lock() {
+        let (state, _) = test_state();
+        assert!(state
+            .poll_accounted_forward(ByteDirection::Outbound, 10, || Poll::Pending)
+            .is_pending());
+        assert_eq!(
+            state
+                .billing
+                .try_lock()
+                .unwrap()
+                .state
+                .session_total_bytes_out,
+            0
+        );
+        assert!(matches!(
+            state.poll_accounted_forward(ByteDirection::Outbound, 10, || Poll::Ready(Err(
+                io::ErrorKind::BrokenPipe.into()
+            ))),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(
+            state
+                .billing
+                .try_lock()
+                .unwrap()
+                .state
+                .session_total_bytes_out,
+            0
+        );
+        // A successful partial prefix counts exactly and may overshoot credit.
+        assert!(matches!(
+            state.poll_accounted_forward(ByteDirection::Outbound, 10, || Poll::Ready(Ok(3))),
+            Poll::Ready(Ok((3, _)))
+        ));
+        assert_eq!(state.billing.lock().unwrap().remaining_milli_sats(), -3);
+    }
+
+    #[test]
+    fn concurrent_forwarders_cannot_race_numeric_headroom() {
+        for direction in [ByteDirection::Inbound, ByteDirection::Outbound] {
+            let (state, _) = test_state();
+            {
+                let mut billing = state.billing.lock().unwrap();
+                billing.pricing = SessionPricing::new(u64::MAX, u64::MAX);
+                match direction {
+                    ByteDirection::Inbound => billing.state.session_total_bytes_in = u64::MAX - 4,
+                    ByteDirection::Outbound => billing.state.session_total_bytes_out = u64::MAX - 4,
+                }
+            }
+            let gate = std::sync::Barrier::new(2);
+            let forwarded = AtomicU64::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        gate.wait();
+                        state.poll_accounted_forward(direction, 4, || {
+                            forwarded.fetch_add(4, Ordering::Relaxed);
+                            Poll::Ready(Ok(4))
+                        })
+                    });
+                }
+            });
+            assert_eq!(forwarded.load(Ordering::Relaxed), 4);
+            let billing = state.billing.lock().unwrap();
+            let total = match direction {
+                ByteDirection::Inbound => billing.state.session_total_bytes_in,
+                ByteDirection::Outbound => billing.state.session_total_bytes_out,
+            };
+            assert_eq!(total, u64::MAX);
+        }
+        let (state, _) = test_state();
+        state.billing.lock().unwrap().state.session_total_bytes_out = i64::MAX as u64;
+        let gate = std::sync::Barrier::new(2);
+        let forwarded = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for direction in [ByteDirection::Inbound, ByteDirection::Outbound] {
+                let state = &state;
+                let gate = &gate;
+                let forwarded = &forwarded;
+                scope.spawn(move || {
+                    gate.wait();
+                    state.poll_accounted_forward(direction, 1, || {
+                        forwarded.fetch_add(1, Ordering::Relaxed);
+                        Poll::Ready(Ok(1))
+                    })
+                });
+            }
+        });
+        assert_eq!(forwarded.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.billing.lock().unwrap().remaining_milli_sats(),
+            i64::MIN as i128
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_enqueued_before_pause_drains_and_survives_proxy_drop() {
+        let (state, _) = test_state();
+        {
+            let mut billing = state.billing.lock().unwrap();
+            billing.state.total_paid_millisats = 1;
+            billing.state.paused = false;
+        }
+        state.update_pause_watch(false);
+        state.connect_opened().unwrap();
+        let (send, recv, _client_send, mut client_recv, mut drivers) = test_h2_streams(65535).await;
+        let (target, mut peer) = tokio::io::duplex(64);
+        peer.write_all(b"data").await.unwrap();
+        let mut proxy = Box::pin(proxy::proxy_bidirectional_accounted(
+            send,
+            recv,
+            target,
+            "inbound",
+            state.clone(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut proxy => panic!("proxy unexpectedly ended: {result:?}"),
+                data = client_recv.data() => assert_eq!(data.unwrap().unwrap().as_ref(), b"data"),
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let billing = state.billing.lock().unwrap();
+            assert!(billing.state.paused);
+            assert_eq!(billing.state.session_total_bytes_in, 4);
+            assert_eq!(billing.remaining_milli_sats(), -3);
+        }
+        drop(proxy);
+        assert_eq!(
+            state.billing.lock().unwrap().state.session_total_bytes_in,
+            4
+        );
+        assert_eq!(state.counters.snapshot(), (0, 1, 0));
+        drivers.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn proxy_preserves_reply_after_request_half_close() {
         use tokio::io::AsyncReadExt;
         let (state, _) = test_state();
-        state.billing.lock().await.state.total_paid_millisats = 1000;
+        state.billing.lock().unwrap().state.total_paid_millisats = 1000;
         state.update_pause_watch(false);
-        state.connect_opened();
+        state.connect_opened().unwrap();
         let (send, recv, mut client_send, mut client_recv, mut drivers) =
             test_h2_streams(65535).await;
         let (target, mut peer) = tokio::io::duplex(64);
@@ -1838,7 +2383,7 @@ mod tests {
                 state.terminate();
             }
             if mode == "admission" {
-                state.billing.lock().await.state.paused = false;
+                state.billing.lock().unwrap().state.paused = false;
                 state
                     .session_registry
                     .set_controls(crate::session_registry::RelayControls {
@@ -1893,6 +2438,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_rejects_unrepresentable_remaining_without_approximation() {
+        let (state, _) = test_state();
+        {
+            let mut billing = state.billing.lock().unwrap();
+            billing.state.session_total_bytes_in = u64::MAX;
+            billing.state.total_paid_millisats = 0;
+        }
+        assert!(state.session_status_message().await.is_none());
+        assert!(state.is_terminated());
+    }
+
+    #[tokio::test]
     async fn status_advertises_trusted_units_independently_of_cached_keysets_and_versions() {
         let cache = shared_spilman_mint_cache(SpilmanMintCache::default());
         let (mut state, _) = test_state_with_cache(cache.clone());
@@ -1901,7 +2458,7 @@ mod tests {
             .get_mut("mint")
             .unwrap()
             .insert("msat".into());
-        let ServerMessage::SessionStatus { advertisements, .. } =
+        let Some(ServerMessage::SessionStatus { advertisements, .. }) =
             state.session_status_message().await
         else {
             panic!()
@@ -1926,7 +2483,7 @@ mod tests {
             "untrusted".into(),
             BTreeMap::from([("sat".into(), vec!["0000000000000002".into()])]),
         );
-        let ServerMessage::SessionStatus { advertisements, .. } =
+        let Some(ServerMessage::SessionStatus { advertisements, .. }) =
             state.session_status_message().await
         else {
             panic!()
@@ -1945,7 +2502,7 @@ mod tests {
                     r#"{"channel_id":"owned","balance":0,"capacity":100,"unit":"msat"}"#,
                 )
                 .unwrap();
-            state.billing.lock().await.state.linked_channel_id = Some(link.channel_id);
+            state.billing.lock().unwrap().state.linked_channel_id = Some(link.channel_id);
             let (client, server) = tokio::io::duplex(4096);
             let client_task = tokio::spawn(async move {
                 let (mut client, connection) = h2::client::Builder::new()
@@ -1987,7 +2544,7 @@ mod tests {
             .unwrap());
             assert!(state.is_terminated());
             assert!(payments.owner_of("owned").is_none());
-            assert!(state.billing.lock().await.state.terminated);
+            assert!(state.billing.lock().unwrap().state.terminated);
             server_driver.abort();
             client_driver.abort();
             let _ = server_driver.await;

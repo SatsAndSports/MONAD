@@ -186,7 +186,11 @@ pub(super) async fn run_session_driver(
                             failed_connects,
                         } => {
                             let previous_paid = state.relay_snapshot.as_ref().map(|s| s.total_paid_millisats).unwrap_or(0);
-                            let pricing = SessionPricing::new(active_in_rate, active_out_rate);
+                            let pricing = SessionPricing::try_new(active_in_rate, active_out_rate)
+                                .map_err(|error| io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("protocol violation: invalid relay session pricing: {error}"),
+                                ))?;
                             validate_session_pricing(&mut state.established_pricing, pricing)?;
                             let due_now = pricing.amount_due_millisats(session_total_bytes_in, session_total_bytes_out);
                             info!(
@@ -296,7 +300,18 @@ pub(super) async fn run_session_driver(
                             if let Some(error) = payment_conflict_error(&code, &config.hop_label) {
                                 return Err(error);
                             }
+                            let payment_pending = matches!(
+                                state.control_op_in_flight,
+                                Some(super::state::ControlOpInFlight::Payment { .. })
+                            );
+                            let rejection_code = format!("{code:?}");
                             apply_server_error(&config, &mut state, code).await;
+                            if payment_pending {
+                                return Err(io::Error::other(format!(
+                                    "{} payment rejected ({rejection_code}); signed payment retained",
+                                    config.hop_label,
+                                )));
+                            }
                             false
                         }
                     };

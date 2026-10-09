@@ -89,6 +89,7 @@ pub enum ServerErrorCode {
     PaymentInvalid,
     PaymentNoNewFunds,
     PaymentConflict,
+    NumericLimitExceeded,
     InternalError,
     LinkChannelRetired,
     ChannelUnlinkRejected,
@@ -358,6 +359,24 @@ mod advertisement_tests {
         .unwrap();
         status["unexpected"] = json!(null);
         assert!(serde_json::from_value::<ServerMessage>(status).is_err());
+    }
+
+    #[test]
+    fn numeric_limit_error_uses_stable_wire_code() {
+        let value = serde_json::to_value(ServerMessage::Error {
+            code: ServerErrorCode::NumericLimitExceeded,
+            message: "numeric limit exceeded".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type":"Error",
+                "code":"NUMERIC_LIMIT_EXCEEDED",
+                "message":"numeric limit exceeded"
+            })
+        );
+        assert!(serde_json::from_value::<ServerMessage>(value).is_ok());
     }
 
     #[test]

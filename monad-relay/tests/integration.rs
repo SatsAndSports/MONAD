@@ -3149,14 +3149,28 @@ impl SessionPaymentChannel {
         )
         .await;
 
-        let status = expect_session_status_struct(read_control_message(h2_recv).await);
-        status.assert_linked_channel(
-            &self.channel_id,
-            self.cumulative_balance_units,
-            self.capacity_units(),
-            self.unit,
-        );
-        status.as_tuple()
+        // Data-path pause statuses can be queued around the payment response.
+        // Skip those stale snapshots until the relay-authoritative response for
+        // this exact cumulative balance arrives.
+        for _ in 0..8 {
+            let status = expect_session_status_struct(read_control_message(h2_recv).await);
+            if status.linked_channel.as_ref().is_some_and(|linked| {
+                linked.channel_id == self.channel_id
+                    && linked.balance_raw == self.cumulative_balance_units
+            }) {
+                status.assert_linked_channel(
+                    &self.channel_id,
+                    self.cumulative_balance_units,
+                    self.capacity_units(),
+                    self.unit,
+                );
+                return status.as_tuple();
+            }
+        }
+        panic!(
+            "payment response for channel {} balance {} did not arrive",
+            self.channel_id, self.cumulative_balance_units
+        )
     }
 }
 
@@ -4994,11 +5008,10 @@ async fn test_session_payment_driver_skips_expiry_too_soon_channel_and_preserves
     let _ = relay_handle.await;
 }
 
-/// End-to-end test that the session payment driver marks a channel unusable
-/// and reselects to another channel when the relay rejects a payment with
-/// `ChannelClosed`.
+/// A rejected signed payment ends the session without buying replacement
+/// credit. Channel-specific diagnostics survive for subsequent sessions.
 #[tokio::test]
-async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
+async fn test_session_payment_rejection_preserves_signature_and_ends_session() {
     let (mint_url, keyset_id, mint_shutdown) = start_http_test_mint().await;
     let payment_receiver_secret = cashu::nuts::SecretKey::generate();
     let receiver_pubkey = payment_receiver_secret.public_key().to_hex();
@@ -5026,7 +5039,7 @@ async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
         .unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
-    let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
+    let (driver_handle, ready_rx, failure_rx) = start_session_payment_driver(
         &conn,
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "integration hop",
@@ -5052,30 +5065,30 @@ async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
 
     // Send exactly the remaining balance worth of outbound data. The relay
     // proxies it, then pauses. The driver tries to top up the now-closed
-    // channel, gets ChannelClosed, marks it unusable, and reselects.
+    // channel, gets ChannelClosed, marks it unusable, and ends this session.
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_counting_server(upper_listener, 1000, b"OK"));
     let mut tunnel = conn.open_tunnel(&upper_addr.to_string()).await.unwrap();
     tunnel.write_all(&[b'x'; 1000]).await.unwrap();
     tunnel.shutdown().await.unwrap();
-    let mut result = Vec::new();
-    tunnel.read_to_end(&mut result).await.unwrap();
-    assert_eq!(result, b"OK");
-
-    timeout(Duration::from_secs(3), async {
-        loop {
-            let first_state = wallet.get_channel("a-first").unwrap().state;
-            let second_linked = wallet.last_link_payload("b-second").unwrap().is_some();
-            let second_paid = wallet.last_payment_payload("b-second").unwrap().is_some();
-            if first_state != WalletChannelState::Open && second_linked && second_paid {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("driver should mark first channel unusable and reselect second channel");
+    timeout(Duration::from_secs(3), driver_handle)
+        .await
+        .expect("payment rejection must end the driver without waiting for heartbeat failure")
+        .unwrap();
+    assert!(
+        *failure_rx.borrow(),
+        "route recovery should observe failure"
+    );
+    let signed = wallet.get_channel("a-first").unwrap();
+    assert!(signed.current_signed_balance_msats > 1000);
+    let payment: serde_json::Value =
+        serde_json::from_str(&wallet.last_payment_payload("a-first").unwrap().unwrap()).unwrap();
+    assert_eq!(
+        payment["balance"].as_u64().unwrap() * 1000,
+        signed.current_signed_balance_msats,
+        "rejected signature and signed high-water mark must be retained"
+    );
 
     assert_eq!(
         wallet.get_channel("a-first").unwrap().state,
@@ -5083,16 +5096,15 @@ async fn test_session_payment_driver_marks_channel_closed_and_reselects() {
         "closed channel should be marked unusable"
     );
     assert!(
-        wallet.last_link_payload("b-second").unwrap().is_some(),
-        "second channel should be linked"
+        wallet.last_link_payload("b-second").unwrap().is_none(),
+        "rejection must not trigger replacement funding in this session"
     );
     assert!(
-        wallet.last_payment_payload("b-second").unwrap().is_some(),
-        "second channel should receive a payment"
+        wallet.last_payment_payload("b-second").unwrap().is_none(),
+        "no payment should be sent on the second channel"
     );
 
-    driver_handle.abort();
-    let _ = driver_handle.await;
+    drop(tunnel);
     conn.shutdown().await;
     let _ = mint_shutdown.send(());
 }
@@ -6069,21 +6081,17 @@ async fn test_session_overshoot_negative_balance_and_resume() {
         .unwrap();
 
     let (_in2, out2, _paid2, rem2, paused2) =
-        expect_session_status(read_control_message(&mut control_recv).await);
-    assert!(paused2, "session should pause after overshooting credit");
-    assert!(
-        (5..=10).contains(&out2),
-        "paused status should account for between 5 and 10 outbound bytes, got {out2}"
-    );
-    assert_eq!(rem2, 5 - out2 as i64);
+        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 10)
+            .await
+            .expect("the whole bounded frame may overshoot paid credit");
+    assert_eq!(out2, 10);
+    assert_eq!(rem2, -5);
+    assert!(paused2);
 
     let (_in3, _out3, _paid3, rem3, paused3) =
         channel.pay(&mut control_send, &mut control_recv, 10).await;
-    assert!(
-        !paused3,
-        "session should unpause after positive top-up, got paused={paused3} remaining={rem3}"
-    );
     assert_eq!(rem3, 5);
+    assert!(!paused3);
 
     let _ = release_tx.send(());
 
@@ -6101,14 +6109,15 @@ async fn test_session_overshoot_negative_balance_and_resume() {
     .expect("response should complete after positive top-up");
     assert_eq!(result, b"DONE");
 
-    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
     let (
         session_total_bytes_in,
         session_total_bytes_out,
         _total_paid,
         remaining_milli_sats,
         paused,
-    ) = expect_session_status(read_control_message(&mut control_recv).await);
+    ) = wait_for_session_totals(&mut control_send, &mut control_recv, 4, 10)
+        .await
+        .expect("final accounting should include the inbound response");
     assert_eq!(session_total_bytes_out, 10);
     assert_eq!(session_total_bytes_in, 4);
     assert_eq!(remaining_milli_sats, 1);
@@ -6386,18 +6395,17 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
         .unwrap();
 
     let (_in2, out2, _paid2, rem2, paused2) =
-        expect_session_status(read_control_message(&mut control_recv).await);
-    assert!(paused2, "session should pause after overshooting credit");
+        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 10)
+            .await
+            .expect("the whole bounded frame may overshoot paid credit");
     assert_eq!(out2, 10);
     assert_eq!(rem2, -5);
+    assert!(paused2);
 
     let (_in3, _out3, _paid3, rem3, paused3) =
         channel.pay(&mut control_send, &mut control_recv, 4).await;
-    assert!(
-        paused3,
-        "session should stay paused while balance is non-positive"
-    );
     assert_eq!(rem3, -1);
+    assert!(paused3);
 
     let mut h2_for_paused_connect = conn.clone_send_request().await;
     let paused_request = Request::builder()
@@ -6416,11 +6424,8 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
 
     let (_in4, _out4, _paid4, rem4, paused4) =
         channel.pay(&mut control_send, &mut control_recv, 6).await;
-    assert!(
-        !paused4,
-        "session should unpause once balance becomes positive, got paused={paused4} remaining={rem4}"
-    );
     assert_eq!(rem4, 5);
+    assert!(!paused4);
 
     let _ = release_tx.send(());
 
@@ -6511,35 +6516,23 @@ async fn test_inbound_bytes_pushed_after_pause_are_delivered_after_unpause() {
         .unwrap();
 
     let (_in2, out2, _paid2, rem2, paused2) =
-        expect_session_status(read_control_message(&mut control_recv).await);
-    assert!(paused2, "session should pause after overshooting credit");
+        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 10)
+            .await
+            .expect("the whole bounded frame may overshoot paid credit");
     assert_eq!(out2, 10);
     assert_eq!(rem2, -5);
+    assert!(paused2);
 
     let _ = release_tx.send(());
 
-    channel.cumulative_balance_units = channel.cumulative_balance_units.saturating_add(10);
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelPayment {
-            payment_json: channel.payment_json(),
-        },
-        false,
-    )
-    .await;
+    channel.pay(&mut control_send, &mut control_recv, 10).await;
 
-    let (rem3, paused3) = loop {
-        let (_in3, _out3, _paid3, remaining, paused) =
-            expect_session_status(read_control_message(&mut control_recv).await);
-        if !paused {
-            break (remaining, paused);
-        }
-    };
-    assert!(
-        !paused3,
-        "session should unpause after positive top-up, got paused={paused3} remaining={rem3}"
-    );
+    let (_in3, _out3, _paid3, rem3, paused3) =
+        wait_for_session_totals(&mut control_send, &mut control_recv, 4, 10)
+            .await
+            .expect("response bytes should commit after the top-up");
     assert_eq!(rem3, 1);
+    assert!(!paused3);
 
     let mut result = Vec::new();
     while let Some(chunk) = h2_recv.data().await {
@@ -11839,8 +11832,91 @@ clients:
     let _ = mint_shutdown_tx.send(());
 }
 
-/// End-to-end test that the relay can unilaterally close a funded Spilman
-/// channel and that further payments on that channel are rejected.
+/// Numeric admission rejects before the real signed-payment SQLite CAS.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_numeric_payment_rejection_preserves_sqlite_balance_and_signature() {
+    let mint = TestMintHelper::new().await.unwrap();
+    let mint_url = "https://test-mint.invalid".to_owned();
+    let keyset_id = mint.keyset_id().to_string();
+    let keyset_info = mint.keyset_info_json().unwrap();
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey = receiver_secret.public_key().to_hex();
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let path = temp_db.path().to_str().unwrap();
+    let (_, _, relay, shutdown, payments) = start_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &SecpTransportKeypair::generate(),
+        receiver_secret,
+        path,
+        mint_cache_with_keyset(&mint_url, "sat", &keyset_id, &keyset_info, true),
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".into()]))]),
+    )
+    .await
+    .unwrap();
+    let wallet = TestSigningWallet::new(
+        mint.mint(),
+        receiver_pubkey.clone(),
+        mint_url.clone(),
+        keyset_id,
+        keyset_info,
+    )
+    .await;
+    let channel = wallet.pre_create_channel(1000).await.unwrap();
+    let session = [42; 32];
+    let offer = RelayPaymentOffer {
+        receiver_pubkey,
+        mint_url,
+        unit: "sat".into(),
+        funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    wallet.attach_channel_to_session(&channel, session).unwrap();
+    payments
+        .link_channel(
+            &supported_cashu_spilman_keyset_versions(),
+            session,
+            &wallet.build_link_request(&channel, &offer).unwrap(),
+        )
+        .unwrap();
+    let signed = wallet
+        .build_channel_payment(&channel, &offer, 0, 10)
+        .unwrap();
+    let before = SqliteStorage::open(path)
+        .unwrap()
+        .get_balance(&channel)
+        .unwrap();
+    assert_eq!(
+        payments
+            .apply_channel_payment_with_limit(session, &channel, &signed, 9999)
+            .unwrap_err(),
+        monad_relay::payments::ChannelPaymentError::NumericLimitExceeded
+    );
+    let after = SqliteStorage::open(path)
+        .unwrap()
+        .get_balance(&channel)
+        .unwrap();
+    assert_eq!(after.balance, before.balance);
+    assert_eq!(after.signature, before.signature);
+    let accepted = payments
+        .apply_channel_payment_with_limit(session, &channel, &signed, 10000)
+        .unwrap();
+    assert_eq!(accepted.delta_millisats, 10000);
+    assert_eq!(
+        SqliteStorage::open(path)
+            .unwrap()
+            .get_balance(&channel)
+            .unwrap()
+            .balance,
+        10
+    );
+    payments.release_channel_ownership(session, &channel);
+    let _ = shutdown.send(());
+    relay.await.unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -14898,6 +14974,72 @@ async fn test_session_status_reports_connect_count_transitions() {
     control.wait_for_connect_counts(0, 3, 0).await;
 
     control.close().await;
+    drop(h2);
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_concurrent_tunnels_may_overshoot_shared_credit() {
+    async fn hold_target(listener: TcpListener) -> std::net::SocketAddr {
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((_stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        addr
+    }
+
+    let target_a = hold_target(TcpListener::bind("127.0.0.1:0").await.unwrap()).await;
+    let target_b = hold_target(TcpListener::bind("127.0.0.1:0").await.unwrap()).await;
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let mut control = ControlSessionHarness::open(&conn).await;
+    control.handshake().await;
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    channel.link(&mut control.send, &mut control.recv).await;
+    channel.pay(&mut control.send, &mut control.recv, 5).await;
+
+    let mut h2 = conn.clone_send_request().await;
+    let (mut tunnel_a_send, tunnel_a_recv) =
+        open_connect_tunnel(&mut h2, &target_a.to_string()).await;
+    let (mut tunnel_b_send, tunnel_b_recv) =
+        open_connect_tunnel(&mut h2, &target_b.to_string()).await;
+
+    tunnel_a_send.reserve_capacity(10);
+    wait_for_send_capacity(&mut tunnel_a_send).await.unwrap();
+    tunnel_a_send
+        .send_data(Bytes::from_static(b"aaaaaaaaaa"), false)
+        .unwrap();
+    tunnel_b_send.reserve_capacity(10);
+    wait_for_send_capacity(&mut tunnel_b_send).await.unwrap();
+    tunnel_b_send
+        .send_data(Bytes::from_static(b"bbbbbbbbbb"), false)
+        .unwrap();
+
+    let (_in1, out1, _paid1, remaining1, paused1) =
+        wait_for_session_totals(&mut control.send, &mut control.recv, 0, 20)
+            .await
+            .expect("both bounded tunnel frames may complete after starting with credit");
+    assert_eq!(out1, 20);
+    assert_eq!(remaining1, -15);
+    assert!(paused1);
+
+    channel.pay(&mut control.send, &mut control.recv, 20).await;
+    let (_in2, out2, _paid2, remaining2, paused2) =
+        wait_for_session_totals(&mut control.send, &mut control.recv, 0, 20)
+            .await
+            .expect("top-up should restore positive credit");
+    assert_eq!(out2, 20);
+    assert_eq!(remaining2, 5);
+    assert!(!paused2);
+
+    control.close().await;
+    drop(tunnel_a_send);
+    drop(tunnel_a_recv);
+    drop(tunnel_b_send);
+    drop(tunnel_b_recv);
     drop(h2);
     conn.shutdown().await;
 }

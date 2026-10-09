@@ -235,17 +235,17 @@ to the keyset ID; positive V2 expiry is ID-bound. Both formats remain supported.
 Implemented today:
 - `monad-relay`: accepts client connections, performs Noise handshake, runs an H2 session, proxies `CONNECT` tunnels, enforces per-session billing with pause/resume, keeps a shared in-memory cache of configured mint keysets, and persists relay-side Spilman channel state in SQLite
 - `monad-client`: provides reusable route selection, the session payment driver, a SQLite-backed channel wallet, a loose-proof wallet, and multi-hop connection setup
-- `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), session and billing types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
+- `monad-common`: shared Noise transport (with session ID from handshake hash), H2 stream helpers, control protocol types (`ClientMessage`/`ServerMessage`), exact session billing arithmetic, session types (`RelayConnection`, `SessionPricing`, `SessionSpilmanInfo`), shared bidirectional proxy
 - `monad-quic`: shared QUIC transport code plus standalone echo tooling — `QuicStream`, secp attestation helpers, echo server/client, and shared config/keygen helpers used by relay and client
 - `monad-test-client`: localhost SOCKS5/manual test harness for mocked relay funding, circuit rebuild testing, and daily-driver browser/SSH experiments
 - QUIC hop support: relay dual TCP+UDP listener, QUIC connection pool, configured client routes, and `quic-secp256k1-pubkey` H2 header for CONNECT forwarding
 - Noise-payload bootstrap: MONAD uses the Noise `NK` pattern over secp256k1 with ChaCha20-Poly1305 and BLAKE2s; the client maps each supported Cashu Spilman channel protocol version to its supported keyset-format versions in the first handshake payload, and the relay selects one protocol plus the full mutual keyset-format set before H2 starts. Today `2026-09-14` supports `v1` and `v2` and requires a nonempty intersection, alongside `h2` and `session_constant` pricing
 - deterministic developer tooling: pinned Rust toolchain, repo-local rustfmt config, `Makefile`, and GitHub Actions checks for formatting and tests
-- session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, totals-based billing with directional pricing, pause/resume enforcement, open/total/failed CONNECT counters, `ChannelLink`, `ChannelPayment`, `ChannelEvicted`, and correlated Ping/Pong liveness
-- relay-authoritative linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
+- session payment system: paused-by-default sessions, initial `SessionStatus` after control stream establishment, exact totals-based billing with directional pricing, bounded chunk overshoot with pause/resume enforcement, open/total/failed CONNECT counters, `ChannelLink`, `ChannelPayment`, `ChannelEvicted`, and correlated Ping/Pong liveness
+- relay-reported linked-channel sync: `SessionStatus` includes the currently linked channel's id, latest accepted cumulative balance, capacity, and unit
 - relay-side session FSM for steady-state control handling and full teardown on control-stream detach
 - in-process relay wallet manager: multiple hosted relays can share one SQLite-backed relay wallet database while keeping distinct Cashu receiver keys / wallet names
-- client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments, with periodic local cleartext-counter checks sizing payments against the latest authoritative relay baseline
+- client-side direct control-loop funding logic for per-session channel acquisition, linking, and payments, with periodic local cleartext-counter checks sizing payments from client-side byte and payment records
 - client wallet library path: `SqliteClientWallet` manages Spilman channels, `LooseProofWallet` stores spendable Cashu proofs, and `session_driver` handles per-session linking and payments; `MockWallet` remains for tests and connector harnesses
 - blinded-hop routing over QUIC: `CONNECT blinded.monad.invalid:443`, tweak-prefixed QUIC forwarded sessions, `RouteHop` / `Route` connector support, public-key-only blinded-path construction, and parity-aware reverse-tweak key recovery for MONAD's x-only secp256k1 identity model
 - integration tests for direct, nested, IPv6, hostname-resolution, TCP secp transport, QUIC single-hop, QUIC nested tunnels, mixed TCP/QUIC hop chains, and the session payment / pause / resume lifecycle
@@ -397,7 +397,19 @@ YAML order; add `--client <name>` to run only one entry.
 
 `client_wallet.channel_funding_token_target_msats` controls the desired funding-token value for each newly provisioned channel. Cashu input fees are selected in addition to this target; output fees and deterministic channel outputs can make usable channel capacity lower. The default is `1000000` msats.
 
-`client_wallet.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `client_wallet.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats.
+`client_wallet.target_topup_buffer_msats` controls the positive session balance the client tries to restore when funding is needed; the default is `10000000` msats. `client_wallet.minimum_topup_msats` sets a lower bound for normal topups; the default is `0` msats. Payment sizing uses the client's own byte and payment records; an unexpectedly higher relay-reported accepted-payment total can only increase the client's credit estimate.
+
+If a relay rejects a signed/sent payment, the client preserves its pessimistic
+payment record and signed wallet history, records the error, and ends that
+session rather than sending replacement funds there. The relay may still be
+able to claim the signed amount despite reporting rejection.
+
+Numeric-limit failures are reported explicitly: the client checks its proposed
+session total before signing, and the relay checks both paid-total and signed
+remaining-credit limits before recording a payment. Transport accounting checks
+representability and records each successful write in the same poll, including
+partial writes followed by task cancellation. These are numeric safeguards, not
+a monetary cap or a prohibition on negative-balance overshoot.
 
 Admin/recovery commands can use the configured singleton `client_wallet`:
 
@@ -565,6 +577,8 @@ Current coverage includes:
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
 - session overshoot with negative balance and resume
+- concurrent bounded tunnel operations overshooting shared credit
+- exact billing boundaries, zero-rate rejection, and pre-mutation numeric-limit errors
 - underpayment stays paused until balance is positive
 - multiple simultaneous tunnels
 - 2-hop and 3-hop nested routing

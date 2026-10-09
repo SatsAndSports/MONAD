@@ -48,11 +48,12 @@ impl RelayPayments for ObservedPayments {
         Ok(result)
     }
 
-    fn apply_channel_payment(
+    fn apply_channel_payment_with_limit(
         &self,
         session: [u8; 32],
         channel: &str,
         json: &str,
+        max_delta_millisats: u64,
     ) -> Result<PaymentOutcome, ChannelPaymentError> {
         let mut state = self.observer.state.lock().unwrap();
         state.payments.push(session);
@@ -62,14 +63,20 @@ impl RelayPayments for ObservedPayments {
             // Lose ownership at the payment boundary. The real signature validation
             // still runs, then the real owned-payment CAS must reject the commit.
             self.inner.release_channel_ownership(session, channel);
-            let result = self.inner.apply_channel_payment(session, channel, json);
+            let result = self.inner.apply_channel_payment_with_limit(
+                session,
+                channel,
+                json,
+                max_delta_millisats,
+            );
             assert_eq!(result, Err(ChannelPaymentError::Conflict));
             assert_eq!(self.inner.linked_channel_status(channel).unwrap(), before);
             state.rejected = Some((session, before, self.registry.clone()));
             self.observer.rejected.notify_one();
             result
         } else {
-            self.inner.apply_channel_payment(session, channel, json)
+            self.inner
+                .apply_channel_payment_with_limit(session, channel, json, max_delta_millisats)
         }
     }
 
