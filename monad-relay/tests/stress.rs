@@ -456,7 +456,9 @@ fn synthetic_trusted_mint_units() -> BTreeMap<String, BTreeSet<String>> {
     )])
 }
 
-async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
+async fn start_monad_relay(
+    connect_limits: monad_common::config::RelayConnectLimitsConfig,
+) -> (SocketAddr, Secp256k1Pubkey) {
     let identity = QuicCertIdentity::generate().unwrap();
     let transport_key = SecpTransportKeypair::generate();
     let pubkey = transport_key.pubkey();
@@ -484,6 +486,7 @@ async fn start_monad_relay() -> (SocketAddr, Secp256k1Pubkey) {
             .unwrap()
             .to_string(),
         channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+        connect_limits,
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
@@ -1421,9 +1424,17 @@ async fn run_stress_scenario(config: StressConfig) {
         targets.len()
     );
 
+    let connect_limits = stress_connect_limits();
+    println!(
+        "stress connect limits open_per_session={} setups_per_session={} open_per_relay={} setups_per_relay={}",
+        connect_limits.max_open_per_session,
+        connect_limits.max_setups_per_session,
+        connect_limits.max_open_per_relay,
+        connect_limits.max_setups_per_relay,
+    );
     let mut relays = Vec::with_capacity(config.relays);
     for relay_idx in 0..config.relays {
-        let relay = start_monad_relay().await;
+        let relay = start_monad_relay(connect_limits.clone()).await;
         println!(
             "stress relay {relay_idx}: addr={} pubkey={}",
             relay.0, relay.1
@@ -1572,6 +1583,34 @@ fn read_env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn stress_connect_limits() -> monad_common::config::RelayConnectLimitsConfig {
+    let defaults = monad_common::config::RelayConnectLimitsConfig::default();
+    monad_common::config::RelayConnectLimitsConfig {
+        max_open_per_session: read_env_u32(
+            "MONAD_STRESS_MAX_OPEN_CONNECTS_PER_SESSION",
+            defaults.max_open_per_session,
+        ),
+        max_setups_per_session: read_env_u32(
+            "MONAD_STRESS_MAX_CONNECT_SETUPS_PER_SESSION",
+            defaults.max_setups_per_session,
+        ),
+        max_open_per_relay: read_env_u32(
+            "MONAD_STRESS_MAX_OPEN_CONNECTS_PER_RELAY",
+            defaults.max_open_per_relay,
+        ),
+        max_setups_per_relay: read_env_u32(
+            "MONAD_STRESS_MAX_CONNECT_SETUPS_PER_RELAY",
+            defaults.max_setups_per_relay,
+        ),
+    }
+}
+
+fn read_env_u32(name: &str, default: u32) -> u32 {
+    read_env_usize(name, default as usize)
+        .try_into()
+        .unwrap_or_else(|_| panic!("{name} exceeds u32"))
 }
 
 fn read_env_u64(name: &str, default: u64) -> u64 {

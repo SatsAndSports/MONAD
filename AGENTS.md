@@ -74,6 +74,7 @@ cargo run -p monad-quic -- ...
 - Data stream: `CONNECT host:port`
 - Nesting: another full Noise+H2 session can run on top of an H2 CONNECT tunnel via `H2ConnectStream`
 - H2 request/response header lists are capped at 32 KiB uncompressed; MONAD-layer trailers are prohibited. Internet protocol headers inside CONNECT remain opaque DATA.
+- Logical CONNECT limits default to 64 open/16 setting up per session and 1,024 open/512 setting up per relay. Capacity refusal is immediate and does not affect the control stream.
 
 ### Control Protocol
 
@@ -242,6 +243,7 @@ The test suite currently covers:
 - session starts paused by default
 - second control stream rejected
 - CONNECT rejected before initial payment without destination setup
+- per-session and per-relay open/setup CONNECT limits, typed fail-fast refusal, no destination contact, and cancellation/publication permit release
 - CONNECT accepted during later pauses with forwarding blocked until payment
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
@@ -299,6 +301,7 @@ The test suite currently covers:
 - `monad-relay/tests/stress.rs` now supports transport-focused stress runs with:
   - huge per-hop prefunding to keep payment timing out of the critical path
   - `MONAD_STRESS_MAX_IN_FLIGHT_PER_CIRCUIT` to cap burst concurrency per circuit
+  - `MONAD_STRESS_MAX_OPEN_CONNECTS_PER_SESSION`, `MONAD_STRESS_MAX_CONNECT_SETUPS_PER_SESSION`, `MONAD_STRESS_MAX_OPEN_CONNECTS_PER_RELAY`, and `MONAD_STRESS_MAX_CONNECT_SETUPS_PER_RELAY` to override production CONNECT limits explicitly
   - `MONAD_STRESS_TARGETS` to shard final-hop exits across many loopback targets in `127.127.x.y`
 - `make stress-transport-extreme` is the current high-end manual transport recipe and expects a high `ulimit -n`
 - `make stress-payment-buffered` is the current stable payment-focused recipe:

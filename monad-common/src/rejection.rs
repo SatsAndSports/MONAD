@@ -13,6 +13,10 @@ pub enum RejectionCode {
     ChannelAdmissionDisabled,
     DestinationPolicyDenied,
     InitialPaymentRequired,
+    SessionConnectLimitReached,
+    SessionConnectSetupLimitReached,
+    RelayConnectLimitReached,
+    RelayConnectSetupLimitReached,
     BootstrapRejected,
 }
 
@@ -32,6 +36,18 @@ impl RejectionCode {
             Self::ChannelAdmissionDisabled => "This relay is not accepting new channels.",
             Self::DestinationPolicyDenied => "This destination is denied by relay policy.",
             Self::InitialPaymentRequired => "This session has not received a payment.",
+            Self::SessionConnectLimitReached => {
+                "This session has reached its concurrent CONNECT limit."
+            }
+            Self::SessionConnectSetupLimitReached => {
+                "This session has reached its concurrent CONNECT setup limit."
+            }
+            Self::RelayConnectLimitReached => {
+                "This relay has reached its concurrent CONNECT limit."
+            }
+            Self::RelayConnectSetupLimitReached => {
+                "This relay has reached its concurrent CONNECT setup limit."
+            }
             Self::BootstrapRejected => "Bootstrap negotiation was rejected.",
         };
         Rejection {
@@ -47,6 +63,12 @@ impl RejectionCode {
             }
             Self::DestinationPolicyDenied => Some(http::StatusCode::FORBIDDEN),
             Self::InitialPaymentRequired => Some(http::StatusCode::PAYMENT_REQUIRED),
+            Self::SessionConnectLimitReached | Self::SessionConnectSetupLimitReached => {
+                Some(http::StatusCode::TOO_MANY_REQUESTS)
+            }
+            Self::RelayConnectLimitReached | Self::RelayConnectSetupLimitReached => {
+                Some(http::StatusCode::SERVICE_UNAVAILABLE)
+            }
             _ => None,
         }
     }
@@ -122,6 +144,10 @@ mod tests {
             RejectionCode::TunnelAdmissionDisabled,
             RejectionCode::DestinationPolicyDenied,
             RejectionCode::InitialPaymentRequired,
+            RejectionCode::SessionConnectLimitReached,
+            RejectionCode::SessionConnectSetupLimitReached,
+            RejectionCode::RelayConnectLimitReached,
+            RejectionCode::RelayConnectSetupLimitReached,
         ] {
             let mut headers = http::HeaderMap::new();
             headers.insert(CONNECT_REJECTION_HEADER, code.header_value());

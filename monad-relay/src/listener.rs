@@ -3,7 +3,7 @@
 use crate::keyset_refresh::RelayKeysetRefreshCoordinator;
 use crate::payments::RelayPayments;
 use crate::quic_pool::QuicPool;
-use crate::session::{relay_session_from_transport_stream, RelaySessionConfig};
+use crate::session::{relay_session_from_transport_stream, RelayConnectLimits, RelaySessionConfig};
 use crate::session_registry::SessionRegistry;
 use crate::wallet_manager::{cache_relay_keysets, CloseExpiringChannelsResult, RelayWalletManager};
 use cashu::nuts::Id;
@@ -15,7 +15,7 @@ use monad_common::bootstrap::{
     initial_server_accept_v1, select_cashu_spilman_protocol_keyset_versions, select_pricing_policy,
     BootstrapCapabilities, BootstrapV1ClientHello, BootstrapV1ServerAccept,
 };
-use monad_common::config::RelayChannelPolicyConfig;
+use monad_common::config::{RelayChannelPolicyConfig, RelayConnectLimitsConfig};
 use monad_common::noise_secp256k1;
 use monad_common::protocol::MintUnitKeysets;
 use monad_common::quic_cert_identity::QuicCertIdentity;
@@ -47,6 +47,7 @@ struct QuicSessionRuntime {
     payments: Arc<dyn RelayPayments>,
     session_registry: Arc<SessionRegistry>,
     keyset_refresh: Option<Arc<RelayKeysetRefreshCoordinator>>,
+    connect_limits: RelayConnectLimits,
 }
 
 async fn run_quic_noise_session(
@@ -161,6 +162,7 @@ async fn run_quic_noise_session_admitted(
             cashu_spilman_keyset_versions: bootstrap_accept.cashu_spilman_keyset_versions,
             in_bytes_per_millisat: runtime.config.in_bytes_per_millisat,
             out_bytes_per_millisat: runtime.config.out_bytes_per_millisat,
+            connect_limits: runtime.connect_limits,
         },
     )
     .await
@@ -306,6 +308,8 @@ pub struct ServerConfig {
     pub spilman_storage_path: String,
     /// Relay-side channel acceptance and expiry-maintenance policy.
     pub channel_policy: RelayChannelPolicyConfig,
+    /// Concurrent logical CONNECT and destination-setup limits.
+    pub connect_limits: RelayConnectLimitsConfig,
 }
 
 impl ServerConfig {
@@ -490,6 +494,7 @@ where
         relay_wallet_name: config.relay_wallet_name.clone(),
         spilman_storage_path: config.spilman_storage_path.clone(),
         channel_policy: config.channel_policy.clone(),
+        connect_limits: config.connect_limits.clone(),
     });
     let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
     let enabled = config.channel_policy.expiring_channels.auto_close.enabled;
@@ -703,6 +708,7 @@ where
     // Create the QUIC connection pool for outbound CONNECT quic: forwarding.
     // This is separate from the QUIC endpoint (which handles inbound connections).
     let quic_pool = QuicPool::new().ok();
+    let connect_limits = RelayConnectLimits::new(&config.connect_limits);
     // Accept loop — runs until shutdown signal
     let result = loop {
         tokio::select! {
@@ -719,6 +725,7 @@ where
                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
                 let payments = payments.clone();
                 let services = services.clone();
+                let connect_limits = connect_limits.clone();
 
                 sessions.push(std::panic::AssertUnwindSafe(async move {
                     let registry = services.session_registry.clone();
@@ -777,6 +784,7 @@ where
                                 .cashu_spilman_keyset_versions,
                             in_bytes_per_millisat: config.in_bytes_per_millisat,
                             out_bytes_per_millisat: config.out_bytes_per_millisat,
+                            connect_limits,
                         },
                     )
                     .await {
@@ -806,6 +814,7 @@ where
                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
                 let payments = payments.clone();
                 let services = services.clone();
+                let connect_limits = connect_limits.clone();
 
                 sessions.push(std::panic::AssertUnwindSafe(async move {
                     // Complete the QUIC connection handshake
@@ -839,6 +848,7 @@ where
                                 let discovered_spilman_mint_cache = discovered_spilman_mint_cache.clone();
                                 let payments = payments.clone();
                                 let services = services.clone();
+                                let connect_limits = connect_limits.clone();
                                 let authenticated = authenticated.clone();
                                 let conn = conn.clone();
                                 stream_tasks.push(std::panic::AssertUnwindSafe(async move {
@@ -887,7 +897,8 @@ where
                                                  payments,
                                                  session_registry: services.session_registry,
                                                  keyset_refresh: services.keyset_refresh,
-                                             };
+                                                 connect_limits,
+                                              };
                                             run_quic_noise_session(
                                                 QuicStream::new(send, recv),
                                                 runtime.transport_key.normalized_secret_bytes(),
@@ -929,7 +940,8 @@ where
                                                  payments,
                                                  session_registry: services.session_registry,
                                                  keyset_refresh: services.keyset_refresh,
-                                             };
+                                                 connect_limits,
+                                              };
 
                                             run_quic_noise_session(
                                                 QuicStream::new(send, recv),

@@ -207,6 +207,31 @@ impl MonadConfig {
                     relay.name
                 );
             }
+            for (name, value) in [
+                (
+                    "max_open_per_session",
+                    relay.connect_limits.max_open_per_session,
+                ),
+                (
+                    "max_setups_per_session",
+                    relay.connect_limits.max_setups_per_session,
+                ),
+                (
+                    "max_open_per_relay",
+                    relay.connect_limits.max_open_per_relay,
+                ),
+                (
+                    "max_setups_per_relay",
+                    relay.connect_limits.max_setups_per_relay,
+                ),
+            ] {
+                if value == 0 {
+                    anyhow::bail!(
+                        "relay '{}' connect_limits.{name} must be greater than zero",
+                        relay.name
+                    );
+                }
+            }
             if relay.channel_policy.min_expiry_secs == 0 {
                 anyhow::bail!(
                     "relay '{}' channel_policy.min_expiry must be greater than zero",
@@ -539,6 +564,8 @@ pub struct RelayConfig {
     pub trusted_mints: Vec<TrustedMintConfig>,
     pub pricing: PricingConfig,
     #[serde(default)]
+    pub connect_limits: RelayConnectLimitsConfig,
+    #[serde(default)]
     pub channel_policy: RelayChannelPolicyConfig,
 }
 
@@ -561,6 +588,45 @@ impl RelayConfig {
 pub struct PricingConfig {
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayConnectLimitsConfig {
+    #[serde(default = "default_max_open_connects_per_session")]
+    pub max_open_per_session: u32,
+    #[serde(default = "default_max_connect_setups_per_session")]
+    pub max_setups_per_session: u32,
+    #[serde(default = "default_max_open_connects_per_relay")]
+    pub max_open_per_relay: u32,
+    #[serde(default = "default_max_connect_setups_per_relay")]
+    pub max_setups_per_relay: u32,
+}
+
+impl Default for RelayConnectLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_open_per_session: default_max_open_connects_per_session(),
+            max_setups_per_session: default_max_connect_setups_per_session(),
+            max_open_per_relay: default_max_open_connects_per_relay(),
+            max_setups_per_relay: default_max_connect_setups_per_relay(),
+        }
+    }
+}
+
+fn default_max_open_connects_per_session() -> u32 {
+    64
+}
+
+fn default_max_connect_setups_per_session() -> u32 {
+    16
+}
+
+fn default_max_open_connects_per_relay() -> u32 {
+    1024
+}
+
+fn default_max_connect_setups_per_relay() -> u32 {
+    512
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1129,6 +1195,10 @@ management:
             0
         );
         assert_eq!(config.relays[0].pricing.in_bytes_per_millisat, 10);
+        assert_eq!(config.relays[0].connect_limits.max_open_per_session, 64);
+        assert_eq!(config.relays[0].connect_limits.max_setups_per_session, 16);
+        assert_eq!(config.relays[0].connect_limits.max_open_per_relay, 1024);
+        assert_eq!(config.relays[0].connect_limits.max_setups_per_relay, 512);
         assert_eq!(config.relays[0].channel_policy.min_expiry_secs, 3_600);
         assert_eq!(config.relays[0].channel_policy.min_capacity_msats, 1);
         assert_eq!(
@@ -1161,6 +1231,34 @@ management:
             config.clients[0].route[0].to_compact_string().unwrap(),
             format!("{}::127.10.0.11:9050", sample_pubkey_hex(7))
         );
+    }
+
+    #[test]
+    fn parse_and_validate_relay_connect_limits() {
+        let yaml = minimal_config_yaml().replace(
+            "    trusted_mints:",
+            "    connect_limits:\n      max_open_per_session: 7\n      max_setups_per_session: 3\n      max_open_per_relay: 70\n      max_setups_per_relay: 30\n    trusted_mints:",
+        );
+        let config: MonadConfig = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let limits = &config.relays[0].connect_limits;
+        assert_eq!(limits.max_open_per_session, 7);
+        assert_eq!(limits.max_setups_per_session, 3);
+        assert_eq!(limits.max_open_per_relay, 70);
+        assert_eq!(limits.max_setups_per_relay, 30);
+
+        let mut invalid = config.clone();
+        invalid.relays[0].connect_limits.max_open_per_session = 0;
+        assert!(invalid.validate().is_err());
+        let mut invalid = config.clone();
+        invalid.relays[0].connect_limits.max_setups_per_session = 0;
+        assert!(invalid.validate().is_err());
+        let mut invalid = config.clone();
+        invalid.relays[0].connect_limits.max_open_per_relay = 0;
+        assert!(invalid.validate().is_err());
+        let mut invalid = config;
+        invalid.relays[0].connect_limits.max_setups_per_relay = 0;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

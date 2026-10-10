@@ -40,12 +40,21 @@ new stream on either a new or pooled connection can reach the Noise rejection.
 | `CHANNEL_ADMISSION_DISABLED` | Control `Error {code,message}` | Stored channels may relink/pay; first-time acceptance refused |
 | `DESTINATION_POLICY_DENIED` | CONNECT 403 | This destination is not permitted |
 | `INITIAL_PAYMENT_REQUIRED` | CONNECT 402 | The session has never received a positive payment; no destination setup occurs |
+| `SESSION_CONNECT_LIMIT_REACHED` | CONNECT 429 | This session has reached its concurrent open-CONNECT limit |
+| `SESSION_CONNECT_SETUP_LIMIT_REACHED` | CONNECT 429 | This session has reached its concurrent destination-setup limit |
+| `RELAY_CONNECT_LIMIT_REACHED` | CONNECT 503 | This relay has reached its concurrent open-CONNECT limit |
+| `RELAY_CONNECT_SETUP_LIMIT_REACHED` | CONNECT 503 | This relay has reached its concurrent destination-setup limit |
 
 CONNECT supplies the code in `monad-rejection-code`, without a response body that
 the client would have to wait to read. The client derives the standard explanation
 and retains the requested destination locally. Unknown/duplicate headers and
 code/status mismatches are invalid metadata, not reasons for indefinite waiting.
 A plain 503 without MONAD metadata remains a generic CONNECT failure.
+
+Capacity refusals are fail-fast and do not enter the administrative wait path.
+Final-exit refusal fails that SOCKS request; route construction and recovery apply
+their ordinary bounded-attempt/backoff policy. Closing a tunnel or cancelling a
+setup releases capacity without a control exchange.
 
 Destination-policy refusal is protocol/client preparation only. There is no new
 whitelist, regex configuration or destination-policy engine in this change.

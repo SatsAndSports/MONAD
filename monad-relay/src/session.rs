@@ -21,6 +21,7 @@ use h2::{server, RecvStream};
 use http::{Method, Request, Response, StatusCode};
 use monad_common::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
 use monad_common::blinded_hop::resolve_blinded_hop_for_intro;
+use monad_common::config::RelayConnectLimitsConfig;
 use monad_common::control_codec::{
     send_json_line, try_decode_json_line, CONTROL_INVALID_MESSAGE_TEXT,
 };
@@ -43,7 +44,7 @@ use std::task::Poll;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -205,6 +206,95 @@ pub(crate) struct SessionState {
     keyset_refresh: Option<Arc<RelayKeysetRefreshCoordinator>>,
     cashu_spilman_protocol_version: Option<String>,
     cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
+    connect_limits: SessionConnectLimits,
+}
+
+#[derive(Clone)]
+struct SessionConnectLimits {
+    open: Arc<Semaphore>,
+    setups: Arc<Semaphore>,
+    relay: RelayConnectLimits,
+}
+
+pub struct RelayConnectLimits {
+    open: Arc<Semaphore>,
+    setups: Arc<Semaphore>,
+    max_open_per_session: usize,
+    max_setups_per_session: usize,
+}
+
+impl Clone for RelayConnectLimits {
+    fn clone(&self) -> Self {
+        Self {
+            open: self.open.clone(),
+            setups: self.setups.clone(),
+            max_open_per_session: self.max_open_per_session,
+            max_setups_per_session: self.max_setups_per_session,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConnectPermit {
+    _session: OwnedSemaphorePermit,
+    _relay: OwnedSemaphorePermit,
+}
+
+impl RelayConnectLimits {
+    pub fn new(config: &RelayConnectLimitsConfig) -> Self {
+        Self {
+            open: Arc::new(Semaphore::new(config.max_open_per_relay as usize)),
+            setups: Arc::new(Semaphore::new(config.max_setups_per_relay as usize)),
+            max_open_per_session: config.max_open_per_session as usize,
+            max_setups_per_session: config.max_setups_per_session as usize,
+        }
+    }
+}
+
+impl SessionConnectLimits {
+    fn new(relay: RelayConnectLimits) -> Self {
+        Self {
+            open: Arc::new(Semaphore::new(relay.max_open_per_session)),
+            setups: Arc::new(Semaphore::new(relay.max_setups_per_session)),
+            relay,
+        }
+    }
+
+    fn try_open(&self) -> Result<ConnectPermit, RejectionCode> {
+        let session = self
+            .open
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| RejectionCode::SessionConnectLimitReached)?;
+        let relay = self
+            .relay
+            .open
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| RejectionCode::RelayConnectLimitReached)?;
+        Ok(ConnectPermit {
+            _session: session,
+            _relay: relay,
+        })
+    }
+
+    fn try_setup(&self) -> Result<ConnectPermit, RejectionCode> {
+        let session = self
+            .setups
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| RejectionCode::SessionConnectSetupLimitReached)?;
+        let relay = self
+            .relay
+            .setups
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| RejectionCode::RelayConnectSetupLimitReached)?;
+        Ok(ConnectPermit {
+            _session: session,
+            _relay: relay,
+        })
+    }
 }
 
 /// Snapshot-only handles have no back-reference to the registry/session owner.
@@ -268,6 +358,7 @@ impl SessionState {
             keyset_refresh: config.keyset_refresh.clone(),
             cashu_spilman_protocol_version: config.cashu_spilman_protocol_version.clone(),
             cashu_spilman_keyset_versions: config.cashu_spilman_keyset_versions.clone(),
+            connect_limits: SessionConnectLimits::new(config.connect_limits.clone()),
         };
         config.session_registry.monitor(
             session_id,
@@ -626,6 +717,7 @@ struct ConnectHandler {
     state: SessionState,
     quic_pool: Option<QuicPool>,
     accepted: AtomicBool,
+    _open_permit: ConnectPermit,
 }
 
 impl Drop for ConnectHandler {
@@ -652,6 +744,7 @@ pub struct RelaySessionConfig {
     pub cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
     pub in_bytes_per_millisat: u64,
     pub out_bytes_per_millisat: u64,
+    pub connect_limits: RelayConnectLimits,
 }
 
 pub async fn relay_session_from_transport_stream<S>(
@@ -697,6 +790,19 @@ impl ConnectHandler {
             )
             .body(())
             .unwrap()
+    }
+
+    fn acquire_setup_or_reject(
+        &self,
+        respond: &mut server::SendResponse<Bytes>,
+    ) -> Option<ConnectPermit> {
+        match self.state.connect_limits.try_setup() {
+            Ok(permit) => Some(permit),
+            Err(code) => {
+                let _ = respond.send_response(Self::rejection_response(code), true);
+                None
+            }
+        }
     }
 
     async fn handle_connect(
@@ -772,6 +878,9 @@ impl ConnectHandler {
                 let _ = respond.send_response(resp, true);
                 return;
             };
+            let Some(setup_permit) = self.acquire_setup_or_reject(&mut respond) else {
+                return;
+            };
             info!("CONNECT {authority} (via QUIC secp256k1 auth)");
             let target = tokio::time::timeout(
                 CONNECT_SETUP_TIMEOUT,
@@ -797,6 +906,7 @@ impl ConnectHandler {
                             stream,
                             &authority,
                             &format!("quic:{authority}"),
+                            setup_permit,
                         )
                         .await
                     {
@@ -813,6 +923,9 @@ impl ConnectHandler {
                 }
             }
         } else {
+            let Some(setup_permit) = self.acquire_setup_or_reject(&mut respond) else {
+                return;
+            };
             info!("CONNECT {authority}");
             let target =
                 tokio::time::timeout(CONNECT_SETUP_TIMEOUT, TcpStream::connect(&authority))
@@ -826,7 +939,14 @@ impl ConnectHandler {
             match target {
                 Ok(stream) => {
                     if let Err(e) = self
-                        .proxy_tunnel(&mut respond, request, stream, &authority, &authority)
+                        .proxy_tunnel(
+                            &mut respond,
+                            request,
+                            stream,
+                            &authority,
+                            &authority,
+                            setup_permit,
+                        )
                         .await
                     {
                         error!("h2 send response error: {e}");
@@ -855,6 +975,7 @@ impl ConnectHandler {
         target: T,
         authority: &str,
         label: &str,
+        setup_permit: ConnectPermit,
     ) -> Result<(), h2::Error>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -892,6 +1013,7 @@ impl ConnectHandler {
         let Some(h2_send) = h2_send else {
             return Ok(());
         };
+        drop(setup_permit);
         let (_, h2_recv) = request.into_parts();
         let state = self.state.clone();
         let session_id = self.state.session_id;
@@ -972,6 +1094,9 @@ impl ConnectHandler {
                 return;
             }
         };
+        let Some(setup_permit) = self.acquire_setup_or_reject(respond) else {
+            return;
+        };
 
         info!(
             "CONNECT {} (via blinded QUIC secp256k1 auth)",
@@ -1006,6 +1131,7 @@ impl ConnectHandler {
                         quic_stream,
                         &resolved.next_hop_addr,
                         &format!("quic-blinded:{}", resolved.next_hop_addr),
+                        setup_permit,
                     )
                     .await
                 {
@@ -1060,10 +1186,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
 
                     match (&method, uri.path()) {
                         (&Method::CONNECT, _) => {
+                            let open_permit = match self.state.connect_limits.try_open() {
+                                Ok(permit) => permit,
+                                Err(code) => {
+                                    let _ = respond.send_response(
+                                        ConnectHandler::rejection_response(code),
+                                        true,
+                                    );
+                                    if self.state.connect_failed().is_none() {
+                                        self.state.terminate();
+                                    }
+                                    continue;
+                                }
+                            };
                             let handler = ConnectHandler {
                                 state: self.state.clone(),
                                 quic_pool: self.quic_pool.clone(),
                                 accepted: AtomicBool::new(false),
+                                _open_permit: open_permit,
                             };
                             children.push(Box::pin(handler.handle_connect(request, respond)));
                         }
@@ -1433,9 +1573,47 @@ mod tests {
                 cashu_spilman_keyset_versions: Some(BTreeSet::from(["v1".to_string()])),
                 in_bytes_per_millisat: 1,
                 out_bytes_per_millisat: 1,
+                connect_limits: RelayConnectLimits::new(&Default::default()),
             },
         );
         (state, payments)
+    }
+
+    #[test]
+    fn connect_limits_are_scoped_and_release_on_drop() {
+        let config = RelayConnectLimitsConfig {
+            max_open_per_session: 1,
+            max_setups_per_session: 1,
+            max_open_per_relay: 1,
+            max_setups_per_relay: 1,
+        };
+        let relay = RelayConnectLimits::new(&config);
+        let first = SessionConnectLimits::new(relay.clone());
+        let second = SessionConnectLimits::new(relay);
+
+        let open = first.try_open().unwrap();
+        assert_eq!(
+            first.try_open().unwrap_err(),
+            RejectionCode::SessionConnectLimitReached
+        );
+        assert_eq!(
+            second.try_open().unwrap_err(),
+            RejectionCode::RelayConnectLimitReached
+        );
+        drop(open);
+        assert!(second.try_open().is_ok());
+
+        let setup = first.try_setup().unwrap();
+        assert_eq!(
+            first.try_setup().unwrap_err(),
+            RejectionCode::SessionConnectSetupLimitReached
+        );
+        assert_eq!(
+            second.try_setup().unwrap_err(),
+            RejectionCode::RelayConnectSetupLimitReached
+        );
+        drop(setup);
+        assert!(second.try_setup().is_ok());
     }
 
     #[tokio::test]
@@ -2791,9 +2969,18 @@ mod tests {
                 state: state.clone(),
                 quic_pool: None,
                 accepted: AtomicBool::new(false),
+                _open_permit: state.connect_limits.try_open().unwrap(),
             };
+            let setup_permit = state.connect_limits.try_setup().unwrap();
             handler
-                .proxy_tunnel(&mut respond, request, target, "target:80", "gated")
+                .proxy_tunnel(
+                    &mut respond,
+                    request,
+                    target,
+                    "target:80",
+                    "gated",
+                    setup_permit,
+                )
                 .await
                 .unwrap();
             let response = response.await;

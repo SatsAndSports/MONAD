@@ -684,6 +684,17 @@ tunnel. This policy does not inspect or constrain application protocols inside a
 CONNECT: internet HTTP headers, HTTP trailers, TLS records, and nested MONAD H2
 frames are all opaque DATA to the outer session.
 
+CONNECT admission uses two nested fail-fast resource budgets. An open reservation
+is acquired before the request becomes a session-owned child and remains held
+through setup and the accepted tunnel lifetime. A setup reservation is acquired
+after request validation but before destination I/O, and is released after the
+relay submits `200 OK` or any earlier path fails. Both reservations have
+per-session and per-relay semaphores; the relay-wide pair is shared by TCP and
+QUIC sessions belonging to that configured relay. Owned permits make cancellation,
+stream reset, timeout, setup failure, and session teardown release capacity without
+cleanup messages. These are logical CONNECT limits, not H2 concurrent-stream,
+transport-connection, or control-stream limits.
+
 ## Control Protocol and Session Billing
 
 For the stable implementation-independent target contract, see the
