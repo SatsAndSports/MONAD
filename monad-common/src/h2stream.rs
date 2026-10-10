@@ -13,6 +13,27 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// Maximum uncompressed size of one MONAD H2 header list, including the
+/// per-field overhead defined by HTTP/2.
+pub const MAX_H2_HEADER_LIST_SIZE: u32 = 32 * 1024;
+
+const TRAILERS_NOT_PERMITTED: &str = "H2 trailers are not permitted by MONAD";
+
+/// Complete an H2 receive body while rejecting any trailing HEADERS block.
+pub async fn ensure_no_trailers(recv: &mut RecvStream) -> io::Result<()> {
+    match recv
+        .trailers()
+        .await
+        .map_err(|e| io::Error::other(format!("h2 trailer receive error: {e}")))?
+    {
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            TRAILERS_NOT_PERMITTED,
+        )),
+        None => Ok(()),
+    }
+}
+
 /// An H2 CONNECT stream wrapped as AsyncRead + AsyncWrite.
 ///
 /// This allows an H2 data channel to be used as the underlying transport
@@ -114,11 +135,20 @@ impl AsyncRead for H2ConnectStream {
             Poll::Ready(Some(Err(e))) => {
                 Poll::Ready(Err(io::Error::other(format!("h2 recv error: {e}"))))
             }
-            Poll::Ready(None) => {
-                // End of stream
-                me.recv_done = true;
-                Poll::Ready(Ok(()))
-            }
+            Poll::Ready(None) => match me.recv.poll_trailers(cx) {
+                Poll::Ready(Ok(Some(_))) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    TRAILERS_NOT_PERMITTED,
+                ))),
+                Poll::Ready(Ok(None)) => {
+                    me.recv_done = true;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(format!(
+                    "h2 trailer receive error: {e}"
+                )))),
+                Poll::Pending => Poll::Pending,
+            },
             Poll::Pending => Poll::Pending,
         }
     }
@@ -175,5 +205,125 @@ impl AsyncWrite for H2ConnectStream {
         // Send an empty frame with end_of_stream=true
         let _ = me.send.send_data(Bytes::new(), true);
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::{HeaderMap, HeaderValue, Request, Response};
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn connect_stream_rejects_trailers() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        let client_driver = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+        let (response, send) = client
+            .send_request(
+                Request::builder()
+                    .method("CONNECT")
+                    .uri("target:80")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+
+        let mut server = h2::server::handshake(server_io).await.unwrap();
+        let (_request, mut respond) = server.accept().await.unwrap().unwrap();
+        let mut server_send = respond.send_response(Response::new(()), false).unwrap();
+        let server_driver = tokio::spawn(async move { while server.accept().await.is_some() {} });
+        let recv = response.await.unwrap().into_body();
+        let mut stream = H2ConnectStream::new(send, recv, None);
+
+        server_send.send_trailers(HeaderMap::new()).unwrap();
+        let error = timeout(Duration::from_secs(2), async {
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap_err()
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), TRAILERS_NOT_PERMITTED);
+
+        client_driver.abort();
+        server_driver.abort();
+    }
+
+    #[tokio::test]
+    async fn client_header_limit_rejects_oversized_response() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let (mut client, client_conn) = h2::client::Builder::new()
+            .max_header_list_size(MAX_H2_HEADER_LIST_SIZE)
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .unwrap();
+        let client_driver = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+        let (response, _send) = client.send_request(Request::new(()), true).unwrap();
+
+        let mut server = h2::server::handshake(server_io).await.unwrap();
+        let (_request, mut respond) = server.accept().await.unwrap().unwrap();
+        let oversized = HeaderValue::from_bytes(&vec![b'x'; 40 * 1024]).unwrap();
+        let response_headers = Response::builder()
+            .header("x-oversized", oversized)
+            .body(())
+            .unwrap();
+        respond.send_response(response_headers, true).unwrap();
+        let server_driver = tokio::spawn(async move { while server.accept().await.is_some() {} });
+
+        assert!(timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .is_err());
+        client_driver.abort();
+        server_driver.abort();
+    }
+
+    #[tokio::test]
+    async fn server_header_limit_rejects_oversized_request_before_dispatch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        let client_driver = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+        let mut server = h2::server::Builder::new()
+            .max_header_list_size(MAX_H2_HEADER_LIST_SIZE)
+            .handshake::<_, Bytes>(server_io)
+            .await
+            .unwrap();
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let server_dispatched = dispatched.clone();
+        let server_driver = tokio::spawn(async move {
+            if matches!(server.accept().await, Some(Ok(_))) {
+                server_dispatched.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let oversized = HeaderValue::from_bytes(&vec![b'x'; 40 * 1024]).unwrap();
+        let request = Request::builder()
+            .header("x-oversized", oversized)
+            .body(())
+            .unwrap();
+        if let Ok((response, _send)) = client.send_request(request, true) {
+            if let Ok(response) = timeout(Duration::from_secs(2), response).await.unwrap() {
+                assert_eq!(
+                    response.status(),
+                    http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+                );
+            }
+        }
+        tokio::task::yield_now().await;
+        assert!(!dispatched.load(Ordering::SeqCst));
+        client_driver.abort();
+        server_driver.abort();
     }
 }

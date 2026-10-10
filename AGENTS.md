@@ -73,6 +73,7 @@ cargo run -p monad-quic -- ...
 - Control stream: `POST /control`
 - Data stream: `CONNECT host:port`
 - Nesting: another full Noise+H2 session can run on top of an H2 CONNECT tunnel via `H2ConnectStream`
+- H2 request/response header lists are capped at 32 KiB uncompressed; MONAD-layer trailers are prohibited. Internet protocol headers inside CONNECT remain opaque DATA.
 
 ### Control Protocol
 

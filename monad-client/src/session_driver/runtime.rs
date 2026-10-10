@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use monad_common::control_codec::try_decode_json_line;
 use monad_common::control_exchange::{Attribution, PendingRequest};
+use monad_common::h2stream::ensure_no_trailers;
 use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
 use monad_common::session::SessionPricing;
 use std::io;
@@ -171,6 +172,7 @@ pub(super) async fn run_session_driver(
             tokio::select! {
             maybe_chunk = h2_recv.data() => {
                 let Some(chunk) = maybe_chunk else {
+                    ensure_no_trailers(&mut h2_recv).await?;
                     break;
                 };
                 let data = chunk.map_err(|e| io::Error::other(format!("h2 recv error: {e}")))?;

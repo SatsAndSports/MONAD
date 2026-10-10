@@ -211,6 +211,9 @@ Why this is acceptable for MONAD:
 
 - A MONAD session is control plus a handful of CONNECT tunnels, with the
   default 64 KiB window — the relaxed bound is small and explicit.
+- Both peers cap each received uncompressed H2 header list at 32 KiB. MONAD
+  rejects all trailing HEADERS blocks, so headers cannot create an additional
+  application-level buffering channel after a stream has started.
 - Stock behavior is unchanged for peers that do not opt in; the per-stream
   window itself is untouched, so per-stream buffering is exactly as before.
 - The 25,000-concurrent-stream stress configuration passes with the fix

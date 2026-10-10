@@ -635,6 +635,13 @@ generic `CONTROL_INVALID_MESSAGE` before teardown. Remaining work is tracked in
 [issue #125](https://github.com/SatsAndSports/MONAD/issues/125). No database
 migration or reset is needed for this advertisement update.
 
+Every MONAD H2 request and response header list is limited to 32 KiB of
+uncompressed HTTP/2 header-list size. MONAD does not use trailing H2 HEADERS:
+control trailers are a fatal framing error, while CONNECT trailers close that
+tunnel without terminating the enclosing session. This restriction applies only
+to the internal MONAD H2 layer. HTTP headers and trailers sent to an internet
+destination travel as opaque CONNECT DATA and are unaffected.
+
 When a first-time `ChannelLink` uses an unknown keyset for a configured trusted mint/unit, the relay performs metadata-independent structural checks, transparently invokes its bounded refresh coordinator, and retries the immutable link once. A successful refresh that still does not know the keyset produces a permanent `LinkMintOrKeysetUnacceptable` rejection. If cooldown, that relay coordinator's cross-mint capacity, timeout, or mint failure prevents a fresh decision, the relay returns a specific transient link error and the configured client preserves the channel and retries with backoff.
 
 There is no client-requested relay refresh operation. Automatic first-link refresh is limited to configured trusted mint/unit pairs: within one hosted relay, each mint gets at most one actual attempt per cooldown regardless of outcome, concurrent same-mint links share one cancellation-safe attempt, cross-mint saturation fails fast, and mint I/O has a timeout. Hosted relays share the wallet cache but have separate refresh coordinators and budgets. Existing stored channels relink from authoritative persisted funding without requiring the current cache or triggering refresh. Startup discovery still populates the cache. Close and drain operations have separate recovery state machines; both use cache-only selection, can warm an empty mint/unit cache, and allow at most one changed-output-keyset retry after a recognized keyset rejection.

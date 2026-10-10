@@ -676,6 +676,14 @@ This means:
 
 At intermediate hops in a nested route, the inner hop connection is itself just one long-lived CONNECT tunnel.
 
+Initial request and response header lists on each MONAD H2 session have a fixed
+32 KiB uncompressed header-list limit, including HTTP/2's per-field overhead.
+MONAD permits extensible initial headers but no trailing HEADERS blocks. A trailer
+on the control stream is session-fatal; a trailer on CONNECT is local to that
+tunnel. This policy does not inspect or constrain application protocols inside a
+CONNECT: internet HTTP headers, HTTP trailers, TLS records, and nested MONAD H2
+frames are all opaque DATA to the outer session.
+
 ## Control Protocol and Session Billing
 
 For the stable implementation-independent target contract, see the

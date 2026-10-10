@@ -126,6 +126,19 @@ peer.
 
 ### 2.1 Encoding and resource bound
 
+Each initial MONAD H2 request or response header list MUST fit within **32,768
+bytes** using HTTP/2's uncompressed header-list accounting: name length plus value
+length plus 32 bytes per field, including pseudo-headers. Initial ordinary headers
+remain extensible and are not rejected merely because an implementation does not
+recognize them.
+
+MONAD does not use H2 trailers. A trailing HEADERS block, including an empty one,
+is a protocol violation. On the control stream it follows the fatal malformed-input
+handling below. On a CONNECT stream it terminates that tunnel without terminating
+the enclosing session. These rules apply to the MONAD H2 envelope only; headers or
+trailers in an HTTP protocol carried inside CONNECT are opaque DATA and are outside
+this bound and prohibition.
+
 Each message is one UTF-8 JSON object terminated by LF (`0x0a`), with a required,
 case-sensitive `type`. H2 DATA boundaries have no application significance.
 Senders MUST NOT emit blank lines; receivers MAY ignore them. A final partial

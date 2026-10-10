@@ -18,7 +18,7 @@ mod payment_conflict;
 
 use bytes::Bytes;
 use h2::client;
-use http::{Method, Request};
+use http::{HeaderMap, Method, Request};
 use monad_client::config_runtime::route_from_client_config;
 use monad_client::connector;
 use monad_client::loose_proof_wallet::{LooseProofWallet, NewLooseProof};
@@ -3499,6 +3499,81 @@ async fn test_second_control_stream_rejected() {
     drop(first_recv);
     drop(h2);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_control_trailers_send_bounded_error_and_terminate() {
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut h2_send, mut h2_recv) = conn.open_control().await.unwrap();
+    let (_in0, _out0, _paid0, _rem0, paused0) = control_handshake(&mut h2_send, &mut h2_recv).await;
+    assert!(paused0);
+
+    h2_send.send_trailers(HeaderMap::new()).unwrap();
+
+    let (code, message) = match read_control_message(&mut h2_recv).await {
+        ServerMessage::Error { code, message } => (code, message),
+        other => panic!("expected Error, got {other:?}"),
+    };
+    assert_eq!(code, ServerErrorCode::ControlInvalidMessage);
+    assert_eq!(message, "invalid control message");
+    expect_control_stream_closed(&mut h2_recv).await;
+
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_connect_trailers_close_only_the_tunnel() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        received
+    });
+
+    let (server_addr, pubkey) = start_monad_relay().await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let mut control = ControlSessionHarness::open(&conn).await;
+    control.handshake().await;
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    channel.link(&mut control.send, &mut control.recv).await;
+    channel
+        .pay(&mut control.send, &mut control.recv, TEST_SESSION_PAYMENT)
+        .await;
+
+    let mut h2 = conn.clone_send_request().await;
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(target_addr.to_string())
+        .body(())
+        .unwrap();
+    let (response, mut tunnel_send) = h2.send_request(request, false).unwrap();
+    let mut tunnel_recv = response.await.unwrap().into_body();
+    control.wait_for_connect_counts(1, 1, 0).await;
+
+    tunnel_send
+        .send_data(Bytes::from_static(b"before trailers"), false)
+        .unwrap();
+    tunnel_send.send_trailers(HeaderMap::new()).unwrap();
+
+    assert_eq!(
+        timeout(Duration::from_secs(2), target_task)
+            .await
+            .unwrap()
+            .unwrap(),
+        b"before trailers"
+    );
+    control.wait_for_connect_counts(0, 1, 0).await;
+    let status = control.get_status().await;
+    assert_eq!(status.total_connects, 1);
+    assert_eq!(status.failed_connects, 0);
+
+    let _ = tunnel_recv.data().await;
+    control.close().await;
+    drop(h2);
     conn.shutdown().await;
 }
 
