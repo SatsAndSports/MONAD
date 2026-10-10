@@ -6589,23 +6589,36 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
         release_rx,
     ));
 
+    let paused_target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let paused_target_addr = paused_target_listener.local_addr().unwrap();
+    let (reply_queued_tx, reply_queued_rx) = tokio::sync::oneshot::channel();
+    let (request_received_tx, mut request_received_rx) = tokio::sync::oneshot::channel();
+    let paused_target_task = tokio::spawn(async move {
+        let (mut stream, _) = paused_target_listener.accept().await.unwrap();
+        stream.write_all(b"PONG").await.unwrap();
+        let _ = reply_queued_tx.send(());
+
+        let mut request = [0; 4];
+        stream.read_exact(&mut request).await.unwrap();
+        let _ = request_received_tx.send(request);
+    });
+
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
 
-    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
-    let (_in0, _out0, _paid0, rem0, paused0) =
-        control_handshake(&mut control_send, &mut control_recv).await;
-    assert!(paused0);
-    assert_eq!(rem0, 0);
+    let mut control = ControlSessionHarness::open(&conn).await;
+    let initial = control.handshake().await;
+    assert!(initial.paused);
+    assert_eq!(initial.remaining_milli_sats, 0);
 
     let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
     let (_in1, _out1, paid1, rem1, paused1) =
-        channel.link(&mut control_send, &mut control_recv).await;
+        channel.link(&mut control.send, &mut control.recv).await;
     assert_eq!(paid1, 0);
     assert_eq!(rem1, 0);
     assert!(paused1);
     let (_in1, _out1, _paid1, rem1, paused1) =
-        channel.pay(&mut control_send, &mut control_recv, 5).await;
+        channel.pay(&mut control.send, &mut control.recv, 5).await;
     assert!(!paused1);
     assert_eq!(rem1, 5);
 
@@ -6627,7 +6640,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
         .unwrap();
 
     let (_in2, out2, _paid2, rem2, paused2) =
-        wait_for_session_totals(&mut control_send, &mut control_recv, 0, 10)
+        wait_for_session_totals(&mut control.send, &mut control.recv, 0, 10)
             .await
             .expect("the whole bounded frame may overshoot paid credit");
     assert_eq!(out2, 10);
@@ -6635,31 +6648,82 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     assert!(paused2);
 
     let (_in3, _out3, _paid3, rem3, paused3) =
-        channel.pay(&mut control_send, &mut control_recv, 4).await;
+        channel.pay(&mut control.send, &mut control.recv, 4).await;
     assert_eq!(rem3, -1);
     assert!(paused3);
 
     let mut h2_for_paused_connect = conn.clone_send_request().await;
     let paused_request = Request::builder()
         .method(Method::CONNECT)
-        .uri(format!("127.0.0.1:{}", target_addr.port()))
+        .uri(format!("127.0.0.1:{}", paused_target_addr.port()))
         .body(())
         .unwrap();
-    let (paused_response_future, paused_h2_send) = h2_for_paused_connect
+    let (paused_response_future, mut paused_h2_send) = h2_for_paused_connect
         .send_request(paused_request, false)
         .unwrap();
     let paused_response = paused_response_future.await.unwrap();
     assert!(paused_response.status().is_success());
-    drop(paused_h2_send);
-    drop(paused_response);
-    drop(h2_for_paused_connect);
+    let mut paused_h2_recv = paused_response.into_body();
+    reply_queued_rx
+        .await
+        .expect("paused target should queue its response");
+
+    paused_h2_send.reserve_capacity(4);
+    wait_for_send_capacity(&mut paused_h2_send).await.unwrap();
+    paused_h2_send
+        .send_data(Bytes::from_static(b"PING"), true)
+        .unwrap();
+
+    let paused_status = control.wait_for_connect_counts(2, 2, 0).await;
+    assert!(paused_status.paused);
+    assert_eq!(paused_status.session_total_bytes_in, 0);
+    assert_eq!(paused_status.session_total_bytes_out, 10);
+
+    assert!(
+        timeout(Duration::from_millis(200), &mut request_received_rx)
+            .await
+            .is_err(),
+        "a fresh CONNECT must not forward client DATA while paused"
+    );
+    assert!(
+        timeout(Duration::from_millis(200), paused_h2_recv.data())
+            .await
+            .is_err(),
+        "a fresh CONNECT must not forward target DATA while paused"
+    );
 
     let (_in4, _out4, _paid4, rem4, paused4) =
-        channel.pay(&mut control_send, &mut control_recv, 6).await;
-    assert_eq!(rem4, 5);
+        channel.pay(&mut control.send, &mut control.recv, 20).await;
+    assert_eq!(rem4, 19);
     assert!(!paused4);
 
     let _ = release_tx.send(());
+
+    assert_eq!(
+        timeout(Duration::from_millis(500), request_received_rx)
+            .await
+            .expect("paused target should receive after positive top-up")
+            .unwrap(),
+        *b"PING"
+    );
+
+    let paused_result = timeout(Duration::from_millis(500), async {
+        let mut result = Vec::new();
+        while let Some(chunk) = paused_h2_recv.data().await {
+            let data = chunk.unwrap();
+            let len = data.len();
+            let _ = paused_h2_recv.flow_control().release_capacity(len);
+            result.extend_from_slice(&data);
+        }
+        result
+    })
+    .await
+    .expect("paused target response should complete after positive top-up");
+    assert_eq!(paused_result, b"PONG");
+    timeout(Duration::from_millis(500), paused_target_task)
+        .await
+        .expect("paused target should finish")
+        .unwrap();
 
     let result = tokio::time::timeout(std::time::Duration::from_millis(500), async {
         let mut result = Vec::new();
@@ -6675,25 +6739,19 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
     .expect("response should complete after balance becomes positive");
     assert_eq!(result, b"DONE");
 
-    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    let (
-        session_total_bytes_in,
-        session_total_bytes_out,
-        _total_paid,
-        remaining_milli_sats,
-        paused,
-    ) = expect_session_status(read_control_message(&mut control_recv).await);
-    assert_eq!(session_total_bytes_out, 10);
-    assert_eq!(session_total_bytes_in, 4);
-    assert_eq!(remaining_milli_sats, 1);
-    assert!(!paused);
+    let final_status = control.wait_for_connect_counts(0, 2, 0).await;
+    assert_eq!(final_status.session_total_bytes_out, 14);
+    assert_eq!(final_status.session_total_bytes_in, 8);
+    assert_eq!(final_status.remaining_milli_sats, 7);
+    assert!(!final_status.paused);
 
-    let _ = control_send.send_data(Bytes::new(), true);
-    drop(control_send);
-    drop(control_recv);
+    control.close().await;
     drop(h2_send);
     drop(h2_recv);
     drop(h2);
+    drop(paused_h2_send);
+    drop(paused_h2_recv);
+    drop(h2_for_paused_connect);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     conn.shutdown().await;
 }

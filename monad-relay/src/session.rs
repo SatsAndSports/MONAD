@@ -1322,7 +1322,7 @@ pub(crate) async fn send_control_message(
     send_json_line(h2_send, message).await
 }
 
-/// Handle a long-lived control stream for one paid relay session.
+/// Handle the long-lived control stream for one relay session.
 struct InboundControlRequest {
     message: ClientMessage,
     // Held through validation, snapshot construction, and response submission.
