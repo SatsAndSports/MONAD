@@ -784,7 +784,13 @@ state machine begins only after the initial `SessionStatus` has been sent.
 
 ### Paused-by-Default
 
-Sessions start paused with zero balance. While paused:
+Sessions start paused with zero balance. Before the first positive payment,
+`CONNECT` receives structured HTTP 402 `INITIAL_PAYMENT_REQUIRED`; the relay
+checks both before destination setup and immediately before publishing `200 OK`.
+This prevents an unpaid session from consuming destination or accepted-tunnel
+resources. Linking a zero-balance channel does not satisfy the gate.
+
+After any positive cumulative payment, while paused:
 - The control stream is always usable (free)
 - New `CONNECT` requests may establish and be accepted, but start with both
   forwarding directions blocked
@@ -853,7 +859,7 @@ A bounded forwarding operation that starts while the session has positive credit
 
 ### Client Auto-Funding
 
-The client opens a control stream immediately after connecting. Once it receives the initial `SessionStatus`, the per-session payment driver runs one serialized direct control loop. That loop chooses or provisions a local channel, sends `ChannelLink`, and later sends `ChannelPayment` updates. Intermediate hops in multi-hop chains use the same session-driver model.
+The client opens a control stream immediately after connecting. Once it receives the initial `SessionStatus`, the per-session payment driver runs one serialized direct control loop. That loop chooses or provisions a local channel, sends `ChannelLink`, and later sends `ChannelPayment` updates. Intermediate hops in multi-hop chains use the same session-driver model. Normal route constructors fund every hop, including the final hop, and return only after an attributed `ChannelPayment` response reports a positive paid total and unpaused state. `connect_route_with_unfunded_final` is the explicit test/special-purpose exception.
 
 The client stores each channel's expiry timestamp in local channel metadata and excludes already-expired channels from selection. If a relay rejects a link because the channel expiry is too soon or the capacity does not satisfy the relay's channel policy, the driver marks that channel globally unusable locally and selects or provisions another channel.
 
@@ -925,7 +931,9 @@ Important design points:
 - the per-session client state does not need a mutex
 - `paused` is the real operational state; there is no separate long-lived `ready`
   state inside the funding logic
-- the startup oneshot waiter is executor-only coordination, not session state
+- the startup oneshot waiter is executor-only coordination, not session state;
+  it resolves only from an attributed successful payment response with positive
+  cumulative payment and unpaused forwarding
 - a parent session collapse still indirectly ends deeper nested client sessions via
   transport teardown rather than explicit tree-walking
 

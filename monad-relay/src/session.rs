@@ -29,6 +29,7 @@ use monad_common::protocol::{
     ChannelEvictionScope, ClientMessage, MintUnitAdvertisement, MintUnitAdvertisements,
     ServerErrorCode, ServerMessage,
 };
+use monad_common::rejection::RejectionCode;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::SessionPricing;
 use monad_quic::client::ClientAuthMode;
@@ -585,6 +586,10 @@ impl SessionState {
         self.counters.connect_acceptance_available()
     }
 
+    fn initial_payment_required(&self) -> bool {
+        self.billing.lock().unwrap().state.total_paid_millisats == 0
+    }
+
     pub(crate) fn connect_opened(&self) -> Option<(u32, u64)> {
         self.counters.connect_opened()
     }
@@ -681,6 +686,17 @@ where
 }
 
 impl ConnectHandler {
+    fn rejection_response(code: RejectionCode) -> Response<()> {
+        Response::builder()
+            .status(code.connect_status().unwrap())
+            .header(
+                monad_common::rejection::CONNECT_REJECTION_HEADER,
+                code.header_value(),
+            )
+            .body(())
+            .unwrap()
+    }
+
     async fn handle_connect(
         self,
         request: Request<RecvStream>,
@@ -688,14 +704,16 @@ impl ConnectHandler {
     ) {
         let controls = self.state.session_registry.controls();
         if let Some(code) = controls.tunnel_rejection() {
-            let resp = Response::builder()
-                .status(code.connect_status().unwrap())
-                .header(
-                    monad_common::rejection::CONNECT_REJECTION_HEADER,
-                    code.header_value(),
-                )
-                .body(())
-                .unwrap();
+            let resp = Self::rejection_response(code);
+            let _ = respond.send_response(resp, true);
+            return;
+        }
+        if self.state.is_terminated() {
+            respond.send_reset(h2::Reason::CANCEL);
+            return;
+        }
+        if self.state.initial_payment_required() {
+            let resp = Self::rejection_response(RejectionCode::InitialPaymentRequired);
             let _ = respond.send_response(resp, true);
             return;
         }
@@ -845,19 +863,17 @@ impl ConnectHandler {
         }
         let h2_send = self.state.session_registry.with_controls(|controls| {
             if let Some(code) = controls.tunnel_rejection() {
-                let resp = Response::builder()
-                    .status(code.connect_status().unwrap())
-                    .header(
-                        monad_common::rejection::CONNECT_REJECTION_HEADER,
-                        code.header_value(),
-                    )
-                    .body(())
-                    .unwrap();
+                let resp = Self::rejection_response(code);
                 respond.send_response(resp, true)?;
                 return Ok::<_, h2::Error>(None);
             }
             if self.state.is_terminated() {
                 respond.send_reset(h2::Reason::CANCEL);
+                return Ok(None);
+            }
+            if self.state.initial_payment_required() {
+                let resp = Self::rejection_response(RejectionCode::InitialPaymentRequired);
+                respond.send_response(resp, true)?;
                 return Ok(None);
             }
             if !self.state.connect_acceptance_available() {
@@ -1431,8 +1447,12 @@ mod tests {
                     r#"{"channel_id":"abort-owned","balance":0,"capacity":100,"unit":"msat"}"#,
                 )
                 .unwrap();
-            state.billing.lock().unwrap().state.linked_channel_id = Some(link.channel_id);
-            state.billing.lock().unwrap().state.paused = false;
+            {
+                let mut billing = state.billing.lock().unwrap();
+                billing.state.linked_channel_id = Some(link.channel_id);
+                billing.state.total_paid_millisats = 1;
+                billing.state.paused = false;
+            }
             state.update_pause_watch(false);
             let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let (client_io, server_io) = tokio::io::duplex(4096);
@@ -2216,7 +2236,11 @@ mod tests {
         use tokio::time::{timeout, Duration};
         for wait_for_deadline in [false, true] {
             let (state, _) = test_state();
-            state.billing.lock().unwrap().state.paused = false;
+            {
+                let mut billing = state.billing.lock().unwrap();
+                billing.state.total_paid_millisats = 1;
+                billing.state.paused = false;
+            }
             state.update_pause_watch(false);
             // A bound UDP socket that observes but never answers QUIC Initials is
             // a deterministic setup gate, not an unroutable-host timing assumption.
@@ -2720,15 +2744,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_publication_rechecks_termination_and_admission() {
-        for mode in ["terminate", "admission"] {
+    async fn connect_publication_rechecks_termination_payment_and_admission() {
+        for mode in ["terminate", "initial_payment", "admission"] {
             let terminate = mode == "terminate";
             let (state, _) = test_state();
             if terminate {
                 state.terminate();
             }
             if mode == "admission" {
-                state.billing.lock().unwrap().state.paused = false;
+                let mut billing = state.billing.lock().unwrap();
+                billing.state.total_paid_millisats = 1;
+                billing.state.paused = false;
+                drop(billing);
                 state
                     .session_registry
                     .set_controls(crate::session_registry::RelayControls {
@@ -2769,6 +2796,16 @@ mod tests {
             let response = response.await;
             if terminate {
                 assert!(response.is_err());
+            } else if mode == "initial_payment" {
+                let response = response.unwrap();
+                assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(monad_common::rejection::CONNECT_REJECTION_HEADER)
+                        .unwrap(),
+                    RejectionCode::InitialPaymentRequired.header_value()
+                );
             } else if mode == "admission" {
                 assert_eq!(response.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
             }

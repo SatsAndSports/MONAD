@@ -584,7 +584,8 @@ Current coverage includes:
 - Noise session ID (handshake hash) matches on both sides
 - session starts paused by default
 - second control stream rejected
-- CONNECT accepted while paused but forwarding blocked until payment
+- CONNECT rejected before the first payment without destination setup
+- CONNECT accepted during later pauses but forwarding blocked until payment
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
 - session overshoot with negative balance and resume

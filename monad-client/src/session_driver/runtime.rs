@@ -291,7 +291,7 @@ pub(super) async fn run_session_driver(
                                 }
                                 hop.status(owner, state.relay_snapshot.as_ref().and_then(|s| s.linked_channel.clone()), paused, total_paid_millisats, remaining_milli_sats);
                             }
-                            if !paused {
+                            if resolved && total_paid_millisats > 0 && !paused {
                                 signal_ready(&mut state, &mut ready_tx).await;
                             }
                             resolved

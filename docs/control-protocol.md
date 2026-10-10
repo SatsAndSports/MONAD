@@ -33,6 +33,10 @@ development period described in §7.
   `ExtensionNotification` messages may appear before it, but it is the relay's
   first non-extension message.
 - A new session is unlinked and paused, with zero CONNECT counters.
+- Until `total_paid_millisats` becomes positive, every data `CONNECT` MUST be
+  rejected before destination setup with HTTP 402 and
+  `monad-rejection-code: INITIAL_PAYMENT_REQUIRED`. Linking a channel alone does
+  not satisfy this gate.
 - The initial status supplies the state and funding information defined in §3.3.
 
 ### 1.2 Payment channels and payments into a session
@@ -477,11 +481,13 @@ paused = (remaining_milli_sats <= 0)
 
 Round the sum once using exact arithmetic, not each direction separately. The
 wire remaining value is exact and is never clamped. Negative credit is permitted
-from chunk-boundary overshoot and does not erase payment history. Pausing gates
-cleartext forwarding, not CONNECT admission or destination setup. A CONNECT
-accepted while paused starts with both forwarding directions blocked until
-credit becomes positive, just like an existing tunnel that becomes paused.
-Ordinary transport failure or termination may still end either kind of tunnel.
+from chunk-boundary overshoot and does not erase payment history. After the
+session has received any positive cumulative payment, pausing gates cleartext
+forwarding, not CONNECT admission or destination setup. A CONNECT accepted
+during a later pause starts with both forwarding directions blocked until credit
+becomes positive, just like an existing tunnel that becomes paused. This does
+not override the initial-payment gate in §1.1. Ordinary transport failure or
+termination may still end either kind of tunnel.
 
 A client decides what to pay from its own records: locally observed cleartext
 bytes in each direction plus its signed and accepted-payment history. Relay

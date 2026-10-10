@@ -39,6 +39,7 @@ new stream on either a new or pooled connection can reach the Noise rejection.
 | `TUNNEL_ADMISSION_DISABLED` | CONNECT 503 | Existing tunnels continue, new tunnels refused |
 | `CHANNEL_ADMISSION_DISABLED` | Control `Error {code,message}` | Stored channels may relink/pay; first-time acceptance refused |
 | `DESTINATION_POLICY_DENIED` | CONNECT 403 | This destination is not permitted |
+| `INITIAL_PAYMENT_REQUIRED` | CONNECT 402 | The session has never received a positive payment; no destination setup occurs |
 
 CONNECT supplies the code in `monad-rejection-code`, without a response body that
 the client would have to wait to read. The client derives the standard explanation

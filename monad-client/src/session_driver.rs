@@ -344,13 +344,13 @@ mod tests {
         use crate::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
         use monad_common::control_codec::{send_json_line, try_decode_json_line};
         use monad_common::protocol::{ClientMessage, ServerMessage};
-        fn status(paid: u64, linked: bool, balance: u64) -> ServerMessage {
+        fn status(paid: u64, linked: bool, balance: u64, paused: bool) -> ServerMessage {
             serde_json::from_value(serde_json::json!({
                 "type":"SessionStatus", "receiver_pubkey":"receiver",
                 "advertisements":{"https://mint":{"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400}}},
                 "linked_channel":if linked { serde_json::json!({"channel_id":"channel","balance_raw":balance,"capacity_raw":1000,"unit":"msat"}) } else { serde_json::Value::Null },
                 "bytes_in_per_msat":1,"bytes_out_per_msat":1,"session_total_bytes_in":0,"session_total_bytes_out":0,
-                "total_paid_millisats":paid,"remaining_milli_sats":paid,"paused":paid==0,
+                "total_paid_millisats":paid,"remaining_milli_sats":paid,"paused":paused,
                 "open_connects":0,"total_connects":0,"failed_connects":0
             })).unwrap()
         }
@@ -409,7 +409,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                send_json_line(&mut send, &status(0, false, 0))
+                send_json_line(&mut send, &status(0, false, 0, true))
                     .await
                     .unwrap();
                 let mut buf = Vec::new();
@@ -439,7 +439,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                send_json_line(&mut send, &status(0, true, 0))
+                // An inconsistent unpaused link response must not publish the
+                // route before an attributed payment response confirms funds.
+                send_json_line(&mut send, &status(0, true, 0, false))
                     .await
                     .unwrap();
                 assert!(matches!(
@@ -456,13 +458,13 @@ mod tests {
                 .unwrap();
                 send_json_line(
                     &mut send,
-                    &status(if shortchange { 9 } else { 10 }, true, 10),
+                    &status(if shortchange { 9 } else { 10 }, true, 10, false),
                 )
                 .await
                 .unwrap();
                 if !shortchange {
                     // Neither empty-FIFO response may mutate state or terminate.
-                    send_json_line(&mut send, &status(0, true, 0))
+                    send_json_line(&mut send, &status(0, true, 0, true))
                         .await
                         .unwrap();
                     send_json_line(
@@ -486,7 +488,7 @@ mod tests {
                         next(&mut recv, &mut buf).await,
                         ClientMessage::ChannelUnlink { .. }
                     ));
-                    send_json_line(&mut send, &status(10, false, 0))
+                    send_json_line(&mut send, &status(10, false, 0, false))
                         .await
                         .unwrap();
                     send_json_line(

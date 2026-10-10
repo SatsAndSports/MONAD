@@ -12,6 +12,7 @@ pub enum RejectionCode {
     TunnelAdmissionDisabled,
     ChannelAdmissionDisabled,
     DestinationPolicyDenied,
+    InitialPaymentRequired,
     BootstrapRejected,
 }
 
@@ -30,6 +31,7 @@ impl RejectionCode {
             Self::TunnelAdmissionDisabled => "This relay is not accepting new tunnels.",
             Self::ChannelAdmissionDisabled => "This relay is not accepting new channels.",
             Self::DestinationPolicyDenied => "This destination is denied by relay policy.",
+            Self::InitialPaymentRequired => "This session has not received a payment.",
             Self::BootstrapRejected => "Bootstrap negotiation was rejected.",
         };
         Rejection {
@@ -44,6 +46,7 @@ impl RejectionCode {
                 Some(http::StatusCode::SERVICE_UNAVAILABLE)
             }
             Self::DestinationPolicyDenied => Some(http::StatusCode::FORBIDDEN),
+            Self::InitialPaymentRequired => Some(http::StatusCode::PAYMENT_REQUIRED),
             _ => None,
         }
     }
@@ -118,6 +121,7 @@ mod tests {
             RejectionCode::RelayDisabled,
             RejectionCode::TunnelAdmissionDisabled,
             RejectionCode::DestinationPolicyDenied,
+            RejectionCode::InitialPaymentRequired,
         ] {
             let mut headers = http::HeaderMap::new();
             headers.insert(CONNECT_REJECTION_HEADER, code.header_value());
