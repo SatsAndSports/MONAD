@@ -274,7 +274,7 @@ The test suite currently covers:
 - QUIC first hop then TCP second hop
 - Noise session ID (handshake hash) matches on both sides
 - Spilman channel implementation (delta-based) is exercised through relay validation, client wallet provisioning/recovery tests, and connector/session-driver flows
-- relay advertises multiple mint/unit pricing options
+- relay advertises multiple mint/unit funding options under session-wide rates
 - relay loads its trusted mint policy from a per-relay YAML config entry and advertises only configured mints/units
 - default integration-test relays advertise a synthetic test mint/unit offer; mock wallets own synthetic keysets so connector-driven intermediate hops can provision mock channels through the test wallet path
 - control detach releases linked channel ownership and tears down active/future streams

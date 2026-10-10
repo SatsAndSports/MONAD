@@ -591,11 +591,16 @@ Current coverage includes:
 - second control stream rejected
 - CONNECT rejected before the first payment without destination setup
 - CONNECT accepted during later pauses but forwarding blocked until payment
+- per-session and relay-wide CONNECT open/setup limits, fail-fast refusal, and permit release
+- SessionStatus CONNECT acceptance, closure, and failure counters
+- control traffic remains usable while paused CONNECT DATA fills the H2 receive window
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
 - session overshoot with negative balance and resume
 - concurrent bounded tunnel operations overshooting shared credit
 - exact billing boundaries, zero-rate rejection, and pre-mutation numeric-limit errors
+- bounded control framing, parser complexity, error delivery, and fatal cleanup
+- exact 32 KiB H2 header-list boundaries and internal trailer rejection
 - underpayment stays paused until balance is positive
 - multiple simultaneous tunnels
 - 2-hop and 3-hop nested routing
@@ -623,7 +628,7 @@ Current coverage includes:
 - QUIC first hop then TCP second hop
 - TCP secp single-hop and nested plain-CONNECT secp tunnels
 - session funding and incremental payments via `ChannelLink` / `ChannelPayment`
-- relay advertises multiple mint/unit pricing options
+- relay advertises multiple mint/unit funding options under session-wide rates
 - control detach releases linked channels and tears down active / future streams
 - changing a relay's current trusted mint policy stops new advertisement/acceptance for that mint without invalidating previously stored channels
 

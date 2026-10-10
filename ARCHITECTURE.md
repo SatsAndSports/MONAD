@@ -348,9 +348,9 @@ Responsibilities:
   - `CONNECT host:port`
 - proxy bytes between H2 streams and external TCP targets
 - populate a shared relay-wallet `SpilmanMintCache` from configured mint URLs, caching all keysets returned by those mints; trusted mint/unit policy comes from the relay's YAML config and is applied at advertisement/acceptance read sites
-- advertise receiver pubkey and trusted mint/unit recovery windows in `SessionStatus`
-  (per-(mint, unit) rate configuration is planned; today every advertisement
-  carries the session's global default rates)
+- advertise receiver pubkey and trusted mint/unit recovery windows in
+  `SessionStatus`; directional prices are reported once per session, with no
+  per-mint/unit pricing
 - load relay identity, wallet DB path, listen address, transport key, and mint policy from a per-relay entry in the shared YAML config file
 - enforce per-session billing with pause/resume on the control stream
   using validated `ChannelLink` / `ChannelPayment` messages
@@ -671,7 +671,7 @@ Noise+H2 connection to hop N
 ```
 
 This means:
-- one control stream can fund many data streams in the future
+- one control stream funds all data streams in the session
 - multiple SSH sessions, HTTP requests, and SCP transfers can coexist on the same hop connection
 
 At intermediate hops in a nested route, the inner hop connection is itself just one long-lived CONNECT tunnel.
