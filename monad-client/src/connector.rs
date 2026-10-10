@@ -393,19 +393,29 @@ pub async fn connect(
         use_quic: false,
     }])?;
     let runtime = ConnectorRuntime::with_mock_wallet()?;
-    connect_route_internal(&route, runtime, false).await
+    connect_route_internal(&route, runtime, true).await
 }
 
 pub async fn connect_route(route: &Route) -> io::Result<RouteConnection> {
+    let runtime = ConnectorRuntime::with_mock_wallet()?;
+    connect_route_internal(route, runtime, true).await
+}
+
+/// Build a route while deliberately leaving its final session unpaid.
+///
+/// Intermediate sessions are still funded so nested hops can be established.
+/// This is intended for tests and specialized callers that need to inspect or
+/// fund the final session manually.
+pub async fn connect_route_with_unfunded_final(route: &Route) -> io::Result<RouteConnection> {
     let runtime = ConnectorRuntime::with_mock_wallet()?;
     connect_route_internal(route, runtime, false).await
 }
 
 pub async fn connect_route_with_wallet(
     route: &Route,
-    wallet: Option<Arc<dyn MonadWallet>>,
+    wallet: Arc<dyn MonadWallet>,
 ) -> io::Result<RouteConnection> {
-    let runtime = ConnectorRuntime::new(wallet)?;
+    let runtime = ConnectorRuntime::new(Some(wallet))?;
     connect_route_internal(route, runtime, true).await
 }
 

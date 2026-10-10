@@ -2601,7 +2601,7 @@ impl TestRouteConnection {
 async fn connect_route_hops(hops: Vec<RouteHop>) -> TestRouteConnection {
     // A final-hop handle alone does not own the prefix tasks.
     TestRouteConnection(
-        connector::connect_route(&Route::new(hops).unwrap())
+        connector::connect_route_with_unfunded_final(&Route::new(hops).unwrap())
             .await
             .unwrap(),
     )
@@ -3564,10 +3564,9 @@ async fn test_final_partial_control_line_is_not_executed() {
 }
 
 #[tokio::test]
-async fn test_connect_accepted_while_paused_waits_for_payment() {
+async fn test_connect_requires_initial_payment_before_destination_setup() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
-    tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
@@ -3581,47 +3580,31 @@ async fn test_connect_accepted_while_paused_waits_for_payment() {
         .body(())
         .unwrap();
 
-    let (response_future, mut h2_send) = h2.send_request(request, false).unwrap();
+    let (response_future, h2_send) = h2.send_request(request, false).unwrap();
     let response = response_future.await.unwrap();
-    assert!(response.status().is_success());
-    let mut h2_recv = response.into_body();
-
-    h2_send.reserve_capacity(5);
-    wait_for_send_capacity(&mut h2_send).await.unwrap();
-    h2_send
-        .send_data(Bytes::from_static(b"hello"), false)
-        .unwrap();
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), h2_recv.data())
-            .await
-            .is_err(),
-        "accepted CONNECT must not forward while the session is paused"
+    assert_eq!(response.status(), http::StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        response
+            .headers()
+            .get(monad_common::rejection::CONNECT_REJECTION_HEADER)
+            .unwrap(),
+        monad_common::rejection::RejectionCode::InitialPaymentRequired.header_value()
     );
-
-    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
-    channel.link(&mut control.send, &mut control.recv).await;
-    let (_, _, _, _, paused) = channel
-        .pay(&mut control.send, &mut control.recv, TEST_SESSION_PAYMENT)
-        .await;
-    assert!(!paused);
-
-    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), h2_recv.data())
+    assert!(timeout(Duration::from_millis(200), upper_listener.accept())
         .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(reply, b"HELLO"[..]);
-    let _ = h2_recv.flow_control().release_capacity(reply.len());
+        .is_err());
+    control.wait_for_connect_counts(0, 0, 1).await;
 
     control.close().await;
     drop(h2_send);
-    drop(h2_recv);
     drop(h2);
     conn.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_channel_link_does_not_unpause_session() {
+    let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upper_addr = upper_listener.local_addr().unwrap();
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let mut control = ControlSessionHarness::open(&conn).await;
@@ -3636,6 +3619,26 @@ async fn test_channel_link_does_not_unpause_session() {
     assert_eq!(paid1, 0);
     assert_eq!(rem1, 0);
     assert!(paused1);
+
+    let mut h2 = conn.clone_send_request().await;
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(upper_addr.to_string())
+        .body(())
+        .unwrap();
+    let (response, _send) = h2.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        response
+            .headers()
+            .get(monad_common::rejection::CONNECT_REJECTION_HEADER)
+            .unwrap(),
+        monad_common::rejection::RejectionCode::InitialPaymentRequired.header_value()
+    );
+    assert!(timeout(Duration::from_millis(200), upper_listener.accept())
+        .await
+        .is_err());
 
     control.close().await;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -15139,7 +15142,7 @@ async fn test_session_status_reports_failed_connect_transitions() {
     let mut h2 = conn.clone_send_request().await;
     assert_eq!(
         connect_response_status(&mut h2, "host:0").await,
-        http::StatusCode::BAD_REQUEST
+        http::StatusCode::PAYMENT_REQUIRED
     );
     control.wait_for_connect_counts(0, 0, 1).await;
 
@@ -15150,6 +15153,12 @@ async fn test_session_status_reports_failed_connect_transitions() {
         .await;
     assert!(!paused);
 
+    assert_eq!(
+        connect_response_status(&mut h2, "host:0").await,
+        http::StatusCode::BAD_REQUEST
+    );
+    control.wait_for_connect_counts(0, 0, 2).await;
+
     let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let closed_addr = closed_listener.local_addr().unwrap();
     drop(closed_listener);
@@ -15157,7 +15166,7 @@ async fn test_session_status_reports_failed_connect_transitions() {
         connect_response_status(&mut h2, &closed_addr.to_string()).await,
         http::StatusCode::BAD_GATEWAY
     );
-    control.wait_for_connect_counts(0, 0, 2).await;
+    control.wait_for_connect_counts(0, 0, 3).await;
 
     control.close().await;
     drop(h2);
@@ -16158,7 +16167,6 @@ async fn test_connector_blinded_hop() {
     .unwrap();
     let route_conn = connector::connect_route(&route).await.unwrap();
     let conn = route_conn.final_connection_arc();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
 
     let mut h2 = conn.clone_send_request().await;
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"connector blinded hop").await;
@@ -16361,7 +16369,6 @@ async fn test_connector_two_consecutive_blinded_hops() {
     let route = monad_client::config_runtime::route_from_client_config(&client).unwrap();
     let route_conn = connector::connect_route(&route).await.unwrap();
     let conn = route_conn.final_connection_arc();
-    fund_session(&conn, TEST_SESSION_PAYMENT).await;
 
     let mut h2 = conn.clone_send_request().await;
     let result = tunnel_roundtrip(&mut h2, &upper_addr.to_string(), b"two blinded hops").await;

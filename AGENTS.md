@@ -82,8 +82,10 @@ cargo run -p monad-quic -- ...
 - Initial state: once the H2 control stream is established, the relay immediately sends a unified `SessionStatus` containing advertisements and initial state
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, exact integer quotient/remainder arithmetic in `monad-common/src/billing.rs`; rates must be positive and unsupported numeric ranges reject with `NUMERIC_LIMIT_EXCEEDED` before mutation
-- `CONNECT` may establish while paused; accepted tunnels block both forwarding
-  directions until credit becomes positive
+- Before the first positive payment, `CONNECT` receives structured HTTP 402
+  `INITIAL_PAYMENT_REQUIRED` without destination setup. After any positive
+  cumulative payment, `CONNECT` may establish during later pauses; accepted
+  tunnels block both forwarding directions until credit becomes positive
 - A bounded forwarding operation that starts with positive credit may complete and take the session balance negative; the relay records the actual bytes exactly, then pauses subsequent forwarding until payment restores positive credit
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
 - After the initial status, ordinary requests (link/payment/unlink/status query) have exactly one ordered status/error response. Five active/queued request permits bound relay execution; excess input is backpressured. Ping still uses the decoder → reducer → resolver path but no ordinary slot. Pause/eviction do not push status; eviction/release remain advisories. The shared `control_exchange.rs` client FIFO rejects response mismatches and short-paid responses, discards ordinary empty-FIFO responses, and preserves independent Pong correlation. Main channel funding remains serialized and uses local credit for exhaustion/reselection.
@@ -238,7 +240,8 @@ The test suite currently covers:
 - secp256k1 Noise partial-write tolerance and shutdown flushing
 - session starts paused by default
 - second control stream rejected
-- CONNECT accepted while paused with forwarding blocked until payment
+- CONNECT rejected before initial payment without destination setup
+- CONNECT accepted during later pauses with forwarding blocked until payment
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
 - session overshoot with negative balance and resume

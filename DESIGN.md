@@ -51,7 +51,9 @@ uses one HTTP/2 connection with two kinds of stream:
 This lets one session carry many application connections without making a new
 encrypted connection for each one. The control stream is deliberately separate
 from data streams: it remains available for payment and session management even
-when the session is paused. New `CONNECT` requests may still establish, but their
+when the session is paused. Before a session's first payment, new `CONNECT`
+requests are rejected without destination setup. After any payment has been
+credited, new `CONNECT` requests may establish during a later pause, but their
 data forwarding waits alongside existing tunnels until credit becomes positive.
 
 ## Nesting Creates Multi-Hop Routes
@@ -138,8 +140,10 @@ The relay accounts for the session's total inbound and outbound bytes and
 derives the amount due from its advertised prices. The client receives the
 relay's authoritative status over the control stream and keeps the session
 funded ahead of that amount. A session starts paused with zero balance; its
-control stream remains free, but the relay accepts `CONNECT` streams only while
-the total accepted payment to the session is greater than the total amount due.
+control stream remains free, and its `CONNECT` requests receive
+`INITIAL_PAYMENT_REQUIRED` until the first positive payment is credited. After
+that first payment, later zero or negative remaining credit pauses forwarding
+without preventing new tunnels from being accepted.
 
 Payments use Cashu Spilman channels. At a high level, a channel commits Cashu
 value to a relay and lets the client authorize monotonically increasing payment
