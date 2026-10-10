@@ -15210,8 +15210,11 @@ async fn test_relay_open_connect_limit_is_shared_across_sessions() {
     let (server_addr, pubkey) = start_monad_relay_with_connect_limits(limits).await;
     let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
     let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
+    let conn_unpaid = connect_client_quic_secp(server_addr, &pubkey).await;
     let (send_a, recv_a) = open_funded_control(&conn_a, TEST_SESSION_PAYMENT).await;
     let (send_b, recv_b) = open_funded_control(&conn_b, TEST_SESSION_PAYMENT).await;
+    let mut control_unpaid = ControlSessionHarness::open(&conn_unpaid).await;
+    assert!(control_unpaid.handshake().await.paused);
     let mut control_a = ControlSessionHarness {
         send: send_a,
         recv: recv_a,
@@ -15224,10 +15227,30 @@ async fn test_relay_open_connect_limit_is_shared_across_sessions() {
     let target = target.to_string();
     let mut h2_a = conn_a.clone_send_request().await;
     let mut h2_b = conn_b.clone_send_request().await;
+    let mut h2_unpaid = conn_unpaid.clone_send_request().await;
 
     let (mut first_send, first_recv) = open_connect_tunnel(&mut h2_a, &target).await;
     accepted.recv().await.unwrap();
     control_a.wait_for_connect_counts(1, 1, 0).await;
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&target)
+        .body(())
+        .unwrap();
+    let (response, unpaid_send) = h2_unpaid.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_connect_rejection(
+        &response,
+        http::StatusCode::PAYMENT_REQUIRED,
+        monad_common::rejection::RejectionCode::InitialPaymentRequired,
+    );
+    drop(unpaid_send);
+    drop(response);
+    control_unpaid.wait_for_connect_counts(0, 0, 1).await;
+    assert!(timeout(Duration::from_millis(100), accepted.recv())
+        .await
+        .is_err());
 
     let request = Request::builder()
         .method(Method::CONNECT)
@@ -15260,8 +15283,10 @@ async fn test_relay_open_connect_limit_is_shared_across_sessions() {
 
     control_a.close().await;
     control_b.close().await;
+    control_unpaid.close().await;
     conn_a.shutdown().await;
     conn_b.shutdown().await;
+    conn_unpaid.shutdown().await;
 }
 
 #[tokio::test]

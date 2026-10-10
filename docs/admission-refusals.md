@@ -52,6 +52,8 @@ code/status mismatches are invalid metadata, not reasons for indefinite waiting.
 A plain 503 without MONAD metadata remains a generic CONNECT failure.
 
 Capacity refusals are fail-fast and do not enter the administrative wait path.
+The initial-payment gate precedes CONNECT capacity admission, so a never-funded
+session receives `INITIAL_PAYMENT_REQUIRED` even when open capacity is exhausted.
 Final-exit refusal fails that SOCKS request; route construction and recovery apply
 their ordinary bounded-attempt/backoff policy. Closing a tunnel or cancelling a
 setup releases capacity without a control exchange.

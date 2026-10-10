@@ -36,7 +36,8 @@ development period described in §7.
 - Until `total_paid_millisats` becomes positive, every data `CONNECT` MUST be
   rejected before destination setup with HTTP 402 and
   `monad-rejection-code: INITIAL_PAYMENT_REQUIRED`. Linking a channel alone does
-  not satisfy this gate.
+  not satisfy this gate. This initial-payment gate precedes CONNECT capacity
+  admission.
 - Relays enforce documented per-session and per-relay limits for open CONNECTs
   and concurrent destination setups. Exhaustion MUST reject before destination
   contact and MUST NOT queue behind capacity. Per-session exhaustion uses typed

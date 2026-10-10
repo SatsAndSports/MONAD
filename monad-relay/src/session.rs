@@ -1186,6 +1186,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RelaySession<S> {
 
                     match (&method, uri.path()) {
                         (&Method::CONNECT, _) => {
+                            if self.state.initial_payment_required() {
+                                let _ = respond.send_response(
+                                    ConnectHandler::rejection_response(
+                                        RejectionCode::InitialPaymentRequired,
+                                    ),
+                                    true,
+                                );
+                                if self.state.connect_failed().is_none() {
+                                    self.state.terminate();
+                                }
+                                continue;
+                            }
                             let open_permit = match self.state.connect_limits.try_open() {
                                 Ok(permit) => permit,
                                 Err(code) => {
