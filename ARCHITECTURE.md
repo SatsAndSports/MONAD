@@ -786,7 +786,8 @@ state machine begins only after the initial `SessionStatus` has been sent.
 
 Sessions start paused with zero balance. While paused:
 - The control stream is always usable (free)
-- `CONNECT` requests are rejected with HTTP 402
+- New `CONNECT` requests may establish and be accepted, but start with both
+  forwarding directions blocked
 - The session unpauses only when the remaining balance becomes strictly positive
 
 Control usability while paused is a transport-level invariant, not just a
@@ -995,7 +996,7 @@ this change does not complete internally consistent SessionStatus snapshots.
 The relay commits CONNECT acceptance only when it submits the successful H2
 response; that transition increments `open_connects` and `total_connects`. Every
 pre-acceptance rejection or setup/stream failure instead increments
-`failed_connects` exactly once, including pause, policy, malformed target,
+`failed_connects` exactly once, including policy, malformed target,
 upstream-connect, and response-delivery failures. Closing an accepted tunnel
 decrements `open_connects` exactly once and never changes `failed_connects`.
 
@@ -1742,7 +1743,8 @@ No journal state or durable funding reservations are discarded.
 
 CONNECT setup has a 10-second budget for TCP, QUIC, or blinded QUIC (including
 tweak write/flush), without blocking H2 acceptance or control progress. Setup
-completion rechecks pause/termination before sending 200. Session cancellation
+completion rechecks termination and administrative admission before sending 200;
+current pause state instead gates the new proxy's forwarding. Session cancellation
 drops pending setup, so it cannot publish a tunnel later. Proxy cancellation
 covers the complete bidirectional operation, including blocked writes, shutdown,
 and H2 capacity waits; ordinary EOF still preserves the opposite half of the

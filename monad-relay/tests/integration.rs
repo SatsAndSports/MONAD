@@ -3564,13 +3564,15 @@ async fn test_final_partial_control_line_is_not_executed() {
 }
 
 #[tokio::test]
-async fn test_connect_rejected_while_paused() {
+async fn test_connect_accepted_while_paused_waits_for_payment() {
     let upper_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upper_addr = upper_listener.local_addr().unwrap();
     tokio::spawn(run_uppercase_server(upper_listener));
 
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let mut control = ControlSessionHarness::open(&conn).await;
+    assert!(control.handshake().await.paused);
     let mut h2 = conn.clone_send_request().await;
 
     let request = Request::builder()
@@ -3579,12 +3581,41 @@ async fn test_connect_rejected_while_paused() {
         .body(())
         .unwrap();
 
-    let (response_future, h2_send) = h2.send_request(request, false).unwrap();
+    let (response_future, mut h2_send) = h2.send_request(request, false).unwrap();
     let response = response_future.await.unwrap();
-    assert_eq!(response.status(), http::StatusCode::PAYMENT_REQUIRED);
+    assert!(response.status().is_success());
+    let mut h2_recv = response.into_body();
 
+    h2_send.reserve_capacity(5);
+    wait_for_send_capacity(&mut h2_send).await.unwrap();
+    h2_send
+        .send_data(Bytes::from_static(b"hello"), false)
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), h2_recv.data())
+            .await
+            .is_err(),
+        "accepted CONNECT must not forward while the session is paused"
+    );
+
+    let mut channel = SessionPaymentChannel::for_session_id(conn.session_id());
+    channel.link(&mut control.send, &mut control.recv).await;
+    let (_, _, _, _, paused) = channel
+        .pay(&mut control.send, &mut control.recv, TEST_SESSION_PAYMENT)
+        .await;
+    assert!(!paused);
+
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), h2_recv.data())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply, b"HELLO"[..]);
+    let _ = h2_recv.flow_control().release_capacity(reply.len());
+
+    control.close().await;
     drop(h2_send);
-    drop(response);
+    drop(h2_recv);
     drop(h2);
     conn.shutdown().await;
 }
@@ -6467,7 +6498,7 @@ async fn test_session_overshoot_underpayment_stays_paused_until_positive() {
         .send_request(paused_request, false)
         .unwrap();
     let paused_response = paused_response_future.await.unwrap();
-    assert_eq!(paused_response.status(), http::StatusCode::PAYMENT_REQUIRED);
+    assert!(paused_response.status().is_success());
     drop(paused_h2_send);
     drop(paused_response);
     drop(h2_for_paused_connect);
@@ -15096,8 +15127,6 @@ async fn test_concurrent_tunnels_may_overshoot_shared_credit() {
 
 #[tokio::test]
 async fn test_session_status_reports_failed_connect_transitions() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let target_addr = listener.local_addr().unwrap();
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let mut control = ControlSessionHarness::open(&conn).await;
@@ -15108,10 +15137,9 @@ async fn test_session_status_reports_failed_connect_transitions() {
     assert_eq!(initial.failed_connects, 0);
 
     let mut h2 = conn.clone_send_request().await;
-    let target = format!("127.0.0.1:{}", target_addr.port());
     assert_eq!(
-        connect_response_status(&mut h2, &target).await,
-        http::StatusCode::PAYMENT_REQUIRED
+        connect_response_status(&mut h2, "host:0").await,
+        http::StatusCode::BAD_REQUEST
     );
     control.wait_for_connect_counts(0, 0, 1).await;
 
@@ -15122,12 +15150,6 @@ async fn test_session_status_reports_failed_connect_transitions() {
         .await;
     assert!(!paused);
 
-    assert_eq!(
-        connect_response_status(&mut h2, "host:0").await,
-        http::StatusCode::BAD_REQUEST
-    );
-    control.wait_for_connect_counts(0, 0, 2).await;
-
     let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let closed_addr = closed_listener.local_addr().unwrap();
     drop(closed_listener);
@@ -15135,7 +15157,7 @@ async fn test_session_status_reports_failed_connect_transitions() {
         connect_response_status(&mut h2, &closed_addr.to_string()).await,
         http::StatusCode::BAD_GATEWAY
     );
-    control.wait_for_connect_counts(0, 0, 3).await;
+    control.wait_for_connect_counts(0, 0, 2).await;
 
     control.close().await;
     drop(h2);

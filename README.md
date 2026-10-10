@@ -584,7 +584,7 @@ Current coverage includes:
 - Noise session ID (handshake hash) matches on both sides
 - session starts paused by default
 - second control stream rejected
-- CONNECT rejected while paused (402)
+- CONNECT accepted while paused but forwarding blocked until payment
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
 - session overshoot with negative balance and resume
@@ -1016,8 +1016,9 @@ Both client and relay handle `Ctrl+C` gracefully:
 Relay session teardown also ends paused tunnels and tunnels blocked on target
 writes or H2 flow control. Relay CONNECT setup runs concurrently with the control
 stream and has a 10-second deadline (including the blinded-hop tweak preamble).
-Setup failure or timeout returns HTTP 502; a session that becomes paused before
-the tunnel is published receives HTTP 402 instead of a late successful CONNECT.
+Setup failure or timeout returns HTTP 502. A CONNECT may be established and
+published while the session is paused; its proxy forwards no cleartext bytes
+until payment restores positive credit.
 Explicit relay shutdown drains QUIC connections before returning. Abrupt task
 cancellation drops MONAD sessions immediately, but Quinn's internal protocol
 drivers can retain the UDP socket briefly while draining. Interrupted auto-close

@@ -22,7 +22,7 @@ are recovery state, not leaks, and teardown must not release their reservations.
 | Shared `QuicPool` | Cached connection or pending attempt | Stale cleanup matches Quinn stable connection identity or watch channel identity, not enum variant alone | `pool::tests::stale_pending_waiter_does_not_match_replacement` tests the pending identity predicate |
 | Relay session | Control/setup/data children | Directly owned futures polled alongside H2; no detached proxy/control tasks | Root abort, gated panic, transport loss, and termination finish with target EOF and zero active tunnels |
 | Relay session | Registry and channel ownership | Synchronous link bookkeeping before reducer awaits; idempotent Drop cleanup with conditional-owner release | Registry/owner cleanup, link-before-reducer window, replacement-owner preservation |
-| Relay session | CONNECT setup | Concurrent setup with a 10-second deadline; publication rechecks pause/termination | UDP-gated pending QUIC setup permits control bootstrap, cancels without publication, and returns 502 at deadline; publication tests require 402/reset |
+| Relay session | CONNECT setup | Concurrent setup with a 10-second deadline; publication rechecks termination and admission while accepted paused tunnels defer forwarding | UDP-gated pending QUIC setup permits control bootstrap, cancels without publication, and returns 502 at deadline; publication tests require administrative rejection/reset |
 | Relay proxy/control | Blocked I/O and counters | Whole-operation cancellation; drop accounting; unchanged normal half-close | Gated target write/shutdown, zero H2 window, zero-window control bootstrap, reply after request EOF |
 
 The original watcher and pending-pool defects were confirmed by code inspection;

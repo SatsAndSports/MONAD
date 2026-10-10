@@ -296,7 +296,7 @@ CONNECTs, not packets, pooled QUIC connections, or the outer session.
 `total_connects` and `open_connects` increment when the relay commits acceptance
 of a CONNECT and submits its successful H2 response. `failed_connects` increments
 exactly once when session handling instead commits non-acceptance, including
-pause, policy, target, upstream-connect, or pre-acceptance stream failure. Client
+policy, target, upstream-connect, or pre-acceptance stream failure. Client
 receipt of the response is not part of either counter's definition. A tunnel
 failure after successful acceptance does not retrospectively increment
 `failed_connects`. `open_connects` decrements exactly once when an accepted tunnel
@@ -477,9 +477,11 @@ paused = (remaining_milli_sats <= 0)
 
 Round the sum once using exact arithmetic, not each direction separately. The
 wire remaining value is exact and is never clamped. Negative credit is permitted
-from chunk-boundary overshoot and does not erase payment history. New CONNECTs
-MUST be rejected with HTTP 402 while paused; existing tunnels wait for credit.
-Ordinary transport failure or termination may still end them.
+from chunk-boundary overshoot and does not erase payment history. Pausing gates
+cleartext forwarding, not CONNECT admission or destination setup. A CONNECT
+accepted while paused starts with both forwarding directions blocked until
+credit becomes positive, just like an existing tunnel that becomes paused.
+Ordinary transport failure or termination may still end either kind of tunnel.
 
 A client decides what to pay from its own records: locally observed cleartext
 bytes in each direction plus its signed and accepted-payment history. Relay
