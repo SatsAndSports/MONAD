@@ -91,6 +91,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, Duration};
 
@@ -297,6 +298,19 @@ async fn start_monad_relay() -> (std::net::SocketAddr, Secp256k1Pubkey) {
     start_monad_relay_with_transport_key(SecpTransportKeypair::generate()).await
 }
 
+async fn start_monad_relay_with_connect_limits(
+    connect_limits: monad_common::config::RelayConnectLimitsConfig,
+) -> (std::net::SocketAddr, Secp256k1Pubkey) {
+    start_monad_relay_with_transport_key_capabilities_pricing_and_limits(
+        SecpTransportKeypair::generate(),
+        initial_server_capabilities(),
+        1,
+        1,
+        connect_limits,
+    )
+    .await
+}
+
 async fn start_monad_relay_with_pricing(
     in_bytes_per_millisat: u64,
     out_bytes_per_millisat: u64,
@@ -329,6 +343,23 @@ async fn start_monad_relay_with_transport_key_capabilities_and_pricing(
     in_bytes_per_millisat: u64,
     out_bytes_per_millisat: u64,
 ) -> (std::net::SocketAddr, Secp256k1Pubkey) {
+    start_monad_relay_with_transport_key_capabilities_pricing_and_limits(
+        transport_key,
+        bootstrap_capabilities,
+        in_bytes_per_millisat,
+        out_bytes_per_millisat,
+        Default::default(),
+    )
+    .await
+}
+
+async fn start_monad_relay_with_transport_key_capabilities_pricing_and_limits(
+    transport_key: SecpTransportKeypair,
+    bootstrap_capabilities: BootstrapCapabilities,
+    in_bytes_per_millisat: u64,
+    out_bytes_per_millisat: u64,
+    connect_limits: monad_common::config::RelayConnectLimitsConfig,
+) -> (std::net::SocketAddr, Secp256k1Pubkey) {
     let identity = QuicCertIdentity::generate().unwrap();
     let pubkey = transport_key.pubkey();
     let quic_km = monad_quic::keygen::generate_from_seed(identity.seed()).unwrap();
@@ -355,6 +386,7 @@ async fn start_monad_relay_with_transport_key_capabilities_and_pricing(
             .unwrap()
             .to_string(),
         channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+        connect_limits,
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
 
@@ -413,6 +445,7 @@ async fn start_monad_relay_with_test_payments() -> (
             .unwrap()
             .to_string(),
         channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+        connect_limits: Default::default(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
@@ -660,6 +693,7 @@ async fn test_listener_finish_quiesces_tcp_and_quic_descendants() {
             relay_wallet_name: "teardown".to_string(),
             spilman_storage_path: String::new(),
             channel_policy: Default::default(),
+            connect_limits: Default::default(),
         });
         let registry = Arc::new(SessionRegistry::new());
         let payments = Arc::new(InMemoryRelayPayments::new());
@@ -851,6 +885,7 @@ async fn start_monad_relay_with_spilman(
             .unwrap()
             .to_string(),
         channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+        connect_limits: Default::default(),
     });
 
     let discovered_spilman_mint_cache = shared_spilman_mint_cache(
@@ -1002,6 +1037,7 @@ async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp
             .unwrap()
             .to_string(),
         channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+        connect_limits: Default::default(),
     });
     let payments = Arc::new(InMemoryRelayPayments::new());
     let synthetic_mint_cache = shared_spilman_mint_cache(synthetic_test_mint_cache());
@@ -1094,6 +1130,7 @@ async fn start_managed_persistent_relay(
         relay_wallet_name: wallet_name.to_string(),
         spilman_storage_path: String::new(),
         channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+        connect_limits: Default::default(),
     });
 
     let payments = wallet_manager.spilman_payments_for_live(wallet_name)?;
@@ -1402,6 +1439,7 @@ async fn start_relay_from_bound_listener_internal(
         relay_wallet_name: relay_config.name.clone(),
         spilman_storage_path: wallet_manager.db_path().to_string(),
         channel_policy: relay_config.channel_policy.clone(),
+        connect_limits: relay_config.connect_limits.clone(),
     });
 
     wallet_manager.install_keyset_cache(mint_cache);
@@ -1876,6 +1914,7 @@ async fn assert_auto_close_worker_lifecycle(cancel: Option<bool>) {
         relay_wallet_name: relay_name.to_string(),
         spilman_storage_path: temp_db.path().to_str().unwrap().to_string(),
         channel_policy,
+        connect_limits: Default::default(),
     });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(run_with_wallet_manager_and_shutdown(
@@ -3222,6 +3261,20 @@ async fn connect_response_status(
     status
 }
 
+fn assert_connect_rejection(
+    response: &http::Response<h2::RecvStream>,
+    status: http::StatusCode,
+    code: monad_common::rejection::RejectionCode,
+) {
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response
+            .headers()
+            .get(monad_common::rejection::CONNECT_REJECTION_HEADER),
+        Some(&code.header_value())
+    );
+}
+
 async fn open_connect_tunnel(
     h2_client: &mut client::SendRequest<Bytes>,
     target_authority: &str,
@@ -3240,6 +3293,25 @@ async fn open_connect_tunnel(
         response.status()
     );
     (h2_send, response.into_body())
+}
+
+async fn start_counting_target() -> (SocketAddr, mpsc::UnboundedReceiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = accepted_tx.send(());
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let _ = stream.read_to_end(&mut bytes).await;
+            });
+        }
+    });
+    (address, accepted_rx)
 }
 
 fn mock_wallet_channel(
@@ -4153,6 +4225,7 @@ async fn test_cooperative_channel_unlink_handshake() {
         relay_wallet_name: wallet_name.to_string(),
         spilman_storage_path: String::new(),
         channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+        connect_limits: Default::default(),
     });
     let payments = wallet_manager
         .spilman_payments_for_live(wallet_name)
@@ -15018,6 +15091,7 @@ async fn test_session_status_reflects_manager_keyset_refresh_mid_session() {
         relay_wallet_name: "live-cache-relay".to_string(),
         spilman_storage_path: temp_db.path().to_str().unwrap().to_string(),
         channel_policy: monad_common::config::RelayChannelPolicyConfig::default(),
+        connect_limits: Default::default(),
     });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let payments = wallet_manager.payments_for("live-cache-relay").unwrap();
@@ -15066,6 +15140,313 @@ async fn test_session_status_reflects_manager_keyset_refresh_mid_session() {
     let _ = shutdown_tx.send(());
     let _ = mint_shutdown_tx.send(());
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_session_open_connect_limit_rejects_without_destination_contact_and_recovers() {
+    let limits = monad_common::config::RelayConnectLimitsConfig {
+        max_open_per_session: 1,
+        max_setups_per_session: 1,
+        max_open_per_relay: 10,
+        max_setups_per_relay: 10,
+    };
+    let (server_addr, pubkey) = start_monad_relay_with_connect_limits(limits).await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (control_send, control_recv) = open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
+    let mut control = ControlSessionHarness {
+        send: control_send,
+        recv: control_recv,
+    };
+    let (target, mut accepted) = start_counting_target().await;
+    let target = target.to_string();
+    let mut h2 = conn.clone_send_request().await;
+
+    let (mut first_send, first_recv) = open_connect_tunnel(&mut h2, &target).await;
+    accepted.recv().await.unwrap();
+    control.wait_for_connect_counts(1, 1, 0).await;
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&target)
+        .body(())
+        .unwrap();
+    let (response, second_send) = h2.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_connect_rejection(
+        &response,
+        http::StatusCode::TOO_MANY_REQUESTS,
+        monad_common::rejection::RejectionCode::SessionConnectLimitReached,
+    );
+    drop(second_send);
+    drop(response);
+    control.wait_for_connect_counts(1, 1, 1).await;
+    assert!(timeout(Duration::from_millis(100), accepted.recv())
+        .await
+        .is_err());
+
+    first_send.send_data(Bytes::new(), true).unwrap();
+    drop(first_recv);
+    control.wait_for_connect_counts(0, 1, 1).await;
+
+    let (mut third_send, third_recv) = open_connect_tunnel(&mut h2, &target).await;
+    accepted.recv().await.unwrap();
+    control.wait_for_connect_counts(1, 2, 1).await;
+    third_send.send_data(Bytes::new(), true).unwrap();
+    drop(third_recv);
+    control.wait_for_connect_counts(0, 2, 1).await;
+
+    control.close().await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_relay_open_connect_limit_is_shared_across_sessions() {
+    let limits = monad_common::config::RelayConnectLimitsConfig {
+        max_open_per_session: 2,
+        max_setups_per_session: 1,
+        max_open_per_relay: 1,
+        max_setups_per_relay: 10,
+    };
+    let (server_addr, pubkey) = start_monad_relay_with_connect_limits(limits).await;
+    let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
+    let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
+    let conn_unpaid = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (send_a, recv_a) = open_funded_control(&conn_a, TEST_SESSION_PAYMENT).await;
+    let (send_b, recv_b) = open_funded_control(&conn_b, TEST_SESSION_PAYMENT).await;
+    let mut control_unpaid = ControlSessionHarness::open(&conn_unpaid).await;
+    assert!(control_unpaid.handshake().await.paused);
+    let mut control_a = ControlSessionHarness {
+        send: send_a,
+        recv: recv_a,
+    };
+    let mut control_b = ControlSessionHarness {
+        send: send_b,
+        recv: recv_b,
+    };
+    let (target, mut accepted) = start_counting_target().await;
+    let target = target.to_string();
+    let mut h2_a = conn_a.clone_send_request().await;
+    let mut h2_b = conn_b.clone_send_request().await;
+    let mut h2_unpaid = conn_unpaid.clone_send_request().await;
+
+    let (mut first_send, first_recv) = open_connect_tunnel(&mut h2_a, &target).await;
+    accepted.recv().await.unwrap();
+    control_a.wait_for_connect_counts(1, 1, 0).await;
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&target)
+        .body(())
+        .unwrap();
+    let (response, unpaid_send) = h2_unpaid.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_connect_rejection(
+        &response,
+        http::StatusCode::PAYMENT_REQUIRED,
+        monad_common::rejection::RejectionCode::InitialPaymentRequired,
+    );
+    drop(unpaid_send);
+    drop(response);
+    control_unpaid.wait_for_connect_counts(0, 0, 1).await;
+    assert!(timeout(Duration::from_millis(100), accepted.recv())
+        .await
+        .is_err());
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&target)
+        .body(())
+        .unwrap();
+    let (response, rejected_send) = h2_b.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_connect_rejection(
+        &response,
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        monad_common::rejection::RejectionCode::RelayConnectLimitReached,
+    );
+    drop(rejected_send);
+    drop(response);
+    control_b.wait_for_connect_counts(0, 0, 1).await;
+    assert!(timeout(Duration::from_millis(100), accepted.recv())
+        .await
+        .is_err());
+
+    first_send.send_data(Bytes::new(), true).unwrap();
+    drop(first_recv);
+    control_a.wait_for_connect_counts(0, 1, 0).await;
+
+    let (mut second_send, second_recv) = open_connect_tunnel(&mut h2_b, &target).await;
+    accepted.recv().await.unwrap();
+    control_b.wait_for_connect_counts(1, 1, 1).await;
+    second_send.send_data(Bytes::new(), true).unwrap();
+    drop(second_recv);
+
+    control_a.close().await;
+    control_b.close().await;
+    control_unpaid.close().await;
+    conn_a.shutdown().await;
+    conn_b.shutdown().await;
+    conn_unpaid.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_session_setup_limit_rejects_without_destination_contact() {
+    let limits = monad_common::config::RelayConnectLimitsConfig {
+        max_open_per_session: 4,
+        max_setups_per_session: 1,
+        max_open_per_relay: 8,
+        max_setups_per_relay: 2,
+    };
+    let (server_addr, pubkey) = start_monad_relay_with_connect_limits(limits).await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (send, recv) = open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
+    let mut control = ControlSessionHarness { send, recv };
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let blackhole_addr = blackhole.local_addr().unwrap();
+    let (target, mut accepted) = start_counting_target().await;
+    let mut h2 = conn.clone_send_request().await;
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(blackhole_addr.to_string())
+        .header(
+            monad_relay::session::QUIC_SECP256K1_PUBKEY_HEADER,
+            SecpTransportKeypair::generate().pubkey().to_hex(),
+        )
+        .body(())
+        .unwrap();
+    let (pending_response, pending_send) = h2.send_request(request, false).unwrap();
+    let mut datagram = [0u8; 2048];
+    timeout(Duration::from_secs(2), blackhole.recv_from(&mut datagram))
+        .await
+        .expect("QUIC setup did not contact blackhole")
+        .unwrap();
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(target.to_string())
+        .body(())
+        .unwrap();
+    let (response, rejected_send) = h2.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_connect_rejection(
+        &response,
+        http::StatusCode::TOO_MANY_REQUESTS,
+        monad_common::rejection::RejectionCode::SessionConnectSetupLimitReached,
+    );
+    drop(rejected_send);
+    drop(response);
+    control.wait_for_connect_counts(0, 0, 1).await;
+    assert!(timeout(Duration::from_millis(100), accepted.recv())
+        .await
+        .is_err());
+
+    drop(pending_send);
+    drop(pending_response);
+    control.close().await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_relay_setup_limit_releases_on_cancellation_and_after_publication() {
+    let limits = monad_common::config::RelayConnectLimitsConfig {
+        max_open_per_session: 4,
+        max_setups_per_session: 2,
+        max_open_per_relay: 8,
+        max_setups_per_relay: 1,
+    };
+    let (server_addr, pubkey) = start_monad_relay_with_connect_limits(limits).await;
+    let conn_a = connect_client_quic_secp(server_addr, &pubkey).await;
+    let conn_b = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (send_a, recv_a) = open_funded_control(&conn_a, TEST_SESSION_PAYMENT).await;
+    let (send_b, recv_b) = open_funded_control(&conn_b, TEST_SESSION_PAYMENT).await;
+    let control_a = ControlSessionHarness {
+        send: send_a,
+        recv: recv_a,
+    };
+    let control_b = ControlSessionHarness {
+        send: send_b,
+        recv: recv_b,
+    };
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let blackhole_addr = blackhole.local_addr().unwrap();
+    let (target, mut accepted) = start_counting_target().await;
+    let target = target.to_string();
+    let mut h2_a = conn_a.clone_send_request().await;
+    let mut h2_b = conn_b.clone_send_request().await;
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(blackhole_addr.to_string())
+        .header(
+            monad_relay::session::QUIC_SECP256K1_PUBKEY_HEADER,
+            SecpTransportKeypair::generate().pubkey().to_hex(),
+        )
+        .body(())
+        .unwrap();
+    let (pending_response, pending_send) = h2_a.send_request(request, false).unwrap();
+    let mut datagram = [0u8; 2048];
+    timeout(Duration::from_secs(2), blackhole.recv_from(&mut datagram))
+        .await
+        .expect("QUIC setup did not contact blackhole")
+        .unwrap();
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&target)
+        .body(())
+        .unwrap();
+    let (response, rejected_send) = h2_b.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_connect_rejection(
+        &response,
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        monad_common::rejection::RejectionCode::RelayConnectSetupLimitReached,
+    );
+    drop(rejected_send);
+    drop(response);
+    assert!(timeout(Duration::from_millis(100), accepted.recv())
+        .await
+        .is_err());
+
+    drop(pending_send);
+    drop(pending_response);
+    control_a.close().await;
+    conn_a.shutdown().await;
+
+    let (mut first_send, first_recv) = timeout(Duration::from_secs(2), async {
+        loop {
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .uri(&target)
+                .body(())
+                .unwrap();
+            let (response, send) = h2_b.send_request(request, false).unwrap();
+            let response = response.await.unwrap();
+            if response.status().is_success() {
+                break (send, response.into_body());
+            }
+            assert_connect_rejection(
+                &response,
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                monad_common::rejection::RejectionCode::RelayConnectSetupLimitReached,
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("relay setup permit was not released after session cancellation");
+    accepted.recv().await.unwrap();
+
+    let (mut second_send, second_recv) = open_connect_tunnel(&mut h2_b, &target).await;
+    accepted.recv().await.unwrap();
+
+    first_send.send_data(Bytes::new(), true).unwrap();
+    second_send.send_data(Bytes::new(), true).unwrap();
+    drop(first_recv);
+    drop(second_recv);
+    control_b.close().await;
+    conn_b.shutdown().await;
 }
 
 #[tokio::test]

@@ -292,6 +292,11 @@ relays:
     pricing:
       in_bytes_per_millisat: 1
       out_bytes_per_millisat: 1
+    connect_limits:
+      max_open_per_session: 64
+      max_setups_per_session: 16
+      max_open_per_relay: 1024
+      max_setups_per_relay: 512
     channel_policy:
       funding_keyset_recovery_window: 24h
       min_expiry: 1h
@@ -571,7 +576,7 @@ The `Makefile` also includes named manual stress recipes for:
 - repeated relink stress with one active channel per session at a time (`make stress-payment-relink`)
 - configured-client chaos route rebuilds (`make stress-chaos-rebuild`, the longer 5-hop `make stress-chaos-rebuild-intense`, or abrupt-kill coverage with `make stress-chaos-rebuild-abrupt`)
 
-The throughput/payment stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. The chaos rebuild recipes run at a smaller scale and need no special `ulimit`. `MONAD_CHAOS_KILL_MODE=graceful|abrupt|mixed` selects whether chaos restarts use clean shutdown, task-tree cancellation, or alternating modes. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
+The throughput/payment stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. The configurable transport harness accepts explicit `MONAD_STRESS_MAX_OPEN_CONNECTS_PER_SESSION`, `MONAD_STRESS_MAX_CONNECT_SETUPS_PER_SESSION`, `MONAD_STRESS_MAX_OPEN_CONNECTS_PER_RELAY`, and `MONAD_STRESS_MAX_CONNECT_SETUPS_PER_RELAY` overrides; the extreme recipe sets these above production defaults. The chaos rebuild recipes run at a smaller scale and need no special `ulimit`. `MONAD_CHAOS_KILL_MODE=graceful|abrupt|mixed` selects whether chaos restarts use clean shutdown, task-tree cancellation, or alternating modes. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
 
 Ignored but important regression tests can be run explicitly when changing route rebuild or keyset-refresh behavior:
 
@@ -641,6 +646,15 @@ control trailers are a fatal framing error, while CONNECT trailers close that
 tunnel without terminating the enclosing session. This restriction applies only
 to the internal MONAD H2 layer. HTTP headers and trailers sent to an internet
 destination travel as opaque CONNECT DATA and are unaffected.
+
+Relays also bound logical CONNECT work independently of H2 stream mechanics.
+`connect_limits` defaults to 64 open CONNECTs and 16 concurrent destination
+setups per session, and 1,024 open CONNECTs and 512 setups across the relay.
+Open capacity is held from request admission through tunnel close; setup capacity
+is held only around TCP, authenticated QUIC, or blinded QUIC establishment through
+successful `200 OK` submission. Exhaustion fails immediately without destination
+contact: session limits return typed HTTP 429 and relay limits return typed HTTP
+503. Control traffic is unaffected.
 
 When a first-time `ChannelLink` uses an unknown keyset for a configured trusted mint/unit, the relay performs metadata-independent structural checks, transparently invokes its bounded refresh coordinator, and retries the immutable link once. A successful refresh that still does not know the keyset produces a permanent `LinkMintOrKeysetUnacceptable` rejection. If cooldown, that relay coordinator's cross-mint capacity, timeout, or mint failure prevents a fresh decision, the relay returns a specific transient link error and the configured client preserves the channel and retries with backoff.
 

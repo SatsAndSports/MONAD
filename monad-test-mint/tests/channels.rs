@@ -169,6 +169,7 @@ async fn exercise() {
             relay_wallet_name: name,
             spilman_storage_path: relay_wallet.db_path().into(),
             channel_policy: RelayChannelPolicyConfig::default(),
+            connect_limits: Default::default(),
         });
         offers.insert(
             unit,

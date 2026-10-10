@@ -32,6 +32,7 @@ impl Relay {
             relay_wallet_name: "admission".into(),
             spilman_storage_path: String::new(),
             channel_policy: Default::default(),
+            connect_limits: Default::default(),
         });
         let registry = Arc::new(SessionRegistry::new());
         let (stop, stopped) = tokio::sync::oneshot::channel();

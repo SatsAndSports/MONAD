@@ -245,6 +245,7 @@ async fn run(config_path: String, relay_name: Option<String>) -> anyhow::Result<
             relay_wallet_name: relay.name.clone(),
             spilman_storage_path: relay_wallet.db_path.clone(),
             channel_policy: relay.channel_policy.clone(),
+            connect_limits: relay.connect_limits.clone(),
         });
         let manager = wallet_manager.clone();
         let mut relay_shutdown = shutdown_rx.clone();
