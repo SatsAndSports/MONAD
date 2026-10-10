@@ -4,7 +4,7 @@ use crate::session::SessionState;
 use crate::session_fsm::ByteDirection;
 use bytes::Bytes;
 use h2::{RecvStream, SendStream};
-use monad_common::h2stream::wait_for_send_capacity;
+use monad_common::h2stream::{ensure_no_trailers, wait_for_send_capacity};
 use std::{future::poll_fn, io, pin::Pin, task::Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
@@ -93,7 +93,10 @@ where
                 Some(Err(error)) => {
                     return Err(io::Error::other(format!("h2 recv error: {error}")))
                 }
-                None => break,
+                None => {
+                    ensure_no_trailers(&mut h2_recv).await?;
+                    break;
+                }
             };
             // Restore the original stream-capacity timing: consumption by this
             // proxy releases the frame before the target write. At most one

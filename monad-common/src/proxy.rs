@@ -4,7 +4,7 @@
 //! tunnels to external targets) and the client (proxying local SOCKS5
 //! connections through H2 tunnels).
 
-use crate::h2stream::wait_for_send_capacity;
+use crate::h2stream::{ensure_no_trailers, wait_for_send_capacity};
 use bytes::Bytes;
 use h2::RecvStream;
 use h2::SendStream;
@@ -146,7 +146,8 @@ where
                     return Err(io::Error::other(format!("h2 recv error: {e}")));
                 }
                 None => {
-                    // H2 stream closed (peer done sending)
+                    ensure_no_trailers(h2_recv).await?;
+                    // H2 stream closed without trailers (peer done sending)
                     debug!("h2 recv stream ended");
                     break;
                 }
@@ -253,6 +254,7 @@ async fn wait_for_h2_reset(send: &mut SendStream<Bytes>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::{timeout, Duration};
 
     struct WriteGate {
         io: tokio::io::DuplexStream,
@@ -483,5 +485,42 @@ mod tests {
             }
             tasks.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn trailers_are_not_forwarded_as_tunnel_eof() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client, driver) = h2::client::handshake(client).await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let _ = driver.await;
+        });
+        let (response, send) = client
+            .send_request(
+                http::Request::builder()
+                    .method("CONNECT")
+                    .uri("target:80")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let mut server = h2::server::handshake(server).await.unwrap();
+        let (_request, mut respond) = server.accept().await.unwrap().unwrap();
+        let mut server_send = respond
+            .send_response(http::Response::new(()), false)
+            .unwrap();
+        tasks.spawn(async move { while server.accept().await.is_some() {} });
+        let recv = response.await.unwrap().into_body();
+        let (target, _app) = tokio::io::duplex(64);
+        let proxy = proxy_bidirectional_from_client(send, recv, target, "trailers", None);
+
+        server_send.send_trailers(http::HeaderMap::new()).unwrap();
+        let error = timeout(Duration::from_secs(2), proxy)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        tasks.shutdown().await;
     }
 }

@@ -1205,7 +1205,10 @@ async fn read_control_message(
                 buf.extend_from_slice(&data);
             }
             Some(Err(e)) => return Err(io::Error::other(format!("h2 recv error: {e}"))),
-            None => return Ok(None),
+            None => {
+                monad_common::h2stream::ensure_no_trailers(h2_recv).await?;
+                return Ok(None);
+            }
         }
     }
 }

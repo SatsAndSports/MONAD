@@ -15,7 +15,7 @@ use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::blinded_connect::{BlindedConnectRequest, BLINDED_HOP_CONNECT_AUTHORITY};
-use crate::h2stream::H2ConnectStream;
+use crate::h2stream::{H2ConnectStream, MAX_H2_HEADER_LIST_SIZE};
 use crate::proxy::CleartextByteCounters;
 
 // ---------------------------------------------------------------------------
@@ -147,6 +147,7 @@ impl RelayConnection {
         // own stream window without starving the shared connection window the
         // control stream needs for payments.
         let (h2_client, h2_conn) = client::Builder::new()
+            .max_header_list_size(MAX_H2_HEADER_LIST_SIZE)
             .recv_release_connection_on_buffer(true)
             .handshake(stream)
             .await

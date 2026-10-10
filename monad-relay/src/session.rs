@@ -24,6 +24,7 @@ use monad_common::blinded_hop::resolve_blinded_hop_for_intro;
 use monad_common::control_codec::{
     send_json_line, try_decode_json_line, CONTROL_INVALID_MESSAGE_TEXT,
 };
+use monad_common::h2stream::{ensure_no_trailers, MAX_H2_HEADER_LIST_SIZE};
 use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::protocol::{
     ChannelEvictionScope, ClientMessage, MintUnitAdvertisement, MintUnitAdvertisements,
@@ -667,6 +668,7 @@ where
     // task consumes them. Paused CONNECT tunnels can fill their own stream
     // windows without starving the control stream that carries payments.
     let h2_conn = server::Builder::new()
+        .max_header_list_size(MAX_H2_HEADER_LIST_SIZE)
         .recv_release_connection_on_buffer(true)
         .handshake(stream)
         .await
@@ -1210,6 +1212,7 @@ async fn read_control_requests(
                 .map_err(|_| io::Error::other("control executor closed"))?;
         }
     }
+    ensure_no_trailers(&mut recv).await?;
     // An unterminated final line is never executed.
     Ok(())
 }
