@@ -14,7 +14,9 @@
 # builder option: connection-level receive capacity is returned as soon as a
 # DATA frame is buffered, while stream-level capacity stays reserved until
 # the application consumes the data. This keeps MONAD control streams usable
-# while CONNECT tunnels are paused with full stream receive windows.
+# while CONNECT tunnels are paused with full stream receive windows. It also
+# fixes SETTINGS_MAX_HEADER_LIST_SIZE enforcement so the advertised maximum
+# is inclusive as required by HTTP/2.
 #
 # The empty [workspace] table keeps this crate independently testable with
 # `cargo test --manifest-path vendor/h2/Cargo.toml` without absorbing it into
@@ -26,7 +28,7 @@
 edition = "2021"
 rust-version = "1.63"
 name = "h2"
-version = "0.4.16+monad.1"
+version = "0.4.16+monad.2"
 authors = [
     "Carl Lerche <me@carllerche.com>",
     "Sean McArthur <sean@seanmonstar.com>",

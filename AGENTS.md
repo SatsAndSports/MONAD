@@ -21,7 +21,7 @@ cargo run -p monad-quic -- ...
 ## Repo Shape
 
 - `vendor/h2`
-  - vendored `h2` 0.4.16 (`0.4.16+monad.1`) patched in via `[patch.crates-io]`
+  - vendored `h2` 0.4.16 (`0.4.16+monad.2`) patched in via `[patch.crates-io]`
   - adds opt-in `recv_release_connection_on_buffer`: connection-level H2 receive capacity returns when DATA is buffered; stream-level capacity still waits for consumption. Enabled on both MONAD H2 handshakes so paused CONNECT tunnels cannot starve the control stream. Full rationale, diff inventory, and vendoring mechanics: `docs/h2-flow-control.md`.
   - standalone-testable: `cargo test --manifest-path vendor/h2/Cargo.toml` (note: packaged hpack fixture tests fail without the upstream fixture checkout; the stream/flow-control unit tests and `tests/paused_flow_control.rs` are the relevant ones)
 - `monad-common`
