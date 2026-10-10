@@ -51,7 +51,8 @@ uses one HTTP/2 connection with two kinds of stream:
 This lets one session carry many application connections without making a new
 encrypted connection for each one. The control stream is deliberately separate
 from data streams: it remains available for payment and session management even
-when the session is paused and new `CONNECT` requests are not allowed.
+when the session is paused. New `CONNECT` requests may still establish, but their
+data forwarding waits alongside existing tunnels until credit becomes positive.
 
 ## Nesting Creates Multi-Hop Routes
 

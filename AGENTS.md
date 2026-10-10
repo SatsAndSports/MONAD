@@ -82,7 +82,8 @@ cargo run -p monad-quic -- ...
 - Initial state: once the H2 control stream is established, the relay immediately sends a unified `SessionStatus` containing advertisements and initial state
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, exact integer quotient/remainder arithmetic in `monad-common/src/billing.rs`; rates must be positive and unsupported numeric ranges reject with `NUMERIC_LIMIT_EXCEEDED` before mutation
-- `CONNECT` rejected with 402 while paused
+- `CONNECT` may establish while paused; accepted tunnels block both forwarding
+  directions until credit becomes positive
 - A bounded forwarding operation that starts with positive credit may complete and take the session balance negative; the relay records the actual bytes exactly, then pauses subsequent forwarding until payment restores positive credit
 - `GetSessionStatus` requests a fresh `SessionStatus` snapshot
 - After the initial status, ordinary requests (link/payment/unlink/status query) have exactly one ordered status/error response. Five active/queued request permits bound relay execution; excess input is backpressured. Ping still uses the decoder → reducer → resolver path but no ordinary slot. Pause/eviction do not push status; eviction/release remain advisories. The shared `control_exchange.rs` client FIFO rejects response mismatches and short-paid responses, discards ordinary empty-FIFO responses, and preserves independent Pong correlation. Main channel funding remains serialized and uses local credit for exhaustion/reselection.
@@ -237,7 +238,7 @@ The test suite currently covers:
 - secp256k1 Noise partial-write tolerance and shutdown flushing
 - session starts paused by default
 - second control stream rejected
-- CONNECT rejected while paused (402)
+- CONNECT accepted while paused with forwarding blocked until payment
 - funded data channel (payment unpauses, then data flows)
 - session repauses and resumes after second payment
 - session overshoot with negative balance and resume
@@ -247,7 +248,7 @@ The test suite currently covers:
 - underpayment stays paused until balance is positive
 - control stream stays usable while a paused tunnel holds a full H2 receive window (`test_control_stream_survives_connection_window_blocked_by_paused_tunnel`; vendored-h2 coverage in `vendor/h2/tests/paused_flow_control.rs` and `src/proto/streams/recv.rs` tests)
 - concurrent tunnels
-- SessionStatus CONNECT counters for TCP/QUIC acceptance, close, paused rejection, malformed targets, and destination failure
+- SessionStatus CONNECT counters for TCP/QUIC acceptance, close, paused acceptance, malformed targets, and destination failure
 - nested 2-hop and 3-hop routes
 - IPv6 targets and IPv6 listeners
 - mixed-family hop chains

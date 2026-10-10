@@ -521,11 +521,6 @@ impl SessionState {
         })
     }
 
-    async fn is_paused(&self) -> bool {
-        let billing = self.billing.lock().unwrap();
-        billing.state.paused || billing.state.terminated
-    }
-
     async fn attach_control(&self, tx: mpsc::UnboundedSender<ServerMessage>) -> Result<(), ()> {
         let mut control = self.control.lock().await;
         control.attach(tx.clone())?;
@@ -704,14 +699,6 @@ impl ConnectHandler {
             let _ = respond.send_response(resp, true);
             return;
         }
-        if self.state.is_paused().await {
-            let resp = Response::builder()
-                .status(StatusCode::PAYMENT_REQUIRED)
-                .body(())
-                .unwrap();
-            let _ = respond.send_response(resp, true);
-            return;
-        }
         if !self.state.connect_acceptance_available() {
             let resp = Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -852,17 +839,8 @@ impl ConnectHandler {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let paused = self.state.is_paused().await;
         if self.state.is_terminated() {
             respond.send_reset(h2::Reason::CANCEL);
-            return Ok(());
-        }
-        if paused {
-            let resp = Response::builder()
-                .status(StatusCode::PAYMENT_REQUIRED)
-                .body(())
-                .unwrap();
-            respond.send_response(resp, true)?;
             return Ok(());
         }
         let h2_send = self.state.session_registry.with_controls(|controls| {
@@ -2742,8 +2720,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_publication_rechecks_pause_termination_and_admission() {
-        for mode in ["pause", "terminate", "admission"] {
+    async fn connect_publication_rechecks_termination_and_admission() {
+        for mode in ["terminate", "admission"] {
             let terminate = mode == "terminate";
             let (state, _) = test_state();
             if terminate {
@@ -2793,8 +2771,6 @@ mod tests {
                 assert!(response.is_err());
             } else if mode == "admission" {
                 assert_eq!(response.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
-            } else {
-                assert_eq!(response.unwrap().status(), StatusCode::PAYMENT_REQUIRED);
             }
             drop(handler);
             assert_eq!(state.counters.snapshot(), (0, 0, 1));
