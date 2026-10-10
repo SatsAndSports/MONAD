@@ -879,7 +879,7 @@ impl HeaderBlock {
                     header_list_way_too_large = true;
                     ControlFlow::Break(())
                 } else {
-                    if headers_size >= max_header_list_size && !self.is_over_size {
+                    if headers_size > max_header_list_size && !self.is_over_size {
                         tracing::trace!("load_hpack; header list size over max");
                         self.is_over_size = true;
                     }
@@ -1300,6 +1300,39 @@ mod test {
             headers.is_over_size(),
             "is_over_size should be true when HeaderMap capacity is exceeded"
         );
+    }
+
+    #[test]
+    fn max_header_list_size_is_inclusive() {
+        const MAX: usize = 32 * 1024;
+        const NAME: &str = "x-boundary";
+
+        for (header_size, expected_over_size) in [(MAX, false), (MAX + 1, true)] {
+            let value_len = header_size - NAME.len() - 32;
+            let mut fields = HeaderMap::new();
+            fields.insert(
+                HeaderName::from_static(NAME),
+                HeaderValue::from_bytes(&vec![b'x'; value_len]).unwrap(),
+            );
+            let source = HeaderBlock {
+                pseudo: Pseudo::default(),
+                fields,
+                field_size: header_size,
+                is_over_size: false,
+            };
+            let mut encoder = hpack::Encoder::default();
+            let mut encoded = source.into_encoding(&mut encoder).hpack;
+            let mut decoded = HeaderBlock {
+                pseudo: Pseudo::default(),
+                fields: HeaderMap::new(),
+                field_size: 0,
+                is_over_size: false,
+            };
+            let mut decoder = hpack::Decoder::new(4096);
+
+            decoded.load(&mut encoded, MAX, &mut decoder).unwrap();
+            assert_eq!(decoded.is_over_size, expected_over_size);
+        }
     }
 
     #[test]

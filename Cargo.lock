@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.16+monad.1"
+version = "0.4.16+monad.2"
 dependencies = [
  "atomic-waker",
  "bytes",

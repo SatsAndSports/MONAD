@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_header_limit_rejects_oversized_response() {
+    async fn client_header_limit_accepts_exact_boundary_response() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
         let (mut client, client_conn) = h2::client::Builder::new()
             .max_header_list_size(MAX_H2_HEADER_LIST_SIZE)
@@ -269,9 +269,42 @@ mod tests {
 
         let mut server = h2::server::handshake(server_io).await.unwrap();
         let (_request, mut respond) = server.accept().await.unwrap().unwrap();
-        let oversized = HeaderValue::from_bytes(&vec![b'x'; 40 * 1024]).unwrap();
+        // RFC header-list size is name + value + 32 per field. The response's
+        // `:status: 200` contributes another 42 bytes.
+        let boundary = HeaderValue::from_bytes(&vec![b'x'; 32_684]).unwrap();
         let response_headers = Response::builder()
-            .header("x-oversized", oversized)
+            .header("x-boundary", boundary)
+            .body(())
+            .unwrap();
+        respond.send_response(response_headers, true).unwrap();
+        let server_driver = tokio::spawn(async move { while server.accept().await.is_some() {} });
+
+        assert!(timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .is_ok());
+        client_driver.abort();
+        server_driver.abort();
+    }
+
+    #[tokio::test]
+    async fn client_header_limit_rejects_one_byte_oversized_response() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let (mut client, client_conn) = h2::client::Builder::new()
+            .max_header_list_size(MAX_H2_HEADER_LIST_SIZE)
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .unwrap();
+        let client_driver = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+        let (response, _send) = client.send_request(Request::new(()), true).unwrap();
+
+        let mut server = h2::server::handshake(server_io).await.unwrap();
+        let (_request, mut respond) = server.accept().await.unwrap().unwrap();
+        let oversized = HeaderValue::from_bytes(&vec![b'x'; 32_685]).unwrap();
+        let response_headers = Response::builder()
+            .header("x-boundary", oversized)
             .body(())
             .unwrap();
         respond.send_response(response_headers, true).unwrap();
@@ -286,7 +319,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_header_limit_rejects_oversized_request_before_dispatch() {
+    async fn server_header_limit_accepts_exact_boundary_request() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        let client_driver = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+        let mut server = h2::server::Builder::new()
+            .max_header_list_size(MAX_H2_HEADER_LIST_SIZE)
+            .handshake::<_, Bytes>(server_io)
+            .await
+            .unwrap();
+
+        // The client adds `:scheme: http` to `:method: GET` and `:path: /`,
+        // for 123 bytes. The ordinary header contributes its ten-byte name,
+        // value, and 32-byte overhead.
+        let boundary = HeaderValue::from_bytes(&vec![b'x'; 32_603]).unwrap();
+        let request = Request::builder()
+            .header("x-boundary", boundary)
+            .body(())
+            .unwrap();
+        let (_response, _send) = client.send_request(request, true).unwrap();
+
+        assert!(timeout(Duration::from_secs(2), server.accept())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        client_driver.abort();
+    }
+
+    #[tokio::test]
+    async fn server_header_limit_rejects_one_byte_oversized_request_before_dispatch() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -308,9 +372,9 @@ mod tests {
             }
         });
 
-        let oversized = HeaderValue::from_bytes(&vec![b'x'; 40 * 1024]).unwrap();
+        let oversized = HeaderValue::from_bytes(&vec![b'x'; 32_604]).unwrap();
         let request = Request::builder()
-            .header("x-oversized", oversized)
+            .header("x-boundary", oversized)
             .body(())
             .unwrap();
         if let Ok((response, _send)) = client.send_request(request, true) {

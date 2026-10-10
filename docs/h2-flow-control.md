@@ -152,7 +152,7 @@ streams from starving in presence of slow or inactive streams" —
 
 ### Diff inventory vs pristine h2 0.4.16
 
-All changes are opt-in via a new builder flag
+The receive-flow-control changes are opt-in via a new builder flag
 `recv_release_connection_on_buffer(bool)`, default `false` (stock behavior).
 
 - `src/client.rs`, `src/server.rs`
@@ -177,13 +177,18 @@ All changes are opt-in via a new builder flag
   - `recv_data` wrapper: on stream error after receiving DATA, only
     auto-release connection capacity when the flag is off.
   - `proto/streams/counts.rs`: test `Config` updated for the new field.
+- `src/frame/headers.rs`
+  - Treats `SETTINGS_MAX_HEADER_LIST_SIZE` as an inclusive maximum, accepting
+    a decoded header list exactly equal to the advertised limit and rejecting
+    the first byte over it.
+  - Unit test `max_header_list_size_is_inclusive` covers the exact boundary.
 - `tests/paused_flow_control.rs` (new test target)
   - `blocked_request_body_does_not_starve_another_stream` (flag on: an
     unconsumed full-window request body must not starve another stream's
     connection capacity).
   - `default_receive_accounting_still_blocks_shared_connection_window`
     (flag off: stock behavior preserved).
-- `Cargo.toml` — version `0.4.16+monad.1`, empty `[workspace]` table,
+- `Cargo.toml` — version `0.4.16+monad.2`, empty `[workspace]` table,
   `[[test]]` target, `time`/`io-util` dev features, `futures-core` dev-dep
   (see §5).
 
@@ -234,7 +239,7 @@ fix.
 - **Base**: the crates.io package `h2 0.4.16` (sha256
   `a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27`, as
   previously recorded in `Cargo.lock`). Copied from the local registry cache.
-- **Version**: `0.4.16+monad.1` (build metadata marks provenance; semver
+- **Version**: `0.4.16+monad.2` (build metadata marks provenance; semver
   requirement `h2 = "0.4"` still matches).
 - **Location**: `vendor/h2/` in the workspace root (not a workspace member).
 
@@ -248,7 +253,7 @@ fix.
 - `cargo update -p h2` re-resolves the graph so every `h2` consumer — direct
   (monad-common, monad-relay, monad-client, monad-test-client) and transitive
   (hyper via axum/cdk) — uses the vendored copy. `Cargo.lock` then contains a
-  single `h2` entry (`0.4.16+monad.1`, no checksum: path deps have none).
+  single `h2` entry (`0.4.16+monad.2`, no checksum: path deps have none).
 - `vendor/h2/Cargo.toml` gains an **empty `[workspace]` table** so the crate
   stands alone: `cargo test --manifest-path vendor/h2/Cargo.toml` works
   without absorbing it into the MONAD workspace. The outer workspace lists
