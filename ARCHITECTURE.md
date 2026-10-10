@@ -823,7 +823,23 @@ remaining = total_paid_millisats - amount_due
 
 This is implemented in `monad-common/src/billing.rs` with integer quotient/remainder arithmetic. The combined rational sum is rounded up once; no direction is rounded separately, no floating point is used, and no LCM is saturated. Rates must be positive.
 
-Channel capacity, payment deltas, session-paid totals, byte counters, and CONNECT counters use checked arithmetic against their actual storage and wire limits. Payment admission checks both `u64` paid-total headroom and `i64` remaining-credit headroom before the durable channel-balance update. Over-limit requests receive `NUMERIC_LIMIT_EXCEEDED`; unrepresentable data accounting terminates before the transport operation rather than forwarding uncountable bytes. No optional monetary cap is imposed.
+Channel capacity, payment deltas, session-paid totals, and CONNECT counters use checked arithmetic against their actual storage and wire limits. Payment admission checks both `u64` paid-total headroom and `i64` remaining-credit headroom before the durable channel-balance update. Over-limit requests receive `NUMERIC_LIMIT_EXCEEDED`. Actual byte counters are updated after successful forwarding and treat `u64` exhaustion as operationally unreachable within a session. No optional monetary cap is imposed.
+
+### Intentional Accounting Profile
+
+MONAD deliberately uses the following implementation choices within the latitude
+allowed by the control protocol:
+
+- MONAD does not apply the optional 90,000 BTC example cap. Client-supplied channel capacities, payment deltas, and cumulative session payments are still checked against their actual conversion, `u64`, and signed wire-balance limits before durable payment acceptance. This matters even on test infrastructure, where a client can submit artificially large valid payments without transferring comparable network traffic.
+- The two actual-traffic totals are relaxed `AtomicU64` counters. They count only bytes successfully forwarded, and exhausting either counter would require an operationally impossible amount of traffic within one session. They therefore do not use per-operation numeric reservations or the billing mutex.
+- A bounded transport operation runs first, its actual transferred prefix is counted, and pause state is recalculated afterward. Concurrent traffic and payment sampling may temporarily favor the client; MONAD does not require a perfectly simultaneous snapshot to enforce pause transitions.
+- An operation that starts with positive credit may complete and make the exact remaining balance negative. Other already-started bounded operations may do the same. Subsequent forwarding waits until payment restores positive credit.
+- Relay byte and CONNECT totals are diagnostic. The client sizes payments from its own cleartext counters and signed-payment history rather than treating relay counters as proof of debt.
+
+These choices are intentional performance and trust-boundary decisions. In
+particular, moving transport polling back under the billing mutex or applying
+payment-style attacker-input limits to physically accumulated byte counters would
+change this profile rather than merely harden arithmetic.
 
 ### Chunk-Boundary Overshoot
 
@@ -952,23 +968,21 @@ Important effects include:
 Per-byte accounting is intentionally not routed through the main control/session
 reducer.
 
-Instead, active proxy tasks update session byte counters directly around the
-per-session billing mutex:
+Instead, active proxy tasks update independent atomic session byte counters after
+each successful transport operation:
 
 - forward each bounded operation that starts while credit is positive, even if it takes the balance negative
 - increment `session_total_bytes_in` / `session_total_bytes_out` only by the actual forwarded prefix
 - recompute paused state and notify pause watchers on transitions
 
-This keeps the hot data path low-latency without serializing tunnels against a
-shared prepaid-byte budget. The control FSM still handles the more complex
-protocol transitions.
-
-The short synchronous billing critical section spans numeric preflight, one
-nonblocking transport write/enqueue, and its actual-byte accounting update.
-The lock is released before returning `Pending` and never crosses an await.
-Concurrent operations therefore cannot race the numeric headroom, and dropping
-or aborting a proxy cannot lose a completed-write prefix. This is not a
-prepaid-byte reservation or a credit limit on a chunk already in flight.
+After recording the actual prefix, the proxy briefly takes the per-session
+billing mutex to recompute pause state from the two byte totals, fixed rates, and
+accepted session payments. Payment and pause transitions remain serialized, but
+transport polling and byte accumulation do not contend on that mutex. A traffic
+snapshot racing payment may temporarily favor the client; the next forwarding or
+payment transition recomputes pause state. Dropping or aborting a proxy cannot
+lose a completed-write prefix. This is not a prepaid-byte reservation or a credit
+limit on a chunk already in flight.
 H2 stream receive capacity is released when the proxy consumes a DATA frame,
 before its target write, preserving the original buffering/backpressure policy.
 Traffic counters remain in-memory, not crash-durable. Transport write success

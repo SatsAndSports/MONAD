@@ -181,10 +181,11 @@ rounding, truncation, saturation, clamping, or counter wrap.
 Implementations MAY impose documented supported ranges smaller than the wire
 types. They MUST reject unsupported request values before persistence, ownership,
 payment, or credit mutation, using `NUMERIC_LIMIT_EXCEEDED`. A local failure must
-not alter signed history. Relays MUST set operational limits that keep every
-status field, including exact `remaining_milli_sats`, representable. If exact
-accounting or a received response becomes unrepresentable despite those checks,
-the endpoint terminates rather than emitting or accepting an approximation.
+not alter signed history. Actual traffic counters accumulate only bytes that were
+successfully forwarded and may treat exhaustion of their `u64` representation as
+operationally unreachable for a session. If exact accounting or a received
+response becomes unrepresentable, the endpoint terminates rather than emitting
+or accepting an approximation.
 
 JavaScript's ordinary `JSON.parse` uses IEEE-754 binary64 numbers, whose 53 bits
 of integer precision represent every integer only through
@@ -199,6 +200,9 @@ adjacent value is, and converting an already rounded `Number` to `BigInt` does
 not restore precision. Any reduced-range cap alone does not make multiplication,
 addition, or counters safe; each intermediate result needs its own exactness
 check.
+
+MONAD's concrete choices within these protocol allowances are recorded in the
+[Intentional Accounting Profile](../ARCHITECTURE.md#intentional-accounting-profile).
 
 ### 2.3 Sensitive material
 
@@ -486,16 +490,19 @@ accepted or otherwise unexpected credit. It MUST NOT use the relay's claimed
 traffic totals or remaining balance to reduce the client's own paid-credit
 record or to infer an obligation to pay for bytes the client has not observed.
 
-For the byte-accounting events defined in §1.3, implementations MUST check counter
-and billing representability before each bounded forwarding operation and update
-the counter immediately by the number of bytes successfully forwarded.
+For the byte-accounting events defined in §1.3, implementations update the
+counter immediately after each bounded forwarding operation by the number of
+bytes successfully forwarded, then re-evaluate whether forwarding should pause.
+Traffic and payment state may be sampled independently; a concurrent update may
+temporarily favor the client, but a completed forwarding prefix is never omitted.
 
 Implementations choose their forwarding chunk sizes and in-flight limits. Larger
 chunks can increase the bytes forwarded after credit reaches zero and therefore
 increase the relay's financial exposure; that is a relay implementation and
-policy choice, not a wire-protocol violation. Chunking MUST remain bounded and
-MUST NOT permit counter overflow, inaccurate accounting, or forwarding to resume
-without positive credit.
+policy choice, not a wire-protocol violation. Chunking MUST remain bounded. A
+relay may rely on operational session lifetime and throughput bounds to ensure
+that traffic counters cannot wrap, and MUST NOT resume forwarding without
+positive credit.
 
 The initial status fixes both rates. A changed rate in a later solicited status is
 fatal; different rates require a new session or future negotiation.

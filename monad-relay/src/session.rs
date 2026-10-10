@@ -11,8 +11,8 @@ use crate::payments::RelayPayments;
 use crate::proxy;
 use crate::quic_pool::QuicPool;
 use crate::session_fsm::{
-    apply_accounted_bytes, remaining_milli_sats, step, ByteDirection, ServerSessionState,
-    SessionEvent,
+    refresh_pause_state, remaining_milli_sats, step, ByteDirection, ServerSessionState,
+    SessionByteTotals, SessionEvent,
 };
 use crate::session_registry::SessionRegistry;
 use bytes::Bytes;
@@ -48,8 +48,7 @@ use tracing::{debug, error, info, warn};
 /// Custom header name for QUIC secp256k1 transport identity in CONNECT requests.
 pub const QUIC_SECP256K1_PUBKEY_HEADER: &str = "quic-secp256k1-pubkey";
 
-/// Authoritative per-session billing state used by the relay reducer and the
-/// data-path byte accounting fast path.
+/// Authoritative per-session payment and pause state used by the relay reducer.
 ///
 /// `state` is the canonical reducer state shared with `session_fsm`; `pricing`
 /// is the immutable session pricing used to compute amount due and pause state.
@@ -60,8 +59,8 @@ struct BillingState {
 }
 
 impl BillingState {
-    fn remaining_milli_sats(&self) -> i128 {
-        remaining_milli_sats(&self.state, self.pricing)
+    fn remaining_milli_sats(&self, bytes: SessionByteTotals) -> i128 {
+        remaining_milli_sats(&self.state, self.pricing, bytes)
     }
 }
 
@@ -95,6 +94,33 @@ struct SessionCounters {
     open_connects: AtomicU32,
     total_connects: AtomicU64,
     failed_connects: AtomicU64,
+}
+
+/// Actual cleartext bytes forwarded during this session. `Relaxed` operations
+/// are sufficient because these counters do not publish other memory. They count
+/// physical traffic, so `u64` exhaustion is operationally unreachable; unlike
+/// client-supplied payments, they intentionally have no numeric preflight.
+#[derive(Debug, Default)]
+struct SessionByteCounters {
+    inbound: AtomicU64,
+    outbound: AtomicU64,
+}
+
+impl SessionByteCounters {
+    fn snapshot(&self) -> SessionByteTotals {
+        SessionByteTotals {
+            inbound: self.inbound.load(Ordering::Relaxed),
+            outbound: self.outbound.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record(&self, direction: ByteDirection, bytes: u64) {
+        let counter = match direction {
+            ByteDirection::Inbound => &self.inbound,
+            ByteDirection::Outbound => &self.outbound,
+        };
+        counter.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 impl SessionCounters {
@@ -162,6 +188,7 @@ impl SessionCounters {
 #[derive(Clone)]
 pub(crate) struct SessionState {
     billing: Arc<BillingMutex<BillingState>>,
+    bytes: Arc<SessionByteCounters>,
     control: Arc<Mutex<ControlState>>,
     counters: Arc<SessionCounters>,
     pause_tx: watch::Sender<bool>,
@@ -182,18 +209,20 @@ pub(crate) struct SessionState {
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMonitor {
     billing: Arc<BillingMutex<BillingState>>,
+    bytes: Arc<SessionByteCounters>,
     counters: Arc<SessionCounters>,
 }
 
 impl SessionMonitor {
     pub(crate) async fn snapshot(&self, id: [u8; 32]) -> serde_json::Value {
+        let bytes = self.bytes.snapshot();
         let billing = self.billing.lock().unwrap();
         let (active, total, _) = self.counters.snapshot();
         serde_json::json!({
-            "session_id": hex::encode(id), "inbound_bytes": billing.state.session_total_bytes_in,
-            "outbound_bytes": billing.state.session_total_bytes_out,
+            "session_id": hex::encode(id), "inbound_bytes": bytes.inbound,
+            "outbound_bytes": bytes.outbound,
             "total_paid_msats": billing.state.total_paid_millisats,
-            "remaining_msats": billing.remaining_milli_sats().to_string(),
+            "remaining_msats": billing.remaining_milli_sats(bytes).to_string(),
             "paused": billing.state.paused, "linked_channel_id": billing.state.linked_channel_id,
             "active_tunnels": active, "total_tunnels": total,
         })
@@ -212,8 +241,6 @@ impl SessionState {
         let state = Self {
             billing: Arc::new(BillingMutex::new(BillingState {
                 state: ServerSessionState {
-                    session_total_bytes_in: 0,
-                    session_total_bytes_out: 0,
                     total_paid_millisats: 0,
                     paused: true,
                     linked_channel_id: None,
@@ -224,6 +251,7 @@ impl SessionState {
                     config.out_bytes_per_millisat,
                 ),
             })),
+            bytes: Arc::new(SessionByteCounters::default()),
             control: Arc::new(Mutex::new(ControlState::default())),
             counters: Arc::new(SessionCounters::default()),
             pause_tx,
@@ -243,6 +271,7 @@ impl SessionState {
             session_id,
             SessionMonitor {
                 billing: state.billing.clone(),
+                bytes: state.bytes.clone(),
                 counters: state.counters.clone(),
             },
         );
@@ -372,9 +401,12 @@ impl SessionState {
         expected_channel_id: &str,
         payment_json: &str,
     ) -> Result<crate::payments::PaymentOutcome, crate::payments::ChannelPaymentError> {
+        // Sample traffic before payment state so concurrent forwarding can only
+        // make this headroom check more conservative for the client.
+        let bytes = self.bytes.snapshot();
         let max_delta_millisats = {
             let billing = self.billing.lock().unwrap();
-            let remaining = billing.remaining_milli_sats();
+            let remaining = billing.remaining_milli_sats(bytes);
             if i64::try_from(remaining).is_err() {
                 return Err(crate::payments::ChannelPaymentError::NumericLimitExceeded);
             }
@@ -426,22 +458,15 @@ impl SessionState {
     }
 
     pub(crate) fn update_pause_watch(&self, paused: bool) {
-        let _ = self.pause_tx.send_replace(paused);
+        let billing = self.billing.lock().unwrap();
+        if billing.state.paused == paused {
+            let _ = self.pause_tx.send_replace(paused);
+        }
     }
 
     // Billing state and status snapshots.
 
     pub(crate) async fn session_status_message(&self) -> Option<ServerMessage> {
-        let billing = self.billing.lock().unwrap();
-        let Some(remaining_milli_sats) =
-            monad_common::billing::remaining_milli_sats_to_wire(billing.remaining_milli_sats())
-        else {
-            drop(billing);
-            self.terminate();
-            return None;
-        };
-        let (open_connects, total_connects, failed_connects) = self.counters.snapshot();
-
         let mut advertisements = MintUnitAdvertisements::new();
         for (mint_url, trusted_units) in &self.trusted_mint_units {
             for unit in trusted_units {
@@ -459,21 +484,37 @@ impl SessionState {
             }
         }
 
+        // Control requests are serialized, so linkage cannot change while this
+        // status is being prepared. Do not hold billing across storage access.
+        let linked_channel_id = self.billing.lock().unwrap().state.linked_channel_id.clone();
+        let linked_channel = linked_channel_id
+            .as_deref()
+            .and_then(|channel_id| self.payments.linked_channel_status(channel_id));
+        let (open_connects, total_connects, failed_connects) = self.counters.snapshot();
+
+        // Serialize the traffic snapshot with payment and pause state. Concurrent
+        // traffic after this point is reflected in a later status.
+        let billing = self.billing.lock().unwrap();
+        let bytes = self.bytes.snapshot();
+        let Some(remaining_milli_sats) = monad_common::billing::remaining_milli_sats_to_wire(
+            billing.remaining_milli_sats(bytes),
+        ) else {
+            drop(billing);
+            self.terminate();
+            return None;
+        };
+
         Some(ServerMessage::SessionStatus {
             receiver_pubkey: self.receiver_pubkey_hex.clone(),
             advertisements,
-            linked_channel: billing
-                .state
-                .linked_channel_id
-                .as_deref()
-                .and_then(|channel_id| self.payments.linked_channel_status(channel_id)),
+            linked_channel,
             active_in_rate: billing.pricing.in_bytes_per_millisat,
             active_out_rate: billing.pricing.out_bytes_per_millisat,
-            session_total_bytes_in: billing.state.session_total_bytes_in,
-            session_total_bytes_out: billing.state.session_total_bytes_out,
+            session_total_bytes_in: bytes.inbound,
+            session_total_bytes_out: bytes.outbound,
             total_paid_millisats: billing.state.total_paid_millisats,
             remaining_milli_sats,
-            paused: billing.state.paused,
+            paused: remaining_milli_sats <= 0,
             open_connects,
             total_connects,
             failed_connects,
@@ -498,33 +539,18 @@ impl SessionState {
         self.session_registry.deregister_control(&self.session_id);
     }
 
-    /// Check representability, perform one nonblocking transport operation, and
-    /// commit its actual byte count in the same poll. No guard survives Pending
-    /// or an await. Cancellation/drop cannot interpose after a successful write.
-    /// This lock is numeric accounting only: it never reserves prepaid credit
-    /// and does not stop an already-started chunk from taking credit negative.
+    /// Perform one nonblocking transport operation, then record its actual byte
+    /// count and refresh pause state in the same poll. The transport poll is
+    /// intentionally outside the billing mutex; pause enforcement tolerates a
+    /// concurrent snapshot that temporarily favors the client. Cancellation/drop
+    /// cannot interpose after a successful write, and an already-started bounded
+    /// chunk may take credit negative.
     pub(crate) fn poll_accounted_forward(
         &self,
         direction: ByteDirection,
         maximum_bytes: usize,
         forward: impl FnOnce() -> Poll<io::Result<usize>>,
     ) -> Poll<io::Result<(usize, bool)>> {
-        let mut billing = self.billing.lock().unwrap();
-        let candidate = match apply_accounted_bytes(
-            billing.state.clone(),
-            billing.pricing,
-            direction,
-            maximum_bytes,
-        ) {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                self.terminate();
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("session accounting limit exceeded before forwarding: {error:?}"),
-                )));
-            }
-        };
         let actual_bytes = match forward() {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -537,20 +563,19 @@ impl SessionState {
                 )));
             }
         };
-        let (next_state, pause_changed) = if actual_bytes == maximum_bytes {
-            candidate
-        } else {
-            // Totals and due are monotone in actual_bytes; the maximum passed
-            // the check while this same lock was held.
-            apply_accounted_bytes(
-                billing.state.clone(),
-                billing.pricing,
-                direction,
-                actual_bytes,
-            )
-            .expect("actual prefix fits the preflight bound")
+        let Ok(actual_bytes_u64) = u64::try_from(actual_bytes) else {
+            self.terminate();
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forwarded byte count is not representable",
+            )));
         };
-        billing.state = next_state;
+        self.bytes.record(direction, actual_bytes_u64);
+
+        let mut billing = self.billing.lock().unwrap();
+        let bytes = self.bytes.snapshot();
+        let pricing = billing.pricing;
+        let pause_changed = refresh_pause_state(&mut billing.state, pricing, bytes);
         if let Some(paused) = pause_changed {
             let _ = self.pause_tx.send_replace(paused);
         }
@@ -1357,7 +1382,9 @@ async fn process_session_event(
     while let Some(event) = pending.pop_front() {
         let effects = {
             let mut billing = state.billing.lock().unwrap();
-            let (next_state, effects) = step(billing.state.clone(), event, billing.pricing);
+            // Serialize the traffic snapshot with payment-driven pause changes.
+            let bytes = state.bytes.snapshot();
+            let (next_state, effects) = step(billing.state.clone(), event, billing.pricing, bytes);
             billing.state = next_state;
             effects
         };
@@ -2379,10 +2406,7 @@ mod tests {
                 }
             }).await.unwrap();
                 // Counts are already current while the next write is blocked.
-                assert_eq!(
-                    state.billing.lock().unwrap().state.session_total_bytes_out,
-                    3
-                );
+                assert_eq!(state.bytes.outbound.load(Ordering::Relaxed), 3);
                 if finish == "terminate" {
                     state.terminate();
                     timeout(Duration::from_secs(2), &mut proxy)
@@ -2392,10 +2416,7 @@ mod tests {
                 }
                 drop(proxy);
             }
-            assert_eq!(
-                state.billing.lock().unwrap().state.session_total_bytes_out,
-                3
-            );
+            assert_eq!(state.bytes.outbound.load(Ordering::Relaxed), 3);
             assert_eq!(state.counters.snapshot(), (0, 1, 0));
             drivers.shutdown().await;
         }
@@ -2411,7 +2432,7 @@ mod tests {
         state.billing.lock().unwrap().state.total_paid_millisats = u64::MAX;
         // Keep remaining credit representable so this exercises u64 paid-total
         // exhaustion independently of the i64 remaining-credit check.
-        state.billing.lock().unwrap().state.session_total_bytes_out = u64::MAX;
+        state.bytes.outbound.store(u64::MAX, Ordering::Relaxed);
 
         let error = state
             .apply_channel_payment(
@@ -2467,42 +2488,14 @@ mod tests {
                 billing.state.clone(),
                 SessionEvent::PaymentValidationFinished(Ok(accepted)),
                 billing.pricing,
+                state.bytes.snapshot(),
             );
             billing.state = next;
-            assert_eq!(billing.remaining_milli_sats(), i64::MAX as i128);
+            assert_eq!(
+                billing.remaining_milli_sats(state.bytes.snapshot()),
+                i64::MAX as i128
+            );
         }
-    }
-
-    #[test]
-    fn forwarding_numeric_preflight_prevents_transport_side_effects() {
-        for direction in [ByteDirection::Inbound, ByteDirection::Outbound] {
-            let (state, _) = test_state();
-            {
-                let mut billing = state.billing.lock().unwrap();
-                billing.pricing = SessionPricing::new(u64::MAX, u64::MAX);
-                match direction {
-                    ByteDirection::Inbound => billing.state.session_total_bytes_in = u64::MAX,
-                    ByteDirection::Outbound => billing.state.session_total_bytes_out = u64::MAX,
-                }
-            }
-            let result = state.poll_accounted_forward(direction, 1, || {
-                panic!("overflow must reject before transport poll")
-            });
-            assert!(matches!(result, Poll::Ready(Err(_))));
-            assert!(state.is_terminated());
-        }
-        let (state, _) = test_state();
-        state.billing.lock().unwrap().state.session_total_bytes_out = i64::MAX as u64;
-        assert!(matches!(
-            state.poll_accounted_forward(ByteDirection::Outbound, 2, || panic!(
-                "i64 range preflight"
-            )),
-            Poll::Ready(Err(_))
-        ));
-        assert_eq!(
-            state.billing.lock().unwrap().state.session_total_bytes_out,
-            i64::MAX as u64
-        );
     }
 
     #[tokio::test]
@@ -2553,50 +2546,53 @@ mod tests {
         assert!(state
             .poll_accounted_forward(ByteDirection::Outbound, 10, || Poll::Pending)
             .is_pending());
-        assert_eq!(
-            state
-                .billing
-                .try_lock()
-                .unwrap()
-                .state
-                .session_total_bytes_out,
-            0
-        );
+        assert!(state.billing.try_lock().is_ok());
+        assert_eq!(state.bytes.outbound.load(Ordering::Relaxed), 0);
         assert!(matches!(
             state.poll_accounted_forward(ByteDirection::Outbound, 10, || Poll::Ready(Err(
                 io::ErrorKind::BrokenPipe.into()
             ))),
             Poll::Ready(Err(_))
         ));
-        assert_eq!(
-            state
-                .billing
-                .try_lock()
-                .unwrap()
-                .state
-                .session_total_bytes_out,
-            0
-        );
+        assert!(state.billing.try_lock().is_ok());
+        assert_eq!(state.bytes.outbound.load(Ordering::Relaxed), 0);
         // A successful partial prefix counts exactly and may overshoot credit.
         assert!(matches!(
             state.poll_accounted_forward(ByteDirection::Outbound, 10, || Poll::Ready(Ok(3))),
             Poll::Ready(Ok((3, _)))
         ));
-        assert_eq!(state.billing.lock().unwrap().remaining_milli_sats(), -3);
+        assert_eq!(
+            state
+                .billing
+                .lock()
+                .unwrap()
+                .remaining_milli_sats(state.bytes.snapshot()),
+            -3
+        );
     }
 
     #[test]
-    fn concurrent_forwarders_cannot_race_numeric_headroom() {
+    fn transport_poll_runs_without_billing_lock() {
+        let (state, _) = test_state();
+        {
+            let mut billing = state.billing.lock().unwrap();
+            billing.state.total_paid_millisats = 10;
+            billing.state.paused = false;
+        }
+        let result = state.poll_accounted_forward(ByteDirection::Outbound, 5, || {
+            assert!(state.billing.try_lock().is_ok());
+            Poll::Ready(Ok(5))
+        });
+
+        assert!(matches!(result, Poll::Ready(Ok((5, false)))));
+        assert_eq!(state.bytes.outbound.load(Ordering::Relaxed), 5);
+        assert!(!state.billing.lock().unwrap().state.paused);
+    }
+
+    #[test]
+    fn concurrent_forwarders_accumulate_atomic_byte_totals() {
         for direction in [ByteDirection::Inbound, ByteDirection::Outbound] {
             let (state, _) = test_state();
-            {
-                let mut billing = state.billing.lock().unwrap();
-                billing.pricing = SessionPricing::new(u64::MAX, u64::MAX);
-                match direction {
-                    ByteDirection::Inbound => billing.state.session_total_bytes_in = u64::MAX - 4,
-                    ByteDirection::Outbound => billing.state.session_total_bytes_out = u64::MAX - 4,
-                }
-            }
             let gate = std::sync::Barrier::new(2);
             let forwarded = AtomicU64::new(0);
             std::thread::scope(|scope| {
@@ -2610,16 +2606,15 @@ mod tests {
                     });
                 }
             });
-            assert_eq!(forwarded.load(Ordering::Relaxed), 4);
-            let billing = state.billing.lock().unwrap();
+            assert_eq!(forwarded.load(Ordering::Relaxed), 8);
             let total = match direction {
-                ByteDirection::Inbound => billing.state.session_total_bytes_in,
-                ByteDirection::Outbound => billing.state.session_total_bytes_out,
+                ByteDirection::Inbound => state.bytes.inbound.load(Ordering::Relaxed),
+                ByteDirection::Outbound => state.bytes.outbound.load(Ordering::Relaxed),
             };
-            assert_eq!(total, u64::MAX);
+            assert_eq!(total, 8);
         }
+
         let (state, _) = test_state();
-        state.billing.lock().unwrap().state.session_total_bytes_out = i64::MAX as u64;
         let gate = std::sync::Barrier::new(2);
         let forwarded = AtomicU64::new(0);
         std::thread::scope(|scope| {
@@ -2636,11 +2631,31 @@ mod tests {
                 });
             }
         });
-        assert_eq!(forwarded.load(Ordering::Relaxed), 1);
+        assert_eq!(forwarded.load(Ordering::Relaxed), 2);
         assert_eq!(
-            state.billing.lock().unwrap().remaining_milli_sats(),
-            i64::MIN as i128
+            state
+                .billing
+                .lock()
+                .unwrap()
+                .remaining_milli_sats(state.bytes.snapshot()),
+            -2
         );
+        assert!(state.billing.lock().unwrap().state.paused);
+    }
+
+    #[test]
+    fn stale_pause_effect_cannot_overwrite_current_watch_state() {
+        let (state, _) = test_state();
+        let paused = state.pause_receiver();
+
+        state.billing.lock().unwrap().state.paused = false;
+        state.update_pause_watch(false);
+        assert!(!*paused.borrow());
+
+        state.billing.lock().unwrap().state.paused = true;
+        state.pause_tx.send_replace(true);
+        state.update_pause_watch(false);
+        assert!(*paused.borrow());
     }
 
     #[tokio::test]
@@ -2674,14 +2689,11 @@ mod tests {
         {
             let billing = state.billing.lock().unwrap();
             assert!(billing.state.paused);
-            assert_eq!(billing.state.session_total_bytes_in, 4);
-            assert_eq!(billing.remaining_milli_sats(), -3);
+            assert_eq!(state.bytes.inbound.load(Ordering::Relaxed), 4);
+            assert_eq!(billing.remaining_milli_sats(state.bytes.snapshot()), -3);
         }
         drop(proxy);
-        assert_eq!(
-            state.billing.lock().unwrap().state.session_total_bytes_in,
-            4
-        );
+        assert_eq!(state.bytes.inbound.load(Ordering::Relaxed), 4);
         assert_eq!(state.counters.snapshot(), (0, 1, 0));
         drivers.shutdown().await;
     }
@@ -2690,7 +2702,11 @@ mod tests {
     async fn proxy_preserves_reply_after_request_half_close() {
         use tokio::io::AsyncReadExt;
         let (state, _) = test_state();
-        state.billing.lock().unwrap().state.total_paid_millisats = 1000;
+        {
+            let mut billing = state.billing.lock().unwrap();
+            billing.state.total_paid_millisats = 1000;
+            billing.state.paused = false;
+        }
         state.update_pause_watch(false);
         state.connect_opened().unwrap();
         let (send, recv, mut client_send, mut client_recv, mut drivers) =
@@ -2791,13 +2807,31 @@ mod tests {
     #[tokio::test]
     async fn status_rejects_unrepresentable_remaining_without_approximation() {
         let (state, _) = test_state();
-        {
-            let mut billing = state.billing.lock().unwrap();
-            billing.state.session_total_bytes_in = u64::MAX;
-            billing.state.total_paid_millisats = 0;
-        }
+        state.bytes.inbound.store(u64::MAX, Ordering::Relaxed);
         assert!(state.session_status_message().await.is_none());
         assert!(state.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn status_pause_matches_reported_byte_and_payment_totals() {
+        let (state, _) = test_state();
+        state.billing.lock().unwrap().state.paused = false;
+        state.bytes.outbound.store(1, Ordering::Relaxed);
+
+        let Some(ServerMessage::SessionStatus {
+            session_total_bytes_out,
+            total_paid_millisats,
+            remaining_milli_sats,
+            paused,
+            ..
+        }) = state.session_status_message().await
+        else {
+            panic!()
+        };
+        assert_eq!(session_total_bytes_out, 1);
+        assert_eq!(total_paid_millisats, 0);
+        assert_eq!(remaining_milli_sats, -1);
+        assert!(paused);
     }
 
     #[tokio::test]

@@ -4,12 +4,16 @@ use monad_common::session::SessionPricing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerSessionState {
-    pub session_total_bytes_in: u64,
-    pub session_total_bytes_out: u64,
     pub total_paid_millisats: u64,
     pub paused: bool,
     pub linked_channel_id: Option<String>,
     pub terminated: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionByteTotals {
+    pub inbound: u64,
+    pub outbound: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -70,12 +74,6 @@ pub(crate) enum ByteDirection {
     Outbound,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionAccountingError {
-    CounterOverflow,
-    RemainingOutOfRange,
-}
-
 fn error_effects(
     state: &mut ServerSessionState,
     code: ServerErrorCode,
@@ -106,6 +104,7 @@ pub(crate) fn step(
     mut state: ServerSessionState,
     event: SessionEvent,
     pricing: SessionPricing,
+    bytes: SessionByteTotals,
 ) -> (ServerSessionState, Vec<SessionEffect>) {
     if state.terminated {
         return (state, Vec::new());
@@ -192,7 +191,7 @@ pub(crate) fn step(
                     return (state, effects);
                 };
                 state.total_paid_millisats = total_paid_millisats;
-                let pause_changed = refresh_pause_state(&mut state, pricing);
+                let pause_changed = refresh_pause_state(&mut state, pricing, bytes);
                 let mut effects = Vec::new();
                 if let Some(paused) = pause_changed {
                     effects.push(SessionEffect::UpdatePauseWatch(paused));
@@ -225,54 +224,28 @@ pub(crate) fn step(
     (state, effects)
 }
 
-pub(crate) fn apply_accounted_bytes(
-    mut state: ServerSessionState,
+pub(crate) fn refresh_pause_state(
+    state: &mut ServerSessionState,
     pricing: SessionPricing,
-    direction: ByteDirection,
-    bytes: usize,
-) -> Result<(ServerSessionState, Option<bool>), SessionAccountingError> {
-    let bytes = u64::try_from(bytes).map_err(|_| SessionAccountingError::CounterOverflow)?;
-    match direction {
-        ByteDirection::Inbound => {
-            state.session_total_bytes_in = state
-                .session_total_bytes_in
-                .checked_add(bytes)
-                .ok_or(SessionAccountingError::CounterOverflow)?;
-        }
-        ByteDirection::Outbound => {
-            state.session_total_bytes_out = state
-                .session_total_bytes_out
-                .checked_add(bytes)
-                .ok_or(SessionAccountingError::CounterOverflow)?;
-        }
-    }
-
-    if i64::try_from(remaining_milli_sats(&state, pricing)).is_err() {
-        return Err(SessionAccountingError::RemainingOutOfRange);
-    }
-    let pause_changed = refresh_pause_state(&mut state, pricing);
-    Ok((state, pause_changed))
-}
-
-fn refresh_pause_state(state: &mut ServerSessionState, pricing: SessionPricing) -> Option<bool> {
+    bytes: SessionByteTotals,
+) -> Option<bool> {
     let was_paused = state.paused;
-    state.paused = remaining_milli_sats(state, pricing) <= 0;
+    state.paused = remaining_milli_sats(state, pricing, bytes) <= 0;
     (state.paused != was_paused).then_some(state.paused)
 }
 
-pub(crate) fn remaining_milli_sats(state: &ServerSessionState, pricing: SessionPricing) -> i128 {
-    pricing.remaining_milli_sats(
-        state.total_paid_millisats,
-        state.session_total_bytes_in,
-        state.session_total_bytes_out,
-    )
+pub(crate) fn remaining_milli_sats(
+    state: &ServerSessionState,
+    pricing: SessionPricing,
+    bytes: SessionByteTotals,
+) -> i128 {
+    pricing.remaining_milli_sats(state.total_paid_millisats, bytes.inbound, bytes.outbound)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_accounted_bytes, step, ByteDirection, ServerSessionState, SessionAccountingError,
-        SessionEffect, SessionEvent,
+        step as reduce, ServerSessionState, SessionByteTotals, SessionEffect, SessionEvent,
     };
     use crate::payments::{ChannelPaymentError, LinkError, LinkOutcome, PaymentOutcome};
     use monad_common::protocol::{ChannelEvictionScope, ServerErrorCode, ServerMessage};
@@ -280,13 +253,19 @@ mod tests {
 
     fn state() -> ServerSessionState {
         ServerSessionState {
-            session_total_bytes_in: 0,
-            session_total_bytes_out: 0,
             total_paid_millisats: 0,
             paused: true,
             linked_channel_id: None,
             terminated: false,
         }
+    }
+
+    fn step(
+        state: ServerSessionState,
+        event: SessionEvent,
+        pricing: SessionPricing,
+    ) -> (ServerSessionState, Vec<SessionEffect>) {
+        reduce(state, event, pricing, SessionByteTotals::default())
     }
 
     #[test]
@@ -328,8 +307,6 @@ mod tests {
     fn link_accept_releases_previous_channel_before_status() {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());
-        current.session_total_bytes_in = 11;
-        current.session_total_bytes_out = 13;
         current.total_paid_millisats = 29;
         current.paused = false;
         let accounting = current.clone();
@@ -345,14 +322,6 @@ mod tests {
         );
 
         assert_eq!(next.linked_channel_id.as_deref(), Some("chan-b"));
-        assert_eq!(
-            next.session_total_bytes_in,
-            accounting.session_total_bytes_in
-        );
-        assert_eq!(
-            next.session_total_bytes_out,
-            accounting.session_total_bytes_out
-        );
         assert_eq!(next.total_paid_millisats, accounting.total_paid_millisats);
         assert_eq!(next.paused, accounting.paused);
         assert!(matches!(
@@ -518,8 +487,6 @@ mod tests {
     fn unlink_success_clears_link_and_confirms() {
         let mut current = state();
         current.linked_channel_id = Some("chan-a".to_string());
-        current.session_total_bytes_in = 11;
-        current.session_total_bytes_out = 13;
         current.total_paid_millisats = 29;
         current.paused = false;
         let accounting = current.clone();
@@ -531,14 +498,6 @@ mod tests {
         );
 
         assert_eq!(next.linked_channel_id, None);
-        assert_eq!(
-            next.session_total_bytes_in,
-            accounting.session_total_bytes_in
-        );
-        assert_eq!(
-            next.session_total_bytes_out,
-            accounting.session_total_bytes_out
-        );
         assert_eq!(next.total_paid_millisats, accounting.total_paid_millisats);
         assert_eq!(next.paused, accounting.paused);
         assert!(matches!(effects.as_slice(), [SessionEffect::SendStatus]));
@@ -628,41 +587,22 @@ mod tests {
     }
 
     #[test]
-    fn byte_accounting_only_updates_pause_on_transition() {
-        let mut current = state();
-        current.total_paid_millisats = 10;
-        current.paused = false;
-
-        let (next, pause_changed) = apply_accounted_bytes(
+    fn payment_pause_uses_external_byte_totals() {
+        let current = state();
+        let (next, effects) = reduce(
             current,
+            SessionEvent::PaymentValidationFinished(Ok(PaymentOutcome {
+                channel_id: "chan-a".to_string(),
+                delta_millisats: 10,
+            })),
             SessionPricing::new(1, 1),
-            ByteDirection::Outbound,
-            4,
-        )
-        .unwrap();
-        assert_eq!(next.session_total_bytes_out, 4);
-        assert_eq!(pause_changed, None);
+            SessionByteTotals {
+                inbound: 4,
+                outbound: 6,
+            },
+        );
 
-        let (next, pause_changed) =
-            apply_accounted_bytes(next, SessionPricing::new(1, 1), ByteDirection::Outbound, 6)
-                .unwrap();
-        assert_eq!(next.session_total_bytes_out, 10);
-        assert_eq!(pause_changed, Some(true));
         assert!(next.paused);
-    }
-
-    #[test]
-    fn byte_accounting_rejects_counter_overflow_without_mutation() {
-        let mut current = state();
-        current.session_total_bytes_out = u64::MAX;
-        let error = apply_accounted_bytes(
-            current.clone(),
-            SessionPricing::new(1, 1),
-            ByteDirection::Outbound,
-            1,
-        )
-        .unwrap_err();
-        assert_eq!(error, SessionAccountingError::CounterOverflow);
-        assert_eq!(current.session_total_bytes_out, u64::MAX);
+        assert!(matches!(effects.as_slice(), [SessionEffect::SendStatus]));
     }
 }
