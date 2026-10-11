@@ -39,10 +39,14 @@ unless independently evicted. Wallet preparation, signing/persistence, submissio
 and reservation cleanup remain serialized executor operations. Heartbeats and
 tunnel forwarding are outside the funding reducer.
 
-Current status handling still validates against the wallet database before
-committing the response or publishing state. Session-scoped authority caching is
-follow-up work. A counting-wallet executor test requires zero wallet calls on
-repeated sufficiently funded ticks and on ticks with any ordinary request pending.
+Successful acquisition captures immutable channel metadata, attachment ownership,
+and the signed-balance high-water in session-scoped authority. Status handling
+validates against that task-local cache before committing or publishing; a relay
+status cannot populate an unknown channel or switch to an acquired-only candidate.
+Durable payment signing advances the cached high-water before network submission,
+and relay acceptance can never lower it. A counting-wallet executor test requires
+one accounting read at acquisition and none for subsequent link/payment statuses;
+other tests require zero wallet calls on funded or ordinary-request-busy ticks.
 
 The relay-side steady-state authority lives in:
 

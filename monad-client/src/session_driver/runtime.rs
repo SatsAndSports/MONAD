@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use super::funding::{apply_channel_evicted, apply_channel_unlinked, apply_server_error};
 use super::funding::{handle_control_detached, run_funding_cycle};
 use super::payment::{
-    compute_estimated_remaining, validate_linked_channel_against_wallet, validate_session_pricing,
+    compute_estimated_remaining, validate_linked_channel_against_session, validate_session_pricing,
     validate_session_status_baseline_against_local_counters,
 };
 use super::state::{
@@ -231,9 +231,10 @@ pub(super) async fn run_session_driver(
                             total_connects,
                             failed_connects,
                         } => {
-                            if let Err(error) = validate_linked_channel_against_wallet(
-                                config.wallet.as_ref(),
+                            if let Err(error) = validate_linked_channel_against_session(
+                                &state,
                                 config.conn.session_id,
+                                &attribution,
                                 linked_channel.as_ref(),
                             ) {
                                 if let Some((owner, _)) = &config.management {

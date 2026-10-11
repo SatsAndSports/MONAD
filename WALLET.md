@@ -145,6 +145,11 @@ Important details:
   executor concern
 - one relay session is handled by one serialized executor loop, so the client
   state itself does not need a mutex
+- channel acquisition reads accounting authority once after reservation; later
+  statuses validate task-local metadata, ownership, capacity, and signed balance
+  without reopening the wallet database
+- successful payment construction advances the task-local signed-balance
+  high-water before network submission; relay reports cannot lower it
 - nested client sessions end indirectly via transport collapse when a parent
   session dies
 

@@ -416,6 +416,7 @@ pub struct MockWallet {
 #[derive(Debug, Default)]
 struct MockWalletInner {
     channels: BTreeMap<String, StoredChannel>,
+    accounting_reads: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -469,6 +470,15 @@ impl MockWallet {
             },
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accounting_read_count(&self) -> Result<u64, WalletError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| WalletError::Backend("wallet mutex poisoned".to_string()))?;
+        Ok(inner.accounting_reads)
     }
 
     pub fn set_attachment(
@@ -636,10 +646,11 @@ impl MonadWallet for MockWallet {
         &self,
         channel_id: &str,
     ) -> Result<WalletChannelAccounting, WalletError> {
-        let inner = self
+        let mut inner = self
             .inner
             .lock()
             .map_err(|_| WalletError::Backend("wallet mutex poisoned".to_string()))?;
+        inner.accounting_reads = inner.accounting_reads.saturating_add(1);
         let stored = inner
             .channels
             .get(channel_id)
