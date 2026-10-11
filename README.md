@@ -679,7 +679,9 @@ The canonical client funding implementation lives in `monad-client/src/session_d
 
 - `runtime` runs the serialized control loop
 - `state` holds local driver state and publishing helpers
-- `funding` handles channel selection, link, payment, eviction, and recovery
+- `reducer` owns ordinary-request sequencing and channel replacement transitions
+- `policy` makes in-memory funding decisions on the existing 250 ms opportunities
+- `funding` executes channel acquisition, link, payment, retirement, and recovery effects
 - `payment` holds payment math and relay/client safety checks
 
 Shared protocol helpers used by client, relay, and harness code live in:

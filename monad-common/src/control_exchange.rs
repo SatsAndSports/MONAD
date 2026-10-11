@@ -43,6 +43,69 @@ pub fn is_fatal_error(code: &ServerErrorCode) -> bool {
     code.is_fatal()
 }
 
+/// Shared by serialized and pipelined clients. Does not consume request state.
+pub fn validate_response(
+    request: &PendingRequest,
+    confirmed_paid: u64,
+    message: &ServerMessage,
+) -> io::Result<u64> {
+    let ServerMessage::SessionStatus {
+        linked_channel,
+        total_paid_millisats,
+        active_in_rate,
+        active_out_rate,
+        ..
+    } = message
+    else {
+        return Err(invalid("expected status response"));
+    };
+    if *active_in_rate == 0 || *active_out_rate == 0 {
+        return Err(invalid("status pricing rates must be positive"));
+    }
+    let increment = match request {
+        PendingRequest::Link { channel_id } => {
+            if linked_channel
+                .as_ref()
+                .is_none_or(|c| &c.channel_id != channel_id)
+            {
+                return Err(invalid("link response does not identify requested channel"));
+            }
+            0
+        }
+        PendingRequest::Payment {
+            channel_id,
+            balance_raw,
+            minimum_increment_msats,
+        } => {
+            if !linked_channel
+                .as_ref()
+                .is_some_and(|c| &c.channel_id == channel_id && c.balance_raw == *balance_raw)
+            {
+                return Err(invalid(
+                    "payment response does not match submitted channel and balance",
+                ));
+            }
+            *minimum_increment_msats
+        }
+        PendingRequest::Unlink { .. } => {
+            if linked_channel.is_some() {
+                return Err(invalid("unlink response still reports a linked channel"));
+            }
+            0
+        }
+        PendingRequest::Status => 0,
+    };
+    let expected = confirmed_paid
+        .checked_add(increment)
+        .ok_or_else(|| invalid("expected session paid total overflow"))?;
+    if *total_paid_millisats < expected {
+        return Err(invalid(
+            "relay session paid total is smaller than expected for this response",
+        ));
+    }
+    Ok(*total_paid_millisats)
+}
+
 impl ControlExchange {
     pub fn is_initialized(&self) -> bool {
         self.initialized
@@ -102,58 +165,11 @@ impl ControlExchange {
             return Ok(Attribution::InitialStatus);
         }
         match message {
-            ServerMessage::SessionStatus {
-                total_paid_millisats,
-                linked_channel,
-                ..
-            } => {
+            ServerMessage::SessionStatus { .. } => {
                 let Some(request) = self.pending.front() else {
                     return Ok(Attribution::Unsolicited);
                 };
-                let increment = match request {
-                    PendingRequest::Link { channel_id } => {
-                        if linked_channel
-                            .as_ref()
-                            .is_none_or(|c| &c.channel_id != channel_id)
-                        {
-                            return Err(invalid(
-                                "link response does not identify requested channel",
-                            ));
-                        }
-                        0
-                    }
-                    PendingRequest::Payment {
-                        channel_id,
-                        balance_raw,
-                        minimum_increment_msats,
-                    } => {
-                        if !linked_channel.as_ref().is_some_and(|c| {
-                            &c.channel_id == channel_id && c.balance_raw == *balance_raw
-                        }) {
-                            return Err(invalid(
-                                "payment response does not match submitted channel and balance",
-                            ));
-                        }
-                        *minimum_increment_msats
-                    }
-                    PendingRequest::Unlink { .. } => {
-                        if linked_channel.is_some() {
-                            return Err(invalid("unlink response still reports a linked channel"));
-                        }
-                        0
-                    }
-                    PendingRequest::Status => 0,
-                };
-                let expected = self
-                    .confirmed_paid
-                    .checked_add(increment)
-                    .ok_or_else(|| invalid("expected session paid total overflow"))?;
-                if *total_paid_millisats < expected {
-                    return Err(invalid(
-                        "relay session paid total is smaller than expected for this response",
-                    ));
-                }
-                self.confirmed_paid = *total_paid_millisats;
+                self.confirmed_paid = validate_response(request, self.confirmed_paid, message)?;
                 Ok(Attribution::Response(self.pending.pop_front().unwrap()))
             }
             ServerMessage::Error { .. } => Ok(match self.pending.pop_front() {

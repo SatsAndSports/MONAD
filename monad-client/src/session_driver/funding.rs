@@ -1,3 +1,4 @@
+use super::reducer::{channel_step, ChannelEffect, ChannelEvent};
 use bytes::Bytes;
 use monad_common::control_codec::send_json_line;
 use monad_common::control_exchange::PendingRequest;
@@ -16,16 +17,14 @@ pub(super) const LOCAL_KEYSET_RETRY_COOLDOWN: Duration = Duration::from_secs(60)
 
 use super::payment::{
     channel_signed_balance_raw, compute_estimated_remaining, exclude_on_wallet_error,
-    plan_payment_topup, reconcile_payment_topup, server_error_invalidates_channel,
+    plan_payment_delta, reconcile_payment_topup, server_error_invalidates_channel,
     server_error_rejects_intended_channel, PaymentTopupPlan,
 };
 use super::state::{
-    abandon_intended_channel, clear_channel_control_op, clear_control_op, exclude_channel,
-    finish_channel_release, publish_spilman_info, relay_confirms_intended_channel,
-    relay_linked_channel_id, release_is_pending, request_channel_release, session_is_paused,
-    set_blocked_reason, set_link_in_flight, set_payment_in_flight, set_unlink_in_flight,
-    state_summary, terminate_session, ControlOpInFlight, DriverState, FundingBlockedReason,
-    SessionDriverConfig,
+    abandon_intended_channel, clear_control_op, exclude_channel, finish_channel_release,
+    publish_spilman_info, relay_confirms_intended_channel, relay_linked_channel_id,
+    release_is_pending, request_channel_release, set_blocked_reason, state_summary,
+    terminate_session, DriverState, FundingBlockedReason, SessionDriverConfig,
 };
 
 pub(super) async fn send_control_message(
@@ -68,9 +67,11 @@ fn choose_channel_and_offer(
         .list_channels()?
         .into_iter()
         .filter(|channel| {
-            !state
+            !(state
                 .session_excluded_channels
                 .contains(&channel.channel_id)
+                || (relay_confirms_intended_channel(state)
+                    && state.intended_channel_id.as_deref() == Some(channel.channel_id.as_str())))
         })
         .collect::<Vec<_>>();
     for advertisement in &snapshot.advertisements {
@@ -144,9 +145,19 @@ async fn send_channel_link(
         channel_id,
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
-    state.exchange.enqueue(PendingRequest::Link {
-        channel_id: channel_id.clone(),
-    })?;
+    state
+        .exchange
+        .step(super::reducer::Event::Submit(PendingRequest::Link {
+            channel_id: channel_id.clone(),
+        }))?;
+    channel_step(
+        state,
+        ChannelEvent::LinkSelected {
+            channel_id: channel_id.clone(),
+            keyset_id: channel.keyset_id,
+            offer,
+        },
+    );
     send_control_message(
         h2_send,
         &ClientMessage::ChannelLink {
@@ -157,7 +168,7 @@ async fn send_channel_link(
         },
     )
     .await?;
-    set_link_in_flight(state, channel_id.clone(), channel.keyset_id, offer);
+    state.exchange.step(super::reducer::Event::Submitted)?;
     if let Some((owner, hop)) = &config.management {
         hop.linking(owner, channel_id);
     }
@@ -165,10 +176,10 @@ async fn send_channel_link(
     Ok(())
 }
 
-async fn try_link_channel(
+async fn acquire_existing_channel(
     config: &SessionDriverConfig,
     state: &mut DriverState,
-    h2_send: &mut h2::SendStream<Bytes>,
+    _h2_send: &mut h2::SendStream<Bytes>,
     channel: WalletChannel,
     offer: RelayPaymentOffer,
 ) -> io::Result<bool> {
@@ -192,10 +203,23 @@ async fn try_link_channel(
         return Ok(true);
     }
 
+    channel_step(state, ChannelEvent::Acquired(channel, offer));
+    Ok(false)
+}
+
+async fn link_acquired(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    h2_send: &mut h2::SendStream<Bytes>,
+) -> io::Result<()> {
+    let Some((channel, offer)) = state.acquired.take() else {
+        return Ok(());
+    };
+    let channel_id = channel.channel_id.clone();
     match config.wallet.build_link_request(&channel_id, &offer) {
         Ok(request) => {
             send_channel_link(config, state, h2_send, channel, offer, request).await?;
-            Ok(false)
+            Ok(())
         }
         Err(error) => {
             let _ = config
@@ -208,28 +232,29 @@ async fn try_link_channel(
                     FundingBlockedReason::LinkRequestBuild,
                     &error.to_string(),
                 )?;
-                return Ok(false);
+                return Ok(());
             }
             if exclude_on_wallet_error(&error) {
                 exclude_channel(state, &channel_id);
             }
-            Ok(true)
+            // A failed retry preparation must not leave an excluded candidate
+            // as the intended channel and select it again on every tick.
+            if state.intended_channel_id.as_deref() == Some(channel_id.as_str())
+                && !relay_confirms_intended_channel(state)
+            {
+                abandon_intended_channel(config, state, channel_id, false).await;
+            }
+            Ok(())
         }
     }
 }
 
-pub(super) async fn maybe_ensure_linked_channel(
+pub(super) async fn acquire_channel_candidate(
     config: &SessionDriverConfig,
     state: &mut DriverState,
     h2_send: &mut h2::SendStream<Bytes>,
 ) -> io::Result<()> {
     if state.terminated || state.funding_blocked_reason.is_some() {
-        return Ok(());
-    }
-    if !session_is_paused(state)
-        && compute_estimated_remaining(state, &config.conn.cleartext_byte_counters)?
-            .is_none_or(|remaining| remaining > 0)
-    {
         return Ok(());
     }
     let Some(versions) = state
@@ -240,16 +265,7 @@ pub(super) async fn maybe_ensure_linked_channel(
     else {
         return Ok(());
     };
-    if state.control_op_in_flight.is_some() {
-        return Ok(());
-    }
-    if relay_confirms_intended_channel(state) {
-        info!(
-            "{} relay confirms intended channel {} | {}",
-            config.hop_label,
-            state.intended_channel_id.as_deref().unwrap_or("none"),
-            state_summary(state, &config.conn.cleartext_byte_counters)
-        );
+    if state.exchange.pending().is_some() {
         return Ok(());
     }
     if state
@@ -281,10 +297,15 @@ pub(super) async fn maybe_ensure_linked_channel(
     }
 
     loop {
-        if let (Some(channel_id), Some(offer)) = (
-            state.intended_channel_id.clone(),
-            state.intended_offer.clone(),
-        ) {
+        let retry = if relay_confirms_intended_channel(state) {
+            None
+        } else {
+            state
+                .intended_channel_id
+                .clone()
+                .zip(state.intended_offer.clone())
+        };
+        if let Some((channel_id, offer)) = retry {
             let channel = match config.wallet.get_channel(&channel_id) {
                 Ok(channel) => channel,
                 Err(error) => {
@@ -307,7 +328,7 @@ pub(super) async fn maybe_ensure_linked_channel(
                 channel.channel_id,
                 state_summary(state, &config.conn.cleartext_byte_counters)
             );
-            if !try_link_channel(config, state, h2_send, channel, offer).await? {
+            if !acquire_existing_channel(config, state, h2_send, channel, offer).await? {
                 return Ok(());
             }
             abandon_intended_channel(config, state, channel_id, false).await;
@@ -322,7 +343,7 @@ pub(super) async fn maybe_ensure_linked_channel(
                     channel.channel_id,
                     state_summary(state, &config.conn.cleartext_byte_counters)
                 );
-                if !try_link_channel(config, state, h2_send, channel, offer).await? {
+                if !acquire_existing_channel(config, state, h2_send, channel, offer).await? {
                     return Ok(());
                 }
             }
@@ -425,7 +446,7 @@ pub(super) async fn maybe_ensure_linked_channel(
                         return Ok(());
                     }
                 };
-                if !try_link_channel(config, state, h2_send, channel, offer).await? {
+                if !acquire_existing_channel(config, state, h2_send, channel, offer).await? {
                     return Ok(());
                 }
             }
@@ -451,7 +472,7 @@ pub(super) async fn maybe_ensure_linked_channel(
 pub(super) async fn apply_channel_release_requested(
     config: &SessionDriverConfig,
     state: &mut DriverState,
-    h2_send: &mut h2::SendStream<Bytes>,
+    _h2_send: &mut h2::SendStream<Bytes>,
     channel_id: String,
 ) -> io::Result<()> {
     info!(
@@ -461,7 +482,11 @@ pub(super) async fn apply_channel_release_requested(
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
     let applies_to_session = state.intended_channel_id.as_deref() == Some(channel_id.as_str())
-        || super::state::relay_linked_channel_id(state) == Some(channel_id.as_str());
+        || super::state::relay_linked_channel_id(state) == Some(channel_id.as_str())
+        || state
+            .previous_link
+            .as_ref()
+            .is_some_and(|c| c.channel_id == channel_id);
     if !applies_to_session {
         warn!(
             "{} ignoring channel release request for unrelated channel {}",
@@ -469,7 +494,7 @@ pub(super) async fn apply_channel_release_requested(
         );
         return Ok(());
     }
-    request_channel_release(state, &channel_id);
+    channel_step(state, ChannelEvent::ReleaseRequested(channel_id.clone()));
     if let Some((owner, _hop)) = &config.management {
         owner.events.record(
             "channel_release_requested",
@@ -480,7 +505,7 @@ pub(super) async fn apply_channel_release_requested(
         );
         owner.notify();
     }
-    maybe_send_channel_unlink(config, state, h2_send).await
+    Ok(())
 }
 
 /// Send ID-only `ChannelUnlink` for a retirement-pending channel once no
@@ -492,7 +517,7 @@ pub(super) async fn maybe_send_channel_unlink(
     state: &mut DriverState,
     h2_send: &mut h2::SendStream<Bytes>,
 ) -> io::Result<()> {
-    if state.terminated || state.control_op_in_flight.is_some() {
+    if state.terminated || state.exchange.pending().is_some() {
         return Ok(());
     }
     let Some(intended) = state.intended_channel_id.clone() else {
@@ -516,9 +541,11 @@ pub(super) async fn maybe_send_channel_unlink(
         intended,
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
-    state.exchange.enqueue(PendingRequest::Unlink {
-        channel_id: intended.clone(),
-    })?;
+    state
+        .exchange
+        .step(super::reducer::Event::Submit(PendingRequest::Unlink {
+            channel_id: intended.clone(),
+        }))?;
     send_control_message(
         h2_send,
         &ClientMessage::ChannelUnlink {
@@ -526,7 +553,7 @@ pub(super) async fn maybe_send_channel_unlink(
         },
     )
     .await?;
-    set_unlink_in_flight(state, intended);
+    state.exchange.step(super::reducer::Event::Submitted)?;
     Ok(())
 }
 
@@ -546,7 +573,6 @@ pub(super) async fn apply_channel_unlinked(
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
     finish_channel_release(state, &channel_id);
-    clear_channel_control_op(state, &channel_id);
     if let Some((owner, _hop)) = &config.management {
         owner.events.record(
             "channel_unlinked",
@@ -566,15 +592,11 @@ pub(super) async fn maybe_progress_payment(
     config: &SessionDriverConfig,
     state: &mut DriverState,
     h2_send: &mut h2::SendStream<Bytes>,
-    skip_for_resolved_payment: bool,
+    requested_delta_msats: u64,
 ) -> io::Result<()> {
-    if skip_for_resolved_payment
-        || state.terminated
+    if state.terminated
         || state.funding_blocked_reason.is_some()
-        || matches!(
-            state.control_op_in_flight,
-            Some(ControlOpInFlight::Payment { .. }) | Some(ControlOpInFlight::Unlink { .. })
-        )
+        || state.exchange.pending().is_some()
     {
         return Ok(());
     }
@@ -602,29 +624,18 @@ pub(super) async fn maybe_progress_payment(
     else {
         return Ok(());
     };
-    let should_pay = snapshot.paused
-        || snapshot.remaining_milli_sats <= 0
-        || i128::from(estimated_remaining)
-            < i128::from(config.payment_policy.target_topup_buffer_msats);
-    if linked_channel.channel_id != intended_channel_id || !should_pay {
-        if linked_channel.channel_id != intended_channel_id {
-            info!(
-                "{} payment skipped: relay linked channel {} does not match intended {} | {}",
-                config.hop_label,
-                linked_channel.channel_id,
-                intended_channel_id,
-                state_summary(state, &config.conn.cleartext_byte_counters)
-            );
-        }
+    if linked_channel.channel_id != intended_channel_id {
+        info!(
+            "{} payment skipped: relay linked channel {} does not match intended {} | {}",
+            config.hop_label,
+            linked_channel.channel_id,
+            intended_channel_id,
+            state_summary(state, &config.conn.cleartext_byte_counters)
+        );
         return Ok(());
     }
 
-    let plan = match plan_payment_topup(
-        estimated_remaining,
-        config.payment_policy.target_topup_buffer_msats,
-        config.payment_policy.minimum_topup_msats,
-        linked_channel,
-    ) {
+    let plan = match plan_payment_delta(requested_delta_msats, linked_channel) {
         Ok(plan) => plan,
         Err(error) => {
             warn!(
@@ -693,11 +704,13 @@ pub(super) async fn maybe_progress_payment(
         next_balance_raw,
     ) {
         Ok(request) => {
-            state.exchange.enqueue(PendingRequest::Payment {
-                channel_id: intended_channel_id.clone(),
-                balance_raw: next_balance_raw,
-                minimum_increment_msats,
-            })?;
+            state
+                .exchange
+                .step(super::reducer::Event::Submit(PendingRequest::Payment {
+                    channel_id: intended_channel_id.clone(),
+                    balance_raw: next_balance_raw,
+                    minimum_increment_msats,
+                }))?;
             info!(
                 "{} sending ChannelPayment for {}: remaining={} target={} reaches_capacity={} next_balance_raw={} | {}",
                 config.hop_label,
@@ -718,7 +731,7 @@ pub(super) async fn maybe_progress_payment(
             )
             .await?;
             state.local_session_paid_msats = next_local_session_paid_msats;
-            set_payment_in_flight(state, intended_channel_id.clone(), next_balance_raw);
+            state.exchange.step(super::reducer::Event::Submitted)?;
             if let Some((owner, hop)) = &config.management {
                 hop.paying(owner, intended_channel_id);
             }
@@ -756,15 +769,108 @@ pub(super) async fn run_funding_cycle(
     h2_send: &mut h2::SendStream<Bytes>,
     skip_for_resolved_payment: bool,
 ) -> io::Result<()> {
-    // Funding remains deliberately serialized; the shared exchange supports
-    // the five-request window for pipelined callers without guessing replies.
-    if !state.exchange.is_empty() {
-        return Ok(());
+    run_policy_cycle(
+        config,
+        state,
+        h2_send,
+        skip_for_resolved_payment,
+        &config.payment_policy,
+    )
+    .await
+}
+
+/// The view is assembled only from task-owned state and atomic byte counters.
+/// Each bounded pass can acquire -> link, or retire -> acquire -> link; no
+/// unsuccessful operation is retried in a tight loop.
+pub(super) async fn run_policy_cycle(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    h2_send: &mut h2::SendStream<Bytes>,
+    skip_payment: bool,
+    policy: &impl super::policy::FundingStrategy,
+) -> io::Result<()> {
+    use super::policy::{Intent, View};
+    use super::reducer::{Event, FundingEffect};
+    for _ in 0..3 {
+        if state.terminated
+            || !state.exchange.is_initialized()
+            || !state.exchange.is_empty()
+            || state.funding_blocked_reason.is_some()
+        {
+            return Ok(());
+        }
+        let snapshot = state.relay_snapshot.as_ref();
+        let linked = relay_confirms_intended_channel(state);
+        let view = View {
+            acquired: state.acquired.is_some(),
+            linked,
+            release_requested: state
+                .intended_channel_id
+                .as_deref()
+                .is_some_and(|id| release_is_pending(state, id)),
+            paused: snapshot.is_some_and(|s| s.paused),
+            relay_remaining: snapshot.map_or(0, |s| s.remaining_milli_sats),
+            estimated_remaining: compute_estimated_remaining(
+                state,
+                &config.conn.cleartext_byte_counters,
+            )?,
+            exhausted: snapshot
+                .and_then(|s| s.linked_channel.as_ref())
+                .is_some_and(|c| c.balance_raw >= c.capacity_raw),
+            skip_payment,
+            retry_eligible: state
+                .funding_retry_not_before
+                .is_none_or(|at| Instant::now() >= at),
+        };
+        let intent = policy.decide(&view);
+        let Some(effect) = state.exchange.funding_decided(intent, &view)? else {
+            return Ok(());
+        };
+        match effect {
+            FundingEffect::AcquireChannel => {
+                acquire_channel_candidate(config, state, h2_send).await?
+            }
+            FundingEffect::PrepareLink => link_acquired(config, state, h2_send).await?,
+            FundingEffect::PreparePayment {
+                requested_delta_msats,
+            } => maybe_progress_payment(config, state, h2_send, requested_delta_msats).await?,
+            FundingEffect::RetireAndUnlink => {
+                if let Some(id) = state.intended_channel_id.clone() {
+                    request_channel_release(state, &id);
+                }
+                maybe_send_channel_unlink(config, state, h2_send).await?;
+            }
+            FundingEffect::ReleaseAcquired => {
+                if let Some((channel, _)) = state.acquired.take() {
+                    config
+                        .wallet
+                        .detach_channel_from_session(&channel.channel_id, config.conn.session_id)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                }
+            }
+            FundingEffect::ReleaseExhausted => {
+                if let Some(id) = state.intended_channel_id.clone() {
+                    config
+                        .wallet
+                        .mark_channel_unusable(&id)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    abandon_intended_channel(config, state, id, true).await;
+                }
+            }
+            FundingEffect::SubmitStatus => {
+                state.exchange.step(Event::Submit(PendingRequest::Status))?;
+                send_control_message(h2_send, &ClientMessage::GetSessionStatus).await?;
+                state.exchange.step(Event::Submitted)?;
+            }
+        }
+        state.exchange.step(Event::WorkFinished)?;
+        if intent == Intent::AcquireChannel && state.acquired.is_none() {
+            return Ok(());
+        }
+        if !matches!(intent, Intent::AcquireChannel | Intent::ReleaseExhausted) {
+            return Ok(());
+        }
     }
-    maybe_send_channel_unlink(config, state, h2_send).await?;
-    maybe_ensure_linked_channel(config, state, h2_send).await?;
-    maybe_progress_payment(config, state, h2_send, skip_for_resolved_payment).await?;
-    maybe_ensure_linked_channel(config, state, h2_send).await?;
     Ok(())
 }
 
@@ -773,8 +879,48 @@ pub(super) async fn apply_channel_evicted(
     state: &mut DriverState,
     channel_id: String,
 ) {
-    exclude_channel(state, &channel_id);
-    abandon_intended_channel(config, state, channel_id, false).await;
+    let effects = channel_step(state, ChannelEvent::Evicted(channel_id));
+    for ChannelEffect::ReleaseReservation(id) in effects {
+        let _ = config
+            .wallet
+            .detach_channel_from_session(&id, config.conn.session_id);
+    }
+    publish_spilman_info(config, state).await;
+}
+
+/// Finish a replacement only after its response has been fully validated.
+pub(super) async fn finish_replacement(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    accepted: bool,
+) -> io::Result<()> {
+    if state.previous_link.is_none() {
+        return Ok(());
+    }
+    if accepted {
+        let effects = channel_step(state, ChannelEvent::LinkAccepted);
+        for ChannelEffect::ReleaseReservation(id) in effects {
+            config
+                .wallet
+                .detach_channel_from_session(&id, config.conn.session_id)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+    } else {
+        // Error-specific handling has already retired or excluded an invalid B.
+        // Keep a still-usable B reserved as a candidate for a bounded retry.
+        if let Some(id) = state.intended_channel_id.take() {
+            if let Some(offer) = state.intended_offer.take() {
+                let channel = config
+                    .wallet
+                    .get_channel(&id)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                state.acquired = Some((channel, offer));
+            }
+        }
+        channel_step(state, ChannelEvent::LinkRejected);
+        publish_spilman_info(config, state).await;
+    }
+    Ok(())
 }
 
 pub(super) async fn apply_server_error(

@@ -125,12 +125,14 @@ MONAD currently has:
 
 - `monad_client::session_driver::start_session_payment_driver(...)`
 
-The client payment driver is now implemented as one serialized direct control
-loop across `monad-client/src/session_driver/`:
+The client payment driver uses a serialized executor, reducer, and funding policy
+across `monad-client/src/session_driver/`:
 
 - `session_driver.rs` - public entrypoints
 - `runtime.rs` - serialized executor loop
 - `state.rs` - local driver state
+- `reducer.rs` - single ordinary-operation state and channel transitions
+- `policy.rs` - pure funding decisions without wallet access
 - `funding.rs` - link/payment progression and recovery
 - `payment.rs` - payment math and safety checks
 

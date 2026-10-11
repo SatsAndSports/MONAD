@@ -11,7 +11,7 @@ Use it together with:
 
 The canonical client funding implementation is in `monad-client`:
 
-- `monad-client/src/session_driver.rs` - public entrypoints and private `runtime`, `state`, `funding`, and `payment` modules for the serialized control loop, local state, funding lifecycle, and payment safety checks
+- `monad-client/src/session_driver.rs` - public entrypoints and private `runtime`, `state`, `reducer`, `policy`, `funding`, and `payment` modules for the serialized executor, local state, ordinary/channel transitions, funding strategy, wallet effects, and payment safety checks
 - `monad-client/src/wallet.rs` - wallet abstraction, selector, mock wallet
 - `monad-client/src/sqlite_client_wallet.rs` - SQLite-backed `MonadWallet` using upstream Spilman channels
 - `monad-client/src/loose_proof_wallet.rs` - loose Cashu proof custody, quote/premint records, reservations, and spend/release state
@@ -21,6 +21,28 @@ Shared helpers used by multiple crates live in `monad-common`:
 
 - `monad-common/src/control_codec.rs` - JSON newline control-stream framing
 - `monad-common/src/payment_units.rs` - `msat` / `sat` raw-unit conversion helpers
+- `monad-common/src/control_exchange.rs` - shared pure response validation and the pipelined harness FIFO; the main client's single pending operation belongs to its reducer
+
+### Policy and effects
+
+Policy evaluation receives only task-local state and an atomic counter snapshot;
+it does not read the wallet, acquire a wallet lock, or perform I/O. The 250 ms
+timer remains, but a busy ordinary slot suppresses evaluation altogether.
+The default strategy keeps target/minimum topups, signed-high-water safety, and
+spending remaining session credit before exhausted-channel replacement.
+
+The reducer accepts policy intents only when legal and returns funding effects.
+Acquisition and linking are distinct: acquisition exclusively reserves a candidate;
+link selection records the client's active choice before submission, retaining a
+previous channel through replacement. Rejection restores the previous channel
+unless independently evicted. Wallet preparation, signing/persistence, submission,
+and reservation cleanup remain serialized executor operations. Heartbeats and
+tunnel forwarding are outside the funding reducer.
+
+Current status handling still validates against the wallet database before
+committing the response or publishing state. Session-scoped authority caching is
+follow-up work. A counting-wallet executor test requires zero wallet calls on
+repeated sufficiently funded ticks and on ticks with any ordinary request pending.
 
 The relay-side steady-state authority lives in:
 
