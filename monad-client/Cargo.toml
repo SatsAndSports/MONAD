@@ -31,11 +31,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 async-trait = "0.1"
 url = "2"
 cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cashu", default-features = false }
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "22de9a78fc7c314cf04f0817a5bbe156cc41c734", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "097ec96e3fefb812b692b830345c3aeb4fd749b0", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
 
 [dev-dependencies]
 monad-test-traffic = { path = "../monad-test-traffic" }
 tokio = { version = "1", features = ["test-util"] }
 axum = "0.8.9"
 tempfile = "3"
-cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "22de9a78fc7c314cf04f0817a5bbe156cc41c734", package = "cdk-spilman-test-mint", default-features = false, features = ["http"] }
+cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "097ec96e3fefb812b692b830345c3aeb4fd749b0", package = "cdk-spilman-test-mint", default-features = false, features = ["http"] }

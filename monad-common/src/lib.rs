@@ -2,6 +2,7 @@ pub mod billing;
 pub mod blinded_connect;
 pub mod blinded_hop;
 pub mod bootstrap;
+pub mod cashu_v4;
 pub mod config;
 pub mod control_codec;
 pub mod control_exchange;

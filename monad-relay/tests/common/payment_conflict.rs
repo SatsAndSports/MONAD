@@ -1,5 +1,5 @@
 use super::*;
-use monad_common::protocol::LinkedChannelStatus;
+use monad_common::protocol::{ChannelLinkRequest, ChannelPaymentRequest, LinkedChannelStatus};
 use monad_relay::payments::{ChannelPaymentError, LinkError, LinkOutcome, PaymentOutcome};
 
 #[derive(Default)]
@@ -32,9 +32,9 @@ impl RelayPayments for ObservedPayments {
         &self,
         versions: &BTreeSet<String>,
         session: [u8; 32],
-        json: &str,
+        request: &ChannelLinkRequest,
     ) -> Result<LinkOutcome, LinkError> {
-        let result = self.inner.link_channel(versions, session, json)?;
+        let result = self.inner.link_channel(versions, session, request)?;
         let status = self
             .inner
             .linked_channel_status(&result.channel_id)
@@ -52,7 +52,7 @@ impl RelayPayments for ObservedPayments {
         &self,
         session: [u8; 32],
         channel: &str,
-        json: &str,
+        request: &ChannelPaymentRequest,
         max_delta_millisats: u64,
     ) -> Result<PaymentOutcome, ChannelPaymentError> {
         let mut state = self.observer.state.lock().unwrap();
@@ -66,7 +66,7 @@ impl RelayPayments for ObservedPayments {
             let result = self.inner.apply_channel_payment_with_limit(
                 session,
                 channel,
-                json,
+                request,
                 max_delta_millisats,
             );
             assert_eq!(result, Err(ChannelPaymentError::Conflict));
@@ -75,8 +75,12 @@ impl RelayPayments for ObservedPayments {
             self.observer.rejected.notify_one();
             result
         } else {
-            self.inner
-                .apply_channel_payment_with_limit(session, channel, json, max_delta_millisats)
+            self.inner.apply_channel_payment_with_limit(
+                session,
+                channel,
+                request,
+                max_delta_millisats,
+            )
         }
     }
 
@@ -304,10 +308,14 @@ async fn payment_conflict_wire_error_without_funded_status() {
         wallet
             .attach_channel_to_session(&channel, *conn.session_id())
             .unwrap();
+        let link_request = wallet.build_link_request(&channel, &offer).unwrap();
         send_control_message(
             &mut control.send,
             &ClientMessage::ChannelLink {
-                payment_json: wallet.build_link_request(&channel, &offer).unwrap(),
+                channel_id: link_request.channel_id,
+                zero_balance_signature: link_request.zero_balance_signature,
+                params: link_request.params,
+                funding_token: link_request.funding_token,
             },
             false,
         )
@@ -316,12 +324,15 @@ async fn payment_conflict_wire_error_without_funded_status() {
         assert!(linked.paused);
         assert_eq!(linked.total_paid_millisats, 0);
         observer.state.lock().unwrap().armed = Some(*conn.session_id());
+        let payment_request = wallet
+            .build_channel_payment(&channel, &offer, 0, 100)
+            .unwrap();
         send_control_message(
             &mut control.send,
             &ClientMessage::ChannelPayment {
-                payment_json: wallet
-                    .build_channel_payment(&channel, &offer, 0, 100)
-                    .unwrap(),
+                channel_id: payment_request.channel_id,
+                balance_raw: payment_request.balance_raw,
+                signature: payment_request.signature,
             },
             false,
         )

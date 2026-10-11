@@ -597,7 +597,8 @@ Route failure waits own their per-connection futures directly. SOCKS handshakes
 run before acquiring the current route, so stalled handshakes cannot pin old
 route generations. SOCKS connection futures are owned directly by the listener.
 All client control writes, including heartbeat requests, have the existing
-15-second heartbeat timeout as their send deadline.
+15-second heartbeat timeout as their send deadline. A Ping's separate
+matching-Pong deadline starts only after that send succeeds.
 
 Route (re)connect retry policy is split by lifecycle: before the first
 successful connect the client fails fast after a bounded number of attempts so
@@ -709,15 +710,14 @@ Control messages are JSON objects, newline-delimited, exchanged over the H2 cont
 ### Message Types
 
 Client to server (`ClientMessage`):
-- `ChannelLink { payment_json }` — link a Spilman channel to this session; requires a valid Spilman `Payment` with balance=0, funding proofs, sufficient capacity for the relay's configured channel policy, and an expiry at least `channel_policy.min_expiry` in the future
-- `ChannelPayment { payment_json }` — increment session balance; requires a Spilman `Payment` signature for a higher balance than previously seen for this channel
+- `ChannelLink { channel_id, zero_balance_signature, params, funding_token }` — link a Spilman channel to this session; `funding_token` is one strict, resource-bounded Cashu V4 `cashuB` token containing the channel proofs, while `params` contains only the documented typed public channel fields
+- `ChannelPayment { channel_id, balance_raw, signature }` — increment session balance with a signature for a higher cumulative balance; funding fields are forbidden
 - `ChannelUnlink { channel_id }` — release linked channel ownership
 - `GetSessionStatus` — request a fresh session status snapshot
 - `Ping { nonce }` — request correlated control-path liveness evidence without requesting a status
 
 Server to client (`ServerMessage`):
 - `SessionStatus { ... }` — primary state synchronization message; sent once after control stream establishment, then as the ordered response to successful link/payment/unlink or `GetSessionStatus` requests. Fast-path byte accounting, pause transitions, and eviction do not push snapshots. Contains:
-  - `version`: Negotiated protocol version
   - `receiver_pubkey`: Server's secp256k1 key for Spilman
   - `advertisements`: Map of mint URL to unit to `{minimum_channel_lifetime_secs, funding_keyset_recovery_window_secs}`; no keyset IDs or per-offer prices
   - `linked_channel`: Relay-authoritative linked channel status (if any), including channel id, latest accepted raw balance, raw capacity, and unit
@@ -767,11 +767,19 @@ session); recognized fatal errors terminate regardless of the FIFO.
 The main funding policy still sends channel operations serially. Local counters
 now also trigger exhausted-channel reselection; it does not wait for an
 unsolicited pause snapshot. Ping/Pong retains its independent nonce liveness
-tracking. Extension envelopes are accepted bidirectionally and preserved as
-uninterpreted hints. Error codes use the exact stable registry; only
+tracking. Any protocol-accepted server control message, including an extension
+or advisory, defers a Ping that has not been sent; discarded unsolicited
+responses do not. Once a Ping is outstanding, only a matching Pong strictly
+before its submission-based deadline clears it, and no other traffic extends
+that deadline. Extension envelopes are accepted bidirectionally and preserved
+as uninterpreted hints. Error codes use the exact stable registry; only
 `CONTROL_INVALID_MESSAGE`, `LINK_KEYSET_VERSION_NOT_NEGOTIATED`, and
 `INTERNAL_ERROR` are protocol-fatal. A client may still end a session as local
 recovery policy after a nonfatal rejection such as `PAYMENT_CONFLICT`.
+Before applying or publishing a status, the client checks any linked channel
+against durable wallet accounting: the ID must exist locally, unit and raw
+capacity must match, the relay balance must not exceed capacity, and it must not
+exceed the client's highest signed balance.
 
 ### Relay Keyset Refresh
 
@@ -1046,11 +1054,11 @@ The relay is configured with trusted mint/unit options plus one session pricing 
 The relay wallet manager owns a shared in-memory `SpilmanMintCache`. The cache stores all keysets returned by configured mints, active and inactive, for all units the mint reports. Trusted mint/unit policy filters advertisements and first-time funding acceptance; stored channels can relink and pay after a policy change. Close and drain use the same shared cache-selection mechanics but different durable recovery state machines. Each can warm an empty mint/unit cache and perform at most one changed-output-keyset retry after a recognized keyset rejection.
 
 #### 2. Channel Linking
-The client selects a mint/unit and sends a `ChannelLink` message containing a Spilman `Payment` with `balance: 0` and the required multisig funding proofs. If the bootstrap did not negotiate a supported Cashu Spilman channel protocol version and keyset-format set, the relay rejects linking immediately.
+The client selects a mint/unit and sends `ChannelLink { channel_id, zero_balance_signature, params, funding_token }`. The signature covers the zero-balance commitment, `params` is the exact public Spilman parameter object, and `funding_token` is a strict single-group Cashu V4 token containing the required proofs. If the bootstrap did not negotiate a supported Cashu Spilman channel protocol version and keyset-format set, the relay rejects linking immediately.
 
 Production hellos offer both `v1` (`00` keyset IDs) and `v2` (`01` keyset IDs). The relay selects the full nonempty intersection; clients validate selections against the actual hello. Session advertisements expose trusted mint/unit policy and recovery windows independently of cached keysets and negotiated versions. New funding selection and channel acceptance enforce the negotiated version set. The shared cache, channel close/drain output selection, and loose input proofs are unaffected.
 
-Before persisting a new channel or changing ownership, `ChannelLink` checks its funding keyset version. Existing channels use authoritative stored funding, never caller-supplied replacement or omitted params. A mismatch yields `LinkKeysetVersionNotNegotiated`, releases the offending session's previous ownership, and ends its data/control streams after a bounded best-effort error send. Other MONAD sessions on the same QUIC connection remain usable. The client terminates its driver without invalidating the wallet channel.
+Before persisting a new channel or changing ownership, `ChannelLink` checks its funding keyset version. Existing channels use authoritative stored funding rather than caller-supplied replacement data. A mismatch yields `LinkKeysetVersionNotNegotiated`, releases the offending session's previous ownership, and ends its data/control streams after a bounded best-effort error send. Other MONAD sessions on the same QUIC connection remain usable. The client terminates its driver without invalidating the wallet channel.
 
 For a first-time channel on a negotiated keyset format, an unknown keyset is refreshable only when the submitted mint/unit is already trusted. Before mint I/O, the relay recomputes the channel identity and checks funding-proof structure that does not require mint key metadata. It then invokes the shared bounded coordinator and retries the immutable link once after a fresh successful result. A still-unknown keyset is permanently rejected. Cooldown, saturation, and refresh failure remain transient; the client retains its intended channel and backs off. Stored `Open` channels bypass this path and validate against persisted funding, while `Closing` and `Closed` channels remain unusable.
 - **One Session Per Channel**: One live relay payment backend maintains a registry of `ChannelId -> SessionId` shared by that relay's sessions. Process/database ownership and durable channel ownership metadata are separate layers.

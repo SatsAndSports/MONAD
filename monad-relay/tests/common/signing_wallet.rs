@@ -19,9 +19,11 @@ use cdk_spilman::{
 };
 use cdk_spilman_test_mint::InMemoryMintNetworking;
 use monad_client::wallet::{
-    MonadWallet, RelayPaymentOffer, WalletChannel, WalletChannelState, WalletError,
+    link_request_from_spilman_payment, payment_request_from_spilman_payment, MonadWallet,
+    RelayPaymentOffer, WalletChannel, WalletChannelAccounting, WalletChannelState, WalletError,
 };
 use monad_common::payment_units::raw_units_to_msats;
+use monad_common::protocol::{ChannelLinkRequest, ChannelPaymentRequest};
 
 #[derive(Debug, Clone)]
 struct ChannelMetadata {
@@ -288,6 +290,24 @@ impl MonadWallet for TestSigningWallet {
         Ok(Self::channel_to_wallet_channel(metadata))
     }
 
+    fn get_channel_accounting(
+        &self,
+        channel_id: &str,
+    ) -> Result<WalletChannelAccounting, WalletError> {
+        let channels = self
+            .channels
+            .lock()
+            .map_err(|_| WalletError::Backend("channels mutex poisoned".to_string()))?;
+        let metadata = channels.get(channel_id).ok_or(WalletError::NotFound)?;
+        Ok(WalletChannelAccounting {
+            state: metadata.state,
+            attached_session_id: metadata.attached_session_id,
+            unit: metadata.unit.clone(),
+            capacity_raw: metadata.capacity_raw,
+            current_signed_balance_raw: metadata.current_signed_balance_raw,
+        })
+    }
+
     fn attach_channel_to_session(
         &self,
         channel_id: &str,
@@ -357,7 +377,7 @@ impl MonadWallet for TestSigningWallet {
         &self,
         channel_id: &str,
         offer: &RelayPaymentOffer,
-    ) -> Result<String, WalletError> {
+    ) -> Result<ChannelLinkRequest, WalletError> {
         let channels = self
             .channels
             .lock()
@@ -380,8 +400,7 @@ impl MonadWallet for TestSigningWallet {
         let payment = bridge
             .sign_channel_registration(channel_id)
             .map_err(|e| WalletError::Backend(format!("failed to create link payment: {e}")))?;
-        serde_json::to_string(&payment)
-            .map_err(|e| WalletError::Backend(format!("failed to serialize payment: {e}")))
+        link_request_from_spilman_payment(payment)
     }
 
     fn build_channel_payment(
@@ -390,7 +409,7 @@ impl MonadWallet for TestSigningWallet {
         offer: &RelayPaymentOffer,
         latest_server_balance_raw: u64,
         next_balance_raw: u64,
-    ) -> Result<String, WalletError> {
+    ) -> Result<ChannelPaymentRequest, WalletError> {
         let mut channels = self
             .channels
             .lock()
@@ -429,8 +448,7 @@ impl MonadWallet for TestSigningWallet {
         let payment = bridge
             .sign_payment(channel_id, next_balance_raw)
             .map_err(|e| WalletError::Backend(format!("failed to create payment: {e}")))?;
-        let payment_json = serde_json::to_string(&payment)
-            .map_err(|e| WalletError::Backend(format!("failed to serialize payment: {e}")))?;
+        let request = payment_request_from_spilman_payment(payment.clone())?;
         bridge
             .record_signed_payment(&payment)
             .map_err(|e| WalletError::Backend(format!("failed to record payment: {e}")))?;
@@ -439,6 +457,6 @@ impl MonadWallet for TestSigningWallet {
         metadata.current_signed_balance_msats =
             Self::raw_to_msats(&metadata.unit, next_balance_raw)?;
 
-        Ok(payment_json)
+        Ok(request)
     }
 }

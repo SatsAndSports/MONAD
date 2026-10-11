@@ -127,7 +127,7 @@ mod tests {
         channel_signed_balance_raw, exclude_on_wallet_error, plan_payment_topup,
         raw_amount_to_msats, reconcile_payment_topup, requested_delta_msats,
         server_error_invalidates_channel, server_error_rejects_intended_channel,
-        validate_linked_channel_balance_against_wallet, validate_session_pricing,
+        validate_linked_channel_against_wallet, validate_session_pricing,
         validate_session_status_baseline_against_local_counters, PaymentTopupPlan,
     };
     use super::state::{
@@ -172,10 +172,11 @@ mod tests {
         use monad_common::control_codec::{send_json_line, try_decode_json_line};
         use monad_common::protocol::{ClientMessage, ServerMessage};
         for abort in [false, true] {
+            let channel_id = "c".repeat(64);
             let wallet = Arc::new(MockWallet::new());
             wallet
                 .insert_channel(WalletChannel {
-                    channel_id: "channel".to_string(),
+                    channel_id: channel_id.clone(),
                     state: WalletChannelState::Open,
                     receiver_pubkey: "receiver".to_string(),
                     mint_url: "https://mint".to_string(),
@@ -284,16 +285,175 @@ mod tests {
                 assert!(*failed.borrow());
             }
             assert!(ready.await.is_err());
-            let channel = wallet.get_channel("channel").unwrap();
+            let channel = wallet.get_channel(&channel_id).unwrap();
             assert_eq!(channel.state, WalletChannelState::Open);
             assert_eq!(channel.attached_session_id, None);
             wallet
-                .attach_channel_to_session("channel", [2; 32])
+                .attach_channel_to_session(&channel_id, [2; 32])
                 .unwrap();
             let _ = stop.send(());
             server_task.await.unwrap();
             conn.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn linked_capacity_mismatch_ends_driver_before_ready_or_publish() {
+        use crate::wallet::{MockWallet, MonadWallet, WalletChannel, WalletChannelState};
+        use monad_common::control_codec::{send_json_line, try_decode_json_line};
+        use monad_common::protocol::{ClientMessage, MintUnitAdvertisement, ServerMessage};
+
+        fn status(linked_channel: Option<LinkedChannelStatus>) -> ServerMessage {
+            ServerMessage::SessionStatus {
+                receiver_pubkey: "receiver".into(),
+                advertisements: std::collections::BTreeMap::from([(
+                    "https://mint".into(),
+                    std::collections::BTreeMap::from([(
+                        "msat".into(),
+                        MintUnitAdvertisement {
+                            funding_keyset_recovery_window_secs: 86_400,
+                            minimum_channel_lifetime_secs: 3600,
+                        },
+                    )]),
+                )]),
+                linked_channel,
+                active_in_rate: 1,
+                active_out_rate: 1,
+                session_total_bytes_in: 0,
+                session_total_bytes_out: 0,
+                total_paid_millisats: 0,
+                remaining_milli_sats: 0,
+                paused: true,
+                open_connects: 0,
+                total_connects: 0,
+                failed_connects: 0,
+            }
+        }
+
+        let channel_id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let session_id = [1; 32];
+        let wallet = Arc::new(MockWallet::new());
+        wallet
+            .insert_channel(WalletChannel {
+                channel_id: channel_id.into(),
+                state: WalletChannelState::Open,
+                receiver_pubkey: "receiver".into(),
+                mint_url: "https://mint".into(),
+                unit: "msat".into(),
+                keyset_id: "0000000000000001".into(),
+                attached_session_id: None,
+                capacity_msats: 1_000,
+                current_signed_balance_msats: 0,
+                expiry_timestamp: u64::MAX,
+            })
+            .unwrap();
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (link_seen_tx, link_seen_rx) = oneshot::channel();
+        let (send_mismatch_tx, send_mismatch_rx) = oneshot::channel();
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let server_task = tokio::spawn(async move {
+            let mut h2 = h2::server::handshake(server).await.unwrap();
+            let (request, mut response) = h2.accept().await.unwrap().unwrap();
+            let mut recv = request.into_body();
+            let mut send = response
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let h2_driver = tokio::spawn(async move { while h2.accept().await.is_some() {} });
+            send_json_line(&mut send, &status(None)).await.unwrap();
+
+            let mut buf = Vec::new();
+            loop {
+                let data = recv.data().await.unwrap().unwrap();
+                recv.flow_control().release_capacity(data.len()).unwrap();
+                buf.extend_from_slice(&data);
+                if let Some(ClientMessage::ChannelLink {
+                    channel_id: linked_id,
+                    ..
+                }) = try_decode_json_line(&mut buf).unwrap()
+                {
+                    assert_eq!(linked_id, channel_id);
+                    break;
+                }
+            }
+            link_seen_tx.send(()).unwrap();
+            send_mismatch_rx.await.unwrap();
+            send_json_line(
+                &mut send,
+                &status(Some(LinkedChannelStatus {
+                    channel_id: channel_id.into(),
+                    balance_raw: 0,
+                    capacity_raw: 999,
+                    unit: "msat".into(),
+                })),
+            )
+            .await
+            .unwrap();
+            let _ = stop_rx.await;
+            h2_driver.abort();
+            let _ = h2_driver.await;
+        });
+
+        let (mut conn, h2_driver) =
+            monad_common::session::RelayConnection::from_transport_stream(client, session_id)
+                .await
+                .unwrap();
+        conn.set_cashu_spilman_keyset_versions(Some(std::collections::BTreeSet::from([
+            "v1".into()
+        ])))
+        .await;
+        conn.add_driver(h2_driver);
+        let (handle, ready, mut failed) = super::start_session_payment_driver(
+            &conn,
+            wallet.clone(),
+            "capacity mismatch test",
+            PaymentPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        link_seen_rx.await.unwrap();
+        assert_eq!(
+            wallet.get_channel(channel_id).unwrap().attached_session_id,
+            Some(session_id)
+        );
+        let published_before_mismatch = conn.session_spilman_info().await;
+        assert_eq!(
+            published_before_mismatch
+                .as_ref()
+                .map(|info| info.keyset_id.as_str()),
+            Some("0000000000000001")
+        );
+        send_mismatch_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), failed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*failed.borrow());
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ready.await.is_err());
+        assert_eq!(
+            conn.session_spilman_info()
+                .await
+                .as_ref()
+                .map(|info| info.keyset_id.as_str()),
+            Some("")
+        );
+        let channel = wallet.get_channel(channel_id).unwrap();
+        assert_eq!(
+            (
+                channel.attached_session_id,
+                channel.current_signed_balance_msats
+            ),
+            (None, 0)
+        );
+
+        let _ = stop_tx.send(());
+        server_task.await.unwrap();
+        conn.shutdown().await;
     }
 
     #[test]
@@ -348,7 +508,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "type":"SessionStatus", "receiver_pubkey":"receiver",
                 "advertisements":{"https://mint":{"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400}}},
-                "linked_channel":if linked { serde_json::json!({"channel_id":"channel","balance_raw":balance,"capacity_raw":1000,"unit":"msat"}) } else { serde_json::Value::Null },
+                "linked_channel":if linked { serde_json::json!({"channel_id":"c".repeat(64),"balance_raw":balance,"capacity_raw":1000,"unit":"msat"}) } else { serde_json::Value::Null },
                 "bytes_in_per_msat":1,"bytes_out_per_msat":1,"session_total_bytes_in":0,"session_total_bytes_out":0,
                 "total_paid_millisats":paid,"remaining_milli_sats":paid,"paused":paused,
                 "open_connects":0,"total_connects":0,"failed_connects":0
@@ -369,16 +529,31 @@ mod tests {
             .unwrap()
         }
         for shortchange in [true, false] {
+            let channel_id = "c".repeat(64);
             let wallet = Arc::new(MockWallet::new());
             wallet
                 .insert_channel(WalletChannel {
-                    channel_id: "channel".into(),
+                    channel_id: channel_id.clone(),
                     state: WalletChannelState::Open,
                     receiver_pubkey: "receiver".into(),
                     mint_url: "https://mint".into(),
                     unit: "msat".into(),
                     keyset_id: "0000000000000001".into(),
                     attached_session_id: None,
+                    capacity_msats: 1000,
+                    current_signed_balance_msats: 0,
+                    expiry_timestamp: u64::MAX,
+                })
+                .unwrap();
+            wallet
+                .insert_channel(WalletChannel {
+                    channel_id: "d".repeat(64),
+                    state: WalletChannelState::Open,
+                    receiver_pubkey: "receiver".into(),
+                    mint_url: "https://mint".into(),
+                    unit: "msat".into(),
+                    keyset_id: "0000000000000001".into(),
+                    attached_session_id: Some([2; 32]),
                     capacity_msats: 1000,
                     current_signed_balance_msats: 0,
                     expiry_timestamp: u64::MAX,
@@ -451,7 +626,15 @@ mod tests {
                 send_json_line(
                     &mut send,
                     &ServerMessage::ChannelReleaseRequested {
-                        channel_id: "other".into(),
+                        channel_id: "d".repeat(64),
+                    },
+                )
+                .await
+                .unwrap();
+                send_json_line(
+                    &mut send,
+                    &ServerMessage::ChannelReleaseRequested {
+                        channel_id: "c".repeat(64),
                     },
                 )
                 .await
@@ -463,6 +646,15 @@ mod tests {
                 .await
                 .unwrap();
                 if !shortchange {
+                    // The release arrived while payment was in flight. Its
+                    // acknowledgement is accepted before retirement and unlink.
+                    assert!(matches!(
+                        next(&mut recv, &mut buf).await,
+                        ClientMessage::ChannelUnlink { .. }
+                    ));
+                    send_json_line(&mut send, &status(10, false, 0, false))
+                        .await
+                        .unwrap();
                     // Neither empty-FIFO response may mutate state or terminate.
                     send_json_line(&mut send, &status(0, true, 0, true))
                         .await
@@ -476,21 +668,6 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                    send_json_line(
-                        &mut send,
-                        &ServerMessage::ChannelReleaseRequested {
-                            channel_id: "channel".into(),
-                        },
-                    )
-                    .await
-                    .unwrap();
-                    assert!(matches!(
-                        next(&mut recv, &mut buf).await,
-                        ClientMessage::ChannelUnlink { .. }
-                    ));
-                    send_json_line(&mut send, &status(10, false, 0, false))
-                        .await
-                        .unwrap();
                     send_json_line(
                         &mut send,
                         &ServerMessage::Error {
@@ -534,12 +711,18 @@ mod tests {
             assert_eq!(ready.await.is_err(), shortchange);
             assert_eq!(
                 wallet
-                    .get_channel("channel")
+                    .get_channel(&channel_id)
                     .unwrap()
                     .current_signed_balance_msats,
                 10
             );
-            assert_eq!(wallet.successful_payment_build_count("channel").unwrap(), 1);
+            assert_eq!(
+                wallet.successful_payment_build_count(&channel_id).unwrap(),
+                1
+            );
+            let sibling = wallet.get_channel(&"d".repeat(64)).unwrap();
+            assert_eq!(sibling.state, WalletChannelState::Open);
+            assert_eq!(sibling.attached_session_id, Some([2; 32]));
             let _ = stop.send(());
             server.await.unwrap();
             conn.shutdown().await;
@@ -643,11 +826,16 @@ mod tests {
         for code in [
             ServerErrorCode::LinkInvalidZeroBalanceSignature,
             ServerErrorCode::ChannelEvictedFromSession,
+        ] {
+            assert!(server_error_rejects_intended_channel(&code));
+            assert!(!server_error_invalidates_channel(&code));
+        }
+        for code in [
             ServerErrorCode::ChannelRetiredAtRelay,
             ServerErrorCode::LinkChannelRetired,
         ] {
             assert!(server_error_rejects_intended_channel(&code));
-            assert!(!server_error_invalidates_channel(&code));
+            assert!(server_error_invalidates_channel(&code));
         }
     }
 
@@ -699,7 +887,7 @@ mod tests {
                 mint_url: "https://mint".to_string(),
                 unit: "msat".to_string(),
                 keyset_id: "keyset-a".to_string(),
-                attached_session_id: None,
+                attached_session_id: Some([1; 32]),
                 capacity_msats: 100,
                 current_signed_balance_msats: 7,
                 expiry_timestamp: u64::MAX,
@@ -726,12 +914,73 @@ mod tests {
             ..DriverState::default()
         };
 
-        let mut state = state;
-        let err = validate_linked_channel_balance_against_wallet(&wallet, &mut state).unwrap_err();
+        let err = validate_linked_channel_against_wallet(
+            &wallet,
+            [1; 32],
+            state
+                .relay_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.linked_channel.as_ref()),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains(
             "relay reported linked balance_raw=8 above client local signed balance_raw=7"
         ));
+    }
+
+    #[test]
+    fn validate_linked_channel_rejects_unknown_or_inconsistent_metadata() {
+        let wallet = crate::wallet::MockWallet::new();
+        let channel_id = "a".repeat(64);
+        wallet
+            .insert_channel(crate::wallet::WalletChannel {
+                channel_id: channel_id.clone(),
+                state: crate::wallet::WalletChannelState::Open,
+                receiver_pubkey: "receiver".to_string(),
+                mint_url: "https://mint".to_string(),
+                unit: "msat".to_string(),
+                keyset_id: "keyset-a".to_string(),
+                attached_session_id: Some([1; 32]),
+                capacity_msats: 100,
+                current_signed_balance_msats: 10,
+                expiry_timestamp: u64::MAX,
+            })
+            .unwrap();
+
+        for linked in [
+            LinkedChannelStatus {
+                channel_id: "b".repeat(64),
+                balance_raw: 0,
+                capacity_raw: 100,
+                unit: "msat".to_string(),
+            },
+            LinkedChannelStatus {
+                channel_id: channel_id.clone(),
+                balance_raw: 0,
+                capacity_raw: 99,
+                unit: "msat".to_string(),
+            },
+            LinkedChannelStatus {
+                channel_id: channel_id.clone(),
+                balance_raw: 0,
+                capacity_raw: 100,
+                unit: "sat".to_string(),
+            },
+            LinkedChannelStatus {
+                channel_id: channel_id.clone(),
+                balance_raw: 101,
+                capacity_raw: 100,
+                unit: "msat".to_string(),
+            },
+        ] {
+            assert_eq!(
+                validate_linked_channel_against_wallet(&wallet, [1; 32], Some(&linked))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]
@@ -746,8 +995,11 @@ mod tests {
             ..DriverState::default()
         };
 
-        let err =
-            validate_session_status_baseline_against_local_counters(&state, &counters).unwrap_err();
+        let err = validate_session_status_baseline_against_local_counters(
+            state.relay_snapshot.as_ref().unwrap(),
+            &counters,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains(
             "relay reported session_total_bytes_out=5 above client local outbound total=4"
@@ -773,7 +1025,11 @@ mod tests {
                     ..snapshot(true)
                 },
             );
-            validate_session_status_baseline_against_local_counters(&state, &counters).unwrap();
+            validate_session_status_baseline_against_local_counters(
+                state.relay_snapshot.as_ref().unwrap(),
+                &counters,
+            )
+            .unwrap();
             assert_eq!(state.local_session_paid_msats, expected);
             assert_eq!(
                 super::payment::compute_estimated_remaining(&state, &counters).unwrap(),
@@ -1312,12 +1568,27 @@ mod tests {
     #[tokio::test]
     async fn rejection_never_rolls_back_locally_recorded_payment() {
         use super::state::{set_payment_in_flight, RelayConnectionHandles, SessionDriverConfig};
-        use crate::wallet::MockWallet;
+        use crate::wallet::{MockWallet, WalletChannel, WalletChannelState};
 
         let counters = CleartextByteCounters::default();
         counters.note_outbound(100);
+        let wallet = Arc::new(MockWallet::new());
+        wallet
+            .insert_channel(WalletChannel {
+                channel_id: "channel".into(),
+                state: WalletChannelState::Open,
+                receiver_pubkey: "receiver".into(),
+                mint_url: "https://mint".into(),
+                unit: "msat".into(),
+                keyset_id: "0000000000000001".into(),
+                attached_session_id: Some([0; 32]),
+                capacity_msats: 3000,
+                current_signed_balance_msats: 2000,
+                expiry_timestamp: u64::MAX,
+            })
+            .unwrap();
         let config = SessionDriverConfig {
-            wallet: Arc::new(MockWallet::new()),
+            wallet,
             conn: RelayConnectionHandles {
                 session_id: [0; 32],
                 pricing_handle: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1346,7 +1617,9 @@ mod tests {
                 ..Default::default()
             };
             set_payment_in_flight(&mut state, "channel".into(), 2000);
-            super::funding::apply_server_error(&config, &mut state, code).await;
+            super::funding::apply_server_error(&config, &mut state, code)
+                .await
+                .unwrap();
             assert_eq!(state.local_session_paid_msats, 2000, "{code:?}");
             assert_eq!(
                 super::payment::compute_estimated_remaining(&state, &counters).unwrap(),

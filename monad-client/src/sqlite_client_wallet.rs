@@ -13,7 +13,8 @@ use crate::proof_selection::{
     ProofCandidate, ProofSelection, ProofSelectionError, SmallestFirstProofCandidate,
 };
 use crate::wallet::{
-    msats_to_raw_units, raw_to_msats, MonadWallet, RelayPaymentOffer, WalletChannel,
+    link_request_from_spilman_payment, msats_to_raw_units, payment_request_from_spilman_payment,
+    raw_to_msats, MonadWallet, RelayPaymentOffer, WalletChannel, WalletChannelAccounting,
     WalletChannelState, WalletError,
 };
 use crate::wallet_lock::{ExclusiveWalletAccess, WalletLockIdentity};
@@ -3466,6 +3467,35 @@ impl MonadWallet for SqliteClientWallet {
         self.meta_to_wallet_channel(&conn, meta)
     }
 
+    fn get_channel_accounting(
+        &self,
+        channel_id: &str,
+    ) -> Result<WalletChannelAccounting, WalletError> {
+        let conn = self.conn()?;
+        let meta = conn
+            .query_row(
+                "SELECT channel_id, receiver_pubkey, mint_url, unit, keyset_id,
+                        capacity_msats, attached_session_id, state, expiry_timestamp
+                 FROM monad_client_channels
+                 WHERE channel_id = ?1",
+                params![channel_id],
+                row_to_channel_meta,
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => WalletError::NotFound,
+                _ => WalletError::Backend(format!("query channel: {error}")),
+            })?;
+        let channel = self.meta_to_wallet_channel(&conn, meta)?;
+        let upstream = checked_upstream_info(&conn, channel_id)?;
+        Ok(WalletChannelAccounting {
+            state: channel.state,
+            attached_session_id: channel.attached_session_id,
+            unit: channel.unit,
+            capacity_raw: upstream.capacity,
+            current_signed_balance_raw: upstream.current_balance,
+        })
+    }
+
     fn attach_channel_to_session(
         &self,
         channel_id: &str,
@@ -3640,7 +3670,7 @@ impl MonadWallet for SqliteClientWallet {
         &self,
         channel_id: &str,
         offer: &RelayPaymentOffer,
-    ) -> Result<String, WalletError> {
+    ) -> Result<monad_common::protocol::ChannelLinkRequest, WalletError> {
         let channel = self.get_channel(channel_id)?;
         ensure_channel_matches_offer(&channel, offer)?;
         if channel.state != WalletChannelState::Open {
@@ -3661,8 +3691,7 @@ impl MonadWallet for SqliteClientWallet {
                 .sign_channel_registration(channel_id)
                 .map_err(|e| map_create_payment_error(&channel, e, 0))?
         };
-        serde_json::to_string(&payment)
-            .map_err(|e| WalletError::Backend(format!("serialize link payment: {e}")))
+        link_request_from_spilman_payment(payment)
     }
 
     fn build_channel_payment(
@@ -3671,7 +3700,7 @@ impl MonadWallet for SqliteClientWallet {
         offer: &RelayPaymentOffer,
         latest_server_balance_raw: u64,
         next_balance_raw: u64,
-    ) -> Result<String, WalletError> {
+    ) -> Result<monad_common::protocol::ChannelPaymentRequest, WalletError> {
         let channel = self.get_channel(channel_id)?;
         ensure_channel_matches_offer(&channel, offer)?;
         if channel.state != WalletChannelState::Open {
@@ -3700,14 +3729,13 @@ impl MonadWallet for SqliteClientWallet {
             let payment = bridge
                 .sign_payment(channel_id, next_balance_raw)
                 .map_err(|e| map_create_payment_error(&channel, e, next_balance_raw))?;
-            let payment_json = serde_json::to_string(&payment)
-                .map_err(|e| WalletError::Backend(format!("serialize channel payment: {e}")))?;
-            // Serialize before recording so local state cannot advance for a
-            // payment JSON that was never returned to the session driver.
+            let request = payment_request_from_spilman_payment(payment.clone())?;
+            // Construct the complete outgoing request before recording so local
+            // state cannot advance for a payment that could not be submitted.
             bridge
                 .record_signed_payment(&payment)
                 .map_err(|e| WalletError::Backend(format!("record signed payment: {e}")))?;
-            Ok(payment_json)
+            Ok(request)
         };
         payment
     }
@@ -8118,21 +8146,23 @@ mod tests {
         wallet
             .attach_channel_to_session(&channel_id, session_id)
             .unwrap();
-        let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-        let link_payment: Payment = serde_json::from_str(&link_json).unwrap();
-        assert_eq!(link_payment.channel_id, channel_id);
-        assert_eq!(link_payment.balance, 0);
-        assert!(link_payment.params.is_some());
-        assert!(link_payment.funding_proofs.is_some());
+        let link_request = wallet.build_link_request(&channel_id, &offer).unwrap();
+        assert_eq!(link_request.channel_id, channel_id);
+        assert!(!link_request.params.is_empty());
+        assert!(link_request.funding_token.parse::<Token>().is_ok());
 
         // Use the actual upstream-reported capacity for payment planning, not the
         // original funding-token target.
         let capacity_raw = msats_to_raw_units(&channel.unit, channel.capacity_msats).unwrap();
         let next_balance_raw = capacity_raw / 2;
-        let payment_json = wallet
+        let payment_request = wallet
             .build_channel_payment(&channel_id, &offer, 0, next_balance_raw)
             .unwrap();
-        let payment: Payment = serde_json::from_str(&payment_json).unwrap();
+        let payment = Payment::new(
+            payment_request.channel_id,
+            payment_request.balance_raw,
+            payment_request.signature,
+        );
         assert_eq!(payment.channel_id, channel_id);
         assert_eq!(payment.balance, next_balance_raw);
         assert!(payment.params.is_none());
@@ -8150,10 +8180,14 @@ mod tests {
             .get_channel_info(&channel_id)
             .unwrap();
         assert_eq!(info.current_balance, next_balance_raw);
-        let replay_json = wallet
+        let replay_request = wallet
             .build_channel_payment(&channel_id, &offer, 0, next_balance_raw)
             .unwrap();
-        let replay: Payment = serde_json::from_str(&replay_json).unwrap();
+        let replay = Payment::new(
+            replay_request.channel_id,
+            replay_request.balance_raw,
+            replay_request.signature,
+        );
         assert_eq!(replay.balance, next_balance_raw);
         assert!(wallet
             .build_channel_payment(&channel_id, &offer, next_balance_raw + 1, next_balance_raw)
@@ -8238,11 +8272,10 @@ mod tests {
         wallet
             .attach_channel_to_session(&channel_id, [9u8; 32])
             .unwrap();
-        let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-        let link_payment: Payment = serde_json::from_str(&link_json).unwrap();
-        assert_eq!(link_payment.channel_id, channel_id);
-        assert!(link_payment.params.is_some());
-        assert!(link_payment.funding_proofs.is_some());
+        let link_request = wallet.build_link_request(&channel_id, &offer).unwrap();
+        assert_eq!(link_request.channel_id, channel_id);
+        assert!(!link_request.params.is_empty());
+        assert!(link_request.funding_token.parse::<Token>().is_ok());
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();

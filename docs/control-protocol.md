@@ -163,15 +163,19 @@ unrestricted power-of-two denominations need few proofs, but a small
 amount. A Spilman construction can therefore be valid under its NUT yet too large
 for MONAD. Clients MUST account for the final encoded JSON line, including the
 base64url token, while constructing channels and SHOULD conservatively reject
-candidates that cannot fit before requesting funding. Encoded size, not a
-separate proof-count limit, is authoritative.
+candidates that cannot fit before requesting funding. MONAD additionally limits
+a funding token to 992 proofs and 768 KiB of decoded CBOR. Its exact typed nested
+maps and bounded arrays are decoded without first materializing an unrestricted
+generic CBOR tree, so compact hostile encodings cannot amplify bounded control
+input into unbounded parser work.
 
 Reject duplicate keys, unknown top-level types, wrong-direction core messages,
 missing required fields, unexpected top-level fields, and invalid outer field
 types or ranges. Forbidden fields are forbidden even as `null`. Senders MUST
 encode public parameters and proofs under their referenced NUT schemas. The relay
-MUST validate those nested schemas on first registration but MAY rely on its
-stored immutable record without parsing them for a known relink under §5.1.
+MUST validate their bounded wire structure on every link and the complete nested
+semantics on first registration; it may rely on its stored immutable funding for
+a known relink under §5.1.
 Extension payloads follow §3.5. Unknown extension names inside a valid envelope
 are not unknown top-level types.
 
@@ -191,12 +195,15 @@ are target rules, not current decoder behavior.
 | `u64` | JSON integer 0 through 18,446,744,073,709,551,615 |
 | `u32` | JSON integer 0 through 4,294,967,295 |
 | `i64` | JSON integer -9,223,372,036,854,775,808 through 9,223,372,036,854,775,807 |
-| `channel_id` | Spilman channel identifier; 32 bytes as 64 lowercase hex characters |
+| `channel_id` | Nonempty opaque string; representation is defined by the negotiated Spilman version |
 | `signature` | Spilman BIP-340 commitment signature; 64 bytes as 128 lowercase hex characters |
 | `unit` | Cashu unit string; exactly `sat` or `msat` |
 
 Integer tokens use decimal integer notation, not fractional values. Channel
-balances and capacities use the channel's raw unit; session credit uses
+identifiers are not length- or hex-validated by the MONAD wire decoder. The
+current Spilman `2026-09-14` library generates 32-byte SHA-256 identifiers as
+64 lowercase hexadecimal characters and validates their derivation on first link.
+Channel balances and capacities use the channel's raw unit; session credit uses
 millisatoshis. All supported values, comparisons, conversions, and intermediate
 arithmetic MUST be exact. There is no unit inference from magnitude, silent
 rounding, truncation, saturation, clamping, or counter wrap.
@@ -258,6 +265,12 @@ the channel's unit; zero is implicit and `balance_raw` is forbidden. A payment's
 `balance_raw` maps directly to the Spilman commitment. Funding fields are
 forbidden on payments, even as null. Unlink has no final balance and signs
 nothing.
+
+For protocol `2026-09-14`, `params` contains exactly `mint`, `unit`, `capacity`,
+`funding_token_amount`, `keyset_id`, `input_fee_ppk`,
+`maximum_amount_for_one_output`, `setup_timestamp`, `sender_pubkey`,
+`receiver_pubkey`, and `expiry_timestamp`. Legacy aliases and additional fields
+are forbidden.
 
 `funding_token` is a standard `cashuB` Cashu V4 token containing exactly the
 channel's funding proofs. Its mint, unit, keyset ID, amounts, proof order, and
@@ -359,8 +372,9 @@ client uses only a unit it also supports.
 
 `linked_channel.balance_raw` is the relay's accepted cumulative channel balance,
 not the client's highest signed balance or total session credit. Clients validate
-its ID, unit, capacity, and balance against local records. No accepting/draining
-funding-state field exists; §5.5 uses an ordered request error.
+its ID, open state, attachment to this session, unit, capacity, and balance
+against durable local records before applying or publishing the status. No
+accepting/draining funding-state field exists; §5.5 uses an ordered request error.
 
 ### 3.4 Ordered requests and correlated liveness
 
@@ -420,16 +434,21 @@ or provide zero-latency preemption. Normal bounded control-stream buffering and
 backpressure apply.
 
 Status, notifications, ordinary traffic, and a Pong with a different nonce do
-not answer a Ping, update request state, or cancel recovery already selected
-after a timeout. Paused and unlinked sessions permit Ping; termination may
-prevent Pong delivery.
+not answer a Ping, extend its deadline, update request state, or cancel recovery
+already selected after a timeout. Paused and unlinked sessions permit Ping;
+termination may prevent Pong delivery.
 
 Recommended policy is Ping after 5 seconds without valid relay control activity
-and a 15-second matching-Pong deadline. Ordinary valid traffic may defer creating
-a probe but does not answer a Ping already sent. Rebuild logic may demand fresh
-evidence. Client-local stalls must not be blamed on the peer. Pong proves only
-control-path responsiveness, not destination reachability or nonreceipt of an
-outstanding payment. No mandatory periodic Ping or QUIC keep-alive is imposed.
+and a 15-second matching-Pong deadline. Any protocol-accepted relay control
+message, including an extension or advisory, may defer an as-yet-unsent probe.
+A prohibited unsolicited response discarded under §3.6 is not activity for this
+purpose. The response deadline starts only after successful Ping submission. Once
+the Ping is outstanding, only its matching Pong received strictly before that
+deadline clears it; a matching Pong at or after the deadline is too late, and no
+other message extends the deadline. Rebuild logic may demand fresh evidence.
+Client-local stalls must not be blamed on the peer. Pong proves only control-path
+responsiveness, not destination reachability or nonreceipt of an outstanding
+payment. No mandatory periodic Ping or QUIC keep-alive is imposed.
 
 ### 3.5 Advisories and extensions
 
@@ -617,10 +636,11 @@ after all validation succeeds.
 
 For a known channel, the relay's stored, previously validated immutable funding
 is authoritative. The client MUST still send the channel's original complete
-`params` and `funding_token` to keep one `ChannelLink` shape, but the relay MAY
-skip parsing, comparing, or cryptographically revalidating them and SHOULD
-normally reuse its stored record without mint I/O. Supplied relink data MUST NOT
-overwrite stored funding or accepted balance.
+`params` and `funding_token` to keep one `ChannelLink` shape. The relay MUST
+validate the exact parameter types and bounded Cashu V4 structure, but MAY skip
+semantic comparison and cryptographic revalidation and SHOULD normally reuse its
+stored record without mint I/O. Supplied relink data MUST NOT overwrite stored
+funding or accepted balance.
 
 Every relink still validates channel state and policy, bootstrap-negotiated
 keyset-version eligibility, both admission deadlines (§4.1), exact numeric
@@ -903,11 +923,14 @@ If the relay had accepted 100 previously, relink reports `balance_raw=100` but
   or per-offer prices; map-order independence; trusted offers present with empty
   metadata caches and unchanged by keyset rotation or negotiated versions.
 - §3.4: opaque string nonces, paused and concurrent Pings, same-nonce Pong
-  responses, in-order and independent relay handling, local stalls, timeout
-  races, and no claim of destination reachability.
+  responses, in-order and independent relay handling, accepted
+  extension/advisory deferral before submission, no discarded-unsolicited
+  deferral, submission-based strict deadlines unaffected by other traffic, local
+  stalls, timeout races, and no claim of destination reachability.
 - §3.5: ignored bidirectional extensions with one nonempty name, absent `data`,
-  arbitrary additional members, no response/FIFO/accounting/liveness effect, and
-  malformed names or envelopes remaining fatal.
+  arbitrary additional members, no response/FIFO/accounting effect, only the
+  §3.4 pre-probe liveness deferral, and malformed names or envelopes remaining
+  fatal.
 - §4: exact one-round billing; partial forwarding; configured chunk/in-flight
   overshoot exposure; counter exhaustion; fixed rates; TCP/QUIC accounting
   excluding pooled connections; one current receiver; known-channel lookup before receiver checks;

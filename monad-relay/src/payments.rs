@@ -2,15 +2,18 @@ use crate::channel_store::ChannelStore;
 use crate::listener::{
     shared_spilman_mint_cache, SharedSpilmanMintCache, SpilmanMintCache, TrustedMintUnits,
 };
-use cashu::nuts::{CurrencyUnit, Id, PublicKey, SecretKey};
+use cashu::nut02::ShortKeysetId;
+use cashu::nuts::{CurrencyUnit, Id, Proof, PublicKey, SecretKey, TokenV4};
 use cdk_spilman::{
     compute_channel_secret_from_hex, configurable_host::ClosedDataView, sign_with_tweaked_key_util,
     BridgeError, ChannelFunding, ChannelPolicy, ChannelState, CloseError, CloseSuccess,
-    ClosingData, Payment, PaymentProof, PreparedClose, SelectedOutputKeyset,
-    SpilmanAsyncKeysetRefresher, SpilmanBridge, SpilmanHost,
+    ClosingData, PaymentProof, PreparedClose, SelectedOutputKeyset, SpilmanAsyncKeysetRefresher,
+    SpilmanBridge, SpilmanHost,
 };
 use monad_common::config::RelayChannelPolicyConfig;
-use monad_common::protocol::{LinkedChannelStatus, ServerErrorCode};
+use monad_common::protocol::{
+    ChannelLinkRequest, ChannelPaymentRequest, LinkedChannelStatus, ServerErrorCode,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -67,28 +70,23 @@ pub trait RelayPayments: Send + Sync + 'static {
         &self,
         negotiated_versions: &BTreeSet<String>,
         session_id: [u8; 32],
-        payment_json: &str,
+        request: &ChannelLinkRequest,
     ) -> Result<LinkOutcome, LinkError>;
 
     fn apply_channel_payment(
         &self,
         session_id: [u8; 32],
         expected_channel_id: &str,
-        payment_json: &str,
+        request: &ChannelPaymentRequest,
     ) -> Result<PaymentOutcome, ChannelPaymentError> {
-        self.apply_channel_payment_with_limit(
-            session_id,
-            expected_channel_id,
-            payment_json,
-            u64::MAX,
-        )
+        self.apply_channel_payment_with_limit(session_id, expected_channel_id, request, u64::MAX)
     }
 
     fn apply_channel_payment_with_limit(
         &self,
         session_id: [u8; 32],
         expected_channel_id: &str,
-        payment_json: &str,
+        request: &ChannelPaymentRequest,
         max_delta_millisats: u64,
     ) -> Result<PaymentOutcome, ChannelPaymentError>;
 
@@ -407,7 +405,8 @@ impl SpilmanRelayPayments {
 
     fn prevalidate_unknown_keyset_link(
         &self,
-        payment: &Payment,
+        channel_id: &str,
+        proofs: &[Proof],
         params: &serde_json::Value,
         keyset_id: &Id,
     ) -> Result<(), LinkError> {
@@ -439,7 +438,7 @@ impl SpilmanRelayPayments {
         if input_fee_ppk > 999 {
             return Err(invalid("input_fee_ppk exceeds 999"));
         }
-        let maximum_amount = required_u64("maximum_amount")?;
+        let maximum_amount = required_u64("maximum_amount_for_one_output")?;
         let setup_timestamp = required_u64("setup_timestamp")?;
         let expiry_timestamp = required_u64("expiry_timestamp")?;
         let sender_pubkey: PublicKey = params["sender_pubkey"]
@@ -469,16 +468,12 @@ impl SpilmanRelayPayments {
             receiver_pubkey.to_hex(),
         );
         let expected_channel_id = hex::encode(Sha256::digest(channel_id_input.as_bytes()));
-        if payment.channel_id != expected_channel_id {
+        if channel_id != expected_channel_id {
             return Err(LinkError::InvalidChannel(
                 "channel ID does not match funding parameters".to_string(),
             ));
         }
 
-        let proofs = payment
-            .funding_proofs
-            .as_deref()
-            .ok_or_else(|| LinkError::InvalidPayment("missing funding_proofs".to_string()))?;
         if proofs.is_empty() {
             return Err(LinkError::InvalidPayment(
                 "funding_proofs is empty".to_string(),
@@ -657,30 +652,22 @@ impl RelayPayments for SpilmanRelayPayments {
         &self,
         negotiated_versions: &BTreeSet<String>,
         session_id: [u8; 32],
-        payment_json: &str,
+        request: &ChannelLinkRequest,
     ) -> Result<LinkOutcome, LinkError> {
-        let payment: Payment = serde_json::from_str(payment_json)
-            .map_err(|e| LinkError::InvalidPayment(e.to_string()))?;
-        if payment.balance != 0 {
-            return Err(LinkError::NonZeroLinkBalance);
-        }
-
+        validate_link_params_shape(&request.params)?;
+        monad_common::cashu_v4::validate_channel_funding_token_structure(&request.funding_token)
+            .map_err(LinkError::InvalidPayment)?;
         let stored = self
             .store
-            .get_channel(&payment.channel_id)
+            .get_channel(&request.channel_id)
             .map_err(LinkError::Internal)?;
-        // Stored funding is authoritative on relink, even if the caller omits or spoofs params.
+        // Stored funding is authoritative on relink after the caller supplies a
+        // structurally valid request.
         let params = if let Some(channel) = &stored {
             serde_json::from_str::<serde_json::Value>(&channel.funding.params_json)
                 .map_err(|e| LinkError::Internal(e.to_string()))?
         } else {
-            serde_json::to_value(
-                payment
-                    .params
-                    .as_ref()
-                    .ok_or_else(|| LinkError::InvalidPayment("missing params".to_string()))?,
-            )
-            .map_err(|e| LinkError::InvalidPayment(e.to_string()))?
+            serde_json::Value::Object(request.params.clone())
         };
         let id: Id = params["keyset_id"]
             .as_str()
@@ -692,6 +679,12 @@ impl RelayPayments for SpilmanRelayPayments {
                 .as_str()
                 .ok_or_else(|| LinkError::InvalidChannel("missing unit".to_string()))?,
         )?;
+        let claimed_capacity = params["capacity"]
+            .as_u64()
+            .ok_or_else(|| LinkError::InvalidChannel("missing capacity".to_string()))?;
+        if claimed_capacity > unit.max_balance_raw() {
+            return Err(LinkError::NumericLimitExceeded);
+        }
         if !keyset_version_is_negotiated(&id, negotiated_versions) {
             return Err(LinkError::KeysetVersionNotNegotiated);
         }
@@ -739,9 +732,9 @@ impl RelayPayments for SpilmanRelayPayments {
             let capacity = self
                 .bridge
                 .validate_existing_channel_funding(
-                    &payment.channel_id,
-                    payment.balance,
-                    &payment.signature,
+                    &request.channel_id,
+                    0,
+                    &request.zero_balance_signature,
                 )
                 .map_err(map_link_bridge_error)?
                 .capacity;
@@ -750,36 +743,38 @@ impl RelayPayments for SpilmanRelayPayments {
             }
             capacity
         } else {
+            let funding_proofs = decode_channel_funding_token(request, &id)?;
             if self.known_keyset_unit_mismatch(&params, &id) {
                 return Err(LinkError::MintOrKeysetNotAcceptable);
             }
             let refresh_target = self.unknown_trusted_keyset_target(&params, &id);
             if refresh_target.is_some() {
-                self.prevalidate_unknown_keyset_link(&payment, &params, &id)?;
+                self.prevalidate_unknown_keyset_link(
+                    &request.channel_id,
+                    &funding_proofs,
+                    &params,
+                    &id,
+                )?;
             }
             // First link validates funding, then explicitly records it so MONAD
             // controls the persistence boundary around session ownership.
-            let validated =
-                self.bridge
-                    .validate_new_channel_funding(
-                        &payment.channel_id,
-                        payment.params.as_ref().ok_or_else(|| {
-                            LinkError::InvalidPayment("missing params".to_string())
-                        })?,
-                        payment.funding_proofs.as_deref().ok_or_else(|| {
-                            LinkError::InvalidPayment("missing funding_proofs".to_string())
-                        })?,
-                        payment.balance,
-                        &payment.signature,
-                    )
-                    .map_err(|error| {
-                        if matches!(error, BridgeError::MintOrKeysetNotAcceptable) {
-                            if let Some((mint_url, unit)) = refresh_target.clone() {
-                                return LinkError::UnknownTrustedKeyset { mint_url, unit };
-                            }
+            let validated = self
+                .bridge
+                .validate_new_channel_funding(
+                    &request.channel_id,
+                    &params,
+                    &funding_proofs,
+                    0,
+                    &request.zero_balance_signature,
+                )
+                .map_err(|error| {
+                    if matches!(error, BridgeError::MintOrKeysetNotAcceptable) {
+                        if let Some((mint_url, unit)) = refresh_target.clone() {
+                            return LinkError::UnknownTrustedKeyset { mint_url, unit };
                         }
-                        map_link_bridge_error(error)
-                    })?;
+                    }
+                    map_link_bridge_error(error)
+                })?;
             let capacity = validated.capacity;
             if capacity > unit.max_balance_raw() {
                 return Err(LinkError::NumericLimitExceeded);
@@ -794,7 +789,7 @@ impl RelayPayments for SpilmanRelayPayments {
 
         let channel = self
             .store
-            .get_channel(&payment.channel_id)
+            .get_channel(&request.channel_id)
             .map_err(LinkError::Internal)?
             .ok_or_else(|| {
                 LinkError::Internal("linked channel missing after validation".to_string())
@@ -802,7 +797,7 @@ impl RelayPayments for SpilmanRelayPayments {
         let capacity_millisats = channel.unit.capacity_millisats(capacity_raw)?;
 
         let evicted_session = self.store.set_channel_owner_checked(
-            &payment.channel_id,
+            &request.channel_id,
             session_id,
             check_lifetime,
             |error| {
@@ -815,7 +810,7 @@ impl RelayPayments for SpilmanRelayPayments {
         )?;
 
         Ok(LinkOutcome {
-            channel_id: payment.channel_id,
+            channel_id: request.channel_id.clone(),
             capacity_millisats,
             evicted_session,
         })
@@ -825,18 +820,11 @@ impl RelayPayments for SpilmanRelayPayments {
         &self,
         session_id: [u8; 32],
         expected_channel_id: &str,
-        payment_json: &str,
+        request: &ChannelPaymentRequest,
         max_delta_millisats: u64,
     ) -> Result<PaymentOutcome, ChannelPaymentError> {
-        let payment: Payment = serde_json::from_str(payment_json)
-            .map_err(|e| ChannelPaymentError::InvalidPayment(e.to_string()))?;
-        if payment.channel_id != expected_channel_id {
+        if request.channel_id != expected_channel_id {
             return Err(ChannelPaymentError::WrongChannel);
-        }
-        if payment.params.is_some() || payment.funding_proofs.is_some() {
-            return Err(ChannelPaymentError::InvalidPayment(
-                "channel payment must not include funding".to_string(),
-            ));
         }
 
         let (previous_payment, unit, state_kind) = {
@@ -852,16 +840,16 @@ impl RelayPayments for SpilmanRelayPayments {
         if state_kind != ChannelState::Open {
             return Err(ChannelPaymentError::ChannelClosed);
         }
-        if payment.balance > unit.max_balance_raw() {
+        if request.balance_raw > unit.max_balance_raw() {
             return Err(ChannelPaymentError::NumericLimitExceeded);
         }
 
         let validation = self
             .bridge
             .validate_payment(
-                &payment.channel_id,
-                payment.balance,
-                &payment.signature,
+                &request.channel_id,
+                request.balance_raw,
+                &request.signature,
                 &PaymentContext::Payment,
             )
             .map_err(map_payment_bridge_error)?;
@@ -880,7 +868,7 @@ impl RelayPayments for SpilmanRelayPayments {
         // relay-authoritative baseline for future payments.
         self.store
             .compare_owned_payment(
-                &payment.channel_id,
+                &request.channel_id,
                 session_id,
                 &previous_payment,
                 PaymentProof {
@@ -896,7 +884,7 @@ impl RelayPayments for SpilmanRelayPayments {
             })?;
 
         Ok(PaymentOutcome {
-            channel_id: payment.channel_id,
+            channel_id: request.channel_id.clone(),
             delta_millisats,
         })
     }
@@ -1291,13 +1279,95 @@ mod channel_policy_tests {
     }
 }
 
+fn validate_link_params_shape(
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), LinkError> {
+    const REQUIRED: [&str; 11] = [
+        "capacity",
+        "expiry_timestamp",
+        "funding_token_amount",
+        "input_fee_ppk",
+        "keyset_id",
+        "maximum_amount_for_one_output",
+        "mint",
+        "receiver_pubkey",
+        "sender_pubkey",
+        "setup_timestamp",
+        "unit",
+    ];
+    if params.len() != REQUIRED.len() {
+        return Err(LinkError::InvalidPayment(
+            "channel params must contain exactly the documented public fields".to_string(),
+        ));
+    }
+    for field in REQUIRED {
+        if !params.contains_key(field) {
+            return Err(LinkError::InvalidPayment(format!(
+                "channel params missing {field}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn decode_channel_funding_token(
+    request: &ChannelLinkRequest,
+    keyset_id: &Id,
+) -> Result<Vec<Proof>, LinkError> {
+    let invalid = |message: &str| LinkError::InvalidPayment(message.to_string());
+    let token: TokenV4 = request
+        .funding_token
+        .parse()
+        .map_err(|_| invalid("invalid Cashu V4 funding_token"))?;
+    if token.memo.is_some() || token.token.len() != 1 {
+        return Err(invalid(
+            "funding_token must have one keyset group and no memo",
+        ));
+    }
+    let mint = request.params["mint"]
+        .as_str()
+        .ok_or_else(|| invalid("channel params mint must be a string"))?;
+    let unit = request.params["unit"]
+        .as_str()
+        .ok_or_else(|| invalid("channel params unit must be a string"))?;
+    if token.mint_url.to_string() != mint || token.unit.to_string() != unit {
+        return Err(invalid(
+            "funding_token mint or unit does not match channel params",
+        ));
+    }
+    let group = &token.token[0];
+    if group.keyset_id != ShortKeysetId::from(*keyset_id) {
+        return Err(invalid(
+            "funding_token keyset does not match channel params",
+        ));
+    }
+    let proofs = group
+        .proofs
+        .iter()
+        .map(|proof| proof.into_proof(keyset_id))
+        .collect::<Vec<_>>();
+    let expected_total = request.params["funding_token_amount"]
+        .as_u64()
+        .ok_or_else(|| invalid("channel params funding_token_amount must be u64"))?;
+    let total = proofs.iter().try_fold(0u64, |total, proof| {
+        total
+            .checked_add(u64::from(proof.amount))
+            .ok_or_else(|| invalid("funding_token amount overflow"))
+    })?;
+    if total != expected_total {
+        return Err(invalid(
+            "funding_token amount does not match channel params",
+        ));
+    }
+    Ok(proofs)
+}
+
 pub mod testing {
     use super::{
         ChannelPaymentError, ChannelUnit, LinkError, LinkOutcome, PaymentOutcome, RelayPayments,
     };
     use cdk_spilman::{ChannelState, CloseError, CloseSuccess};
-    use monad_common::protocol::LinkedChannelStatus;
-    use serde_json::Value;
+    use monad_common::protocol::{ChannelLinkRequest, ChannelPaymentRequest, LinkedChannelStatus};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1384,79 +1454,20 @@ pub mod testing {
         }
     }
 
-    #[derive(Debug)]
-    struct ParsedPayment {
-        channel_id: String,
-        balance: u64,
-        capacity: Option<u64>,
-        unit: Option<String>,
-        has_funding: bool,
-        closed: bool,
-        invalid: bool,
-        wrong_receiver: bool,
-    }
-
-    impl ParsedPayment {
-        fn parse(payment_json: &str) -> Result<Self, String> {
-            let value: Value =
-                serde_json::from_str(payment_json).map_err(|e| format!("invalid json: {e}"))?;
-            let obj = value
-                .as_object()
-                .ok_or_else(|| "payment must be a JSON object".to_string())?;
-
-            let channel_id = obj
-                .get("channel_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing channel_id".to_string())?
-                .to_string();
-            let balance = obj
-                .get("balance")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| "missing balance".to_string())?;
-            let capacity = obj.get("capacity").and_then(Value::as_u64);
-            let unit = obj
-                .get("unit")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            let has_funding = obj.contains_key("params") || obj.contains_key("funding_proofs");
-            let closed = obj.get("closed").and_then(Value::as_bool).unwrap_or(false);
-            let invalid = obj.get("invalid").and_then(Value::as_bool).unwrap_or(false);
-            let wrong_receiver = obj
-                .get("wrong_receiver")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-
-            Ok(Self {
-                channel_id,
-                balance,
-                capacity,
-                unit,
-                has_funding,
-                closed,
-                invalid,
-                wrong_receiver,
-            })
-        }
-    }
-
     impl RelayPayments for InMemoryRelayPayments {
         fn link_channel(
             &self,
             _negotiated_versions: &std::collections::BTreeSet<String>,
             session_id: [u8; 32],
-            payment_json: &str,
+            request: &ChannelLinkRequest,
         ) -> Result<LinkOutcome, LinkError> {
-            let parsed = ParsedPayment::parse(payment_json).map_err(LinkError::InvalidPayment)?;
-            if parsed.invalid {
-                return Err(LinkError::InvalidPayment(
-                    "forced invalid payment".to_string(),
+            if request.zero_balance_signature == "1".repeat(128) {
+                return Err(LinkError::InvalidZeroBalanceSignature(
+                    "forced invalid signature".to_string(),
                 ));
             }
-            if parsed.wrong_receiver {
+            if request.zero_balance_signature == "2".repeat(128) {
                 return Err(LinkError::ReceiverKeyMismatch);
-            }
-            if parsed.balance != 0 {
-                return Err(LinkError::NonZeroLinkBalance);
             }
 
             let mut inner = self
@@ -1464,8 +1475,8 @@ pub mod testing {
                 .lock()
                 .map_err(|_| LinkError::Internal("mutex poisoned".to_string()))?;
 
-            if let Some(record) = inner.channels.get_mut(&parsed.channel_id) {
-                if parsed.closed || record.closed {
+            if let Some(record) = inner.channels.get_mut(&request.channel_id) {
+                if record.closed {
                     return Err(LinkError::ChannelClosed);
                 }
 
@@ -1477,28 +1488,23 @@ pub mod testing {
                 record.owner = Some(session_id);
 
                 return Ok(LinkOutcome {
-                    channel_id: parsed.channel_id,
+                    channel_id: request.channel_id.clone(),
                     capacity_millisats,
                     evicted_session,
                 });
             }
 
-            if parsed.closed {
-                return Err(LinkError::ChannelClosed);
-            }
-
-            let capacity_raw = parsed
-                .capacity
+            let capacity_raw = request.params["capacity"]
+                .as_u64()
                 .ok_or_else(|| LinkError::InvalidPayment("missing capacity".to_string()))?;
-            let unit_str = parsed
-                .unit
-                .as_deref()
+            let unit_str = request.params["unit"]
+                .as_str()
                 .ok_or_else(|| LinkError::InvalidPayment("missing unit".to_string()))?;
             let unit = ChannelUnit::from_str(unit_str)?;
             let capacity_millisats = unit.capacity_millisats(capacity_raw)?;
 
             inner.channels.insert(
-                parsed.channel_id.clone(),
+                request.channel_id.clone(),
                 ChannelRecord {
                     capacity_raw,
                     unit,
@@ -1509,7 +1515,7 @@ pub mod testing {
             );
 
             Ok(LinkOutcome {
-                channel_id: parsed.channel_id,
+                channel_id: request.channel_id.clone(),
                 capacity_millisats,
                 evicted_session: None,
             })
@@ -1519,23 +1525,16 @@ pub mod testing {
             &self,
             session_id: [u8; 32],
             expected_channel_id: &str,
-            payment_json: &str,
+            request: &ChannelPaymentRequest,
             max_delta_millisats: u64,
         ) -> Result<PaymentOutcome, ChannelPaymentError> {
-            let parsed =
-                ParsedPayment::parse(payment_json).map_err(ChannelPaymentError::InvalidPayment)?;
-            if parsed.invalid {
+            if request.signature == "1".repeat(128) {
                 return Err(ChannelPaymentError::InvalidPayment(
                     "forced invalid payment".to_string(),
                 ));
             }
-            if parsed.channel_id != expected_channel_id {
+            if request.channel_id != expected_channel_id {
                 return Err(ChannelPaymentError::WrongChannel);
-            }
-            if parsed.has_funding {
-                return Err(ChannelPaymentError::InvalidPayment(
-                    "channel payment must not include funding".to_string(),
-                ));
             }
 
             let mut inner = self
@@ -1551,30 +1550,30 @@ pub mod testing {
                 return Err(ChannelPaymentError::Conflict);
             }
 
-            if parsed.closed || record.closed {
+            if record.closed {
                 return Err(ChannelPaymentError::ChannelClosed);
             }
-            if parsed.wrong_receiver {
+            if request.signature == "2".repeat(128) {
                 return Err(ChannelPaymentError::InvalidPayment(
                     "wrong receiver".to_string(),
                 ));
             }
-            if parsed.balance > record.unit.max_balance_raw() {
+            if request.balance_raw > record.unit.max_balance_raw() {
                 return Err(ChannelPaymentError::NumericLimitExceeded);
             }
-            if parsed.balance <= record.latest_balance {
+            if request.balance_raw <= record.latest_balance {
                 return Err(ChannelPaymentError::NoNewFunds);
             }
 
-            let delta_raw = parsed.balance - record.latest_balance;
+            let delta_raw = request.balance_raw - record.latest_balance;
             let delta_millisats = record.unit.delta_millisats(delta_raw)?;
             if delta_millisats > max_delta_millisats {
                 return Err(ChannelPaymentError::NumericLimitExceeded);
             }
-            record.latest_balance = parsed.balance;
+            record.latest_balance = request.balance_raw;
 
             Ok(PaymentOutcome {
-                channel_id: parsed.channel_id,
+                channel_id: request.channel_id.clone(),
                 delta_millisats,
             })
         }
@@ -1635,47 +1634,26 @@ pub mod testing {
     mod tests {
         use super::{ChannelRecord, InMemoryRelayPayments};
         use crate::payments::{ChannelPaymentError, ChannelUnit, LinkError, RelayPayments};
+        use monad_common::protocol::{ChannelLinkRequest, ChannelPaymentRequest};
 
-        fn payment_json(
-            channel_id: &str,
-            balance: u64,
-            capacity: Option<u64>,
-            unit: Option<&str>,
-        ) -> String {
-            let mut json = serde_json::json!({
-                "channel_id": channel_id,
-                "balance": balance,
-            });
-            if let Some(capacity) = capacity {
-                json["capacity"] = serde_json::json!(capacity);
+        fn link_request(channel_id: &str, capacity: u64, unit: &str) -> ChannelLinkRequest {
+            ChannelLinkRequest {
+                channel_id: channel_id.to_string(),
+                zero_balance_signature: "0".repeat(128),
+                params: serde_json::Map::from_iter([
+                    ("capacity".to_string(), serde_json::json!(capacity)),
+                    ("unit".to_string(), serde_json::json!(unit)),
+                ]),
+                funding_token: "mock-cashuB-valid-looking-token".to_string(),
             }
-            if let Some(unit) = unit {
-                json["unit"] = serde_json::json!(unit);
-            }
-            serde_json::to_string(&json).unwrap()
         }
 
-        fn payment_json_with_flag(
-            channel_id: &str,
-            balance: u64,
-            capacity: Option<u64>,
-            unit: Option<&str>,
-            flag: &str,
-            value: bool,
-        ) -> String {
-            let mut value_json: serde_json::Value =
-                serde_json::from_str(&payment_json(channel_id, balance, capacity, unit)).unwrap();
-            value_json[flag] = serde_json::json!(value);
-            serde_json::to_string(&value_json).unwrap()
-        }
-
-        fn payment_json_with_params(channel_id: &str, balance: u64) -> String {
-            serde_json::json!({
-                "channel_id": channel_id,
-                "balance": balance,
-                "params": { "fake": true },
-            })
-            .to_string()
+        fn payment_request(channel_id: &str, balance_raw: u64) -> ChannelPaymentRequest {
+            ChannelPaymentRequest {
+                channel_id: channel_id.to_string(),
+                balance_raw,
+                signature: "0".repeat(128),
+            }
         }
 
         fn session(byte: u8) -> [u8; 32] {
@@ -1689,7 +1667,7 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(123), Some("msat")),
+                    &link_request("chan", 123, "msat"),
                 )
                 .unwrap();
 
@@ -1705,7 +1683,7 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(5), Some("sat")),
+                    &link_request("chan", 5, "sat"),
                 )
                 .unwrap();
 
@@ -1713,57 +1691,53 @@ pub mod testing {
         }
 
         #[test]
-        fn link_rejects_non_zero_balance_without_storing_channel() {
+        fn link_rejects_forced_invalid_signature_without_storing_channel() {
             let payments = InMemoryRelayPayments::new();
+            let mut request = link_request("chan", 5, "msat");
+            request.zero_balance_signature = "1".repeat(128);
             let err = payments
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 1, Some(5), Some("msat")),
+                    &request,
                 )
                 .unwrap_err();
-            assert_eq!(err, LinkError::NonZeroLinkBalance);
+            assert_eq!(
+                err,
+                LinkError::InvalidZeroBalanceSignature("forced invalid signature".to_string())
+            );
 
             let err = payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 2, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 2))
                 .unwrap_err();
             assert_eq!(err, ChannelPaymentError::UnknownChannel);
         }
 
         #[test]
-        fn relink_non_zero_balance_preserves_existing_latest_balance() {
+        fn relink_preserves_existing_latest_balance() {
             let payments = InMemoryRelayPayments::new();
             payments
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(10), Some("msat")),
+                    &link_request("chan", 10, "msat"),
                 )
                 .unwrap();
             payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 7, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 7))
                 .unwrap();
-
-            let err = payments
-                .link_channel(
-                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
-                    session(2),
-                    &payment_json("chan", 3, Some(999), Some("sat")),
-                )
-                .unwrap_err();
-            assert_eq!(err, LinkError::NonZeroLinkBalance);
 
             let outcome = payments
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(2),
-                    &payment_json("chan", 0, Some(999), Some("sat")),
+                    &link_request("chan", 999, "sat"),
                 )
                 .unwrap();
             assert_eq!(outcome.evicted_session, Some(session(1)));
 
             let err = payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 9, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 9))
                 .unwrap_err();
             assert_eq!(err, ChannelPaymentError::Conflict);
             assert_eq!(
@@ -1772,7 +1746,7 @@ pub mod testing {
             );
 
             let payment = payments
-                .apply_channel_payment(session(2), "chan", &payment_json("chan", 10, None, None))
+                .apply_channel_payment(session(2), "chan", &payment_request("chan", 10))
                 .unwrap();
             assert_eq!(payment.delta_millisats, 3);
         }
@@ -1784,7 +1758,7 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(10), Some("msat")),
+                    &link_request("chan", 10, "msat"),
                 )
                 .unwrap();
 
@@ -1792,7 +1766,7 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(99), Some("sat")),
+                    &link_request("chan", 99, "sat"),
                 )
                 .unwrap();
             assert_eq!(outcome.evicted_session, None);
@@ -1806,7 +1780,7 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(10), Some("msat")),
+                    &link_request("chan", 10, "msat"),
                 )
                 .unwrap();
 
@@ -1834,7 +1808,7 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(2),
-                    &payment_json("chan", 0, None, None),
+                    &link_request("chan", 0, "msat"),
                 )
                 .unwrap_err();
 
@@ -1852,36 +1826,44 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(10), Some("usd")),
+                    &link_request("chan", 10, "usd"),
                 )
                 .unwrap_err();
             assert_eq!(err, LinkError::UnsupportedUnit("usd".to_string()));
         }
 
         #[test]
-        fn malformed_payload_is_rejected() {
+        fn wrong_receiver_link_is_rejected() {
             let payments = InMemoryRelayPayments::new();
+            let mut request = link_request("chan", 10, "msat");
+            request.zero_balance_signature = "2".repeat(128);
             let err = payments
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    "[]",
+                    &request,
                 )
                 .unwrap_err();
-            assert_eq!(
-                err,
-                LinkError::InvalidPayment("payment must be a JSON object".to_string())
-            );
+            assert_eq!(err, LinkError::ReceiverKeyMismatch);
         }
 
         #[test]
         fn closed_channel_link_is_rejected() {
             let payments = InMemoryRelayPayments::new();
+            let request = link_request("chan", 10, "msat");
+            payments
+                .link_channel(
+                    &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
+                    session(1),
+                    &request,
+                )
+                .unwrap();
+            assert!(payments.mark_closed("chan"));
             let err = payments
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json_with_flag("chan", 0, Some(10), Some("msat"), "closed", true),
+                    &request,
                 )
                 .unwrap_err();
             assert_eq!(err, LinkError::ChannelClosed);
@@ -1894,12 +1876,12 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(10), Some("msat")),
+                    &link_request("chan", 10, "msat"),
                 )
                 .unwrap();
 
             let err = payments
-                .apply_channel_payment(session(1), "other", &payment_json("chan", 1, None, None))
+                .apply_channel_payment(session(1), "other", &payment_request("chan", 1))
                 .unwrap_err();
             assert_eq!(err, ChannelPaymentError::WrongChannel);
         }
@@ -1911,38 +1893,38 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(10), Some("msat")),
+                    &link_request("chan", 10, "msat"),
                 )
                 .unwrap();
             payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 5, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 5))
                 .unwrap();
 
             let err = payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 5, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 5))
                 .unwrap_err();
             assert_eq!(err, ChannelPaymentError::NoNewFunds);
         }
 
         #[test]
-        fn funding_bearing_channel_payment_is_rejected() {
+        fn wrong_receiver_channel_payment_is_rejected() {
             let payments = InMemoryRelayPayments::new();
             payments
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(10), Some("msat")),
+                    &link_request("chan", 10, "msat"),
                 )
                 .unwrap();
 
+            let mut request = payment_request("chan", 1);
+            request.signature = "2".repeat(128);
             let err = payments
-                .apply_channel_payment(session(1), "chan", &payment_json_with_params("chan", 1))
+                .apply_channel_payment(session(1), "chan", &request)
                 .unwrap_err();
             assert_eq!(
                 err,
-                ChannelPaymentError::InvalidPayment(
-                    "channel payment must not include funding".to_string()
-                )
+                ChannelPaymentError::InvalidPayment("wrong receiver".to_string())
             );
         }
 
@@ -1953,18 +1935,18 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(100), Some("msat")),
+                    &link_request("chan", 100, "msat"),
                 )
                 .unwrap();
 
             let first = payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 1, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 1))
                 .unwrap();
             let second = payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 5, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 5))
                 .unwrap();
             let third = payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 100, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 100))
                 .unwrap();
 
             assert_eq!(first.delta_millisats, 1);
@@ -1979,18 +1961,18 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(100), Some("sat")),
+                    &link_request("chan", 100, "sat"),
                 )
                 .unwrap();
 
             let first = payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 1, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 1))
                 .unwrap();
             let second = payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 5, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 5))
                 .unwrap();
             let third = payments
-                .apply_channel_payment(session(1), "chan", &payment_json("chan", 100, None, None))
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 100))
                 .unwrap();
 
             assert_eq!(first.delta_millisats, 1_000);
@@ -2005,7 +1987,7 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(u64::MAX), Some("sat")),
+                    &link_request("chan", u64::MAX, "sat"),
                 )
                 .unwrap_err();
             assert_eq!(err, LinkError::NumericLimitExceeded);
@@ -2018,14 +2000,14 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(10), Some("msat")),
+                    &link_request("chan", 10, "msat"),
                 )
                 .unwrap();
             let err = payments
                 .apply_channel_payment_with_limit(
                     session(1),
                     "chan",
-                    &payment_json("chan", 5, None, None),
+                    &payment_request("chan", 5),
                     3,
                 )
                 .unwrap_err();
@@ -2039,7 +2021,7 @@ pub mod testing {
                 .apply_channel_payment_with_limit(
                     session(1),
                     "chan",
-                    &payment_json("chan", 3, None, None),
+                    &payment_request("chan", 3),
                     3,
                 )
                 .unwrap();
@@ -2053,16 +2035,13 @@ pub mod testing {
                 .link_channel(
                     &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
                     session(1),
-                    &payment_json("chan", 0, Some(10), Some("msat")),
+                    &link_request("chan", 10, "msat"),
                 )
                 .unwrap();
+            assert!(payments.mark_closed("chan"));
 
             let err = payments
-                .apply_channel_payment(
-                    session(1),
-                    "chan",
-                    &payment_json_with_flag("chan", 1, None, None, "closed", true),
-                )
+                .apply_channel_payment(session(1), "chan", &payment_request("chan", 1))
                 .unwrap_err();
             assert_eq!(err, ChannelPaymentError::ChannelClosed);
         }

@@ -12,8 +12,8 @@ use tracing::{info, warn};
 use super::funding::{apply_channel_evicted, apply_channel_unlinked, apply_server_error};
 use super::funding::{handle_control_detached, run_funding_cycle};
 use super::payment::{
-    compute_estimated_remaining, validate_linked_channel_balance_against_wallet,
-    validate_session_pricing, validate_session_status_baseline_against_local_counters,
+    compute_estimated_remaining, validate_linked_channel_against_wallet, validate_session_pricing,
+    validate_session_status_baseline_against_local_counters,
 };
 use super::state::{
     apply_session_status, publish_pricing, publish_spilman_info, signal_ready, state_summary,
@@ -46,6 +46,7 @@ struct PendingPing {
 #[derive(Debug, Default)]
 struct ControlHeartbeat {
     last_server_message_at: Option<Instant>,
+    ping_to_submit: Option<String>,
     pending_ping: Option<PendingPing>,
     next_ping_sequence: u64,
 }
@@ -58,21 +59,37 @@ enum HeartbeatAction {
 }
 
 impl ControlHeartbeat {
-    fn observe_server_message(&mut self, now: Instant) {
+    fn observe_server_message(
+        &mut self,
+        now: Instant,
+        attribution: &Attribution,
+        message: &ServerMessage,
+    ) -> HeartbeatAction {
+        if *attribution == Attribution::Unsolicited {
+            return HeartbeatAction::None;
+        }
+
         self.last_server_message_at = Some(now);
+        if let ServerMessage::Pong { nonce } = message {
+            if let Some(pending) = &self.pending_ping {
+                if pending.nonce == *nonce {
+                    if now >= pending.sent_at + HEARTBEAT_TIMEOUT {
+                        return HeartbeatAction::TimedOut;
+                    }
+                    self.pending_ping = None;
+                }
+            }
+        }
+        HeartbeatAction::None
     }
 
-    fn observe_pong(&mut self, now: Instant, nonce: &str) -> bool {
-        self.observe_server_message(now);
-        if self
-            .pending_ping
-            .as_ref()
-            .is_some_and(|pending| pending.nonce == nonce)
-        {
-            self.pending_ping = None;
-            return true;
-        }
-        false
+    fn ping_submitted(&mut self, now: Instant, nonce: String) {
+        debug_assert_eq!(self.ping_to_submit.as_deref(), Some(nonce.as_str()));
+        self.ping_to_submit = None;
+        self.pending_ping = Some(PendingPing {
+            nonce,
+            sent_at: now,
+        });
     }
 
     fn on_tick(&mut self, now: Instant, session_id: &[u8; 32]) -> HeartbeatAction {
@@ -80,6 +97,9 @@ impl ControlHeartbeat {
             if now.duration_since(pending.sent_at) >= HEARTBEAT_TIMEOUT {
                 return HeartbeatAction::TimedOut;
             }
+            return HeartbeatAction::None;
+        }
+        if self.ping_to_submit.is_some() {
             return HeartbeatAction::None;
         }
 
@@ -94,10 +114,7 @@ impl ControlHeartbeat {
             };
             self.next_ping_sequence = next_sequence;
             let nonce = format!("monad:{}:{sequence}", hex::encode(session_id));
-            self.pending_ping = Some(PendingPing {
-                nonce: nonce.clone(),
-                sent_at: now,
-            });
+            self.ping_to_submit = Some(nonce.clone());
             return HeartbeatAction::SendPing { nonce };
         }
 
@@ -200,10 +217,11 @@ pub(super) async fn run_session_driver(
                         }
                         continue;
                     }
-                    if let ServerMessage::Pong { nonce } = &message {
-                        heartbeat.observe_pong(observed_at, nonce);
-                    } else {
-                        heartbeat.observe_server_message(observed_at);
+                    if state.exchange.is_initialized()
+                        && heartbeat.observe_server_message(observed_at, &attribution, &message)
+                        == HeartbeatAction::TimedOut
+                    {
+                        return Err(heartbeat_timeout_error(&config.hop_label));
                     }
 
                     let resolved_payment = match message {
@@ -222,6 +240,24 @@ pub(super) async fn run_session_driver(
                             total_connects,
                             failed_connects,
                         } => {
+                            if let Err(error) = validate_linked_channel_against_wallet(
+                                config.wallet.as_ref(),
+                                config.conn.session_id,
+                                linked_channel.as_ref(),
+                            ) {
+                                if let Some((owner, _)) = &config.management {
+                                    let message = if error.kind() == io::ErrorKind::InvalidData {
+                                        error.to_string()
+                                    } else {
+                                        "Unable to validate linked channel against local wallet".to_owned()
+                                    };
+                                    owner.events.record("session_payment_failed", serde_json::json!({
+                                        "session_id": hex::encode(config.conn.session_id),
+                                        "message": message,
+                                    }));
+                                }
+                                return Err(error);
+                            }
                             let previous_paid = state.relay_snapshot.as_ref().map(|s| s.total_paid_millisats).unwrap_or(0);
                             let pricing = SessionPricing::try_new(active_in_rate, active_out_rate)
                                 .map_err(|error| io::Error::new(
@@ -256,32 +292,13 @@ pub(super) async fn run_session_driver(
                                     remaining_milli_sats,
                                     paused,
                                  };
+                            validate_session_status_baseline_against_local_counters(
+                                &snapshot,
+                                &config.conn.cleartext_byte_counters,
+                            )?;
                                let resolved = apply_driver_session_status(&config, &mut state, snapshot, attribution).await;
                             publish_pricing(&config, pricing).await;
                             publish_spilman_info(&config, &state).await;
-                             if let Err(error) = validate_linked_channel_balance_against_wallet(
-                                 config.wallet.as_ref(),
-                                 &mut state,
-                             ) {
-                                 if let Some((owner, _)) = &config.management {
-                                     // Expose the numeric protocol mismatch, but not
-                                     // arbitrary wallet/backend error contents.
-                                     let message = if error.kind() == io::ErrorKind::InvalidData {
-                                         error.to_string()
-                                     } else {
-                                         "Unable to validate linked channel against local wallet".to_owned()
-                                     };
-                                     owner.events.record("session_payment_failed", serde_json::json!({
-                                         "session_id": hex::encode(config.conn.session_id),
-                                         "message": message,
-                                     }));
-                                 }
-                                 return Err(error);
-                             }
-                            validate_session_status_baseline_against_local_counters(
-                                &state,
-                                &config.conn.cleartext_byte_counters,
-                            )?;
                             if let Some((owner, hop)) = &config.management {
                                 if super::state::relay_confirms_intended_channel(&state) { hop.channel_admitted(owner); }
                                 if total_paid_millisats > previous_paid {
@@ -345,7 +362,7 @@ pub(super) async fn run_session_driver(
                                 Attribution::Response(PendingRequest::Payment { .. })
                             );
                             let rejection_code = format!("{code:?}");
-                            apply_server_error(&config, &mut state, code).await;
+                            apply_server_error(&config, &mut state, code).await?;
                             if payment_pending {
                                 return Err(io::Error::other(format!(
                                     "{} payment rejected ({rejection_code}); signed payment retained",
@@ -373,17 +390,17 @@ pub(super) async fn run_session_driver(
                 match heartbeat.on_tick(Instant::now(), &config.conn.session_id) {
                     HeartbeatAction::None => {}
                     HeartbeatAction::SendPing { nonce } => {
-                        super::funding::send_control_message(&mut h2_send, &ClientMessage::Ping { nonce }).await?;
+                        super::funding::send_control_message(
+                            &mut h2_send,
+                            &ClientMessage::Ping {
+                                nonce: nonce.clone(),
+                            },
+                        )
+                        .await?;
+                        heartbeat.ping_submitted(Instant::now(), nonce);
                     }
                     HeartbeatAction::TimedOut => {
-                    return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!(
-                                "{} control heartbeat timed out after {}ms",
-                                config.hop_label,
-                                HEARTBEAT_TIMEOUT.as_millis()
-                            ),
-                        ));
+                        return Err(heartbeat_timeout_error(&config.hop_label));
                     }
                 }
             }
@@ -395,6 +412,16 @@ pub(super) async fn run_session_driver(
 
     handle_control_detached(&config, &mut state).await;
     result
+}
+
+fn heartbeat_timeout_error(hop_label: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "{hop_label} control heartbeat timed out after {}ms",
+            HEARTBEAT_TIMEOUT.as_millis()
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -488,8 +515,10 @@ mod tests {
     fn heartbeat_sends_correlated_ping_after_idle_interval() {
         let session_id = heartbeat_session_id();
         let now = Instant::now();
-        let mut heartbeat = ControlHeartbeat::default();
-        heartbeat.observe_server_message(now);
+        let mut heartbeat = ControlHeartbeat {
+            last_server_message_at: Some(now),
+            ..Default::default()
+        };
 
         assert_eq!(
             heartbeat.on_tick(
@@ -504,6 +533,7 @@ mod tests {
                 nonce: expected_nonce(0)
             }
         );
+        heartbeat.ping_submitted(now + HEARTBEAT_INTERVAL, expected_nonce(0));
         assert_eq!(
             heartbeat.on_tick(
                 now + HEARTBEAT_INTERVAL + Duration::from_secs(1),
@@ -517,19 +547,40 @@ mod tests {
     fn only_matching_pong_answers_pending_ping() {
         let session_id = heartbeat_session_id();
         let now = Instant::now();
-        let mut heartbeat = ControlHeartbeat::default();
-        heartbeat.observe_server_message(now);
+        let mut heartbeat = ControlHeartbeat {
+            last_server_message_at: Some(now),
+            ..Default::default()
+        };
         assert_eq!(
             heartbeat.on_tick(now + HEARTBEAT_INTERVAL, &session_id),
             HeartbeatAction::SendPing {
                 nonce: expected_nonce(0)
             }
         );
+        heartbeat.ping_submitted(now + HEARTBEAT_INTERVAL, expected_nonce(0));
 
         let unrelated_at = now + HEARTBEAT_INTERVAL + Duration::from_secs(1);
-        heartbeat.observe_server_message(unrelated_at);
+        assert_eq!(
+            heartbeat.observe_server_message(
+                unrelated_at,
+                &Attribution::Notification,
+                &ServerMessage::ChannelReleaseRequested {
+                    channel_id: "channel".into(),
+                },
+            ),
+            HeartbeatAction::None
+        );
         let mismatched_at = now + HEARTBEAT_INTERVAL + Duration::from_secs(2);
-        assert!(!heartbeat.observe_pong(mismatched_at, "different"));
+        assert_eq!(
+            heartbeat.observe_server_message(
+                mismatched_at,
+                &Attribution::Notification,
+                &ServerMessage::Pong {
+                    nonce: "different".into(),
+                },
+            ),
+            HeartbeatAction::None
+        );
         assert_eq!(
             heartbeat.on_tick(
                 now + HEARTBEAT_INTERVAL + HEARTBEAT_TIMEOUT - Duration::from_millis(1),
@@ -539,7 +590,16 @@ mod tests {
         );
 
         let matched_at = now + HEARTBEAT_INTERVAL + Duration::from_secs(3);
-        assert!(heartbeat.observe_pong(matched_at, &expected_nonce(0)));
+        assert_eq!(
+            heartbeat.observe_server_message(
+                matched_at,
+                &Attribution::Notification,
+                &ServerMessage::Pong {
+                    nonce: expected_nonce(0),
+                },
+            ),
+            HeartbeatAction::None
+        );
         assert_eq!(
             heartbeat.on_tick(
                 matched_at + HEARTBEAT_INTERVAL - Duration::from_millis(1),
@@ -559,20 +619,38 @@ mod tests {
     fn ordinary_traffic_and_mismatched_pong_do_not_prevent_ping_timeout() {
         let session_id = heartbeat_session_id();
         let now = Instant::now();
-        let mut heartbeat = ControlHeartbeat::default();
-        heartbeat.observe_server_message(now);
+        let mut heartbeat = ControlHeartbeat {
+            last_server_message_at: Some(now),
+            ..Default::default()
+        };
         assert_eq!(
             heartbeat.on_tick(now + HEARTBEAT_INTERVAL, &session_id),
             HeartbeatAction::SendPing {
                 nonce: expected_nonce(0)
             }
         );
+        heartbeat.ping_submitted(now + HEARTBEAT_INTERVAL, expected_nonce(0));
 
-        heartbeat.observe_server_message(now + HEARTBEAT_INTERVAL + Duration::from_secs(1));
-        assert!(!heartbeat.observe_pong(
-            now + HEARTBEAT_INTERVAL + Duration::from_secs(2),
-            "different"
-        ));
+        assert_eq!(
+            heartbeat.observe_server_message(
+                now + HEARTBEAT_INTERVAL + Duration::from_secs(1),
+                &Attribution::Notification,
+                &ServerMessage::ChannelReleaseRequested {
+                    channel_id: "channel".into(),
+                },
+            ),
+            HeartbeatAction::None
+        );
+        assert_eq!(
+            heartbeat.observe_server_message(
+                now + HEARTBEAT_INTERVAL + Duration::from_secs(2),
+                &Attribution::Notification,
+                &ServerMessage::Pong {
+                    nonce: "different".into(),
+                },
+            ),
+            HeartbeatAction::None
+        );
         assert_eq!(
             heartbeat.on_tick(
                 now + HEARTBEAT_INTERVAL + HEARTBEAT_TIMEOUT - Duration::from_millis(1),
@@ -582,6 +660,224 @@ mod tests {
         );
         assert_eq!(
             heartbeat.on_tick(now + HEARTBEAT_INTERVAL + HEARTBEAT_TIMEOUT, &session_id),
+            HeartbeatAction::TimedOut
+        );
+    }
+
+    #[test]
+    fn extensions_and_advisories_defer_an_unsent_ping() {
+        let session_id = heartbeat_session_id();
+        let now = Instant::now();
+
+        for message in [
+            ServerMessage::ExtensionNotification(monad_common::protocol::ExtensionNotification {
+                name: "example.activity".into(),
+                rest: Default::default(),
+            }),
+            ServerMessage::ChannelReleaseRequested {
+                channel_id: "channel".into(),
+            },
+        ] {
+            let mut heartbeat = ControlHeartbeat {
+                last_server_message_at: Some(now),
+                ..Default::default()
+            };
+            let observed_at = now + HEARTBEAT_INTERVAL;
+            assert_eq!(
+                heartbeat
+                    .observe_server_message(observed_at, &Attribution::Notification, &message,),
+                HeartbeatAction::None
+            );
+            assert_eq!(
+                heartbeat.on_tick(
+                    observed_at + HEARTBEAT_INTERVAL - Duration::from_millis(1),
+                    &session_id,
+                ),
+                HeartbeatAction::None
+            );
+            assert!(matches!(
+                heartbeat.on_tick(observed_at + HEARTBEAT_INTERVAL, &session_id),
+                HeartbeatAction::SendPing { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn discarded_unsolicited_response_does_not_defer_ping() {
+        let session_id = heartbeat_session_id();
+        let now = Instant::now();
+        let mut heartbeat = ControlHeartbeat {
+            last_server_message_at: Some(now),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            heartbeat.observe_server_message(
+                now + HEARTBEAT_INTERVAL - Duration::from_millis(1),
+                &Attribution::Unsolicited,
+                &ServerMessage::Error {
+                    code: ServerErrorCode::PaymentNoNewFunds,
+                    message: "discarded".into(),
+                },
+            ),
+            HeartbeatAction::None
+        );
+        assert!(matches!(
+            heartbeat.on_tick(now + HEARTBEAT_INTERVAL, &session_id),
+            HeartbeatAction::SendPing { .. }
+        ));
+    }
+
+    #[test]
+    fn accepted_ordinary_response_defers_only_an_unsent_ping() {
+        let session_id = heartbeat_session_id();
+        let now = Instant::now();
+        let response = ServerMessage::Error {
+            code: ServerErrorCode::PaymentNoNewFunds,
+            message: "accepted response".into(),
+        };
+        let attribution = Attribution::Response(PendingRequest::Status);
+
+        let mut unsent = ControlHeartbeat {
+            last_server_message_at: Some(now),
+            ..Default::default()
+        };
+        let observed_at = now + HEARTBEAT_INTERVAL;
+        assert_eq!(
+            unsent.observe_server_message(observed_at, &attribution, &response),
+            HeartbeatAction::None
+        );
+        assert_eq!(
+            unsent.on_tick(
+                observed_at + HEARTBEAT_INTERVAL - Duration::from_millis(1),
+                &session_id,
+            ),
+            HeartbeatAction::None
+        );
+
+        let mut pending = ControlHeartbeat {
+            last_server_message_at: Some(now),
+            ..Default::default()
+        };
+        let sent_at = now + HEARTBEAT_INTERVAL;
+        assert!(matches!(
+            pending.on_tick(sent_at, &session_id),
+            HeartbeatAction::SendPing { .. }
+        ));
+        pending.ping_submitted(sent_at, expected_nonce(0));
+        assert_eq!(
+            pending.observe_server_message(
+                sent_at + Duration::from_secs(1),
+                &attribution,
+                &response,
+            ),
+            HeartbeatAction::None
+        );
+        assert_eq!(
+            pending.on_tick(sent_at + HEARTBEAT_TIMEOUT, &session_id),
+            HeartbeatAction::TimedOut
+        );
+    }
+
+    #[test]
+    fn extension_and_advisory_do_not_extend_pending_ping_deadline() {
+        let session_id = heartbeat_session_id();
+        let now = Instant::now();
+        let sent_at = now + HEARTBEAT_INTERVAL;
+        let mut heartbeat = ControlHeartbeat {
+            last_server_message_at: Some(now),
+            ..Default::default()
+        };
+        assert!(matches!(
+            heartbeat.on_tick(sent_at, &session_id),
+            HeartbeatAction::SendPing { .. }
+        ));
+        heartbeat.ping_submitted(sent_at, expected_nonce(0));
+
+        for (offset, message) in [
+            (
+                Duration::from_secs(1),
+                ServerMessage::ExtensionNotification(
+                    monad_common::protocol::ExtensionNotification {
+                        name: "example.activity".into(),
+                        rest: Default::default(),
+                    },
+                ),
+            ),
+            (
+                HEARTBEAT_TIMEOUT - Duration::from_millis(1),
+                ServerMessage::ChannelReleaseRequested {
+                    channel_id: "channel".into(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                heartbeat.observe_server_message(
+                    sent_at + offset,
+                    &Attribution::Notification,
+                    &message,
+                ),
+                HeartbeatAction::None
+            );
+        }
+        assert_eq!(
+            heartbeat.on_tick(sent_at + HEARTBEAT_TIMEOUT, &session_id),
+            HeartbeatAction::TimedOut
+        );
+    }
+
+    #[test]
+    fn matching_pong_at_deadline_is_too_late() {
+        let session_id = heartbeat_session_id();
+        let now = Instant::now();
+        let sent_at = now + HEARTBEAT_INTERVAL;
+        let mut heartbeat = ControlHeartbeat {
+            last_server_message_at: Some(now),
+            ..Default::default()
+        };
+        assert!(matches!(
+            heartbeat.on_tick(sent_at, &session_id),
+            HeartbeatAction::SendPing { .. }
+        ));
+        heartbeat.ping_submitted(sent_at, expected_nonce(0));
+
+        assert_eq!(
+            heartbeat.observe_server_message(
+                sent_at + HEARTBEAT_TIMEOUT,
+                &Attribution::Notification,
+                &ServerMessage::Pong {
+                    nonce: expected_nonce(0),
+                },
+            ),
+            HeartbeatAction::TimedOut
+        );
+    }
+
+    #[test]
+    fn pong_deadline_starts_after_successful_ping_submission() {
+        let session_id = heartbeat_session_id();
+        let now = Instant::now();
+        let selected_at = now + HEARTBEAT_INTERVAL;
+        let submitted_at = selected_at + Duration::from_secs(2);
+        let mut heartbeat = ControlHeartbeat {
+            last_server_message_at: Some(now),
+            ..Default::default()
+        };
+        assert!(matches!(
+            heartbeat.on_tick(selected_at, &session_id),
+            HeartbeatAction::SendPing { .. }
+        ));
+        heartbeat.ping_submitted(submitted_at, expected_nonce(0));
+
+        assert_eq!(
+            heartbeat.on_tick(
+                submitted_at + HEARTBEAT_TIMEOUT - Duration::from_millis(1),
+                &session_id,
+            ),
+            HeartbeatAction::None
+        );
+        assert_eq!(
+            heartbeat.on_tick(submitted_at + HEARTBEAT_TIMEOUT, &session_id),
             HeartbeatAction::TimedOut
         );
     }

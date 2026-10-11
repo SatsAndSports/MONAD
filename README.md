@@ -5,6 +5,14 @@ lookups. Custom `RelayPayments` implementations must return
 `Result<Option<ChannelState>, String>` from `channel_state`: `None` for unknown
 channels and `Err` for lookup failures. This API update requires no database reset.
 
+The control wire now carries structured `ChannelLink { channel_id,
+zero_balance_signature, params, funding_token }` and `ChannelPayment {
+channel_id, balance_raw, signature }` messages instead of nested
+`payment_json`. This pre-alpha wire break requires coordinated client and relay
+updates. The pinned Spilman parameter schema also renames the persisted/public
+`maximum_amount` field to `maximum_amount_for_one_output`; recover channels
+before upgrading or explicitly reset disposable alpha wallet and relay databases.
+
 ### Retire a linked payment channel
 
 Use the relay management action `request_channel_unlink` with

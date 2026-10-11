@@ -2,7 +2,7 @@ use monad_common::payment_units::{
     msats_to_raw_units as common_msats_to_raw_units,
     raw_units_to_msats as common_raw_units_to_msats,
 };
-use monad_common::protocol::PaymentOption;
+use monad_common::protocol::{ChannelLinkRequest, ChannelPaymentRequest, PaymentOption};
 use rand::RngCore;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,6 +86,15 @@ pub struct WalletChannel {
     pub capacity_msats: u64,
     pub current_signed_balance_msats: u64,
     pub expiry_timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletChannelAccounting {
+    pub state: WalletChannelState,
+    pub attached_session_id: Option<[u8; 32]>,
+    pub unit: String,
+    pub capacity_raw: u64,
+    pub current_signed_balance_raw: u64,
 }
 
 impl WalletChannel {
@@ -228,6 +237,11 @@ pub trait MonadWallet: Send + Sync + 'static {
 
     fn get_channel(&self, channel_id: &str) -> Result<WalletChannel, WalletError>;
 
+    fn get_channel_accounting(
+        &self,
+        channel_id: &str,
+    ) -> Result<WalletChannelAccounting, WalletError>;
+
     fn attach_channel_to_session(
         &self,
         channel_id: &str,
@@ -261,7 +275,7 @@ pub trait MonadWallet: Send + Sync + 'static {
         &self,
         channel_id: &str,
         offer: &RelayPaymentOffer,
-    ) -> Result<String, WalletError>;
+    ) -> Result<ChannelLinkRequest, WalletError>;
 
     fn build_channel_payment(
         &self,
@@ -269,7 +283,83 @@ pub trait MonadWallet: Send + Sync + 'static {
         offer: &RelayPaymentOffer,
         latest_server_balance_raw: u64,
         next_balance_raw: u64,
-    ) -> Result<String, WalletError>;
+    ) -> Result<ChannelPaymentRequest, WalletError>;
+}
+
+pub fn link_request_from_spilman_payment(
+    payment: cdk_spilman::Payment,
+) -> Result<ChannelLinkRequest, WalletError> {
+    if payment.balance != 0 {
+        return Err(WalletError::Backend(
+            "channel registration must sign zero balance".to_string(),
+        ));
+    }
+    let params = payment
+        .params
+        .ok_or_else(|| WalletError::Backend("channel registration missing params".to_string()))?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| WalletError::Backend("channel params must be an object".to_string()))?;
+    let proofs = payment.funding_proofs.ok_or_else(|| {
+        WalletError::Backend("channel registration missing funding proofs".to_string())
+    })?;
+    if proofs.is_empty() {
+        return Err(WalletError::Backend(
+            "channel registration funding token is empty".to_string(),
+        ));
+    }
+
+    let mint_url = params
+        .get("mint")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| WalletError::Backend("channel params missing mint".to_string()))?
+        .parse()
+        .map_err(|error| WalletError::Backend(format!("invalid channel mint: {error}")))?;
+    let unit: cashu::nuts::CurrencyUnit = params
+        .get("unit")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| WalletError::Backend("channel params missing unit".to_string()))?
+        .parse()
+        .map_err(|error| WalletError::Backend(format!("invalid channel unit: {error}")))?;
+    let keyset_id = params
+        .get("keyset_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| WalletError::Backend("channel params missing keyset_id".to_string()))?;
+    for proof in &proofs {
+        if proof.keyset_id.to_string() != keyset_id {
+            return Err(WalletError::Backend(
+                "funding proof keyset does not match channel params".to_string(),
+            ));
+        }
+        if proof.dleq.is_none() || proof.witness.is_some() || proof.p2pk_e.is_some() {
+            return Err(WalletError::Backend(
+                "funding proof lacks canonical channel funding metadata".to_string(),
+            ));
+        }
+    }
+    let funding_token = cashu::nuts::Token::new(mint_url, proofs, None, unit).to_string();
+
+    Ok(ChannelLinkRequest {
+        channel_id: payment.channel_id,
+        zero_balance_signature: payment.signature,
+        params,
+        funding_token,
+    })
+}
+
+pub fn payment_request_from_spilman_payment(
+    payment: cdk_spilman::Payment,
+) -> Result<ChannelPaymentRequest, WalletError> {
+    if payment.params.is_some() || payment.funding_proofs.is_some() {
+        return Err(WalletError::Backend(
+            "channel payment unexpectedly contains funding".to_string(),
+        ));
+    }
+    Ok(ChannelPaymentRequest {
+        channel_id: payment.channel_id,
+        balance_raw: payment.balance,
+        signature: payment.signature,
+    })
 }
 
 pub fn select_channel(
@@ -542,6 +632,27 @@ impl MonadWallet for MockWallet {
             .ok_or(WalletError::NotFound)
     }
 
+    fn get_channel_accounting(
+        &self,
+        channel_id: &str,
+    ) -> Result<WalletChannelAccounting, WalletError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| WalletError::Backend("wallet mutex poisoned".to_string()))?;
+        let stored = inner
+            .channels
+            .get(channel_id)
+            .ok_or(WalletError::NotFound)?;
+        Ok(WalletChannelAccounting {
+            state: stored.channel.state,
+            attached_session_id: stored.channel.attached_session_id,
+            unit: stored.channel.unit.clone(),
+            capacity_raw: stored.capacity_raw,
+            current_signed_balance_raw: stored.current_signed_balance_raw,
+        })
+    }
+
     fn attach_channel_to_session(
         &self,
         channel_id: &str,
@@ -626,9 +737,9 @@ impl MonadWallet for MockWallet {
             .lock()
             .map_err(|_| WalletError::Backend("wallet mutex poisoned".to_string()))?;
         let channel_id = loop {
-            let mut bytes = [0u8; 16];
+            let mut bytes = [0u8; 32];
             rand::rng().fill_bytes(&mut bytes);
-            let candidate = format!("mock-chan-{}", hex::encode(bytes));
+            let candidate = hex::encode(bytes);
             if !inner.channels.contains_key(&candidate) {
                 break candidate;
             }
@@ -682,7 +793,7 @@ impl MonadWallet for MockWallet {
         &self,
         channel_id: &str,
         offer: &RelayPaymentOffer,
-    ) -> Result<String, WalletError> {
+    ) -> Result<ChannelLinkRequest, WalletError> {
         let mut inner = self
             .inner
             .lock()
@@ -701,24 +812,44 @@ impl MonadWallet for MockWallet {
             ));
         }
 
-        let mut payload = json!({
-            "channel_id": channel_id,
-            "balance": 0,
-            "capacity": stored.capacity_raw,
-            "unit": stored.channel.unit,
-        });
-        if stored.next_link_invalid {
-            payload["invalid"] = json!(true);
-            stored.next_link_invalid = false;
-        }
-        if stored.next_link_wrong_receiver {
-            payload["wrong_receiver"] = json!(true);
-            stored.next_link_wrong_receiver = false;
-        }
-
-        let payload = payload.to_string();
-        stored.last_link_payload = Some(payload.clone());
-        Ok(payload)
+        let signature = if std::mem::take(&mut stored.next_link_invalid) {
+            "1".repeat(128)
+        } else if std::mem::take(&mut stored.next_link_wrong_receiver) {
+            "2".repeat(128)
+        } else {
+            "0".repeat(128)
+        };
+        let request = ChannelLinkRequest {
+            channel_id: channel_id.to_string(),
+            zero_balance_signature: signature,
+            params: serde_json::Map::from_iter([
+                ("mint".to_string(), json!(stored.channel.mint_url)),
+                ("capacity".to_string(), json!(stored.capacity_raw)),
+                ("unit".to_string(), json!(stored.channel.unit)),
+                (
+                    "funding_token_amount".to_string(),
+                    json!(stored.capacity_raw),
+                ),
+                ("keyset_id".to_string(), json!(stored.channel.keyset_id)),
+                ("input_fee_ppk".to_string(), json!(0)),
+                ("maximum_amount_for_one_output".to_string(), json!(0)),
+                ("setup_timestamp".to_string(), json!(0)),
+                ("sender_pubkey".to_string(), json!("sender")),
+                (
+                    "receiver_pubkey".to_string(),
+                    json!(stored.channel.receiver_pubkey),
+                ),
+                (
+                    "expiry_timestamp".to_string(),
+                    json!(stored.channel.expiry_timestamp),
+                ),
+            ]),
+            funding_token: "mock-cashuB".to_string(),
+        };
+        stored.last_link_payload = Some(serde_json::to_string(&request).map_err(|error| {
+            WalletError::Backend(format!("serialize mock link request: {error}"))
+        })?);
+        Ok(request)
     }
 
     fn build_channel_payment(
@@ -727,7 +858,7 @@ impl MonadWallet for MockWallet {
         offer: &RelayPaymentOffer,
         latest_server_balance_raw: u64,
         next_balance_raw: u64,
-    ) -> Result<String, WalletError> {
+    ) -> Result<ChannelPaymentRequest, WalletError> {
         let mut inner = self
             .inner
             .lock()
@@ -761,22 +892,25 @@ impl MonadWallet for MockWallet {
             ));
         }
 
-        let mut payload = json!({
-            "channel_id": channel_id,
-            "balance": next_balance_raw,
-        });
-        if stored.next_payment_invalid {
-            payload["invalid"] = json!(true);
-            stored.next_payment_invalid = false;
-        }
+        let signature = if std::mem::take(&mut stored.next_payment_invalid) {
+            "1".repeat(128)
+        } else {
+            "0".repeat(128)
+        };
 
         stored.current_signed_balance_raw = next_balance_raw;
         stored.channel.current_signed_balance_msats =
             raw_to_msats(&stored.channel.unit, next_balance_raw)?;
         stored.successful_payment_builds = stored.successful_payment_builds.saturating_add(1);
-        let payload = payload.to_string();
-        stored.last_payment_payload = Some(payload.clone());
-        Ok(payload)
+        let request = ChannelPaymentRequest {
+            channel_id: channel_id.to_string(),
+            balance_raw: next_balance_raw,
+            signature,
+        };
+        stored.last_payment_payload = Some(serde_json::to_string(&request).map_err(|error| {
+            WalletError::Backend(format!("serialize mock payment request: {error}"))
+        })?);
+        Ok(request)
     }
 }
 
@@ -1132,11 +1266,10 @@ mod tests {
             .attach_channel_to_session("chan", session(1))
             .unwrap();
 
-        let payload = wallet.build_link_request("chan", &offer("msat")).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(value["balance"], 0);
-        assert_eq!(value["capacity"], 10_000);
-        assert_eq!(value["unit"], "msat");
+        let request = wallet.build_link_request("chan", &offer("msat")).unwrap();
+        assert_eq!(request.channel_id, "chan");
+        assert_eq!(request.params["capacity"], 10_000);
+        assert_eq!(request.params["unit"], "msat");
     }
 
     #[test]
@@ -1150,11 +1283,10 @@ mod tests {
             .attach_channel_to_session("chan", session(1))
             .unwrap();
 
-        let payload = wallet
+        let request = wallet
             .build_channel_payment("chan", &offer("msat"), 7_000, 12_000)
             .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(value["balance"], 12_000);
+        assert_eq!(request.balance_raw, 12_000);
         assert_eq!(
             wallet
                 .get_channel("chan")
@@ -1175,11 +1307,10 @@ mod tests {
             .attach_channel_to_session("chan", session(1))
             .unwrap();
 
-        let payload = wallet
+        let request = wallet
             .build_channel_payment("chan", &offer("msat"), 7_000, 12_000)
             .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(value["balance"], 12_000);
+        assert_eq!(request.balance_raw, 12_000);
         assert_eq!(wallet.successful_payment_build_count("chan").unwrap(), 1);
     }
 
@@ -1194,11 +1325,10 @@ mod tests {
             .attach_channel_to_session("chan", session(1))
             .unwrap();
 
-        let payload = wallet
+        let request = wallet
             .build_channel_payment("chan", &offer("sat"), 0, 2)
             .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(value["balance"], 2);
+        assert_eq!(request.balance_raw, 2);
         assert_eq!(
             wallet
                 .get_channel("chan")

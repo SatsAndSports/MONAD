@@ -53,20 +53,18 @@ impl<'a> ControlDriver<'a> {
                 };
                 send_control_message(self.h2_send, &status).await?;
             }
-            SessionEffect::RunLinkValidation { payment_json } => {
+            SessionEffect::RunLinkValidation(request) => {
                 pending.push_back(SessionEvent::LinkValidationFinished(
-                    self.state
-                        .link_channel_with_keyset_refresh(&payment_json)
-                        .await,
+                    self.state.link_channel_with_keyset_refresh(&request).await,
                 ));
             }
             SessionEffect::RunPaymentValidation {
                 expected_channel_id,
-                payment_json,
+                request,
             } => {
                 pending.push_back(SessionEvent::PaymentValidationFinished(
                     self.state
-                        .apply_channel_payment(&expected_channel_id, &payment_json)
+                        .apply_channel_payment(&expected_channel_id, &request)
                         .await,
                 ));
             }

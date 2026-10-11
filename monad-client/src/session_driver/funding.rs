@@ -135,7 +135,7 @@ async fn send_channel_link(
     h2_send: &mut h2::SendStream<Bytes>,
     channel: WalletChannel,
     offer: RelayPaymentOffer,
-    payment_json: String,
+    request: monad_common::protocol::ChannelLinkRequest,
 ) -> io::Result<()> {
     let channel_id = channel.channel_id.clone();
     info!(
@@ -147,7 +147,16 @@ async fn send_channel_link(
     state.exchange.enqueue(PendingRequest::Link {
         channel_id: channel_id.clone(),
     })?;
-    send_control_message(h2_send, &ClientMessage::ChannelLink { payment_json }).await?;
+    send_control_message(
+        h2_send,
+        &ClientMessage::ChannelLink {
+            channel_id: request.channel_id,
+            zero_balance_signature: request.zero_balance_signature,
+            params: request.params,
+            funding_token: request.funding_token,
+        },
+    )
+    .await?;
     set_link_in_flight(state, channel_id.clone(), channel.keyset_id, offer);
     if let Some((owner, hop)) = &config.management {
         hop.linking(owner, channel_id);
@@ -184,8 +193,8 @@ async fn try_link_channel(
     }
 
     match config.wallet.build_link_request(&channel_id, &offer) {
-        Ok(payment_json) => {
-            send_channel_link(config, state, h2_send, channel, offer, payment_json).await?;
+        Ok(request) => {
+            send_channel_link(config, state, h2_send, channel, offer, request).await?;
             Ok(false)
         }
         Err(error) => {
@@ -451,16 +460,16 @@ pub(super) async fn apply_channel_release_requested(
         channel_id,
         state_summary(state, &config.conn.cleartext_byte_counters)
     );
-    request_channel_release(state, &channel_id);
-    // Persist that this channel must never be reused for future funding. The
-    // channel records and refund recovery data remain intact; unusable does
-    // not mean closed.
-    if let Err(error) = config.wallet.mark_channel_unusable(&channel_id) {
+    let applies_to_session = state.intended_channel_id.as_deref() == Some(channel_id.as_str())
+        || super::state::relay_linked_channel_id(state) == Some(channel_id.as_str());
+    if !applies_to_session {
         warn!(
-            "{} failed to mark retiring channel {} unusable: {error}",
+            "{} ignoring channel release request for unrelated channel {}",
             config.hop_label, channel_id
         );
+        return Ok(());
     }
+    request_channel_release(state, &channel_id);
     if let Some((owner, _hop)) = &config.management {
         owner.events.record(
             "channel_release_requested",
@@ -492,6 +501,15 @@ pub(super) async fn maybe_send_channel_unlink(
     if !release_is_pending(state, &intended) {
         return Ok(());
     }
+    // Do not detach the wallet record until any payment acknowledgement has
+    // been validated. Once persisted as unusable, the channel can never be
+    // selected for future funding even if control submission fails.
+    config
+        .wallet
+        .mark_channel_unusable(&intended)
+        .map_err(|error| {
+            io::Error::other(format!("failed to retire channel {intended}: {error}"))
+        })?;
     info!(
         "{} sending ChannelUnlink for {} | {}",
         config.hop_label,
@@ -674,7 +692,7 @@ pub(super) async fn maybe_progress_payment(
         linked_channel.balance_raw,
         next_balance_raw,
     ) {
-        Ok(payment_json) => {
+        Ok(request) => {
             state.exchange.enqueue(PendingRequest::Payment {
                 channel_id: intended_channel_id.clone(),
                 balance_raw: next_balance_raw,
@@ -690,7 +708,15 @@ pub(super) async fn maybe_progress_payment(
                 next_balance_raw,
                 state_summary(state, &config.conn.cleartext_byte_counters)
             );
-            send_control_message(h2_send, &ClientMessage::ChannelPayment { payment_json }).await?;
+            send_control_message(
+                h2_send,
+                &ClientMessage::ChannelPayment {
+                    channel_id: request.channel_id,
+                    balance_raw: request.balance_raw,
+                    signature: request.signature,
+                },
+            )
+            .await?;
             state.local_session_paid_msats = next_local_session_paid_msats;
             set_payment_in_flight(state, intended_channel_id.clone(), next_balance_raw);
             if let Some((owner, hop)) = &config.management {
@@ -755,7 +781,7 @@ pub(super) async fn apply_server_error(
     config: &SessionDriverConfig,
     state: &mut DriverState,
     code: ServerErrorCode,
-) {
+) -> io::Result<()> {
     // Rejection does not revoke a signed payment. Retain the pessimistic local
     // payment record: the relay may still claim those funds. The runtime ends
     // the session after recording any channel-specific consequences below.
@@ -769,12 +795,12 @@ pub(super) async fn apply_server_error(
             hop.relay_admission_refused(owner);
         }
         publish_spilman_info(config, state).await;
-        return;
+        return Ok(());
     }
 
     if defer_link_after_refresh_error(state, &code, Instant::now()) {
         publish_spilman_info(config, state).await;
-        return;
+        return Ok(());
     }
 
     if code == ServerErrorCode::ChannelUnlinkRejected {
@@ -789,16 +815,28 @@ pub(super) async fn apply_server_error(
         );
         if let Some(channel_id) = state.intended_channel_id.clone() {
             finish_channel_release(state, &channel_id);
-            let _ = config.wallet.mark_channel_unusable(&channel_id);
+            config
+                .wallet
+                .mark_channel_unusable(&channel_id)
+                .map_err(|error| {
+                    io::Error::other(format!("failed to persist rejected unlink: {error}"))
+                })?;
             abandon_intended_channel(config, state, channel_id, true).await;
         }
-        return;
+        return Ok(());
     }
 
     if server_error_rejects_intended_channel(&code) {
         if let Some(channel_id) = state.intended_channel_id.clone() {
             if server_error_invalidates_channel(&code) {
-                let _ = config.wallet.mark_channel_unusable(&channel_id);
+                config
+                    .wallet
+                    .mark_channel_unusable(&channel_id)
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "failed to persist unusable channel after {code:?}: {error}"
+                        ))
+                    })?;
             }
             let exclude_for_session = matches!(
                 code,
@@ -808,13 +846,14 @@ pub(super) async fn apply_server_error(
                     | ServerErrorCode::LinkChannelRetired
             );
             abandon_intended_channel(config, state, channel_id, exclude_for_session).await;
-            return;
+            return Ok(());
         }
     }
 
     // No intended channel was rejected, but we still need to republish Spilman
     // info because the in-flight operation was cleared above.
     publish_spilman_info(config, state).await;
+    Ok(())
 }
 
 pub(super) fn link_refresh_retry_delay(code: &ServerErrorCode) -> Option<Duration> {
