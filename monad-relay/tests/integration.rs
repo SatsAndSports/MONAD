@@ -31,7 +31,8 @@ use monad_client::session_driver::{start_session_payment_driver, PaymentPolicy};
 use monad_client::sqlite_client_wallet::{ChannelFundRecoveryResult, SqliteClientWallet};
 use monad_client::tunnel;
 use monad_client::wallet::{
-    MockWallet, MonadWallet, RelayPaymentOffer, WalletChannel, WalletChannelState, WalletError,
+    MockWallet, MonadWallet, RelayPaymentOffer, WalletChannel, WalletChannelAccounting,
+    WalletChannelState, WalletError,
 };
 use monad_common::blinded_connect::BlindedConnectRequest;
 use monad_common::blinded_hop::{build_blinded_hop_descriptor, BlindedHopDescriptor};
@@ -44,7 +45,9 @@ use monad_common::bootstrap::{
 use monad_common::control_codec::{encode_json_line, try_decode_json_line, MAX_CONTROL_LINE_LEN};
 use monad_common::h2stream::wait_for_send_capacity;
 use monad_common::noise_secp256k1;
-use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
+use monad_common::protocol::{
+    ChannelLinkRequest, ChannelPaymentRequest, ClientMessage, ServerErrorCode, ServerMessage,
+};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::RelayConnection;
@@ -103,6 +106,94 @@ const MAX_SHARED_BIND_RETRIES: usize = 32;
 const SYNTHETIC_TEST_MINT_URL: &str = "https://test-mint.invalid";
 const SYNTHETIC_TEST_MINT_UNIT: &str = "msat";
 const SYNTHETIC_TEST_KEYSET_ID: &str = "0000000000000001";
+
+fn fixture_channel_id(label: impl AsRef<str>) -> String {
+    let label = label.as_ref();
+    if label.len() == 64
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        label.to_string()
+    } else {
+        hex::encode(Sha256::digest(label.as_bytes()))
+    }
+}
+
+fn fixture_link_params(capacity: u64, unit: &str) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("mint".to_string(), SYNTHETIC_TEST_MINT_URL.into()),
+        ("unit".to_string(), unit.into()),
+        ("capacity".to_string(), capacity.into()),
+        ("funding_token_amount".to_string(), capacity.into()),
+        ("keyset_id".to_string(), SYNTHETIC_TEST_KEYSET_ID.into()),
+        ("input_fee_ppk".to_string(), 0.into()),
+        ("maximum_amount_for_one_output".to_string(), 0.into()),
+        ("setup_timestamp".to_string(), 0.into()),
+        ("sender_pubkey".to_string(), "sender".into()),
+        ("receiver_pubkey".to_string(), "receiver".into()),
+        ("expiry_timestamp".to_string(), u64::MAX.into()),
+    ])
+}
+
+fn channel_link_message(request: ChannelLinkRequest) -> ClientMessage {
+    let ChannelLinkRequest {
+        channel_id,
+        zero_balance_signature,
+        params,
+        funding_token,
+    } = request;
+    ClientMessage::ChannelLink {
+        channel_id,
+        zero_balance_signature,
+        params,
+        funding_token,
+    }
+}
+
+fn channel_payment_message(request: ChannelPaymentRequest) -> ClientMessage {
+    let ChannelPaymentRequest {
+        channel_id,
+        balance_raw,
+        signature,
+    } = request;
+    ClientMessage::ChannelPayment {
+        channel_id,
+        balance_raw,
+        signature,
+    }
+}
+
+fn parse_raw_link_request(json: &str) -> ChannelLinkRequest {
+    let payment: cdk_spilman::Payment =
+        serde_json::from_str(json).expect("cdk-spilman should return a valid payment");
+    assert_eq!(payment.balance, 0, "link request must sign zero balance");
+    let params = payment
+        .params
+        .expect("link request should include params")
+        .as_object()
+        .cloned()
+        .expect("channel params should be an object");
+    let proofs = payment
+        .funding_proofs
+        .expect("link request should include funding proofs");
+    let mint_url = params["mint"]
+        .as_str()
+        .expect("channel params should include a mint")
+        .parse()
+        .expect("channel mint should be a URL");
+    let unit = params["unit"]
+        .as_str()
+        .expect("channel params should include a unit")
+        .parse()
+        .expect("channel unit should be valid");
+    ChannelLinkRequest {
+        channel_id: payment.channel_id,
+        zero_balance_signature: payment.signature,
+        params,
+        funding_token: cashu::nuts::Token::new(mint_url, proofs, None, unit).to_string(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -1712,19 +1803,19 @@ async fn create_paid_closed_channel(
     wallet
         .attach_channel_to_session(&channel_id, session_id)
         .unwrap();
-    let link_json = wallet.build_link_request(&channel_id, offer).unwrap();
+    let link_request = wallet.build_link_request(&channel_id, offer).unwrap();
     payments
         .link_channel(
             &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
             session_id,
-            &link_json,
+            &link_request,
         )
         .unwrap();
-    let payment_json = wallet
+    let payment_request = wallet
         .build_channel_payment(&channel_id, offer, 0, funded_balance_raw)
         .unwrap();
     payments
-        .apply_channel_payment(session_id, &channel_id, &payment_json)
+        .apply_channel_payment(session_id, &channel_id, &payment_request)
         .unwrap();
 
     let net = wallet_manager
@@ -1755,19 +1846,19 @@ async fn create_paid_open_channel_with_expiry(
     wallet
         .attach_channel_to_session(&channel_id, session_id)
         .unwrap();
-    let link_json = wallet.build_link_request(&channel_id, offer).unwrap();
+    let link_request = wallet.build_link_request(&channel_id, offer).unwrap();
     payments
         .link_channel(
             &monad_common::bootstrap::supported_cashu_spilman_keyset_versions(),
             session_id,
-            &link_json,
+            &link_request,
         )
         .unwrap();
-    let payment_json = wallet
+    let payment_request = wallet
         .build_channel_payment(&channel_id, offer, 0, funded_balance_raw)
         .unwrap();
     payments
-        .apply_channel_payment(session_id, &channel_id, &payment_json)
+        .apply_channel_payment(session_id, &channel_id, &payment_request)
         .unwrap();
     channel_id
 }
@@ -3087,7 +3178,7 @@ struct SessionPaymentChannel {
 impl SessionPaymentChannel {
     fn for_session_id(session_id: &[u8; 32]) -> Self {
         Self {
-            channel_id: format!("test-chan-{}", hex::encode(&session_id[..8])),
+            channel_id: fixture_channel_id(format!("test-chan-{}", hex::encode(&session_id[..8]))),
             cumulative_balance_units: 0,
             unit: "msat",
         }
@@ -3095,7 +3186,7 @@ impl SessionPaymentChannel {
 
     fn for_explicit_id(channel_id: impl Into<String>) -> Self {
         Self {
-            channel_id: channel_id.into(),
+            channel_id: fixture_channel_id(channel_id.into()),
             cumulative_balance_units: 0,
             unit: "msat",
         }
@@ -3110,22 +3201,21 @@ impl SessionPaymentChannel {
         TEST_CHANNEL_CAPACITY_UNITS
     }
 
-    fn link_json(&self) -> String {
-        serde_json::json!({
-            "channel_id": self.channel_id,
-            "balance": 0,
-            "capacity": self.capacity_units(),
-            "unit": self.unit,
-        })
-        .to_string()
+    fn link_request(&self) -> ChannelLinkRequest {
+        ChannelLinkRequest {
+            channel_id: self.channel_id.clone(),
+            zero_balance_signature: "0".repeat(128),
+            params: fixture_link_params(self.capacity_units(), self.unit),
+            funding_token: String::new(),
+        }
     }
 
-    fn payment_json(&self) -> String {
-        serde_json::json!({
-            "channel_id": self.channel_id,
-            "balance": self.cumulative_balance_units,
-        })
-        .to_string()
+    fn payment_request(&self) -> ChannelPaymentRequest {
+        ChannelPaymentRequest {
+            channel_id: self.channel_id.clone(),
+            balance_raw: self.cumulative_balance_units,
+            signature: "0".repeat(128),
+        }
     }
 
     async fn link_expect_balance(
@@ -3134,14 +3224,7 @@ impl SessionPaymentChannel {
         h2_recv: &mut h2::RecvStream,
         expected_balance_raw: u64,
     ) -> TestSessionStatus {
-        send_control_message(
-            h2_send,
-            &ClientMessage::ChannelLink {
-                payment_json: self.link_json(),
-            },
-            false,
-        )
-        .await;
+        send_control_message(h2_send, &channel_link_message(self.link_request()), false).await;
 
         let status = expect_session_status_struct(read_control_message(h2_recv).await);
         status.assert_linked_channel(
@@ -3184,9 +3267,7 @@ impl SessionPaymentChannel {
 
         send_control_message(
             h2_send,
-            &ClientMessage::ChannelPayment {
-                payment_json: self.payment_json(),
-            },
+            &channel_payment_message(self.payment_request()),
             false,
         )
         .await;
@@ -3321,7 +3402,7 @@ fn mock_wallet_channel(
     keyset_id: String,
 ) -> WalletChannel {
     WalletChannel {
-        channel_id: channel_id.to_string(),
+        channel_id: fixture_channel_id(channel_id),
         state: WalletChannelState::Open,
         receiver_pubkey,
         mint_url,
@@ -3793,7 +3874,7 @@ async fn test_channel_link_does_not_unpause_session() {
 }
 
 #[tokio::test]
-async fn test_non_zero_channel_link_is_rejected_and_does_not_link_session() {
+async fn test_invalid_zero_balance_signature_is_rejected_and_does_not_link_session() {
     let (server_addr, pubkey) = start_monad_relay().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let mut control = ControlSessionHarness::open(&conn).await;
@@ -3802,24 +3883,14 @@ async fn test_non_zero_channel_link_is_rejected_and_does_not_link_session() {
     assert!(status0.paused);
     assert_eq!(status0.remaining_milli_sats, 0);
 
-    let payment_json = serde_json::json!({
-        "channel_id": "bad-link",
-        "balance": 1,
-        "capacity": TEST_CHANNEL_CAPACITY_UNITS,
-        "unit": "msat",
-    })
-    .to_string();
-    send_control_message(
-        &mut control.send,
-        &ClientMessage::ChannelLink { payment_json },
-        false,
-    )
-    .await;
+    let mut request = SessionPaymentChannel::for_explicit_id("bad-link").link_request();
+    request.zero_balance_signature = "1".repeat(128);
+    send_control_message(&mut control.send, &channel_link_message(request), false).await;
 
     let (code, message) = control.expect_error().await;
-    assert_eq!(code, ServerErrorCode::LinkInvalidChannel);
+    assert_eq!(code, ServerErrorCode::LinkInvalidZeroBalanceSignature);
     assert!(
-        message.contains("link balance must be zero"),
+        message.contains("invalid zero-balance signature"),
         "unexpected error: {message}"
     );
 
@@ -3844,19 +3915,10 @@ async fn test_unsupported_unit_channel_link_is_rejected_and_does_not_link_sessio
     assert!(status0.paused);
     assert_eq!(status0.remaining_milli_sats, 0);
 
-    let payment_json = serde_json::json!({
-        "channel_id": "bad-unit",
-        "balance": 0,
-        "capacity": TEST_CHANNEL_CAPACITY_UNITS,
-        "unit": "usd",
-    })
-    .to_string();
-    send_control_message(
-        &mut control.send,
-        &ClientMessage::ChannelLink { payment_json },
-        false,
-    )
-    .await;
+    let request = SessionPaymentChannel::for_explicit_id("bad-unit")
+        .with_unit("usd")
+        .link_request();
+    send_control_message(&mut control.send, &channel_link_message(request), false).await;
 
     let (code, message) = control.expect_error().await;
     assert_eq!(code, ServerErrorCode::LinkUnsupportedUnit);
@@ -3907,7 +3969,7 @@ async fn test_channel_payment_msat_unpauses_with_raw_delta() {
 
 #[tokio::test]
 async fn test_channel_payment_with_funding_payload_is_rejected_and_state_is_unchanged() {
-    let (server_addr, pubkey) = start_monad_relay().await;
+    let (server_addr, pubkey, payments) = start_monad_relay_with_test_payments().await;
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
 
@@ -3928,54 +3990,35 @@ async fn test_channel_payment_with_funding_payload_is_rejected_and_state_is_unch
     assert!(!paused2);
 
     let bad_payment_json = serde_json::json!({
-        "channel_id": channel.channel_id,
-        "balance": channel.cumulative_balance_units + 1,
+        "type": "ChannelPayment",
+        "channel_id": channel.channel_id.clone(),
+        "balance_raw": channel.cumulative_balance_units + 1,
+        "signature": "0".repeat(128),
         "params": { "fake": true },
     })
     .to_string();
-    send_control_message(
+    send_raw_control_bytes(
         &mut control_send,
-        &ClientMessage::ChannelPayment {
-            payment_json: bad_payment_json,
-        },
+        format!("{bad_payment_json}\n").as_bytes(),
         false,
     )
     .await;
 
     match read_control_message(&mut control_recv).await {
         ServerMessage::Error { code, message } => {
-            assert_eq!(code, ServerErrorCode::PaymentInvalid);
+            assert_eq!(code, ServerErrorCode::ControlInvalidMessage);
             assert!(
-                message.contains("must not include funding"),
+                message.contains("invalid control message"),
                 "unexpected error: {message}"
             );
         }
         other => panic!("expected Error for funding-bearing ChannelPayment, got {other:?}"),
     }
 
-    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
-    match read_control_message(&mut control_recv).await {
-        ServerMessage::SessionStatus {
-            linked_channel,
-            total_paid_millisats,
-            remaining_milli_sats,
-            paused,
-            ..
-        } => {
-            assert_eq!(
-                linked_channel
-                    .as_ref()
-                    .map(|channel| channel.channel_id.as_str()),
-                Some("chan-funded-payload")
-            );
-            assert_eq!(total_paid_millisats, 50);
-            assert_eq!(remaining_milli_sats, 50);
-            assert!(!paused);
-        }
-        other => {
-            panic!("expected SessionStatus after rejected funding-bearing payment, got {other:?}")
-        }
-    }
+    let linked = payments
+        .linked_channel_status(&channel.channel_id)
+        .expect("malformed outer message must not mutate the linked channel");
+    assert_eq!(linked.balance_raw, 50);
 
     let _ = control_send.send_data(Bytes::new(), true);
     drop(control_send);
@@ -3999,9 +4042,10 @@ async fn test_session_payment_driver_links_unpauses_and_allows_data_flow() {
         start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
 
     let wallet = Arc::new(MockWallet::new());
+    let channel_id = fixture_channel_id("driver-chan");
     wallet
         .insert_channel(mock_wallet_channel(
-            "driver-chan",
+            &channel_id,
             receiver_pubkey,
             mint_url,
             keyset_id,
@@ -4026,11 +4070,8 @@ async fn test_session_payment_driver_links_unpauses_and_allows_data_flow() {
     let target = format!("127.0.0.1:{}", upper_addr.port());
     let result = tunnel_roundtrip(&mut h2, &target, b"wallet flow").await;
     assert_eq!(result, b"WALLET FLOW");
-    assert!(wallet.last_link_payload("driver-chan").unwrap().is_some());
-    assert!(wallet
-        .last_payment_payload("driver-chan")
-        .unwrap()
-        .is_some());
+    assert!(wallet.last_link_payload(&channel_id).unwrap().is_some());
+    assert!(wallet.last_payment_payload(&channel_id).unwrap().is_some());
 
     driver_handle.abort();
     let _ = driver_handle.await;
@@ -4299,7 +4340,7 @@ async fn test_cooperative_channel_unlink_handshake() {
     };
     // Capture a valid relink payload while the channel is still open so we can
     // prove the retired channel is rejected by channel ID after unlink.
-    let relink = wallet.build_raw_link_request(&first).unwrap();
+    let relink = parse_raw_link_request(&wallet.build_raw_link_request(&first).unwrap());
 
     // Relay management service over a unix socket.
     let socket_dir = tempfile::tempdir().unwrap();
@@ -4580,7 +4621,7 @@ async fn test_expiring_funding_keyset_discovery_persistence_and_link_admission()
             .await
             .unwrap();
         wallet.attach_channel_to_session(&channel, [1; 32]).unwrap();
-        let link = wallet.build_raw_link_request(&channel).unwrap();
+        let link = parse_raw_link_request(&wallet.build_raw_link_request(&channel).unwrap());
         let versions = supported_cashu_spilman_keyset_versions();
         if !v2 {
             // V1 expiry is metadata, not part of the keyset ID. Explicit zero
@@ -4642,30 +4683,25 @@ async fn test_expiring_funding_keyset_discovery_persistence_and_link_admission()
         assert_eq!(payments.funding_keyset_recovery_window_secs(), 86_400);
         payments.link_channel(&versions, [1; 32], &link).unwrap();
 
-        // Neither omitted nor forged caller params can weaken stored admission.
-        let mut relink: serde_json::Value = serde_json::from_str(&link).unwrap();
-        for forged in [false, true] {
-            if forged {
-                relink["params"] =
-                    serde_json::from_str::<serde_json::Value>(&link).unwrap()["params"].clone();
-                relink["params"]["expiry_timestamp"] = serde_json::json!(channel_expiry - 1);
-            } else {
-                relink.as_object_mut().unwrap().remove("params");
-                relink.as_object_mut().unwrap().remove("funding_proofs");
-            }
-            assert!(matches!(
-                strict.link_channel(&versions, [2; 32], &relink.to_string()),
-                Err(LinkError::InvalidChannel(_))
-            ));
-            if forged {
-                // Claiming a later expiry cannot bypass the stored expiry.
-                relink["params"]["expiry_timestamp"] = serde_json::json!(u64::MAX - 1);
-            }
-            assert_eq!(
-                short_lifetime.link_channel(&versions, [2; 32], &relink.to_string()),
-                Err(LinkError::ChannelExpired)
-            );
-        }
+        // Forged caller values cannot weaken authoritative stored admission.
+        let mut relink = link.clone();
+        relink.params.insert(
+            "expiry_timestamp".to_string(),
+            serde_json::json!(channel_expiry - 1),
+        );
+        assert!(matches!(
+            strict.link_channel(&versions, [2; 32], &relink),
+            Err(LinkError::InvalidChannel(_))
+        ));
+        // Claiming a later expiry cannot bypass the stored expiry.
+        relink.params.insert(
+            "expiry_timestamp".to_string(),
+            serde_json::json!(u64::MAX - 1),
+        );
+        assert_eq!(
+            short_lifetime.link_channel(&versions, [2; 32], &relink),
+            Err(LinkError::ChannelExpired)
+        );
         let offer = RelayPaymentOffer {
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
@@ -4819,40 +4855,35 @@ async fn test_negotiated_keyset_link_enforcement_is_session_local() {
             .advertisements
             .iter()
             .all(|ad| ad.funding_keyset_recovery_window_secs == 86_400));
-        send_control_message(
-            send,
-            &ClientMessage::ChannelLink {
-                payment_json: links[index].clone(),
-            },
-            false,
-        )
-        .await;
+        send_control_message(send, &channel_link_message(links[index].clone()), false).await;
         let linked = expect_session_status_struct(read_control_message(recv).await);
         assert_eq!(linked.linked_channel.unwrap().channel_id, ids[index]);
     }
-    // Incoming params cannot override or bypass authoritative stored funding.
-    let mut omitted: serde_json::Value = serde_json::from_str(&links[1]).unwrap();
-    omitted.as_object_mut().unwrap().remove("params");
-    omitted.as_object_mut().unwrap().remove("funding_proofs");
-    for payload in [&links[1], &omitted.to_string()] {
-        assert_eq!(
-            payments
-                .link_channel(&v1, *bad.session_id(), payload)
-                .unwrap_err(),
-            monad_relay::payments::LinkError::KeysetVersionNotNegotiated
-        );
-        assert!(payments
-            .link_channel(&v2, *good.session_id(), &links[1])
-            .unwrap()
-            .evicted_session
-            .is_none());
-    }
-    let mut spoofed: serde_json::Value = serde_json::from_str(&links[1]).unwrap();
-    spoofed["params"] =
-        serde_json::from_str::<serde_json::Value>(&links[0]).unwrap()["params"].clone();
+    // Malformed relinks fail structural validation before stored-funding
+    // semantics; valid incoming values cannot override authoritative storage.
+    let mut omitted = links[1].clone();
+    omitted.params.clear();
+    omitted.funding_token.clear();
+    assert!(matches!(
+        payments.link_channel(&v1, *bad.session_id(), &omitted),
+        Err(monad_relay::payments::LinkError::InvalidPayment(_))
+    ));
     assert_eq!(
         payments
-            .link_channel(&v1, *bad.session_id(), &spoofed.to_string())
+            .link_channel(&v1, *bad.session_id(), &links[1])
+            .unwrap_err(),
+        monad_relay::payments::LinkError::KeysetVersionNotNegotiated
+    );
+    assert!(payments
+        .link_channel(&v2, *good.session_id(), &links[1])
+        .unwrap()
+        .evicted_session
+        .is_none());
+    let mut spoofed = links[1].clone();
+    spoofed.params = links[0].params.clone();
+    assert_eq!(
+        payments
+            .link_channel(&v1, *bad.session_id(), &spoofed)
             .unwrap_err(),
         monad_relay::payments::LinkError::KeysetVersionNotNegotiated
     );
@@ -4863,14 +4894,7 @@ async fn test_negotiated_keyset_link_enforcement_is_session_local() {
     let payment = wallets[0]
         .build_channel_payment(&ids[0], &offers[0], 0, 100)
         .unwrap();
-    send_control_message(
-        &mut bad_send,
-        &ClientMessage::ChannelPayment {
-            payment_json: payment,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut bad_send, &channel_payment_message(payment), false).await;
     assert!(!expect_session_status_struct(read_control_message(&mut bad_recv).await).paused);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = listener.local_addr().unwrap();
@@ -4882,9 +4906,7 @@ async fn test_negotiated_keyset_link_enforcement_is_session_local() {
     assert_eq!(&byte, b"X");
     send_control_message(
         &mut bad_send,
-        &ClientMessage::ChannelLink {
-            payment_json: omitted.to_string(),
-        },
+        &channel_link_message(links[1].clone()),
         false,
     )
     .await;
@@ -4941,9 +4963,10 @@ async fn test_session_payment_driver_proactively_pays_from_local_counters() {
         start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
 
     let wallet = Arc::new(MockWallet::new());
+    let channel_id = fixture_channel_id("driver-chan");
     wallet
         .insert_channel(mock_wallet_channel(
-            "driver-chan",
+            &channel_id,
             receiver_pubkey,
             mint_url,
             keyset_id,
@@ -4964,9 +4987,7 @@ async fn test_session_payment_driver_proactively_pays_from_local_counters() {
         .expect("driver should ready")
         .expect("driver ready signal");
 
-    let initial_payment_builds = wallet
-        .successful_payment_build_count("driver-chan")
-        .unwrap();
+    let initial_payment_builds = wallet.successful_payment_build_count(&channel_id).unwrap();
     assert_eq!(initial_payment_builds, 1);
 
     let target = format!("127.0.0.1:{}", upper_addr.port());
@@ -4979,11 +5000,7 @@ async fn test_session_payment_driver_proactively_pays_from_local_counters() {
 
     timeout(Duration::from_secs(2), async {
         loop {
-            if wallet
-                .successful_payment_build_count("driver-chan")
-                .unwrap()
-                >= 2
-            {
+            if wallet.successful_payment_build_count(&channel_id).unwrap() >= 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5013,9 +5030,10 @@ async fn test_session_payment_driver_timer_does_not_duplicate_payment_builds() {
         start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
 
     let wallet = Arc::new(MockWallet::new());
+    let channel_id = fixture_channel_id("driver-chan");
     wallet
         .insert_channel(mock_wallet_channel(
-            "driver-chan",
+            &channel_id,
             receiver_pubkey,
             mint_url,
             keyset_id,
@@ -5046,11 +5064,7 @@ async fn test_session_payment_driver_timer_does_not_duplicate_payment_builds() {
 
     timeout(Duration::from_secs(2), async {
         loop {
-            if wallet
-                .successful_payment_build_count("driver-chan")
-                .unwrap()
-                >= 2
-            {
+            if wallet.successful_payment_build_count(&channel_id).unwrap() >= 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5061,9 +5075,7 @@ async fn test_session_payment_driver_timer_does_not_duplicate_payment_builds() {
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(
-        wallet
-            .successful_payment_build_count("driver-chan")
-            .unwrap(),
+        wallet.successful_payment_build_count(&channel_id).unwrap(),
         2
     );
 
@@ -5084,9 +5096,11 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
         start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
 
     let wallet = Arc::new(MockWallet::new());
+    let bad_channel_id = "a".repeat(64);
+    let good_channel_id = "b".repeat(64);
     wallet
         .insert_channel(mock_wallet_channel(
-            "a-bad",
+            &bad_channel_id,
             receiver_pubkey.clone(),
             mint_url.clone(),
             keyset_id.clone(),
@@ -5094,13 +5108,15 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
         .unwrap();
     wallet
         .insert_channel(mock_wallet_channel(
-            "b-good",
+            &good_channel_id,
             receiver_pubkey,
             mint_url,
             keyset_id,
         ))
         .unwrap();
-    wallet.force_next_link_wrong_receiver("a-bad").unwrap();
+    wallet
+        .force_next_link_wrong_receiver(&bad_channel_id)
+        .unwrap();
 
     let conn = connect_client_quic_secp(server_addr, &pubkey).await;
     let (driver_handle, ready_rx, _failure_rx) = start_session_payment_driver(
@@ -5117,12 +5133,18 @@ async fn test_session_payment_driver_marks_invalid_channel_and_reselects() {
         .expect("driver ready signal");
 
     assert_eq!(
-        wallet.get_channel("a-bad").unwrap().state,
+        wallet.get_channel(&bad_channel_id).unwrap().state,
         WalletChannelState::Closing
     );
-    assert!(wallet.last_link_payload("a-bad").unwrap().is_some());
-    assert!(wallet.last_link_payload("b-good").unwrap().is_some());
-    assert!(wallet.last_payment_payload("b-good").unwrap().is_some());
+    assert!(wallet.last_link_payload(&bad_channel_id).unwrap().is_some());
+    assert!(wallet
+        .last_link_payload(&good_channel_id)
+        .unwrap()
+        .is_some());
+    assert!(wallet
+        .last_payment_payload(&good_channel_id)
+        .unwrap()
+        .is_some());
 
     driver_handle.abort();
     let _ = driver_handle.await;
@@ -5246,9 +5268,11 @@ async fn test_session_payment_rejection_preserves_signature_and_ends_session() {
         start_monad_relay_with_spilman(trusted_mint_units, payment_receiver_secret).await;
 
     let wallet = Arc::new(MockWallet::new());
+    let first_channel_id = "a".repeat(64);
+    let second_channel_id = "b".repeat(64);
     wallet
         .insert_channel(mock_wallet_channel(
-            "a-first",
+            &first_channel_id,
             receiver_pubkey.clone(),
             mint_url.clone(),
             keyset_id.clone(),
@@ -5256,7 +5280,7 @@ async fn test_session_payment_rejection_preserves_signature_and_ends_session() {
         .unwrap();
     wallet
         .insert_channel(mock_wallet_channel(
-            "b-second",
+            &second_channel_id,
             receiver_pubkey,
             mint_url,
             keyset_id,
@@ -5284,7 +5308,7 @@ async fn test_session_payment_rejection_preserves_signature_and_ends_session() {
     // The driver linked and paid "a-first" to reach the target buffer. Close
     // it from the relay side to simulate a unilateral close.
     assert!(
-        payments.mark_closed("a-first"),
+        payments.mark_closed(&first_channel_id),
         "relay should have recorded the channel"
     );
 
@@ -5305,27 +5329,38 @@ async fn test_session_payment_rejection_preserves_signature_and_ends_session() {
         *failure_rx.borrow(),
         "route recovery should observe failure"
     );
-    let signed = wallet.get_channel("a-first").unwrap();
+    let signed = wallet.get_channel(&first_channel_id).unwrap();
     assert!(signed.current_signed_balance_msats > 1000);
-    let payment: serde_json::Value =
-        serde_json::from_str(&wallet.last_payment_payload("a-first").unwrap().unwrap()).unwrap();
+    let payment: serde_json::Value = serde_json::from_str(
+        &wallet
+            .last_payment_payload(&first_channel_id)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
-        payment["balance"].as_u64().unwrap() * 1000,
+        payment["balance_raw"].as_u64().unwrap() * 1000,
         signed.current_signed_balance_msats,
         "rejected signature and signed high-water mark must be retained"
     );
 
     assert_eq!(
-        wallet.get_channel("a-first").unwrap().state,
+        wallet.get_channel(&first_channel_id).unwrap().state,
         WalletChannelState::Closing,
         "closed channel should be marked unusable"
     );
     assert!(
-        wallet.last_link_payload("b-second").unwrap().is_none(),
+        wallet
+            .last_link_payload(&second_channel_id)
+            .unwrap()
+            .is_none(),
         "rejection must not trigger replacement funding in this session"
     );
     assert!(
-        wallet.last_payment_payload("b-second").unwrap().is_none(),
+        wallet
+            .last_payment_payload(&second_channel_id)
+            .unwrap()
+            .is_none(),
         "no payment should be sent on the second channel"
     );
 
@@ -5356,13 +5391,11 @@ async fn test_closed_channel_payment_is_rejected_after_successful_link_and_payme
     assert_eq!(rem2, 50);
     assert!(!paused2);
 
-    assert!(payments.mark_closed("chan-closed-later"));
+    assert!(payments.mark_closed(&channel.channel_id));
     channel.cumulative_balance_units = channel.cumulative_balance_units.saturating_add(1);
     send_control_message(
         &mut control.send,
-        &ClientMessage::ChannelPayment {
-            payment_json: channel.payment_json(),
-        },
+        &channel_payment_message(channel.payment_request()),
         false,
     )
     .await;
@@ -5376,7 +5409,7 @@ async fn test_closed_channel_payment_is_rejected_after_successful_link_and_payme
 
     let status = control.get_status().await;
     status.assert_linked_channel(
-        "chan-closed-later",
+        &channel.channel_id,
         50,
         channel.capacity_units(),
         channel.unit,
@@ -5401,10 +5434,11 @@ async fn test_session_payment_driver_detaches_evicted_channel() {
 
     let wallet_a = Arc::new(MockWallet::new());
     let wallet_b = Arc::new(MockWallet::new());
+    let channel_id = fixture_channel_id("shared-channel");
     for wallet in [&wallet_a, &wallet_b] {
         wallet
             .insert_channel(mock_wallet_channel(
-                "shared-channel",
+                &channel_id,
                 receiver_pubkey.clone(),
                 mint_url.clone(),
                 keyset_id.clone(),
@@ -5425,12 +5459,12 @@ async fn test_session_payment_driver_detaches_evicted_channel() {
         .await
         .expect("driver a should ready")
         .expect("driver a ready signal");
-    assert!(wallet_a.attachment("shared-channel").unwrap().is_some());
+    assert!(wallet_a.attachment(&channel_id).unwrap().is_some());
     wallet_b
         .set_balance(
-            "shared-channel",
+            &channel_id,
             wallet_a
-                .get_channel("shared-channel")
+                .get_channel(&channel_id)
                 .unwrap()
                 .current_signed_balance_msats,
         )
@@ -5452,7 +5486,7 @@ async fn test_session_payment_driver_detaches_evicted_channel() {
 
     timeout(Duration::from_secs(2), async {
         loop {
-            if wallet_a.attachment("shared-channel").unwrap().is_none() {
+            if wallet_a.attachment(&channel_id).unwrap().is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5460,7 +5494,7 @@ async fn test_session_payment_driver_detaches_evicted_channel() {
     })
     .await
     .expect("driver a should observe eviction");
-    assert!(wallet_b.attachment("shared-channel").unwrap().is_some());
+    assert!(wallet_b.attachment(&channel_id).unwrap().is_some());
 
     driver_a.abort();
     let _ = driver_a.await;
@@ -5515,7 +5549,8 @@ async fn test_channel_eviction_clears_linked_channel() {
     let _ = channel_a.link(&mut send_a, &mut recv_a).await;
     let _ = channel_b.link(&mut send_b, &mut recv_b).await;
 
-    let eviction_status = assert_evicted_then_status(&mut send_a, &mut recv_a, "shared").await;
+    let eviction_status =
+        assert_evicted_then_status(&mut send_a, &mut recv_a, &channel_a.channel_id).await;
     assert_eq!(eviction_status.linked_channel, None);
     assert!(eviction_status.paused);
 
@@ -5561,11 +5596,11 @@ async fn test_channel_eviction_preserves_existing_session_balance() {
             .linked_channel
             .as_ref()
             .map(|channel| channel.channel_id.as_str()),
-        Some("shared-funded")
+        Some(channel_b.channel_id.as_str())
     );
 
     let eviction_status =
-        assert_evicted_then_status(&mut send_a, &mut recv_a, "shared-funded").await;
+        assert_evicted_then_status(&mut send_a, &mut recv_a, &channel_a.channel_id).await;
     assert_eq!(eviction_status.linked_channel, None);
     assert_eq!(eviction_status.total_paid_millisats, paid_before_eviction);
     assert_eq!(
@@ -5574,7 +5609,7 @@ async fn test_channel_eviction_preserves_existing_session_balance() {
     );
     assert!(!eviction_status.paused);
     assert_eq!(
-        payments.owner_of("shared-funded"),
+        payments.owner_of(&channel_b.channel_id),
         Some(*conn_b.session_id()),
         "ownership should transfer to the new session while credited balance remains usable"
     );
@@ -5610,7 +5645,7 @@ async fn test_control_detach_releases_channel_ownership() {
     let mut channel = SessionPaymentChannel::for_explicit_id("detach-owned");
     let _ = channel.link(&mut send_a, &mut recv_a).await;
     assert_eq!(
-        payments.owner_of("detach-owned"),
+        payments.owner_of(&channel.channel_id),
         Some(*conn_a.session_id()),
         "relay should record channel ownership for the linked session"
     );
@@ -5621,7 +5656,7 @@ async fn test_control_detach_releases_channel_ownership() {
 
     timeout(Duration::from_secs(2), async {
         loop {
-            if payments.owner_of("detach-owned").is_none() {
+            if payments.owner_of(&channel.channel_id).is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5630,14 +5665,14 @@ async fn test_control_detach_releases_channel_ownership() {
     .await
     .expect("relay should release linked channel ownership after control detach");
     assert_eq!(
-        payments.owner_of("detach-owned"),
+        payments.owner_of(&channel.channel_id),
         None,
         "relay should clear ownership map on detach"
     );
 
     let _ = channel.link(&mut send_b, &mut recv_b).await;
     assert_eq!(
-        payments.owner_of("detach-owned"),
+        payments.owner_of(&channel.channel_id),
         Some(*conn_b.session_id()),
         "ownership should transfer cleanly to the new session"
     );
@@ -5888,7 +5923,10 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
     assert_eq!(paid1, 0);
     assert_eq!(rem1, 0);
     assert!(paused1);
-    assert_eq!(payments.owner_of("chan-a"), Some(*conn.session_id()));
+    assert_eq!(
+        payments.owner_of(&channel_a.channel_id),
+        Some(*conn.session_id())
+    );
     let (_in1, _out1, paid1, rem1, paused1) =
         channel_a.pay(&mut control_send, &mut control_recv, 7).await;
     assert_eq!(paid1, 7);
@@ -5900,8 +5938,11 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
     assert_eq!(paid2, 7);
     assert_eq!(rem2, 7);
     assert!(!paused2);
-    assert_eq!(payments.owner_of("chan-a"), None);
-    assert_eq!(payments.owner_of("chan-b"), Some(*conn.session_id()));
+    assert_eq!(payments.owner_of(&channel_a.channel_id), None);
+    assert_eq!(
+        payments.owner_of(&channel_b.channel_id),
+        Some(*conn.session_id())
+    );
     send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::SessionStatus {
@@ -5915,7 +5956,7 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
                 linked_channel
                     .as_ref()
                     .map(|channel| channel.channel_id.as_str()),
-                Some("chan-b")
+                Some(channel_b.channel_id.as_str())
             );
             assert_eq!(total_paid_millisats, 7);
             assert_eq!(remaining_milli_sats, 7);
@@ -5933,9 +5974,7 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
     channel_a.cumulative_balance_units = channel_a.cumulative_balance_units.saturating_add(1);
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment {
-            payment_json: channel_a.payment_json(),
-        },
+        &channel_payment_message(channel_a.payment_request()),
         false,
     )
     .await;
@@ -5963,7 +6002,7 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
                 linked_channel
                     .as_ref()
                     .map(|channel| channel.channel_id.as_str()),
-                Some("chan-b")
+                Some(channel_b.channel_id.as_str())
             );
             assert_eq!(total_paid_millisats, 12);
             assert_eq!(remaining_milli_sats, 12);
@@ -5978,8 +6017,11 @@ async fn test_relinking_session_to_second_channel_preserves_credit_and_rejects_o
     assert_eq!(relinked_a.total_paid_millisats, 12);
     assert_eq!(relinked_a.remaining_milli_sats, 12);
     assert!(!relinked_a.paused);
-    assert_eq!(payments.owner_of("chan-a"), Some(*conn.session_id()));
-    assert_eq!(payments.owner_of("chan-b"), None);
+    assert_eq!(
+        payments.owner_of(&channel_a.channel_id),
+        Some(*conn.session_id())
+    );
+    assert_eq!(payments.owner_of(&channel_b.channel_id), None);
 
     channel_a.cumulative_balance_units = 7;
     let (_in3, _out3, paid3, rem3, paused3) =
@@ -6006,26 +6048,27 @@ async fn test_failed_replacement_preserves_link_ownership_and_credit() {
     let _ = channel_a.link(&mut control_send, &mut control_recv).await;
     let (_, _, paid_before, remaining_before, paused_before) =
         channel_a.pay(&mut control_send, &mut control_recv, 7).await;
-    assert_eq!(payments.owner_of("valid-a"), Some(*conn.session_id()));
+    assert_eq!(
+        payments.owner_of(&channel_a.channel_id),
+        Some(*conn.session_id())
+    );
+
+    let invalid_channel_id = fixture_channel_id("invalid-b");
 
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: serde_json::json!({
-                "channel_id": "invalid-b",
-                "balance": 0,
-                "capacity": TEST_CHANNEL_CAPACITY_UNITS,
-                "unit": "msat",
-                "invalid": true,
-            })
-            .to_string(),
-        },
+        &channel_link_message(ChannelLinkRequest {
+            channel_id: invalid_channel_id.clone(),
+            zero_balance_signature: "1".repeat(128),
+            params: fixture_link_params(TEST_CHANNEL_CAPACITY_UNITS, "msat"),
+            funding_token: String::new(),
+        }),
         false,
     )
     .await;
     match read_control_message(&mut control_recv).await {
         ServerMessage::Error { code, .. } => {
-            assert_eq!(code, ServerErrorCode::LinkInvalidChannel);
+            assert_eq!(code, ServerErrorCode::LinkInvalidZeroBalanceSignature);
         }
         other => panic!("expected rejected replacement, got {other:?}"),
     }
@@ -6037,13 +6080,16 @@ async fn test_failed_replacement_preserves_link_ownership_and_credit() {
             .linked_channel
             .as_ref()
             .map(|channel| channel.channel_id.as_str()),
-        Some("valid-a")
+        Some(channel_a.channel_id.as_str())
     );
     assert_eq!(status.total_paid_millisats, paid_before);
     assert_eq!(status.remaining_milli_sats, remaining_before);
     assert_eq!(status.paused, paused_before);
-    assert_eq!(payments.owner_of("valid-a"), Some(*conn.session_id()));
-    assert_eq!(payments.owner_of("invalid-b"), None);
+    assert_eq!(
+        payments.owner_of(&channel_a.channel_id),
+        Some(*conn.session_id())
+    );
+    assert_eq!(payments.owner_of(&invalid_channel_id), None);
 
     let (_, _, paid_after, remaining_after, paused_after) =
         channel_a.pay(&mut control_send, &mut control_recv, 2).await;
@@ -6094,9 +6140,11 @@ async fn test_production_link_failures_do_not_change_ownership() {
     wallet
         .attach_channel_to_session(&read_failure_channel, old_owner)
         .unwrap();
-    let read_failure_link = wallet
-        .build_raw_link_request(&read_failure_channel)
-        .unwrap();
+    let read_failure_link = parse_raw_link_request(
+        &wallet
+            .build_raw_link_request(&read_failure_channel)
+            .unwrap(),
+    );
     payments
         .link_channel(&versions, old_owner, &read_failure_link)
         .unwrap();
@@ -6128,9 +6176,11 @@ async fn test_production_link_failures_do_not_change_ownership() {
     wallet
         .attach_channel_to_session(&owner_failure_channel, old_owner)
         .unwrap();
-    let owner_failure_link = wallet
-        .build_raw_link_request(&owner_failure_channel)
-        .unwrap();
+    let owner_failure_link = parse_raw_link_request(
+        &wallet
+            .build_raw_link_request(&owner_failure_channel)
+            .unwrap(),
+    );
     payments
         .link_channel(&versions, old_owner, &owner_failure_link)
         .unwrap();
@@ -6438,23 +6488,35 @@ async fn test_control_stream_survives_connection_window_blocked_by_paused_tunnel
 
     // Control shares the 65,535-byte connection-level receive window with the
     // tunnel DATA above. A tiny message can squeeze through h2's zero-window
-    // WINDOW_UPDATE recycle fragment by fragment; a ChannelLink-sized payload
+    // WINDOW_UPDATE recycle fragment by fragment; a large valid extension
     // cannot complete in reasonable time unless connection-level capacity is
-    // returned as soon as the paused tunnel's DATA is buffered.
-    let large_payment = ClientMessage::ChannelPayment {
-        payment_json: format!(
-            "{{\"channel_id\":\"unknown\",\"balance\":1,\"padding\":\"{}\"}}",
-            "a".repeat(500_000)
-        ),
-    };
+    // returned as soon as the paused tunnel's DATA is buffered. A following
+    // Ping/Pong proves the control session remains usable.
+    let large_extension =
+        ClientMessage::ExtensionNotification(monad_common::protocol::ExtensionNotification {
+            name: "flow_control_probe".to_string(),
+            rest: serde_json::Map::from_iter([(
+                "padding".to_string(),
+                serde_json::Value::String("a".repeat(500_000)),
+            )]),
+        });
+    let nonce = "paused-window-probe".to_string();
     timeout(Duration::from_secs(2), async {
-        send_control_message(&mut control_send, &large_payment, false).await;
+        send_control_message(&mut control_send, &large_extension, false).await;
+        send_control_message(
+            &mut control_send,
+            &ClientMessage::Ping {
+                nonce: nonce.clone(),
+            },
+            false,
+        )
+        .await;
         loop {
             match read_control_message(&mut control_recv).await {
-                ServerMessage::Error { .. } => break,
+                ServerMessage::Pong { nonce: received } if received == nonce => break,
                 // Pause-transition statuses may still be queued; skip them.
                 ServerMessage::SessionStatus { .. } => continue,
-                other => panic!("expected payment Error response, got {other:?}"),
+                other => panic!("expected matching Pong response, got {other:?}"),
             }
         }
     })
@@ -6973,9 +7035,7 @@ async fn test_two_relays_share_one_wallet_manager_db() {
         .unwrap();
     send_control_message(
         &mut control_send_a,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json_a,
-        },
+        &channel_link_message(link_json_a),
         false,
     )
     .await;
@@ -6985,9 +7045,7 @@ async fn test_two_relays_share_one_wallet_manager_db() {
         .unwrap();
     send_control_message(
         &mut control_send_a,
-        &ClientMessage::ChannelPayment {
-            payment_json: payment_json_a,
-        },
+        &channel_payment_message(payment_json_a),
         false,
     )
     .await;
@@ -7014,9 +7072,7 @@ async fn test_two_relays_share_one_wallet_manager_db() {
         .unwrap();
     send_control_message(
         &mut control_send_b,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json_b,
-        },
+        &channel_link_message(link_json_b),
         false,
     )
     .await;
@@ -7026,9 +7082,7 @@ async fn test_two_relays_share_one_wallet_manager_db() {
         .unwrap();
     send_control_message(
         &mut control_send_b,
-        &ClientMessage::ChannelPayment {
-            payment_json: payment_json_b,
-        },
+        &channel_payment_message(payment_json_b),
         false,
     )
     .await;
@@ -7196,14 +7250,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
     );
 
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-    send_control_message(
-        &mut control_send2,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send2, &channel_link_message(link_json), false).await;
 
     let status_after_link =
         expect_session_status_struct(read_control_message(&mut control_recv2).await);
@@ -7232,7 +7279,7 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
         .unwrap();
     send_control_message(
         &mut control_send2,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -7331,14 +7378,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
         .attach_channel_to_session(&channel_id, *conn.session_id())
         .unwrap();
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
     let _ = expect_session_status_struct(read_control_message(&mut control_recv).await);
 
     let payment_json = wallet
@@ -7346,7 +7386,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -7412,14 +7452,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
         out_bytes_per_millisat: 1,
     };
     let link_json = wallet.build_link_request(&channel_id, &old_offer).unwrap();
-    send_control_message(
-        &mut control_send2,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send2, &channel_link_message(link_json), false).await;
     let status_after_link =
         expect_session_status_struct(read_control_message(&mut control_recv2).await);
     status_after_link.assert_linked_channel(&channel_id, stored_balance_msats / 1000, 1000, "sat");
@@ -7435,7 +7468,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
         .unwrap();
     send_control_message(
         &mut control_send2,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -7555,10 +7588,10 @@ async fn test_channel_link_rejects_known_keyset_unit_mismatch() {
     wallet
         .attach_channel_to_session(&channel_id, *conn.session_id())
         .unwrap();
-    let payment_json = wallet.build_raw_link_request(&channel_id).unwrap();
+    let payment_json = parse_raw_link_request(&wallet.build_raw_link_request(&channel_id).unwrap());
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelLink { payment_json },
+        &channel_link_message(payment_json),
         false,
     )
     .await;
@@ -7665,14 +7698,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
     let link_json = old_wallet
         .build_link_request(&old_channel_id, &old_offer)
         .unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
     let link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
     link_status.assert_linked_channel(&old_channel_id, 0, 1000, "sat");
 
@@ -7687,7 +7713,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -7797,14 +7823,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
     let link_json = new_wallet
         .build_link_request(&new_channel_id, &new_offer)
         .unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
     let new_link_status =
         expect_session_status_struct(read_control_message(&mut control_recv).await);
     new_link_status.assert_linked_channel(&new_channel_id, 0, 1000, "sat");
@@ -7814,9 +7833,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment {
-            payment_json: new_payment_json,
-        },
+        &channel_payment_message(new_payment_json),
         false,
     )
     .await;
@@ -7930,14 +7947,7 @@ async fn test_channel_link_refreshes_and_accepts_new_keyset() {
     let link_json = new_wallet
         .build_link_request(&new_channel_id, &new_offer)
         .unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
     let link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
     let new_capacity_raw = new_wallet
         .get_channel(&new_channel_id)
@@ -8026,26 +8036,30 @@ async fn test_malformed_unknown_keyset_links_do_not_consume_refresh_budget() {
         .unwrap();
     let original = wallet.build_link_request(&channel_id, &offer).unwrap();
     for corrupt_channel_id in [true, false] {
-        let mut payment: serde_json::Value = serde_json::from_str(&original).unwrap();
+        let mut payment = original.clone();
         let expected_code = if corrupt_channel_id {
-            payment["channel_id"] = serde_json::json!("00".repeat(32));
+            payment.channel_id = "00".repeat(32);
             ServerErrorCode::LinkInvalidChannel
         } else {
-            payment["funding_proofs"][0]["id"] = serde_json::json!(known_keyset_id);
+            payment.funding_token = "not-a-cashu-token".to_string();
             ServerErrorCode::LinkInvalidChannel
         };
-        send_control_message(
-            &mut control_send,
-            &ClientMessage::ChannelLink {
-                payment_json: serde_json::to_string(&payment).unwrap(),
-            },
-            false,
-        )
-        .await;
+        send_control_message(&mut control_send, &channel_link_message(payment), false).await;
         match read_control_message(&mut control_recv).await {
             ServerMessage::Error { code, .. } => assert_eq!(code, expected_code),
             other => panic!("expected channel-link keyset error, got {other:?}"),
         }
+    }
+    let mut over_limit = original.clone();
+    over_limit
+        .params
+        .insert("capacity".to_string(), serde_json::json!(u64::MAX));
+    send_control_message(&mut control_send, &channel_link_message(over_limit), false).await;
+    match read_control_message(&mut control_recv).await {
+        ServerMessage::Error { code, .. } => {
+            assert_eq!(code, ServerErrorCode::NumericLimitExceeded)
+        }
+        other => panic!("expected numeric-limit error, got {other:?}"),
     }
     assert_eq!(keyset_requests.load(Ordering::SeqCst), 0);
 
@@ -8077,9 +8091,7 @@ async fn test_malformed_unknown_keyset_links_do_not_consume_refresh_budget() {
     ] {
         send_control_message(
             &mut control_send,
-            &ClientMessage::ChannelLink {
-                payment_json: foreign_link.clone(),
-            },
+            &channel_link_message(foreign_link.clone()),
             false,
         )
         .await;
@@ -8162,9 +8174,7 @@ async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: wallet.build_link_request(&channel_id, &offer).unwrap(),
-        },
+        &channel_link_message(wallet.build_link_request(&channel_id, &offer).unwrap()),
         false,
     )
     .await;
@@ -8296,14 +8306,7 @@ async fn test_rotated_mint_stale_relay_falls_back_and_refreshes_on_link() {
         .attach_channel_to_session(&channel_id, *conn1.session_id())
         .unwrap();
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-    send_control_message(
-        &mut control_send1,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send1, &channel_link_message(link_json), false).await;
     let link_status = expect_session_status_struct(read_control_message(&mut control_recv1).await);
     let capacity_raw = link_status
         .linked_channel
@@ -8317,7 +8320,7 @@ async fn test_rotated_mint_stale_relay_falls_back_and_refreshes_on_link() {
         .unwrap();
     send_control_message(
         &mut control_send1,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -8412,9 +8415,7 @@ async fn test_rotated_mint_stale_relay_falls_back_and_refreshes_on_link() {
         for _ in 0..50 {
             send_control_message(
                 &mut control_send2,
-                &ClientMessage::ChannelLink {
-                    payment_json: link_json.clone(),
-                },
+                &channel_link_message(link_json.clone()),
                 false,
             )
             .await;
@@ -8448,7 +8449,7 @@ async fn test_rotated_mint_stale_relay_falls_back_and_refreshes_on_link() {
         .unwrap();
     send_control_message(
         &mut control_send2,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -8478,9 +8479,7 @@ async fn test_rotated_mint_stale_relay_falls_back_and_refreshes_on_link() {
     let new_link_json = wallet.build_link_request(&new_channel_id, &offer2).unwrap();
     send_control_message(
         &mut control_send2,
-        &ClientMessage::ChannelLink {
-            payment_json: new_link_json,
-        },
+        &channel_link_message(new_link_json),
         false,
     )
     .await;
@@ -10375,6 +10374,9 @@ impl MonadWallet for StalledProvisionWallet {
     fn get_channel(&self, id: &str) -> Result<WalletChannel, WalletError> {
         self.inner.get_channel(id)
     }
+    fn get_channel_accounting(&self, id: &str) -> Result<WalletChannelAccounting, WalletError> {
+        self.inner.get_channel_accounting(id)
+    }
     fn attach_channel_to_session(&self, id: &str, session: [u8; 32]) -> Result<(), WalletError> {
         self.inner.attach_channel_to_session(id, session)
     }
@@ -10402,7 +10404,7 @@ impl MonadWallet for StalledProvisionWallet {
         &self,
         id: &str,
         offer: &RelayPaymentOffer,
-    ) -> Result<String, WalletError> {
+    ) -> Result<ChannelLinkRequest, WalletError> {
         if self.stall_on_link {
             self.stall(id);
         }
@@ -10414,7 +10416,7 @@ impl MonadWallet for StalledProvisionWallet {
         offer: &RelayPaymentOffer,
         latest: u64,
         next: u64,
-    ) -> Result<String, WalletError> {
+    ) -> Result<ChannelPaymentRequest, WalletError> {
         self.inner.build_channel_payment(id, offer, latest, next)
     }
 }
@@ -12270,14 +12272,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
         .attach_channel_to_session(&channel_id, *conn.session_id())
         .unwrap();
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
     let _link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
 
     // Fund the session by paying part of the channel capacity.
@@ -12288,7 +12283,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -12345,7 +12340,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -12364,14 +12359,7 @@ async fn test_channel_close_blocks_further_payments_with_real_signatures() {
     // rejected, even though the wallet still produces a valid signed link
     // request (balance 0).
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
 
     let (code, message) = match read_control_message(&mut control_recv).await {
         ServerMessage::Error { code, message } => (code, message),
@@ -12449,14 +12437,7 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
         .attach_channel_to_session(&channel_id, *conn.session_id())
         .unwrap();
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
     let _link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
 
     let capacity_raw = wallet.get_channel(&channel_id).unwrap().capacity_msats / 1000;
@@ -12466,7 +12447,7 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -12621,14 +12602,7 @@ async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
         .attach_channel_to_session(&channel_id, *conn.session_id())
         .unwrap();
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
     let _link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
 
     let capacity_raw = wallet.get_channel(&channel_id).unwrap().capacity_msats / 1000;
@@ -12638,7 +12612,7 @@ async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -12831,14 +12805,7 @@ async fn test_wallet_manager_close_channel_by_id() {
         .attach_channel_to_session(&channel_id, *conn.session_id())
         .unwrap();
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
     let _link_status = expect_session_status_struct(read_control_message(&mut control_recv).await);
 
     let capacity_raw = wallet.get_channel(&channel_id).unwrap().capacity_msats / 1000;
@@ -12848,7 +12815,7 @@ async fn test_wallet_manager_close_channel_by_id() {
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -12963,14 +12930,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
         .attach_channel_to_session(&channel_id, *conn.session_id())
         .unwrap();
     let link_json = wallet.build_link_request(&channel_id, &offer).unwrap();
-    send_control_message(
-        &mut control_send,
-        &ClientMessage::ChannelLink {
-            payment_json: link_json,
-        },
-        false,
-    )
-    .await;
+    send_control_message(&mut control_send, &channel_link_message(link_json), false).await;
     let _ = expect_session_status_struct(read_control_message(&mut control_recv).await);
 
     let capacity_raw = wallet.get_channel(&channel_id).unwrap().capacity_msats / 1000;
@@ -12980,7 +12940,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
         .unwrap();
     send_control_message(
         &mut control_send,
-        &ClientMessage::ChannelPayment { payment_json },
+        &channel_payment_message(payment_json),
         false,
     )
     .await;
@@ -14139,7 +14099,7 @@ async fn test_sender_refund_is_terminal_with_or_without_extra_signature() {
             .link_channel(
                 &supported_cashu_spilman_keyset_versions(),
                 [36; 32],
-                &ctx.wallet.build_raw_link_request(&channel_id).unwrap()
+                &parse_raw_link_request(&ctx.wallet.build_raw_link_request(&channel_id).unwrap())
             )
             .is_err());
         assert!(ctx
@@ -14147,8 +14107,11 @@ async fn test_sender_refund_is_terminal_with_or_without_extra_signature() {
             .apply_channel_payment(
                 [35; 32],
                 &channel_id,
-                &serde_json::json!({"channel_id":channel_id,"balance":451,"signature":"invalid"})
-                    .to_string()
+                &ChannelPaymentRequest {
+                    channel_id: channel_id.clone(),
+                    balance_raw: 451,
+                    signature: "invalid".to_string(),
+                }
             )
             .is_err());
         // Relay terminal classification does not consume or invalidate sender outputs.

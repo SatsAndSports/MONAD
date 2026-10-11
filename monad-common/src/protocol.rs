@@ -6,6 +6,76 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
+fn deserialize_channel_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(serde::de::Error::custom("channel_id must be nonempty"));
+    }
+    Ok(value)
+}
+
+fn deserialize_signature<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() != 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(serde::de::Error::custom(
+            "signature must be 128 lowercase hexadecimal characters",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_unit<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if !matches!(value.as_str(), "sat" | "msat") {
+        return Err(serde::de::Error::custom("unit must be 'sat' or 'msat'"));
+    }
+    Ok(value)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelLinkParamsWire {
+    mint: String,
+    unit: String,
+    capacity: u64,
+    funding_token_amount: u64,
+    keyset_id: String,
+    input_fee_ppk: u64,
+    maximum_amount_for_one_output: u64,
+    setup_timestamp: u64,
+    sender_pubkey: String,
+    receiver_pubkey: String,
+    expiry_timestamp: u64,
+}
+
+fn deserialize_channel_link_params<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Map<String, serde_json::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let params = ChannelLinkParamsWire::deserialize(deserializer)?;
+    let serde_json::Value::Object(params) =
+        serde_json::to_value(params).map_err(serde::de::Error::custom)?
+    else {
+        unreachable!("a struct always serializes as an object");
+    };
+    Ok(params)
+}
+
 /// Optional advisory extension envelope. The only constrained member is one
 /// nonempty string `name`; optional and unknown members are preserved verbatim.
 /// A supplied `type` member is extension data and is preserved after decoding.
@@ -100,11 +170,36 @@ pub fn advertisement_options(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LinkedChannelStatus {
+    #[serde(deserialize_with = "deserialize_channel_id")]
     pub channel_id: String,
     pub balance_raw: u64,
     pub capacity_raw: u64,
+    #[serde(deserialize_with = "deserialize_unit")]
     pub unit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelLinkRequest {
+    #[serde(deserialize_with = "deserialize_channel_id")]
+    pub channel_id: String,
+    #[serde(deserialize_with = "deserialize_signature")]
+    pub zero_balance_signature: String,
+    #[serde(deserialize_with = "deserialize_channel_link_params")]
+    pub params: serde_json::Map<String, serde_json::Value>,
+    pub funding_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPaymentRequest {
+    #[serde(deserialize_with = "deserialize_channel_id")]
+    pub channel_id: String,
+    pub balance_raw: u64,
+    #[serde(deserialize_with = "deserialize_signature")]
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,16 +254,28 @@ pub enum ChannelEvictionScope {
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum ClientMessage {
     /// Link a Spilman channel to this session.
-    ///
-    /// The payload is a serialized `cdk_spilman::Payment` JSON object with
-    /// `balance == 0`, plus `params` and `funding_proofs` included.
-    ChannelLink { payment_json: String },
-    /// Increment session balance.
-    ///
-    /// The payload is a serialized `cdk_spilman::Payment` JSON object.
-    ChannelPayment { payment_json: String },
+    ChannelLink {
+        #[serde(deserialize_with = "deserialize_channel_id")]
+        channel_id: String,
+        #[serde(deserialize_with = "deserialize_signature")]
+        zero_balance_signature: String,
+        #[serde(deserialize_with = "deserialize_channel_link_params")]
+        params: serde_json::Map<String, serde_json::Value>,
+        funding_token: String,
+    },
+    /// Submit a cumulative signed channel payment.
+    ChannelPayment {
+        #[serde(deserialize_with = "deserialize_channel_id")]
+        channel_id: String,
+        balance_raw: u64,
+        #[serde(deserialize_with = "deserialize_signature")]
+        signature: String,
+    },
     /// Release linked ownership of a channel after all signed payments are acknowledged.
-    ChannelUnlink { channel_id: String },
+    ChannelUnlink {
+        #[serde(deserialize_with = "deserialize_channel_id")]
+        channel_id: String,
+    },
     /// Request a fresh session status snapshot.
     GetSessionStatus,
     /// Request correlated control-path liveness evidence.
@@ -211,16 +318,16 @@ pub enum ServerMessage {
 
     /// Another session claimed the channel; this session is now Unlinked.
     ChannelEvicted {
+        #[serde(deserialize_with = "deserialize_channel_id")]
         channel_id: String,
         scope: ChannelEvictionScope,
     },
     ChannelReleaseRequested {
+        #[serde(deserialize_with = "deserialize_channel_id")]
         channel_id: String,
     },
     /// Correlated response to a client Ping.
-    Pong {
-        nonce: String,
-    },
+    Pong { nonce: String },
 
     /// Server-initiated error or notification
     Error {
@@ -448,6 +555,27 @@ mod advertisement_tests {
     }
 
     #[test]
+    fn channel_ids_are_opaque_nonempty_strings() {
+        for id in ["x", "future:ID/Ω", &"a".repeat(128)] {
+            for value in [
+                json!({"type":"ChannelUnlink", "channel_id":id}),
+                json!({"type":"ChannelPayment", "channel_id":id,
+                    "balance_raw":1, "signature":"b".repeat(128)}),
+            ] {
+                assert!(serde_json::from_value::<ClientMessage>(value).is_ok());
+            }
+            assert!(serde_json::from_value::<LinkedChannelStatus>(json!({
+                "channel_id":id,"balance_raw":0,"capacity_raw":1,"unit":"sat"
+            }))
+            .is_ok());
+        }
+        assert!(serde_json::from_value::<LinkedChannelStatus>(json!({
+            "channel_id":"","balance_raw":0,"capacity_raw":1,"unit":"sat"
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn channel_unlink_is_id_only_and_rejects_legacy_fields() {
         let unlink = ClientMessage::ChannelUnlink {
             channel_id: "a".repeat(64),
@@ -465,6 +593,101 @@ mod advertisement_tests {
             "final_balance_raw":0
         });
         assert!(serde_json::from_value::<ClientMessage>(legacy).is_err());
+        assert!(serde_json::from_value::<ClientMessage>(json!({
+            "type":"ChannelUnlink",
+            "channel_id":""
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn channel_link_and_payment_use_exact_structured_wire_shapes() {
+        let channel_id = "a".repeat(64);
+        let signature = "b".repeat(128);
+        let params = serde_json::Map::from_iter([
+            ("mint".to_string(), json!("https://mint.example")),
+            ("unit".to_string(), json!("sat")),
+            ("capacity".to_string(), json!(100)),
+            ("funding_token_amount".to_string(), json!(101)),
+            ("keyset_id".to_string(), json!("0000000000000001")),
+            ("input_fee_ppk".to_string(), json!(0)),
+            ("maximum_amount_for_one_output".to_string(), json!(64)),
+            ("setup_timestamp".to_string(), json!(1)),
+            ("sender_pubkey".to_string(), json!("sender")),
+            ("receiver_pubkey".to_string(), json!("receiver")),
+            ("expiry_timestamp".to_string(), json!(2)),
+        ]);
+        let link = ClientMessage::ChannelLink {
+            channel_id: channel_id.clone(),
+            zero_balance_signature: signature.clone(),
+            params: params.clone(),
+            funding_token: "cashuBtoken".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(link).unwrap(),
+            json!({
+                "type":"ChannelLink",
+                "channel_id":channel_id,
+                "zero_balance_signature":signature,
+                "params":params,
+                "funding_token":"cashuBtoken"
+            })
+        );
+        let valid_link = json!({
+            "type":"ChannelLink",
+            "channel_id":"a".repeat(64),
+            "zero_balance_signature":"b".repeat(128),
+            "params":params,
+            "funding_token":"cashuBtoken"
+        });
+        assert!(serde_json::from_value::<ClientMessage>(valid_link.clone()).is_ok());
+
+        for mutation in [
+            ("capacity", json!("100")),
+            ("unit", json!(100)),
+            ("maximum_amount_for_one_output", json!(null)),
+        ] {
+            let mut invalid = valid_link.clone();
+            invalid["params"][mutation.0] = mutation.1;
+            assert!(serde_json::from_value::<ClientMessage>(invalid).is_err());
+        }
+        let mut legacy = valid_link.clone();
+        legacy["params"]["maximum_amount"] =
+            legacy["params"]["maximum_amount_for_one_output"].take();
+        legacy["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("maximum_amount_for_one_output");
+        assert!(serde_json::from_value::<ClientMessage>(legacy).is_err());
+
+        let payment = ClientMessage::ChannelPayment {
+            channel_id: "c".repeat(64),
+            balance_raw: 42,
+            signature: "d".repeat(128),
+        };
+        assert_eq!(
+            serde_json::to_value(payment).unwrap(),
+            json!({
+                "type":"ChannelPayment",
+                "channel_id":"c".repeat(64),
+                "balance_raw":42,
+                "signature":"d".repeat(128)
+            })
+        );
+
+        for invalid in [
+            json!({"type":"ChannelLink","payment_json":"{}"}),
+            json!({"type":"ChannelLink","channel_id":"a".repeat(64),"zero_balance_signature":"b".repeat(128),"params":{},"funding_token":null}),
+            json!({"type":"ChannelLink","channel_id":"a".repeat(64),"zero_balance_signature":"b".repeat(128),"params":{},"funding_token":"cashuBtoken","funding_proofs":null}),
+            json!({"type":"ChannelLink","channel_id":"a".repeat(64),"zero_balance_signature":"b".repeat(128),"params":{},"funding_token":"cashuBtoken","balance_raw":null}),
+            json!({"type":"ChannelPayment","payment_json":"{}"}),
+            json!({"type":"ChannelPayment","channel_id":"c".repeat(64),"balance_raw":42,"signature":"d".repeat(128),"params":null}),
+            json!({"type":"ChannelPayment","channel_id":"c".repeat(64),"balance_raw":42,"signature":"d".repeat(128),"funding_token":null}),
+            json!({"type":"ChannelPayment","channel_id":"c".repeat(64),"balance_raw":42,"signature":"d".repeat(128),"funding_proofs":null}),
+            json!({"type":"ChannelPayment","channel_id":"","balance_raw":42,"signature":"d".repeat(128)}),
+        ] {
+            assert!(serde_json::from_value::<ClientMessage>(invalid).is_err());
+        }
     }
 
     #[test]

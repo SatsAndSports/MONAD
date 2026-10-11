@@ -1,5 +1,7 @@
 use crate::payments::{ChannelPaymentError, LinkError, LinkOutcome, PaymentOutcome};
-use monad_common::protocol::{ChannelEvictionScope, ServerErrorCode, ServerMessage};
+use monad_common::protocol::{
+    ChannelEvictionScope, ChannelLinkRequest, ChannelPaymentRequest, ServerErrorCode, ServerMessage,
+};
 use monad_common::session::SessionPricing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,13 +30,9 @@ pub(crate) enum SessionEvent {
     ClientPing {
         nonce: String,
     },
-    ClientChannelLink {
-        payment_json: String,
-    },
+    ClientChannelLink(ChannelLinkRequest),
     LinkValidationFinished(Result<LinkOutcome, LinkError>),
-    ClientChannelPayment {
-        payment_json: String,
-    },
+    ClientChannelPayment(ChannelPaymentRequest),
     PaymentValidationFinished(Result<PaymentOutcome, ChannelPaymentError>),
     ChannelEvicted {
         channel_id: String,
@@ -50,12 +48,10 @@ pub(crate) enum SessionEffect {
     },
     SendControl(ServerMessage),
     SendStatus,
-    RunLinkValidation {
-        payment_json: String,
-    },
+    RunLinkValidation(ChannelLinkRequest),
     RunPaymentValidation {
         expected_channel_id: String,
-        payment_json: String,
+        request: ChannelPaymentRequest,
     },
     NotifySessionEvicted {
         target_session_id: [u8; 32],
@@ -139,9 +135,7 @@ pub(crate) fn step(
         SessionEvent::ClientPing { nonce } => {
             vec![SessionEffect::SendControl(ServerMessage::Pong { nonce })]
         }
-        SessionEvent::ClientChannelLink { payment_json } => {
-            vec![SessionEffect::RunLinkValidation { payment_json }]
-        }
+        SessionEvent::ClientChannelLink(request) => vec![SessionEffect::RunLinkValidation(request)],
         SessionEvent::LinkValidationFinished(result) => match result {
             Ok(outcome) => {
                 let previous_channel = state
@@ -163,11 +157,11 @@ pub(crate) fn step(
             }
             Err(err) => error_effects(&mut state, err.code(), err.to_string()),
         },
-        SessionEvent::ClientChannelPayment { payment_json } => {
+        SessionEvent::ClientChannelPayment(request) => {
             if let Some(expected_channel_id) = state.linked_channel_id.clone() {
                 vec![SessionEffect::RunPaymentValidation {
                     expected_channel_id,
-                    payment_json,
+                    request,
                 }]
             } else {
                 vec![SessionEffect::SendControl(ServerMessage::Error {

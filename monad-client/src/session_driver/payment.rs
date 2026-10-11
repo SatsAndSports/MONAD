@@ -9,7 +9,7 @@ use std::io;
 
 use crate::wallet::{MonadWallet, WalletChannel, WalletError};
 
-use super::state::DriverState;
+use super::state::{DriverState, RelaySnapshot};
 
 pub(super) fn validate_session_pricing(
     established_pricing: &mut Option<SessionPricing>,
@@ -129,6 +129,16 @@ pub(super) fn reconcile_payment_topup(
     ))
 }
 
+pub(super) fn channel_signed_balance_raw(channel: &WalletChannel) -> Result<u64, WalletError> {
+    match channel.unit.as_str() {
+        "msat" => Ok(channel.current_signed_balance_msats),
+        "sat" => Ok(channel.current_signed_balance_msats.div_ceil(1000)),
+        other => Err(WalletError::OfferMismatch(format!(
+            "unsupported unit: {other}"
+        ))),
+    }
+}
+
 pub(super) fn exclude_on_wallet_error(error: &WalletError) -> bool {
     matches!(
         error,
@@ -141,18 +151,6 @@ pub(super) fn exclude_on_wallet_error(error: &WalletError) -> bool {
     )
 }
 
-// Convert the locally stored signed balance into the channel's raw unit so it
-// can be compared directly against relay-reported `linked_channel.balance_raw`.
-pub(super) fn channel_signed_balance_raw(channel: &WalletChannel) -> Result<u64, WalletError> {
-    match channel.unit.as_str() {
-        "msat" => Ok(channel.current_signed_balance_msats),
-        "sat" => Ok(channel.current_signed_balance_msats.div_ceil(1000)),
-        other => Err(WalletError::OfferMismatch(format!(
-            "unsupported unit: {other}"
-        ))),
-    }
-}
-
 pub(super) fn raw_amount_to_msats(unit: &str, amount_raw: u64) -> Result<u64, WalletError> {
     common_raw_units_to_msats(unit, amount_raw).map_err(|e| match e.kind() {
         io::ErrorKind::InvalidInput => WalletError::OfferMismatch(e.to_string()),
@@ -160,41 +158,67 @@ pub(super) fn raw_amount_to_msats(unit: &str, amount_raw: u64) -> Result<u64, Wa
     })
 }
 
-// The relay may report accepted linked-channel state, but it must never claim a
-// raw balance above what the client has actually signed for that same channel.
-pub(super) fn validate_linked_channel_balance_against_wallet(
+pub(super) fn validate_linked_channel_against_wallet(
     wallet: &dyn MonadWallet,
-    state: &mut DriverState,
+    session_id: [u8; 32],
+    linked_channel: Option<&LinkedChannelStatus>,
 ) -> io::Result<()> {
-    let Some(intended_channel_id) = state.intended_channel_id.as_deref() else {
+    let Some(linked_channel) = linked_channel else {
         return Ok(());
     };
-    let Some(snapshot) = state.relay_snapshot.as_ref() else {
-        return Ok(());
-    };
-    let Some(linked_channel) = snapshot.linked_channel.as_ref() else {
-        return Ok(());
-    };
-    let linked_channel_id = linked_channel.channel_id.clone();
-    let linked_balance_raw = linked_channel.balance_raw;
-    if linked_channel_id != intended_channel_id {
-        return Ok(());
+    if linked_channel.balance_raw > linked_channel.capacity_raw {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "protocol violation: relay reported linked balance_raw={} above capacity_raw={} for channel {}",
+                linked_channel.balance_raw,
+                linked_channel.capacity_raw,
+                linked_channel.channel_id,
+            ),
+        ));
     }
 
-    let channel = wallet
-        .get_channel(intended_channel_id)
-        .map_err(|e| io::Error::other(format!("wallet channel lookup failed: {e}")))?;
-    let local_signed_balance_raw = channel_signed_balance_raw(&channel)
-        .map_err(|e| io::Error::other(format!("wallet channel balance conversion failed: {e}")))?;
+    let local = wallet
+        .get_channel_accounting(&linked_channel.channel_id)
+        .map_err(|error| match error {
+            WalletError::NotFound => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "protocol violation: relay reported unknown linked channel {}",
+                    linked_channel.channel_id
+                ),
+            ),
+            error => io::Error::other(format!("wallet channel lookup failed: {error}")),
+        })?;
+    if local.state != crate::wallet::WalletChannelState::Open
+        || local.attached_session_id != Some(session_id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "protocol violation: relay reported channel {} not open and attached to this session",
+                linked_channel.channel_id,
+            ),
+        ));
+    }
+    if linked_channel.unit != local.unit || linked_channel.capacity_raw != local.capacity_raw {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "protocol violation: relay linked channel {} metadata differs from local wallet",
+                linked_channel.channel_id,
+            ),
+        ));
+    }
 
-    if linked_balance_raw > local_signed_balance_raw {
+    if linked_channel.balance_raw > local.current_signed_balance_raw {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "protocol violation: relay reported linked balance_raw={} above client local signed balance_raw={} for channel {}",
-                linked_balance_raw,
-                local_signed_balance_raw,
-                linked_channel_id,
+                linked_channel.balance_raw,
+                local.current_signed_balance_raw,
+                linked_channel.channel_id,
             ),
         ));
     }
@@ -203,12 +227,9 @@ pub(super) fn validate_linked_channel_balance_against_wallet(
 }
 
 pub(super) fn validate_session_status_baseline_against_local_counters(
-    state: &DriverState,
+    snapshot: &RelaySnapshot,
     counters: &CleartextByteCounters,
 ) -> io::Result<()> {
-    let Some(snapshot) = state.relay_snapshot.as_ref() else {
-        return Ok(());
-    };
     let (_local_inbound, local_outbound) = counters.snapshot();
 
     if snapshot.session_total_bytes_out > local_outbound {
@@ -252,6 +273,8 @@ pub(super) fn server_error_invalidates_channel(code: &ServerErrorCode) -> bool {
             | ServerErrorCode::LinkReceiverMismatch
             | ServerErrorCode::LinkMintOrKeysetUnacceptable
             | ServerErrorCode::LinkUnsupportedUnit
+            | ServerErrorCode::ChannelRetiredAtRelay
+            | ServerErrorCode::LinkChannelRetired
             | ServerErrorCode::ChannelExpired
             | ServerErrorCode::ChannelClosed
     )

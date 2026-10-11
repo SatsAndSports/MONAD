@@ -6,7 +6,9 @@ use monad_common::control_exchange::{
     Attribution, ControlExchange, PendingRequest, MAX_PENDING_REQUESTS,
 };
 use monad_common::noise_secp256k1;
-use monad_common::protocol::{ClientMessage, ServerErrorCode, ServerMessage};
+use monad_common::protocol::{
+    ChannelPaymentRequest, ClientMessage, ServerErrorCode, ServerMessage,
+};
 use monad_common::quic_cert_identity::QuicCertIdentity;
 use monad_common::secp_identity::{Secp256k1Pubkey, SecpTransportKeypair};
 use monad_common::session::{RelayConnection, SessionPricing, SessionSpilmanInfo};
@@ -905,17 +907,22 @@ async fn start_auto_control(
                             warn!("{hop_label}: failed to attach mock channel: {err}");
                             continue;
                         }
-                        let payment_json =
-                            match wallet.build_link_request(&new_channel_id, &relay_offer) {
-                                Ok(payload) => payload,
-                                Err(err) => {
-                                    warn!("{hop_label}: failed to build link request: {err}");
-                                    continue;
-                                }
-                            };
+                        let request = match wallet.build_link_request(&new_channel_id, &relay_offer)
+                        {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                warn!("{hop_label}: failed to build link request: {err}");
+                                continue;
+                            }
+                        };
                         if let Err(err) = send_control_message(
                             &mut h2_send,
-                            &ClientMessage::ChannelLink { payment_json },
+                            &ClientMessage::ChannelLink {
+                                channel_id: request.channel_id,
+                                zero_balance_signature: request.zero_balance_signature,
+                                params: request.params,
+                                funding_token: request.funding_token,
+                            },
                             &mut exchange,
                             PendingRequest::Link {
                                 channel_id: new_channel_id.clone(),
@@ -969,10 +976,14 @@ async fn start_auto_control(
                                 &current_offer,
                                 linked,
                             ) {
-                                Ok(Some(payment_json)) => {
+                                Ok(Some(request)) => {
                                     if let Err(err) = send_control_message(
                                         &mut h2_send,
-                                        &ClientMessage::ChannelPayment { payment_json },
+                                        &ClientMessage::ChannelPayment {
+                                            channel_id: request.channel_id,
+                                            balance_raw: request.balance_raw,
+                                            signature: request.signature,
+                                        },
                                         &mut exchange,
                                         PendingRequest::Payment {
                                             channel_id: current_channel_id.clone(),
@@ -1166,7 +1177,7 @@ fn build_payment_to_capacity(
     channel_id: &str,
     offer: &RelayPaymentOffer,
     linked_channel: &monad_common::protocol::LinkedChannelStatus,
-) -> Result<Option<String>, WalletError> {
+) -> Result<Option<ChannelPaymentRequest>, WalletError> {
     if linked_channel.balance_raw >= linked_channel.capacity_raw {
         return Ok(None);
     }

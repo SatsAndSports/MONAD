@@ -290,7 +290,7 @@ fix.
   spends all credit (relay pauses), then ~65 KB of tunnel DATA is queued
   without waiting for stream capacity (modeling bytes already in flight when
   the pause lands). Asserts (a) the paused tunnel's **stream** window stays
-  withheld, and (b) a ~500 KB control `ChannelPayment` round trip completes
+  withheld, and (b) a ~500 KB valid extension followed by a Ping/Pong round trip completes
   within 2 s. Verified to **fail (timeout) with the flag off** and **pass
   (~0.5 s) with the flag on**. The 500 KB payload is deliberate: small control
   messages survive via the fragment recycle (§2) and would make the test

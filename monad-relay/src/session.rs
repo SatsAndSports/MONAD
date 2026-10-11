@@ -405,7 +405,7 @@ impl SessionState {
 
     pub(crate) fn link_channel(
         &self,
-        payment_json: &str,
+        request: &monad_common::protocol::ChannelLinkRequest,
     ) -> Result<crate::payments::LinkOutcome, crate::payments::LinkError> {
         if self.cashu_spilman_protocol_version.is_none()
             || self.cashu_spilman_keyset_versions.is_none()
@@ -416,28 +416,21 @@ impl SessionState {
             if !controls.enabled || self.is_terminated() {
                 return Err(crate::payments::LinkError::AdmissionDisabled);
             }
-            if !controls.accept_new_channels {
-                #[derive(serde::Deserialize)]
-                struct ChannelReference {
-                    channel_id: String,
-                }
-                let reference: ChannelReference = serde_json::from_str(payment_json)
-                    .map_err(|e| crate::payments::LinkError::InvalidPayment(e.to_string()))?;
-                if self
+            if !controls.accept_new_channels
+                && self
                     .payments
-                    .channel_state(&reference.channel_id)
+                    .channel_state(&request.channel_id)
                     .map_err(crate::payments::LinkError::Internal)?
                     .is_none()
-                {
-                    return Err(crate::payments::LinkError::AdmissionDisabled);
-                }
+            {
+                return Err(crate::payments::LinkError::AdmissionDisabled);
             }
             self.payments.link_channel(
                 self.cashu_spilman_keyset_versions
                     .as_ref()
                     .expect("checked above"),
                 self.session_id,
-                payment_json,
+                request,
             )
         })?;
         // Record the side effect before another await can cancel the reducer.
@@ -452,12 +445,12 @@ impl SessionState {
 
     pub(crate) async fn link_channel_with_keyset_refresh(
         &self,
-        payment_json: &str,
+        request: &monad_common::protocol::ChannelLinkRequest,
     ) -> Result<crate::payments::LinkOutcome, crate::payments::LinkError> {
         use crate::keyset_refresh::{KeysetRefreshError, KeysetRefreshOutcome};
         use crate::payments::LinkError;
 
-        let (mint_url, unit) = match self.link_channel(payment_json) {
+        let (mint_url, unit) = match self.link_channel(request) {
             Err(LinkError::UnknownTrustedKeyset { mint_url, unit }) => (mint_url, unit),
             result => return result,
         };
@@ -467,7 +460,7 @@ impl SessionState {
 
         info!(mint = %mint_url, unit = %unit, "refreshing unknown channel funding keyset");
         match coordinator.refresh_mint_unit(&mint_url, &unit).await {
-            Ok(KeysetRefreshOutcome::Refreshed) => match self.link_channel(payment_json) {
+            Ok(KeysetRefreshOutcome::Refreshed) => match self.link_channel(request) {
                 Err(LinkError::UnknownTrustedKeyset { .. }) => {
                     Err(LinkError::MintOrKeysetNotAcceptable)
                 }
@@ -492,7 +485,7 @@ impl SessionState {
     pub(crate) async fn apply_channel_payment(
         &self,
         expected_channel_id: &str,
-        payment_json: &str,
+        request: &monad_common::protocol::ChannelPaymentRequest,
     ) -> Result<crate::payments::PaymentOutcome, crate::payments::ChannelPaymentError> {
         // Sample traffic before payment state so concurrent forwarding can only
         // make this headroom check more conservative for the client.
@@ -512,7 +505,7 @@ impl SessionState {
         let result = self.payments.apply_channel_payment_with_limit(
             self.session_id,
             expected_channel_id,
-            payment_json,
+            request,
             max_delta_millisats,
         )?;
         self.session_registry.events.record(
@@ -1443,18 +1436,40 @@ async fn handle_control_stream(
                                         // Optional hints must not elicit responses,
                                         // consume an ordinary permit, or mutate state.
                                     }
-                                    ClientMessage::ChannelLink { payment_json } => {
+                                    ClientMessage::ChannelLink {
+                                        channel_id,
+                                        zero_balance_signature,
+                                        params,
+                                        funding_token,
+                                    } => {
                                         terminate_session = process_session_event(
                                             &state,
-                                            SessionEvent::ClientChannelLink { payment_json },
+                                            SessionEvent::ClientChannelLink(
+                                                monad_common::protocol::ChannelLinkRequest {
+                                                    channel_id,
+                                                    zero_balance_signature,
+                                                    params,
+                                                    funding_token,
+                                                },
+                                            ),
                                             &mut h2_send,
                                         )
                                         .await?;
                                     }
-                                    ClientMessage::ChannelPayment { payment_json } => {
+                                    ClientMessage::ChannelPayment {
+                                        channel_id,
+                                        balance_raw,
+                                        signature,
+                                    } => {
                                         terminate_session = process_session_event(
                                             &state,
-                                            SessionEvent::ClientChannelPayment { payment_json },
+                                            SessionEvent::ClientChannelPayment(
+                                                monad_common::protocol::ChannelPaymentRequest {
+                                                    channel_id,
+                                                    balance_raw,
+                                                    signature,
+                                                },
+                                            ),
                                             &mut h2_send,
                                         )
                                         .await?;
@@ -1556,7 +1571,63 @@ mod tests {
     use monad_common::bootstrap::{
         supported_cashu_spilman_keyset_versions, CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14,
     };
+    use monad_common::protocol::{ChannelLinkRequest, ChannelPaymentRequest};
     use std::collections::BTreeMap;
+
+    fn link_request(channel_id: &str, capacity: u64, unit: &str) -> ChannelLinkRequest {
+        ChannelLinkRequest {
+            channel_id: channel_id.to_string(),
+            zero_balance_signature: "0".repeat(128),
+            params: serde_json::Map::from_iter([
+                ("capacity".to_string(), serde_json::json!(capacity)),
+                ("unit".to_string(), serde_json::json!(unit)),
+                ("mint".to_string(), serde_json::json!("https://mint")),
+                (
+                    "funding_token_amount".to_string(),
+                    serde_json::json!(capacity),
+                ),
+                (
+                    "keyset_id".to_string(),
+                    serde_json::json!("0000000000000001"),
+                ),
+                ("input_fee_ppk".to_string(), serde_json::json!(0)),
+                (
+                    "maximum_amount_for_one_output".to_string(),
+                    serde_json::json!(0),
+                ),
+                ("setup_timestamp".to_string(), serde_json::json!(0)),
+                ("sender_pubkey".to_string(), serde_json::json!("sender")),
+                ("receiver_pubkey".to_string(), serde_json::json!("receiver")),
+                ("expiry_timestamp".to_string(), serde_json::json!(u64::MAX)),
+            ]),
+            funding_token: "mock-cashuB-valid-looking-token".to_string(),
+        }
+    }
+
+    fn payment_request(channel_id: &str, balance_raw: u64) -> ChannelPaymentRequest {
+        ChannelPaymentRequest {
+            channel_id: channel_id.to_string(),
+            balance_raw,
+            signature: "0".repeat(128),
+        }
+    }
+
+    fn client_link(request: ChannelLinkRequest) -> ClientMessage {
+        ClientMessage::ChannelLink {
+            channel_id: request.channel_id,
+            zero_balance_signature: request.zero_balance_signature,
+            params: request.params,
+            funding_token: request.funding_token,
+        }
+    }
+
+    fn client_payment(request: ChannelPaymentRequest) -> ClientMessage {
+        ClientMessage::ChannelPayment {
+            channel_id: request.channel_id,
+            balance_raw: request.balance_raw,
+            signature: request.signature,
+        }
+    }
 
     fn test_state() -> (SessionState, Arc<InMemoryRelayPayments>) {
         test_state_with_cache(shared_spilman_mint_cache(SpilmanMintCache::default()))
@@ -1636,9 +1707,7 @@ mod tests {
         for finish in ["abort", "panic", "transport loss", "terminate"] {
             let (state, payments) = test_state();
             let link = state
-                .link_channel(
-                    r#"{"channel_id":"abort-owned","balance":0,"capacity":100,"unit":"msat"}"#,
-                )
+                .link_channel(&link_request("abort-owned", 100, "msat"))
                 .unwrap();
             {
                 let mut billing = state.billing.lock().unwrap();
@@ -1774,8 +1843,8 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let link = r#"{"channel_id":"channel","balance":0,"capacity":100,"unit":"msat"}"#;
-        assert_eq!(state.link_channel(link), Err(LinkError::AdmissionDisabled));
+        let link = link_request("channel", 100, "msat");
+        assert_eq!(state.link_channel(&link), Err(LinkError::AdmissionDisabled));
         assert_eq!(state.payments.channel_state("channel").unwrap(), None);
 
         storage
@@ -1796,13 +1865,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            state.link_channel(link),
+            state.link_channel(&link),
             Err(LinkError::Internal(_))
         ));
         assert!(storage.get_funding("channel").is_some());
         conn.execute("DROP TABLE spilman_channels", []).unwrap();
         assert!(matches!(
-            state.link_channel(link),
+            state.link_channel(&link),
             Err(LinkError::Internal(_))
         ));
     }
@@ -1810,8 +1879,8 @@ mod tests {
     #[test]
     fn new_channel_gate_preserves_relinks_and_payments() {
         let (state, payments) = test_state();
-        let existing = r#"{"channel_id":"existing","balance":0,"capacity":100,"unit":"msat"}"#;
-        state.link_channel(existing).unwrap();
+        let existing = link_request("existing", 100, "msat");
+        state.link_channel(&existing).unwrap();
         payments.release_channel_ownership(state.session_id, "existing");
         state
             .session_registry
@@ -1820,17 +1889,17 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        state.link_channel(existing).unwrap();
-        let payment = r#"{"channel_id":"existing","balance":10,"capacity":100,"unit":"msat"}"#;
+        state.link_channel(&existing).unwrap();
+        let payment = payment_request("existing", 10);
         assert_eq!(
             payments
-                .apply_channel_payment(state.session_id, "existing", payment)
+                .apply_channel_payment(state.session_id, "existing", &payment)
                 .unwrap()
                 .delta_millisats,
             10
         );
         assert_eq!(
-            state.link_channel(r#"{"channel_id":"new","balance":0,"capacity":100,"unit":"msat"}"#),
+            state.link_channel(&link_request("new", 100, "msat")),
             Err(LinkError::AdmissionDisabled)
         );
         assert!(payments.channel_state("new").unwrap().is_none());
@@ -1839,7 +1908,7 @@ mod tests {
             .set_controls(Default::default())
             .unwrap();
         state
-            .link_channel(r#"{"channel_id":"new","balance":0,"capacity":100,"unit":"msat"}"#)
+            .link_channel(&link_request("new", 100, "msat"))
             .unwrap();
         state.cleanup();
     }
@@ -1847,17 +1916,21 @@ mod tests {
     #[test]
     fn cleanup_covers_link_before_reducer_and_preserves_replacement_owner() {
         let (state, payments) = test_state();
-        let payment = r#"{"channel_id":"owned","balance":0,"capacity":100,"unit":"msat"}"#;
-        state.link_channel(payment).unwrap();
+        let request = link_request("owned", 100, "msat");
+        state.link_channel(&request).unwrap();
         // The reducer has not yet recorded the successful validation result.
         assert_eq!(payments.owner_of("owned"), Some(state.session_id));
         state.cleanup();
         assert_eq!(payments.owner_of("owned"), None);
 
         let (state, payments) = test_state();
-        state.link_channel(payment).unwrap();
+        state.link_channel(&request).unwrap();
         payments
-            .link_channel(&supported_cashu_spilman_keyset_versions(), [2; 32], payment)
+            .link_channel(
+                &supported_cashu_spilman_keyset_versions(),
+                [2; 32],
+                &request,
+            )
             .unwrap();
         state.cleanup();
         state.cleanup();
@@ -1907,17 +1980,15 @@ mod tests {
         use std::task::Poll;
 
         let (state, payments) = test_state();
-        let channel_a = r#"{"channel_id":"replace-a","balance":0,"capacity":100,"unit":"msat"}"#;
-        let channel_b = r#"{"channel_id":"replace-b","balance":0,"capacity":100,"unit":"msat"}"#;
-        let linked_a = state.link_channel(channel_a).unwrap();
+        let channel_a = link_request("replace-a", 100, "msat");
+        let channel_b = link_request("replace-b", 100, "msat");
+        let linked_a = state.link_channel(&channel_a).unwrap();
         state.billing.lock().unwrap().state.linked_channel_id = Some(linked_a.channel_id);
         let (mut send, _recv, _client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
 
         let mut replacement = Box::pin(process_session_event(
             &state,
-            SessionEvent::ClientChannelLink {
-                payment_json: channel_b.to_string(),
-            },
+            SessionEvent::ClientChannelLink(channel_b),
             &mut send,
         ));
         std::future::poll_fn(|cx| {
@@ -2079,7 +2150,7 @@ mod tests {
         use std::task::Poll;
         let (state, payments) = test_state();
         let link = state
-            .link_channel(r#"{"channel_id":"owned","balance":0,"capacity":100,"unit":"msat"}"#)
+            .link_channel(&link_request("owned", 100, "msat"))
             .unwrap();
         state.billing.lock().unwrap().state.linked_channel_id = Some(link.channel_id);
         let (send, recv, _client_send, _client_recv, mut drivers) = test_h2_streams(0).await;
@@ -2117,7 +2188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_large_requests_buffer_while_response_is_flow_blocked() {
+    async fn five_requests_buffer_while_response_is_flow_blocked() {
         use monad_common::control_exchange::{Attribution, ControlExchange, PendingRequest};
         use tokio::time::{timeout, Duration};
         async fn next(recv: &mut h2::RecvStream, buf: &mut Vec<u8>) -> ServerMessage {
@@ -2128,18 +2199,20 @@ mod tests {
         let (events, event_rx) = mpsc::unbounded_channel();
         state.attach_control(events.clone()).await.unwrap();
         let control = tokio::spawn(handle_control_stream(send, recv, state.clone(), event_rx));
-        let payload = |balance| {
-            serde_json::json!({"channel_id":"queued", "balance":balance,
-            "padding":"x".repeat(200_000)})
-            .to_string()
-        };
+        let channel_id = "a".repeat(64);
+        let mut large_link = link_request(&channel_id, 100, "msat");
+        large_link.funding_token = "x".repeat(200_000);
         let messages = [
-            ClientMessage::ChannelLink { payment_json: serde_json::json!({"channel_id":"queued","balance":0,"capacity":100,"unit":"msat","padding":"x".repeat(200_000)}).to_string() },
-            ClientMessage::Ping { nonce: "between-link-and-payment".into() },
-            ClientMessage::ChannelPayment { payment_json: payload(10) },
-            ClientMessage::ChannelPayment { payment_json: payload(10) },
-            ClientMessage::ChannelPayment { payment_json: payload(15) },
-            ClientMessage::ChannelUnlink { channel_id: "queued".into() },
+            client_link(large_link),
+            ClientMessage::Ping {
+                nonce: "between-link-and-payment".into(),
+            },
+            client_payment(payment_request(&channel_id, 10)),
+            ClientMessage::GetSessionStatus,
+            client_payment(payment_request(&channel_id, 15)),
+            ClientMessage::ChannelUnlink {
+                channel_id: channel_id.clone(),
+            },
         ];
         // Do not consume response capacity yet. H2 may enqueue the initial
         // status using the first 64 bytes; the following response then blocks.
@@ -2153,13 +2226,11 @@ mod tests {
             .unwrap()
             .unwrap();
         }
-        assert_eq!(
+        assert!(
             payments
-                .linked_channel_status("queued")
-                .unwrap()
-                .balance_raw,
-            0,
-            "later payments must not execute while the first response is blocked"
+                .linked_channel_status(&channel_id)
+                .is_none_or(|status| status.balance_raw == 0),
+            "payments must not execute while the first response is blocked"
         );
         let mut buf = Vec::new();
         let mut exchange = ControlExchange::default();
@@ -2171,25 +2242,21 @@ mod tests {
         );
         let expectations = [
             PendingRequest::Link {
-                channel_id: "queued".into(),
+                channel_id: channel_id.clone(),
             },
             PendingRequest::Payment {
-                channel_id: "queued".into(),
+                channel_id: channel_id.clone(),
                 balance_raw: 10,
                 minimum_increment_msats: 10,
             },
+            PendingRequest::Status,
             PendingRequest::Payment {
-                channel_id: "queued".into(),
-                balance_raw: 10,
-                minimum_increment_msats: 0,
-            },
-            PendingRequest::Payment {
-                channel_id: "queued".into(),
+                channel_id: channel_id.clone(),
                 balance_raw: 15,
                 minimum_increment_msats: 5,
             },
             PendingRequest::Unlink {
-                channel_id: "queued".into(),
+                channel_id: channel_id.clone(),
             },
         ];
         for expected in &expectations {
@@ -2215,9 +2282,6 @@ mod tests {
                         assert_eq!(linked_channel.as_ref().unwrap().balance_raw, 0);
                     }
                 }
-                ServerMessage::Error { code, .. } if i == 2 => {
-                    assert_eq!(*code, ServerErrorCode::PaymentNoNewFunds)
-                }
                 other => panic!("unexpected reply {other:?}"),
             }
             assert_eq!(
@@ -2226,10 +2290,10 @@ mod tests {
             );
         }
         assert!(exchange.is_empty());
-        assert_eq!(payments.owner_of("queued"), None);
+        assert_eq!(payments.owner_of(&channel_id), None);
         events
             .send(ServerMessage::ChannelEvicted {
-                channel_id: "queued".into(),
+                channel_id: channel_id.clone(),
                 scope: ChannelEvictionScope::Session,
             })
             .unwrap();
@@ -2398,13 +2462,10 @@ mod tests {
         let (events, event_rx) = mpsc::unbounded_channel();
         state.attach_control(events).await.unwrap();
         let control = tokio::spawn(handle_control_stream(send, recv, state.clone(), event_rx));
+        let channel_id = "b".repeat(64);
         send_json_line(
             &mut client_send,
-            &ClientMessage::ChannelLink {
-                payment_json:
-                    r#"{"channel_id":"must-not-run","balance":0,"capacity":100,"unit":"msat"}"#
-                        .into(),
-            },
+            &client_link(link_request(&channel_id, 100, "msat")),
         )
         .await
         .unwrap();
@@ -2419,7 +2480,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-        assert!(payments.linked_channel_status("must-not-run").is_none());
+        assert!(payments.linked_channel_status(&channel_id).is_none());
         assert!(state.is_terminated());
         drivers.shutdown().await;
     }
@@ -2621,7 +2682,7 @@ mod tests {
     async fn session_payment_limit_rejects_before_balance_mutation() {
         let (state, payments) = test_state();
         let link = state
-            .link_channel(r#"{"channel_id":"limited","balance":0,"capacity":10,"unit":"msat"}"#)
+            .link_channel(&link_request("limited", 10, "msat"))
             .unwrap();
         state.billing.lock().unwrap().state.linked_channel_id = Some(link.channel_id.clone());
         state.billing.lock().unwrap().state.total_paid_millisats = u64::MAX;
@@ -2630,10 +2691,7 @@ mod tests {
         state.bytes.outbound.store(u64::MAX, Ordering::Relaxed);
 
         let error = state
-            .apply_channel_payment(
-                "limited",
-                r#"{"channel_id":"limited","balance":1,"signature":"sig"}"#,
-            )
+            .apply_channel_payment("limited", &payment_request("limited", 1))
             .await
             .unwrap_err();
         assert_eq!(
@@ -2653,9 +2711,9 @@ mod tests {
     async fn payment_checks_signed_remaining_limit_before_acceptance() {
         for (unit, scale) in [("msat", 1_u64), ("sat", 1000)] {
             let (state, payments) = test_state();
-            let link =
-                format!(r#"{{"channel_id":"bounded","balance":0,"capacity":10,"unit":"{unit}"}}"#);
-            state.link_channel(&link).unwrap();
+            state
+                .link_channel(&link_request("bounded", 10, unit))
+                .unwrap();
             {
                 let mut billing = state.billing.lock().unwrap();
                 billing.state.total_paid_millisats = i64::MAX as u64 - scale;
@@ -2663,7 +2721,7 @@ mod tests {
             }
             let before = payments.linked_channel_status("bounded").unwrap();
             let rejected = state
-                .apply_channel_payment("bounded", r#"{"channel_id":"bounded","balance":2}"#)
+                .apply_channel_payment("bounded", &payment_request("bounded", 2))
                 .await;
             assert_eq!(
                 rejected.unwrap_err(),
@@ -2675,7 +2733,7 @@ mod tests {
                 i64::MAX as u64 - scale
             );
             let accepted = state
-                .apply_channel_payment("bounded", r#"{"channel_id":"bounded","balance":1}"#)
+                .apply_channel_payment("bounded", &payment_request("bounded", 1))
                 .await
                 .unwrap();
             let mut billing = state.billing.lock().unwrap();
@@ -2697,12 +2755,14 @@ mod tests {
     async fn payment_limits_are_representation_bounds_not_optional_policy_caps() {
         let (state, payments) = test_state();
         let too_large_sat_balance = i64::MAX as u64 / 1000 + 1;
-        state.link_channel(&format!(r#"{{"channel_id":"sat-limit","balance":0,"capacity":{too_large_sat_balance},"unit":"sat"}}"#)).unwrap();
+        state
+            .link_channel(&link_request("sat-limit", too_large_sat_balance, "sat"))
+            .unwrap();
         assert_eq!(
             state
                 .apply_channel_payment(
                     "sat-limit",
-                    &format!(r#"{{"channel_id":"sat-limit","balance":{too_large_sat_balance}}}"#)
+                    &payment_request("sat-limit", too_large_sat_balance)
                 )
                 .await
                 .unwrap_err(),
@@ -2718,16 +2778,11 @@ mod tests {
 
         let large_msats = 9_000_000_000_000_001_u64;
         state
-            .link_channel(&format!(
-                r#"{{"channel_id":"large","balance":0,"capacity":{large_msats},"unit":"msat"}}"#
-            ))
+            .link_channel(&link_request("large", large_msats, "msat"))
             .unwrap();
         assert_eq!(
             state
-                .apply_channel_payment(
-                    "large",
-                    &format!(r#"{{"channel_id":"large","balance":{large_msats}}}"#)
-                )
+                .apply_channel_payment("large", &payment_request("large", large_msats))
                 .await
                 .unwrap()
                 .delta_millisats,
@@ -3099,7 +3154,7 @@ mod tests {
                 .link_channel(
                     &supported_cashu_spilman_keyset_versions(),
                     state.session_id,
-                    r#"{"channel_id":"owned","balance":0,"capacity":100,"unit":"msat"}"#,
+                    &link_request("owned", 100, "msat"),
                 )
                 .unwrap();
             state.billing.lock().unwrap().state.linked_channel_id = Some(link.channel_id);

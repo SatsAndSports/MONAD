@@ -299,7 +299,7 @@ async fn channel_evicted_does_not_force_rebuild_when_control_stays_healthy() {
     assert!(relays[1].notify_session(
         &session_id,
         ServerMessage::ChannelEvicted {
-            channel_id: "synthetic-evict".to_string(),
+            channel_id: "e".repeat(64),
             scope: monad_common::protocol::ChannelEvictionScope::Session,
         }
     ));

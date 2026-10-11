@@ -615,12 +615,17 @@ async fn provision_and_send_link(
     wallet
         .attach_channel_to_session(&channel_id, session_id)
         .map_err(|e| io::Error::other(format!("failed to attach stress channel: {e}")))?;
-    let payment_json = wallet
+    let request = wallet
         .build_link_request(&channel_id, offer)
         .map_err(|e| io::Error::other(format!("failed to build stress link request: {e}")))?;
     send_control_message(
         h2_send,
-        &ClientMessage::ChannelLink { payment_json },
+        &ClientMessage::ChannelLink {
+            channel_id: request.channel_id,
+            zero_balance_signature: request.zero_balance_signature,
+            params: request.params,
+            funding_token: request.funding_token,
+        },
         exchange,
         monad_common::control_exchange::PendingRequest::Link {
             channel_id: channel_id.clone(),
@@ -929,13 +934,13 @@ async fn start_huge_funding_control(
 
                             if let Some(next_target_raw) = next_target_raw {
                                 if next_target_raw > base_balance_raw {
-                                    let payment_json = match wallet.build_channel_payment(
+                                    let request = match wallet.build_channel_payment(
                                         current_channel_id,
                                         current_offer,
                                         base_balance_raw,
                                         next_target_raw,
                                     ) {
-                                        Ok(payment_json) => payment_json,
+                                        Ok(request) => request,
                                         Err(err) => {
                                             if err.to_string() == "no new funds" {
                                                 payment_stats
@@ -955,7 +960,11 @@ async fn start_huge_funding_control(
                                     };
                                     if let Err(err) = send_control_message(
                                         &mut h2_send,
-                                        &ClientMessage::ChannelPayment { payment_json },
+                                        &ClientMessage::ChannelPayment {
+                                            channel_id: request.channel_id,
+                                            balance_raw: request.balance_raw,
+                                            signature: request.signature,
+                                        },
                                         &mut exchange,
                                         monad_common::control_exchange::PendingRequest::Payment {
                                             channel_id: current_channel_id.clone(),

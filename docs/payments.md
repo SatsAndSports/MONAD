@@ -312,11 +312,11 @@ For one relay session, the client funding flow is:
 3. Validate pricing and safety invariants.
 4. Choose or provision a compatible channel.
 5. Attach that channel locally to the session id.
-6. Send `ChannelLink { payment_json }`.
+6. Send `ChannelLink { channel_id, zero_balance_signature, params, funding_token }`.
 7. Wait for a relay `SessionStatus` that confirms the linked channel.
 8. Use relay-reported state plus local cleartext counters to decide whether a `ChannelPayment` is needed.
 9. Ask the wallet to build a payment for an exact next cumulative balance.
-10. Send `ChannelPayment { payment_json }`.
+10. Send `ChannelPayment { channel_id, balance_raw, signature }`.
 11. Repeat as more balance is needed.
 
 If a channel is evicted, invalidated, or exhausted, the client abandons its local
