@@ -915,12 +915,49 @@ The developer stress harness in `monad-relay/tests/stress.rs` can also run alter
 
 ### Client Control Loop
 
-After the control stream is established and the initial `SessionStatus` arrives, steady-state client behavior is handled by one serialized direct control loop in `monad-client/src/session_driver.rs`.
+The client uses one serialized executor in `monad-client/src/session_driver.rs`,
+with a pure ordinary-control/channel reducer and a separate funding policy.
 
 `session_driver.rs` contains the public entrypoints and private `runtime`,
-`state`, `funding`, and `payment` modules for executor input ordering, local
+`state`, `reducer`, `policy`, `funding`, and `payment` modules for executor input ordering, local
 state publishing, channel acquisition/link/payment progression, and payment
 protocol-safety checks.
+
+The reducer's phase is `AwaitingInitialStatus`, `Active`, `Ending`, or `Ended`.
+Its single ordinary slot is `Idle`, `Working`, `Submitting(request)`, or
+`AwaitingResponse(request)`. Link, payment, unlink, and status requests share that
+slot. There is no second main-client request FIFO or in-flight-operation flag.
+Response classification is nonmutating; the slot and confirmed-paid baseline
+advance only after wallet and status checks succeed. The pipelined harnesses
+retain `ControlExchange`, sharing pure response validation with this reducer.
+
+Channel acquisition reserves an existing or newly provisioned channel locally;
+it is separate from linking. The acquired candidate can coexist with the active
+channel. Selecting B for a link makes B the client's active choice immediately,
+while the pending replacement retains A. Success releases A's local reservation;
+rejection restores A unless an independent eviction invalidated it. Release
+advisories are retained through the pending operation rather than resolving it.
+Session cleanup covers active, acquired, and previous-channel reservations.
+
+`policy::FundingStrategy` receives only an in-memory view. The existing
+`PaymentPolicy` implements the default strategy. Intents include wait, acquire,
+link acquired, pay, unlink, release acquired/exhausted, and request status.
+The reducer gates intents and emits wallet/submission effects; `funding` resolves
+them in the serialized task. Effect failures use the existing wallet/error and
+session-termination paths. No background effect tasks are detached.
+
+The 250 ms timer remains a funding opportunity, not a payment command. Busy ticks
+skip policy evaluation; idle ticks use atomic byte-counter loads and task-owned
+pricing/payment state, without wallet calls or locks. The policy runs again on
+fresh state after responses. A bounded local pass can acquire then link, or
+retire an exhausted channel then acquire and link. Retry deadlines prevent
+unavailable funding from becoming a tight retry loop. Response-time wallet
+validation remains in place; caching that authority is a separate optimization.
+
+Heartbeat/Ping/Pong state stays in the executor independently of the ordinary
+slot. Data forwarding and byte counters stay outside the reducer. Policy does
+not require a paused session to pay and may choose to wait while paused; the
+default retains the existing proactive target/minimum-topup behavior.
 
 Shared control-stream framing and raw-unit conversion helpers are intentionally
 kept out of the client driver and live in `monad-common/src/control_codec.rs`

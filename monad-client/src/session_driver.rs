@@ -36,8 +36,12 @@ impl Drop for SessionAttachments {
     }
 }
 
+#[cfg(test)]
+mod executor_tests;
 mod funding;
 mod payment;
+mod policy;
+mod reducer;
 mod runtime;
 mod state;
 
@@ -132,7 +136,7 @@ mod tests {
     };
     use super::state::{
         current_spilman_info, pre_ready_blocked_error, relay_confirms_intended_channel,
-        set_link_in_flight, ControlOpInFlight, DriverState, FundingBlockedReason, RelaySnapshot,
+        set_link_in_flight, DriverState, FundingBlockedReason, RelaySnapshot,
     };
     use super::PaymentPolicy;
     use crate::wallet::WalletError;
@@ -804,9 +808,6 @@ mod tests {
         let now = Instant::now();
         let mut state = DriverState {
             intended_channel_id: Some("channel".to_string()),
-            control_op_in_flight: Some(ControlOpInFlight::Link {
-                channel_id: "channel".to_string(),
-            }),
             ..DriverState::default()
         };
         assert!(defer_link_after_refresh_error(
@@ -1542,7 +1543,7 @@ mod tests {
                 )
                 .unwrap();
             let error =
-                super::funding::maybe_progress_payment(&config, &mut state, &mut send, false)
+                super::funding::maybe_progress_payment(&config, &mut state, &mut send, u64::MAX)
                     .await
                     .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -1567,7 +1568,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejection_never_rolls_back_locally_recorded_payment() {
-        use super::state::{set_payment_in_flight, RelayConnectionHandles, SessionDriverConfig};
+        use super::state::{RelayConnectionHandles, SessionDriverConfig};
         use crate::wallet::{MockWallet, WalletChannel, WalletChannelState};
 
         let counters = CleartextByteCounters::default();
@@ -1616,7 +1617,6 @@ mod tests {
                 relay_snapshot: Some(snapshot(true)),
                 ..Default::default()
             };
-            set_payment_in_flight(&mut state, "channel".into(), 2000);
             super::funding::apply_server_error(&config, &mut state, code)
                 .await
                 .unwrap();
@@ -1726,7 +1726,7 @@ mod tests {
                 .unwrap();
             let (_response, mut h2_send) = h2_client.send_request(request, false).unwrap();
 
-            super::funding::maybe_progress_payment(&config, &mut state, &mut h2_send, false)
+            super::funding::maybe_progress_payment(&config, &mut state, &mut h2_send, 10_000_000)
                 .await
                 .unwrap();
             assert_eq!(state.intended_channel_id.as_deref(), Some("exhausted"));
@@ -1742,7 +1742,8 @@ mod tests {
             );
 
             config.conn.cleartext_byte_counters.note_outbound(2);
-            super::funding::maybe_progress_payment(&config, &mut state, &mut h2_send, false).await
+            super::funding::maybe_progress_payment(&config, &mut state, &mut h2_send, 10_000_000)
+                .await
         });
 
         assert!(result.is_ok());

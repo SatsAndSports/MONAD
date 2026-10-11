@@ -9,7 +9,7 @@ use tokio::time::Instant;
 use tracing::warn;
 
 use crate::session_driver::PaymentPolicy;
-use crate::wallet::{MonadWallet, RelayPaymentOffer};
+use crate::wallet::{MonadWallet, RelayPaymentOffer, WalletChannel};
 
 #[derive(Clone)]
 pub(super) struct SessionDriverConfig {
@@ -70,19 +70,8 @@ pub(super) struct RelaySnapshot {
     pub(super) paused: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ControlOpInFlight {
-    Link {
-        channel_id: String,
-    },
-    Payment {
-        channel_id: String,
-        balance_raw: u64,
-    },
-    Unlink {
-        channel_id: String,
-    },
-}
+#[cfg(test)]
+use monad_common::control_exchange::PendingRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum FundingBlockedReason {
@@ -93,7 +82,7 @@ pub(super) enum FundingBlockedReason {
 
 #[derive(Debug, Default)]
 pub(super) struct DriverState {
-    pub(super) exchange: monad_common::control_exchange::ControlExchange,
+    pub(super) exchange: super::reducer::ControlState,
     pub(super) relay_snapshot: Option<RelaySnapshot>,
     pub(super) established_pricing: Option<SessionPricing>,
     pub(super) cashu_spilman_protocol_version: Option<String>,
@@ -102,8 +91,9 @@ pub(super) struct DriverState {
     pub(super) intended_channel_id: Option<String>,
     pub(super) intended_channel_keyset_id: Option<String>,
     pub(super) intended_offer: Option<RelayPaymentOffer>,
+    pub(super) acquired: Option<(WalletChannel, RelayPaymentOffer)>,
+    pub(super) previous_link: Option<PreviousChannel>,
     pub(super) session_excluded_channels: BTreeSet<String>,
-    pub(super) control_op_in_flight: Option<ControlOpInFlight>,
     /// Channels the relay has politely asked to retire. The client stops
     /// creating payments on them, awaits acknowledgement of any in-flight
     /// payment, then sends an ID-only `ChannelUnlink`.
@@ -114,19 +104,20 @@ pub(super) struct DriverState {
     pub(super) terminated: bool,
 }
 
+#[derive(Debug)]
+pub(super) struct PreviousChannel {
+    pub channel_id: String,
+    pub keyset_id: Option<String>,
+    pub offer: Option<RelayPaymentOffer>,
+    pub evicted: bool,
+}
+
 pub(super) fn relay_linked_channel_id(state: &DriverState) -> Option<&str> {
     state
         .relay_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.linked_channel.as_ref())
         .map(|channel| channel.channel_id.as_str())
-}
-
-pub(super) fn session_is_paused(state: &DriverState) -> bool {
-    state
-        .relay_snapshot
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.paused)
 }
 
 pub(super) fn relay_confirms_intended_channel(state: &DriverState) -> bool {
@@ -170,7 +161,7 @@ pub(super) fn state_summary(state: &DriverState, counters: &CleartextByteCounter
         relay_out,
         relay_linked,
         intended,
-        state.control_op_in_flight,
+        state.exchange.pending(),
         state.funding_blocked_reason,
         state.ready_signaled,
     )
@@ -212,31 +203,11 @@ pub(super) async fn publish_pricing(config: &SessionDriverConfig, pricing: Sessi
     *config.conn.pricing_handle.write().await = Some(pricing);
 }
 
-pub(super) fn clear_channel_control_op(state: &mut DriverState, channel_id: &str) {
-    match &state.control_op_in_flight {
-        Some(ControlOpInFlight::Link {
-            channel_id: in_flight_channel,
-        })
-        | Some(ControlOpInFlight::Payment {
-            channel_id: in_flight_channel,
-            ..
-        })
-        | Some(ControlOpInFlight::Unlink {
-            channel_id: in_flight_channel,
-        }) if in_flight_channel == channel_id => {
-            state.control_op_in_flight = None;
-        }
-        _ => {}
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Channel-state transition helpers
 //
-// These are the only places that should mutate intended-channel state,
-// in-flight control operations, and the session-local excluded-channel set.
-// Keep them small and explicit so callers cannot accidentally leave the driver
-// in an inconsistent state.
+// Executor-side cleanup/publication helpers. Ordinary-operation and replacement
+// transitions live in reducer.rs. Cleanup must not consume a pending response.
 // ---------------------------------------------------------------------------
 
 pub(super) fn exclude_channel(state: &mut DriverState, channel_id: &str) {
@@ -245,6 +216,7 @@ pub(super) fn exclude_channel(state: &mut DriverState, channel_id: &str) {
         .insert(channel_id.to_owned());
 }
 
+#[cfg(test)]
 pub(super) fn set_link_in_flight(
     state: &mut DriverState,
     channel_id: String,
@@ -254,22 +226,11 @@ pub(super) fn set_link_in_flight(
     state.intended_channel_id = Some(channel_id.clone());
     state.intended_channel_keyset_id = Some(keyset_id);
     state.intended_offer = Some(offer);
-    state.control_op_in_flight = Some(ControlOpInFlight::Link { channel_id });
-}
-
-pub(super) fn set_payment_in_flight(state: &mut DriverState, channel_id: String, balance_raw: u64) {
-    state.control_op_in_flight = Some(ControlOpInFlight::Payment {
-        channel_id,
-        balance_raw,
-    });
-}
-
-pub(super) fn set_unlink_in_flight(state: &mut DriverState, channel_id: String) {
-    state.control_op_in_flight = Some(ControlOpInFlight::Unlink { channel_id });
 }
 
 pub(super) fn clear_control_op(state: &mut DriverState) {
-    state.control_op_in_flight = None;
+    // Responses have already been committed by the control reducer.
+    debug_assert!(state.exchange.is_empty());
 }
 
 pub(super) fn request_channel_release(state: &mut DriverState, channel_id: &str) {
@@ -287,7 +248,7 @@ pub(super) fn finish_channel_release(state: &mut DriverState, channel_id: &str) 
 }
 
 /// Abandon the intended channel: detach it from the wallet, optionally exclude it
-/// for the remainder of the session, clear intended/offer/in-flight state if it
+/// for the remainder of the session, clear intended/offer state if it
 /// still belongs to this channel, and republish Spilman info.
 pub(super) async fn abandon_intended_channel(
     config: &SessionDriverConfig,
@@ -306,7 +267,6 @@ pub(super) async fn abandon_intended_channel(
         state.intended_channel_keyset_id = None;
         state.intended_offer = None;
     }
-    clear_channel_control_op(state, &channel_id);
     publish_spilman_info(config, state).await;
 }
 
@@ -314,6 +274,16 @@ pub(super) async fn abandon_intended_channel(
 /// channel/in-flight/blocked state, set the terminated flag, and republish
 /// Spilman info.
 pub(super) async fn terminate_session(config: &SessionDriverConfig, state: &mut DriverState) {
+    if let Some((channel, _)) = state.acquired.take() {
+        let _ = config
+            .wallet
+            .detach_channel_from_session(&channel.channel_id, config.conn.session_id);
+    }
+    if let Some(previous) = state.previous_link.take() {
+        let _ = config
+            .wallet
+            .detach_channel_from_session(&previous.channel_id, config.conn.session_id);
+    }
     if let Some(channel_id) = state.intended_channel_id.clone() {
         let _ = config
             .wallet
@@ -322,7 +292,7 @@ pub(super) async fn terminate_session(config: &SessionDriverConfig, state: &mut 
     state.intended_channel_id = None;
     state.intended_channel_keyset_id = None;
     state.intended_offer = None;
-    state.control_op_in_flight = None;
+    let _ = state.exchange.step(super::reducer::Event::End);
     state.funding_blocked_reason = None;
     state.terminated = true;
     publish_spilman_info(config, state).await;
@@ -430,9 +400,14 @@ mod acknowledgement_tests {
     #[test]
     fn storing_a_snapshot_cannot_heuristically_resolve_a_request() {
         let mut state = DriverState::default();
-        set_payment_in_flight(&mut state, "channel".into(), 1000);
+        state.exchange.ordinary =
+            super::super::reducer::Ordinary::AwaitingResponse(PendingRequest::Payment {
+                channel_id: "channel".into(),
+                balance_raw: 1000,
+                minimum_increment_msats: 1000,
+            });
         apply_session_status(&mut state, status("channel", 1000));
         apply_session_status(&mut state, unlinked_status(1000));
-        assert!(state.control_op_in_flight.is_some());
+        assert!(state.exchange.pending().is_some());
     }
 }

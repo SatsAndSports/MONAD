@@ -136,16 +136,6 @@ async fn apply_driver_session_status(
         attribution,
         Attribution::Response(PendingRequest::Payment { .. })
     );
-    if matches!(
-        attribution,
-        Attribution::Response(
-            PendingRequest::Link { .. }
-                | PendingRequest::Payment { .. }
-                | PendingRequest::Unlink { .. }
-        )
-    ) {
-        state.control_op_in_flight = None;
-    }
     apply_session_status(state, snapshot);
     if let Some(channel_id) = confirmed_unlink_channel {
         apply_channel_unlinked(config, state, channel_id).await;
@@ -202,7 +192,7 @@ pub(super) async fn run_session_driver(
                         break;
                     };
                     let observed_at = Instant::now();
-                    let attribution = state.exchange.observe(&message).map_err(|error| {
+                    let attribution = state.exchange.classify(&message).map_err(|error| {
                         if let ServerMessage::Error { code, .. } = &message {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -217,13 +207,14 @@ pub(super) async fn run_session_driver(
                         }
                         continue;
                     }
-                    if state.exchange.is_initialized()
+                    if (state.exchange.is_initialized() || attribution == Attribution::InitialStatus)
                         && heartbeat.observe_server_message(observed_at, &attribution, &message)
                         == HeartbeatAction::TimedOut
                     {
                         return Err(heartbeat_timeout_error(&config.hop_label));
                     }
 
+                    let accepted_message = message.clone();
                     let resolved_payment = match message {
                         ServerMessage::SessionStatus {
                             receiver_pubkey,
@@ -278,7 +269,7 @@ pub(super) async fn run_session_driver(
                                 due_now,
                                 linked_channel.as_ref().map(|channel| &channel.channel_id),
                                 state.intended_channel_id.as_deref().unwrap_or("none"),
-                                state.control_op_in_flight,
+                                 state.exchange.pending(),
                                 state.funding_blocked_reason,
                                 compute_estimated_remaining(&state, &config.conn.cleartext_byte_counters),
                             );
@@ -296,6 +287,10 @@ pub(super) async fn run_session_driver(
                                 &snapshot,
                                 &config.conn.cleartext_byte_counters,
                             )?;
+                             state.exchange.step(super::reducer::Event::Accept(accepted_message))?;
+                             if matches!(attribution, Attribution::Response(PendingRequest::Link { .. })) {
+                                 super::funding::finish_replacement(&config, &mut state, true).await?;
+                             }
                                let resolved = apply_driver_session_status(&config, &mut state, snapshot, attribution).await;
                             publish_pricing(&config, pricing).await;
                             publish_spilman_info(&config, &state).await;
@@ -341,6 +336,7 @@ pub(super) async fn run_session_driver(
                             continue;
                         }
                         ServerMessage::Error { code, message } => {
+                            state.exchange.step(super::reducer::Event::Accept(accepted_message))?;
                             warn!(
                                 "{} control error: code={:?} message={} | {}",
                                 config.hop_label,
@@ -361,8 +357,12 @@ pub(super) async fn run_session_driver(
                                 attribution,
                                 Attribution::Response(PendingRequest::Payment { .. })
                             );
+                            let link_pending = matches!(attribution, Attribution::Response(PendingRequest::Link { .. }));
                             let rejection_code = format!("{code:?}");
                             apply_server_error(&config, &mut state, code).await?;
+                            if link_pending {
+                                super::funding::finish_replacement(&config, &mut state, false).await?;
+                            }
                             if payment_pending {
                                 return Err(io::Error::other(format!(
                                     "{} payment rejected ({rejection_code}); signed payment retained",
@@ -411,6 +411,9 @@ pub(super) async fn run_session_driver(
     .await;
 
     handle_control_detached(&config, &mut state).await;
+    state
+        .exchange
+        .step(super::reducer::Event::CleanupFinished)?;
     result
 }
 

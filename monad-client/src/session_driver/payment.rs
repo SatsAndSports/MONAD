@@ -66,6 +66,7 @@ pub enum PaymentTopupPlan {
 
 // Convert a local remaining-balance estimate into the next cumulative raw
 // channel balance the wallet should sign.
+#[cfg(test)]
 pub(super) fn plan_payment_topup(
     estimated_remaining_msats: i64,
     target_remaining_msats: u64,
@@ -85,6 +86,16 @@ pub(super) fn plan_payment_topup(
     }
 
     let requested_delta_msats = base_delta_msats.max(minimum_topup_msats);
+    plan_payment_delta(requested_delta_msats, linked_channel)
+}
+
+pub(super) fn plan_payment_delta(
+    requested_delta_msats: u64,
+    linked_channel: &LinkedChannelStatus,
+) -> Result<PaymentTopupPlan, WalletError> {
+    if requested_delta_msats == 0 {
+        return Ok(PaymentTopupPlan::NoPaymentNeeded);
+    }
     let requested_delta_raw =
         delta_msats_to_raw_units(&linked_channel.unit, requested_delta_msats)?;
     let remaining_capacity_raw = linked_channel
