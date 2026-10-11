@@ -1,7 +1,7 @@
 use monad_common::protocol::{LinkedChannelStatus, PaymentOption};
 use monad_common::proxy::CleartextByteCounters;
 use monad_common::session::{RelayConnection, SessionPricing, SessionSpilmanInfo};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -9,7 +9,7 @@ use tokio::time::Instant;
 use tracing::warn;
 
 use crate::session_driver::PaymentPolicy;
-use crate::wallet::{MonadWallet, RelayPaymentOffer, WalletChannel};
+use crate::wallet::{MonadWallet, RelayPaymentOffer, WalletChannel, WalletChannelAccounting};
 
 #[derive(Clone)]
 pub(super) struct SessionDriverConfig {
@@ -93,6 +93,10 @@ pub(super) struct DriverState {
     pub(super) intended_offer: Option<RelayPaymentOffer>,
     pub(super) acquired: Option<(WalletChannel, RelayPaymentOffer)>,
     pub(super) previous_link: Option<PreviousChannel>,
+    /// Wallet authority captured when this session reserves a channel. Relay
+    /// statuses validate against this task-owned snapshot; they never load or
+    /// populate authority from a relay-provided channel ID.
+    pub(super) channel_authority: BTreeMap<String, WalletChannelAccounting>,
     pub(super) session_excluded_channels: BTreeSet<String>,
     /// Channels the relay has politely asked to retire. The client stops
     /// creating payments on them, awaits acknowledgement of any in-flight
@@ -262,6 +266,7 @@ pub(super) async fn abandon_intended_channel(
     let _ = config
         .wallet
         .detach_channel_from_session(&channel_id, config.conn.session_id);
+    state.channel_authority.remove(&channel_id);
     if state.intended_channel_id.as_deref() == Some(channel_id.as_str()) {
         state.intended_channel_id = None;
         state.intended_channel_keyset_id = None;
@@ -274,21 +279,26 @@ pub(super) async fn abandon_intended_channel(
 /// channel/in-flight/blocked state, set the terminated flag, and republish
 /// Spilman info.
 pub(super) async fn terminate_session(config: &SessionDriverConfig, state: &mut DriverState) {
+    let mut channel_ids = state
+        .channel_authority
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if let Some((channel, _)) = state.acquired.take() {
-        let _ = config
-            .wallet
-            .detach_channel_from_session(&channel.channel_id, config.conn.session_id);
+        channel_ids.insert(channel.channel_id);
     }
     if let Some(previous) = state.previous_link.take() {
-        let _ = config
-            .wallet
-            .detach_channel_from_session(&previous.channel_id, config.conn.session_id);
+        channel_ids.insert(previous.channel_id);
     }
     if let Some(channel_id) = state.intended_channel_id.clone() {
+        channel_ids.insert(channel_id);
+    }
+    for channel_id in channel_ids {
         let _ = config
             .wallet
             .detach_channel_from_session(&channel_id, config.conn.session_id);
     }
+    state.channel_authority.clear();
     state.intended_channel_id = None;
     state.intended_channel_keyset_id = None;
     state.intended_offer = None;

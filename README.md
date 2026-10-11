@@ -678,7 +678,7 @@ There is no client-requested relay refresh operation. Automatic first-link refre
 The canonical client funding implementation lives in `monad-client/src/session_driver.rs` and its private modules:
 
 - `runtime` runs the serialized control loop
-- `state` holds local driver state and publishing helpers
+- `state` holds local driver state, publishing helpers, and session-scoped channel accounting authority
 - `reducer` owns ordinary-request sequencing and channel replacement transitions
 - `policy` makes in-memory funding decisions on the existing 250 ms opportunities
 - `funding` executes channel acquisition, link, payment, retirement, and recovery effects

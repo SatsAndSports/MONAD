@@ -128,19 +128,20 @@ mod tests {
         LINK_REFRESH_RETRY_COOLDOWN,
     };
     use super::payment::{
-        channel_signed_balance_raw, exclude_on_wallet_error, plan_payment_topup,
-        raw_amount_to_msats, reconcile_payment_topup, requested_delta_msats,
-        server_error_invalidates_channel, server_error_rejects_intended_channel,
-        validate_linked_channel_against_wallet, validate_session_pricing,
-        validate_session_status_baseline_against_local_counters, PaymentTopupPlan,
+        exclude_on_wallet_error, plan_payment_topup, raw_amount_to_msats, reconcile_payment_topup,
+        requested_delta_msats, server_error_invalidates_channel,
+        server_error_rejects_intended_channel, validate_linked_channel_against_session,
+        validate_session_pricing, validate_session_status_baseline_against_local_counters,
+        PaymentTopupPlan,
     };
     use super::state::{
         current_spilman_info, pre_ready_blocked_error, relay_confirms_intended_channel,
         set_link_in_flight, DriverState, FundingBlockedReason, RelaySnapshot,
     };
     use super::PaymentPolicy;
-    use crate::wallet::WalletError;
+    use crate::wallet::{WalletChannelAccounting, WalletChannelState, WalletError};
     use http::{Method, Request};
+    use monad_common::control_exchange::{Attribution, PendingRequest};
     use monad_common::protocol::{LinkedChannelStatus, PaymentOption, ServerErrorCode};
     use monad_common::proxy::CleartextByteCounters;
     use monad_common::session::SessionPricing;
@@ -724,6 +725,11 @@ mod tests {
                 wallet.successful_payment_build_count(&channel_id).unwrap(),
                 1
             );
+            assert_eq!(
+                wallet.accounting_read_count().unwrap(),
+                1,
+                "link and payment statuses must reuse acquisition authority"
+            );
             let sibling = wallet.get_channel(&"d".repeat(64)).unwrap();
             assert_eq!(sibling.state, WalletChannelState::Open);
             assert_eq!(sibling.attached_session_id, Some([2; 32]));
@@ -841,37 +847,6 @@ mod tests {
     }
 
     #[test]
-    fn channel_signed_balance_raw_matches_msat_and_sat_units() {
-        let msat_channel = crate::wallet::WalletChannel {
-            channel_id: "chan-msat".to_string(),
-            state: crate::wallet::WalletChannelState::Open,
-            receiver_pubkey: "receiver".to_string(),
-            mint_url: "https://mint".to_string(),
-            unit: "msat".to_string(),
-            keyset_id: "keyset-a".to_string(),
-            attached_session_id: None,
-            capacity_msats: 10,
-            current_signed_balance_msats: 7,
-            expiry_timestamp: u64::MAX,
-        };
-        let sat_channel = crate::wallet::WalletChannel {
-            channel_id: "chan-sat".to_string(),
-            state: crate::wallet::WalletChannelState::Open,
-            receiver_pubkey: "receiver".to_string(),
-            mint_url: "https://mint".to_string(),
-            unit: "sat".to_string(),
-            keyset_id: "keyset-a".to_string(),
-            attached_session_id: None,
-            capacity_msats: 2_000,
-            current_signed_balance_msats: 1_001,
-            expiry_timestamp: u64::MAX,
-        };
-
-        assert_eq!(channel_signed_balance_raw(&msat_channel).unwrap(), 7);
-        assert_eq!(channel_signed_balance_raw(&sat_channel).unwrap(), 2);
-    }
-
-    #[test]
     fn raw_amount_to_msats_matches_msat_and_sat_units() {
         assert_eq!(raw_amount_to_msats("msat", 7).unwrap(), 7);
         assert_eq!(raw_amount_to_msats("sat", 2).unwrap(), 2_000);
@@ -879,22 +854,7 @@ mod tests {
 
     #[test]
     fn validate_linked_channel_balance_rejects_relay_balance_above_local_signed_balance() {
-        let wallet = crate::wallet::MockWallet::new();
-        wallet
-            .insert_channel(crate::wallet::WalletChannel {
-                channel_id: "chan-a".to_string(),
-                state: crate::wallet::WalletChannelState::Open,
-                receiver_pubkey: "receiver".to_string(),
-                mint_url: "https://mint".to_string(),
-                unit: "msat".to_string(),
-                keyset_id: "keyset-a".to_string(),
-                attached_session_id: Some([1; 32]),
-                capacity_msats: 100,
-                current_signed_balance_msats: 7,
-                expiry_timestamp: u64::MAX,
-            })
-            .unwrap();
-        let state = DriverState {
+        let mut state = DriverState {
             intended_channel_id: Some("chan-a".to_string()),
             relay_snapshot: Some(RelaySnapshot {
                 receiver_pubkey: "receiver".to_string(),
@@ -914,10 +874,20 @@ mod tests {
             local_session_paid_msats: 7,
             ..DriverState::default()
         };
-
-        let err = validate_linked_channel_against_wallet(
-            &wallet,
+        state.channel_authority.insert(
+            "chan-a".into(),
+            WalletChannelAccounting {
+                state: WalletChannelState::Open,
+                attached_session_id: Some([1; 32]),
+                unit: "msat".into(),
+                capacity_raw: 100,
+                current_signed_balance_raw: 7,
+            },
+        );
+        let err = validate_linked_channel_against_session(
+            &state,
             [1; 32],
+            &Attribution::Response(PendingRequest::Status),
             state
                 .relay_snapshot
                 .as_ref()
@@ -932,23 +902,7 @@ mod tests {
 
     #[test]
     fn validate_linked_channel_rejects_unknown_or_inconsistent_metadata() {
-        let wallet = crate::wallet::MockWallet::new();
         let channel_id = "a".repeat(64);
-        wallet
-            .insert_channel(crate::wallet::WalletChannel {
-                channel_id: channel_id.clone(),
-                state: crate::wallet::WalletChannelState::Open,
-                receiver_pubkey: "receiver".to_string(),
-                mint_url: "https://mint".to_string(),
-                unit: "msat".to_string(),
-                keyset_id: "keyset-a".to_string(),
-                attached_session_id: Some([1; 32]),
-                capacity_msats: 100,
-                current_signed_balance_msats: 10,
-                expiry_timestamp: u64::MAX,
-            })
-            .unwrap();
-
         for linked in [
             LinkedChannelStatus {
                 channel_id: "b".repeat(64),
@@ -975,13 +929,67 @@ mod tests {
                 unit: "msat".to_string(),
             },
         ] {
+            let mut state = DriverState::default();
+            state.channel_authority.insert(
+                channel_id.clone(),
+                WalletChannelAccounting {
+                    state: WalletChannelState::Open,
+                    attached_session_id: Some([1; 32]),
+                    unit: "msat".into(),
+                    capacity_raw: 100,
+                    current_signed_balance_raw: 10,
+                },
+            );
             assert_eq!(
-                validate_linked_channel_against_wallet(&wallet, [1; 32], Some(&linked))
-                    .unwrap_err()
-                    .kind(),
+                validate_linked_channel_against_session(
+                    &state,
+                    [1; 32],
+                    &Attribution::Response(PendingRequest::Link {
+                        channel_id: linked.channel_id.clone(),
+                    }),
+                    Some(&linked),
+                )
+                .unwrap_err()
+                .kind(),
                 io::ErrorKind::InvalidData
             );
         }
+    }
+
+    #[test]
+    fn status_cannot_create_or_switch_session_channel_authority() {
+        let linked = LinkedChannelStatus {
+            channel_id: "candidate".into(),
+            balance_raw: 0,
+            capacity_raw: 100,
+            unit: "msat".into(),
+        };
+        let mut state = DriverState::default();
+        state.channel_authority.insert(
+            linked.channel_id.clone(),
+            WalletChannelAccounting {
+                state: WalletChannelState::Open,
+                attached_session_id: Some([1; 32]),
+                unit: linked.unit.clone(),
+                capacity_raw: linked.capacity_raw,
+                current_signed_balance_raw: 0,
+            },
+        );
+
+        assert!(validate_linked_channel_against_session(
+            &state,
+            [1; 32],
+            &Attribution::InitialStatus,
+            Some(&linked),
+        )
+        .is_err());
+        assert!(validate_linked_channel_against_session(
+            &state,
+            [1; 32],
+            &Attribution::Response(PendingRequest::Status),
+            Some(&linked),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1512,6 +1520,16 @@ mod tests {
                 established_pricing: Some(SessionPricing::new(1, 1)),
                 ..Default::default()
             };
+            state.channel_authority.insert(
+                "channel".into(),
+                WalletChannelAccounting {
+                    state: WalletChannelState::Open,
+                    attached_session_id: Some([0; 32]),
+                    unit: "msat".into(),
+                    capacity_raw: u64::MAX,
+                    current_signed_balance_raw: 0,
+                },
+            );
             let config = SessionDriverConfig {
                 wallet: wallet.clone(),
                 conn: RelayConnectionHandles {

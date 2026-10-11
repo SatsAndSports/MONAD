@@ -356,6 +356,13 @@ pub(super) fn channel_step(state: &mut DriverState, event: ChannelEvent) -> Vec<
             }
         }
         ChannelEvent::Evicted(id) => {
+            if state
+                .acquired
+                .as_ref()
+                .is_some_and(|(channel, _)| channel.channel_id == id)
+            {
+                state.acquired = None;
+            }
             if let Some(previous) = state.previous_link.as_mut() {
                 if previous.channel_id == id {
                     previous.evicted = true;

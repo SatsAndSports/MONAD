@@ -952,7 +952,12 @@ pricing/payment state, without wallet calls or locks. The policy runs again on
 fresh state after responses. A bounded local pass can acquire then link, or
 retire an exhausted channel then acquire and link. Retry deadlines prevent
 unavailable funding from becoming a tight retry loop. Response-time wallet
-validation remains in place; caching that authority is a separate optimization.
+validation uses session-scoped accounting authority captured after successful
+wallet reservation. Link and payment statuses perform no database lookup. The
+cache retains both channels during replacement, advances its signed-balance
+high-water immediately after durable payment construction, and is removed with
+reservation authority. Statuses cannot populate the cache or switch linkage
+without an attributed link response.
 
 Heartbeat/Ping/Pong state stays in the executor independently of the ordinary
 slot. Data forwarding and byte counters stay outside the reducer. Policy does
@@ -969,6 +974,7 @@ That loop keeps small local state for:
 - the latest relay-reported session snapshot
 - immutable session pricing
 - the client's intended active channel / offer
+- session-scoped channel accounting authority and signed-balance high-water
 - session-local excluded channels
 - link/payment operations currently in flight
 - blocked funding reason and readiness state

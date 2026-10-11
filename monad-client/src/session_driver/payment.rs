@@ -1,3 +1,4 @@
+use monad_common::control_exchange::{Attribution, PendingRequest};
 use monad_common::payment_units::{
     msats_to_raw_units as common_msats_to_raw_units,
     raw_units_to_msats as common_raw_units_to_msats,
@@ -7,7 +8,7 @@ use monad_common::proxy::CleartextByteCounters;
 use monad_common::session::SessionPricing;
 use std::io;
 
-use crate::wallet::{MonadWallet, WalletChannel, WalletError};
+use crate::wallet::WalletError;
 
 use super::state::{DriverState, RelaySnapshot};
 
@@ -140,16 +141,6 @@ pub(super) fn reconcile_payment_topup(
     ))
 }
 
-pub(super) fn channel_signed_balance_raw(channel: &WalletChannel) -> Result<u64, WalletError> {
-    match channel.unit.as_str() {
-        "msat" => Ok(channel.current_signed_balance_msats),
-        "sat" => Ok(channel.current_signed_balance_msats.div_ceil(1000)),
-        other => Err(WalletError::OfferMismatch(format!(
-            "unsupported unit: {other}"
-        ))),
-    }
-}
-
 pub(super) fn exclude_on_wallet_error(error: &WalletError) -> bool {
     matches!(
         error,
@@ -169,11 +160,35 @@ pub(super) fn raw_amount_to_msats(unit: &str, amount_raw: u64) -> Result<u64, Wa
     })
 }
 
-pub(super) fn validate_linked_channel_against_wallet(
-    wallet: &dyn MonadWallet,
+pub(super) fn validate_linked_channel_against_session(
+    state: &DriverState,
     session_id: [u8; 32],
+    attribution: &Attribution,
     linked_channel: Option<&LinkedChannelStatus>,
 ) -> io::Result<()> {
+    let expected_channel = match attribution {
+        Attribution::InitialStatus => None,
+        Attribution::Response(PendingRequest::Link { channel_id })
+        | Attribution::Response(PendingRequest::Payment { channel_id, .. }) => {
+            Some(channel_id.as_str())
+        }
+        Attribution::Response(PendingRequest::Unlink { .. }) => None,
+        Attribution::Response(PendingRequest::Status) => {
+            super::state::relay_linked_channel_id(state)
+        }
+        Attribution::Notification | Attribution::Unsolicited => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "protocol violation: status has no ordinary response attribution",
+            ));
+        }
+    };
+    if linked_channel.map(|channel| channel.channel_id.as_str()) != expected_channel {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "protocol violation: relay status changed linked channel without matching link response",
+        ));
+    }
     let Some(linked_channel) = linked_channel else {
         return Ok(());
     };
@@ -189,17 +204,17 @@ pub(super) fn validate_linked_channel_against_wallet(
         ));
     }
 
-    let local = wallet
-        .get_channel_accounting(&linked_channel.channel_id)
-        .map_err(|error| match error {
-            WalletError::NotFound => io::Error::new(
+    let local = state
+        .channel_authority
+        .get(&linked_channel.channel_id)
+        .ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "protocol violation: relay reported unknown linked channel {}",
+                    "protocol violation: relay reported linked channel {} without session authority",
                     linked_channel.channel_id
                 ),
-            ),
-            error => io::Error::other(format!("wallet channel lookup failed: {error}")),
+            )
         })?;
     if local.state != crate::wallet::WalletChannelState::Open
         || local.attached_session_id != Some(session_id)

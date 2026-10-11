@@ -9,15 +9,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use crate::wallet::{select_channel, RelayPaymentOffer, WalletChannel, WalletError};
+use crate::wallet::{
+    select_channel, RelayPaymentOffer, WalletChannel, WalletChannelState, WalletError,
+};
 
 pub(super) const LINK_REFRESH_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 pub(super) const LINK_REFRESH_BUSY_RETRY_DELAY: Duration = Duration::from_secs(1);
 pub(super) const LOCAL_KEYSET_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
 use super::payment::{
-    channel_signed_balance_raw, compute_estimated_remaining, exclude_on_wallet_error,
-    plan_payment_delta, reconcile_payment_topup, server_error_invalidates_channel,
+    compute_estimated_remaining, exclude_on_wallet_error, plan_payment_delta,
+    reconcile_payment_topup, server_error_invalidates_channel,
     server_error_rejects_intended_channel, PaymentTopupPlan,
 };
 use super::state::{
@@ -203,6 +205,40 @@ async fn acquire_existing_channel(
         return Ok(true);
     }
 
+    let authority = match config.wallet.get_channel_accounting(&channel_id) {
+        Ok(authority)
+            if authority.state == WalletChannelState::Open
+                && authority.attached_session_id == Some(config.conn.session_id)
+                && authority.current_signed_balance_raw <= authority.capacity_raw =>
+        {
+            authority
+        }
+        Ok(_) => {
+            let _ = config
+                .wallet
+                .detach_channel_from_session(&channel_id, config.conn.session_id);
+            set_blocked_reason(
+                config,
+                state,
+                FundingBlockedReason::ChannelAcquire,
+                "reserved channel accounting is inconsistent",
+            )?;
+            return Ok(false);
+        }
+        Err(error) => {
+            let _ = config
+                .wallet
+                .detach_channel_from_session(&channel_id, config.conn.session_id);
+            set_blocked_reason(
+                config,
+                state,
+                FundingBlockedReason::ChannelAcquire,
+                &format!("reserved channel accounting lookup failed: {error}"),
+            )?;
+            return Ok(false);
+        }
+    };
+    state.channel_authority.insert(channel_id, authority);
     channel_step(state, ChannelEvent::Acquired(channel, offer));
     Ok(false)
 }
@@ -225,6 +261,7 @@ async fn link_acquired(
             let _ = config
                 .wallet
                 .detach_channel_from_session(&channel_id, config.conn.session_id);
+            state.channel_authority.remove(&channel_id);
             if matches!(error, WalletError::Backend(_)) {
                 set_blocked_reason(
                     config,
@@ -535,6 +572,7 @@ pub(super) async fn maybe_send_channel_unlink(
         .map_err(|error| {
             io::Error::other(format!("failed to retire channel {intended}: {error}"))
         })?;
+    state.channel_authority.remove(&intended);
     info!(
         "{} sending ChannelUnlink for {} | {}",
         config.hop_label,
@@ -673,11 +711,16 @@ pub(super) async fn maybe_progress_payment(
         } => (requested_delta_msats, next_balance_raw, reaches_capacity),
     };
 
-    let signed_balance_raw = config
-        .wallet
-        .get_channel(&intended_channel_id)
-        .and_then(|channel| channel_signed_balance_raw(&channel))
-        .map_err(|e| io::Error::other(format!("wallet channel balance lookup failed: {e}")))?;
+    let signed_balance_raw = state
+        .channel_authority
+        .get(&intended_channel_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing session accounting authority for channel {intended_channel_id}"),
+            )
+        })?
+        .current_signed_balance_raw;
     let (next_balance_raw, authorized_delta_msats, reaches_capacity) =
         reconcile_payment_topup(planned_next_balance_raw, signed_balance_raw, linked_channel)
             .map_err(|e| io::Error::other(format!("payment delta conversion failed: {e}")))?;
@@ -704,6 +747,18 @@ pub(super) async fn maybe_progress_payment(
         next_balance_raw,
     ) {
         Ok(request) => {
+            if request.channel_id != intended_channel_id || request.balance_raw != next_balance_raw
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "wallet payment request does not match requested channel and balance",
+                ));
+            }
+            state
+                .channel_authority
+                .get_mut(&intended_channel_id)
+                .expect("authority checked before payment build")
+                .current_signed_balance_raw = next_balance_raw;
             state
                 .exchange
                 .step(super::reducer::Event::Submit(PendingRequest::Payment {
@@ -846,6 +901,7 @@ pub(super) async fn run_policy_cycle(
                         .wallet
                         .detach_channel_from_session(&channel.channel_id, config.conn.session_id)
                         .map_err(|e| io::Error::other(e.to_string()))?;
+                    state.channel_authority.remove(&channel.channel_id);
                 }
             }
             FundingEffect::ReleaseExhausted => {
@@ -884,6 +940,7 @@ pub(super) async fn apply_channel_evicted(
         let _ = config
             .wallet
             .detach_channel_from_session(&id, config.conn.session_id);
+        state.channel_authority.remove(&id);
     }
     publish_spilman_info(config, state).await;
 }
@@ -904,6 +961,7 @@ pub(super) async fn finish_replacement(
                 .wallet
                 .detach_channel_from_session(&id, config.conn.session_id)
                 .map_err(|e| io::Error::other(e.to_string()))?;
+            state.channel_authority.remove(&id);
         }
     } else {
         // Error-specific handling has already retired or excluded an invalid B.

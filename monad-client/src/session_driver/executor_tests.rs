@@ -73,6 +73,16 @@ fn fixture(wallet: Arc<dyn MonadWallet>) -> (SessionDriverConfig, DriverState) {
         }),
         ..Default::default()
     };
+    state.channel_authority.insert(
+        "A".into(),
+        WalletChannelAccounting {
+            state: WalletChannelState::Open,
+            attached_session_id: Some([1; 32]),
+            unit: "msat".into(),
+            capacity_raw: 1000,
+            current_signed_balance_raw: 100,
+        },
+    );
     state.exchange.phase = Phase::Active;
     (config, state)
 }
@@ -130,6 +140,8 @@ async fn failed_link_preparation_releases_candidate_and_does_not_retry_excluded_
         assert!(state.session_excluded_channels.contains("B"));
         assert_eq!(wallet.attachment("B").unwrap(), None);
         assert_eq!(wallet.attachment("A").unwrap(), Some([1; 32]));
+        assert!(!state.channel_authority.contains_key("B"));
+        assert!(state.channel_authority.contains_key("A"));
         task.abort();
         let _ = task.await;
     }
@@ -183,6 +195,7 @@ async fn acquire_reserves_candidate_without_linking_and_can_release_it() {
     assert_eq!(state.intended_channel_id.as_deref(), Some("A"));
     assert!(state.exchange.is_empty());
     assert_eq!(wallet.attachment("B").unwrap(), Some([1; 32]));
+    assert!(state.channel_authority.contains_key("B"));
     assert!(wallet.attach_channel_to_session("B", [3; 32]).is_err());
     assert_eq!(wallet.attachment("C").unwrap(), Some([2; 32]));
     run_policy_cycle(
@@ -196,6 +209,7 @@ async fn acquire_reserves_candidate_without_linking_and_can_release_it() {
     .unwrap();
     assert!(state.acquired.is_none());
     assert_eq!(wallet.attachment("B").unwrap(), None);
+    assert!(!state.channel_authority.contains_key("B"));
     assert_eq!(wallet.attachment("A").unwrap(), Some([1; 32]));
     task.abort();
     let _ = task.await;
@@ -211,6 +225,16 @@ async fn replacement_executor_preserves_old_owner_on_rejection_and_releases_on_s
         wallet.insert_channel(channel("A", Some([1; 32]))).unwrap();
         wallet.insert_channel(channel("B", Some([1; 32]))).unwrap();
         let (config, mut state) = fixture(wallet.clone());
+        state.channel_authority.insert(
+            "B".into(),
+            WalletChannelAccounting {
+                state: WalletChannelState::Open,
+                attached_session_id: Some([1; 32]),
+                unit: "msat".into(),
+                capacity_raw: 1000,
+                current_signed_balance_raw: 0,
+            },
+        );
         let offer = state.intended_offer.clone().unwrap();
         channel_step(
             &mut state,
@@ -273,7 +297,13 @@ async fn replacement_executor_preserves_old_owner_on_rejection_and_releases_on_s
         if !accepted {
             assert_eq!(state.acquired.as_ref().unwrap().0.channel_id, "B");
         }
+        assert!(state.channel_authority.contains_key("B"));
+        assert_eq!(
+            state.channel_authority.contains_key("A"),
+            !accepted && !evicted
+        );
         terminate_session(&config, &mut state).await;
+        assert!(state.channel_authority.is_empty());
         assert_eq!(wallet.attachment("B").unwrap(), None);
         assert_eq!(
             wallet
