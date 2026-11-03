@@ -4,7 +4,7 @@
 //! session reducer and performs the corresponding I/O and side effects. It does
 //! not contain session-state policy; that lives in `session_fsm`.
 
-use crate::session::{send_control_message, SessionState};
+use crate::session::{fail_status_construction, send_control_message, SessionState};
 use crate::session_fsm::{SessionEffect, SessionEvent};
 use bytes::Bytes;
 use monad_common::protocol::ServerMessage;
@@ -15,11 +15,16 @@ use std::io;
 pub(crate) struct ControlDriver<'a> {
     state: &'a SessionState,
     h2_send: &'a mut h2::SendStream<Bytes>,
+    accepted_payment: Option<(String, u64)>,
 }
 
 impl<'a> ControlDriver<'a> {
     pub(crate) fn new(state: &'a SessionState, h2_send: &'a mut h2::SendStream<Bytes>) -> Self {
-        Self { state, h2_send }
+        Self {
+            state,
+            h2_send,
+            accepted_payment: None,
+        }
     }
 
     /// Interpret one effect. Returns `true` if the session should end.
@@ -47,8 +52,17 @@ impl<'a> ControlDriver<'a> {
                 }
             }
             SessionEffect::SendStatus => {
-                let Some(status) = self.state.session_status_message().await else {
-                    self.state.terminate();
+                let accepted_payment = self.accepted_payment.take();
+                let Some(status) = self
+                    .state
+                    .session_status_message_for_payment(
+                        accepted_payment
+                            .as_ref()
+                            .map(|(id, balance)| (id.as_str(), *balance)),
+                    )
+                    .await
+                else {
+                    fail_status_construction(self.state, self.h2_send).await;
                     return Ok(true);
                 };
                 send_control_message(self.h2_send, &status).await?;
@@ -62,11 +76,14 @@ impl<'a> ControlDriver<'a> {
                 expected_channel_id,
                 request,
             } => {
-                pending.push_back(SessionEvent::PaymentValidationFinished(
-                    self.state
-                        .apply_channel_payment(&expected_channel_id, &request)
-                        .await,
-                ));
+                let result = self
+                    .state
+                    .apply_channel_payment(&expected_channel_id, &request)
+                    .await;
+                if result.is_ok() {
+                    self.accepted_payment = Some((request.channel_id.clone(), request.balance_raw));
+                }
+                pending.push_back(SessionEvent::PaymentValidationFinished(result));
             }
             SessionEffect::NotifySessionEvicted {
                 target_session_id,

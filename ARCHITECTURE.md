@@ -1066,10 +1066,19 @@ H2 stream receive capacity is released when the proxy consumes a DATA frame,
 before its target write, preserving the original buffering/backpressure policy.
 Traffic counters remain in-memory, not crash-durable. Transport write success
 also does not prove that the remote application consumed the bytes. Payment,
-channel ownership, and CONNECT snapshots still have separate synchronization;
-this change does not complete internally consistent SessionStatus snapshots.
+channel ownership, and CONNECT observations have separate synchronization.
+The status contract permits these groups to be sampled at different times.
+Remaining credit and pause state are derived from the reported byte and payment
+values. Payment acknowledgements retain their accepted request balance even if a
+later owner has advanced the durable channel balance. Missing required linked
+authority causes bounded `INTERNAL_ERROR` delivery and cleanup, not a null link.
 
 ### CONNECT Counters
+
+The three counters share a short per-session synchronous mutex. Acceptance holds
+it through synchronous H2 response enqueue and paired open/total increments;
+close, failure, and snapshots use the same mutex. No network await, storage I/O,
+or serialization occurs under it. Data forwarding never acquires this mutex.
 
 The relay commits CONNECT acceptance only when it submits the successful H2
 response; that transition increments `open_connects` and `total_connects`. Every

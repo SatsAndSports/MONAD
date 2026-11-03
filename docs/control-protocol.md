@@ -336,8 +336,23 @@ policy, target, upstream-connect, or pre-acceptance stream failure. Client
 receipt of the response is not part of either counter's definition. A tunnel
 failure after successful acceptance does not retrospectively increment
 `failed_connects`. `open_connects` decrements exactly once when an accepted tunnel
-terminates. Each status is one internally consistent snapshot, although
-accounting may advance immediately after its linearization point.
+terminates. The three CONNECT counters are captured together and must satisfy
+`open_connects <= total_connects`.
+
+A status is not a transactionally atomic snapshot across linkage, billing,
+traffic, and CONNECT activity. These groups may reflect different observation
+times, and state may advance during construction or delivery. The reported
+`remaining_milli_sats` must be the exact result of applying the fixed rates to
+the reported byte totals and subtracting that cost from the reported
+`total_paid_millisats`; `paused` must equal `remaining_milli_sats <= 0`.
+Inbound and outbound totals may be sampled separately.
+
+Relaxed sampling does not weaken ordinary response attribution: successful link
+and unlink responses reflect their committed linkage result, and a payment
+success reports the balance accepted for that request, not a later balance
+committed by another session. Linkage may lag an ownership transfer until the
+session processes its eviction advisory. Failure to obtain required linked-channel
+authority is an internal error, not a successful status reporting no channel.
 
 Each advertisement value has two required durations:
 
