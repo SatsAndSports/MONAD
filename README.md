@@ -675,6 +675,12 @@ There is no client-requested relay refresh operation. Automatic first-link refre
 
 ## Payment Code Map
 
+Session status reports may sample linkage, billing, and CONNECT activity at
+different times. Billing fields remain arithmetically consistent, CONNECT counts
+are captured together, and payment acknowledgements retain the balance accepted
+for their request. This pre-alpha contract clarification needs no configuration
+change or database reset.
+
 The canonical client funding implementation lives in `monad-client/src/session_driver.rs` and its private modules:
 
 - `runtime` runs the serialized control loop

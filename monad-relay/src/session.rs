@@ -38,7 +38,7 @@ use monad_quic::client::ClientAuthMode;
 use monad_quic::stream::{STREAM_KIND_SECP_NOISE, STREAM_KIND_TWEAKED_NOISE};
 use std::collections::{BTreeSet, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as BillingMutex};
 use std::task::Poll;
 use tokio::io::AsyncWriteExt;
@@ -94,9 +94,14 @@ impl ControlState {
 /// Lightweight observability counters that do not participate in billing.
 #[derive(Debug, Default)]
 struct SessionCounters {
-    open_connects: AtomicU32,
-    total_connects: AtomicU64,
-    failed_connects: AtomicU64,
+    counts: BillingMutex<ConnectCounts>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ConnectCounts {
+    open_connects: u32,
+    total_connects: u64,
+    failed_connects: u64,
 }
 
 /// Actual cleartext bytes forwarded during this session. `Relaxed` operations
@@ -128,63 +133,39 @@ impl SessionByteCounters {
 
 impl SessionCounters {
     fn snapshot(&self) -> (u32, u64, u64) {
+        let counts = self.counts.lock().unwrap();
         (
-            self.open_connects.load(Ordering::Relaxed),
-            self.total_connects.load(Ordering::Relaxed),
-            self.failed_connects.load(Ordering::Relaxed),
+            counts.open_connects,
+            counts.total_connects,
+            counts.failed_connects,
         )
     }
 
     fn connect_acceptance_available(&self) -> bool {
-        self.open_connects.load(Ordering::Relaxed) != u32::MAX
-            && self.total_connects.load(Ordering::Relaxed) != u64::MAX
+        let counts = self.counts.lock().unwrap();
+        counts.open_connects != u32::MAX && counts.total_connects != u64::MAX
     }
 
+    #[cfg(test)]
     fn connect_opened(&self) -> Option<(u32, u64)> {
-        let open_connects = self
-            .open_connects
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .ok()
-            .map(|previous| previous + 1)?;
-        let total_connects = match self.total_connects.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| current.checked_add(1),
-        ) {
-            Ok(previous) => previous + 1,
-            Err(_) => {
-                let _ = self.open_connects.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |current| current.checked_sub(1),
-                );
-                return None;
-            }
-        };
+        let mut counts = self.counts.lock().unwrap();
+        let open_connects = counts.open_connects.checked_add(1)?;
+        let total_connects = counts.total_connects.checked_add(1)?;
+        counts.open_connects = open_connects;
+        counts.total_connects = total_connects;
         Some((open_connects, total_connects))
     }
 
     fn connect_failed(&self) -> Option<u64> {
-        self.failed_connects
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .ok()
-            .map(|previous| previous + 1)
+        let mut counts = self.counts.lock().unwrap();
+        counts.failed_connects = counts.failed_connects.checked_add(1)?;
+        Some(counts.failed_connects)
     }
 
     fn connect_closed(&self) -> Option<(u32, u64)> {
-        let open_connects = self
-            .open_connects
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(1)
-            })
-            .ok()
-            .map(|previous| previous - 1)?;
-        let total_connects = self.total_connects.load(Ordering::Relaxed);
-        Some((open_connects, total_connects))
+        let mut counts = self.counts.lock().unwrap();
+        counts.open_connects = counts.open_connects.checked_sub(1)?;
+        Some((counts.open_connects, counts.total_connects))
     }
 }
 
@@ -553,6 +534,13 @@ impl SessionState {
     // Billing state and status snapshots.
 
     pub(crate) async fn session_status_message(&self) -> Option<ServerMessage> {
+        self.session_status_message_for_payment(None).await
+    }
+
+    pub(crate) async fn session_status_message_for_payment(
+        &self,
+        accepted_payment: Option<(&str, u64)>,
+    ) -> Option<ServerMessage> {
         let mut advertisements = MintUnitAdvertisements::new();
         for (mint_url, trusted_units) in &self.trusted_mint_units {
             for unit in trusted_units {
@@ -573,9 +561,22 @@ impl SessionState {
         // Control requests are serialized, so linkage cannot change while this
         // status is being prepared. Do not hold billing across storage access.
         let linked_channel_id = self.billing.lock().unwrap().state.linked_channel_id.clone();
-        let linked_channel = linked_channel_id
-            .as_deref()
-            .and_then(|channel_id| self.payments.linked_channel_status(channel_id));
+        let mut linked_channel = match linked_channel_id.as_deref() {
+            Some(channel_id) => match self.payments.linked_channel_status(channel_id) {
+                Some(channel) => Some(channel),
+                None => return None,
+            },
+            None => None,
+        };
+        // A later owner may already have advanced durable balance. The reply
+        // acknowledges this operation, not that owner's subsequent payment.
+        if let Some((channel_id, balance_raw)) = accepted_payment {
+            let channel = linked_channel.as_mut()?;
+            if channel.channel_id != channel_id || balance_raw > channel.capacity_raw {
+                return None;
+            }
+            channel.balance_raw = balance_raw;
+        }
         let (open_connects, total_connects, failed_connects) = self.counters.snapshot();
 
         // Serialize the traffic snapshot with payment and pause state. Concurrent
@@ -675,6 +676,7 @@ impl SessionState {
         self.billing.lock().unwrap().state.total_paid_millisats == 0
     }
 
+    #[cfg(test)]
     pub(crate) fn connect_opened(&self) -> Option<(u32, u64)> {
         self.counters.connect_opened()
     }
@@ -992,7 +994,11 @@ impl ConnectHandler {
                 respond.send_response(resp, true)?;
                 return Ok(None);
             }
-            if !self.state.connect_acceptance_available() {
+            // Serialize publication with the counter snapshot. This synchronous
+            // H2 enqueue never awaits network capacity. Forwarding does not take
+            // this mutex. Lock order: registry controls -> counters.
+            let mut counts = self.state.counters.counts.lock().unwrap();
+            if counts.open_connects == u32::MAX || counts.total_connects == u64::MAX {
                 let resp = Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
                     .body(())
@@ -1001,20 +1007,19 @@ impl ConnectHandler {
                 return Ok(None);
             }
             let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
-            respond.send_response(resp, false).map(Some)
+            let send = respond.send_response(resp, false)?;
+            counts.open_connects += 1;
+            counts.total_connects += 1;
+            self.accepted.store(true, Ordering::Relaxed);
+            Ok(Some((send, counts.open_connects, counts.total_connects)))
         })?;
-        let Some(h2_send) = h2_send else {
+        let Some((h2_send, open_connects, total_connects)) = h2_send else {
             return Ok(());
         };
         drop(setup_permit);
         let (_, h2_recv) = request.into_parts();
         let state = self.state.clone();
         let session_id = self.state.session_id;
-        self.accepted.store(true, Ordering::Relaxed);
-        let Some((open_connects, total_connects)) = state.connect_opened() else {
-            state.terminate();
-            return Ok(());
-        };
         info!(
             "CONNECT opened: {authority} ({label}) | session_id={} open_connects={} total_connects={}",
             hex::encode(session_id),
@@ -1315,6 +1320,24 @@ pub(crate) async fn send_control_message(
     send_json_line(h2_send, message).await
 }
 
+pub(crate) async fn fail_status_construction(
+    state: &SessionState,
+    send: &mut h2::SendStream<Bytes>,
+) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        send_control_message(
+            send,
+            &ServerMessage::Error {
+                code: monad_common::protocol::ServerErrorCode::InternalError,
+                message: "unable to construct session status".into(),
+            },
+        ),
+    )
+    .await;
+    state.terminate();
+}
+
 /// Handle the long-lived control stream for one relay session.
 struct InboundControlRequest {
     message: ClientMessage,
@@ -1380,7 +1403,7 @@ async fn handle_control_stream(
         // pre-H2 Noise bootstrap selected the session protocol, we immediately send
         // the initial SessionStatus before entering the reducer-driven control loop.
         let Some(initial_status) = state.session_status_message().await else {
-            state.terminate();
+            fail_status_construction(&state, &mut h2_send).await;
             return Ok(());
         };
         send_control_message(&mut h2_send, &initial_status).await?;
@@ -1785,39 +1808,154 @@ mod tests {
     #[test]
     fn connect_counters_reject_overflow_without_wrapping() {
         let (state, _) = test_state();
-        state
-            .counters
-            .open_connects
-            .store(u32::MAX, Ordering::Relaxed);
+        state.counters.counts.lock().unwrap().open_connects = u32::MAX;
         assert!(!state.connect_acceptance_available());
         assert_eq!(state.connect_opened(), None);
-        assert_eq!(
-            state.counters.open_connects.load(Ordering::Relaxed),
-            u32::MAX
-        );
+        assert_eq!(state.counters.snapshot().0, u32::MAX);
 
-        state.counters.open_connects.store(0, Ordering::Relaxed);
-        state
-            .counters
-            .total_connects
-            .store(u64::MAX, Ordering::Relaxed);
+        state.counters.counts.lock().unwrap().open_connects = 0;
+        state.counters.counts.lock().unwrap().total_connects = u64::MAX;
         assert!(!state.connect_acceptance_available());
         assert_eq!(state.connect_opened(), None);
-        assert_eq!(state.counters.open_connects.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            state.counters.total_connects.load(Ordering::Relaxed),
-            u64::MAX
-        );
+        assert_eq!(state.counters.snapshot().0, 0);
+        assert_eq!(state.counters.snapshot().1, u64::MAX);
 
-        state
-            .counters
-            .failed_connects
-            .store(u64::MAX, Ordering::Relaxed);
+        state.counters.counts.lock().unwrap().failed_connects = u64::MAX;
         assert_eq!(state.connect_failed(), None);
 
-        state.counters.open_connects.store(1, Ordering::Relaxed);
+        state.counters.counts.lock().unwrap().open_connects = 1;
         assert_eq!(state.connect_closed(), Some((0, u64::MAX)));
         assert_eq!(state.connect_closed(), None);
+    }
+
+    #[test]
+    fn concurrent_connect_snapshots_preserve_group_invariants() {
+        let counters = SessionCounters::default();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..10_000 {
+                        counters.connect_opened().unwrap();
+                        counters.connect_closed().unwrap();
+                        counters.connect_failed().unwrap();
+                    }
+                });
+            }
+            for _ in 0..10_000 {
+                let (open, total, _) = counters.snapshot();
+                assert!(u64::from(open) <= total);
+                assert!(open <= 4);
+            }
+        });
+        assert_eq!(counters.snapshot(), (0, 40_000, 40_000));
+    }
+
+    #[tokio::test]
+    async fn missing_linked_authority_sends_fatal_error_instead_of_null_status() {
+        let (state, _) = test_state();
+        state.billing.lock().unwrap().state.linked_channel_id = Some("missing".into());
+        let (mut send, _recv, _client_send, mut client_recv, mut drivers) =
+            test_h2_streams(65535).await;
+        let mut driver = ControlDriver::new(&state, &mut send);
+        assert!(driver
+            .interpret(
+                crate::session_fsm::SessionEffect::SendStatus,
+                &mut VecDeque::new(),
+            )
+            .await
+            .unwrap());
+        assert!(state.is_terminated());
+        let mut buf = Vec::new();
+        loop {
+            let data = client_recv.data().await.unwrap().unwrap();
+            client_recv
+                .flow_control()
+                .release_capacity(data.len())
+                .unwrap();
+            buf.extend_from_slice(&data);
+            if let Some(message) = try_decode_json_line::<ServerMessage>(&mut buf).unwrap() {
+                assert!(matches!(
+                    message,
+                    ServerMessage::Error {
+                        code: monad_common::protocol::ServerErrorCode::InternalError,
+                        ..
+                    }
+                ));
+                break;
+            }
+        }
+        drivers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn payment_reply_preserves_accepted_balance_after_owner_transfer() {
+        let (state, payments) = test_state();
+        let request = link_request("shared", 100, "msat");
+        state.link_channel(&request).unwrap();
+        state.billing.lock().unwrap().state.linked_channel_id = Some("shared".into());
+        let (mut send, _recv, _client_send, mut client_recv, mut drivers) =
+            test_h2_streams(65535).await;
+        let mut driver = ControlDriver::new(&state, &mut send);
+        let mut pending = VecDeque::new();
+        driver
+            .interpret(
+                crate::session_fsm::SessionEffect::RunPaymentValidation {
+                    expected_channel_id: "shared".into(),
+                    request: payment_request("shared", 10),
+                },
+                &mut pending,
+            )
+            .await
+            .unwrap();
+        // Force another owner to advance storage before the first reply is built.
+        payments
+            .link_channel(&["v1".to_string()].into(), [2; 32], &request)
+            .unwrap();
+        payments
+            .apply_channel_payment_with_limit(
+                [2; 32],
+                "shared",
+                &payment_request("shared", 20),
+                u64::MAX,
+            )
+            .unwrap();
+        let effects = {
+            let mut billing = state.billing.lock().unwrap();
+            let (next, effects) = step(
+                billing.state.clone(),
+                pending.pop_front().unwrap(),
+                billing.pricing,
+                state.bytes.snapshot(),
+            );
+            billing.state = next;
+            effects
+        };
+        for effect in effects {
+            driver.interpret(effect, &mut pending).await.unwrap();
+        }
+        let mut buf = Vec::new();
+        loop {
+            let data = client_recv.data().await.unwrap().unwrap();
+            client_recv
+                .flow_control()
+                .release_capacity(data.len())
+                .unwrap();
+            buf.extend_from_slice(&data);
+            if let Some(message) = try_decode_json_line::<ServerMessage>(&mut buf).unwrap() {
+                let ServerMessage::SessionStatus {
+                    linked_channel,
+                    total_paid_millisats,
+                    ..
+                } = message
+                else {
+                    panic!("expected status")
+                };
+                assert_eq!(linked_channel.unwrap().balance_raw, 10);
+                assert_eq!(total_paid_millisats, 10);
+                break;
+            }
+        }
+        drivers.shutdown().await;
     }
 
     #[test]
@@ -2829,6 +2967,8 @@ mod tests {
             billing.state.total_paid_millisats = 10;
             billing.state.paused = false;
         }
+        // CONNECT observation must not block transport or byte accounting.
+        let _connect_counts = state.counters.counts.lock().unwrap();
         let result = state.poll_accounted_forward(ByteDirection::Outbound, 5, || {
             assert!(state.billing.try_lock().is_ok());
             Poll::Ready(Ok(5))
