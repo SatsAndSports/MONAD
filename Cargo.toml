@@ -12,8 +12,8 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "92d3a595f6e35d46ec929ff01c89a4c64c43a3cd" }
-cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "92d3a595f6e35d46ec929ff01c89a4c64c43a3cd", default-features = false }
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "cb3ee0386d5bd010178ede02859c8913c0850f68" }
+cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "cb3ee0386d5bd010178ede02859c8913c0850f68", default-features = false }
 cashu = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
 cdk = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
 cdk-common = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }

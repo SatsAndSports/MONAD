@@ -349,7 +349,8 @@ const CREATE_CHANNEL_RECOVERIES_SQL: &str = r#"
         recovered_amount_raw INTEGER,
         recovered_proof_count INTEGER,
         prepared_refund_json TEXT,
-        journal_version INTEGER NOT NULL DEFAULT 2 CHECK(journal_version = 2),
+        journal_version INTEGER NOT NULL DEFAULT 3 CHECK(journal_version = 3),
+        winning_refund_json TEXT,
         custody_db TEXT NOT NULL,
         custody_wallet TEXT NOT NULL,
         custody_sender TEXT NOT NULL,
@@ -693,12 +694,20 @@ impl SqliteClientWallet {
                 .execute_batch("DROP TABLE monad_client_channel_recoveries")
                 .map_err(|e| WalletError::Backend(format!("replace empty refund schema: {e}")))?;
         }
+        let incompatible_refund: bool = channel_db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='monad_client_channel_recoveries') AND NOT EXISTS(SELECT 1 FROM pragma_table_info('monad_client_channel_recoveries') WHERE name='winning_refund_json')", [], |r| r.get(0))
+            .map_err(|e| WalletError::Backend(format!("inspect refund format: {e}")))?;
+        if incompatible_refund {
+            return Err(WalletError::Backend(
+                "incompatible refund journal v3; database retained".to_string(),
+            ));
+        }
         channel_db
             .execute_batch(&format!(
                 "{CREATE_CHANNELS_SQL};{CREATE_CHANNEL_RECOVERIES_SQL};"
             ))
             .map_err(|e| WalletError::Backend(format!("create channel metadata schema: {e}")))?;
-        let incompatible: bool = channel_db.query_row("SELECT EXISTS(SELECT 1 FROM monad_client_channel_recoveries WHERE journal_version != 2)", [], |r| r.get(0))
+        let incompatible: bool = channel_db.query_row("SELECT EXISTS(SELECT 1 FROM monad_client_channel_recoveries WHERE journal_version != 3)", [], |r| r.get(0))
             .map_err(|e| WalletError::Backend(format!("validate refund journal version: {e}")))?;
         if incompatible {
             return Err(WalletError::Backend(
@@ -761,8 +770,8 @@ impl SqliteClientWallet {
     /// the safest next step and returns what happened.
     ///
     /// Requires matching exclusive maintenance access. Each invocation submits at
-    /// most once plus one exact replay per request. Only an initial, definitive
-    /// inactive-output rejection may produce one immutable successor.
+    /// most once plus one exact replay per candidate. A validated inactive-output
+    /// rejection on any A execution may produce one keyset-only successor B.
     /// - no row / prepared + expired + unspent: persist and submit one refund
     /// - submitting: restore before clock/state checks; retry only after valid absence
     /// - finalizing: finish local proof import and closure without mint IO
@@ -858,12 +867,6 @@ impl SqliteClientWallet {
                     now,
                 });
             }
-            if executions >= 2 {
-                return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
-                    channel_id: channel_id.to_string(),
-                    reason: "refund remains unresolved after bounded exact replay".to_string(),
-                });
-            }
             if prepared.is_none() {
                 prepared = Some(self.prepare_and_persist_refund_recovery(
                     channel_id,
@@ -871,29 +874,39 @@ impl SqliteClientWallet {
                     now,
                 )?);
             }
-            // Resume a durable initial rejection even if the previous invocation
-            // died during refresh. No ambiguous execution may precede this grant.
-            if !refreshed_rejection && self.refund_has_initial_rejection(channel_id)? {
+            // Execution-specific rejection survives prior ambiguity and restart.
+            if !refreshed_rejection && self.refund_has_successor_authority(channel_id)? {
                 refreshed_rejection = true;
                 let p = prepared.as_ref().unwrap();
                 let output = self.select_refund_output_keyset(&established, true)?;
                 if output.keyset_id != p.output_keyset.keyset_id {
-                    let successor = established
-                        .prepare_sender_refund_after_expiry(
-                            self.sender_secret.clone(),
-                            now,
-                            output,
-                            rand::random(),
-                        )
+                    let successor = p
+                        .with_output_keyset(&established, &self.sender_secret, output)
                         .map_err(|e| {
                             WalletError::Backend(format!("prepare successor refund: {e}"))
                         })?;
                     self.persist_refund_successor(channel_id, p, &successor)?;
                     prepared = Some(successor);
                     executions = 0;
+                    // Reconcile again after refresh/persistence: A or Charlie
+                    // may have committed while the successor was being prepared.
+                    continue;
                 }
             }
             let p = prepared.as_ref().unwrap();
+            if self.refund_current_rejected(channel_id, p)? {
+                return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
+                    channel_id: channel_id.to_string(),
+                    reason: "refund keyset rejected; candidates retained without further successor"
+                        .to_string(),
+                });
+            }
+            if executions >= 2 {
+                return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
+                    channel_id: channel_id.to_string(),
+                    reason: "refund remains unresolved after bounded exact replay".to_string(),
+                });
+            }
             let execution = self.record_refund_execution(channel_id, p)?;
             executions += 1;
             match established
@@ -910,12 +923,11 @@ impl SqliteClientWallet {
                     )
                 }
                 Err(error) => {
-                    // Only a typed, direct initial rejection may authorize new outputs.
-                    // Pending execution records are uncertainty, including process death.
+                    // Evidence about this execution does not erase any earlier
+                    // uncertainty. Record B's rejection too, but never create C.
                     if error
                         .downcast_ref::<MintHttpRejection>()
                         .is_some_and(|e| e.inactive_output_keyset())
-                        && self.refund_can_replace(channel_id, execution)?
                     {
                         self.conn()?.execute("UPDATE monad_client_refund_executions SET outcome = 'inactive_output_keyset' WHERE execution_id = ?1", [execution])
                             .map_err(|e| WalletError::Backend(format!("record refund rejection: {e}")))?;
@@ -958,6 +970,7 @@ impl SqliteClientWallet {
         if let Some(current) = current_refund {
             refunds.push(current.clone());
         }
+        self.verify_refund_candidates(&established, &refunds)?;
         let mut result = Err(anyhow::anyhow!("sender discovery not attempted"));
         for refresh in [false, true] {
             let keysets = {
@@ -2009,16 +2022,21 @@ impl SqliteClientWallet {
         Ok(id)
     }
 
-    fn refund_can_replace(&self, channel_id: &str, execution: i64) -> Result<bool, WalletError> {
-        self.conn()?.query_row(
-            "SELECT NOT EXISTS(SELECT 1 FROM monad_client_refund_executions WHERE channel_id = ?1 AND execution_id != ?2) AND NOT EXISTS(SELECT 1 FROM monad_client_refund_predecessors WHERE channel_id = ?1)",
-            params![channel_id, execution], |r| r.get(0),
-        ).map_err(|e| WalletError::Backend(e.to_string()))
+    fn refund_current_rejected(
+        &self,
+        channel_id: &str,
+        prepared: &PreparedSenderRefund,
+    ) -> Result<bool, WalletError> {
+        let json = prepared
+            .to_json()
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        self.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM monad_client_refund_executions WHERE channel_id=?1 AND prepared_json=?2 AND outcome='inactive_output_keyset')", params![channel_id, json], |r| r.get(0))
+            .map_err(|e| WalletError::Backend(e.to_string()))
     }
 
-    fn refund_has_initial_rejection(&self, channel_id: &str) -> Result<bool, WalletError> {
+    fn refund_has_successor_authority(&self, channel_id: &str) -> Result<bool, WalletError> {
         self.conn()?.query_row(
-            "SELECT (SELECT COUNT(*) FROM monad_client_refund_executions WHERE channel_id = ?1) = 1 AND EXISTS(SELECT 1 FROM monad_client_refund_executions WHERE channel_id = ?1 AND outcome = 'inactive_output_keyset') AND NOT EXISTS(SELECT 1 FROM monad_client_refund_predecessors WHERE channel_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM monad_client_refund_executions e JOIN monad_client_channel_recoveries r ON r.channel_id=e.channel_id AND r.prepared_refund_json=e.prepared_json WHERE e.channel_id = ?1 AND e.outcome = 'inactive_output_keyset') AND NOT EXISTS(SELECT 1 FROM monad_client_refund_predecessors WHERE channel_id = ?1)",
             [channel_id], |r| r.get(0),
         ).map_err(|e| WalletError::Backend(e.to_string()))
     }
@@ -2029,6 +2047,15 @@ impl SqliteClientWallet {
         old: &PreparedSenderRefund,
         new: &PreparedSenderRefund,
     ) -> Result<(), WalletError> {
+        let funding = self
+            .bridge
+            .lock()
+            .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?
+            .get_channel_funding(channel_id)
+            .ok_or(WalletError::NotFound)?;
+        let channel = EstablishedChannel::from_client_channel_funding(&funding)
+            .map_err(|_| WalletError::Backend("invalid refund funding".to_string()))?;
+        self.verify_refund_candidates(&channel, &[old.clone(), new.clone()])?;
         if old.output_keyset.keyset_id == new.output_keyset.keyset_id {
             return Err(WalletError::Backend(
                 "refund successor requires a different output keyset".to_string(),
@@ -2045,12 +2072,12 @@ impl SqliteClientWallet {
             .transaction()
             .map_err(|e| WalletError::Backend(e.to_string()))?;
         let authorized: bool = tx.query_row(
-            "SELECT (SELECT COUNT(*) FROM monad_client_refund_executions WHERE channel_id = ?1) = 1 AND EXISTS(SELECT 1 FROM monad_client_refund_executions WHERE channel_id = ?1 AND prepared_json = ?2 AND outcome = 'inactive_output_keyset')",
+            "SELECT EXISTS(SELECT 1 FROM monad_client_refund_executions WHERE channel_id = ?1 AND prepared_json = ?2 AND outcome = 'inactive_output_keyset') AND NOT EXISTS(SELECT 1 FROM monad_client_refund_predecessors WHERE channel_id = ?1)",
             params![channel_id, old], |r| r.get(0),
         ).map_err(|e| WalletError::Backend(e.to_string()))?;
         if !authorized {
             return Err(WalletError::Backend(
-                "refund successor lacks definitive initial rejection".to_string(),
+                "refund successor lacks execution rejection authority".to_string(),
             ));
         }
         tx.execute(
@@ -2058,7 +2085,7 @@ impl SqliteClientWallet {
             params![channel_id, old],
         )
         .map_err(|e| WalletError::Backend(e.to_string()))?;
-        let changed = tx.execute("UPDATE monad_client_channel_recoveries SET prepared_refund_json = ?3, status = 'prepared', updated_at = ?4 WHERE channel_id = ?1 AND prepared_refund_json = ?2 AND status = 'submitting'", params![channel_id, old, new, to_i64(Self::now_seconds()?)?])
+        let changed = tx.execute("UPDATE monad_client_channel_recoveries SET prepared_refund_json = ?3, status = 'submitting', updated_at = ?4 WHERE channel_id = ?1 AND prepared_refund_json = ?2 AND status = 'submitting'", params![channel_id, old, new, to_i64(Self::now_seconds()?)?])
             .map_err(|e| WalletError::Backend(e.to_string()))?;
         if changed != 1 {
             return Err(WalletError::Backend(
@@ -2115,13 +2142,18 @@ impl SqliteClientWallet {
         full_refund: bool,
     ) -> Result<ChannelFundRecoveryResult, WalletError> {
         self.validate_recovery_custody(channel_id)?;
+        let winner = if full_refund {
+            Some(self.identify_refund_winner(channel_id, funding, &proofs)?)
+        } else {
+            None
+        };
         let (db, wallet, sender) = self.recovery_custody()?;
         let json =
             serde_json::to_string(&proofs).map_err(|e| WalletError::Backend(e.to_string()))?;
         let now = to_i64(Self::now_seconds()?)?;
         {
             let conn = self.conn()?;
-            conn.execute("INSERT INTO monad_client_channel_recoveries(channel_id, kind, status, completed_proofs_json, created_at, updated_at, custody_db, custody_wallet, custody_sender) VALUES (?1, ?2, 'finalizing', ?3, ?4, ?4, ?5, ?6, ?7) ON CONFLICT(channel_id) DO UPDATE SET kind = excluded.kind, status = 'finalizing', completed_proofs_json = excluded.completed_proofs_json WHERE monad_client_channel_recoveries.status IN ('prepared', 'submitting') AND monad_client_channel_recoveries.completed_proofs_json IS NULL", params![channel_id, kind, json, now, db, wallet, sender])
+            conn.execute("INSERT INTO monad_client_channel_recoveries(channel_id, kind, status, completed_proofs_json, created_at, updated_at, custody_db, custody_wallet, custody_sender, winning_refund_json) VALUES (?1, ?2, 'finalizing', ?3, ?4, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(channel_id) DO UPDATE SET kind = excluded.kind, status = 'finalizing', completed_proofs_json = excluded.completed_proofs_json, winning_refund_json = excluded.winning_refund_json WHERE monad_client_channel_recoveries.status IN ('prepared', 'submitting') AND monad_client_channel_recoveries.completed_proofs_json IS NULL", params![channel_id, kind, json, now, db, wallet, sender, winner])
                 .map_err(|e| WalletError::Backend(format!("persist verified recovery proofs: {e}")))?;
             let stored: (String, String) = conn.query_row("SELECT kind, completed_proofs_json FROM monad_client_channel_recoveries WHERE channel_id = ?1 AND status = 'finalizing'", [channel_id], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map_err(|e| WalletError::Backend(format!("check finalization: {e}")))?;
@@ -2129,6 +2161,11 @@ impl SqliteClientWallet {
                 return Err(WalletError::Backend(
                     "immutable completed proofs conflict".to_string(),
                 ));
+            }
+            let stored_winner: Option<String> = conn.query_row("SELECT winning_refund_json FROM monad_client_channel_recoveries WHERE channel_id=?1", [channel_id], |r| r.get(0))
+                .map_err(|e| WalletError::Backend(e.to_string()))?;
+            if stored_winner != winner {
+                return Err(WalletError::Backend("refund winner conflict".to_string()));
             }
         }
         #[cfg(feature = "funds-lifecycle-test")]
@@ -2196,6 +2233,114 @@ impl SqliteClientWallet {
                 recovered_proof_count,
             })
         }
+    }
+
+    fn verify_refund_candidates(
+        &self,
+        channel: &EstablishedChannel,
+        candidates: &[PreparedSenderRefund],
+    ) -> Result<(), WalletError> {
+        if candidates.len() > 2 {
+            return Err(WalletError::Backend(
+                "too many refund candidates".to_string(),
+            ));
+        }
+        for candidate in candidates {
+            candidate
+                .verify(channel, &self.sender_secret)
+                .map_err(|_| WalletError::Backend("invalid refund candidate".to_string()))?;
+        }
+        if candidates.len() == 2 {
+            let original = candidates[0]
+                .to_json()
+                .map_err(|e| WalletError::Backend(e.to_string()))?;
+            let authorized: bool = self.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM monad_client_refund_executions WHERE channel_id=?1 AND prepared_json=?2 AND outcome='inactive_output_keyset')", params![channel.params.get_channel_id(), original], |r| r.get(0))
+                .map_err(|e| WalletError::Backend(e.to_string()))?;
+            if !authorized {
+                return Err(WalletError::Backend(
+                    "refund successor lacks retained rejection evidence".to_string(),
+                ));
+            }
+            let expected = candidates[0]
+                .with_output_keyset(
+                    channel,
+                    &self.sender_secret,
+                    candidates[1].output_keyset.clone(),
+                )
+                .map_err(|_| WalletError::Backend("invalid refund successor".to_string()))?;
+            if expected
+                .to_json()
+                .map_err(|e| WalletError::Backend(e.to_string()))?
+                != candidates[1]
+                    .to_json()
+                    .map_err(|e| WalletError::Backend(e.to_string()))?
+            {
+                return Err(WalletError::Backend(
+                    "refund successor changed immutable inputs or outputs".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // The immutable preparation is a stable winner identity independent of the
+    // order used for an upstream recovery call. Validate before durable import,
+    // including offline resumption of a finalizing record.
+    fn identify_refund_winner(
+        &self,
+        channel_id: &str,
+        funding: &ClientChannelFunding,
+        proofs: &[Proof],
+    ) -> Result<String, WalletError> {
+        let channel = EstablishedChannel::from_client_channel_funding(funding)
+            .map_err(|_| WalletError::Backend("invalid refund funding".to_string()))?;
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT prepared_json FROM monad_client_refund_predecessors WHERE channel_id=?1 UNION ALL SELECT prepared_refund_json FROM monad_client_channel_recoveries WHERE channel_id=?1 AND prepared_refund_json IS NOT NULL")
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let rows = stmt
+            .query_map([channel_id], |r| r.get::<_, String>(0))
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(
+                PreparedSenderRefund::from_json(
+                    &row.map_err(|e| WalletError::Backend(e.to_string()))?,
+                )
+                .map_err(|_| WalletError::Backend("invalid refund candidate".to_string()))?,
+            );
+        }
+        drop(stmt);
+        drop(conn);
+        self.verify_refund_candidates(&channel, &candidates)?;
+        for candidate in candidates {
+            if !proofs.is_empty()
+                && proofs.len() == candidate.outputs.len()
+                && proofs
+                    .iter()
+                    .zip(&candidate.outputs)
+                    .all(|(proof, output)| {
+                        proof.keyset_id == candidate.output_keyset.keyset_id
+                            && u64::from(proof.amount) == output.amount
+                            && proof.secret == output.secret
+                            && proof
+                                .dleq
+                                .as_ref()
+                                .is_some_and(|d| d.r == output.blinding_factor)
+                            && candidate
+                                .output_keyset
+                                .active_keys
+                                .amount_key(proof.amount)
+                                .is_some_and(|k| proof.verify_dleq(k).is_ok())
+                    })
+            {
+                return candidate
+                    .to_json()
+                    .map_err(|e| WalletError::Backend(e.to_string()));
+            }
+        }
+        Err(WalletError::Backend(
+            "refund payout does not match retained candidate".to_string(),
+        ))
     }
 
     fn mark_channel_recovery_completed(
@@ -4650,6 +4795,7 @@ fn sql_decode_error(message: impl Into<String>) -> rusqlite::Error {
 
 #[cfg(test)]
 mod tests {
+    mod competing_refunds;
     use super::*;
     use crate::loose_proof_wallet::OpeningExecutionKind;
     use crate::loose_proof_wallet::{LooseProofState, NewLooseProof};
@@ -6205,7 +6351,13 @@ mod tests {
             if let Some(old) = old {
                 let requests = mint.requests.lock().unwrap();
                 assert_eq!(requests[1], requests[2]);
-                assert_ne!(old.derivation_context, prepared.derivation_context);
+                assert_eq!(old.derivation_context, prepared.derivation_context);
+                assert!(old.swap_request.inputs() == prepared.swap_request.inputs());
+                assert!(old
+                    .outputs
+                    .iter()
+                    .zip(&prepared.outputs)
+                    .all(|(a, b)| a.secret == b.secret && a.blinding_factor == b.blinding_factor));
                 assert_eq!(old.output_amount_raw, prepared.output_amount_raw);
                 let stored: String = ctx
                     .wallet
@@ -6304,7 +6456,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn refund_ambiguous_replay_rejection_never_creates_successor() {
+    async fn refund_ambiguous_replay_rejection_waits_for_changed_keyset() {
         let ctx = open_short_expiry_test_channel(16, 1).await;
         wait_until_expired(ctx.expiry_timestamp).await;
         let mut mint = scripted_refund_mint(&ctx);
@@ -6323,7 +6475,7 @@ mod tests {
         }
         {
             let requests = mint.requests.lock().unwrap();
-            assert_eq!(requests.len(), 4);
+            assert_eq!(requests.len(), 2);
             assert!(requests.iter().all(|r| r == &requests[0]));
         }
         {
@@ -6343,7 +6495,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(successors, 0);
-            assert_eq!(uncertain, 4);
+            assert_eq!(uncertain, 1);
         }
         assert!(ctx
             .wallet
@@ -6496,15 +6648,24 @@ mod tests {
             .unwrap();
         assert!(matches!(
             result,
-            ChannelFundRecoveryResult::RecoveryRetryLater { .. }
+            ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
         ));
-        assert_eq!(
-            prepared_refund_json(&ctx.wallet, &ctx.channel_id).unwrap(),
-            original
+        let retained: String = reopened
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT prepared_json FROM monad_client_refund_predecessors WHERE channel_id=?1",
+                [&ctx.channel_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            retained == original,
+            "original cancelled request must remain retained"
         );
         assert_eq!(retry.requests.lock().unwrap().len(), 2);
         assert!(!reopened
-            .refund_has_initial_rejection(&ctx.channel_id)
+            .refund_has_successor_authority(&ctx.channel_id)
             .unwrap());
         let _ = ctx.shutdown_tx.send(());
         ctx.mint_task.await.unwrap().unwrap();
@@ -6558,7 +6719,7 @@ mod tests {
             )
             .unwrap();
         rotate_sat_keyset(&ctx.mint_helper.mint(), 0).await.unwrap();
-        ctx.wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_successor BEFORE UPDATE ON monad_client_channel_recoveries WHEN NEW.status = 'prepared' AND OLD.status = 'submitting' BEGIN SELECT RAISE(ABORT, 'injected successor failure after predecessor insert'); END").unwrap();
+        ctx.wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_successor BEFORE UPDATE ON monad_client_channel_recoveries WHEN NEW.prepared_refund_json != OLD.prepared_refund_json BEGIN SELECT RAISE(ABORT, 'injected successor failure after predecessor insert'); END").unwrap();
         let locks = refund_test_locks(&ctx);
         let mint = scripted_refund_mint(&ctx);
         assert!(ctx
@@ -6572,7 +6733,7 @@ mod tests {
         );
         assert!(ctx
             .wallet
-            .refund_has_initial_rejection(&ctx.channel_id)
+            .refund_has_successor_authority(&ctx.channel_id)
             .unwrap());
         let predecessors: i64 = ctx
             .wallet
@@ -7027,12 +7188,13 @@ mod tests {
             if boundary == "rejection" {
                 assert!(matches!(
                     result,
-                    ChannelFundRecoveryResult::RecoveryRetryLater { .. }
+                    ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
                 ));
                 assert_eq!(mint.requests.lock().unwrap().len(), 3);
-                assert_eq!(
-                    prepared_refund_json(&ctx.wallet, &ctx.channel_id).unwrap(),
-                    prepared.to_json().unwrap()
+                let retained: String = reopened.conn().unwrap().query_row("SELECT prepared_json FROM monad_client_refund_predecessors WHERE channel_id=?1", [&ctx.channel_id], |r| r.get(0)).unwrap();
+                assert!(
+                    retained == prepared.to_json().unwrap(),
+                    "prior uncertainty lost"
                 );
             } else {
                 assert!(matches!(
