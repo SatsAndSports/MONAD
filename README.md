@@ -201,7 +201,7 @@ rebuilds the affected session; MONAD never blindly retries the stale payment.
 
 ## Status
 
-MONAD pins Spilman **0.3.0** at `7fa7c35d19d03546fb1d45d1295c21a63d624b8d`
+MONAD pins Spilman **0.3.0** at `92d3a595f6e35d46ec929ff01c89a4c64c43a3cd`
 and all CDK/Cashu crates to the matching v0.18.1 backport at
 `SatsAndSports/cdk@da5cf282dd070772af830fa5215630f059e5f1ad`.
 Pins are centralized in the workspace manifest. The fork implementation is
@@ -232,6 +232,13 @@ sweeps skip it. Explicit `wallet close --channel-id ...` still performs online
 recovery and can recover a previously issued payout. Batch close reports resolved
 administrative outcomes, unresolved channels, and failures separately; abandoned
 channels have no drainable payout.
+
+The library cleanup removes signature classifiers, the first-proof state shortcut,
+and the inferred `SenderRefundedAfterExpiry` receiver state. MONAD's CLI, management
+API, and UI no longer expose that outcome/counter. Unsupported old state rows fail
+lookup explicitly without conversion or deletion; retain matching older software
+and data if needed. Full-token inspection and verified payout recovery remain the
+ordinary flow. Retry budgets and the CDK pin are unchanged by this cleanup.
 
 Wallet databases explicitly verify SQLite `synchronous=EXTRA` on each writable
 connection. Back up all client and relay wallet databases using SQLite's backup

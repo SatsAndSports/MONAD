@@ -32,13 +32,11 @@ fn wallet_summary(channels: &[ChannelSummary], drains: &[DrainSummary]) -> Resul
     let mut open = 0_u64;
     let mut closing = 0_u64;
     let mut closed = 0_u64;
-    let mut sender_refunded_after_expiry = 0_u64;
     for channel in channels {
         let count = match channel.state {
             ChannelState::Open => &mut open,
             ChannelState::Closing => &mut closing,
             ChannelState::Closed => &mut closed,
-            ChannelState::SenderRefundedAfterExpiry => &mut sender_refunded_after_expiry,
         };
         *count = count.checked_add(1).ok_or("channel count overflow")?;
     }
@@ -48,7 +46,6 @@ fn wallet_summary(channels: &[ChannelSummary], drains: &[DrainSummary]) -> Resul
             "open": open,
             "closing": closing,
             "closed": closed,
-            "sender_refunded_after_expiry": sender_refunded_after_expiry,
         },
     }))
 }
@@ -336,7 +333,6 @@ impl Backend for RelayBackend {
                     .map_err(|_| "channel closure failed; inspect channel recovery state")?;
                 let outcome = match outcome {
                     CloseOutcome::Closed(_) => "closed",
-                    CloseOutcome::SenderRefundedAfterExpiry { .. } => "sender_refunded",
                     CloseOutcome::CollectionAbandoned { .. } => "collection_abandoned",
                     CloseOutcome::UnknownSpent { .. } => "unresolved_spent",
                 };
@@ -464,7 +460,6 @@ mod tests {
             channel(ChannelState::Open),
             channel(ChannelState::Closing),
             channel(ChannelState::Closed),
-            channel(ChannelState::SenderRefundedAfterExpiry),
         ];
         let drains = [
             drain("Completed", "sat", 20),
@@ -482,7 +477,6 @@ mod tests {
                     "open": 1,
                     "closing": 1,
                     "closed": 1,
-                    "sender_refunded_after_expiry": 1,
                 },
             })
         );

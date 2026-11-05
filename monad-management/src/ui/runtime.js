@@ -963,10 +963,6 @@ function walletSummary(process, state) {
     ` · Closing ${summarizedCount(summary, "closing")}`,
     ` · Closed ${summarizedCount(summary, "closed")}`,
   );
-  if (kind === "relays")
-    channels.append(
-      ` · Refunded after expiry ${summarizedCount(summary, "sender_refunded_after_expiry")}`,
-    );
   card.append(proofs, channels);
   return card;
 }

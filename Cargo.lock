@@ -781,7 +781,7 @@ dependencies = [
 [[package]]
 name = "cdk-spilman"
 version = "0.3.0"
-source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=7fa7c35d19d03546fb1d45d1295c21a63d624b8d#7fa7c35d19d03546fb1d45d1295c21a63d624b8d"
+source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=92d3a595f6e35d46ec929ff01c89a4c64c43a3cd#92d3a595f6e35d46ec929ff01c89a4c64c43a3cd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -805,7 +805,7 @@ dependencies = [
 [[package]]
 name = "cdk-spilman-test-mint"
 version = "0.3.0"
-source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=7fa7c35d19d03546fb1d45d1295c21a63d624b8d#7fa7c35d19d03546fb1d45d1295c21a63d624b8d"
+source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=92d3a595f6e35d46ec929ff01c89a4c64c43a3cd#92d3a595f6e35d46ec929ff01c89a4c64c43a3cd"
 dependencies = [
  "anyhow",
  "axum",
