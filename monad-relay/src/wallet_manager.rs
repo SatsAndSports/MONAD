@@ -576,8 +576,15 @@ impl RelayWalletInspection {
                     state: match state.as_str() {
                         "Closing" => ChannelState::Closing,
                         "Closed" => ChannelState::Closed,
-                        "SenderRefundedAfterExpiry" => ChannelState::SenderRefundedAfterExpiry,
-                        _ => ChannelState::Open,
+                        "Open" => ChannelState::Open,
+                        _ => return Err(rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unsupported stored receiver channel state; wallet data retained",
+                            )),
+                        )),
                     },
                     closing_json: row.get(6)?,
                 })
@@ -625,10 +632,7 @@ impl InspectionChannel {
     }
 
     fn expiring_summary(self, now: u64, cutoff: u64) -> io::Result<Option<ExpiringChannelSummary>> {
-        if matches!(
-            self.state,
-            ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry
-        ) {
+        if matches!(self.state, ChannelState::Closed) {
             return Ok(None);
         }
         let funding = self.funding()?;
@@ -1117,10 +1121,7 @@ impl RelayWalletManager {
                 Some(c) => c,
                 None => continue,
             };
-            if matches!(
-                channel.state,
-                ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry
-            ) {
+            if matches!(channel.state, ChannelState::Closed) {
                 continue;
             }
             let funding =
@@ -1141,7 +1142,7 @@ impl RelayWalletManager {
                     .as_ref()
                     .map(|closing| closing.expiry_timestamp)
                     .unwrap_or(funding.expiry_timestamp),
-                ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry => continue,
+                ChannelState::Closed => continue,
             };
             if expiry_timestamp > cutoff {
                 continue;
@@ -2562,6 +2563,31 @@ mod tests {
 
         let all_channels = manager.list_channels(None).unwrap();
         assert_eq!(all_channels.len(), 1);
+
+        // Read-only inspection must reject old/unknown state labels, not silently
+        // count them as Open or reinterpret them as collection abandonment.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for unsupported in ["SenderRefundedAfterExpiry", "corrupt-state"] {
+            conn.execute(
+                "UPDATE spilman_channels SET state=?1 WHERE channel_id=?2",
+                params![unsupported, channel_id],
+            )
+            .unwrap();
+            assert!(inspection.list_channels(Some("r1")).is_err());
+            assert!(inspection
+                .find_expiring_channels(Some("r1"), 0, u64::MAX)
+                .is_err());
+            assert!(manager.list_channels(Some("r1")).is_err());
+            let saved: String = conn
+                .query_row(
+                    "SELECT state FROM spilman_channels WHERE channel_id=?1",
+                    [&channel_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(saved, unsupported);
+            assert!(manager.storage.get_funding(&channel_id).is_some());
+        }
     }
 
     #[test]

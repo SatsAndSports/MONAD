@@ -87,7 +87,6 @@ test("relay wallet summary labels completed drain outputs and all channel states
       open: 2,
       closing: 0,
       closed: 5,
-      sender_refunded_after_expiry: 1,
     },
   });
   try {
@@ -97,7 +96,7 @@ test("relay wallet summary labels completed drain outputs and all channel states
       "Drained proofs · 4,200 sat · 0 msat",
     );
     await expect(card.locator('[data-wallet-category="channels"]')).toHaveText(
-      "Channels · Open 2 · Closing 0 · Closed 5 · Refunded after expiry 1",
+      "Channels · Open 2 · Closing 0 · Closed 5",
     );
     await page.setViewportSize({ width: 390, height: 844 });
     expect(

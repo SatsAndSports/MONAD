@@ -4661,7 +4661,7 @@ mod tests {
         compute_channel_from_proofs_with_input_keysets_and_funding_amount,
         compute_channel_secret_from_hex, construct_proofs, create_funding_swap_with_plain_change,
         create_plain_blinded_messages, ClientChannelOpeningFromSwap, ClientKeysetCacheEntry,
-        ClientStorage, ConfigurableClientHost, FundingSpendKind, MemoryClientStorage, Payment,
+        ClientStorage, ConfigurableClientHost, FundingState, MemoryClientStorage, Payment,
         ReqwestClientNetworking, SpilmanClientBridge, SpilmanClientHost, SqliteClientStorage,
     };
     use cdk_spilman_test_mint::{
@@ -6735,14 +6735,11 @@ mod tests {
                     .await
                     .unwrap()
             };
-            let state = established
-                .check_funding_token_state(&mint.inner)
-                .await
-                .unwrap();
-            assert_eq!(state.state, State::Spent);
+            let state = established.inspect_funding(&mint.inner).await.unwrap();
+            assert_eq!(state.state(), FundingState::Spent);
             assert_eq!(
-                EstablishedChannel::classify_funding_spend_witness(&state),
-                FundingSpendKind::Unknown
+                state.response().states.len(),
+                established.funding_proofs.len()
             );
             match mode {
                 "empty" => assert_eq!(result, ChannelFundRecoveryResult::UnknownSpent),
@@ -7361,14 +7358,11 @@ mod tests {
             bridge.get_channel_funding(&ctx.channel_id).unwrap()
         };
         let established = EstablishedChannel::from_client_channel_funding(&funding).unwrap();
-        let funding_state = established
-            .check_funding_token_state(&mint_connection)
-            .await
-            .unwrap();
-        assert_eq!(funding_state.state, State::Spent);
+        let funding_state = established.inspect_funding(&mint_connection).await.unwrap();
+        assert_eq!(funding_state.state(), FundingState::Spent);
         assert_eq!(
-            EstablishedChannel::classify_funding_spend_witness(&funding_state),
-            FundingSpendKind::PostExpiryRefund
+            funding_state.response().states.len(),
+            established.funding_proofs.len()
         );
 
         let rerun = ctx
@@ -7471,14 +7465,11 @@ mod tests {
         assert!(!proofs.is_empty());
         assert_eq!(recovery_row_count(&ctx.wallet, &ctx.channel_id), 0);
 
-        let funding_state = established
-            .check_funding_token_state(&mint_connection)
-            .await
-            .unwrap();
-        assert_eq!(funding_state.state, State::Spent);
+        let funding_state = established.inspect_funding(&mint_connection).await.unwrap();
+        assert_eq!(funding_state.state(), FundingState::Spent);
         assert_eq!(
-            EstablishedChannel::classify_funding_spend_witness(&funding_state),
-            FundingSpendKind::PostExpiryRefund
+            funding_state.response().states.len(),
+            established.funding_proofs.len()
         );
 
         let result = ctx
@@ -7749,11 +7740,12 @@ mod tests {
             .unwrap();
 
         let mint_connection = direct_mint_connection(&ctx);
-        let funding_state_before = established
-            .check_funding_token_state(&mint_connection)
-            .await
-            .unwrap();
-        assert_eq!(funding_state_before.state, State::Unspent);
+        let funding_state_before = established.inspect_funding(&mint_connection).await.unwrap();
+        assert_eq!(funding_state_before.state(), FundingState::Unspent);
+        assert_eq!(
+            funding_state_before.response().states.len(),
+            established.funding_proofs.len()
+        );
 
         let result = ctx
             .wallet
@@ -7793,14 +7785,11 @@ mod tests {
             )
         );
 
-        let funding_state_after = established
-            .check_funding_token_state(&mint_connection)
-            .await
-            .unwrap();
-        assert_eq!(funding_state_after.state, State::Spent);
+        let funding_state_after = established.inspect_funding(&mint_connection).await.unwrap();
+        assert_eq!(funding_state_after.state(), FundingState::Spent);
         assert_eq!(
-            EstablishedChannel::classify_funding_spend_witness(&funding_state_after),
-            FundingSpendKind::PostExpiryRefund
+            funding_state_after.response().states.len(),
+            established.funding_proofs.len()
         );
 
         let _ = ctx.shutdown_tx.send(());

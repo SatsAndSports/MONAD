@@ -246,8 +246,11 @@ expose `retired: true/false`.
 Closing an unlinked channel first retires it (idempotent) and requires no
 session to own it, which also reserves it against a concurrent relink.
 
-Close results distinguish `closed`, `sender_refunded`, and `unresolved_spent`.
-The last is not successful settlement. No proof payloads are returned. A close
+Close results distinguish `closed`, `collection_abandoned`, and `unresolved_spent`.
+Only `closed` establishes a verified payout. Collection abandonment is a post-expiry
+policy with retained attempts, not proof of an Alice refund; the channel remains
+`Closing`, automatic collection skips it, and explicit close can retry recovery.
+No proof payloads are returned. A close
 failure requires inspecting/recovering the stored channel, not blindly spending
 again. Snapshot expiry records include absolute expiry and seconds remaining.
 
@@ -295,8 +298,11 @@ to add to channel holdings.
 arithmetic. Client `available_loose_proofs` includes only proofs recorded as
 available, grouped by unit, while `channel_state_counts` reports Open, Closing and
 Closed channels. Relay `drained_proofs` includes only locally Completed drain
-outputs, grouped by unit; its channel counts also include
-`sender_refunded_after_expiry`. Summary amounts are decimal strings. They are
+outputs, grouped by unit; its channel counts report only `open`, `closing`, and
+`closed`. Abandoned collection remains in `closing`; the old
+`sender_refunded_after_expiry` counter/result has been removed. Unsupported stored
+receiver states fail inspection rather than being counted as open or closed.
+Summary amounts are decimal strings. They are
 nominal totals across configured mints for one unit, not a mint status check or a
 promise that separate mints are fungible.
 

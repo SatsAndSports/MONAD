@@ -29,9 +29,6 @@ pub enum CloseOutcome {
     CollectionAbandoned {
         channel_id: String,
     },
-    SenderRefundedAfterExpiry {
-        channel_id: String,
-    },
     /// Funding is spent, but which authorized branch won is unresolved.
     /// The journal remains recoverable; no payout or terminal state is invented.
     UnknownSpent {

@@ -542,7 +542,6 @@ fn print_close_expiring_success(channel: &ExpiringChannelSummary, close: &CloseO
 fn print_close_outcome(result: &CloseOutcome) {
     match result {
         CloseOutcome::Closed(close) => println!("Closed channel={} already_closed={} total_value={} receiver_sum={} sender_sum={}", close.channel_id, close.already_closed, close.total_value, close.receiver_sum, close.sender_sum),
-        CloseOutcome::SenderRefundedAfterExpiry { channel_id } => println!("SenderRefundedAfterExpiry channel={channel_id}; sender spent full funding minus mint fees; no receiver close payout"),
         CloseOutcome::CollectionAbandoned { channel_id } => println!("CollectionAbandoned channel={channel_id}; post-expiry funding unavailable; no known payout recovered; journal retained for explicit recovery"),
         CloseOutcome::UnknownSpent { channel_id } => println!("UnknownSpent channel={channel_id}; close versus refund unresolved; retry recovery later"),
     }

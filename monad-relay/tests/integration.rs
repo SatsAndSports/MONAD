@@ -55,7 +55,7 @@ use monad_common::wallet_lock::{WalletLockMode, WalletLocks};
 
 use cdk_spilman::configurable_host::{SpilmanStorage, SqliteStorage};
 use cdk_spilman::{
-    ChannelState, ClientStorage, ConfigurableClientHost, EstablishedChannel, FundingSpendKind,
+    ChannelState, ClientStorage, ConfigurableClientHost, EstablishedChannel, FundingState,
     MintConnection, SpilmanClientBridge, SqliteClientStorage,
 };
 use cdk_spilman_test_mint::{
@@ -12472,11 +12472,12 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
         mint: mint_helper.mint(),
     };
 
-    let before = established
-        .check_funding_token_state(&mint_connection)
-        .await
-        .unwrap();
-    assert_eq!(before.state, cashu::nuts::State::Unspent);
+    let before = established.inspect_funding(&mint_connection).await.unwrap();
+    assert_eq!(before.state(), FundingState::Unspent);
+    assert_eq!(
+        before.response().states.len(),
+        established.funding_proofs.len()
+    );
 
     let mint_networking = RecoveryTestMint(mint_helper.mint());
     let close_success = payments
@@ -12487,11 +12488,12 @@ async fn test_client_observes_relay_close_and_restores_sender_proofs() {
     assert!(!close_success.already_closed);
     assert_eq!(close_success.receiver_sum, funded_balance_raw);
 
-    let after = established
-        .check_funding_token_state(&mint_connection)
-        .await
-        .unwrap();
-    assert_eq!(after.state, cashu::nuts::State::Spent);
+    let after = established.inspect_funding(&mint_connection).await.unwrap();
+    assert_eq!(after.state(), FundingState::Spent);
+    assert_eq!(
+        after.response().states.len(),
+        established.funding_proofs.len()
+    );
 
     let restored_sender_proofs = EstablishedChannel::restore_sender_proofs_from_client_funding(
         &funding,
@@ -12680,14 +12682,11 @@ async fn sqlite_client_recovery_relay_close(pending_refund: bool) {
         .get_funding(&channel_id)
         .unwrap();
     let established = EstablishedChannel::from_client_channel_funding(&client_funding).unwrap();
-    let funding_state = established
-        .check_funding_token_state(&mint_connection)
-        .await
-        .unwrap();
-    assert_eq!(funding_state.state, cashu::nuts::State::Spent);
+    let funding_state = established.inspect_funding(&mint_connection).await.unwrap();
+    assert_eq!(funding_state.state(), FundingState::Spent);
     assert_eq!(
-        EstablishedChannel::classify_funding_spend_witness(&funding_state),
-        FundingSpendKind::Unknown
+        funding_state.response().states.len(),
+        established.funding_proofs.len()
     );
 
     let maintenance = monad_client::wallet_lock::ClientWalletLocks::acquire(

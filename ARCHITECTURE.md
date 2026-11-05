@@ -226,6 +226,14 @@ An unavailable or invalid check cannot abandon collection. Finalizing/completed
 verified records remain usable offline. Incompatible journals are rejected, not
 migrated or deleted.
 
+The cleanup pin removes the old receiver refund terminal enum/transition and spend
+classification helpers entirely. Management, CLI and UI expose only supported
+receiver states (`Open`, `Closing`, `Closed`) and the separate collection policy.
+Read-only SQL inspection validates state labels too: unsupported persisted values
+are errors, not implicit `Open` rows or inferred abandonment. The stored data is
+retained unchanged. Test oracles use all funding identities and verified payouts;
+signature shape does not classify the winner. Retry budgets are unchanged.
+
 The workspace pins one CDK/Cashu source matching the library. Channel-ID preflight
 for unknown keysets calls the upstream canonical TLV derivation using only the
 advertised identity fields; it does not duplicate the old delimiter-based hash.
