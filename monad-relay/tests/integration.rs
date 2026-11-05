@@ -13,6 +13,8 @@
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
 mod common;
+#[path = "common/drain_successor.rs"]
+mod drain_successor;
 #[path = "common/payment_conflict.rs"]
 mod payment_conflict;
 
@@ -13844,7 +13846,8 @@ async fn test_drain_singleflight_and_cancellation_preserve_immutable_request() {
             .await
             .is_err());
     }
-    // A 12002 on replay after cancellation must never grant changed outputs.
+    // A replay rejection is execution evidence, not rejection of the original.
+    // Refresh still selects the same keyset here, so no successor is created.
     assert!(ctx
         .wallet_manager
         .recover_submitted_drain(&id, &TypedDrainFailure(&net, 400))
@@ -13859,7 +13862,10 @@ async fn test_drain_singleflight_and_cancellation_preserve_immutable_request() {
         .unwrap();
     let history: serde_json::Value = serde_json::from_str(&history).unwrap();
     assert_eq!(history["attempts"].as_array().unwrap().len(), 1);
-    assert!(history["attempts"][0]["rejection"].is_null());
+    assert_eq!(history["attempts"][0]["keyset_rejection"]["submission"], 2);
+    // An actual different active keyset now permits B without erasing the
+    // original cancelled execution or its immutable recovery material.
+    rotate_sat_keyset(&ctx.mint, 500).await.unwrap();
     let recovered = ctx
         .wallet_manager
         .recover_submitted_drain(&id, &ctx.net_for(&channel))
@@ -13873,10 +13879,23 @@ async fn test_drain_singleflight_and_cancellation_preserve_immutable_request() {
             |row| row.get(0),
         )
         .unwrap();
+    let retained: String = conn
+        .query_row(
+            "SELECT journal_json FROM monad_relay_drain_journals WHERE drain_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let retained: serde_json::Value = serde_json::from_str(&retained).unwrap();
     assert!(
-        before == after,
-        "recovery changed the immutable drain request"
+        retained["attempts"][0]["prepared"]["swap_request_json"].as_str() == Some(before.as_str()),
+        "original immutable request was overwritten"
     );
+    assert!(
+        before != after,
+        "winning successor metadata was not installed"
+    );
+    assert_eq!(retained["attempts"].as_array().unwrap().len(), 2);
     ctx.shutdown();
 }
 
@@ -13904,7 +13923,7 @@ async fn test_drain_server_error_code_does_not_authorize_successor_or_release() 
     let journal: serde_json::Value = serde_json::from_str(&journal).unwrap();
     assert_eq!(journal["attempts"].as_array().unwrap().len(), 1);
     assert_eq!(journal["attempts"][0]["submissions"], 2);
-    assert!(journal["attempts"][0]["rejection"].is_null());
+    assert!(journal["attempts"][0]["keyset_rejection"].is_null());
     assert!(ctx
         .wallet_manager
         .drain_closed_channels_to_swap("drain-http500", &ctx.mint_url, "sat", &net, None)

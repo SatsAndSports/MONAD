@@ -552,7 +552,7 @@ or late failure cannot overwrite those proofs or release their reservations.
 
 ### Relay Drain Recovery
 
-Drain journal version 1 atomically reserves source channels with the first exact
+Drain journal version 2 atomically reserves source channels with the first exact
 request. It binds the normalized database, wallet/receiver, mint/unit, closed
 input-proof snapshots, per-input-keyset fees, output secrets and historical keys.
 Exact selection is bounded to 1,024 unique channel IDs. It rejects the entire set
@@ -560,20 +560,42 @@ before mint submission unless every channel is Closed, unreserved, owned by the
 requested relay, has valid nonempty receiver proofs, and shares one mint/unit. The
 legacy relay/mint/unit/limit drain selector resolves channel IDs and enters this
 same exact path.
-Every submitted request and the one permitted rejected predecessor remain in the
-journal. Submitted uncertainty is recorded before HTTP; only an initial typed
-HTTP 4xx numeric `12002` without prior uncertainty authorizes one changed-output
-successor. Untrusted string errors and replay rejections never release custody or
-authorize replacement. Non-keyset failures remain conservatively unresolved.
+The journal retains up to two immutable candidates, A and B, spending exactly the
+same complete input-proof snapshot (including spend authorization). Input fees
+are fixed independently of output-keyset rotation. A validated HTTP 400 `12002`
+on an execution of A may authorize B after refresh selects a different active
+same-mint/unit output keyset, even if A had earlier uncertain executions. The
+observation records its durable submission sequence; it does not mark A rejected
+or erase earlier uncertainty. Both candidates keep their own output secrets,
+historical keys and submission counts. A and B cannot both commit under the mint's
+atomic swap/double-spend rules. Untrusted strings, other HTTP statuses, unrelated
+errors or timeout alone never grant a successor. A rejected B never creates C.
 
 `recover-drain` handles Prepared, Submitted, Finalizing, and Completed. Exact
-restore precedes replay and key selection. Empty restore alone proves neither
+restore of every maybe-submitted candidate precedes replay and key selection.
+Another verified candidate can recover despite a restore error for its peer;
+otherwise invalid/unavailable evidence blocks further execution. Empty restore alone proves neither
 success nor safe replay: every aggregated input must have exactly one matching
-Unspent state, otherwise a final exact restore is attempted and ambiguity remains
-reserved. Each invocation permits at most two submissions. Verified output proofs
-are saved as Finalizing, then atomically committed with the completed journal and
+Unspent state, otherwise every candidate gets a final restore pass and ambiguity
+remains reserved. This covers A committing while B is inspected or submitted.
+Each invocation permits at most two executions of each candidate: initial/exact
+replay for A and a separate initial/exact replay allowance for B. This is a bounded
+maximum (up to four swap submissions), not an instruction to replay every failure.
+Later recovery invocations may continue the same candidate, retaining its history.
+No input is released, replaced, added or omitted to fund a competing request.
+
+Verified output proofs and the winning candidate index are saved as Finalizing,
+then atomically committed with the completed journal and
 terminal custody; resumed local completion rechecks proofs and makes no HTTP
 requests. Proofs stay in the relay DB, with no additional loose-wallet import.
+Mirrored drain metadata is taken from the actual winner, not necessarily the latest
+candidate. If B is prepared but A is already uncertain, the logical drain remains
+Submitted rather than appearing fresh/never submitted. Version 1 journals are
+incompatible and rejected intact, with no automatic migration or reset.
+
+This competing-successor policy currently applies **only to drains**. Opening,
+receiver close and sender refund retain their prior successor/replay rules until
+separate follow-ups. The library and dependency pins are unchanged.
 
 The in-process runtime owner or an offline caller with exclusive maintenance
 authority may execute and recover drains. Per-drain singleflight, atomic unique

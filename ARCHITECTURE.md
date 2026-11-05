@@ -243,8 +243,9 @@ coordinated breaking alpha upgrade without old channel derivation compatibility.
 Custom mint adapters retain the 15-second timeout and cap decoded responses at
 4 MiB with strict UTF-8. Complete responses are classified by upstream typed mint
 outcomes; only validated HTTP 400 NUT-00 rejections carry rejection authority.
-MONAD's immutable-request successor policy remains narrower: initial `12002` only,
-with no prior ambiguity. Diagnostic bodies/details are redacted before propagation.
+Opening, sender-refund and receiver-close successor policy remains narrower:
+initial `12002` only, with no prior ambiguity. Drains use the bounded competing-
+candidate policy described below. Diagnostic bodies/details are redacted before propagation.
 
 ### Wallet Durability
 
@@ -1389,8 +1390,19 @@ release a completed drain's channels. These guards are not full-operation
 singleflight or an immutable execution-history journal on their own. The drain
 orchestrator now supplies both: a versioned identity/input/fee-bound journal is
 inserted atomically with channel reservations. Every request and submission count
-is retained; a single typed initial 4xx/12002 may authorize a retained-predecessor
-successor. Exact restore and all-input Unspent checks gate bounded replay.
+is retained. Drain journal v2 records HTTP 400/12002 evidence about one numbered
+execution, not rejection of an entire candidate. An observation for A can authorize
+one changed-active-keyset candidate B despite earlier uncertainty. Both requests
+must spend the same complete custody snapshot with the same input-fee metadata;
+atomic mint double-spend prevention makes their payouts mutually exclusive.
+Every submitted candidate is restored before replay/key selection and again after
+non-unspent evidence. Either verified payout can win; failure/absence for one does
+not erase its peer. Each candidate gets two executions per invocation and B cannot
+authorize C. Empty/invalid evidence never releases the shared reservation.
+Finalizing data binds a winner index, and mirrored drain fields follow that winner
+rather than the latest prepared candidate. A prepared B does not make an already
+submitted A look unsubmitted. Version 1 journals reject intact without migration.
+Exact restore and all-input Unspent checks gate bounded replay.
 Verified Finalizing payloads permit offline completion, with terminal custody
 remaining in the relay DB. Drain selection accepts at most 1,024 explicit,
 duplicate-free channel IDs and rejects the whole set unless each channel is

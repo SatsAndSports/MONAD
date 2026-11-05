@@ -19,6 +19,7 @@ struct Journal {
     inputs: Vec<DrainCandidate>,
     attempts: Vec<Attempt>,
     finalizing: Option<String>,
+    winner: Option<usize>,
     completed: bool,
 }
 
@@ -30,7 +31,44 @@ struct Attempt {
     input_fees: BTreeMap<String, u64>,
     output_amount: u64,
     submissions: u64,
-    rejection: Option<MintHttpRejection>,
+    // Evidence about one execution, never a claim that this entire candidate
+    // failed. Earlier submissions may still commit or have lost their replies.
+    keyset_rejection: Option<ExecutionRejection>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionRejection {
+    submission: u64,
+    evidence: MintHttpRejection,
+}
+
+impl Journal {
+    fn selected_attempt(&self) -> Result<&Attempt, String> {
+        match (self.finalizing.is_some(), self.winner) {
+            (true, Some(index)) => self
+                .attempts
+                .get(index)
+                .ok_or_else(|| "invalid drain winner".to_string()),
+            (false, None) => self
+                .attempts
+                .last()
+                .ok_or_else(|| "empty drain journal".to_string()),
+            _ => Err("drain winner/finalization mismatch".to_string()),
+        }
+    }
+
+    fn state(&self) -> &'static str {
+        if self.completed {
+            "Completed"
+        } else if self.finalizing.is_some() {
+            "Finalizing"
+        } else if self.attempts.iter().any(|a| a.submissions > 0) {
+            "Submitted"
+        } else {
+            "Prepared"
+        }
+    }
 }
 
 impl From<PreparedDrainAttempt> for Attempt {
@@ -41,7 +79,7 @@ impl From<PreparedDrainAttempt> for Attempt {
             input_fees: attempt.drain_keysets.input_fee_ppk_by_keyset,
             output_amount: attempt.output_amount_raw,
             submissions: 0,
-            rejection: None,
+            keyset_rejection: None,
         }
     }
 }
@@ -76,7 +114,7 @@ fn encode<T: Serialize + ?Sized>(value: &T) -> Result<String, String> {
 pub(super) fn validate_schema(json: &str) -> Result<(), String> {
     let journal: Journal =
         serde_json::from_str(json).map_err(|_| "incompatible drain journal; database retained")?;
-    if journal.version != 1 {
+    if journal.version != 2 {
         return Err("incompatible drain journal version; database retained".to_string());
     }
     Ok(())
@@ -130,7 +168,7 @@ impl RelayWalletManager {
             total,
         )?;
         let journal = Journal {
-            version: 1,
+            version: 2,
             db: self.drain_binding()?,
             drain_id,
             receiver: self
@@ -142,6 +180,7 @@ impl RelayWalletManager {
             inputs,
             attempts: vec![attempt.into()],
             finalizing: None,
+            winner: None,
             completed: false,
         };
         self.verify_drain_journal(&journal)?;
@@ -206,7 +245,7 @@ impl RelayWalletManager {
     }
 
     fn verify_drain_journal(&self, journal: &Journal) -> Result<(), String> {
-        if journal.version != 1
+        if journal.version != 2
             || journal.db != self.drain_binding()?
             || journal.receiver
                 != self
@@ -263,9 +302,11 @@ impl RelayWalletManager {
             .try_fold(0u64, |n, p| n.checked_add(u64::from(p.amount)))
             .ok_or("drain input overflow")?;
         for (index, attempt) in journal.attempts.iter().enumerate() {
-            if attempt.rejection.is_some_and(|r| {
-                !r.inactive_output_keyset() || index != 0 || attempt.submissions != 1
-            }) || (journal.attempts.len() == 2 && journal.attempts[0].rejection.is_none())
+            if attempt.keyset_rejection.as_ref().is_some_and(|r| {
+                !r.evidence.inactive_output_keyset()
+                    || r.submission == 0
+                    || r.submission > attempt.submissions
+            }) || (journal.attempts.len() == 2 && journal.attempts[0].keyset_rejection.is_none())
             {
                 return Err("invalid drain execution history".to_string());
             }
@@ -320,10 +361,15 @@ impl RelayWalletManager {
                 return Err("drain outputs differ from immutable secrets".to_string());
             }
         }
+        let selected = journal.selected_attempt()?;
         if let Some(finalizing) = &journal.finalizing {
+            if selected.submissions == 0 {
+                return Err("unsubmitted drain winner".to_string());
+            }
             let proofs: Vec<Proof> =
                 serde_json::from_str(finalizing).map_err(|_| "invalid drain finalization")?;
-            let valid = journal.attempts.iter().any(|attempt| {
+            let attempt = selected;
+            let valid = (|| {
                 let Ok(keys) = cdk_spilman::parse_keyset_info_from_json(&attempt.keys) else {
                     return false;
                 };
@@ -342,7 +388,7 @@ impl RelayWalletManager {
                                 .amount_key(proof.amount)
                                 .is_some_and(|key| proof.verify_dleq(key).is_ok())
                     })
-            });
+            })();
             if !valid {
                 return Err("drain finalization proof conflict".to_string());
             }
@@ -359,23 +405,62 @@ impl RelayWalletManager {
         if changed != 1 {
             return Err("drain journal conflict".to_string());
         }
-        let current = journal.attempts.last().ok_or("empty drain journal")?;
+        let current = journal.selected_attempt()?;
         let keys = cdk_spilman::parse_keyset_info_from_json(&current.keys)?;
-        let state = if journal.completed {
-            "Completed"
-        } else if journal.finalizing.is_some() {
-            "Finalizing"
-        } else if current.submissions > 0 {
-            "Submitted"
-        } else {
-            "Prepared"
-        };
+        let state = journal.state();
         let changed = tx.execute("UPDATE monad_relay_drains SET state=?2,output_amount_raw=?3,swap_request_json=?4,restore_request_json=?5,output_secrets_json=?6,output_keyset_id=?7,output_keyset_info_json=?8,output_proofs_json=?9,completed_at=CASE WHEN ?2='Completed' THEN COALESCE(completed_at,?10) ELSE completed_at END WHERE drain_id=?1 AND state!='Completed'", params![journal.drain_id,state,i64_from_u64(current.output_amount)?,current.prepared.swap_request_json,current.prepared.restore_request_json,current.prepared.output_secrets_json,keys.keyset_id.to_string(),current.keys,journal.finalizing,i64_from_u64(now_seconds())?]).map_err(|e| e.to_string())?;
         if changed != 1 {
             return Err("drain terminal state conflict".to_string());
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(next)
+    }
+
+    async fn restore_drain_candidates<N: DrainSwapNetworking>(
+        &self,
+        journal: &Journal,
+        net: &N,
+    ) -> Result<Option<(usize, String)>, String> {
+        let mut invalid = false;
+        for (index, attempt) in journal.attempts.iter().enumerate() {
+            if attempt.submissions == 0 {
+                continue;
+            }
+            let result = async {
+                let response = net
+                    .call_mint_restore(&journal.mint, &attempt.prepared.restore_request_json)
+                    .await?;
+                let parsed: cashu::nuts::RestoreResponse =
+                    serde_json::from_str(&response).map_err(|_| "invalid drain restore")?;
+                if parsed.outputs.is_empty() && parsed.signatures.is_empty() {
+                    return Ok(None);
+                }
+                let completed = complete_plain_change_restore(
+                    &response,
+                    &attempt.prepared.output_secrets_json,
+                    &attempt.keys,
+                )
+                .map_err(|_| "invalid exact drain restore")?;
+                let completed: serde_json::Value =
+                    serde_json::from_str(&completed).map_err(|_| "invalid drain completion")?;
+                let proofs = completed["change_proofs_json"]
+                    .as_str()
+                    .ok_or("missing restored drain proofs")?;
+                Ok::<_, String>(Some(proofs.to_string()))
+            }
+            .await;
+            match result {
+                Ok(Some(proofs)) => return Ok(Some((index, proofs))),
+                Ok(None) => {}
+                Err(_) => invalid = true,
+            }
+        }
+        if invalid {
+            return Err(
+                "drain restore unavailable or invalid; submitted outcome unresolved".to_string(),
+            );
+        }
+        Ok(None)
     }
 
     pub(super) async fn run_exact_drain<N: DrainSwapNetworking>(
@@ -409,16 +494,8 @@ impl RelayWalletManager {
         }
         self.verify_drain_journal(&journal)?;
         let stored = self.load_drain(id)?;
-        let current = journal.attempts.last().ok_or("empty drain journal")?;
-        let expected_state = if journal.completed {
-            "Completed"
-        } else if journal.finalizing.is_some() {
-            "Finalizing"
-        } else if current.submissions > 0 {
-            "Submitted"
-        } else {
-            "Prepared"
-        };
+        let current = journal.selected_attempt()?;
+        let expected_state = journal.state();
         if stored.state != expected_state
             || journal
                 .inputs
@@ -429,6 +506,11 @@ impl RelayWalletManager {
             || stored.mint_url != journal.mint
             || stored.unit != journal.unit
             || stored.output_amount_raw != current.output_amount
+            || stored.swap_request_json != current.prepared.swap_request_json
+            || stored.output_keyset_id
+                != cdk_spilman::parse_keyset_info_from_json(&current.keys)?
+                    .keyset_id
+                    .to_string()
             || stored.restore_request_json != current.prepared.restore_request_json
             || stored.output_secrets_json != current.prepared.output_secrets_json
             || stored.output_keyset_info_json != current.keys
@@ -461,7 +543,7 @@ impl RelayWalletManager {
         if self.drain_channel_ids(id)? != expected_channels {
             return Err("drain input membership conflict".to_string());
         }
-        let mut sent = 0;
+        let mut sent = [0_u8; 2];
         let mut restore_first = resumed;
         loop {
             if journal.finalizing.is_some() {
@@ -474,34 +556,11 @@ impl RelayWalletManager {
                 return self.completed_drain_result(self.load_drain(id)?, recovered);
             }
             let last = journal.attempts.len() - 1;
-            if restore_first || journal.attempts[last].submissions > 0 {
-                for attempt in &journal.attempts {
-                    let response = net
-                        .call_mint_restore(&journal.mint, &attempt.prepared.restore_request_json)
-                        .await
-                        .map_err(|_| "drain restore unavailable; submitted outcome unresolved")?;
-                    let parsed: cashu::nuts::RestoreResponse =
-                        serde_json::from_str(&response).map_err(|_| "invalid drain restore")?;
-                    if parsed.outputs.is_empty() && parsed.signatures.is_empty() {
-                        continue;
-                    }
-                    let completed = complete_plain_change_restore(
-                        &response,
-                        &attempt.prepared.output_secrets_json,
-                        &attempt.keys,
-                    )
-                    .map_err(|_| "invalid exact drain restore")?;
-                    let completed: serde_json::Value =
-                        serde_json::from_str(&completed).map_err(|_| "invalid completed drain")?;
-                    journal.finalizing = Some(
-                        completed["change_proofs_json"]
-                            .as_str()
-                            .ok_or("missing restored drain proofs")?
-                            .to_string(),
-                    );
-                    break;
-                }
-                if journal.finalizing.is_some() {
+            if restore_first || journal.attempts.iter().any(|a| a.submissions > 0) {
+                if let Some((winner, proofs)) = self.restore_drain_candidates(&journal, net).await?
+                {
+                    journal.winner = Some(winner);
+                    journal.finalizing = Some(proofs);
                     durable = self.persist_exact_drain(&journal, &durable)?;
                     #[cfg(feature = "funds-lifecycle-test")]
                     crate::lifecycle_test::boundary("drain-finalizing");
@@ -532,28 +591,13 @@ impl RelayWalletManager {
                             != 1
                     })
                 {
-                    let attempt = &journal.attempts[last];
-                    let response = net
-                        .call_mint_restore(&journal.mint, &attempt.prepared.restore_request_json)
-                        .await
-                        .map_err(|_| "final drain restore unavailable")?;
-                    let parsed: cashu::nuts::RestoreResponse = serde_json::from_str(&response)
-                        .map_err(|_| "invalid final drain restore")?;
-                    if !parsed.outputs.is_empty() || !parsed.signatures.is_empty() {
-                        let result = complete_plain_change_restore(
-                            &response,
-                            &attempt.prepared.output_secrets_json,
-                            &attempt.keys,
-                        )
-                        .map_err(|_| "invalid final exact drain restore")?;
-                        let result: serde_json::Value = serde_json::from_str(&result)
-                            .map_err(|_| "invalid final drain completion")?;
-                        journal.finalizing = Some(
-                            result["change_proofs_json"]
-                                .as_str()
-                                .ok_or("missing final drain proofs")?
-                                .to_string(),
-                        );
+                    // A may commit while B is being inspected/submitted. Recheck
+                    // every candidate, not just the newest one, after spent state.
+                    if let Some((winner, proofs)) =
+                        self.restore_drain_candidates(&journal, net).await?
+                    {
+                        journal.winner = Some(winner);
+                        journal.finalizing = Some(proofs);
                         durable = self.persist_exact_drain(&journal, &durable)?;
                         #[cfg(feature = "funds-lifecycle-test")]
                         crate::lifecycle_test::boundary("drain-finalizing");
@@ -565,7 +609,12 @@ impl RelayWalletManager {
                     );
                 }
             }
-            if journal.attempts[last].rejection.is_some() {
+            if journal.attempts[last].keyset_rejection.is_some() {
+                if journal.attempts.len() == 2 {
+                    return Err(
+                        "drain successor keyset rejected; both candidates retained".to_string()
+                    );
+                }
                 self.refresh_all_keysets_for_mint_into_shared_cache(&journal.mint)
                     .await?;
                 let mut keys =
@@ -591,22 +640,22 @@ impl RelayWalletManager {
                 let successor =
                     self.prepare_drain_attempt_with_keysets(keys, request.inputs(), total)?;
                 journal.attempts.push(successor.into());
+                self.verify_drain_journal(&journal)?;
                 durable = self.persist_exact_drain(&journal, &durable)?;
                 restore_first = false;
                 #[cfg(feature = "funds-lifecycle-test")]
                 crate::lifecycle_test::boundary("drain-successor");
                 continue;
             }
-            if sent >= 2 {
+            if sent[last] >= 2 {
                 return Err("drain submitted; immutable replay budget exhausted".to_string());
             }
-            let initial = last == 0 && journal.attempts[last].submissions == 0;
             journal.attempts[last].submissions = journal.attempts[last]
                 .submissions
                 .checked_add(1)
                 .ok_or("drain execution overflow")?;
             durable = self.persist_exact_drain(&journal, &durable)?;
-            sent += 1;
+            sent[last] += 1;
             #[cfg(feature = "funds-lifecycle-test")]
             crate::lifecycle_test::boundary("drain-submitting");
             let attempt = &journal.attempts[last];
@@ -615,6 +664,7 @@ impl RelayWalletManager {
                 .await
             {
                 Ok(response) => {
+                    journal.winner = Some(last);
                     journal.finalizing = Some(
                         complete_plain_drain_swap(
                             &response,
@@ -628,16 +678,17 @@ impl RelayWalletManager {
                     crate::lifecycle_test::boundary("drain-finalizing");
                 }
                 Err(error) => {
-                    if initial {
-                        if let Some(rejection) = error
-                            .downcast_ref::<MintHttpRejection>()
-                            .filter(|r| r.inactive_output_keyset())
-                        {
-                            journal.attempts[last].rejection = Some(*rejection);
-                            durable = self.persist_exact_drain(&journal, &durable)?;
-                            #[cfg(feature = "funds-lifecycle-test")]
-                            crate::lifecycle_test::boundary("drain-rejected");
-                        }
+                    if let Some(rejection) = error
+                        .downcast_ref::<MintHttpRejection>()
+                        .filter(|r| r.inactive_output_keyset())
+                    {
+                        journal.attempts[last].keyset_rejection = Some(ExecutionRejection {
+                            submission: journal.attempts[last].submissions,
+                            evidence: *rejection,
+                        });
+                        durable = self.persist_exact_drain(&journal, &durable)?;
+                        #[cfg(feature = "funds-lifecycle-test")]
+                        crate::lifecycle_test::boundary("drain-rejected");
                     }
                     restore_first = true;
                 }
@@ -677,7 +728,7 @@ mod tests {
         );
         // This fixture exercises the private storage CAS, not crypto completion.
         let journal = Journal {
-            version: 1,
+            version: 2,
             db: manager.drain_binding().unwrap(),
             drain_id: "drain".to_string(),
             relay: "relay".to_string(),
@@ -695,9 +746,10 @@ mod tests {
                 input_fees: BTreeMap::new(),
                 output_amount: 1,
                 submissions: 1,
-                rejection: None,
+                keyset_rejection: None,
             }],
             finalizing: None,
+            winner: None,
             completed: false,
         };
         let before = encode(&journal).unwrap();
@@ -708,6 +760,7 @@ mod tests {
         .unwrap();
         let mut first = journal.clone();
         first.completed = true;
+        first.winner = Some(0);
         first.finalizing = Some("first-fixture-payload".to_string());
         let mut second = first.clone();
         second.finalizing = Some("second-fixture-payload".to_string());
@@ -744,7 +797,7 @@ mod tests {
             1
         );
         let mut incompatible: serde_json::Value = serde_json::from_str(&stored).unwrap();
-        incompatible["version"] = serde_json::json!(2);
+        incompatible["version"] = serde_json::json!(1);
         conn.execute(
             "UPDATE monad_relay_drain_journals SET journal_json=?1",
             [incompatible.to_string()],
