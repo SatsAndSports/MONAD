@@ -14,7 +14,6 @@ use monad_common::config::RelayChannelPolicyConfig;
 use monad_common::protocol::{
     ChannelLinkRequest, ChannelPaymentRequest, LinkedChannelStatus, ServerErrorCode,
 };
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +24,11 @@ mod close_recovery;
 #[serde(tag = "outcome", content = "details")]
 pub enum CloseOutcome {
     Closed(CloseSuccess),
+    /// Post-expiry collection stopped; retained close attempts remain recoverable.
+    /// Does not attest a sender refund or create a zero-value payout.
+    CollectionAbandoned {
+        channel_id: String,
+    },
     SenderRefundedAfterExpiry {
         channel_id: String,
     },
@@ -414,16 +418,10 @@ impl SpilmanRelayPayments {
         let mint = params["mint"]
             .as_str()
             .ok_or_else(|| invalid("missing mint"))?;
-        if mint.contains('|') {
-            return Err(invalid("mint URL contains invalid delimiter"));
-        }
         let mint = mint.trim_end_matches('/');
         let unit = params["unit"]
             .as_str()
             .ok_or_else(|| invalid("missing unit"))?;
-        if unit.contains('|') {
-            return Err(invalid("unit contains invalid delimiter"));
-        }
         let unit: CurrencyUnit = unit
             .parse()
             .map_err(|error| invalid(&format!("invalid unit: {error}")))?;
@@ -460,14 +458,32 @@ impl SpilmanRelayPayments {
             &sender_pubkey.to_hex(),
         )
         .map_err(LinkError::InvalidPayment)?;
-        // Keep this canonical input aligned with cdk-spilman's pinned
-        // ChannelParameters::get_channel_id_bytes implementation.
-        let channel_id_input = format!(
-            "{mint}|{unit}|{capacity}|{funding_token_amount}|{keyset_id}|{input_fee_ppk}|{maximum_amount}|{setup_timestamp}|{}|{}|{expiry_timestamp}|{channel_secret}",
-            sender_pubkey.to_hex(),
-            receiver_pubkey.to_hex(),
-        );
-        let expected_channel_id = hex::encode(Sha256::digest(channel_id_input.as_bytes()));
+        // Metadata-independent ID preflight uses the library's canonical TLV,
+        // never a second hand-maintained derivation. Keys are deliberately absent:
+        // after bounded refresh, normal validation checks real keys, fees and proofs.
+        let identity = cdk_spilman::ChannelParameters {
+            sender_pubkey,
+            receiver_pubkey,
+            mint: mint.to_string(),
+            unit: unit.clone(),
+            capacity,
+            funding_token_amount,
+            expiry_timestamp,
+            setup_timestamp,
+            keyset_info: cdk_spilman::KeysetInfo::new(
+                *keyset_id,
+                unit.clone(),
+                cashu::nuts::Keys::new(Default::default()),
+                input_fee_ppk,
+                None,
+            ),
+            maximum_amount_for_one_output: maximum_amount,
+            channel_secret: hex::decode(channel_secret)
+                .map_err(|_| invalid("invalid channel secret"))?
+                .try_into()
+                .map_err(|_| invalid("invalid channel secret length"))?,
+        };
+        let expected_channel_id = identity.get_channel_id();
         if channel_id != expected_channel_id {
             return Err(LinkError::InvalidChannel(
                 "channel ID does not match funding parameters".to_string(),

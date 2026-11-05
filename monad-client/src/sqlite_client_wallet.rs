@@ -25,10 +25,10 @@ use cashu::nuts::{
 use cdk_spilman::{
     compute_funding_token_amount, parse_keyset_info_from_json, ClientChannelFunding,
     ClientChannelInfo, ClientChannelState, ClientKeysetCacheEntry, ClientPaymentState,
-    CompletedOpenChannel, ConfigurableClientHost, EstablishedChannel, FundingSpendKind,
-    MintConnection, OpenChannelError, OpenChannelFailureStage, OpenChannelResult,
-    PreparedOpenChannel, PreparedSenderRefund, ReqwestClientNetworking, SelectedOutputKeyset,
-    SpilmanClientBridge, SpilmanClientHost, SpilmanClientNetworking, SqliteClientStorage,
+    CompletedOpenChannel, ConfigurableClientHost, EstablishedChannel, MintConnection,
+    OpenChannelError, OpenChannelFailureStage, OpenChannelResult, PreparedOpenChannel,
+    PreparedSenderRefund, ReqwestClientNetworking, SelectedOutputKeyset, SpilmanClientBridge,
+    SpilmanClientHost, SpilmanClientNetworking, SqliteClientStorage,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -85,6 +85,7 @@ mod lifecycle_test {
 }
 const MINT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+use cdk_spilman::MintRequestError;
 pub use monad_common::mint_error::MintHttpRejection;
 
 static ACTIVE_OPENINGS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -113,10 +114,10 @@ fn enter_active_opening(channel_id: &str) -> Result<ActiveOpeningGuard, WalletEr
 }
 
 trait OpeningRecoveryNetworking: SpilmanClientNetworking {
-    // String-only upstream failures carry no definitive HTTP rejection evidence.
+    // Preserve typed response evidence for the immutable-opening retry policy.
     fn call_opening_swap(&self, mint_url: &str, request: &str) -> anyhow::Result<String> {
         self.call_mint_swap(mint_url, request)
-            .map_err(anyhow::Error::msg)
+            .map_err(monad_common::mint_error::recovery_error)
     }
 
     fn call_mint_check_state(
@@ -142,7 +143,7 @@ impl OpeningRecoveryHttpNetworking {
         })
     }
 
-    fn blocking_get(&self, url: &str) -> Result<String, String> {
+    fn blocking_get(&self, url: &str) -> Result<String, MintRequestError> {
         let client = self.client.clone();
         let url = url.to_string();
         tokio::task::block_in_place(|| {
@@ -152,20 +153,12 @@ impl OpeningRecoveryHttpNetworking {
                     .send()
                     .await
                     .map_err(|e| format!("GET {url} failed: {e}"))?;
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(MintHttpRejection::from_body(status.as_u16(), &body).to_string());
-                }
-                response
-                    .text()
-                    .await
-                    .map_err(|e| format!("GET {url} read body: {e}"))
+                monad_common::mint_error::read_mint_response(response).await
             })
         })
     }
 
-    fn blocking_post(&self, url: &str, body: &str) -> anyhow::Result<String> {
+    fn blocking_post(&self, url: &str, body: &str) -> Result<String, MintRequestError> {
         let client = self.client.clone();
         let url = url.to_string();
         let body = body.to_string();
@@ -176,38 +169,38 @@ impl OpeningRecoveryHttpNetworking {
                     .header("Content-Type", "application/json")
                     .body(body)
                     .send()
-                    .await?;
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(MintHttpRejection::from_body(status.as_u16(), &body).into());
-                }
-                response.text().await.map_err(anyhow::Error::from)
+                    .await
+                    .map_err(|_| {
+                        MintRequestError::transport("mint request failed; outcome uncertain")
+                    })?;
+                monad_common::mint_error::read_mint_response(response).await
             })
         })
     }
 }
 
 impl SpilmanClientNetworking for OpeningRecoveryHttpNetworking {
-    fn call_mint_swap(&self, mint_url: &str, swap_request_json: &str) -> Result<String, String> {
+    fn call_mint_swap(
+        &self,
+        mint_url: &str,
+        swap_request_json: &str,
+    ) -> Result<String, MintRequestError> {
         self.blocking_post(&format!("{mint_url}/v1/swap"), swap_request_json)
-            .map_err(|e| e.to_string())
     }
 
     fn call_mint_restore(
         &self,
         mint_url: &str,
         restore_request_json: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, MintRequestError> {
         self.blocking_post(&format!("{mint_url}/v1/restore"), restore_request_json)
-            .map_err(|e| e.to_string())
     }
 
-    fn call_mint_keysets(&self, mint_url: &str) -> Result<String, String> {
+    fn call_mint_keysets(&self, mint_url: &str) -> Result<String, MintRequestError> {
         self.blocking_get(&format!("{mint_url}/v1/keysets"))
     }
 
-    fn call_mint_keys(&self, mint_url: &str, keyset_id: &str) -> Result<String, String> {
+    fn call_mint_keys(&self, mint_url: &str, keyset_id: &str) -> Result<String, MintRequestError> {
         self.blocking_get(&format!("{mint_url}/v1/keys/{keyset_id}"))
     }
 }
@@ -215,6 +208,7 @@ impl SpilmanClientNetworking for OpeningRecoveryHttpNetworking {
 impl OpeningRecoveryNetworking for OpeningRecoveryHttpNetworking {
     fn call_opening_swap(&self, mint_url: &str, request: &str) -> anyhow::Result<String> {
         self.blocking_post(&format!("{mint_url}/v1/swap"), request)
+            .map_err(monad_common::mint_error::recovery_error)
     }
 
     fn call_mint_check_state(
@@ -805,6 +799,11 @@ impl SqliteClientWallet {
         .ok_or(WalletError::NotFound)?;
         let established = EstablishedChannel::from_client_channel_funding(&funding)
             .map_err(|e| WalletError::Backend(format!("reconstruct channel funding: {e}")))?;
+        if established.params.get_channel_id() != channel_id {
+            return Err(WalletError::Backend(
+                "incompatible channel ID derivation; retain data and recover with matching software".to_string(),
+            ));
+        }
         if established.params.sender_pubkey != self.sender_secret.public_key() {
             return Err(WalletError::Backend(
                 "channel recovery sender mismatch".to_string(),
@@ -838,100 +837,19 @@ impl SqliteClientWallet {
             p.verify(&established, &self.sender_secret)
                 .map_err(|e| WalletError::Backend(format!("verify refund: {e}")))?;
         }
-        let mut restore_first = recovery
-            .as_ref()
-            .is_some_and(|r| r.status == ChannelRecoveryStatus::Submitting);
         let mut executions = 0;
         let mut refreshed_rejection = false;
         loop {
-            if restore_first {
-                let p = prepared.as_ref().ok_or_else(|| {
-                    WalletError::Backend("submitted refund missing immutable request".to_string())
-                })?;
-                match established
-                    .restore_prepared_sender_refund_outputs(p, &self.sender_secret, mint_connection)
-                    .await
-                {
-                    Ok(Some(proofs)) => {
-                        return self.complete_channel_recovery(
-                            channel_id,
-                            &funding,
-                            "post_expiry_refund",
-                            proofs,
-                            true,
-                        )
-                    }
-                    Ok(None) => {}
-                    Err(_) => return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
-                        channel_id: channel_id.to_string(),
-                        reason:
-                            "refund restore failed or returned invalid outputs; request retained"
-                                .to_string(),
-                    }),
-                }
-            }
-            let proof_state = established
-                .check_funding_token_state(mint_connection)
-                .await
-                .map_err(|_| {
-                    WalletError::Backend(
-                        "check funding token state failed; refund journal retained".to_string(),
-                    )
-                })?;
-            if proof_state.state == State::Pending {
-                return Ok(ChannelFundRecoveryResult::FundingPending);
-            }
-            if proof_state.state == State::Spent {
-                // The original swap may complete between an empty restore and
-                // checkstate. One final exact restore closes that observation gap.
-                if restore_first {
-                    match established
-                        .restore_prepared_sender_refund_outputs(
-                            prepared.as_ref().unwrap(),
-                            &self.sender_secret,
-                            mint_connection,
-                        )
-                        .await
-                    {
-                        Ok(Some(proofs)) => {
-                            return self.complete_channel_recovery(
-                                channel_id,
-                                &funding,
-                                "post_expiry_refund",
-                                proofs,
-                                true,
-                            )
-                        }
-                        Ok(None) => {}
-                        Err(_) => {
-                            return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
-                                channel_id: channel_id.to_string(),
-                                reason:
-                                    "final exact refund restore failed or returned invalid outputs"
-                                        .to_string(),
-                            })
-                        }
-                    }
-                }
-                // Witness cardinality is advisory: a valid close may include
-                // irrelevant signatures. Discovery still verifies every output.
-                let kind = EstablishedChannel::classify_funding_spend_witness(&proof_state);
-                let result = if kind != FundingSpendKind::PostExpiryRefund {
-                    self.try_relay_close_recovery(channel_id, &funding, mint_connection)
-                        .await?
-                } else {
-                    ChannelFundRecoveryResult::UnknownSpent
-                };
-                return Ok(
-                    if restore_first && result == ChannelFundRecoveryResult::UnknownSpent {
-                        ChannelFundRecoveryResult::RecoveryRetryLater {
-                        channel_id: channel_id.to_string(),
-                        reason: "spent funding with unresolved submitted refund; immutable request retained".to_string(),
-                    }
-                    } else {
-                        result
-                    },
-                );
+            if let Some(result) = self
+                .reconcile_channel_recovery(
+                    channel_id,
+                    &funding,
+                    prepared.as_ref(),
+                    mint_connection,
+                )
+                .await?
+            {
+                return Ok(result);
             }
             let now = Self::now_seconds()?;
             if now <= established.params.expiry_timestamp {
@@ -1002,23 +920,44 @@ impl SqliteClientWallet {
                         self.conn()?.execute("UPDATE monad_client_refund_executions SET outcome = 'inactive_output_keyset' WHERE execution_id = ?1", [execution])
                             .map_err(|e| WalletError::Backend(format!("record refund rejection: {e}")))?;
                     }
-                    restore_first = true;
                 }
             }
         }
     }
 
-    async fn try_relay_close_recovery<M>(
+    async fn reconcile_channel_recovery<M>(
         &self,
         channel_id: &str,
         funding: &ClientChannelFunding,
+        current_refund: Option<&PreparedSenderRefund>,
         mint_connection: &M,
-    ) -> Result<ChannelFundRecoveryResult, WalletError>
+    ) -> Result<Option<ChannelFundRecoveryResult>, WalletError>
     where
         M: MintConnection + ?Sized,
     {
         let established = EstablishedChannel::from_client_channel_funding(funding)
             .map_err(|_| WalletError::Backend("invalid persisted channel funding".to_string()))?;
+        let mut refunds = {
+            let conn = self.conn()?;
+            let mut statement = conn.prepare("SELECT prepared_json FROM monad_client_refund_predecessors WHERE channel_id = ?1")
+                .map_err(|e| WalletError::Backend(format!("read retained refund attempts: {e}")))?;
+            let rows = statement
+                .query_map([channel_id], |row| row.get::<_, String>(0))
+                .map_err(|e| WalletError::Backend(format!("query retained refunds: {e}")))?;
+            let mut attempts = Vec::new();
+            for row in rows {
+                let json =
+                    row.map_err(|e| WalletError::Backend(format!("read retained refund: {e}")))?;
+                attempts
+                    .push(PreparedSenderRefund::from_json(&json).map_err(|_| {
+                        WalletError::Backend("invalid retained refund".to_string())
+                    })?);
+            }
+            attempts
+        };
+        if let Some(current) = current_refund {
+            refunds.push(current.clone());
+        }
         let mut result = Err(anyhow::anyhow!("sender discovery not attempted"));
         for refresh in [false, true] {
             let keysets = {
@@ -1047,7 +986,7 @@ impl SqliteClientWallet {
                 self.sender_secret.clone(),
                 established.clone(),
             )
-            .restore_sender_proofs_with_keysets(mint_connection, &keysets)
+            .recover_funds(mint_connection, &refunds, &keysets)
             .await;
             if !result
                 .as_ref()
@@ -1056,15 +995,45 @@ impl SqliteClientWallet {
                 break;
             }
         }
+        use cdk_spilman::{ChannelRecovery, SenderRecoverySource};
         match result {
-            Ok(proofs) if !proofs.is_empty() => {
-                self.complete_channel_recovery(channel_id, funding, "relay_close", proofs, false)
+            Ok(ChannelRecovery::Unspent(_)) => Ok(None),
+            Ok(ChannelRecovery::Pending(_)) => Ok(Some(ChannelFundRecoveryResult::FundingPending)),
+            Ok(ChannelRecovery::Recovered { payout, .. }) => {
+                let refund = matches!(payout.source, SenderRecoverySource::Refund { .. });
+                self.complete_channel_recovery(
+                    channel_id,
+                    funding,
+                    if refund {
+                        "post_expiry_refund"
+                    } else {
+                        "relay_close"
+                    },
+                    payout.proofs,
+                    refund,
+                )
+                .map(Some)
             }
-            Ok(_) => Ok(ChannelFundRecoveryResult::UnknownSpent),
-            Err(_) => Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
+            Ok(ChannelRecovery::SpentNoKnownPayout(_)) => Ok(Some(if refunds.is_empty() {
+                ChannelFundRecoveryResult::UnknownSpent
+            } else {
+                ChannelFundRecoveryResult::RecoveryRetryLater {
+                    channel_id: channel_id.to_string(),
+                    reason: "spent funding with unresolved refund/close payout; journal retained"
+                        .to_string(),
+                }
+            })),
+            Ok(ChannelRecovery::Mixed(_)) => {
+                Ok(Some(ChannelFundRecoveryResult::RecoveryRetryLater {
+                    channel_id: channel_id.to_string(),
+                    reason: "mixed funding state; journal retained".to_string(),
+                }))
+            }
+            Err(_) => Ok(Some(ChannelFundRecoveryResult::RecoveryRetryLater {
                 channel_id: channel_id.to_string(),
-                reason: "sender close discovery failed or returned invalid outputs".to_string(),
-            }),
+                reason: "funding inspection or payout recovery failed; journal retained"
+                    .to_string(),
+            })),
         }
     }
 
@@ -2688,8 +2657,11 @@ impl SqliteClientWallet {
                     )
                 })?;
                 if attempt_rejected {
+                    let rejection = error
+                        .downcast_ref::<MintHttpRejection>()
+                        .expect("definitive rejection recorded above");
                     return Err(self
-                        .mark_prepared_open_rejected(&prepared, message)
+                        .mark_prepared_open_rejected(&prepared, *rejection)
                         .unwrap_or_else(|error| error));
                 }
                 return Err(open_channel_stage_error(
@@ -2766,13 +2738,22 @@ impl SqliteClientWallet {
     fn mark_prepared_open_rejected(
         &self,
         prepared: &PreparedOpenChannel,
-        message: String,
+        rejection: MintHttpRejection,
     ) -> Result<OpenChannelError, OpenChannelError> {
+        let mint_error = cdk_spilman::MintResponse {
+            status: rejection.status,
+            body: serde_json::json!({"code": rejection.code, "detail": "mint rejected request"})
+                .to_string(),
+        }
+        .into_result()
+        .expect_err("recorded HTTP rejection");
+        let message = rejection.to_string();
         let fallback = OpenChannelError {
             stage: OpenChannelFailureStage::MintRejected,
             channel_id: Some(prepared.channel_id.clone()),
             input_may_be_spent: false,
             message: message.clone(),
+            mint_error: Some(mint_error.clone()),
         };
         let Ok(bridge) = self.bridge.lock() else {
             tracing::warn!(
@@ -2781,7 +2762,7 @@ impl SqliteClientWallet {
             );
             return Ok(fallback);
         };
-        match bridge.mark_prepared_open_rejected(prepared, message) {
+        match bridge.mark_prepared_open_rejected(prepared, mint_error) {
             Ok(error) => Ok(error),
             Err(error) => {
                 tracing::warn!(
@@ -4214,7 +4195,7 @@ fn parse_currency_unit(unit: &str) -> Result<CurrencyUnit, WalletError> {
 fn open_channel_stage_error(
     stage: OpenChannelFailureStage,
     channel_id: Option<String>,
-    message: String,
+    message: impl std::fmt::Display,
 ) -> OpenChannelError {
     let input_may_be_spent = matches!(
         stage,
@@ -4227,7 +4208,8 @@ fn open_channel_stage_error(
         stage,
         channel_id,
         input_may_be_spent,
-        message,
+        message: message.to_string(),
+        mint_error: None,
     }
 }
 
@@ -4934,20 +4916,20 @@ mod tests {
     struct NoopClientNetworking;
 
     impl SpilmanClientNetworking for NoopClientNetworking {
-        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
 
-        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
 
-        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_keysets(&self, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
 
-        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
     }
 
@@ -4972,7 +4954,7 @@ mod tests {
     }
 
     impl SpilmanClientNetworking for BlockingSwapNetworking {
-        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.entered.0.lock().unwrap() = true;
             self.entered.1.notify_one();
@@ -4980,19 +4962,19 @@ mod tests {
             while !*release {
                 release = self.release.1.wait(release).unwrap();
             }
-            Err("injected ambiguous submission".to_string())
+            Err("injected ambiguous submission".into())
         }
 
-        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
             Ok(r#"{"outputs":[],"signatures":[]}"#.to_string())
         }
 
-        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_keysets(&self, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
 
-        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
     }
 
@@ -5003,20 +4985,20 @@ mod tests {
     }
 
     impl SpilmanClientNetworking for CountingSwapNetworking {
-        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
             *self.calls.lock().unwrap() += 1;
             Ok("{}".to_string())
         }
 
-        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
             panic!("restore is not expected")
         }
 
-        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
+        fn call_mint_keysets(&self, _: &str) -> Result<String, MintRequestError> {
             panic!("keyset lookup is not expected")
         }
 
-        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
             panic!("key lookup is not expected")
         }
     }
@@ -5052,20 +5034,22 @@ mod tests {
     }
 
     impl SpilmanClientNetworking for StateCheckNetworking {
-        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
             panic!("startup recovery must never submit a swap")
         }
 
-        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
-            self.restore_response.clone()
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
+            self.restore_response
+                .clone()
+                .map_err(MintRequestError::from)
         }
 
-        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_keysets(&self, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
 
-        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
     }
 
@@ -5090,6 +5074,7 @@ mod tests {
                         | CheckStateMode::NetworkError => State::Unspent,
                     },
                     witness: None,
+                    rerandomization_r: None,
                 })
                 .collect::<Vec<_>>();
             match self.mode {
@@ -5113,11 +5098,15 @@ mod tests {
     }
 
     impl SpilmanClientNetworking for CompleteBeforeFinalRestoreNetworking {
-        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
             panic!("opening recovery must never submit through its networking interface")
         }
 
-        fn call_mint_restore(&self, mint_url: &str, request_json: &str) -> Result<String, String> {
+        fn call_mint_restore(
+            &self,
+            mint_url: &str,
+            request_json: &str,
+        ) -> Result<String, MintRequestError> {
             let call = self.restore_calls.fetch_add(1, Ordering::SeqCst);
             if call < 2 {
                 return Ok(r#"{"outputs":[],"signatures":[]}"#.to_string());
@@ -5129,11 +5118,15 @@ mod tests {
             self.inner.call_mint_restore(mint_url, request_json)
         }
 
-        fn call_mint_keysets(&self, mint_url: &str) -> Result<String, String> {
+        fn call_mint_keysets(&self, mint_url: &str) -> Result<String, MintRequestError> {
             self.inner.call_mint_keysets(mint_url)
         }
 
-        fn call_mint_keys(&self, mint_url: &str, keyset_id: &str) -> Result<String, String> {
+        fn call_mint_keys(
+            &self,
+            mint_url: &str,
+            keyset_id: &str,
+        ) -> Result<String, MintRequestError> {
             self.inner.call_mint_keys(mint_url, keyset_id)
         }
     }
@@ -5150,6 +5143,7 @@ mod tests {
                         y,
                         state: State::Spent,
                         witness: None,
+                        rerandomization_r: None,
                     })
                     .collect(),
             })
@@ -5162,24 +5156,24 @@ mod tests {
     }
 
     impl SpilmanClientNetworking for FinalRestoreFailureNetworking {
-        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
             panic!("opening recovery must never submit a swap")
         }
 
-        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, String> {
+        fn call_mint_restore(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
             if self.restore_calls.fetch_add(1, Ordering::SeqCst) < 2 {
                 Ok(r#"{"outputs":[],"signatures":[]}"#.to_string())
             } else {
-                Err("injected final restore failure".to_string())
+                Err("injected final restore failure".into())
             }
         }
 
-        fn call_mint_keysets(&self, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_keysets(&self, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
 
-        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, String> {
-            Err("not used".to_string())
+        fn call_mint_keys(&self, _: &str, _: &str) -> Result<String, MintRequestError> {
+            Err("not used".into())
         }
     }
 
@@ -5195,6 +5189,7 @@ mod tests {
                         y,
                         state: State::Spent,
                         witness: None,
+                        rerandomization_r: None,
                     })
                     .collect(),
             })
@@ -5276,12 +5271,20 @@ mod tests {
     }
 
     impl SpilmanClientNetworking for ScriptedOpeningNetworking {
-        fn call_mint_swap(&self, mint_url: &str, request: &str) -> Result<String, String> {
+        fn call_mint_swap(
+            &self,
+            mint_url: &str,
+            request: &str,
+        ) -> Result<String, MintRequestError> {
             self.call_opening_swap(mint_url, request)
-                .map_err(|e| e.to_string())
+                .map_err(|e| MintRequestError::transport(e.to_string()))
         }
 
-        fn call_mint_restore(&self, mint_url: &str, request: &str) -> Result<String, String> {
+        fn call_mint_restore(
+            &self,
+            mint_url: &str,
+            request: &str,
+        ) -> Result<String, MintRequestError> {
             let mut calls = self.restores.lock().unwrap();
             let index = *calls;
             *calls += 1;
@@ -5364,11 +5367,15 @@ mod tests {
             Ok(response.to_string())
         }
 
-        fn call_mint_keysets(&self, mint_url: &str) -> Result<String, String> {
+        fn call_mint_keysets(&self, mint_url: &str) -> Result<String, MintRequestError> {
             self.inner.call_mint_keysets(mint_url)
         }
 
-        fn call_mint_keys(&self, mint_url: &str, keyset_id: &str) -> Result<String, String> {
+        fn call_mint_keys(
+            &self,
+            mint_url: &str,
+            keyset_id: &str,
+        ) -> Result<String, MintRequestError> {
             self.inner.call_mint_keys(mint_url, keyset_id)
         }
     }
@@ -5422,20 +5429,32 @@ mod tests {
     }
 
     impl SpilmanClientNetworking for FourSubmissionNetworking {
-        fn call_mint_swap(&self, mint_url: &str, request: &str) -> Result<String, String> {
+        fn call_mint_swap(
+            &self,
+            mint_url: &str,
+            request: &str,
+        ) -> Result<String, MintRequestError> {
             self.call_opening_swap(mint_url, request)
-                .map_err(|e| e.to_string())
+                .map_err(|e| MintRequestError::transport(e.to_string()))
         }
 
-        fn call_mint_restore(&self, mint_url: &str, request_json: &str) -> Result<String, String> {
+        fn call_mint_restore(
+            &self,
+            mint_url: &str,
+            request_json: &str,
+        ) -> Result<String, MintRequestError> {
             self.inner.call_mint_restore(mint_url, request_json)
         }
 
-        fn call_mint_keysets(&self, mint_url: &str) -> Result<String, String> {
+        fn call_mint_keysets(&self, mint_url: &str) -> Result<String, MintRequestError> {
             self.inner.call_mint_keysets(mint_url)
         }
 
-        fn call_mint_keys(&self, mint_url: &str, keyset_id: &str) -> Result<String, String> {
+        fn call_mint_keys(
+            &self,
+            mint_url: &str,
+            keyset_id: &str,
+        ) -> Result<String, MintRequestError> {
             self.inner.call_mint_keys(mint_url, keyset_id)
         }
     }
@@ -6335,7 +6354,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn refund_invalid_restore_blocks_replay_and_restores_before_state_errors() {
+    async fn refund_state_failure_blocks_restore_until_state_is_available() {
         let ctx = open_short_expiry_test_channel(16, 1).await;
         wait_until_expired(ctx.expiry_timestamp).await;
         let funding = ctx
@@ -6385,6 +6404,16 @@ mod tests {
             .unwrap();
         mint.invalid_restore = false;
         let reopened = reopen_wallet(&ctx);
+        let blocked = reopened
+            .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
+            .await
+            .unwrap();
+        assert!(matches!(
+            blocked,
+            ChannelFundRecoveryResult::RecoveryRetryLater { .. }
+        ));
+        assert_eq!(mint.restore_calls.load(Ordering::SeqCst), 0);
+        mint.fail_state = false;
         let result = reopened
             .recover_channel_funds(&locks.exclusive_access().unwrap(), &ctx.channel_id, &mint)
             .await
@@ -6576,7 +6605,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn refund_completion_between_restore_and_state_gets_final_exact_restore() {
+    async fn refund_completion_during_state_check_restores_after_state() {
         for hide_outputs in [false, true] {
             let ctx = open_short_expiry_test_channel(16, 1).await;
             wait_until_expired(ctx.expiry_timestamp).await;
@@ -6627,7 +6656,14 @@ mod tests {
                     ChannelFundRecoveryResult::PostExpiryRefundRecovered { .. }
                 ));
             }
-            assert_eq!(mint.restore_calls.load(Ordering::SeqCst), 2);
+            if hide_outputs {
+                assert!(
+                    mint.restore_calls.load(Ordering::SeqCst) > 1,
+                    "empty refund must fall back to close discovery"
+                );
+            } else {
+                assert_eq!(mint.restore_calls.load(Ordering::SeqCst), 1);
+            }
             assert!(mint.requests.lock().unwrap().is_empty());
             let _ = ctx.shutdown_tx.send(());
             ctx.mint_task.await.unwrap().unwrap();
@@ -7016,7 +7052,14 @@ mod tests {
     #[test]
     fn mint_rejection_requires_structured_direct_inactive_keyset_code() {
         for (status, body, expected) in [
-            (400, r#"{"code":12002}"#, true),
+            (400, r#"{"code":12002,"detail":"inactive"}"#, true),
+            (400, r#"{"code":12002}"#, false),
+            (409, r#"{"code":12002,"detail":"inactive"}"#, false),
+            (
+                400,
+                r#"{"code":12002,"code":12002,"detail":"inactive"}"#,
+                false,
+            ),
             (500, r#"{"code":12002}"#, false),
             (200, r#"{"code":12002}"#, false),
             (400, r#"{"code":12001}"#, false),
@@ -7046,7 +7089,7 @@ mod tests {
             (
                 503,
                 r#"{"code":12002,"detail":"secret mint body"}"#,
-                Some(12002),
+                None,
                 false,
             ),
             (
@@ -7082,15 +7125,20 @@ mod tests {
             });
             let networking = OpeningRecoveryHttpNetworking::new().unwrap();
             let error = networking.call_opening_swap(&url, "{}").unwrap_err();
-            let rejection = error.downcast_ref::<MintHttpRejection>().unwrap();
-            assert_eq!(rejection.status, status);
-            assert_eq!(rejection.code, code);
-            assert_eq!(rejection.inactive_output_keyset(), definitive);
+            let rejection = error.downcast_ref::<MintHttpRejection>();
+            assert_eq!(rejection.and_then(|r| r.code), code);
+            assert_eq!(
+                rejection.is_some_and(MintHttpRejection::inactive_output_keyset),
+                definitive
+            );
+            if let Some(rejection) = rejection {
+                assert_eq!(rejection.status, status);
+            }
             assert!(!format!("{error:?}").contains("secret mint body"));
             assert!(!error.to_string().contains("secret mint body"));
-            // The string-only upstream interface does not recreate typed authority.
+            // The upstream interface preserves typed rejection evidence too.
             let string_error = networking.call_mint_swap(&url, "{}").unwrap_err();
-            assert!(!string_error.contains("secret mint body"));
+            assert!(!string_error.to_string().contains("secret mint body"));
             shutdown.send(()).unwrap();
             task.await.unwrap();
         }
@@ -7869,7 +7917,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn refund_submit_and_restore_failure_returns_retry_later() {
+    async fn refund_submission_failure_with_unspent_state_exhausts_exact_replay_budget() {
         let ctx = open_short_expiry_test_channel(16, 2).await;
         wait_until_expired(ctx.expiry_timestamp).await;
         let mint_connection = FailingRefundMintConnection {
@@ -7889,7 +7937,7 @@ mod tests {
             panic!("expected retry-later recovery result, got {result:?}");
         };
         assert_eq!(channel_id, ctx.channel_id);
-        assert!(reason.contains("refund restore failed"));
+        assert!(reason.contains("bounded exact replay"));
         assert_eq!(
             recovery_row_status(&ctx.wallet, &ctx.channel_id),
             "submitting"

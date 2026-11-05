@@ -131,18 +131,13 @@ struct HttpMintConnection {
 }
 
 impl HttpMintConnection {
-    async fn checked_response(response: reqwest::Response) -> anyhow::Result<reqwest::Response> {
-        let status = response.status();
-        if !status.is_success() {
-            return Err(
-                monad_client::sqlite_client_wallet::MintHttpRejection::from_body(
-                    status.as_u16(),
-                    &response.text().await?,
-                )
-                .into(),
-            );
-        }
-        Ok(response)
+    async fn checked_response<T: serde::de::DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> anyhow::Result<T> {
+        let body = monad_common::mint_error::read_mint_response(response)
+            .await
+            .map_err(monad_common::mint_error::recovery_error)?;
+        Ok(serde_json::from_str(&body)?)
     }
 }
 
@@ -155,11 +150,7 @@ impl MintConnection for HttpMintConnection {
             .json(&request)
             .send()
             .await?;
-        Self::checked_response(response)
-            .await?
-            .json()
-            .await
-            .map_err(Into::into)
+        Self::checked_response(response).await
     }
 
     async fn post_restore(&self, request: RestoreRequest) -> anyhow::Result<RestoreResponse> {
@@ -169,11 +160,7 @@ impl MintConnection for HttpMintConnection {
             .json(&request)
             .send()
             .await?;
-        Self::checked_response(response)
-            .await?
-            .json()
-            .await
-            .map_err(Into::into)
+        Self::checked_response(response).await
     }
 
     async fn check_state(&self, ys: Vec<PublicKey>) -> anyhow::Result<CheckStateResponse> {
@@ -183,11 +170,7 @@ impl MintConnection for HttpMintConnection {
             .json(&CheckStateRequest { ys })
             .send()
             .await?;
-        Self::checked_response(response)
-            .await?
-            .json()
-            .await
-            .map_err(Into::into)
+        Self::checked_response(response).await
     }
 }
 
@@ -804,7 +787,7 @@ mod tests {
     async fn mint_rejection_retains_only_status_and_numeric_code() {
         let body = r#"{"code":12002,"detail":"untrusted mint detail"}"#;
         let response = http::Response::builder().status(400).body(body).unwrap();
-        let error = HttpMintConnection::checked_response(response.into())
+        let error = HttpMintConnection::checked_response::<serde_json::Value>(response.into())
             .await
             .unwrap_err();
         let rejection = error

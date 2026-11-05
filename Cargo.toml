@@ -11,6 +11,16 @@ members = [
 ]
 resolver = "2"
 
+[workspace.dependencies]
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "7fa7c35d19d03546fb1d45d1295c21a63d624b8d" }
+cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "7fa7c35d19d03546fb1d45d1295c21a63d624b8d", default-features = false }
+cashu = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
+cdk = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
+cdk-common = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
+cdk-axum = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
+cdk-fake-wallet = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad" }
+cdk-sqlite = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
+
 # Use the vendored h2 with `recv_release_connection_on_buffer` (see
 # vendor/h2/Cargo.toml). Required so paused CONNECT tunnels cannot starve
 # control streams through the shared HTTP/2 connection receive window.

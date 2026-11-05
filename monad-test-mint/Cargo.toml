@@ -17,15 +17,15 @@ rusqlite = "0.31"
 rand = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", default-features = false, features = ["mint"] }
-cdk-common = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", default-features = false }
-cdk-axum = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", default-features = false }
-cdk-fake-wallet = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1" }
-cdk-sqlite = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", default-features = false, features = ["mint"] }
+cdk = { workspace = true, features = ["mint"] }
+cdk-common.workspace = true
+cdk-axum.workspace = true
+cdk-fake-wallet.workspace = true
+cdk-sqlite = { workspace = true, features = ["mint"] }
 
 [dev-dependencies]
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 monad-client = { path = "../monad-client" }
 monad-relay = { path = "../monad-relay" }
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "c2083defc2015ad0bae2a8a086a2876bc775ff79", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
+cdk-spilman = { workspace = true, features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }

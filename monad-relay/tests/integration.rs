@@ -2097,7 +2097,11 @@ struct PendingCloseMint<'a> {
 struct TypedCloseFailure<'a>(&'a RelayWalletMintClient, u16);
 #[async_trait::async_trait]
 impl cdk_spilman::SpilmanAsyncMintClient for TypedCloseFailure<'_> {
-    async fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+    async fn call_mint_swap(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<String, cdk_spilman::MintRequestError> {
         panic!("checked close transport required")
     }
 }
@@ -2120,7 +2124,11 @@ impl monad_relay::mint_recovery::RecoveryMintClient for TypedCloseFailure<'_> {
 
 #[async_trait::async_trait]
 impl cdk_spilman::SpilmanAsyncMintClient for PendingCloseMint<'_> {
-    async fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+    async fn call_mint_swap(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<String, cdk_spilman::MintRequestError> {
         panic!("unchecked close submission")
     }
 }
@@ -2141,10 +2149,14 @@ impl monad_relay::mint_recovery::RecoveryMintClient for PendingCloseMint<'_> {
 
 #[async_trait::async_trait]
 impl cdk_spilman::SpilmanAsyncMintClient for RecoveryTestMint {
-    async fn call_mint_swap(&self, mint: &str, request: &str) -> Result<String, String> {
+    async fn call_mint_swap(
+        &self,
+        mint: &str,
+        request: &str,
+    ) -> Result<String, cdk_spilman::MintRequestError> {
         monad_relay::mint_recovery::RecoveryMintClient::swap_checked(self, mint, request)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| cdk_spilman::MintRequestError::transport(e.to_string()))
     }
 }
 
@@ -12978,7 +12990,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     );
     let saved = storage.get_close_journal(&channel_id).unwrap().unwrap();
     let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
-    assert_eq!(saved["version"], 3);
+    assert_eq!(saved["version"], 4);
     assert_eq!(saved["attempts"][0]["submissions"], 1);
     assert_eq!(saved["payment"]["balance"], funded_balance_raw);
     assert_eq!(
@@ -14024,7 +14036,7 @@ async fn test_close_and_drain_refresh_inactive_or_missing_cached_output_metadata
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_sender_refund_is_terminal_with_or_without_extra_signature() {
+async fn test_sender_refund_abandons_collection_without_classifying_signatures() {
     use monad_relay::payments::CloseOutcome;
     for extra in [false, true] {
         let ctx = DrainTestContext::with_policy(
@@ -14074,13 +14086,10 @@ async fn test_sender_refund_is_terminal_with_or_without_extra_signature() {
                 .close_channel(&channel_id, &net)
                 .await
                 .unwrap();
-            assert!(matches!(
-                result,
-                CloseOutcome::SenderRefundedAfterExpiry { .. }
-            ));
+            assert!(matches!(result, CloseOutcome::CollectionAbandoned { .. }));
             assert_eq!(
                 ctx.payments.channel_state(&channel_id).unwrap(),
-                Some(ChannelState::SenderRefundedAfterExpiry)
+                Some(ChannelState::Closing)
             );
             assert!(ctx
                 .wallet_manager
@@ -14114,7 +14123,7 @@ async fn test_sender_refund_is_terminal_with_or_without_extra_signature() {
                 }
             )
             .is_err());
-        // Relay terminal classification does not consume or invalidate sender outputs.
+        // Relay abandonment does not consume or invalidate sender outputs.
         let response = ctx
             .mint
             .restore(cashu::nuts::RestoreRequest {
@@ -14143,6 +14152,89 @@ async fn test_sender_refund_is_terminal_with_or_without_extra_signature() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_abandoned_collection_can_restore_a_previously_hidden_close() {
+    use monad_relay::mint_recovery::RecoveryMintClient;
+    use monad_relay::payments::CloseOutcome;
+    struct HiddenPayout<'a>(&'a RelayWalletMintClient);
+    #[async_trait::async_trait]
+    impl cdk_spilman::SpilmanAsyncMintClient for HiddenPayout<'_> {
+        async fn call_mint_swap(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<String, cdk_spilman::MintRequestError> {
+            panic!("checked transport required")
+        }
+    }
+    #[async_trait::async_trait]
+    impl RecoveryMintClient for HiddenPayout<'_> {
+        async fn swap_checked(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+            self.0.swap_checked(mint, request).await?;
+            anyhow::bail!("lost close response")
+        }
+        async fn restore(&self, _: &str, _: &str) -> anyhow::Result<String> {
+            Ok(r#"{"outputs":[],"signatures":[]}"#.to_string())
+        }
+        async fn check_state(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+            self.0.check_state(mint, request).await
+        }
+    }
+    let ctx = DrainTestContext::with_policy(
+        "abandoned-recovery",
+        monad_common::config::RelayChannelPolicyConfig {
+            min_expiry_secs: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let expiry = cashu::util::unix_time() + 6;
+    let channel_id = create_paid_open_channel_with_expiry(
+        &ctx.payments,
+        &ctx.wallet,
+        &ctx.offer,
+        [38; 32],
+        450,
+        expiry,
+    )
+    .await;
+    while cashu::util::unix_time() <= expiry {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let net = ctx.net_for(&channel_id);
+    assert!(matches!(
+        ctx.wallet_manager
+            .close_channel(&channel_id, &HiddenPayout(&net))
+            .await
+            .unwrap(),
+        CloseOutcome::CollectionAbandoned { .. }
+    ));
+    assert_eq!(
+        ctx.payments.channel_state(&channel_id).unwrap(),
+        Some(ChannelState::Closing)
+    );
+    assert!(ctx.payments.closed_data(&channel_id).is_none());
+    assert!(ctx
+        .wallet_manager
+        .find_expiring_channels(None, cashu::util::unix_time(), 86_400)
+        .unwrap()
+        .is_empty());
+    // Reopening preserves abandonment, but explicit recovery can still collect.
+    let reopened = ctx.wallet_manager.reopen().unwrap();
+    let completed = reopened
+        .close_channel(&channel_id, &net)
+        .await
+        .unwrap()
+        .into_closed()
+        .unwrap();
+    assert!(completed.receiver_sum >= 450);
+    assert_eq!(
+        ctx.payments.channel_state(&channel_id).unwrap(),
+        Some(ChannelState::Closed)
+    );
+    ctx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_final_close_restore_checks_predecessor_then_successor_after_spent() {
     use monad_relay::mint_recovery::RecoveryMintClient;
     struct DelayedRestore<'a> {
@@ -14154,7 +14246,11 @@ async fn test_final_close_restore_checks_predecessor_then_successor_after_spent(
     }
     #[async_trait::async_trait]
     impl cdk_spilman::SpilmanAsyncMintClient for DelayedRestore<'_> {
-        async fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+        async fn call_mint_swap(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<String, cdk_spilman::MintRequestError> {
             panic!("checked transport required")
         }
     }

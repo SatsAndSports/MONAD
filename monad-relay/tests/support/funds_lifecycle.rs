@@ -1127,18 +1127,20 @@ clients:
         if refund {
             let args = ["wallet", "--json", "close", "--channel-id", channel];
             let result = self.relay(&args).json().await;
-            assert_eq!(result["outcome"], "SenderRefundedAfterExpiry");
+            assert_eq!(result["outcome"], "CollectionAbandoned");
+            // Explicit close remains an online recovery operation for retained
+            // attempts; abandoned collection is not a verified refund terminal.
+            for _ in 0..2 {
+                assert_eq!(
+                    self.relay(&args).json().await["outcome"],
+                    "CollectionAbandoned"
+                );
+            }
             let before = {
                 let mut ledger = self.ledger.lock().unwrap();
                 ledger.offline = true;
                 ledger.http_requests
             };
-            for _ in 0..2 {
-                assert_eq!(
-                    self.relay(&args).json().await["outcome"],
-                    "SenderRefundedAfterExpiry"
-                );
-            }
             let batch = self
                 .relay(&["wallet", "--json", "close-expiring-channels"])
                 .json()
@@ -1159,7 +1161,7 @@ clients:
             let mut ledger = self.ledger.lock().unwrap();
             assert_eq!(
                 ledger.http_requests, before,
-                "terminal operations performed mint IO"
+                "automatic collection/drain performed mint IO after abandonment"
             );
             ledger.offline = false;
         }
@@ -1593,7 +1595,7 @@ clients:
         };
         let sender_refunded = match close_result["outcome"].as_str().unwrap() {
             "Closed" => false,
-            "SenderRefundedAfterExpiry" => true,
+            "CollectionAbandoned" => true,
             _ => panic!("race did not resolve a typed terminal outcome"),
         };
         assert_eq!(
