@@ -201,18 +201,37 @@ rebuilds the affected session; MONAD never blindly retries the stale payment.
 
 ## Status
 
-Relay wallet close results are typed: `Closed` carries the normal receiver/sender
-payout split; `SenderRefundedAfterExpiry` means the sender spent the full funding
-minus mint fees via the refund branch and no receiver payout exists. Both are
-successful administrative terminal outcomes. `UnknownSpent` retains a recoverable
-journal because close versus refund remains unresolved; retry recovery later.
-`--json` exposes `outcome` and `details`. Batch close reports `resolved`, `unresolved`,
-and `failures` separately. Terminal refunds are excluded from autosweep and drain.
-Close journal v3 binds each durable relay-close attempt to its exact `SIG_ALL`
-message digest and blinded receiver key. Complete all-spent NUT-07 evidence is a
-sender refund only when no witness signature matches any authenticated attempt;
-extra unrelated signatures do not make that refund ambiguous. Incompatible
-journals are rejected without deleting wallet data.
+MONAD pins Spilman **0.3.0** at `7fa7c35d19d03546fb1d45d1295c21a63d624b8d`
+and all CDK/Cashu crates to the matching v0.18.1 backport at
+`SatsAndSports/cdk@da5cf282dd070772af830fa5215630f059e5f1ad`.
+Pins are centralized in the workspace manifest. The fork implementation is
+reviewable in [CDK PR #5](https://github.com/SatsAndSports/cdk/pull/5).
+Channels remain ordinary; adopting the mint backend does not enable rerandomized
+channel closes.
+
+**Coordinated alpha upgrade:** canonical TLV channel IDs change derived channel
+keys and signatures compared with the earlier library pin. Upgrade clients and
+relays together. Retain matching old binaries, keys and databases to settle/recover
+old channels. No channel migration or automatic database deletion is provided.
+Relay close journal v4 rejects incompatible existing journals. Use fresh owned
+test databases, or explicitly reset disposable data only after deciding it is safe.
+The pre-alpha protocol identifier remains `2026-09-14`; it does not promise
+interoperation between these old and new development builds.
+
+Both parties inspect NUT-07 before NUT-09 during uncertain close/refund recovery.
+Alice restores retained refunds first, then discovers her share of a possible relay
+close. Charlie restores all retained close attempts. Signature counts do not route
+recovery. Verified completions still finalize offline.
+
+Relay close `--json` results expose `outcome` and `details`: `Closed` carries the
+verified payout; `UnknownSpent` retains unresolved evidence. After expiry, spent or
+mixed funding with no known recovered payout yields `CollectionAbandoned`. This is
+a collection policy, **not proof of a sender refund or a zero-value payout**. The
+channel stays frozen in `Closing`, its journal is retained, and automatic expiry
+sweeps skip it. Explicit `wallet close --channel-id ...` still performs online
+recovery and can recover a previously issued payout. Batch close reports resolved
+administrative outcomes, unresolved channels, and failures separately; abandoned
+channels have no drainable payout.
 
 Wallet databases explicitly verify SQLite `synchronous=EXTRA` on each writable
 connection. Back up all client and relay wallet databases using SQLite's backup

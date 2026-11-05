@@ -174,7 +174,12 @@ impl RelayWalletMintClient {
         }
     }
 
-    async fn post_json(&self, url: String, body: String, action: &str) -> Result<String, String> {
+    async fn post_json(
+        &self,
+        url: String,
+        body: String,
+        action: &str,
+    ) -> Result<String, cdk_spilman::MintRequestError> {
         let resp = self
             .client
             .post(url)
@@ -184,18 +189,7 @@ impl RelayWalletMintClient {
             .send()
             .await
             .map_err(|e| format!("{action} request failed: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(monad_common::mint_error::MintHttpRejection::from_body(
-                status.as_u16(),
-                &body,
-            )
-            .to_string());
-        }
-        resp.text()
-            .await
-            .map_err(|e| format!("Failed to read {action} response: {e}"))
+        monad_common::mint_error::read_mint_response(resp).await
     }
 }
 
@@ -224,7 +218,7 @@ impl SpilmanAsyncMintClient for RelayWalletMintClient {
         &self,
         mint_url: &str,
         swap_request_json: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, cdk_spilman::MintRequestError> {
         self.post_json(
             format!("{mint_url}/v1/swap"),
             swap_request_json.to_string(),
@@ -265,7 +259,9 @@ impl DrainSwapNetworking for RelayWalletMintClient {
         swap_request_json: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
-            SpilmanAsyncMintClient::call_mint_swap(self, mint_url, swap_request_json).await
+            SpilmanAsyncMintClient::call_mint_swap(self, mint_url, swap_request_json)
+                .await
+                .map_err(|e| e.to_string())
         })
     }
 
@@ -281,6 +277,7 @@ impl DrainSwapNetworking for RelayWalletMintClient {
                 "Restore",
             )
             .await
+            .map_err(|e| e.to_string())
         })
     }
 }
@@ -1128,6 +1125,15 @@ impl RelayWalletManager {
             }
             let funding =
                 parse_channel_summary_metadata(&channel_id, &channel.funding.params_json)?;
+            if let Some(journal) = self
+                .storage
+                .get_close_journal(&channel_id)
+                .map_err(io::Error::other)?
+            {
+                if SpilmanRelayPayments::collection_abandoned(&journal).map_err(io::Error::other)? {
+                    continue;
+                }
+            }
             let expiry_timestamp = match channel.state {
                 ChannelState::Open => funding.expiry_timestamp,
                 ChannelState::Closing => channel
@@ -2271,6 +2277,9 @@ fn close_error_summary(error: &CloseError) -> String {
             "already closed: closed_balance={closed_balance} requested_balance={requested_balance}"
         ),
         CloseError::MintRejected { mint_error, .. } => format!("mint rejected: {mint_error}"),
+        CloseError::MintRequestFailed { .. } => {
+            "mint request failed; outcome uncertain".to_string()
+        }
         CloseError::MintRejectedAfterRetry {
             original_error,
             retry_error,

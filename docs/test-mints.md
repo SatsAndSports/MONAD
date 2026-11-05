@@ -5,6 +5,13 @@ demo/test services: invoices are automatically marked paid after roughly one sec
 without moving real Lightning funds. No new client wallet funding-management API
 is included; tests use the ordinary Cashu HTTP endpoints to bootstrap proofs.
 
+CDK dependencies use the workspace-wide v0.18.1 rerandomization backport at
+`SatsAndSports/cdk@da5cf282dd070772af830fa5215630f059e5f1ad`, matching the Spilman
+0.3.0 pin. Its SQLite backend includes opt-in rerandomized mint swaps; MONAD
+channel construction and settlement still use ordinary swaps. Keep persistent
+mint data paired with the matching backend version. This dependency alignment
+does not add or require another persistence option or automatically reset data.
+
 ## Configuration and startup
 
 Add the optional `test_mints` section to the existing MONAD YAML:

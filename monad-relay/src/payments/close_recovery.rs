@@ -1,7 +1,6 @@
 use super::*;
 use crate::mint_recovery::RecoveryMintClient;
-use cashu::nuts::{CheckStateResponse, Proof, State, SwapRequest};
-use cdk_spilman::{CompletedClose, FundingSpendKind};
+use cdk_spilman::{ChannelRecovery, CompletedClose};
 use monad_common::mint_error::MintHttpRejection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -19,7 +18,7 @@ struct CloseJournal {
     attempts: Vec<CloseAttempt>,
     finalizing: Option<CompletedClose>,
     completed: bool,
-    refunded: Option<CheckStateResponse>,
+    collection_abandoned: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -44,10 +43,16 @@ impl Drop for CloseFlight {
 }
 
 impl SpilmanRelayPayments {
+    pub(crate) fn collection_abandoned(json: &str) -> Result<bool, String> {
+        Self::validate_close_schema(json)?;
+        let journal: CloseJournal =
+            serde_json::from_str(json).map_err(|_| "invalid close journal")?;
+        Ok(journal.collection_abandoned && journal.finalizing.is_none() && !journal.completed)
+    }
     pub(crate) fn validate_close_schema(json: &str) -> Result<(), String> {
         let journal: CloseJournal = serde_json::from_str(json)
             .map_err(|_| "incompatible close journal; database retained")?;
-        if journal.version != 3 || journal.attempts.is_empty() || journal.attempts.len() > 2 {
+        if journal.version != 4 || journal.attempts.is_empty() || journal.attempts.len() > 2 {
             return Err("incompatible close journal version; database retained".to_string());
         }
         Ok(())
@@ -75,7 +80,6 @@ impl SpilmanRelayPayments {
         let _flight = CloseFlight(flight_key);
         let storage = self.store.storage();
         let existing = storage.get_close_journal(channel_id).map_err(error)?;
-        let resumed = existing.is_some();
         let mut journal = match existing.as_ref() {
             Some(json) => serde_json::from_str::<CloseJournal>(json)
                 .map_err(|_| error("incompatible or corrupt close journal; database retained"))?,
@@ -101,7 +105,7 @@ impl SpilmanRelayPayments {
                     &self.receiver_secret.public_key(),
                 )?;
                 let journal = CloseJournal {
-                    version: 3,
+                    version: 4,
                     binding: binding.clone(),
                     receiver: self.receiver_secret.public_key().to_hex(),
                     funding,
@@ -113,7 +117,7 @@ impl SpilmanRelayPayments {
                     }],
                     finalizing: None,
                     completed: false,
-                    refunded: None,
+                    collection_abandoned: false,
                 };
                 let json = serde_json::to_string(&journal)
                     .map_err(|_| error("serialize close journal"))?;
@@ -134,7 +138,7 @@ impl SpilmanRelayPayments {
                 journal
             }
         };
-        if journal.version != 3
+        if journal.version != 4
             || journal.binding != binding
             || journal.receiver != self.receiver_secret.public_key().to_hex()
             || journal.attempts.is_empty()
@@ -189,25 +193,6 @@ impl SpilmanRelayPayments {
                 .map_err(|_| error("invalid funding proofs"))?,
         )
         .map_err(|_| error("invalid funding"))?;
-        if let Some(evidence) = &journal.refunded {
-            if journal.completed
-                || journal.finalizing.is_some()
-                || storage.get_state(channel_id).map_err(error)?
-                    != Some(ChannelState::SenderRefundedAfterExpiry)
-                || channel
-                    .classify_funding_spend_against_prepared_closes(
-                        evidence,
-                        journal.attempts.iter().map(|attempt| &attempt.prepared),
-                    )
-                    .map_err(|_| error("invalid saved refund evidence"))?
-                    != FundingSpendKind::PostExpiryRefund
-            {
-                return Err(error("terminal refund journal conflict"));
-            }
-            return Ok(CloseOutcome::SenderRefundedAfterExpiry {
-                channel_id: channel_id.to_string(),
-            });
-        }
         if !journal.completed {
             let closing = storage
                 .get_closing_data(channel_id)
@@ -225,7 +210,6 @@ impl SpilmanRelayPayments {
             durable = original;
         }
         let mut sent = 0;
-        let mut need_restore = resumed;
         loop {
             if let Some(completed) = journal.finalizing.as_ref() {
                 let total = completed
@@ -280,33 +264,24 @@ impl SpilmanRelayPayments {
                 return Err(error("completed close journal lacks payout"));
             }
             let last = journal.attempts.len() - 1;
-            if need_restore || journal.attempts[last].submissions > 0 {
-                // Every historical request is checked before any new I/O capable
-                // of spending inputs, refreshing output keys, or applying expiry.
-                let mut invalid_restore = false;
-                for attempt in &journal.attempts {
-                    let prepared = &attempt.prepared;
-                    let response = mint
-                        .restore(
-                            &prepared.mint_url,
-                            &serde_json::json!({"outputs": prepared.swap_request["outputs"]})
-                                .to_string(),
-                        )
-                        .await
-                        .map_err(|_| error("close restore failed; reservation retained"))?;
-                    match self
-                        .bridge
-                        .complete_prepared_close_restore(&response, prepared)
-                    {
-                        Ok(Some(completed)) => {
-                            journal.finalizing = Some(completed);
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(_) => invalid_restore = true,
-                    }
-                }
-                if journal.finalizing.is_some() {
+            let attempts = journal
+                .attempts
+                .iter()
+                .map(|a| a.prepared.clone())
+                .collect::<Vec<_>>();
+            let connection = crate::mint_recovery::ChannelMint {
+                client: mint,
+                mint: &channel.params.mint,
+            };
+            match self
+                .bridge
+                .recover_close(channel_id, &attempts, &connection)
+                .await
+                .map_err(|_| {
+                    error("close funding inspection or restore failed; journal retained")
+                })? {
+                ChannelRecovery::Recovered { payout, .. } => {
+                    journal.finalizing = Some(payout);
                     let next = serde_json::to_string(&journal)
                         .map_err(|_| error("serialize close finalization"))?;
                     storage
@@ -317,112 +292,28 @@ impl SpilmanRelayPayments {
                     crate::lifecycle_test::boundary("close-finalizing");
                     continue;
                 }
-                // Deterministic predecessor/successor outputs may share blinded
-                // points. A response for a different keyset can only be accepted
-                // by authenticating another saved attempt, never as absence.
-                if invalid_restore {
-                    return Err(error("invalid close restore; outcome unresolved"));
+                ChannelRecovery::Unspent(_) if !journal.collection_abandoned => {}
+                ChannelRecovery::Unspent(_) => {
+                    return Err(error(
+                        "abandoned channel reported unspent; journal retained",
+                    ))
                 }
-                let prepared = &journal.attempts[last].prepared;
-                let request: SwapRequest = serde_json::from_value(prepared.swap_request.clone())
-                    .map_err(|_| error("invalid close request"))?;
-                let ys = request
-                    .inputs()
-                    .iter()
-                    .map(Proof::y)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| error("invalid close inputs"))?;
-                let response = mint
-                    .check_state(
-                        &prepared.mint_url,
-                        &serde_json::json!({"Ys": ys}).to_string(),
-                    )
-                    .await
-                    .map_err(|_| error("close input state unavailable; reservation retained"))?;
-                let response: CheckStateResponse = serde_json::from_str(&response)
-                    .map_err(|_| error("invalid close input state"))?;
-                if response.states.len() != ys.len()
-                    || ys.iter().any(|y| {
-                        response
-                            .states
-                            .iter()
-                            .filter(|state| state.y == *y && state.state == State::Unspent)
-                            .count()
-                            != 1
-                    })
-                {
-                    // A sender refund may have won. A spent observation is not
-                    // proof of that outcome and never becomes a zero-value close.
-                    // State may have changed during the first restore pass. Check
-                    // every saved request again, including rejected predecessors.
-                    let mut invalid_restore = false;
-                    for attempt in &journal.attempts {
-                        let prepared = &attempt.prepared;
-                        let response = mint
-                            .restore(
-                                &prepared.mint_url,
-                                &serde_json::json!({"outputs": prepared.swap_request["outputs"]})
-                                    .to_string(),
-                            )
-                            .await
-                            .map_err(|_| {
-                                error("final close restore failed; reservation retained")
-                            })?;
-                        match self
-                            .bridge
-                            .complete_prepared_close_restore(&response, prepared)
-                        {
-                            Ok(Some(completed)) => {
-                                journal.finalizing = Some(completed);
-                                break;
-                            }
-                            Ok(None) => {}
-                            Err(_) => invalid_restore = true,
-                        }
-                    }
-                    if journal.finalizing.is_some() {
+                ChannelRecovery::Pending(_) => {
+                    return Err(error("close funding pending; journal retained"))
+                }
+                ChannelRecovery::Mixed(_) | ChannelRecovery::SpentNoKnownPayout(_) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| error("system clock before epoch"))?
+                        .as_secs();
+                    if now > channel.params.expiry_timestamp {
+                        journal.collection_abandoned = true;
                         let next = serde_json::to_string(&journal)
-                            .map_err(|_| error("serialize close finalization"))?;
+                            .map_err(|_| error("serialize collection abandonment"))?;
                         storage
                             .advance_close(channel_id, &durable, &next, None)
                             .map_err(error)?;
-                        durable = next;
-                        #[cfg(feature = "funds-lifecycle-test")]
-                        crate::lifecycle_test::boundary("close-finalizing");
-                        continue;
-                    }
-                    if invalid_restore {
-                        return Err(error("invalid final close restore; outcome unresolved"));
-                    }
-                    let all_spent = response.states.len() == ys.len()
-                        && ys.iter().all(|y| {
-                            response
-                                .states
-                                .iter()
-                                .filter(|s| s.y == *y && s.state == State::Spent)
-                                .count()
-                                == 1
-                        });
-                    if !all_spent {
-                        return Err(error(
-                            "close input state incomplete or pending; outcome unresolved",
-                        ));
-                    }
-                    if channel
-                        .classify_funding_spend_against_prepared_closes(
-                            &response,
-                            journal.attempts.iter().map(|attempt| &attempt.prepared),
-                        )
-                        .map_err(|_| error("invalid funding spend evidence; outcome unresolved"))?
-                        == FundingSpendKind::PostExpiryRefund
-                    {
-                        journal.refunded = Some(response);
-                        let next = serde_json::to_string(&journal)
-                            .map_err(|_| error("serialize sender refund evidence"))?;
-                        storage
-                            .finish_sender_refund(channel_id, &durable, &next)
-                            .map_err(error)?;
-                        return Ok(CloseOutcome::SenderRefundedAfterExpiry {
+                        return Ok(CloseOutcome::CollectionAbandoned {
                             channel_id: channel_id.to_string(),
                         });
                     }
@@ -467,7 +358,6 @@ impl SpilmanRelayPayments {
                     .advance_close(channel_id, &durable, &next, None)
                     .map_err(error)?;
                 durable = next;
-                need_restore = false;
                 #[cfg(feature = "funds-lifecycle-test")]
                 crate::lifecycle_test::boundary("close-successor");
                 continue;
@@ -523,7 +413,6 @@ impl SpilmanRelayPayments {
                             crate::lifecycle_test::boundary("close-rejected");
                         }
                     }
-                    need_restore = true;
                 }
             }
         }

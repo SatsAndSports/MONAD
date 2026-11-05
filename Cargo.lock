@@ -328,6 +328,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -562,7 +568,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "cashu"
 version = "0.18.1"
-source = "git+https://github.com/cashubtc/cdk.git?tag=v0.18.1#a056e0f0f69e94f431b1aeb90d883f18c61ea4c6"
+source = "git+https://github.com/SatsAndSports/cdk.git?rev=da5cf282dd070772af830fa5215630f059e5f1ad#da5cf282dd070772af830fa5215630f059e5f1ad"
 dependencies = [
  "bitcoin",
  "cbor-diag",
@@ -617,7 +623,7 @@ dependencies = [
 [[package]]
 name = "cdk"
 version = "0.18.1"
-source = "git+https://github.com/cashubtc/cdk.git?tag=v0.18.1#a056e0f0f69e94f431b1aeb90d883f18c61ea4c6"
+source = "git+https://github.com/SatsAndSports/cdk.git?rev=da5cf282dd070772af830fa5215630f059e5f1ad#da5cf282dd070772af830fa5215630f059e5f1ad"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -647,7 +653,7 @@ dependencies = [
 [[package]]
 name = "cdk-axum"
 version = "0.18.1"
-source = "git+https://github.com/cashubtc/cdk.git?tag=v0.18.1#a056e0f0f69e94f431b1aeb90d883f18c61ea4c6"
+source = "git+https://github.com/SatsAndSports/cdk.git?rev=da5cf282dd070772af830fa5215630f059e5f1ad#da5cf282dd070772af830fa5215630f059e5f1ad"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -668,7 +674,7 @@ dependencies = [
 [[package]]
 name = "cdk-common"
 version = "0.18.1"
-source = "git+https://github.com/cashubtc/cdk.git?tag=v0.18.1#a056e0f0f69e94f431b1aeb90d883f18c61ea4c6"
+source = "git+https://github.com/SatsAndSports/cdk.git?rev=da5cf282dd070772af830fa5215630f059e5f1ad#da5cf282dd070772af830fa5215630f059e5f1ad"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -699,7 +705,7 @@ dependencies = [
 [[package]]
 name = "cdk-fake-wallet"
 version = "0.18.1"
-source = "git+https://github.com/cashubtc/cdk.git?tag=v0.18.1#a056e0f0f69e94f431b1aeb90d883f18c61ea4c6"
+source = "git+https://github.com/SatsAndSports/cdk.git?rev=da5cf282dd070772af830fa5215630f059e5f1ad#da5cf282dd070772af830fa5215630f059e5f1ad"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -722,7 +728,7 @@ dependencies = [
 [[package]]
 name = "cdk-http-client"
 version = "0.18.1"
-source = "git+https://github.com/cashubtc/cdk.git?tag=v0.18.1#a056e0f0f69e94f431b1aeb90d883f18c61ea4c6"
+source = "git+https://github.com/SatsAndSports/cdk.git?rev=da5cf282dd070772af830fa5215630f059e5f1ad#da5cf282dd070772af830fa5215630f059e5f1ad"
 dependencies = [
  "async-trait",
  "bitreq",
@@ -749,7 +755,7 @@ dependencies = [
 [[package]]
 name = "cdk-signatory"
 version = "0.18.1"
-source = "git+https://github.com/cashubtc/cdk.git?tag=v0.18.1#a056e0f0f69e94f431b1aeb90d883f18c61ea4c6"
+source = "git+https://github.com/SatsAndSports/cdk.git?rev=da5cf282dd070772af830fa5215630f059e5f1ad#da5cf282dd070772af830fa5215630f059e5f1ad"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -774,16 +780,17 @@ dependencies = [
 
 [[package]]
 name = "cdk-spilman"
-version = "0.2.0"
-source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=c2083defc2015ad0bae2a8a086a2876bc775ff79#c2083defc2015ad0bae2a8a086a2876bc775ff79"
+version = "0.3.0"
+source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=7fa7c35d19d03546fb1d45d1295c21a63d624b8d#7fa7c35d19d03546fb1d45d1295c21a63d624b8d"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bitcoin",
  "bls12_381",
  "cashu",
  "hkdf 0.13.0",
+ "lightning",
  "reqwest",
  "rusqlite",
  "serde",
@@ -797,8 +804,8 @@ dependencies = [
 
 [[package]]
 name = "cdk-spilman-test-mint"
-version = "0.2.0"
-source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=c2083defc2015ad0bae2a8a086a2876bc775ff79#c2083defc2015ad0bae2a8a086a2876bc775ff79"
+version = "0.3.0"
+source = "git+https://github.com/SatsAndSports/cashu_spilman_channels.git?rev=7fa7c35d19d03546fb1d45d1295c21a63d624b8d#7fa7c35d19d03546fb1d45d1295c21a63d624b8d"
 dependencies = [
  "anyhow",
  "axum",
@@ -819,7 +826,7 @@ dependencies = [
 [[package]]
 name = "cdk-sql-common"
 version = "0.18.1"
-source = "git+https://github.com/cashubtc/cdk.git?tag=v0.18.1#a056e0f0f69e94f431b1aeb90d883f18c61ea4c6"
+source = "git+https://github.com/SatsAndSports/cdk.git?rev=da5cf282dd070772af830fa5215630f059e5f1ad#da5cf282dd070772af830fa5215630f059e5f1ad"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -835,7 +842,7 @@ dependencies = [
 [[package]]
 name = "cdk-sqlite"
 version = "0.18.1"
-source = "git+https://github.com/cashubtc/cdk.git?tag=v0.18.1#a056e0f0f69e94f431b1aeb90d883f18c61ea4c6"
+source = "git+https://github.com/SatsAndSports/cdk.git?rev=da5cf282dd070772af830fa5215630f059e5f1ad#da5cf282dd070772af830fa5215630f059e5f1ad"
 dependencies = [
  "async-trait",
  "cdk-common",
@@ -2482,6 +2489,7 @@ dependencies = [
  "base64 0.22.1",
  "bech32",
  "bytes",
+ "cdk-spilman",
  "ciborium",
  "dotenvy",
  "h2",
@@ -2491,6 +2499,7 @@ dependencies = [
  "noise-protocol",
  "noise-rust-crypto",
  "rand_core 0.6.4",
+ "reqwest",
  "ring",
  "serde",
  "serde_json",

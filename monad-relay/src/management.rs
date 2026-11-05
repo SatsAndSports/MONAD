@@ -337,6 +337,7 @@ impl Backend for RelayBackend {
                 let outcome = match outcome {
                     CloseOutcome::Closed(_) => "closed",
                     CloseOutcome::SenderRefundedAfterExpiry { .. } => "sender_refunded",
+                    CloseOutcome::CollectionAbandoned { .. } => "collection_abandoned",
                     CloseOutcome::UnknownSpent { .. } => "unresolved_spent",
                 };
                 *self.inventory.lock().await = None;
