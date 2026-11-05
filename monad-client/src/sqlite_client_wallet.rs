@@ -574,8 +574,6 @@ struct ClientOpenAttempt {
     output_keyset: SelectedOutputKeyset,
     reservation: ProofReservation,
     prepared: PreparedOpenChannel,
-    requested_capacity_raw: Option<u64>,
-    desired_funding_token_amount_raw: Option<u64>,
     funding_token_target_msats: u64,
     selected_input_msats: u64,
     expiry_timestamp: u64,
@@ -1173,6 +1171,67 @@ impl SqliteClientWallet {
         attempt: &OpeningAttemptRecord,
         networking: &N,
     ) -> Result<OpeningRecoveryOutcome, WalletError> {
+        // The recovery list is a snapshot: a prior member may already have
+        // completed the operation and retired this candidate.
+        let latest = self
+            .loose_wallet
+            .opening_attempt(&attempt.attempt_id)
+            .map_err(loose_proof_error)?
+            .ok_or(WalletError::NotFound)?;
+        if latest.state == OpeningAttemptState::Cancelled {
+            return Ok(OpeningRecoveryOutcome::Cancelled);
+        }
+        if latest.state == OpeningAttemptState::Completed {
+            return Ok(OpeningRecoveryOutcome::Recovered(latest.attempt_id));
+        }
+        if latest.state == OpeningAttemptState::ExternallySpent {
+            return Ok(OpeningRecoveryOutcome::ExternallySpent);
+        }
+        let peers = self
+            .loose_wallet
+            .opening_candidates(&attempt.attempt_id)
+            .map_err(loose_proof_error)?;
+        if peers.len() > 1 && latest.state != OpeningAttemptState::Finalizing {
+            let prepared: PreparedOpenChannel = serde_json::from_str(&latest.prepared_open_json)
+                .map_err(|_| WalletError::Backend("invalid opening candidate".to_string()))?;
+            if let Some((winner, completed)) = self
+                .restore_opening_candidates(&prepared, networking)
+                .map_err(|e| {
+                    open_channel_error(e, &attempt.unit, attempt.funding_token_target_msats)
+                })?
+            {
+                let result = self
+                    .complete_live_restored_opening(&winner, completed)
+                    .map_err(|e| {
+                        open_channel_error(e, &attempt.unit, attempt.funding_token_target_msats)
+                    })?;
+                let id = result.channel_id.clone();
+                self.finish_open_channel(
+                    result,
+                    &ProofReservation {
+                        reservation_id: attempt.reservation_id.clone(),
+                        proofs: self
+                            .loose_wallet
+                            .proofs_for_reservation(&attempt.reservation_id)
+                            .map_err(loose_proof_error)?,
+                        total_amount_raw: 0,
+                    },
+                    attempt.expiry_timestamp,
+                )?;
+                return Ok(OpeningRecoveryOutcome::Recovered(id));
+            }
+            if matches!(
+                latest.state,
+                OpeningAttemptState::Prepared | OpeningAttemptState::Rejected
+            ) && peers.iter().any(|p| {
+                matches!(
+                    p.state,
+                    OpeningAttemptState::Submitted | OpeningAttemptState::Exported
+                )
+            }) {
+                return Ok(OpeningRecoveryOutcome::Unresolved);
+            }
+        }
         if attempt.state == OpeningAttemptState::Rejected {
             self.loose_wallet
                 .cancel_rejected_opening_attempt(&attempt.attempt_id)
@@ -1244,6 +1303,33 @@ impl SqliteClientWallet {
                     }
                     // Check the exact original outputs once more after the spent
                     // observation before recording the external-spend outcome.
+                    if let Some((winner, completed)) = self
+                        .restore_opening_candidates(&prepared, networking)
+                        .map_err(|e| {
+                            open_channel_error(e, &attempt.unit, attempt.funding_token_target_msats)
+                        })?
+                    {
+                        let result = self
+                            .complete_live_restored_opening(&winner, completed)
+                            .map_err(|e| {
+                                open_channel_error(
+                                    e,
+                                    &attempt.unit,
+                                    attempt.funding_token_target_msats,
+                                )
+                            })?;
+                        let id = result.channel_id.clone();
+                        self.finish_open_channel(
+                            result,
+                            &ProofReservation {
+                                reservation_id: attempt.reservation_id.clone(),
+                                proofs: reserved_proofs,
+                                total_amount_raw: 0,
+                            },
+                            attempt.expiry_timestamp,
+                        )?;
+                        return Ok(OpeningRecoveryOutcome::Recovered(id));
+                    }
                     match self
                         .restore_journaled_opening(&prepared, networking)
                         .map_err(|error| {
@@ -1520,6 +1606,9 @@ impl SqliteClientWallet {
                 .flat_map(|candidate| std::mem::take(&mut candidate.proofs))
                 .collect::<Vec<_>>();
             proofs.sort_by(|left, right| left.0.cmp(&right.0));
+            // Competing candidates reference the same reservation. Export each
+            // proof once while transitioning every represented candidate.
+            proofs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
             let proof_count = proofs.len();
             let amount_raw = proofs.iter().try_fold(0u64, |total, (_, proof)| {
                 total.checked_add(proof.amount.to_u64())
@@ -1612,6 +1701,11 @@ impl SqliteClientWallet {
         prepared: &PreparedOpenChannel,
         networking: &N,
     ) -> Result<Option<OpenChannelResult>, OpenChannelError> {
+        if let Some((winner, completed)) = self.restore_opening_candidates(prepared, networking)? {
+            return self
+                .complete_live_restored_opening(&winner, completed)
+                .map(Some);
+        }
         match self.restore_journaled_opening(prepared, networking)? {
             OpeningRestoreOutcome::Completed(completed) => self
                 .complete_live_restored_opening(prepared, *completed)
@@ -1656,6 +1750,13 @@ impl SqliteClientWallet {
                 match self.submit_prepared_open(prepared.clone(), permit, networking) {
                     Ok(result) => Ok(Some(result)),
                     Err(_replay_error) => {
+                        if let Some((winner, completed)) =
+                            self.restore_opening_candidates(prepared, networking)?
+                        {
+                            return self
+                                .complete_live_restored_opening(&winner, completed)
+                                .map(Some);
+                        }
                         match self.restore_journaled_opening(prepared, networking)? {
                             OpeningRestoreOutcome::Completed(completed) => self
                                 .complete_live_restored_opening(prepared, *completed)
@@ -1665,6 +1766,89 @@ impl SqliteClientWallet {
                     }
                 }
             }
+        }
+    }
+
+    fn restore_opening_candidates<N: OpeningRecoveryNetworking>(
+        &self,
+        current: &PreparedOpenChannel,
+        networking: &N,
+    ) -> Result<Option<(PreparedOpenChannel, CompletedOpenChannel)>, OpenChannelError> {
+        let fail = |message: String| {
+            open_channel_stage_error(
+                OpenChannelFailureStage::SwapSubmitted,
+                Some(current.channel_id.clone()),
+                message,
+            )
+        };
+        let candidates = self
+            .loose_wallet
+            .opening_candidates(&current.channel_id)
+            .map_err(|e| fail(e.to_string()))?;
+        if candidates.len() <= 1 {
+            return Ok(None);
+        }
+        if candidates.len() != 2 {
+            return Err(fail("invalid opening candidate count".to_string()));
+        }
+        let original: PreparedOpenChannel = serde_json::from_str(&candidates[0].prepared_open_json)
+            .map_err(|_| fail("invalid original opening".to_string()))?;
+        let successor: PreparedOpenChannel =
+            serde_json::from_str(&candidates[1].prepared_open_json)
+                .map_err(|_| fail("invalid successor opening".to_string()))?;
+        verify_opening_successor(&original, &successor).map_err(|e| fail(e.to_string()))?;
+        if candidates[0].reservation_id != candidates[1].reservation_id
+            || candidates[0].selected_proof_ids != candidates[1].selected_proof_ids
+            || candidates[1].predecessor_attempt_id.as_deref()
+                != Some(candidates[0].attempt_id.as_str())
+        {
+            return Err(fail("opening candidate custody mismatch".to_string()));
+        }
+        let mut invalid = None;
+        for candidate in candidates {
+            if !matches!(
+                candidate.state,
+                OpeningAttemptState::Submitted
+                    | OpeningAttemptState::Exported
+                    | OpeningAttemptState::Finalizing
+            ) {
+                continue;
+            }
+            let prepared: PreparedOpenChannel = serde_json::from_str(&candidate.prepared_open_json)
+                .map_err(|_| fail("invalid retained opening".to_string()))?;
+            let proofs = self
+                .loose_wallet
+                .proofs_for_reservation(&candidate.reservation_id)
+                .map_err(|e| fail(e.to_string()))?;
+            verify_prepared_inputs_match_selected_proofs(
+                &prepared,
+                &candidate.selected_proof_ids,
+                &proofs,
+            )
+            .map_err(|e| fail(e.to_string()))?;
+            if candidate.state == OpeningAttemptState::Finalizing {
+                let completed = serde_json::from_str(
+                    candidate
+                        .completed_open_json
+                        .as_deref()
+                        .ok_or_else(|| fail("missing opening completion".to_string()))?,
+                )
+                .map_err(|_| fail("invalid opening completion".to_string()))?;
+                return Ok(Some((prepared, completed)));
+            }
+            match self.restore_journaled_opening(&prepared, networking) {
+                Ok(OpeningRestoreOutcome::Completed(completed)) => {
+                    return Ok(Some((prepared, *completed)))
+                }
+                Ok(OpeningRestoreOutcome::FundingOutputsAbsent) => {}
+                Err(error) => {
+                    invalid.get_or_insert(error);
+                }
+            }
+        }
+        match invalid {
+            Some(error) => Err(error),
+            None => Ok(None),
         }
     }
 
@@ -2657,8 +2841,6 @@ impl SqliteClientWallet {
             output_keyset,
             reservation,
             prepared,
-            requested_capacity_raw: plan.requested_capacity_raw,
-            desired_funding_token_amount_raw: plan.desired_funding_token_amount_raw,
             funding_token_target_msats: plan.funding_token_target_msats,
             selected_input_msats: plan.selected_input_msats,
             expiry_timestamp: plan.expiry_timestamp,
@@ -3143,6 +3325,41 @@ impl SqliteClientWallet {
             },
             error => error,
         })?;
+        let candidates = self
+            .loose_wallet
+            .opening_candidates(&attempt.prepared.channel_id)
+            .map_err(loose_proof_error)?;
+        let competing_prepared = candidates.len() > 1
+            && candidates.iter().any(|c| {
+                c.attempt_id == attempt.prepared.channel_id
+                    && c.state == OpeningAttemptState::Prepared
+            });
+        if competing_prepared {
+            if let Some((winner, completed)) = self
+                .restore_opening_candidates(&attempt.prepared, networking)
+                .map_err(|e| open_channel_error(e, &offer.unit, attempt.selected_input_msats))?
+            {
+                let result = self
+                    .complete_live_restored_opening(&winner, completed)
+                    .map_err(|e| {
+                        open_channel_error(e, &offer.unit, attempt.selected_input_msats)
+                    })?;
+                return self.finish_open_channel(
+                    result,
+                    &attempt.reservation,
+                    attempt.expiry_timestamp,
+                );
+            }
+        }
+        if competing_prepared
+            && !prepared_inputs_are_all_unspent(&attempt.prepared, networking)
+                .map_err(|e| open_channel_error(e, &offer.unit, attempt.selected_input_msats))?
+        {
+            return Err(WalletError::Backend(
+                "opening inputs not conclusively unspent; candidates retained for recovery"
+                    .to_string(),
+            ));
+        }
         let result = match self.submit_open_attempt_with_networking(&attempt, networking) {
             Err(SubmitOpenAttemptError::Authority(error)) => return Err(error),
             Err(SubmitOpenAttemptError::Open(error)) if error.input_may_be_spent => {
@@ -3163,23 +3380,58 @@ impl SqliteClientWallet {
             Err(SubmitOpenAttemptError::Open(error)) => Err(error),
             Ok(result) => Ok(result),
         };
+        let result = if result.is_err() {
+            match self.restore_opening_candidates(&attempt.prepared, networking) {
+                Ok(Some((winner, completed))) => {
+                    self.complete_live_restored_opening(&winner, completed)
+                }
+                _ => result,
+            }
+        } else {
+            result
+        };
         match result {
             Ok(result) => {
                 self.finish_open_channel(result, &attempt.reservation, attempt.expiry_timestamp)
             }
             Err(error)
                 if allow_keyset_successor
-                    && !error.input_may_be_spent
-                    && error.stage == OpenChannelFailureStage::MintRejected
                     && self
                         .loose_wallet
                         .opening_attempt(&attempt.prepared.channel_id)
                         .map_err(loose_proof_error)?
                         .is_some_and(|record| {
-                            record.state == OpeningAttemptState::Rejected
-                                && record.rejection_code == Some(12002)
+                            matches!(
+                                record.state,
+                                OpeningAttemptState::Rejected | OpeningAttemptState::Submitted
+                            ) && record.rejection_code == Some(12002)
+                                && record.predecessor_attempt_id.is_none()
                         }) =>
             {
+                if let Some((winner, completed)) = self
+                    .restore_opening_candidates(&attempt.prepared, networking)
+                    .map_err(|e| open_channel_error(e, &offer.unit, attempt.selected_input_msats))?
+                {
+                    let result = self
+                        .complete_live_restored_opening(&winner, completed)
+                        .map_err(|e| {
+                            open_channel_error(e, &offer.unit, attempt.selected_input_msats)
+                        })?;
+                    return self.finish_open_channel(
+                        result,
+                        &attempt.reservation,
+                        attempt.expiry_timestamp,
+                    );
+                }
+                if !prepared_inputs_are_all_unspent(&attempt.prepared, networking)
+                    .map_err(|e| open_channel_error(e, &offer.unit, attempt.selected_input_msats))?
+                {
+                    return Err(open_channel_error(
+                        error,
+                        &offer.unit,
+                        attempt.selected_input_msats,
+                    ));
+                }
                 if let Err(refresh_error) = self.refresh_client_keysets(offer) {
                     let _ = self
                         .loose_wallet
@@ -3260,14 +3512,11 @@ impl SqliteClientWallet {
             proof_input_keysets_json(input_keyset_lookup, &offer.mint_url, &networking).map_err(
                 |e| open_channel_error(e, &offer.unit, predecessor.selected_input_msats),
             )?;
-        let desired_funding_token_amount_raw = match predecessor.requested_capacity_raw {
-            Some(target) => Some(
-                compute_funding_token_amount(target, &output_keyset.info_json, 0).map_err(|e| {
-                    WalletError::Backend(format!("compute successor funding amount: {e}"))
-                })?,
-            ),
-            None => predecessor.desired_funding_token_amount_raw,
-        };
+        // The original target sizes the reservation once. A competing keyset
+        // must not consume additional inputs or the original change to preserve
+        // an exact capacity: retain nominal funding and derive its new capacity.
+        let desired_funding_token_amount_raw =
+            Some(predecessor.prepared.opening.funding_token_amount);
         let prepared = {
             let bridge = self
                 .bridge
@@ -3284,11 +3533,12 @@ impl SqliteClientWallet {
                     predecessor.expiry_timestamp,
                     &output_keyset.info_json,
                     0,
-                    predecessor.requested_capacity_raw,
+                    None,
                     desired_funding_token_amount_raw,
                 )
                 .map_err(|e| open_channel_error(e, &offer.unit, predecessor.selected_input_msats))?
         };
+        verify_opening_successor(&predecessor.prepared, &prepared)?;
         let journal = NewOpeningAttempt {
             attempt_id: prepared.channel_id.clone(),
             opening_id: predecessor.opening_id.clone(),
@@ -3332,8 +3582,6 @@ impl SqliteClientWallet {
             output_keyset,
             reservation: predecessor.reservation.clone(),
             prepared,
-            requested_capacity_raw: predecessor.requested_capacity_raw,
-            desired_funding_token_amount_raw,
             funding_token_target_msats: predecessor.funding_token_target_msats,
             selected_input_msats: predecessor.selected_input_msats,
             expiry_timestamp: predecessor.expiry_timestamp,
@@ -4162,6 +4410,30 @@ fn prepared_input_ys(prepared: &PreparedOpenChannel) -> Result<Vec<String>, Wall
     Ok(ids)
 }
 
+fn verify_opening_successor(
+    a: &PreparedOpenChannel,
+    b: &PreparedOpenChannel,
+) -> Result<(), WalletError> {
+    let ar: cashu::nuts::SwapRequest = serde_json::from_str(&a.swap_request_json)
+        .map_err(|_| WalletError::Backend("invalid opening A request".to_string()))?;
+    let br: cashu::nuts::SwapRequest = serde_json::from_str(&b.swap_request_json)
+        .map_err(|_| WalletError::Backend("invalid opening B request".to_string()))?;
+    if ar.inputs() != br.inputs()
+        || a.keyset_id == b.keyset_id
+        || a.opening.funding_token_amount != b.opening.funding_token_amount
+        || a.opening.change_amount_raw != b.opening.change_amount_raw
+        || a.mint_url != b.mint_url
+        || a.opening.unit != b.opening.unit
+        || a.opening.sender_pubkey_hex != b.opening.sender_pubkey_hex
+        || a.opening.receiver_pubkey_hex != b.opening.receiver_pubkey_hex
+    {
+        return Err(WalletError::Backend(
+            "opening successor changed reserved inputs or funding allocation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn verify_prepared_inputs_match_selected_proofs(
     prepared: &PreparedOpenChannel,
     selected_proof_ids: &[String],
@@ -4795,6 +5067,7 @@ fn sql_decode_error(message: impl Into<String>) -> rusqlite::Error {
 
 #[cfg(test)]
 mod tests {
+    mod competing_openings;
     mod competing_refunds;
     use super::*;
     use crate::loose_proof_wallet::OpeningExecutionKind;
@@ -8268,8 +8541,6 @@ mod tests {
                 total_amount_raw: reserved_total_raw,
             },
             prepared: persisted_prepared.clone(),
-            requested_capacity_raw: None,
-            desired_funding_token_amount_raw: Some(funding_token_target_raw),
             funding_token_target_msats,
             selected_input_msats: raw_to_msats(unit, reserved_total_raw).unwrap(),
             expiry_timestamp: stored_expiry,
@@ -8929,8 +9200,6 @@ mod tests {
             },
             reservation,
             prepared: prepared.clone(),
-            requested_capacity_raw: None,
-            desired_funding_token_amount_raw: Some(1),
             funding_token_target_msats: 1_000,
             selected_input_msats: 1_000,
             expiry_timestamp: 123_456,
@@ -10356,7 +10625,17 @@ mod tests {
             );
         }
         assert_eq!(journal.state, OpeningAttemptState::Submitted);
-        assert_eq!(journal.rejection_code, None);
+        assert_eq!(
+            journal.rejection_code,
+            if matches!(
+                scenario,
+                OpeningOrchestrationScenario::RejectedReplayThenDelayedOriginal
+            ) {
+                Some(12002)
+            } else {
+                None
+            }
+        );
         assert_eq!(
             journal.prepared_open_json,
             serde_json::to_string(&prepared).unwrap()
@@ -10557,7 +10836,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn replay_rejection_does_not_resolve_prior_execution_uncertainty() {
+    async fn replay_rejection_retains_a_and_allows_b_its_own_exact_replay() {
         let mint_helper = TestMintHelper::new().await.unwrap();
         let mint = mint_helper.mint();
         let initial_keyset_id = mint_helper.keyset_id().to_string();
@@ -10624,24 +10903,24 @@ mod tests {
         assert_ne!(initial_keyset_id, successor_keyset_id);
 
         let networking = FourSubmissionNetworking::new();
-        let error = wallet
+        let winning_channel = wallet
             .execute_open_attempt_with_networking(&offer, attempt, true, &networking)
-            .unwrap_err();
-        assert!(error.to_string().contains("input may be spent"));
+            .unwrap();
         let losing_error = wallet
             .execute_open_attempt_with_networking(&offer, losing_attempt, true, &networking)
             .unwrap_err();
         assert_eq!(
             losing_error,
-            WalletError::OpeningInProgress {
+            WalletError::Conflict {
                 channel_id: opening_id.clone()
             }
         );
 
         {
             let swap_requests = networking.swap_requests.lock().unwrap();
-            assert_eq!(swap_requests.len(), 2);
+            assert_eq!(swap_requests.len(), 4);
             assert_eq!(swap_requests[0], swap_requests[1]);
+            assert_eq!(swap_requests[2], swap_requests[3]);
         }
 
         let root = wallet
@@ -10649,8 +10928,8 @@ mod tests {
             .opening_attempt(&opening_id)
             .unwrap()
             .unwrap();
-        assert_eq!(root.state, OpeningAttemptState::Submitted);
-        assert_eq!(root.rejection_code, None);
+        assert_eq!(root.state, OpeningAttemptState::Cancelled);
+        assert_eq!(root.rejection_code, Some(12002));
         assert!(root.latest_submitted_at.is_some());
         assert_eq!(root.predecessor_attempt_id, None);
         let root_prepared: PreparedOpenChannel =
@@ -10671,7 +10950,7 @@ mod tests {
 
         {
             let state_requests = networking.check_state_requests.lock().unwrap();
-            assert_eq!(state_requests.len(), 1);
+            assert!(!state_requests.is_empty());
             for request in state_requests.iter() {
                 assert_eq!(request.ys.len(), expected_input_ys.len());
                 assert_eq!(
@@ -10692,7 +10971,8 @@ mod tests {
         assert!(!reserved.is_empty());
         assert!(reserved
             .iter()
-            .all(|proof| proof.state == LooseProofState::Reserved));
+            .all(|proof| proof.state == LooseProofState::Spent
+                && proof.spent_channel_id.as_deref() == Some(&winning_channel)));
 
         let journal_db = Connection::open(&loose_db).unwrap();
         let successor_count: u64 = journal_db
@@ -10704,7 +10984,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(successor_count, 0);
+        assert_eq!(successor_count, 1);
         let channel_count: u64 = wallet
             .channel_db
             .lock()
@@ -10713,9 +10993,9 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(channel_count, 0);
+        assert_eq!(channel_count, 1);
 
-        assert_eq!(networking.swap_requests.lock().unwrap().len(), 2);
+        assert_eq!(networking.swap_requests.lock().unwrap().len(), 4);
 
         let _ = shutdown_tx.send(());
         mint_task.await.unwrap().unwrap();
