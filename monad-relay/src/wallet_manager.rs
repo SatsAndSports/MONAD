@@ -1643,7 +1643,7 @@ impl RelayWalletManager {
         conn.query_row(
             "SELECT drain_id, relay_name, mint_url, unit, state, input_amount_raw,
                     output_amount_raw, restore_request_json, output_secrets_json,
-                    output_keyset_info_json, output_proofs_json
+                    output_keyset_info_json, output_proofs_json, swap_request_json, output_keyset_id
              FROM monad_relay_drains WHERE drain_id = ?1",
             params![drain_id],
             |row| {
@@ -1659,6 +1659,8 @@ impl RelayWalletManager {
                     output_secrets_json: row.get(8)?,
                     output_keyset_info_json: row.get(9)?,
                     output_proofs_json: row.get(10)?,
+                    swap_request_json: row.get(11)?,
+                    output_keyset_id: row.get(12)?,
                 })
             },
         )
@@ -1898,6 +1900,8 @@ struct StoredDrain {
     state: String,
     input_amount_raw: u64,
     output_amount_raw: u64,
+    swap_request_json: String,
+    output_keyset_id: String,
     restore_request_json: String,
     output_secrets_json: String,
     output_keyset_info_json: String,
