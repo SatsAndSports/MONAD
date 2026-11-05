@@ -46,6 +46,15 @@ asserts zero attempted HTTP; terminal proofs remain solely in the relay DB.
 The close/refund race matrix also kills the winning close with its accepted
 response withheld while the sender attempts recovery.
 
+Established-channel recovery now checks NUT-07 before NUT-09 using the upstream
+ordinary-channel APIs. Alice restores retained refunds before close discovery;
+Charlie restores retained close attempts. A refund winner yields relay
+`CollectionAbandoned` after expiry, not inferred `SenderRefundedAfterExpiry`.
+The relay remains `Closing` with a v4 journal: expiry sweeps and drains perform
+no mint I/O for it, while an explicit close remains an online recovery attempt.
+The race oracle still identifies the actual winner from accepted swaps and exact
+custody conservation, independently of the relay's administrative outcome.
+
 Opening boundaries cover durable finalizing, upstream saved, change imported,
 and metadata saved. Refund boundaries cover durable finalizing, loose-proof
 import, upstream closed, and metadata closed. Refund tests sign eight-second

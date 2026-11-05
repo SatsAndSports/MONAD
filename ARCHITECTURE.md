@@ -201,31 +201,42 @@ Runtime switches are not persisted to YAML or wallet databases.
 
 ## Overview
 
-### Terminal Refunds
+### State-First Close Recovery
 
 The focused persistent-mint crash test gates a completed HTTP close response
 before killing an actual file-backed CDK mint child. Restart reuses the same
 mint/signatory database and deterministic test keys; restoration and conservation
 are checked through HTTP, with no parent in-memory mint or response cache.
 
-`SenderRefundedAfterExpiry` is an upstream persistent channel state, distinct from
-normal `Closed` with no fabricated payout. The relay close journal v3 saves the
-full mint NUT-07 evidence in the same transaction as the terminal state before
-returning it. Every saved close attempt is restored before input-state checks and
-again after spent evidence, so an actual verified close payout takes precedence.
-Each attempt caches the SHA-256 digest of its exact NUT-11 `SIG_ALL` message and
-the blinded receiver key; recovery authenticates both against the immutable swap
-request and channel before use. Under the honest-mint, complete-witness assumption,
-exact all-spent funding-Y coverage attests the refund branch only when every
-well-formed NUT-07 witness signature fails verification against every authenticated
-attempt. A matching receiver signature identifies a relay close even when unrelated
-signatures are also present. This is mint attestation, not independent verification
-of the unavailable full spending request. `UnknownSpent` retains the journal when
-evidence is missing; pending, partial, malformed, unauthenticated, or unavailable
-evidence cannot install a terminal state. Terminal reopen validates saved evidence
-locally and does no mint I/O. No payments, links, autosweep candidates, or drain
-payouts are available for terminal refunds; sender proof restoration remains
-independent.
+Spilman 0.3.0 supplies common NUT-07-first reconciliation. Alice's wallet calls
+`recover_funds` with current and retained predecessor refunds and historical close
+output keys. The relay calls `recover_close` with every authenticated retained
+attempt through a mint-bound adapter. All funding identities are checked in one
+NUT-07 response before NUT-09. Unspent is a snapshot, not reservation or changed-
+request authority; pending and invalid evidence retain the operation. No signature
+count or failure to match known signatures classifies a refund.
+
+Relay close journal v4 stores a `collection_abandoned` policy bit instead of inferred
+refund evidence. After expiry, mixed funding (possible partial refund) or spent
+funding with valid empty restores can stop automatic collection. The channel stays
+`Closing`, preventing further links/payments and excluding it from payout drains.
+Expiry sweeps skip abandonment; explicit close commands may still restore retained
+attempts. Verified close data takes precedence and can later finalize normally.
+An unavailable or invalid check cannot abandon collection. Finalizing/completed
+verified records remain usable offline. Incompatible journals are rejected, not
+migrated or deleted.
+
+The workspace pins one CDK/Cashu source matching the library. Channel-ID preflight
+for unknown keysets calls the upstream canonical TLV derivation using only the
+advertised identity fields; it does not duplicate the old delimiter-based hash.
+Normal key/proof verification follows bounded metadata refresh. This is a
+coordinated breaking alpha upgrade without old channel derivation compatibility.
+
+Custom mint adapters retain the 15-second timeout and cap decoded responses at
+4 MiB with strict UTF-8. Complete responses are classified by upstream typed mint
+outcomes; only validated HTTP 400 NUT-00 rejections carry rejection authority.
+MONAD's immutable-request successor policy remains narrower: initial `12002` only,
+with no prior ambiguity. Diagnostic bodies/details are redacted before propagation.
 
 ### Wallet Durability
 

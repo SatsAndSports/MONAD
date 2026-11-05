@@ -368,10 +368,11 @@ Recovery follows these boundaries:
 
 1. A completed row returns locally. A `finalizing` row resumes proof import and
    closure from its persisted verified payload without mint I/O.
-2. A `submitting` row verifies and restores the exact persisted outputs before
-   clock or funding-state checks. Invalid, partial, or unavailable restore evidence
-   is not absence and blocks replay. A valid complete restore finalizes.
-3. After valid absence, check funding state. `Pending` returns `FundingPending`;
+2. Reconcile through the library's NUT-07-first `recover_funds`, supplying retained
+   predecessor and current refund preparations. If spent, restore those exact
+   outputs before falling back to discovery of Alice's share of a relay close.
+   Invalid, partial, or unavailable evidence is not absence; it retains the journal.
+3. `Pending` returns `FundingPending`; mixed input states remain unresolved;
    unspent funding at or before expiry returns `NotExpiredOrSpentYet`. Expired,
    unspent funding permits submission of the persisted request, preparing it first
    if needed. Each execution atomically records `submitting` and an `uncertain`
@@ -380,7 +381,8 @@ Recovery follows these boundaries:
    submission plus one exact replay), with restore/state checks between them.
    Later invocations may retry that same request; this is not a lifetime replay
    limit and not the opening journal's wall-clock replay rule.
-5. Only a direct initial typed HTTP 4xx rejection with numeric JSON `code: 12002`,
+5. Only a direct initial typed HTTP 400 rejection with numeric JSON `code: 12002`
+   and a string `detail`,
    no prior execution uncertainty, and no predecessor can authorize one durable
    successor. Refresh must select a different active output keyset. Persist the
    rejected predecessor and replacement atomically; the successor gets its own
@@ -390,23 +392,24 @@ Recovery follows these boundaries:
    restart; failure to record it conservatively retains uncertainty.
 
 The CLI mint adapter bounds each swap/restore/checkstate request to 15 seconds.
+Decoded response bodies are capped at 4 MiB and must be valid UTF-8. Truncated,
+oversized, or undecodable responses are uncertain transport failures, not rejection
+evidence. Library-facing callbacks use `MintRequestError`; complete HTTP responses
+are classified by `MintResponse` before producing sanitized diagnostics.
 `MintHttpRejection` retains only HTTP status and an optional numeric NUT-00 code;
 it discards the body, so untrusted body text is absent from `Display`/`Debug`.
 Arbitrary error text is not successor authority.
 
 ### Spent Funding And Finalization
 
-NUT-07 checks exactly the first funding proof's Y and validates response count and
-identity. This representative check assumes supported generated close/refund
-transactions spend all funding proofs atomically; it is not a guarantee for
-arbitrary transactions. The first input carries the generated SIG_ALL witness.
-Signature count is advisory, not cryptographic settlement evidence: one normally
-indicates refund, two close, and extra/missing signatures can yield `Unknown`.
+NUT-07 checks all funding identities and validates exact response coverage. Generated
+close/refund transactions normally spend the full funding token atomically; mixed
+states, including a partial post-expiry refund, remain unresolved. Signature shape
+never selects or excludes a recovery path.
 
-If funding becomes spent after an empty submitted-refund restore, recovery makes
-one final exact restore before discovery, covering completion between observations.
-Both `RelayClose` and `Unknown` permit checked deterministic sender-close discovery;
-a refund-shaped witness alone does not. Only verified nonempty discovered proofs
+After spent evidence, valid empty refund restores allow checked sender-close
+discovery even if Alice submitted a refund: Charlie may have won the race.
+Only verified nonempty discovered proofs
 complete relay-close recovery. An empty scan is `UnknownSpent`, not successful
 zero-value recovery. With an unresolved submitted refund, that unknown result
 becomes `RecoveryRetryLater` and retains the request; invalid or unavailable
@@ -420,6 +423,13 @@ resume from the persisted payload offline, including after import but before
 closure/completion.
 
 ### Compatibility And Coverage
+
+The Spilman 0.3.0 pin changes channel IDs to canonical TLV-derived hashes and changes
+their derived keys/signatures. Existing pre-upgrade channels require matching old
+software for settlement/recovery. Preserve binaries, keys and databases; no legacy
+derivation or channel migration is supplied. The relay's v4 close journal is also
+incompatible with old close journals; it records collection abandonment separately
+from verified close payouts. No automatic reset is performed.
 
 This is a testnet-breaking refund schema/API change, not a migration. A nonempty
 legacy refund journal or incompatible journal version is rejected; only an empty
