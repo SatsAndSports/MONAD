@@ -201,7 +201,7 @@ rebuilds the affected session; MONAD never blindly retries the stale payment.
 
 ## Status
 
-MONAD pins Spilman **0.3.0** at `92d3a595f6e35d46ec929ff01c89a4c64c43a3cd`
+MONAD pins Spilman **0.3.0** at `cb3ee0386d5bd010178ede02859c8913c0850f68`
 and all CDK/Cashu crates to the matching v0.18.1 backport at
 `SatsAndSports/cdk@da5cf282dd070772af830fa5215630f059e5f1ad`.
 Pins are centralized in the workspace manifest. The fork implementation is
@@ -232,7 +232,12 @@ Only output keyset IDs and verification keys change: Alice's and Charlie's store
 signatures remain valid because SIG_ALL does not cover keyset IDs. Recovery checks
 the complete restored payout and records whichever candidate actually won. Close
 journal v5 retains both candidates and that winner; old journals reject intact,
-without automatic migration or reset. Client refund/opening policies are unchanged.
+without automatic migration or reset. Sender refund uses the same bounded A/B
+policy: a validated `12002` on any A execution may authorize B, preserving Alice's
+signature and all output secrets/points while changing only the signing keyset.
+Refund journal v3 records the actual winning preparation (or receiver-close source)
+before proof import. Older refund journals reject intact; no automatic reset or
+migration is performed. Channel opening retains its narrower successor policy.
 
 Relay close `--json` results expose `outcome` and `details`: `Closed` carries the
 verified payout; `UnknownSpent` retains unresolved evidence. After expiry, spent or
@@ -405,7 +410,7 @@ invocation, and either verified winner can complete the same drain. No third
 candidate or replacement inputs are allowed. Drain journal v2 records execution-
 specific rejection evidence and the actual winner; older v1 journals reject intact
 without migration/reset. Receiver close has its own corresponding policy described
-above; opening/refund behavior is unchanged.
+above; opening retains its narrower successor policy.
 
 The reusable relay wallet backend also supports exact drains by channel ID. A
 request may contain at most 1,024 unique Closed channels, all owned by one relay
@@ -524,7 +529,8 @@ after uncertainty. Verified proofs awaiting local import/closure can finish
 offline; completed recovery returns locally. Each CLI mint request has a 15-second
 timeout. An empty sender-close scan is not reported as successful recovery.
 
-Refund journal v2 is a **testnet-breaking change with no data migration**.
+Refund journal v3 is a **testnet-breaking change with no data migration**.
+Version 2 journals reject intact and require matching old software to recover.
 Nonempty incompatible journals are rejected, not deleted; an empty legacy table
 can be replaced. Preserve funded databases and backups. Only explicitly reset
 disposable test databases you own, accepting loss of their local state; MONAD does

@@ -206,7 +206,7 @@ Their durable recovery models are intentionally different:
 | Operation | Durable boundary and recovery |
 | --- | --- |
 | Client opening | Exact immutable attempt plus execution authority; bounded identical live replay; one direct-rejection-only successor; exclusive stale-input bearer-token export. |
-| Client post-expiry refund | Custody-bound v2 journal and execution history; exact restore before bounded per-invocation replay; one initial structured `12002` successor without prior uncertainty; verified proofs persisted for offline finalization. |
+| Client post-expiry refund | Custody-bound v3 journal and execution history; NUT-07-first recovery of retained A/B candidates or receiver-close share; validated `12002` on any A execution may authorize keyset-only B; two submissions per candidate per invocation; verified winner/proofs persisted before offline finalization. |
 | Relay drain | An explicit selection is nonempty, bounded, duplicate-free, and restricted to eligible Closed channels for one relay/mint/unit. Exact swap/restore requests, output secrets, keyset metadata, and all source-channel reservations are persisted atomically. Ambiguous submission remains `Submitted`; `recover-drain` restores the persisted outputs and does not replay the swap. |
 | Relay close | The channel enters durable `Closing` before mint I/O. Resumption reconstructs close execution from stored closing authorization; it is not drain-style restoration of a journaled exact swap request. |
 

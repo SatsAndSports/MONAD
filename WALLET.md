@@ -329,7 +329,7 @@ opening recovery, which never submit opening swaps.
 
 ### Durable State
 
-The v2 `monad_client_channel_recoveries` journal binds each recovery to its
+The v3 `monad_client_channel_recoveries` journal binds each recovery to its
 normalized loose-proof DB path, `wallet_name`, and sender public key. The binding
 is checked before mint I/O, proof import, or even returning `AlreadyRecovered`.
 Upstream funding supplies the channel identity and original inputs; recovered
@@ -343,7 +343,7 @@ bearer value belongs in `LooseProofWallet`, not just channel metadata.
 | `completed` | Proof import and upstream/MONAD closure finished; totals recorded. |
 
 `monad_client_refund_executions` retains each exact request and its outcome;
-`monad_client_refund_predecessors` retains the rejected request if a successor is
+`monad_client_refund_predecessors` retains A, including its uncertainty, if B is
 authorized. These records survive even when relay close wins. Any noncompleted
 recovery row exposes the channel as `Closing`, excluding selection and attachment.
 
@@ -360,7 +360,7 @@ output_keyset, derivation_context)` API returns an immutable `PreparedSenderRefu
 mint/unit/channel identity, historical output keys, exact signed swap, expected
 value, secrets and blindings, and derivation version/context. Version 1 derivation
 includes sender-private material, not just the channel secret known to the relay.
-MONAD supplies a fresh random context for each new request. Unknown derivation
+MONAD supplies a fresh random context for A and preserves it for keyset-only B. Unknown derivation
 versions are rejected. Protect journal/backups as bearer-value material; never log
 prepared records, output secrets, blindings, sender secrets, or derivation preimages.
 
@@ -381,15 +381,25 @@ Recovery follows these boundaries:
    submission plus one exact replay), with restore/state checks between them.
    Later invocations may retry that same request; this is not a lifetime replay
    limit and not the opening journal's wall-clock replay rule.
-5. Only a direct initial typed HTTP 400 rejection with numeric JSON `code: 12002`
-   and a string `detail`,
-   no prior execution uncertainty, and no predecessor can authorize one durable
-   successor. Refresh must select a different active output keyset. Persist the
-   rejected predecessor and replacement atomically; the successor gets its own
-   per-invocation replay allowance but cannot create another successor. A timeout,
-   cancellation, lost response, or rejection after ambiguous execution never
-   authorizes new outputs. A durably recorded initial rejection can resume after
-   restart; failure to record it conservatively retains uncertainty.
+5. A validated HTTP 400 rejection with numeric JSON `code: 12002` and string
+   `detail` on any numbered A execution may authorize one durable candidate B,
+   including after prior uncertainty. Refresh must select a different active
+   output keyset supporting all existing denominations. Upstream
+   `with_output_keyset` retains the derivation keyset/context, input witnesses,
+   Alice's signature, amounts, secrets, blindings and blinded points. Only signing
+   keyset IDs/metadata change. A and B each have two submissions per invocation;
+   B cannot create C. Retain A and its execution history transactionally with B.
+   A prepared B keeps the operation `submitting` because A remains uncertain.
+   Timeout alone grants no successor; durable rejection evidence can resume after
+   restart. An unchanged output keyset or rejected B leaves recovery pending.
+
+Recovery routes shared-point NUT-09 issuance by signature keyset, then verifies
+the complete candidate payout. `winning_refund_json` stores the verified immutable
+preparation as stable winner identity alongside finalizing proofs, independent of
+the ordering passed to upstream. Refund finalization rechecks the retained
+candidate and its exact proof identities/DLEQ offline before import. Receiver-close
+recovery records `kind = relay_close` and no winning refund; valid empty A/B restores
+still permit that fallback. Both requests and execution history remain retained.
 
 The CLI mint adapter bounds each swap/restore/checkstate request to 15 seconds.
 Decoded response bodies are capped at 4 MiB and must be valid UTF-8. Truncated,
@@ -438,8 +448,8 @@ recovery records. Resetting disposable, operator-owned test databases is an
 explicit operator decision, never automatic deletion of incompatible wallet data.
 
 Current MONAD test cases exercise keyset rotation before/after preparation,
-successor exact replay, lost-response restore, ambiguous-replay rejection without
-successor, invalid restore blocking replay, authority/singleflight and cancellation,
+successor exact replay, lost-response restore, ambiguous-replay rejection with a
+bounded keyset-only successor, invalid restore blocking replay, authority/singleflight and cancellation,
 custody mismatch and path aliases, journal-write failures, offline finalization at
 metadata/completion boundaries, proof-import conflict and spent-proof preservation,
 the final-restore spent race, and checked close discovery with extra signatures,
@@ -588,7 +598,8 @@ after expiry may stop automatic collection while preserving `Closing`; explicit
 close can restore a later-visible valid payout and clear abandonment.
 
 Version 4 close journals are incompatible and reject intact, without automatic
-migration or reset. Client refund/opening and relay drain journal formats are unchanged.
+migration or reset. Sender refund uses its separate v3 journal; opening and relay
+drain formats remain independent.
 
 ### Relay Drain Recovery
 
@@ -634,8 +645,8 @@ Submitted rather than appearing fresh/never submitted. Version 1 journals are
 incompatible and rejected intact, with no automatic migration or reset.
 
 Receiver close also has a bounded competing-successor policy as described above.
-Opening and sender refund retain their prior successor/replay rules until separate
-follow-ups. The library and dependency pins are unchanged.
+Sender refund uses the analogous policy described above. Opening retains its prior
+successor/replay rules until a separate follow-up.
 
 The in-process runtime owner or an offline caller with exclusive maintenance
 authority may execute and recover drains. Per-drain singleflight, atomic unique
