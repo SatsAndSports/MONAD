@@ -427,7 +427,7 @@ closure/completion.
 The Spilman 0.3.0 pin changes channel IDs to canonical TLV-derived hashes and changes
 their derived keys/signatures. Existing pre-upgrade channels require matching old
 software for settlement/recovery. Preserve binaries, keys and databases; no legacy
-derivation or channel migration is supplied. The relay's v4 close journal is also
+derivation or channel migration is supplied. The relay's v5 close journal is also
 incompatible with old close journals; it records collection abandonment separately
 from verified close payouts. No automatic reset is performed.
 
@@ -550,6 +550,46 @@ are stored in the relay DB. Repeating completion requires identical serialized
 proofs and preserves the original completion timestamp; a conflicting completion
 or late failure cannot overwrite those proofs or release their reservations.
 
+### Relay Close Recovery
+
+Close journal v5 freezes the accepted payment and channel `Closing` state atomically
+before mint submission. It retains up to two immutable candidates A and B spending
+the same funding under that frozen payment. A validated HTTP 400 `12002` on any
+numbered A execution may authorize B after refresh selects a different active
+same-mint/unit output keyset, including after earlier uncertain executions.
+Rejection evidence describes an execution, not the entire candidate. A and B each
+have at most two submissions per invocation; later invocations may resume retained
+requests. B never authorizes C. No new funding or payment authorization is acquired.
+
+B copies A's input witnesses, output amounts, blinded points, secrets and blindings;
+only output keyset IDs and historical verification keys change. Those IDs are not
+part of SIG_ALL, so Alice's and Charlie's signatures are reused byte-for-byte.
+Each preparation is upstream-authenticated against funding, receiver and frozen
+payment, with an additional check that the successor changes only the keyset.
+
+NUT-07 inspection validates every funding identity before NUT-09. Unspent is only a
+snapshot permitting bounded execution; pending/mixed/invalid evidence does not
+authorize a successor submission. Spent funding triggers exact restores. Because
+the blinded points are shared, a query using A's output IDs can recover B's issuance.
+CDK echoes queried output IDs; issued signature IDs identify the candidate. The
+relay normalizes the echoed IDs to signature IDs, then requires upstream complete
+output matching and cryptographic verification against a retained candidate. One
+label or one valid output never proves the full payout. Another query's valid
+payout can recover despite an earlier restore failure. Partial, duplicate, mixed
+keyset or invalid evidence leaves the journal intact and the channel `Closing`.
+
+Finalizing retains the verified payout and winner index. Offline completion checks
+proof count, role, amount, secret, blinding, keyset and DLEQ against that winner,
+then atomically persists `Closed`, its payout and the completed journal. Both
+candidates remain historical records and completed recovery performs no mint I/O.
+Expiry enables Alice's competing refund without invalidating Charlie's authorized
+close. Existing collection-abandonment policy remains: unknown spent/mixed funding
+after expiry may stop automatic collection while preserving `Closing`; explicit
+close can restore a later-visible valid payout and clear abandonment.
+
+Version 4 close journals are incompatible and reject intact, without automatic
+migration or reset. Client refund/opening and relay drain journal formats are unchanged.
+
 ### Relay Drain Recovery
 
 Drain journal version 2 atomically reserves source channels with the first exact
@@ -593,9 +633,9 @@ candidate. If B is prepared but A is already uncertain, the logical drain remain
 Submitted rather than appearing fresh/never submitted. Version 1 journals are
 incompatible and rejected intact, with no automatic migration or reset.
 
-This competing-successor policy currently applies **only to drains**. Opening,
-receiver close and sender refund retain their prior successor/replay rules until
-separate follow-ups. The library and dependency pins are unchanged.
+Receiver close also has a bounded competing-successor policy as described above.
+Opening and sender refund retain their prior successor/replay rules until separate
+follow-ups. The library and dependency pins are unchanged.
 
 The in-process runtime owner or an offline caller with exclusive maintenance
 authority may execute and recover drains. Per-drain singleflight, atomic unique
