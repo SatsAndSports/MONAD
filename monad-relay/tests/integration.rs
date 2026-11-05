@@ -12,6 +12,8 @@
 //!     incremental channel payments, and linked-channel state synchronization
 //!   - Data channel: CONNECT → proxy → uppercase server → response
 
+#[path = "common/close_successor.rs"]
+mod close_successor;
 mod common;
 #[path = "common/drain_successor.rs"]
 mod drain_successor;
@@ -12991,7 +12993,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     );
     let saved = storage.get_close_journal(&channel_id).unwrap().unwrap();
     let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
-    assert_eq!(saved["version"], 4);
+    assert_eq!(saved["version"], 5);
     assert_eq!(saved["attempts"][0]["submissions"], 1);
     assert_eq!(saved["payment"]["balance"], funded_balance_raw);
     assert_eq!(
@@ -13968,7 +13970,7 @@ async fn test_close_server_error_and_replay_rejection_preserve_exact_request() {
     let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
     assert_eq!(saved["attempts"].as_array().unwrap().len(), 1);
     assert_eq!(saved["attempts"][0]["submissions"], 2);
-    assert!(saved["attempts"][0]["initial_rejection"].is_null());
+    assert!(saved["attempts"][0]["keyset_rejection"].is_null());
     assert!(ctx
         .wallet_manager
         .close_channel(&channel, &TypedCloseFailure(&net, 400))
@@ -13982,12 +13984,15 @@ async fn test_close_server_error_and_replay_rejection_preserve_exact_request() {
         .unwrap();
     let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
     assert_eq!(replay["attempts"].as_array().unwrap().len(), 1);
-    assert_eq!(replay["attempts"][0]["submissions"], 4);
-    assert!(replay["attempts"][0]["initial_rejection"].is_null());
+    assert_eq!(replay["attempts"][0]["submissions"], 3);
+    assert_eq!(replay["attempts"][0]["keyset_rejection"]["submission"], 3);
     assert!(
         saved["attempts"][0]["prepared"] == replay["attempts"][0]["prepared"],
         "close replay changed immutable preparation"
     );
+    // A replay rejection is now retained execution evidence. No changed keyset
+    // was available above; a subsequent rotation permits B without erasing A.
+    rotate_sat_keyset(&ctx.mint, 500).await.unwrap();
     assert_eq!(
         ctx.payments.channel_state(&channel).unwrap(),
         Some(ChannelState::Closing)
@@ -14253,7 +14258,7 @@ async fn test_abandoned_collection_can_restore_a_previously_hidden_close() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_final_close_restore_checks_predecessor_then_successor_after_spent() {
+async fn test_final_close_restore_routes_successor_from_original_query_after_spent() {
     use monad_relay::mint_recovery::RecoveryMintClient;
     struct DelayedRestore<'a> {
         inner: &'a RelayWalletMintClient,
@@ -14336,11 +14341,10 @@ async fn test_final_close_restore_checks_predecessor_then_successor_after_spent(
     let ids = net.final_ids.lock().unwrap().clone();
     assert_eq!(
         ids.len(),
-        2,
-        "final restore must cover both immutable attempts"
+        1,
+        "one restore of shared points must recover either candidate"
     );
     assert_eq!(ids[0], ctx.wallet.get_channel(&channel).unwrap().keyset_id);
-    assert_ne!(ids[0], ids[1]);
     assert_eq!(
         ctx.payments.channel_state(&channel).unwrap(),
         Some(ChannelState::Closed)

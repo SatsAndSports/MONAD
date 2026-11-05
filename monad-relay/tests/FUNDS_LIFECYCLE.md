@@ -52,6 +52,14 @@ per-candidate budget exhaustion, no C, and exact-input/winner binding. The A-win
 case deliberately delays real pre-commit state/empty-restore snapshots to control
 reply ordering; it never edits the mint spent-state DB. All actual successful
 swaps and payout spends use the real mint; output verification is not mocked.
+Receiver close journal v5 retains A/B and the verified winner. Existing close
+process SIGKILL/rejection/rotation cases exercise this format. The separate
+`common/close_successor.rs` orchestrator tests cover A/B wins, signature reuse,
+independent replay budgets, cancellation before B submission/after B commitment,
+NUT-09 A-query/B-issuance and B-query/A-issuance routing, invalid/partial restores,
+offline winner validation, no C and incompatible journal retention. Actual mint
+commits and receiver payout spends are real; delayed state snapshots control
+visibility and are not an additional actual-process concurrent-commit test.
 The close/refund race matrix also kills the winning close with its accepted
 response withheld while the sender attempts recovery.
 

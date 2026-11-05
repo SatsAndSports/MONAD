@@ -210,13 +210,14 @@ are checked through HTTP, with no parent in-memory mint or response cache.
 
 Spilman 0.3.0 supplies common NUT-07-first reconciliation. Alice's wallet calls
 `recover_funds` with current and retained predecessor refunds and historical close
-output keys. The relay calls `recover_close` with every authenticated retained
-attempt through a mint-bound adapter. All funding identities are checked in one
-NUT-07 response before NUT-09. Unspent is a snapshot, not reservation or changed-
-request authority; pending and invalid evidence retain the operation. No signature
+output keys. The relay uses upstream funding inspection and exact-close completion,
+routing restored signatures against every authenticated retained candidate. All
+funding identities are checked in one NUT-07 response before NUT-09. Unspent is a
+snapshot, not a reservation or authority to change a request; pending and invalid
+evidence retain the operation. No signature
 count or failure to match known signatures classifies a refund.
 
-Relay close journal v4 stores a `collection_abandoned` policy bit instead of inferred
+Relay close journal v5 stores a `collection_abandoned` policy bit instead of inferred
 refund evidence. After expiry, mixed funding (possible partial refund) or spent
 funding with valid empty restores can stop automatic collection. The channel stays
 `Closing`, preventing further links/payments and excluding it from payout drains.
@@ -232,7 +233,8 @@ receiver states (`Open`, `Closing`, `Closed`) and the separate collection policy
 Read-only SQL inspection validates state labels too: unsupported persisted values
 are errors, not implicit `Open` rows or inferred abandonment. The stored data is
 retained unchanged. Test oracles use all funding identities and verified payouts;
-signature shape does not classify the winner. Retry budgets are unchanged.
+signature shape does not classify the winner. Close and drain candidate budgets
+are described below.
 
 The workspace pins one CDK/Cashu source matching the library. Channel-ID preflight
 for unknown keysets calls the upstream canonical TLV derivation using only the
@@ -243,9 +245,10 @@ coordinated breaking alpha upgrade without old channel derivation compatibility.
 Custom mint adapters retain the 15-second timeout and cap decoded responses at
 4 MiB with strict UTF-8. Complete responses are classified by upstream typed mint
 outcomes; only validated HTTP 400 NUT-00 rejections carry rejection authority.
-Opening, sender-refund and receiver-close successor policy remains narrower:
-initial `12002` only, with no prior ambiguity. Drains use the bounded competing-
-candidate policy described below. Diagnostic bodies/details are redacted before propagation.
+Opening and sender-refund successor policy remains narrower:
+initial `12002` only, with no prior ambiguity. Closes and drains use the bounded
+competing-candidate policy described below. Diagnostic bodies/details are redacted
+before propagation.
 
 ### Wallet Durability
 
@@ -1421,16 +1424,29 @@ resume that ID rather than create another drain. Public snapshots, operation res
 and events contain decimal-string aggregate amounts and channel IDs but never output
 proofs, secrets, swap/restore requests, or journal payloads.
 
-Receiver close uses a separate versioned exact-request journal. Storage freezes
+Receiver close uses a separate v5 exact-request journal. Storage freezes
 the accepted payment with Closing and the journal atomically, rejecting later
 payments. The request is authenticated against persisted funding/payment/receiver;
-each submission first records uncertainty. Recovery verifies exact historical
-restores and all input states before bounded replay. One initial typed 4xx/12002
-may authorize a retained-predecessor output-keyset successor, never an ambiguous
-replay rejection. Verified finalizing data precedes the atomic Closed/payout
-commit, allowing offline completion. Expiry does not invalidate the receiver's
-signed spending branch. Wallet ownership is retained by derived payment handles,
+each submission first records uncertainty. After NUT-07 inspection, spent funding
+permits exact historical restoration; pending/mixed evidence does not permit replay.
+A validated HTTP 400/12002 on any numbered A execution can authorize B on a different
+active output keyset. Earlier uncertainty remains retained. Each candidate has two
+submissions per invocation and B cannot create C. The same funding, frozen payment,
+input witnesses, output amounts, blinded points and secrets bind both candidates;
+only output keyset IDs and verification keys change. SIG_ALL excludes those IDs,
+so both existing signatures are retained without re-signing.
+
+NUT-09 queries shared blinded points. CDK can echo A's requested output IDs while
+returning B's issued signature IDs. The relay normalizes the echoed IDs to the
+signature IDs and tries complete upstream verification against retained candidates;
+it never accepts a keyset label alone. Partial/duplicate/mixed/invalid results stay
+unresolved. A peer's valid payout can recover despite an earlier restore failure.
+Finalizing records the verified winner and rechecks its complete proof identities,
+amounts, secrets, blindings and DLEQ offline. Verified finalizing data precedes the
+atomic Closed/payout commit, allowing offline completion. Expiry does not invalidate
+the receiver's signed spending branch. Wallet ownership is retained by derived payment handles,
 with per-channel close singleflight plus durable journal CAS.
+Version 4 close journals reject intact, without automatic migration or reset.
 
 #### 6. Session Teardown on Control Detach
 

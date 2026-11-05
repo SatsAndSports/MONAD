@@ -213,8 +213,9 @@ channel closes.
 keys and signatures compared with the earlier library pin. Upgrade clients and
 relays together. Retain matching old binaries, keys and databases to settle/recover
 old channels. No channel migration or automatic database deletion is provided.
-Relay close journal v4 rejects incompatible existing journals. Use fresh owned
-test databases, or explicitly reset disposable data only after deciding it is safe.
+Relay close journal v5 rejects incompatible existing journals, including v4. Use
+fresh owned test databases, or explicitly reset disposable data only after deciding
+it is safe.
 The pre-alpha protocol identifier remains `2026-09-14`; it does not promise
 interoperation between these old and new development builds.
 
@@ -222,6 +223,16 @@ Both parties inspect NUT-07 before NUT-09 during uncertain close/refund recovery
 Alice restores retained refunds first, then discovers her share of a possible relay
 close. Charlie restores all retained close attempts. Signature counts do not route
 recovery. Verified completions still finalize offline.
+
+Receiver close retains at most two immutable candidates spending the same funding
+under the same frozen payment. A validated HTTP 400 `12002` on any execution of A
+can authorize B on a different active output keyset, even after earlier ambiguity.
+Each candidate has up to two submissions per invocation; B cannot create C.
+Only output keyset IDs and verification keys change: Alice's and Charlie's stored
+signatures remain valid because SIG_ALL does not cover keyset IDs. Recovery checks
+the complete restored payout and records whichever candidate actually won. Close
+journal v5 retains both candidates and that winner; old journals reject intact,
+without automatic migration or reset. Client refund/opening policies are unchanged.
 
 Relay close `--json` results expose `outcome` and `details`: `Closed` carries the
 verified payout; `UnknownSpent` retains unresolved evidence. After expiry, spent or
@@ -393,8 +404,8 @@ The original stays recoverable; each candidate gets up to two submissions per
 invocation, and either verified winner can complete the same drain. No third
 candidate or replacement inputs are allowed. Drain journal v2 records execution-
 specific rejection evidence and the actual winner; older v1 journals reject intact
-without migration/reset. This policy is drain-only; opening/close/refund behavior
-is unchanged.
+without migration/reset. Receiver close has its own corresponding policy described
+above; opening/refund behavior is unchanged.
 
 The reusable relay wallet backend also supports exact drains by channel ID. A
 request may contain at most 1,024 unique Closed channels, all owned by one relay
