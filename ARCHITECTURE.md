@@ -245,8 +245,8 @@ coordinated breaking alpha upgrade without old channel derivation compatibility.
 Custom mint adapters retain the 15-second timeout and cap decoded responses at
 4 MiB with strict UTF-8. Complete responses are classified by upstream typed mint
 outcomes; only validated HTTP 400 NUT-00 rejections carry rejection authority.
-Opening and sender-refund successor policy remains narrower:
-initial `12002` only, with no prior ambiguity. Closes and drains use the bounded
+Opening successor policy remains narrower:
+initial `12002` only, with no prior ambiguity. Refunds, closes and drains use the bounded
 competing-candidate policy described below. Diagnostic bodies/details are redacted
 before propagation.
 
@@ -1303,7 +1303,7 @@ close/sweep flows.
 
 `recover_channel_funds(access, channel_id, mint_connection)` requires matching
 exclusive maintenance authority plus per-channel singleflight. It is not the
-startup opening-recovery pass. Refund journal v2 binds the normalized loose DB,
+startup opening-recovery pass. Refund journal v3 binds the normalized loose DB,
 wallet name, and sender; noncompleted recoveries expose `Closing` and exclude
 channel reuse. Its `prepared` / `submitting` / `finalizing` / `completed` phases
 retain immutable requests, execution outcomes, a rejected predecessor if present,
@@ -1315,18 +1315,22 @@ prepared-refund validation and checked response completion use persisted output
 keys. Versioned output derivation includes sender-private material; serialized
 records contain secrets and blindings and must not be logged.
 
-Submitted refunds restore before clock/state checks. Valid absence and expired,
-unspent funding permit at most one submission plus one exact replay per request
-per invocation. Only an initial structured `12002` rejection without earlier
-uncertainty permits one durable changed-keyset successor. A final exact restore
-after observing spent funding covers the restore/checkstate race. The first-proof
-state check assumes generated transactions atomically spend all funding inputs;
-witness cardinality is advisory. Checked sender-close discovery also accepts an
-`Unknown` witness, but an empty scan never completes recovery.
+Refund recovery inspects all funding identities through NUT-07 before NUT-09.
+Expired unspent funding permits at most two submissions per immutable candidate
+per invocation. A validated HTTP 400 `12002` on any A execution can authorize
+keyset-only B despite earlier uncertainty; B cannot create C. Original derivation
+metadata, amounts, blinded points, secrets, and Alice's signature are retained.
+Successor persistence atomically retains A and keeps recovery `submitting`.
+Upstream routes shared-point issuance by signature keyset and verifies the full
+payout. Valid empty refund restores permit receiver-close discovery; pending,
+mixed, invalid or unavailable evidence remains unresolved. An empty close scan
+never completes recovery and witness counts do not identify the winner.
 
 Verified proofs persist before import, then upstream and MONAD closure precede
 completion. These separate local writes resume offline from `finalizing`; imports
-preserve reserved/spent custody. The v2 journal is testnet-breaking: incompatible
+preserve reserved/spent custody. The immutable winning refund preparation is saved
+with finalizing proofs and checked offline; receiver-close recovery has no winning
+refund and retains its own source tag. The v3 journal is testnet-breaking: incompatible
 nonempty journals are rejected with no migration or automatic wallet reset.
 See [WALLET](WALLET.md#channel-fund-recovery) for exact recovery and custody rules.
 

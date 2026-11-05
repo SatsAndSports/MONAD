@@ -63,6 +63,15 @@ visibility and are not an additional actual-process concurrent-commit test.
 The close/refund race matrix also kills the winning close with its accepted
 response withheld while the sender attempts recovery.
 
+Sender refund journal v3 retains the actual winning preparation with finalizing
+proofs. Existing process refund response-loss, rotation, local-finalization and
+close/refund races exercise the new format. Client unit integration module
+`sqlite_client_wallet/tests/competing_refunds.rs` adds real-mint A/B/close winners,
+separate replay budgets, keyset-only signature/output retention, no C, cancelled B
+submission with A recovery after reopening, wrong-winner rejection before import,
+offline completion and spending imported payouts. These controlled response/state
+orderings supplement, rather than replace, the actual-process crash coverage.
+
 Established-channel recovery now checks NUT-07 before NUT-09 using the upstream
 ordinary-channel APIs. Alice restores retained refunds before close discovery;
 Charlie restores retained close attempts. A refund winner yields relay
