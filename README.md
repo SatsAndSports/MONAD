@@ -386,6 +386,16 @@ the relay DB and cannot be replaced by conflicting completion. Incompatible old
 nonempty drain journals are rejected, never migrated or deleted. See
 [WALLET.md](WALLET.md#relay-drain-recovery) for the recovery policy.
 
+Drains retain up to two competing immutable requests spending exactly the same
+reserved proofs. A validated HTTP 400 `12002` for the original request may trigger
+one different-active-keyset successor even after an earlier uncertain submission.
+The original stays recoverable; each candidate gets up to two submissions per
+invocation, and either verified winner can complete the same drain. No third
+candidate or replacement inputs are allowed. Drain journal v2 records execution-
+specific rejection evidence and the actual winner; older v1 journals reject intact
+without migration/reset. This policy is drain-only; opening/close/refund behavior
+is unchanged.
+
 The reusable relay wallet backend also supports exact drains by channel ID. A
 request may contain at most 1,024 unique Closed channels, all owned by one relay
 and using one mint/unit, with valid nonempty receiver proofs; any invalid or

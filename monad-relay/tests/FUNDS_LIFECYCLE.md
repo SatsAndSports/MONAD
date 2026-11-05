@@ -43,6 +43,15 @@ Receiver drain covers the same six durable boundaries, prepared-only recovery,
 HTTP request/response gates, and changed-output-keyset successor response loss.
 Finalizing and completed drain recovery is repeated in fresh offline CLIs and
 asserts zero attempted HTTP; terminal proofs remain solely in the relay DB.
+Drain journal v2 gives each of at most two same-input candidates its own bounded
+execution allowance and records the verified winner. These process tests retain
+the existing SIGKILL/request-gate/rotation coverage against the new journal.
+`common/drain_successor.rs` adds direct orchestrator tests for ambiguity followed
+by a replay `12002`, either actual mint winner, cancellation/reopen with B saved,
+per-candidate budget exhaustion, no C, and exact-input/winner binding. The A-winner
+case deliberately delays real pre-commit state/empty-restore snapshots to control
+reply ordering; it never edits the mint spent-state DB. All actual successful
+swaps and payout spends use the real mint; output verification is not mocked.
 The close/refund race matrix also kills the winning close with its accepted
 response withheld while the sender attempts recovery.
 
