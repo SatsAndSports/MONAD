@@ -530,6 +530,11 @@ after uncertainty. Verified proofs awaiting local import/closure can finish
 offline; completed recovery returns locally. Each CLI mint request has a 15-second
 timeout. An empty sender-close scan is not reported as successful recovery.
 
+If a pending refund cannot refresh/select a compatible successor keyset, recovery
+returns `RecoveryRetryLater` and retains its candidates. Replacement keys must
+support every existing output denomination; rerun recovery when the mint metadata
+or keyset availability changes. Journal persistence and authority failures remain errors.
+
 Refund journal v3 is a **testnet-breaking change with no data migration**.
 Version 2 journals reject intact and require matching old software to recover.
 Nonempty incompatible journals are rejected, not deleted; an empty legacy table

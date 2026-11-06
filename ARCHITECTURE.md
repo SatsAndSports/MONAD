@@ -1222,6 +1222,10 @@ success finalizes normally; replay ambiguity or rejection performs one immediate
 exact restore and otherwise leaves the operation submitted and reserved. A replay
 rejection may authorize one keyset successor without settling the earlier
 ambiguous execution. Both candidate histories remain attached to the reservation.
+Cancelled pre-submission claims do not count as mint-visible executions: a later
+initial submission can record a definitive rejection even if its sequence is not
+one. Prior authorized/uncertain executions still prevent treating the whole
+candidate as definitively rejected.
 Finalization replays local channel, change-proof, and metadata updates
 idempotently. Prepared attempts that were never claimed for submission are
 cancelled and their proofs released only when no uncertain peer owns them.
@@ -1453,8 +1457,9 @@ signature IDs and tries complete upstream verification against retained candidat
 it never accepts a keyset label alone. Partial/duplicate/mixed/invalid results stay
 unresolved. A peer's valid payout can recover despite an earlier restore failure.
 Finalizing records the verified winner and rechecks its complete proof identities,
-amounts, secrets, blindings and DLEQ offline. Verified finalizing data precedes the
-atomic Closed/payout commit, allowing offline completion. Expiry does not invalidate
+amounts, secrets, blindings and DLEQ offline. It requires a durably submitted winner
+and valid receiver P2PK witnesses before the atomic Closed/payout commit, allowing
+offline completion. Expiry does not invalidate
 the receiver's signed spending branch. Wallet ownership is retained by derived payment handles,
 with per-channel close singleflight plus durable journal CAS.
 Version 4 close journals reject intact, without automatic migration or reset.
