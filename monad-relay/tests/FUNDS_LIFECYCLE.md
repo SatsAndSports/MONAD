@@ -80,14 +80,56 @@ real close of the winning funding token. Pending A/B recovery submits no swaps;
 shared-input export deduplicates the proofs and transitions both attempts, with
 delayed B completion afterward. A B-keyset rejection creates no third candidate.
 These controlled transport/state orderings supplement existing process opening
-request gates, rotation and finalization SIGKILL tests; no additional concurrent
-mint-commit or process-kill matrix is claimed.
+request gates, rotation and finalization SIGKILL tests. The deterministic candidate
+process matrix below checks the persisted A/B records directly across SIGKILL.
+
+## Deterministic A/B Process Crashes
+
+Three opt-in tests add seven isolated, fixed-purse scenarios to
+`make test-funds-crashes`. They are not in the seeded stress chooser, and add no
+new drain scenarios:
+
+| Test | Crash and recovery cases |
+|---|---|
+| `process_close_candidate_crashes` | Kill at `close-successor`, then a fresh close CLI completes B; kill after B commits with its successful HTTP response withheld, then restore B with no new swap. |
+| `process_refund_candidate_crashes` | Kill at `refund-successor`, then recover B; kill after B commits and restore without re-submission; kill at successor persistence, let Charlie close, then recover Alice's close share with no refund winner. |
+| `process_opening_candidate_crashes` | Kill at `opening-successor`, cancel definitively rejected A and never-submitted B and release their inputs without submitting; kill after B commits, then restore-only recovery installs exactly B and its change. |
+
+Every scenario uses actual client/relay child processes, their on-disk wallets,
+and a retained real CDK HTTP mint. A's first request is held before mint execution,
+the mint rotates to a different keyset, and the resulting real HTTP `12002`
+authorizes B. Thus these cases test definitive A rejection, not an A-late-winner
+ordering or a fabricated rejection. The latter orderings remain covered by the
+controlled orchestrator tests. `hold_success` holds only successful responses;
+A's rejection reaches the wallet before B's committed response is withheld.
+
+After each kill and reap, read-only DB inspection checks both preparations, exact
+input identity, distinct output keys and the pre-recovery states/counters. B is
+either durably prepared but unsubmitted, or recorded as submitted with no saved
+completion. Recovery runs twice in fresh CLIs. Tests check the actual winner/source,
+unchanged candidate requests, exact submission counts and zero repeat-terminal
+HTTP requests. Refund fallback must recover less than the full refund; opening
+checks B's fee-adjusted capacity and one import per change proof. Subsequent normal
+settlement verifies the full purse and all mint-issued outputs.
+
+The clean opening cancellation case is intentionally different from an ambiguous
+pre-execution death: A was definitively rejected with no earlier uncertainty, and
+B was not submitted. Both journal attempts become `cancelled` atomically with
+input release; a fresh client run can spend those proofs to open a new channel.
+An uncertain A still blocks cancellation/release. A storage trigger test verifies
+rollback of both cancellation and custody when release fails.
+
+`refund-successor` and `opening-successor` use the existing compile-gated IPC
+boundary mechanism; no production-build hook or CLI is added. The mint success
+ledger permits cached replays only for the same output/signature set and rejects
+conflicting successful payouts for identical inputs instead of hiding them by
+deduplication. No mint spent-state or wallet journal is edited to create a race.
 
 Established-channel recovery now checks NUT-07 before NUT-09 using the upstream
 ordinary-channel APIs. Alice restores retained refunds before close discovery;
 Charlie restores retained close attempts. A refund winner yields relay
 `CollectionAbandoned` after expiry, not inferred `SenderRefundedAfterExpiry`.
-The relay remains `Closing` with a v4 journal: expiry sweeps and drains perform
+The relay remains `Closing` with a v5 journal: expiry sweeps and drains perform
 no mint I/O for it, while an explicit close remains an online recovery attempt.
 The race oracle still identifies the actual winner from accepted swaps and exact
 custody conservation, independently of the relay's administrative outcome.
@@ -168,10 +210,21 @@ later relay restarts also reuse the configured address without a reservation.
 - [x] Receiver close rejection/successor persistence and rotated response loss.
 - [x] Receiver drain journal SIGKILL, preparation recovery and offline completion.
 - [x] Receiver drain rejection/successor persistence and rotated response loss.
+- [x] Close/refund/opening A/B state and winner assertions across successor SIGKILL and B response loss.
+- [x] Charlie closes while Alice is dead with B prepared; Alice recovers her close share.
+- [x] Definitively rejected opening A + unsubmitted B cancel and release atomically without recovery submission.
 
 ## Validation
 
-Full relay-recovery stack validation:
+Candidate-process extension validation:
+
+- `cargo test -- --test-threads=4`, strict workspace/all-target Clippy, and formatting passed.
+- The three `process_*_candidate_crashes` tests passed independently (seven scenarios).
+- `make test-funds-lifecycle` passed with normal binaries.
+- `make test-funds-crashes` passed all 14 selected process tests, including the
+  three new candidate tests; the seeded stress schedule was not changed or rerun.
+
+Historical relay-recovery stack validation (before the A/B process extension):
 
 - Default and isolated all-feature `cargo test`: 556 passed each, no failures.
 - Strict all-target/all-features Clippy and formatting checks pass.

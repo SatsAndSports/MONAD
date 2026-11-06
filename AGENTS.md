@@ -301,6 +301,14 @@ The test suite currently covers:
   Exact scope, accounting and secret artifact handling are documented in
   `monad-relay/tests/FUNDS_LIFECYCLE.md`.
 
+- Deterministic `process_*_candidate_crashes` tests cover close/refund/opening
+  A/B journals across real SIGKILL at successor persistence and B committed-response
+  loss. Refund also covers Charlie closing while Alice is dead with B prepared.
+  Opening recovery never submits: definitively rejected A + unsubmitted B cancel
+  atomically and release inputs; ambiguous A still retains custody. These cases
+  are not added to the seeded stress chooser. Client `opening-successor` and
+  `refund-successor` IPC hooks exist only with `funds-lifecycle-test` enabled.
+
 - `monad-relay/tests/stress.rs` now supports transport-focused stress runs with:
   - huge per-hop prefunding to keep payment timing out of the critical path
   - `MONAD_STRESS_MAX_IN_FLIGHT_PER_CIRCUIT` to cap burst concurrency per circuit
