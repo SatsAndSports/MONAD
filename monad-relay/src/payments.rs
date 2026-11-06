@@ -459,6 +459,7 @@ impl SpilmanRelayPayments {
         // never a second hand-maintained derivation. Keys are deliberately absent:
         // after bounded refresh, normal validation checks real keys, fees and proofs.
         let identity = cdk_spilman::ChannelParameters {
+            commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
             sender_pubkey,
             receiver_pubkey,
             mint: mint.to_string(),

@@ -6,7 +6,7 @@ without moving real Lightning funds. No new client wallet funding-management API
 is included; tests use the ordinary Cashu HTTP endpoints to bootstrap proofs.
 
 CDK dependencies use the workspace-wide v0.18.1 rerandomization backport at
-`SatsAndSports/cdk@da5cf282dd070772af830fa5215630f059e5f1ad`, matching the Spilman
+`SatsAndSports/cdk@5b762529fc93746f06477670b7a830685d0336a4`, matching the Spilman
 0.3.0 pin. Its SQLite backend includes opt-in rerandomized mint swaps; MONAD
 channel construction and settlement still use ordinary swaps. Keep persistent
 mint data paired with the matching backend version. This dependency alignment
