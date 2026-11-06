@@ -12,14 +12,14 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "cb3ee0386d5bd010178ede02859c8913c0850f68" }
-cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "cb3ee0386d5bd010178ede02859c8913c0850f68", default-features = false }
-cashu = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
-cdk = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
-cdk-common = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
-cdk-axum = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
-cdk-fake-wallet = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad" }
-cdk-sqlite = { git = "https://github.com/SatsAndSports/cdk.git", rev = "da5cf282dd070772af830fa5215630f059e5f1ad", default-features = false }
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "78f71cba8476d0235dc4b317b729b059a5931126" }
+cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "78f71cba8476d0235dc4b317b729b059a5931126", default-features = false }
+cashu = { git = "https://github.com/SatsAndSports/cdk.git", rev = "5b762529fc93746f06477670b7a830685d0336a4", default-features = false }
+cdk = { git = "https://github.com/SatsAndSports/cdk.git", rev = "5b762529fc93746f06477670b7a830685d0336a4", default-features = false }
+cdk-common = { git = "https://github.com/SatsAndSports/cdk.git", rev = "5b762529fc93746f06477670b7a830685d0336a4", default-features = false }
+cdk-axum = { git = "https://github.com/SatsAndSports/cdk.git", rev = "5b762529fc93746f06477670b7a830685d0336a4", default-features = false }
+cdk-fake-wallet = { git = "https://github.com/SatsAndSports/cdk.git", rev = "5b762529fc93746f06477670b7a830685d0336a4" }
+cdk-sqlite = { git = "https://github.com/SatsAndSports/cdk.git", rev = "5b762529fc93746f06477670b7a830685d0336a4", default-features = false }
 
 # Use the vendored h2 with `recv_release_connection_on_buffer` (see
 # vendor/h2/Cargo.toml). Required so paused CONNECT tunnels cannot starve

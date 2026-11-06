@@ -201,13 +201,16 @@ rebuilds the affected session; MONAD never blindly retries the stale payment.
 
 ## Status
 
-MONAD pins Spilman **0.3.0** at `cb3ee0386d5bd010178ede02859c8913c0850f68`
+MONAD pins Spilman **0.3.0** at `78f71cba8476d0235dc4b317b729b059a5931126`
 and all CDK/Cashu crates to the matching v0.18.1 backport at
-`SatsAndSports/cdk@da5cf282dd070772af830fa5215630f059e5f1ad`.
+`SatsAndSports/cdk@5b762529fc93746f06477670b7a830685d0336a4`.
 Pins are centralized in the workspace manifest. The fork implementation is
-reviewable in [CDK PR #5](https://github.com/SatsAndSports/cdk/pull/5).
-Channels remain ordinary; adopting the mint backend does not enable rerandomized
-channel closes.
+reviewable in [CDK PR #5](https://github.com/SatsAndSports/cdk/pull/5) and
+[CDK PR #6](https://github.com/SatsAndSports/cdk/pull/6).
+This is an ordinary-channel dependency baseline for the upstream dual-mode library.
+MONAD still provisions ordinary channels and rejects the additional
+`commitment_mode` parameter on channel links; rerandomized admission, recovery,
+and selection policy require a subsequent integration change.
 
 **Coordinated alpha upgrade:** canonical TLV channel IDs change derived channel
 keys and signatures compared with the earlier library pin. Upgrade clients and
