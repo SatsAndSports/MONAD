@@ -1191,6 +1191,7 @@ mod tests {
         for (channel_id, session_id) in [("first", [1; 32]), ("sibling", [2; 32])] {
             wallet
                 .insert_channel(WalletChannel {
+                    commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                     channel_id: channel_id.to_string(),
                     state: WalletChannelState::Open,
                     receiver_pubkey: "receiver".to_string(),

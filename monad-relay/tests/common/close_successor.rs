@@ -237,7 +237,7 @@ fn save_journal(
 }
 
 fn assert_candidates(history: &serde_json::Value) {
-    assert_eq!(history["version"], 5);
+    assert_eq!(history["version"], 6);
     assert_eq!(history["attempts"].as_array().unwrap().len(), 2);
     assert_eq!(history["attempts"][0]["submissions"], 2);
     assert_eq!(history["attempts"][0]["keyset_rejection"]["submission"], 2);
@@ -247,7 +247,7 @@ fn assert_candidates(history: &serde_json::Value) {
     let br: SwapRequest = serde_json::from_value(b["swap_request"].clone()).unwrap();
     assert!(ar.inputs() == br.inputs(), "funding or witness changed");
     assert!(
-        ar.sig_all_msg_to_sign() == br.sig_all_msg_to_sign(),
+        ar.sig_all_message_hash() == br.sig_all_message_hash(),
         "SIG_ALL changed"
     );
     assert!(
@@ -451,7 +451,7 @@ async fn competing_close_rejects_mutated_requests_history_and_old_journals_befor
     for change in 0..10 {
         let mut broken = original.clone();
         match change {
-            0 => broken["version"] = serde_json::json!(4),
+            0 => broken["version"] = serde_json::json!(5),
             1 => broken["winner"] = serde_json::json!(1),
             2 => {
                 broken["attempts"][1]["prepared"]["swap_request"]["inputs"][0]["secret"] =

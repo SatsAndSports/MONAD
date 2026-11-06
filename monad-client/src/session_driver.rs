@@ -182,6 +182,7 @@ mod tests {
             wallet
                 .insert_channel(WalletChannel {
                     channel_id: channel_id.clone(),
+                    commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                     state: WalletChannelState::Open,
                     receiver_pubkey: "receiver".to_string(),
                     mint_url: "https://mint".to_string(),
@@ -341,6 +342,7 @@ mod tests {
         wallet
             .insert_channel(WalletChannel {
                 channel_id: channel_id.into(),
+                commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                 state: WalletChannelState::Open,
                 receiver_pubkey: "receiver".into(),
                 mint_url: "https://mint".into(),
@@ -469,6 +471,7 @@ mod tests {
             wallet
                 .insert_channel(WalletChannel {
                     channel_id: id.to_string(),
+                    commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                     state: WalletChannelState::Open,
                     receiver_pubkey: "receiver".to_string(),
                     mint_url: "https://mint".to_string(),
@@ -539,6 +542,7 @@ mod tests {
             wallet
                 .insert_channel(WalletChannel {
                     channel_id: channel_id.clone(),
+                    commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                     state: WalletChannelState::Open,
                     receiver_pubkey: "receiver".into(),
                     mint_url: "https://mint".into(),
@@ -553,6 +557,7 @@ mod tests {
             wallet
                 .insert_channel(WalletChannel {
                     channel_id: "d".repeat(64),
+                    commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                     state: WalletChannelState::Open,
                     receiver_pubkey: "receiver".into(),
                     mint_url: "https://mint".into(),
@@ -1479,6 +1484,7 @@ mod tests {
             wallet
                 .insert_channel(WalletChannel {
                     channel_id: "channel".into(),
+                    commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                     state: WalletChannelState::Open,
                     receiver_pubkey: "receiver".into(),
                     mint_url: "https://mint".into(),
@@ -1595,6 +1601,7 @@ mod tests {
         wallet
             .insert_channel(WalletChannel {
                 channel_id: "channel".into(),
+                commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                 state: WalletChannelState::Open,
                 receiver_pubkey: "receiver".into(),
                 mint_url: "https://mint".into(),
@@ -1656,6 +1663,7 @@ mod tests {
         wallet
             .insert_channel(crate::wallet::WalletChannel {
                 channel_id: "exhausted".to_string(),
+                commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                 state: WalletChannelState::Open,
                 receiver_pubkey: "receiver".to_string(),
                 mint_url: "https://mint".to_string(),

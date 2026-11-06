@@ -180,7 +180,15 @@ fn check_restore(
     };
     assert!(
         fields(
-            serde_json::to_value(swap.outputs()).unwrap(),
+            serde_json::to_value(
+                cdk_spilman::swap_completion::swap_restore_request(
+                    swap,
+                    response.rerandomization_r
+                )
+                .unwrap()
+                .outputs
+            )
+            .unwrap(),
             &["B_", "id", "amount"]
         ) == fields(
             serde_json::to_value(&restored.outputs).unwrap(),
@@ -349,6 +357,19 @@ impl Process {
                 .args(&args[1..])
                 .env("RUST_LOG", "info")
                 .env("NO_PROXY", "*")
+                .env(
+                    "MONAD_FUNDS_TEST_COMMITMENT_MODE",
+                    if config
+                        .parent()
+                        .unwrap()
+                        .join("rerandomized-fixture")
+                        .exists()
+                    {
+                        "rerandomized"
+                    } else {
+                        "ordinary"
+                    },
+                )
                 .env_remove("MONAD_FUNDS_BOUNDARY")
                 .env_remove("MONAD_FUNDS_IPC")
                 .env_remove("MONAD_FUNDS_LIFETIME")
@@ -449,6 +470,15 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    /// Only instrumented binaries interpret this marker-derived child setting.
+    pub fn rerandomized(self) -> Self {
+        std::fs::write(
+            self.config.parent().unwrap().join("rerandomized-fixture"),
+            b"",
+        )
+        .unwrap();
+        self
+    }
     pub async fn start() -> Self {
         Self::start_with_persistent_mint(false).await
     }
@@ -1137,6 +1167,37 @@ clients:
             .await;
         }
         if refund {
+            if self
+                .config
+                .parent()
+                .unwrap()
+                .join("rerandomized-fixture")
+                .exists()
+            {
+                // An ordinary refund has no R: no derived-point close discovery
+                // or inferred refund terminal is possible for this channel mode.
+                for _ in 0..2 {
+                    assert!(!self
+                        .relay(&["wallet", "close", "--channel-id", channel])
+                        .status()
+                        .await
+                        .success());
+                }
+                let json: String = self
+                    .db("relay.db")
+                    .query_row(
+                        "SELECT journal FROM spilman_close_journals WHERE channel_id=?1",
+                        [channel],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let journal: Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(journal["completed"], false);
+                assert_eq!(journal["collection_abandoned"], false);
+                assert!(journal["finalizing"].is_null());
+                self.audit().await;
+                return;
+            }
             let args = ["wallet", "--json", "close", "--channel-id", channel];
             let result = self.relay(&args).json().await;
             assert_eq!(result["outcome"], "CollectionAbandoned");
@@ -1205,7 +1266,7 @@ clients:
                     )
                     .unwrap();
                 let journal: Value = serde_json::from_str(&json).expect("close journal (redacted)");
-                assert_eq!(journal["version"], 5);
+                assert_eq!(journal["version"], 6);
                 assert_eq!(journal["attempts"].as_array().unwrap().len(), 2);
                 journal["attempts"]
                     .as_array()
@@ -1702,6 +1763,61 @@ clients:
                     ledger.offline = true;
                     ledger.http_requests
                 };
+                if boundary == "close-finalizing"
+                    && self
+                        .config
+                        .parent()
+                        .unwrap()
+                        .join("rerandomized-fixture")
+                        .exists()
+                {
+                    let original: String = self
+                        .db("relay.db")
+                        .query_row(
+                            "SELECT journal FROM spilman_close_journals WHERE channel_id=?1",
+                            [&channel],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    let saved: Value = serde_json::from_str(&original).unwrap();
+                    assert!(saved["finalizing_r"].is_string());
+                    // Deliberate tampering of this fixture's own database;
+                    // ordinary inspection connections remain read-only.
+                    let corrupt_db =
+                        rusqlite::Connection::open(self.config.parent().unwrap().join("relay.db"))
+                            .unwrap();
+                    for replacement in [
+                        Value::Null,
+                        Value::String("00".repeat(32)),
+                        Value::String("invalid".into()),
+                    ] {
+                        let mut corrupt = saved.clone();
+                        corrupt["finalizing_r"] = replacement;
+                        let encoded = corrupt.to_string();
+                        corrupt_db
+                            .execute(
+                                "UPDATE spilman_close_journals SET journal=?2 WHERE channel_id=?1",
+                                rusqlite::params![channel, encoded],
+                            )
+                            .unwrap();
+                        assert!(!self.relay(&args).status().await.success());
+                        let retained: String = self
+                            .db("relay.db")
+                            .query_row(
+                                "SELECT journal FROM spilman_close_journals WHERE channel_id=?1",
+                                [&channel],
+                                |r| r.get(0),
+                            )
+                            .unwrap();
+                        assert!(retained == encoded, "invalid finalization journal mutated");
+                    }
+                    corrupt_db
+                        .execute(
+                            "UPDATE spilman_close_journals SET journal=?2 WHERE channel_id=?1",
+                            rusqlite::params![channel, original],
+                        )
+                        .unwrap();
+                }
                 self.relay(&args).success().await;
                 self.relay(&args).success().await;
                 let mut ledger = self.ledger.lock().unwrap();
@@ -2276,6 +2392,25 @@ clients:
 
     async fn audit_custody(&self, include_reserved: bool) {
         self.assert_proxy_checks();
+        if self
+            .config
+            .parent()
+            .unwrap()
+            .join("rerandomized-fixture")
+            .exists()
+        {
+            let conn = self.db("channel.db");
+            let mut stmt = conn.prepare("SELECT funding_json FROM spilman_client_channels WHERE funding_json IS NOT NULL").unwrap();
+            for row in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+                let funding: cdk_spilman::ClientChannelFunding =
+                    serde_json::from_str(&row.unwrap()).unwrap();
+                let params: Value = serde_json::from_str(&funding.params_json).unwrap();
+                assert_eq!(
+                    params["commitment_mode"], "rerandomized",
+                    "instrumented fixture did not create rerandomized funding"
+                );
+            }
+        }
         let wallet = LooseProofWallet::open(
             self.dir.as_ref().unwrap().path().join("loose.db"),
             CONFIGURED_CLIENT_WALLET_NAME,
@@ -2357,9 +2492,11 @@ clients:
             let restored: cashu::nuts::RestoreResponse = self
                 .mint_post(
                     "/v1/restore",
-                    &RestoreRequest {
-                        outputs: swap.outputs().to_vec(),
-                    },
+                    &cdk_spilman::swap_completion::swap_restore_request(
+                        swap,
+                        response.rerandomization_r,
+                    )
+                    .unwrap(),
                 )
                 .await;
             check_restore(swap, response, &restored);

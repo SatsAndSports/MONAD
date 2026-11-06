@@ -4,6 +4,45 @@ mod support;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated fault-injection binaries; make test-funds-crashes"]
+async fn process_rerandomized_lifecycle_and_finalization() {
+    let mut fixture = support::Fixture::start().await.rerandomized();
+    fixture.cycle(false).await;
+    fixture.cycle(true).await;
+    fixture
+        .relay_close_case(Some("close-finalizing"), false, false)
+        .await;
+    fixture.relay_close_case(None, true, true).await;
+    fixture
+        .refund_case(Some("refund-finalizing"), false, false)
+        .await;
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated fault-injection binaries; make test-funds-crashes"]
+async fn process_rerandomized_candidate_crashes() {
+    for operation in [
+        support::CandidateOperation::Opening,
+        support::CandidateOperation::Close,
+        support::CandidateOperation::Refund,
+    ] {
+        for lost_response in [false, true] {
+            let mut fixture = support::Fixture::start().await.rerandomized();
+            fixture
+                .candidate_crash(operation, lost_response, false)
+                .await;
+            fixture.finish().await;
+        }
+    }
+    let mut fixture = support::Fixture::start().await.rerandomized();
+    fixture
+        .candidate_crash(support::CandidateOperation::Refund, false, true)
+        .await;
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated fault-injection binaries; make test-funds-crashes"]
 async fn process_close_candidate_crashes() {
     for lost_response in [false, true] {
         let mut fixture = support::Fixture::start().await;

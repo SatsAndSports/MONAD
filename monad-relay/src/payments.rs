@@ -459,7 +459,12 @@ impl SpilmanRelayPayments {
         // never a second hand-maintained derivation. Keys are deliberately absent:
         // after bounded refresh, normal validation checks real keys, fees and proofs.
         let identity = cdk_spilman::ChannelParameters {
-            commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
+            commitment_mode: params
+                .get("commitment_mode")
+                .map(|mode| serde_json::from_value(mode.clone()))
+                .transpose()
+                .map_err(|_| invalid("invalid commitment mode"))?
+                .unwrap_or_default(),
             sender_pubkey,
             receiver_pubkey,
             mint: mint.to_string(),
@@ -683,6 +688,11 @@ impl RelayPayments for SpilmanRelayPayments {
         } else {
             serde_json::Value::Object(request.params.clone())
         };
+        // Stored funding is authoritative, including mode. A caller cannot
+        // strip the mode from a relink request to bypass ordinary-only admission.
+        validate_link_params_shape(params.as_object().ok_or_else(|| {
+            LinkError::Internal("stored channel parameters are not an object".into())
+        })?)?;
         let id: Id = params["keyset_id"]
             .as_str()
             .ok_or_else(|| LinkError::InvalidChannel("missing keyset_id".to_string()))?
@@ -1309,7 +1319,17 @@ fn validate_link_params_shape(
         "setup_timestamp",
         "unit",
     ];
-    if params.len() != REQUIRED.len() {
+    let extra_mode = 0;
+    #[cfg(feature = "funds-lifecycle-test")]
+    let extra_mode = if std::env::var("MONAD_FUNDS_TEST_COMMITMENT_MODE").as_deref()
+        == Ok("rerandomized")
+        && params.get("commitment_mode").and_then(|v| v.as_str()) == Some("rerandomized")
+    {
+        1
+    } else {
+        extra_mode
+    };
+    if params.len() != REQUIRED.len() + extra_mode {
         return Err(LinkError::InvalidPayment(
             "channel params must contain exactly the documented public fields".to_string(),
         ));

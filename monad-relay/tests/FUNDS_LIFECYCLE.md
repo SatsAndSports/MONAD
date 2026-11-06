@@ -52,7 +52,7 @@ per-candidate budget exhaustion, no C, and exact-input/winner binding. The A-win
 case deliberately delays real pre-commit state/empty-restore snapshots to control
 reply ordering; it never edits the mint spent-state DB. All actual successful
 swaps and payout spends use the real mint; output verification is not mocked.
-Receiver close journal v5 retains A/B and the verified winner. Existing close
+Receiver close journal v6 retains A/B, the verified winner and mint randomness. Existing close
 process SIGKILL/rejection/rotation cases exercise this format. The separate
 `common/close_successor.rs` orchestrator tests cover A/B wins, signature reuse,
 independent replay budgets, cancellation before B submission/after B commitment,
@@ -279,3 +279,20 @@ The bootstrap proof file has mode 0600 in the fixture's private temporary direct
 Persistent-mint artifacts are removed on success and failure; child processes are
 killed and reaped before cleanup. The ordinary scenarios retain their existing
 failure-artifact behavior. No normal binary gains a persistent-test-mint mode.
+## Rerandomized financial groundwork
+
+Two additional ignored tests run with isolated `funds-lifecycle-test` binaries:
+`process_rerandomized_candidate_crashes` covers opening/close/refund A/B successor
+SIGKILL and committed-response loss, plus close winning while Alice is dead;
+`process_rerandomized_lifecycle_and_finalization` covers ordinary funding of
+rerandomized channels, restart recovery, close rotation/lost response, offline
+close finalization and ordinary-refund finalization. Missing/wrong/invalid retained
+R rejects without modifying the journal, then the original fixture journal resumes
+offline. Both modes retain the full custody, fee and DLEQ oracle checks.
+
+The fixture marks its private directory and sets `MONAD_FUNDS_TEST_COMMITMENT_MODE`
+only on its child processes. That setting is compiled out of normal client/relay
+binaries. It temporarily enables the test wire field and explicit mode selection
+to exercise financial handling before the production session-protocol change.
+Normal test runs do not alter their ordinary mode. No seeded stress chooser
+changes are made. All incompatible v5 close journals reject intact.

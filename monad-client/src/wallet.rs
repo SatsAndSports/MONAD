@@ -76,6 +76,7 @@ pub enum WalletChannelState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletChannel {
+    pub commitment_mode: cdk_spilman::CommitmentMode,
     pub channel_id: String,
     pub state: WalletChannelState,
     pub receiver_pubkey: String,
@@ -271,6 +272,22 @@ pub trait MonadWallet: Send + Sync + 'static {
         funding_token_target_msats: u64,
     ) -> Result<String, WalletError>;
 
+    /// Low-level provisioning with an already selected mode. Capability and
+    /// admission policy are the caller's responsibility; prepared attempts bind it.
+    fn provision_channel_in_mode(
+        &self,
+        offer: &RelayPaymentOffer,
+        funding_token_target_msats: u64,
+        mode: cdk_spilman::CommitmentMode,
+    ) -> Result<String, WalletError> {
+        if mode != cdk_spilman::CommitmentMode::Ordinary {
+            return Err(WalletError::Backend(
+                "wallet does not support rerandomized provisioning".into(),
+            ));
+        }
+        self.provision_channel(offer, funding_token_target_msats)
+    }
+
     fn build_link_request(
         &self,
         channel_id: &str,
@@ -373,6 +390,7 @@ pub fn select_channel(
 
     for channel in channels {
         if channel.state != WalletChannelState::Open
+            || channel.commitment_mode != baseline_session_mode()
             || channel.is_expired(now)
             || !monad_common::keyset_expiry::channel_covers_minimum_lifetime(
                 now,
@@ -411,6 +429,16 @@ pub fn select_channel(
 #[derive(Debug, Clone)]
 pub struct MockWallet {
     inner: std::sync::Arc<Mutex<MockWalletInner>>,
+}
+
+/// Production admission remains ordinary until the coordinated protocol change.
+/// Isolated process-test binaries can exercise the financial path before then.
+pub(crate) fn baseline_session_mode() -> cdk_spilman::CommitmentMode {
+    #[cfg(feature = "funds-lifecycle-test")]
+    if std::env::var("MONAD_FUNDS_TEST_COMMITMENT_MODE").as_deref() == Ok("rerandomized") {
+        return cdk_spilman::CommitmentMode::Rerandomized;
+    }
+    cdk_spilman::CommitmentMode::Ordinary
 }
 
 #[derive(Debug, Default)]
@@ -767,6 +795,7 @@ impl MonadWallet for MockWallet {
             unit: offer.unit.clone(),
         })?;
         let channel = WalletChannel {
+            commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
             channel_id: channel_id.clone(),
             state: WalletChannelState::Open,
             receiver_pubkey: offer.receiver_pubkey.clone(),
@@ -993,6 +1022,7 @@ mod tests {
 
     fn channel(channel_id: &str) -> WalletChannel {
         WalletChannel {
+            commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
             channel_id: channel_id.to_string(),
             state: WalletChannelState::Open,
             receiver_pubkey: "receiver".to_string(),
@@ -1004,6 +1034,19 @@ mod tests {
             current_signed_balance_msats: 0,
             expiry_timestamp: u64::MAX,
         }
+    }
+
+    #[test]
+    fn ordinary_session_does_not_reuse_a_rerandomized_channel() {
+        let mut rerandomized = channel("a");
+        rerandomized.commitment_mode = cdk_spilman::CommitmentMode::Rerandomized;
+        assert!(select_channel(&[rerandomized.clone()], &offer("msat"), session(1), 0).is_none());
+        assert_eq!(
+            select_channel(&[rerandomized, channel("b")], &offer("msat"), session(1), 0)
+                .unwrap()
+                .channel_id,
+            "b"
+        );
     }
 
     #[test]

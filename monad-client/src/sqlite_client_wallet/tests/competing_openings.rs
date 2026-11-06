@@ -103,6 +103,15 @@ impl OpeningRecoveryNetworking for Competing<'_> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opening_candidates_keep_fixed_funding_and_finalize_either_channel() {
+    assert_opening_mode(cdk_spilman::CommitmentMode::Ordinary).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rerandomized_opening_candidates_preserve_mode_and_fixed_funding() {
+    assert_opening_mode(cdk_spilman::CommitmentMode::Rerandomized).await;
+}
+
+async fn assert_opening_mode(mode: cdk_spilman::CommitmentMode) {
     for a_wins in [true, false] {
         for target in [true, false] {
             for (initial_fee, next_fee) in [(0, 400), (400, 0)] {
@@ -136,7 +145,7 @@ async fn opening_candidates_keep_fixed_funding_and_finalize_either_channel() {
                     .unwrap();
                 let attempt = if target {
                     ctx.wallet
-                        .prepare_target_capacity_attempt(&offer, 32, keys, expiry)
+                        .prepare_target_capacity_attempt(&offer, 32, keys, expiry, mode)
                         .unwrap()
                 } else {
                     ctx.wallet
@@ -153,6 +162,7 @@ async fn opening_candidates_keep_fixed_funding_and_finalize_either_channel() {
                                 total_amount_raw: 64,
                             },
                             ClientOpenPlan {
+                                commitment_mode: mode,
                                 expiry_timestamp: expiry,
                                 requested_capacity_raw: None,
                                 desired_funding_token_amount_raw: Some(32),
@@ -164,6 +174,14 @@ async fn opening_candidates_keep_fixed_funding_and_finalize_either_channel() {
                         .unwrap()
                 };
                 let original = attempt.prepared.clone();
+                let original_params: serde_json::Value =
+                    serde_json::from_str(&original.opening.params_json).unwrap();
+                assert_eq!(commitment_mode_from_params(&original_params).unwrap(), mode);
+                assert!(!serde_json::from_str::<cashu::nuts::SwapRequest>(
+                    &original.swap_request_json
+                )
+                .unwrap()
+                .is_rerandomized());
                 let reservation = attempt.reservation.reservation_id.clone();
                 let net = Competing {
                     inner: OpeningRecoveryHttpNetworking::new().unwrap(),
@@ -267,6 +285,18 @@ async fn opening_candidates_keep_fixed_funding_and_finalize_either_channel() {
                 }
                 let reopened = reopen_wallet(&ctx);
                 let info = reopened.get_channel(&winner).unwrap();
+                assert_eq!(info.commitment_mode, mode);
+                let mut changed_mode = b.clone();
+                let mut params: serde_json::Value =
+                    serde_json::from_str(&changed_mode.opening.params_json).unwrap();
+                params["commitment_mode"] =
+                    serde_json::json!(if mode == cdk_spilman::CommitmentMode::Ordinary {
+                        "rerandomized"
+                    } else {
+                        "ordinary"
+                    });
+                changed_mode.opening.params_json = params.to_string();
+                assert!(verify_opening_successor(&original, &changed_mode).is_err());
                 assert_eq!(
                     info.capacity_msats,
                     if a_wins {
@@ -323,6 +353,18 @@ async fn opening_candidates_keep_fixed_funding_and_finalize_either_channel() {
                 net.inner
                     .call_opening_swap(&ctx.mint_url, &serde_json::to_string(&close).unwrap())
                     .unwrap();
+                let recovered = reopened
+                    .recover_channel_funds(
+                        &refund_test_locks(&ctx).exclusive_access().unwrap(),
+                        &winner,
+                        &direct_mint_connection(&ctx),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    recovered,
+                    ChannelFundRecoveryResult::RelayCloseRecovered { .. }
+                ));
                 let _ = ctx.shutdown_tx.send(());
                 ctx.mint_task.await.unwrap().unwrap();
             }
@@ -357,7 +399,13 @@ async fn opening_candidates_startup_is_restore_only_and_export_deduplicates_rese
             .unwrap();
         let attempt = ctx
             .wallet
-            .prepare_target_capacity_attempt(&offer, 32, keys, expiry)
+            .prepare_target_capacity_attempt(
+                &offer,
+                32,
+                keys,
+                expiry,
+                cdk_spilman::CommitmentMode::Ordinary,
+            )
             .unwrap();
         let root = attempt.prepared.channel_id.clone();
         let net = Competing {

@@ -1316,6 +1316,7 @@ mod tests {
             let conn = route.connection_for_hop(idx).unwrap();
             wallet
                 .insert_channel(crate::wallet::WalletChannel {
+                    commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
                     channel_id: format!("buffered-{idx}"),
                     state: crate::wallet::WalletChannelState::Open,
                     receiver_pubkey: "receiver".to_string(),

@@ -3,6 +3,10 @@ name = "monad-common"
 version = "0.2.0"
 edition = "2021"
 
+[features]
+# Isolated process fixtures only; not a negotiated production protocol.
+funds-lifecycle-test = []
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 bytes = "1"

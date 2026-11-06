@@ -588,7 +588,7 @@ or late failure cannot overwrite those proofs or release their reservations.
 
 ### Relay Close Recovery
 
-Close journal v5 freezes the accepted payment and channel `Closing` state atomically
+Close journal v6 freezes the accepted payment and channel `Closing` state atomically
 before mint submission. It retains up to two immutable candidates A and B spending
 the same funding under that frozen payment. A validated HTTP 400 `12002` on any
 numbered A execution may authorize B after refresh selects a different active
@@ -614,7 +614,8 @@ label or one valid output never proves the full payout. Another query's valid
 payout can recover despite an earlier restore failure. Partial, duplicate, mixed
 keyset or invalid evidence leaves the journal intact and the channel `Closing`.
 
-Finalizing retains the verified payout and winner index. Offline completion checks
+Finalizing retains the verified payout, winner index and winning mint randomness
+(`finalizing_r`, null for ordinary). Offline completion checks
 proof count, role, amount, secret, blinding, keyset and DLEQ against that winner,
 and requires a recorded winner submission and valid receiver P2PK witnesses,
 then atomically persists `Closed`, its payout and the completed journal. Both
@@ -624,9 +625,27 @@ close. Existing collection-abandonment policy remains: unknown spent/mixed fundi
 after expiry may stop automatic collection while preserving `Closing`; explicit
 close can restore a later-visible valid payout and clear abandonment.
 
-Version 4 close journals are incompatible and reject intact, without automatic
+Version 5 and older close journals are incompatible and reject intact, without automatic
 migration or reset. Sender refund uses its separate v3 journal; opening and relay
 drain formats remain independent.
+
+Rerandomized close recovery requires consistent committed R across the complete
+spent funding set. NUT-09 queries derive issued points from the authenticated
+original request and R. Offline payout validation reconstructs each issued point
+from the proof secret and its effective DLEQ blinding and compares it to that same
+derivation, then verifies DLEQ and receiver authorization. Missing, conflicting or
+tampered R cannot finalize. Missing R (including after an ordinary refund) leaves
+rerandomized close recovery unresolved, not an inferred refund or abandoned
+collection. Sender refund recovery remains ordinary and is tried first.
+
+`MonadWallet::provision_channel_in_mode` and
+`SqliteClientWallet::provision_channel_with_target_capacity_in_mode` take an
+explicit concrete mode before ID/funding derivation. Their callers own capability
+and admission checks. Existing APIs remain ordinary for normal builds. Stored
+upstream parameters retain mode without a redundant metadata column; wallet
+summaries validate the stored channel ID before reporting it. Opening A/B
+successors preserve mode while still submitting ordinary funding swaps. Normal
+sessions do not select rerandomized stored channels until protocol activation.
 
 Closing and the first journal are an atomic payment CAS: earlier accepted payments
 must be in the frozen snapshot and later payments reject. Payment credits also use
