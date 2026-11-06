@@ -2647,6 +2647,15 @@ impl LooseProofWallet {
                 updated: changed,
             });
         }
+        // A definitively rejected root and its never-submitted B share one
+        // reservation. Cancel that rejected history in the same transaction as
+        // B and input release. The peer-uncertainty guard above excludes any
+        // submitted/ambiguous root; such a pair must remain reserved.
+        tx.execute(
+            "UPDATE monad_client_opening_attempts SET state='cancelled', updated_at=?3
+            WHERE wallet_name=?1 AND reservation_id=?2 AND state='rejected'",
+            params![self.wallet_name, reservation_id, to_i64(now)?],
+        )?;
         for proof_id in &expected {
             let changed = tx.execute(
                 "UPDATE monad_client_loose_proofs
@@ -5382,6 +5391,67 @@ mod tests {
         assert_eq!(
             wallet.proofs_for_reservation(&reservation_id).unwrap()[0].state,
             LooseProofState::Reserved
+        );
+    }
+
+    #[test]
+    fn rejected_root_and_unsubmitted_successor_cancel_and_release_atomically() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        let a = opening_attempt("channel-a", "reservation-a", &["proof-a"]);
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(MINT, "sat", &["proof-a".to_string()], &a)
+            .unwrap();
+        let initial = claim_and_authorize(&wallet, "channel-a");
+        assert!(wallet
+            .record_definitive_opening_rejection(initial, 12002, "inactive")
+            .unwrap());
+        let mut b = a.clone();
+        b.attempt_id = "channel-b".to_string();
+        b.predecessor_attempt_id = Some(a.attempt_id);
+        b.prepared_open_json = r#"{"channel_id":"channel-b"}"#.to_string();
+        wallet.store_opening_attempt_for_reservation(&b).unwrap();
+        wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_release BEFORE UPDATE ON monad_client_loose_proofs WHEN NEW.state='available' BEGIN SELECT RAISE(ABORT,'release fault'); END;").unwrap();
+        assert!(wallet.cancel_prepared_opening_attempt("channel-b").is_err());
+        assert_eq!(
+            wallet.opening_attempt("channel-a").unwrap().unwrap().state,
+            OpeningAttemptState::Rejected
+        );
+        assert_eq!(
+            wallet.opening_attempt("channel-b").unwrap().unwrap().state,
+            OpeningAttemptState::Prepared
+        );
+        assert_eq!(
+            wallet.proofs_for_reservation("reservation-a").unwrap()[0].state,
+            LooseProofState::Reserved
+        );
+        wallet
+            .conn()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_release")
+            .unwrap();
+        wallet.cancel_prepared_opening_attempt("channel-b").unwrap();
+        assert!(wallet
+            .opening_candidates("channel-a")
+            .unwrap()
+            .iter()
+            .all(|a| a.state == OpeningAttemptState::Cancelled));
+        assert_eq!(
+            wallet
+                .list_available_proofs(MINT, "sat", &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        wallet.cancel_prepared_opening_attempt("channel-b").unwrap();
+        assert_eq!(
+            wallet
+                .list_available_proofs(MINT, "sat", &[])
+                .unwrap()
+                .len(),
+            1
         );
     }
 

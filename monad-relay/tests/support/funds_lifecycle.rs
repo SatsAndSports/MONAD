@@ -24,6 +24,13 @@ use tokio::task::JoinSet;
 const DEADLINE: Duration = Duration::from_secs(45);
 const INITIAL: u64 = 16_384;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateOperation {
+    Close,
+    Refund,
+    Opening,
+}
+
 /// Reserve the relay's TCP and QUIC address together until fixture setup ends.
 /// The child binds fresh sockets, so release-to-child handoff is not atomic.
 struct RelayPortReservation {
@@ -671,7 +678,12 @@ impl Fixture {
                     let hold = {
                         let mut ledger = ledger.lock().unwrap();
                         // A cached successful replay is not another mint transaction.
-                        ledger.swaps.entry(ys).or_insert((swap, result));
+                        if let Some((previous, issued)) = ledger.swaps.get(&ys) {
+                            assert!(previous.outputs() == swap.outputs() && issued.signatures == result.signatures,
+                                "different successful payouts for the same inputs (payloads redacted)");
+                        } else {
+                            ledger.swaps.insert(ys, (swap, result));
+                        }
                         std::mem::take(&mut ledger.hold_success)
                     };
                     if hold {
@@ -1179,6 +1191,466 @@ clients:
         drop(client);
         drop(relay);
         self.settle(&self.active_channel(), false).await;
+    }
+
+    fn candidate_requests(&self, operation: CandidateOperation, channel: &str) -> [SwapRequest; 2] {
+        let preparations: Vec<Value> = match operation {
+            CandidateOperation::Close => {
+                let json: String = self
+                    .db("relay.db")
+                    .query_row(
+                        "SELECT journal FROM spilman_close_journals WHERE channel_id=?1",
+                        [channel],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let journal: Value = serde_json::from_str(&json).expect("close journal (redacted)");
+                assert_eq!(journal["version"], 5);
+                assert_eq!(journal["attempts"].as_array().unwrap().len(), 2);
+                journal["attempts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| a["prepared"]["swap_request"].clone())
+                    .collect()
+            }
+            CandidateOperation::Refund => {
+                let db = self.db("channel.db");
+                let a: String = db.query_row("SELECT prepared_json FROM monad_client_refund_predecessors WHERE channel_id=?1",[channel],|r|r.get(0)).unwrap();
+                let (version,b): (u64,String) = db.query_row("SELECT journal_version,prepared_refund_json FROM monad_client_channel_recoveries WHERE channel_id=?1",[channel],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                assert_eq!(version, 3);
+                [a, b]
+                    .iter()
+                    .map(|json| {
+                        serde_json::from_str::<Value>(json).expect("refund preparation (redacted)")
+                            ["swap_request"]
+                            .clone()
+                    })
+                    .collect()
+            }
+            CandidateOperation::Opening => {
+                let db = self.db("loose.db");
+                assert_eq!(
+                    db.query_row(
+                        "SELECT schema_version FROM monad_client_opening_journal_meta",
+                        [],
+                        |r| r.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                    4
+                );
+                let mut statement=db.prepare("SELECT prepared_open_json FROM monad_client_opening_attempts ORDER BY predecessor_attempt_id IS NOT NULL").unwrap();
+                let rows = statement
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(rows.len(), 2);
+                let a: Value =
+                    serde_json::from_str(&rows[0]).expect("opening preparation (redacted)");
+                let b: Value =
+                    serde_json::from_str(&rows[1]).expect("opening preparation (redacted)");
+                assert!(
+                    a["opening"]["funding_token_amount"] == b["opening"]["funding_token_amount"]
+                );
+                assert!(a["opening"]["change_amount_raw"] == b["opening"]["change_amount_raw"]);
+                assert!(
+                    b["opening"]["capacity"].as_u64().unwrap()
+                        < a["opening"]["capacity"].as_u64().unwrap(),
+                    "higher output fees must reduce fixed-funding capacity"
+                );
+                assert_ne!(a["channel_id"], b["channel_id"]);
+                [a, b]
+                    .iter()
+                    .map(|p| {
+                        serde_json::from_str(p["swap_request_json"].as_str().unwrap())
+                            .expect("opening swap (redacted)")
+                    })
+                    .collect()
+            }
+        };
+        let requests: Vec<SwapRequest> = preparations
+            .into_iter()
+            .map(|p| serde_json::from_value(p).expect("candidate request (redacted)"))
+            .collect();
+        let requests: [SwapRequest; 2] = requests.try_into().map_err(|_| ()).expect("exactly A/B");
+        assert!(
+            requests[0].inputs() == requests[1].inputs(),
+            "candidate input snapshot changed"
+        );
+        assert_ne!(
+            requests[0].outputs()[0].keyset_id,
+            requests[1].outputs()[0].keyset_id
+        );
+        requests
+    }
+
+    fn assert_candidate_crash_state(
+        &self,
+        operation: CandidateOperation,
+        channel: &str,
+        submitted_b: bool,
+    ) {
+        match operation {
+            CandidateOperation::Close => {
+                let db = self.db("relay.db");
+                let json: String = db
+                    .query_row(
+                        "SELECT journal FROM spilman_close_journals WHERE channel_id=?1",
+                        [channel],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let journal: Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(journal["attempts"][0]["submissions"], 1);
+                assert_eq!(journal["attempts"][0]["keyset_rejection"]["submission"], 1);
+                assert_eq!(
+                    journal["attempts"][1]["submissions"],
+                    u64::from(submitted_b)
+                );
+                assert!(journal["winner"].is_null() && journal["finalizing"].is_null());
+                assert_eq!(
+                    db.query_row(
+                        "SELECT state FROM spilman_channels WHERE channel_id=?1",
+                        [channel],
+                        |r| r.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                    "Closing"
+                );
+            }
+            CandidateOperation::Refund => {
+                let db = self.db("channel.db");
+                let (status,winner,proofs):(String,Option<String>,Option<String>)=db.query_row("SELECT status,winning_refund_json,completed_proofs_json FROM monad_client_channel_recoveries WHERE channel_id=?1",[channel],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                assert_eq!(status, "submitting");
+                assert!(winner.is_none() && proofs.is_none());
+                let executions: u64 = db
+                    .query_row(
+                        "SELECT COUNT(*) FROM monad_client_refund_executions WHERE channel_id=?1",
+                        [channel],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(executions, 1 + u64::from(submitted_b));
+                let rejected:u64=db.query_row("SELECT COUNT(*) FROM monad_client_refund_executions WHERE channel_id=?1 AND outcome='inactive_output_keyset'",[channel],|r|r.get(0)).unwrap();
+                assert_eq!(rejected, 1);
+            }
+            CandidateOperation::Opening => {
+                let db = self.db("loose.db");
+                let states:Vec<String>=db.prepare("SELECT state FROM monad_client_opening_attempts ORDER BY predecessor_attempt_id IS NOT NULL").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+                assert_eq!(
+                    states,
+                    vec![
+                        "rejected",
+                        if submitted_b { "submitted" } else { "prepared" }
+                    ]
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT COUNT(DISTINCT reservation_id) FROM monad_client_opening_attempts",
+                        [],
+                        |r| r.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert!(
+                    db.query_row(
+                        "SELECT COUNT(*) FROM monad_client_loose_proofs WHERE state='reserved'",
+                        [],
+                        |r| r.get::<_, u64>(0)
+                    )
+                    .unwrap()
+                        > 0
+                );
+                assert_eq!(
+                    self.db("channel.db")
+                        .query_row("SELECT COUNT(*) FROM monad_client_channels", [], |r| r
+                            .get::<_, u64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
+    /// Fresh fixture per case: one subject operation, real HTTP rotation/rejection,
+    /// durable A/B inspection after SIGKILL, then recovery in a new process.
+    pub async fn candidate_crash(
+        &mut self,
+        operation: CandidateOperation,
+        lost_response: bool,
+        close_wins: bool,
+    ) {
+        assert!(!close_wins || (operation == CandidateOperation::Refund && !lost_response));
+        self.cycle += 1;
+        eprintln!("funds candidate operation={operation:?} lost_response={lost_response} close_wins={close_wins}");
+        let mut entry_relay = None;
+        let channel = match operation {
+            CandidateOperation::Opening => {
+                entry_relay = Some(self.relay(&["run"]));
+                String::new()
+            }
+            CandidateOperation::Refund => self.open_expired().await,
+            CandidateOperation::Close => {
+                let relay = self.relay(&["run"]);
+                let client = self.client(&["run"]);
+                self.roundtrip().await;
+                drop(client);
+                drop(relay);
+                self.active_channel()
+            }
+        };
+        let (before_requests, before_rejections, before_commits) = {
+            let mut ledger = self.ledger.lock().unwrap();
+            ledger.hold_request = true;
+            ledger.hold_success = lost_response;
+            (
+                ledger.requests,
+                ledger.inactive_rejections,
+                ledger.swaps.len(),
+            )
+        };
+        let (binary, args, boundary) = match operation {
+            CandidateOperation::Opening => (&self.client_bin, vec!["run"], "opening-successor"),
+            CandidateOperation::Refund => (
+                &self.client_bin,
+                vec![
+                    "wallet",
+                    "recover-channel",
+                    "--channel-id",
+                    channel.as_str(),
+                ],
+                "refund-successor",
+            ),
+            CandidateOperation::Close => (
+                &self.relay_bin,
+                vec![
+                    "wallet",
+                    "--relay",
+                    "funds",
+                    "close",
+                    "--channel-id",
+                    channel.as_str(),
+                ],
+                "close-successor",
+            ),
+        };
+        if lost_response {
+            let child = Process::spawn(binary, &args, &self.config);
+            tokio::time::timeout(DEADLINE, self.committed.notified())
+                .await
+                .expect("A request gate");
+            self.rotate(400).await;
+            self.release_gate().await;
+            tokio::time::timeout(DEADLINE, self.committed.notified())
+                .await
+                .expect("B committed response gate");
+            drop(child); // SIGKILL + reap; the complete response has not reached the wallet.
+            self.release_gate().await;
+        } else {
+            let rotation = async {
+                tokio::time::timeout(DEADLINE, self.committed.notified())
+                    .await
+                    .expect("A request gate");
+                self.rotate(400).await;
+                self.release_gate().await;
+            };
+            tokio::join!(self.binary_boundary_kill(binary, &args, boundary), rotation);
+        }
+        let candidates = self.candidate_requests(operation, &channel);
+        self.assert_candidate_crash_state(operation, &channel, lost_response);
+        {
+            let ledger = self.ledger.lock().unwrap();
+            assert_eq!(
+                ledger.requests,
+                before_requests + 1 + usize::from(lost_response)
+            );
+            assert_eq!(ledger.inactive_rejections, before_rejections + 1);
+            assert_eq!(
+                ledger.swaps.len(),
+                before_commits + usize::from(lost_response)
+            );
+            assert!(
+                ledger.attempts[before_requests] == candidates[0],
+                "A request differs from journal"
+            );
+            if lost_response {
+                assert!(
+                    ledger.attempts[before_requests + 1] == candidates[1],
+                    "B request differs from journal"
+                );
+            }
+        }
+        if close_wins {
+            self.relay(&["wallet", "close", "--channel-id", &channel])
+                .success()
+                .await;
+        }
+        let requests_before_recovery = self.ledger.lock().unwrap().requests;
+        for repeat in 0..2 {
+            let before = self.ledger.lock().unwrap().http_requests;
+            match operation {
+                CandidateOperation::Opening => {
+                    self.client(&["wallet", "recover-openings"]).success().await
+                }
+                CandidateOperation::Refund => {
+                    self.client(&["wallet", "recover-channel", "--channel-id", &channel])
+                        .success()
+                        .await
+                }
+                CandidateOperation::Close => {
+                    self.relay(&["wallet", "close", "--channel-id", &channel])
+                        .success()
+                        .await
+                }
+            }
+            let ledger = self.ledger.lock().unwrap();
+            if lost_response || close_wins || operation == CandidateOperation::Opening {
+                assert_eq!(
+                    ledger.requests, requests_before_recovery,
+                    "restore/cancel recovery submitted a swap"
+                );
+            }
+            if repeat == 1 {
+                assert_eq!(
+                    ledger.http_requests, before,
+                    "terminal recovery contacted mint"
+                );
+            }
+        }
+        assert!(
+            self.candidate_requests(operation, &channel) == candidates,
+            "recovery rewrote immutable candidates"
+        );
+        assert_eq!(
+            self.ledger.lock().unwrap().swaps.len(),
+            before_commits + usize::from(operation != CandidateOperation::Opening || lost_response),
+            "wrong number of accepted subject spends before settlement"
+        );
+        match operation {
+            CandidateOperation::Close => {
+                let json: String = self
+                    .db("relay.db")
+                    .query_row(
+                        "SELECT journal FROM spilman_close_journals WHERE channel_id=?1",
+                        [&channel],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let journal: Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(journal["winner"], 1);
+                assert_eq!(journal["completed"], true);
+                assert_eq!(self.ledger.lock().unwrap().requests, before_requests + 2);
+                self.settle(&channel, false).await;
+            }
+            CandidateOperation::Refund => {
+                let (status,kind,b,winner,proofs):(String,String,String,Option<String>,String)=self.db("channel.db").query_row("SELECT status,kind,prepared_refund_json,winning_refund_json,completed_proofs_json FROM monad_client_channel_recoveries WHERE channel_id=?1",[&channel],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+                assert_eq!(status, "completed");
+                if close_wins {
+                    assert_eq!(kind, "relay_close");
+                    assert!(winner.is_none());
+                } else {
+                    assert_eq!(kind, "post_expiry_refund");
+                    assert!(winner.as_ref() == Some(&b), "refund winner is not B");
+                }
+                let payout: Vec<Proof> =
+                    serde_json::from_str(&proofs).expect("completed refund proofs (redacted)");
+                let preparation: Value =
+                    serde_json::from_str(&b).expect("refund preparation (redacted)");
+                let full_refund = preparation["output_amount_raw"].as_u64().unwrap();
+                let recovered = payout.iter().map(|p| u64::from(p.amount)).sum::<u64>();
+                if close_wins {
+                    assert!(
+                        recovered < full_refund,
+                        "close fallback must not report a full refund"
+                    );
+                } else {
+                    assert_eq!(recovered, full_refund);
+                }
+                let identities = payout
+                    .iter()
+                    .map(|p| p.y().unwrap().to_hex())
+                    .collect::<BTreeSet<_>>();
+                let stored: Vec<String> = self
+                    .db("loose.db")
+                    .prepare(
+                        "SELECT proof_id FROM monad_client_loose_proofs WHERE state='available'",
+                    )
+                    .unwrap()
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert!(identities
+                    .iter()
+                    .all(|id| stored.iter().filter(|p| *p == id).count() == 1));
+                assert_eq!(self.ledger.lock().unwrap().requests, before_requests + 2);
+                self.settle(&channel, !close_wins).await;
+            }
+            CandidateOperation::Opening => {
+                let db = self.db("loose.db");
+                let rows:Vec<(String,String,String)>=db.prepare("SELECT attempt_id,state,prepared_open_json FROM monad_client_opening_attempts ORDER BY predecessor_attempt_id IS NOT NULL").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap();
+                assert_eq!(rows[0].1, "cancelled");
+                assert_eq!(
+                    rows[1].1,
+                    if lost_response {
+                        "completed"
+                    } else {
+                        "cancelled"
+                    }
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT COUNT(*) FROM monad_client_loose_proofs WHERE state='reserved'",
+                        [],
+                        |r| r.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+                if lost_response {
+                    let channel = self.active_channel();
+                    assert_eq!(channel, rows[1].0);
+                    let prepared: Value = serde_json::from_str(&rows[1].2).unwrap();
+                    let capacity: u64 = self
+                        .db("channel.db")
+                        .query_row(
+                            "SELECT capacity_msats FROM monad_client_channels WHERE channel_id=?1",
+                            [&channel],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        capacity,
+                        prepared["opening"]["capacity"].as_u64().unwrap() * 1000
+                    );
+                    let completed:String=db.query_row("SELECT completed_open_json FROM monad_client_opening_attempts WHERE attempt_id=?1",[&channel],|r|r.get(0)).unwrap();
+                    let completed: Value = serde_json::from_str(&completed).unwrap();
+                    let change: Vec<Proof> =
+                        serde_json::from_str(completed["change_proofs_json"].as_str().unwrap())
+                            .unwrap();
+                    for proof in change {
+                        assert_eq!(db.query_row("SELECT COUNT(*) FROM monad_client_loose_proofs WHERE proof_id=?1 AND state='available'",[proof.y().unwrap().to_hex()],|r|r.get::<_,u64>(0)).unwrap(),1);
+                    }
+                } else {
+                    assert_eq!(
+                        self.db("channel.db")
+                            .query_row("SELECT COUNT(*) FROM monad_client_channels", [], |r| r
+                                .get::<_, u64>(0))
+                            .unwrap(),
+                        0
+                    );
+                    assert_eq!(db.query_row("SELECT SUM(amount_raw) FROM monad_client_loose_proofs WHERE state='available'",[],|r|r.get::<_,u64>(0)).unwrap(),INITIAL);
+                    self.audit().await;
+                }
+                let client = self.client(&["run"]);
+                self.roundtrip().await;
+                drop(client);
+                drop(entry_relay.take());
+                self.settle(&self.active_channel(), false).await;
+            }
+        }
     }
 
     pub async fn relay_close_case(

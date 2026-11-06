@@ -2,6 +2,46 @@
 #[path = "support/funds_lifecycle.rs"]
 mod support;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated fault-injection binaries; make test-funds-crashes"]
+async fn process_close_candidate_crashes() {
+    for lost_response in [false, true] {
+        let mut fixture = support::Fixture::start().await;
+        fixture
+            .candidate_crash(support::CandidateOperation::Close, lost_response, false)
+            .await;
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated fault-injection binaries; make test-funds-crashes"]
+async fn process_refund_candidate_crashes() {
+    for (lost_response, close_wins) in [(false, false), (true, false), (false, true)] {
+        let mut fixture = support::Fixture::start().await;
+        fixture
+            .candidate_crash(
+                support::CandidateOperation::Refund,
+                lost_response,
+                close_wins,
+            )
+            .await;
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated fault-injection binaries; make test-funds-crashes"]
+async fn process_opening_candidate_crashes() {
+    for lost_response in [false, true] {
+        let mut fixture = support::Fixture::start().await;
+        fixture
+            .candidate_crash(support::CandidateOperation::Opening, lost_response, false)
+            .await;
+        fixture.finish().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistent_mint_worker() {
     support::persistent_mint_worker().await;

@@ -1229,6 +1229,10 @@ candidate as definitively rejected.
 Finalization replays local channel, change-proof, and metadata updates
 idempotently. Prepared attempts that were never claimed for submission are
 cancelled and their proofs released only when no uncertain peer owns them.
+For a definitively rejected A and never-submitted B, cancelling B atomically
+cancels the rejected peer and releases their reservation. Startup/manual recovery
+does not initiate the uncommitted opening; a fresh live provisioning may reuse
+the released proofs. An ambiguous A continues to block release.
 
 If the mint explicitly rejects an inactive output keyset with code `12002`, the
 client records that immutable predecessor, refreshes, and may create one successor

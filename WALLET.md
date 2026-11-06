@@ -328,6 +328,11 @@ finalizing winner and retires its peer as `cancelled`, retaining both requests a
 execution history. Only the winner's channel/change become usable. Finalizing
 resumes local writes without mint submission. A never-submitted or definitively
 rejected peer cannot release inputs still owned by an uncertain candidate.
+If A's only mint-visible execution was definitively rejected and B was never
+submitted, restore-only recovery instead cancels both journal attempts and releases
+the shared inputs in one transaction. It does not submit B. Retained preparations
+remain history; the released proofs can fund a fresh opening. This rule does not
+apply to a `12002` following an earlier ambiguous A execution.
 
 Recovery considers both candidates before interpreting spent inputs. Stale export
 deduplicates their shared proofs and requires evidence for every active candidate

@@ -1178,7 +1178,12 @@ This opens 16 bidirectional QUIC streams, sends 64KB of random data on each, rea
 actual-process wallet lifecycle tests with a retained real CDK HTTP mint.
 See [coverage and private failure artifacts](monad-relay/tests/FUNDS_LIFECYCLE.md).
 `make test-funds-crashes` includes compile-gated fault injection and real-expiry
-refund tests. Both it and `make stress-funds-lifecycle` build their CLIs in
+refund tests. Deterministic A/B cases cover close, refund and opening: kill after
+successor persistence or after B commits before its response reaches the wallet,
+then recover in fresh CLI processes. A refund case lets Charlie close while Alice
+is dead with B prepared. A definitively rejected opening A plus never-submitted B
+is cancelled with its inputs released; ambiguous pairs stay reserved.
+Both it and `make stress-funds-lifecycle` build their CLIs in
 `target/funds-lifecycle/debug`, leaving normal `target/debug` and `target/release`
 binaries untouched; no normal-binary rebuild is required afterward. The isolated
 instrumented client binary is test-only: never use it with real funds.

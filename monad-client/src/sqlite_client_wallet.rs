@@ -897,6 +897,8 @@ impl SqliteClientWallet {
                             }),
                         };
                     self.persist_refund_successor(channel_id, p, &successor)?;
+                    #[cfg(feature = "funds-lifecycle-test")]
+                    lifecycle_test::boundary("refund-successor");
                     prepared = Some(successor);
                     executions = 0;
                     // Reconcile again after refresh/persistence: A or Charlie
@@ -3510,6 +3512,8 @@ impl SqliteClientWallet {
                         return Err(error);
                     }
                 };
+                #[cfg(feature = "funds-lifecycle-test")]
+                lifecycle_test::boundary("opening-successor");
                 self.execute_open_attempt_with_networking(offer, successor, false, networking)
             }
             Err(error) => self.handle_open_error(
