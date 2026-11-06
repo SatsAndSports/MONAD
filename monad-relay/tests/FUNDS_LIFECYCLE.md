@@ -72,6 +72,17 @@ submission with A recovery after reopening, wrong-winner rejection before import
 offline completion and spending imported payouts. These controlled response/state
 orderings supplement, rather than replace, the actual-process crash coverage.
 
+Opening journal v4 retains competing A/B channels under one reservation. The client
+`sqlite_client_wallet/tests/competing_openings.rs` real-mint matrix exercises either
+winner, both target-capacity and nominal-funding preparation, rising/falling keyset
+fees, fixed funding/change values, winner metadata interruption and reopen, and a
+real close of the winning funding token. Pending A/B recovery submits no swaps;
+shared-input export deduplicates the proofs and transitions both attempts, with
+delayed B completion afterward. A B-keyset rejection creates no third candidate.
+These controlled transport/state orderings supplement existing process opening
+request gates, rotation and finalization SIGKILL tests; no additional concurrent
+mint-commit or process-kill matrix is claimed.
+
 Established-channel recovery now checks NUT-07 before NUT-09 using the upstream
 ordinary-channel APIs. Alice restores retained refunds before close discovery;
 Charlie restores retained close attempts. A refund winner yields relay

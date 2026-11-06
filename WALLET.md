@@ -304,9 +304,9 @@ or refresh. The prepared opening and exact inputs are then atomically journaled
 and reserved before submission.
 
 An ambiguous submission first uses exact NUT-09 restore and exact-input NUT-07
-evidence. That may authorize one permit-backed byte-identical replay, but never a
-changed request. Only a direct, unambiguous initial `12002` rejection may create
-one successor, and only with a changed active output keyset. Startup/manual
+evidence. That may authorize one permit-backed byte-identical replay. A validated
+HTTP 400 `12002` on any numbered A execution may authorize one successor on a
+changed active output keyset, while retaining A's uncertainty. Startup/manual
 opening recovery is restore-only and does not submit swaps.
 
 Important boundaries:
@@ -315,8 +315,25 @@ Important boundaries:
   accepts them
 - output funding uses an active keyset selected from the local cache
 - a direct inactive-output-keyset successor requires a changed output keyset
-- replay rejection after an earlier ambiguous execution remains unresolved and
-  cannot create a successor
+- replay rejection does not settle earlier uncertainty, but can authorize B;
+  B never authorizes C
+
+Opening journal v4 retains one logical `opening_id`, one exact input reservation,
+and at most two candidate channels. A target capacity sizes the original attempt;
+B preserves the actual original funding-token amount and change value, allowing
+its capacity to increase or decrease with the new keyset's fees. No additional
+inputs or change value are consumed to preserve the original target. Both funding
+and change outputs are verified for the actual winner. One transaction binds a
+finalizing winner and retires its peer as `cancelled`, retaining both requests and
+execution history. Only the winner's channel/change become usable. Finalizing
+resumes local writes without mint submission. A never-submitted or definitively
+rejected peer cannot release inputs still owned by an uncertain candidate.
+
+Recovery considers both candidates before interpreting spent inputs. Stale export
+deduplicates their shared proofs and requires evidence for every active candidate
+before atomically exporting the group. Prepared peers keep export blocked until
+resolved; no partial candidate export is allowed. Incompatible nonempty v3 opening
+journals reject intact without migration or automatic wallet reset.
 
 ## Channel Fund Recovery
 
@@ -645,8 +662,9 @@ Submitted rather than appearing fresh/never submitted. Version 1 journals are
 incompatible and rejected intact, with no automatic migration or reset.
 
 Receiver close also has a bounded competing-successor policy as described above.
-Sender refund uses the analogous policy described above. Opening retains its prior
-successor/replay rules until a separate follow-up.
+Sender refund and opening use analogous competing-candidate policies described
+above, with opening retaining its distinct execution claims and restore-only
+startup/manual recovery.
 
 The in-process runtime owner or an offline caller with exclusive maintenance
 authority may execute and recover drains. Per-drain singleflight, atomic unique

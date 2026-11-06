@@ -245,9 +245,10 @@ coordinated breaking alpha upgrade without old channel derivation compatibility.
 Custom mint adapters retain the 15-second timeout and cap decoded responses at
 4 MiB with strict UTF-8. Complete responses are classified by upstream typed mint
 outcomes; only validated HTTP 400 NUT-00 rejections carry rejection authority.
-Opening successor policy remains narrower:
-initial `12002` only, with no prior ambiguity. Refunds, closes and drains use the bounded
-competing-candidate policy described below. Diagnostic bodies/details are redacted
+Opening, refund, close and drain policies permit bounded competing candidates on
+validated `12002` evidence, retaining earlier uncertainty. Opening keeps its
+stricter durable replay claims and restore-only startup/manual recovery.
+Diagnostic bodies/details are redacted
 before propagation.
 
 ### Wallet Durability
@@ -1219,21 +1220,27 @@ for that clock advance. Each immutable attempt has at most one authorized replay
 submission. Replay
 success finalizes normally; replay ambiguity or rejection performs one immediate
 exact restore and otherwise leaves the operation submitted and reserved. A replay
-rejection cannot authorize a keyset successor because it does not settle the
-earlier ambiguous execution.
+rejection may authorize one keyset successor without settling the earlier
+ambiguous execution. Both candidate histories remain attached to the reservation.
 Finalization replays local channel, change-proof, and metadata updates
 idempotently. Prepared attempts that were never claimed for submission are
-cancelled and their proofs released.
+cancelled and their proofs released only when no uncertain peer owns them.
 
 If the mint explicitly rejects an inactive output keyset with code `12002`, the
 client records that immutable predecessor, refreshes, and may create one successor
 using a changed active keyset. Transport and protocol ambiguity never authorizes a
-successor submission. Live ambiguous opens run bounded recovery once immediately.
+successor submission without validated rejection evidence. Live ambiguous opens
+run bounded recovery immediately, inspecting both retained candidates. Journal v4
+binds one finalizing winner transactionally and cancels its peer without releasing
+custody. Winner finalization installs only its channel and change. Successor B
+keeps A's exact inputs, nominal funding amount and change value, but recomputes
+capacity for the new keyset; original target capacity is not an invariant across
+rotation. Funding-keyset changes produce distinct channel IDs and funding outputs.
 
 Opening and refund HTTP adapters share a body-discarding rejection type carrying
-only HTTP status and an optional numeric NUT-00 code. HTTP 4xx `12002` is rejection
+only HTTP status and an optional numeric NUT-00 code. HTTP 400 `12002` is rejection
 evidence, not successor authority: the separate opening and refund journals enforce
-their own initial-execution, ambiguity, and predecessor checks. Opening never
+their own execution, candidate and predecessor checks. Opening never
 reconstructs rejection evidence from formatted error strings.
 
 Exact NUT-09 output/signature matching and cryptographic completion use upstream's

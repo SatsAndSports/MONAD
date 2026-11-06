@@ -237,7 +237,8 @@ policy: a validated `12002` on any A execution may authorize B, preserving Alice
 signature and all output secrets/points while changing only the signing keyset.
 Refund journal v3 records the actual winning preparation (or receiver-close source)
 before proof import. Older refund journals reject intact; no automatic reset or
-migration is performed. Channel opening retains its narrower successor policy.
+migration is performed. Channel opening uses the related bounded policy below,
+with restore-only startup/manual recovery.
 
 Relay close `--json` results expose `outcome` and `details`: `Closed` carries the
 verified payout; `UnknownSpent` retains unresolved evidence. After expiry, spent or
@@ -410,7 +411,7 @@ invocation, and either verified winner can complete the same drain. No third
 candidate or replacement inputs are allowed. Drain journal v2 records execution-
 specific rejection evidence and the actual winner; older v1 journals reject intact
 without migration/reset. Receiver close has its own corresponding policy described
-above; opening retains its narrower successor policy.
+above; opening retains its distinct durable replay claims and restore-only recovery.
 
 The reusable relay wallet backend also supports exact drains by channel ID. A
 request may contain at most 1,024 unique Closed channels, all owned by one relay
@@ -459,7 +460,7 @@ YAML order; add `--client <name>` to run only one entry.
 - `SqliteClientWallet` uses those loose proofs to provision Spilman channels via upstream `cdk-spilman`, stores MONAD channel metadata including expiry timestamps in SQLite, and implements `MonadWallet` for the session driver.
 - channel opening atomically reserves its loose proofs and journals the exact prepared swap before submission. Live ambiguous submissions restore their exact funding/change outputs through NUT-09; a valid empty funding restore plus every exact input `UNSPENT` may authorize at most one byte-identical replay submission. Authorization also requires execution authority and a wall-clock second later than the preceding authorized submission.
 - configured-client startup and manual `recover-openings` never submit opening swaps. They finish restored or finalizing channels and cancel prepared attempts and rejected attempts without successors. `wallet export-stale-opening-inputs` requires exclusive wallet access and, after one hour plus exact empty NUT-09 restore and all-`UNSPENT` NUT-07 evidence, groups eligible inputs by mint/unit and atomically marks every attempt represented by a bearer token `Exported` before printing it. The proofs remain reserved. The command reports successful tokens and unresolved attempts independently, so one failed group does not suppress another. Repeated exports are overlapping snapshots and may emit the same still-reserved proofs again. Export never finalizes a restorable opening; it reports that `recover-openings` is required. Recovery later finalizes a delayed opening, or marks exported proofs `ExternallySpent` only after exact all-`SPENT` evidence and a final empty restore. Recent, stale, clock-rollback, partial, invalid, or unavailable evidence remains reserved.
-- output keyset handling is cache-first: channel opening selects a compatible active same-mint/unit keyset from client-owned metadata, ordered deterministically by keyset ID. The client refreshes before concluding that no compatible active keyset exists. Relay advertisements do not trigger refresh or rank keysets. A direct, unambiguous initial inactive-output-keyset rejection (`12002`) may create one persisted successor using a changed active keyset. Ambiguous outcomes may authorize the one identical replay described above, but never a changed-request successor.
+- output keyset handling is cache-first: channel opening selects a compatible active same-mint/unit keyset from client-owned metadata, ordered deterministically by keyset ID. The client refreshes before concluding that no compatible active keyset exists. Relay advertisements do not trigger refresh or rank keysets. A validated HTTP 400 `12002` on any A execution may authorize one persisted successor B using a changed active keyset, retaining A's uncertainty. Each candidate has its own bounded exact replay; no third candidate is created. B preserves the exact inputs, funding-token value and change value, but its capacity may differ with keyset fees—even if A was sized by target capacity. Recovery finalizes whichever candidate actually won. Opening journal v4 rejects incompatible nonempty older journals intact; startup/manual recovery remains restore-only.
 - opening and refund HTTP rejections report the HTTP status and numeric NUT-00 code without retaining the mint's response body. Only a structured HTTP 4xx `12002`, subject to the operation's journal authority, can permit changed output keys; error-message text is not rejection evidence.
 
 `client_wallet.channel_funding_token_target_msats` controls the desired funding-token value for each newly provisioned channel. Cashu input fees are selected in addition to this target; output fees and deterministic channel outputs can make usable channel capacity lower. The default is `1000000` msats.
