@@ -59,11 +59,8 @@ const CREATE_DRAIN_TABLES_SQL: &str = r#"
         output_keyset_id TEXT NOT NULL,
         output_keyset_info_json TEXT NOT NULL,
         output_proofs_json TEXT,
-        error TEXT,
         created_at INTEGER NOT NULL,
-        submitted_at INTEGER,
-        completed_at INTEGER,
-        failed_at INTEGER
+        completed_at INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS monad_relay_drain_inputs (

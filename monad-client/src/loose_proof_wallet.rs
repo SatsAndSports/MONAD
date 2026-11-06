@@ -681,13 +681,6 @@ fn table_columns(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<HashSet<
 }
 
 fn initialize_schema(conn: &mut Connection) -> Result<()> {
-    initialize_schema_with_migration_hook(conn, || Ok(()))
-}
-
-fn initialize_schema_with_migration_hook(
-    conn: &mut Connection,
-    _migration_hook: impl FnOnce() -> Result<()>,
-) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let attempts_exist = sqlite_object_exists(&tx, "monad_client_opening_attempts")?;
     let executions_exist = sqlite_object_exists(&tx, "monad_client_opening_executions")?;
@@ -755,7 +748,10 @@ fn initialize_schema_with_migration_hook(
         .into_iter()
         .all(|column| execution_columns.contains(column));
     let active_index_valid =
-        sqlite_index_exists(&tx, "idx_monad_client_opening_executions_active")?;
+        sqlite_index_exists(&tx, "idx_monad_client_opening_executions_active")?
+            && sqlite_index_exists(&tx, "idx_monad_client_opening_attempts_successor")?
+            && sqlite_index_exists(&tx, "idx_monad_client_opening_attempts_operation_successor")?
+            && sqlite_index_exists(&tx, "idx_monad_client_opening_attempts_operation_root")?;
     let schema_valid = marker.as_ref().is_some_and(|(version, authority)| {
         *version == OPENING_JOURNAL_SCHEMA_VERSION && authority == OPENING_JOURNAL_AUTHORITY_MARKER
     }) && attempts_valid
@@ -1914,7 +1910,7 @@ impl LooseProofWallet {
                 ],
                 |row| row.get(0),
             )?;
-            if permit.execution_sequence != 1 || prior_ambiguous_execution {
+            if prior_ambiguous_execution {
                 return Err(LooseProofWalletError::InvalidStateTransition {
                     entity: "opening attempt",
                     id: permit.attempt_id,
@@ -4669,6 +4665,178 @@ mod tests {
         assert_eq!(executions[0].status, OpeningExecutionStatus::Uncertain);
         assert_eq!(executions[1].status, OpeningExecutionStatus::Rejected);
         assert_eq!(wallet.release_reservation("reservation-a").unwrap(), 0);
+    }
+
+    #[test]
+    fn cancelled_preflight_claim_does_not_poison_later_initial_rejection() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        let a = opening_attempt("channel-a", "reservation-a", &["proof-a"]);
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(MINT, "sat", &["proof-a".to_string()], &a)
+            .unwrap();
+        let OpeningSubmissionClaim::Acquired(claim) = wallet
+            .claim_opening_attempt_submission("channel-a")
+            .unwrap()
+        else {
+            panic!("missing initial claim")
+        };
+        wallet.cancel_opening_submission_claim(claim).unwrap();
+        let second = claim_and_authorize(&wallet, "channel-a");
+        assert!(wallet
+            .record_definitive_opening_rejection(second, 12002, "inactive")
+            .unwrap());
+        let executions = wallet.opening_executions("channel-a").unwrap();
+        assert_eq!(executions[0].status, OpeningExecutionStatus::Cancelled);
+        assert_eq!(executions[1].execution_sequence, 2);
+        assert_eq!(executions[1].status, OpeningExecutionStatus::Rejected);
+        let mut b = a.clone();
+        b.attempt_id = "channel-b".to_string();
+        b.predecessor_attempt_id = Some(a.attempt_id);
+        b.prepared_open_json = r#"{"channel_id":"channel-b"}"#.to_string();
+        wallet.store_opening_attempt_for_reservation(&b).unwrap();
+        let b_claim = claim_and_authorize(&wallet, "channel-b");
+        wallet
+            .record_definitive_opening_rejection(b_claim, 12002, "inactive B")
+            .unwrap();
+        let mut c = b;
+        c.attempt_id = "channel-c".to_string();
+        c.predecessor_attempt_id = Some("channel-b".to_string());
+        c.prepared_open_json = r#"{"channel_id":"channel-c"}"#.to_string();
+        assert!(wallet.store_opening_attempt_for_reservation(&c).is_err());
+        assert_eq!(wallet.opening_candidates("channel-a").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn competing_export_requires_all_peers_and_marks_external_spend_atomically() {
+        let wallet = wallet();
+        wallet
+            .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+            .unwrap();
+        let a = opening_attempt("channel-a", "reservation-a", &["proof-a"]);
+        wallet
+            .reserve_selected_proofs_with_opening_attempt(MINT, "sat", &["proof-a".to_string()], &a)
+            .unwrap();
+        let initial = claim_and_authorize(&wallet, "channel-a");
+        wallet
+            .finish_opening_execution(initial, OpeningExecutionStatus::Uncertain, None)
+            .unwrap();
+        let OpeningSubmissionClaim::Acquired(replay) =
+            wallet.claim_opening_attempt_replay("channel-a").unwrap()
+        else {
+            panic!("missing replay")
+        };
+        let replay = authorize_replay_after_latest(&wallet, replay);
+        wallet
+            .record_definitive_opening_rejection(replay, 12002, "inactive")
+            .unwrap();
+        let mut b = a.clone();
+        b.attempt_id = "channel-b".to_string();
+        b.predecessor_attempt_id = Some(a.attempt_id);
+        b.prepared_open_json = r#"{"channel_id":"channel-b"}"#.to_string();
+        wallet.store_opening_attempt_for_reservation(&b).unwrap();
+        let b_claim = claim_and_authorize(&wallet, "channel-b");
+        wallet
+            .finish_opening_execution(b_claim, OpeningExecutionStatus::Uncertain, None)
+            .unwrap();
+        let a = wallet
+            .opening_export_evidence("channel-a", OpeningAttemptState::Submitted)
+            .unwrap()
+            .unwrap();
+        let b = wallet
+            .opening_export_evidence("channel-b", OpeningAttemptState::Submitted)
+            .unwrap()
+            .unwrap();
+        let now = a.latest_submitted_at.max(b.latest_submitted_at) + OPENING_EXPORT_MIN_AGE_SECONDS;
+        assert!(!wallet
+            .mark_opening_attempts_exported_if_evidence_current(std::slice::from_ref(&a), now)
+            .unwrap());
+        // Seed the mixed exported/submitted state to check atomic normalization
+        // and external-spend refusal while one peer still owns uncertainty.
+        wallet.conn().unwrap().execute("UPDATE monad_client_opening_attempts SET state='exported' WHERE attempt_id='channel-a'",[]).unwrap();
+        let a = wallet
+            .opening_export_evidence("channel-a", OpeningAttemptState::Exported)
+            .unwrap()
+            .unwrap();
+        assert!(!wallet
+            .mark_opening_attempt_externally_spent_if_evidence_current(&a, now)
+            .unwrap());
+        assert!(wallet
+            .mark_opening_attempts_exported_if_evidence_current(&[a.clone(), b], now)
+            .unwrap());
+        wallet.conn().unwrap().execute_batch("CREATE TRIGGER fail_peer BEFORE UPDATE ON monad_client_opening_attempts WHEN NEW.attempt_id='channel-b' AND NEW.state='externally_spent' BEGIN SELECT RAISE(ABORT,'peer failure'); END;").unwrap();
+        assert!(wallet
+            .mark_opening_attempt_externally_spent_if_evidence_current(&a, now)
+            .is_err());
+        assert!(wallet
+            .opening_candidates("channel-a")
+            .unwrap()
+            .iter()
+            .all(|p| p.state == OpeningAttemptState::Exported));
+        assert_eq!(
+            wallet.proofs_for_reservation("reservation-a").unwrap()[0].state,
+            LooseProofState::Reserved
+        );
+        wallet
+            .conn()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_peer")
+            .unwrap();
+        assert!(wallet
+            .mark_opening_attempt_externally_spent_if_evidence_current(&a, now)
+            .unwrap());
+        assert!(wallet
+            .opening_candidates("channel-a")
+            .unwrap()
+            .iter()
+            .all(|p| p.state == OpeningAttemptState::ExternallySpent));
+        assert!(wallet
+            .proofs_for_reservation("reservation-a")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn populated_opening_schema_requires_candidate_unique_indexes() {
+        for index in [
+            "idx_monad_client_opening_attempts_successor",
+            "idx_monad_client_opening_attempts_operation_successor",
+            "idx_monad_client_opening_attempts_operation_root",
+        ] {
+            let wallet = wallet();
+            wallet
+                .import_proofs(&[proof("proof-a", 8, "keyset-a")])
+                .unwrap();
+            wallet
+                .reserve_selected_proofs_with_opening_attempt(
+                    MINT,
+                    "sat",
+                    &["proof-a".to_string()],
+                    &opening_attempt("channel-a", "reservation-a", &["proof-a"]),
+                )
+                .unwrap();
+            let mut conn = wallet.conn().unwrap();
+            conn.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+            assert!(initialize_schema(&mut conn).is_err());
+            assert!(!conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                    [index],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM monad_client_opening_attempts",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
     }
 
     #[test]

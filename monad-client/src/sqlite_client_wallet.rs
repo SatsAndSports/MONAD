@@ -876,13 +876,26 @@ impl SqliteClientWallet {
             if !refreshed_rejection && self.refund_has_successor_authority(channel_id)? {
                 refreshed_rejection = true;
                 let p = prepared.as_ref().unwrap();
-                let output = self.select_refund_output_keyset(&established, true)?;
+                let Some(output) =
+                    self.try_select_refund_output_keyset(&established, true, Some(p))?
+                else {
+                    return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
+                        channel_id: channel_id.to_string(),
+                        reason: "refund successor output keys unavailable; candidates retained"
+                            .to_string(),
+                    });
+                };
                 if output.keyset_id != p.output_keyset.keyset_id {
-                    let successor = p
-                        .with_output_keyset(&established, &self.sender_secret, output)
-                        .map_err(|e| {
-                            WalletError::Backend(format!("prepare successor refund: {e}"))
-                        })?;
+                    let successor =
+                        match p.with_output_keyset(&established, &self.sender_secret, output) {
+                            Ok(successor) => successor,
+                            Err(_) => return Ok(ChannelFundRecoveryResult::RecoveryRetryLater {
+                                channel_id: channel_id.to_string(),
+                                reason:
+                                    "refund successor preparation unavailable; candidates retained"
+                                        .to_string(),
+                            }),
+                        };
                     self.persist_refund_successor(channel_id, p, &successor)?;
                     prepared = Some(successor);
                     executions = 0;
@@ -2147,16 +2160,32 @@ impl SqliteClientWallet {
         established: &EstablishedChannel,
         refresh: bool,
     ) -> Result<cdk_spilman::KeysetInfo, WalletError> {
+        self.try_select_refund_output_keyset(established, refresh, None)?
+            .ok_or_else(|| {
+                WalletError::Backend(
+                    "no available unexpired active same-unit refund output keyset".to_string(),
+                )
+            })
+    }
+
+    // An unavailable metadata refresh/selection is retryable. This does not
+    // suppress errors from the caller's authority checks or journal mutations.
+    fn try_select_refund_output_keyset(
+        &self,
+        established: &EstablishedChannel,
+        refresh: bool,
+        candidate: Option<&PreparedSenderRefund>,
+    ) -> Result<Option<cdk_spilman::KeysetInfo>, WalletError> {
         let bridge = self
             .bridge
             .lock()
             .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
         let mint = &established.params.mint;
         for pass in 0..2 {
-            if (refresh && pass == 0) || (!refresh && pass == 1) {
-                bridge.refresh_keysets_response(mint).map_err(|_| {
-                    WalletError::Backend("refresh refund output keysets failed".to_string())
-                })?;
+            if ((refresh && pass == 0) || (!refresh && pass == 1))
+                && bridge.refresh_keysets_response(mint).is_err()
+            {
+                return Ok(None);
             }
             let mut entries = bridge.cached_keysets_for_unit(mint, &established.params.unit);
             entries.sort_by_key(|(id, _)| id.to_string());
@@ -2165,17 +2194,22 @@ impl SqliteClientWallet {
                 .into_iter()
                 .filter(|(_, entry)| entry.active)
                 .filter_map(|(_, entry)| parse_keyset_info_from_json(&entry.info_json).ok())
-                .find(|info| info.is_unexpired_at(now))
+                .find(|info| {
+                    info.is_unexpired_at(now)
+                        && candidate.is_none_or(|p| {
+                            p.outputs
+                                .iter()
+                                .all(|o| info.active_keys.amount_key(o.amount.into()).is_some())
+                        })
+                })
             {
-                return Ok(info);
+                return Ok(Some(info));
             }
             if refresh {
                 break;
             }
         }
-        Err(WalletError::Backend(
-            "no unexpired active same-unit refund output keyset".to_string(),
-        ))
+        Ok(None)
     }
 
     fn record_refund_execution(
@@ -2479,7 +2513,7 @@ impl SqliteClientWallet {
         let channel = EstablishedChannel::from_client_channel_funding(funding)
             .map_err(|_| WalletError::Backend("invalid refund funding".to_string()))?;
         let conn = self.conn()?;
-        let mut stmt = conn.prepare("SELECT prepared_json FROM monad_client_refund_predecessors WHERE channel_id=?1 UNION ALL SELECT prepared_refund_json FROM monad_client_channel_recoveries WHERE channel_id=?1 AND prepared_refund_json IS NOT NULL")
+        let mut stmt = conn.prepare("SELECT prepared_json FROM (SELECT 0 AS candidate, prepared_json FROM monad_client_refund_predecessors WHERE channel_id=?1 UNION ALL SELECT 1 AS candidate, prepared_refund_json FROM monad_client_channel_recoveries WHERE channel_id=?1 AND prepared_refund_json IS NOT NULL) ORDER BY candidate")
             .map_err(|e| WalletError::Backend(e.to_string()))?;
         let rows = stmt
             .query_map([channel_id], |r| r.get::<_, String>(0))

@@ -7,6 +7,7 @@ use rusqlite::params;
 #[derive(Clone, Copy)]
 enum Outcome {
     OriginalWins,
+    OriginalWinsAfterState,
     SuccessorReplayWins,
     SuccessorReplyLost,
     Neither,
@@ -94,7 +95,10 @@ impl<'a> CandidateNet<'a> {
                     .await
                     .map_err(anyhow::Error::msg)?;
                 *self.early_restore.lock().unwrap() = Some(empty);
-                if matches!(self.outcome, Outcome::OriginalWins) {
+                if matches!(
+                    self.outcome,
+                    Outcome::OriginalWins | Outcome::OriginalWinsAfterState
+                ) {
                     self.accept(mint, request).await?; // The first reply is lost.
                 }
                 rotate_sat_keyset(&self.mint, 500).await?;
@@ -105,7 +109,7 @@ impl<'a> CandidateNet<'a> {
                 .into())
             }
             3 => match self.outcome {
-                Outcome::OriginalWins => {
+                Outcome::OriginalWins | Outcome::OriginalWinsAfterState => {
                     // B uses the now-active keyset, so the real mint rejects its
                     // inputs as spent. Reveal A only after this execution.
                     let error = self
@@ -119,7 +123,9 @@ impl<'a> CandidateNet<'a> {
                             .is_some_and(|r| r.status == 400 && r.code == Some(11001)),
                         "B must lose because the identical inputs were spent"
                     );
-                    self.visible.store(true, Ordering::SeqCst);
+                    if matches!(self.outcome, Outcome::OriginalWins) {
+                        self.visible.store(true, Ordering::SeqCst);
+                    }
                     Err(error)
                 }
                 Outcome::SuccessorReplayWins | Outcome::Neither => {
@@ -173,6 +179,11 @@ impl DrainSwapNetworking for CandidateNet<'_> {
     {
         Box::pin(async move {
             let call = self.state_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.outcome, Outcome::OriginalWinsAfterState)
+                && self.requests.lock().unwrap().len() >= 3
+            {
+                self.visible.store(true, Ordering::SeqCst);
+            }
             if matches!(self.pause, Pause::BeforeSuccessor) && call == 2 {
                 self.entered.notify_one();
                 std::future::pending::<()>().await;
@@ -252,6 +263,36 @@ impl DrainSwapNetworking for Offline {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
     {
         panic!("unexpected mint state query")
+    }
+}
+
+struct FailedRestores {
+    calls: AtomicUsize,
+    both_fail: bool,
+}
+impl DrainSwapNetworking for FailedRestores {
+    fn call_mint_swap<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
+    {
+        panic!("restore errors must block submission")
+    }
+    fn call_mint_restore<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 || self.both_fail {
+                Err("restore unavailable".to_string())
+            } else {
+                Ok(r#"{"outputs":[],"signatures":[]}"#.to_string())
+            }
+        })
     }
 }
 
@@ -370,6 +411,7 @@ async fn verify_and_spend(
 async fn competing_drain_candidates_recover_either_winner_and_successor_gets_its_own_replay() {
     for outcome in [
         Outcome::OriginalWins,
+        Outcome::OriginalWinsAfterState,
         Outcome::SuccessorReplayWins,
         Outcome::SuccessorReplyLost,
     ] {
@@ -409,7 +451,10 @@ async fn competing_drain_candidates_recover_either_winner_and_successor_gets_its
         assert_eq!(net.accepted.load(Ordering::SeqCst), 1);
         let (_, history) = journal(&ctx);
         assert_candidates(&history);
-        let winner = if matches!(outcome, Outcome::OriginalWins) {
+        let winner = if matches!(
+            outcome,
+            Outcome::OriginalWins | Outcome::OriginalWinsAfterState
+        ) {
             0
         } else {
             1
@@ -556,6 +601,22 @@ async fn competing_drain_budget_exhaustion_retains_both_candidates_and_reopens()
     assert_candidates(&history);
     assert_eq!(history["attempts"][1]["submissions"], 2);
     assert!(history["winner"].is_null());
+    for both_fail in [false, true] {
+        let failure = FailedRestores {
+            calls: AtomicUsize::new(0),
+            both_fail,
+        };
+        assert!(ctx
+            .wallet_manager
+            .recover_submitted_drain(&id, &failure)
+            .await
+            .is_err());
+        assert_eq!(failure.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            journal(&ctx).1 == history,
+            "restore failure changed retained journal"
+        );
+    }
     let reopened = ctx.wallet_manager.reopen().unwrap();
     let result = reopened.recover_submitted_drain(&id, &inner).await.unwrap();
     assert_eq!(journal(&ctx).1["winner"], 1);
@@ -617,7 +678,7 @@ async fn competing_drain_rejects_changed_inputs_and_invalid_winner_before_io() {
         .is_err());
     let (id, original) = journal(&ctx);
     let conn = rusqlite::Connection::open(ctx._temp_db.path()).unwrap();
-    for change in 0..4 {
+    for change in 0..9 {
         let mut broken = original.clone();
         let request = &mut broken["attempts"][1]["prepared"]["swap_request_json"];
         let mut parsed: serde_json::Value =
@@ -636,8 +697,17 @@ async fn competing_drain_rejects_changed_inputs_and_invalid_winner_before_io() {
             _ => {}
         }
         *request = serde_json::json!(parsed.to_string());
-        if change == 3 {
-            broken["winner"] = serde_json::json!(0);
+        match change {
+            3 => broken["winner"] = serde_json::json!(0),
+            4 => broken["attempts"][0]["keyset_rejection"]["submission"] = serde_json::json!(0),
+            5 => broken["attempts"][0]["keyset_rejection"]["submission"] = serde_json::json!(3),
+            6 => {
+                let extra = broken["attempts"][1].clone();
+                broken["attempts"].as_array_mut().unwrap().push(extra);
+            }
+            7 => broken["attempts"][1] = broken["attempts"][0].clone(),
+            8 => broken["attempts"][1]["input_fees"] = serde_json::json!({"bad":999}),
+            _ => {}
         }
         conn.execute(
             "UPDATE monad_relay_drain_journals SET journal_json=?1 WHERE drain_id=?2",
@@ -662,6 +732,30 @@ async fn competing_drain_rejects_changed_inputs_and_invalid_winner_before_io() {
     conn.execute(
         "UPDATE monad_relay_drain_journals SET journal_json=?1 WHERE drain_id=?2",
         params![original.to_string(), id],
+    )
+    .unwrap();
+    let keyset: String = conn
+        .query_row(
+            "SELECT output_keyset_id FROM monad_relay_drains WHERE drain_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE monad_relay_drains SET output_keyset_id='wrong' WHERE drain_id=?1",
+        [&id],
+    )
+    .unwrap();
+    let failure = ctx
+        .wallet_manager
+        .recover_submitted_drain(&id, &Offline)
+        .await
+        .map(|_| ())
+        .expect_err("mirror conflict must reject");
+    assert!(failure.contains("metadata/journal conflict"));
+    conn.execute(
+        "UPDATE monad_relay_drains SET output_keyset_id=?2 WHERE drain_id=?1",
+        params![id, keyset],
     )
     .unwrap();
     let result = ctx

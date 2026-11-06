@@ -95,11 +95,14 @@ fn verify_payout(
     payout: &CompletedClose,
     expiry: u64,
 ) -> Result<(), CloseError> {
-    let prepared = &journal
+    let attempt = journal
         .attempts
         .get(winner)
-        .ok_or_else(|| error("invalid close winner"))?
-        .prepared;
+        .ok_or_else(|| error("invalid close winner"))?;
+    if attempt.submissions == 0 {
+        return Err(error("unsubmitted close winner"));
+    }
+    let prepared = &attempt.prepared;
     let keys = cdk_spilman::parse_keyset_info_from_json(&prepared.output_keyset_info.to_string())
         .map_err(error)?;
     let slots = prepared
@@ -130,6 +133,7 @@ fn verify_payout(
             || total != Some(sum)
             || proofs.iter().zip(expected).any(|(proof, slot)| {
                 proof.keyset_id != keys.keyset_id
+                    || (receiver && proof.verify_p2pk().is_err())
                     || Some(u64::from(proof.amount)) != slot["amount"].as_u64()
                     || Some(proof.secret.to_string().as_str()) != slot["secret"].as_str()
                     || !proof.dleq.as_ref().is_some_and(|d| {
