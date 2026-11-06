@@ -301,13 +301,15 @@ impl RelayWalletManager {
             .iter()
             .try_fold(0u64, |n, p| n.checked_add(u64::from(p.amount)))
             .ok_or("drain input overflow")?;
+        if journal.attempts.len() == 2 && journal.attempts[0].keyset_rejection.is_none() {
+            return Err("invalid drain execution history".to_string());
+        }
         for (index, attempt) in journal.attempts.iter().enumerate() {
             if attempt.keyset_rejection.as_ref().is_some_and(|r| {
                 !r.evidence.inactive_output_keyset()
                     || r.submission == 0
                     || r.submission > attempt.submissions
-            }) || (journal.attempts.len() == 2 && journal.attempts[0].keyset_rejection.is_none())
-            {
+            }) {
                 return Err("invalid drain execution history".to_string());
             }
             let keys = cdk_spilman::parse_keyset_info_from_json(&attempt.keys)?;

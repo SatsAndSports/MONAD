@@ -448,7 +448,7 @@ async fn competing_close_rejects_mutated_requests_history_and_old_journals_befor
         .await
         .is_err());
     let original = journal(&ctx, &channel);
-    for change in 0..7 {
+    for change in 0..10 {
         let mut broken = original.clone();
         match change {
             0 => broken["version"] = serde_json::json!(4),
@@ -463,10 +463,16 @@ async fn competing_close_rejects_mutated_requests_history_and_old_journals_befor
             }
             4 => broken["attempts"][0]["keyset_rejection"]["submission"] = serde_json::json!(0),
             5 => broken["attempts"][0]["keyset_rejection"]["submission"] = serde_json::json!(3),
-            _ => {
+            6 => {
                 broken["attempts"][1]["prepared"]["swap_request"]["inputs"][0]["witness"] =
                     serde_json::Value::Null
             }
+            7 => broken["attempts"] = serde_json::json!([]),
+            8 => {
+                let extra = broken["attempts"][1].clone();
+                broken["attempts"].as_array_mut().unwrap().push(extra);
+            }
+            _ => broken["attempts"][1]["prepared"] = broken["attempts"][0]["prepared"].clone(),
         }
         save_journal(&ctx, &channel, &original, &broken);
         assert!(ctx
@@ -491,12 +497,25 @@ async fn competing_close_rejects_mutated_requests_history_and_old_journals_befor
         .into_closed()
         .unwrap();
     let completed = journal(&ctx, &channel);
-    for change in 0..3 {
+    for change in 0..6 {
         let mut broken = completed.clone();
         match change {
             0 => broken["winner"] = serde_json::json!(0),
             1 => broken["finalizing"]["receiver_sum"] = serde_json::json!(1),
-            _ => broken["finalizing"]["sender_proofs_json"] = serde_json::json!("[]"),
+            2 => broken["finalizing"]["sender_proofs_json"] = serde_json::json!("[]"),
+            3 => broken["attempts"][1]["submissions"] = serde_json::json!(0),
+            4 => {
+                let mut proofs: Vec<cashu::nuts::Proof> = serde_json::from_str(
+                    broken["finalizing"]["receiver_proofs_json"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                proofs[0].witness = None;
+                broken["finalizing"]["receiver_proofs_json"] =
+                    serde_json::json!(serde_json::to_string(&proofs).unwrap());
+            }
+            _ => broken["collection_abandoned"] = serde_json::json!(true),
         }
         // Completed rows are immutable through the production CAS. Corrupt the
         // owned test fixture directly to verify offline read validation.
@@ -506,11 +525,18 @@ async fn competing_close_rejects_mutated_requests_history_and_old_journals_befor
             rusqlite::params![broken.to_string(), channel],
         )
         .unwrap();
-        assert!(ctx
+        let failure = ctx
             .wallet_manager
             .close_channel(&channel, &Offline)
             .await
-            .is_err());
+            .map(|_| ())
+            .expect_err("corrupt completion must reject");
+        if change == 3 {
+            assert!(failure.to_string().contains("unsubmitted close winner"));
+        }
+        if change == 4 {
+            assert!(failure.to_string().contains("proof/winner conflict"));
+        }
         conn.execute(
             "UPDATE spilman_close_journals SET journal=?1 WHERE channel_id=?2",
             rusqlite::params![completed.to_string(), channel],
@@ -525,6 +551,7 @@ async fn competing_close_rejects_mutated_requests_history_and_old_journals_befor
 struct BadRestore<'a> {
     inner: &'a RelayWalletMintClient,
     change: usize,
+    calls: AtomicUsize,
 }
 #[async_trait::async_trait]
 impl cdk_spilman::SpilmanAsyncMintClient for BadRestore<'_> {
@@ -545,6 +572,13 @@ impl RecoveryMintClient for BadRestore<'_> {
         self.inner.check_state(mint, request).await
     }
     async fn restore(&self, mint: &str, request: &str) -> anyhow::Result<String> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.change >= 4 {
+            if call == 0 || self.change == 5 {
+                anyhow::bail!("restore unavailable");
+            }
+            return Ok(r#"{"outputs":[],"signatures":[]}"#.to_string());
+        }
         let response = self.inner.restore(mint, request).await?;
         let mut parsed: RestoreResponse = serde_json::from_str(&response)?;
         assert!(parsed.outputs.len() > 1);
@@ -589,18 +623,18 @@ async fn competing_close_incomplete_mixed_duplicate_or_unverified_restore_stays_
         }
     }
     let saved = journal(&ctx, &channel);
-    for change in 0..4 {
+    for change in 0..6 {
+        let bad = BadRestore {
+            inner: &inner,
+            change,
+            calls: AtomicUsize::new(0),
+        };
         assert!(ctx
             .wallet_manager
-            .close_channel(
-                &channel,
-                &BadRestore {
-                    inner: &inner,
-                    change
-                }
-            )
+            .close_channel(&channel, &bad)
             .await
             .is_err());
+        assert_eq!(bad.calls.load(Ordering::SeqCst), 2);
         assert!(
             journal(&ctx, &channel) == saved,
             "invalid restore mutated recovery state"
