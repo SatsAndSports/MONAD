@@ -217,7 +217,7 @@ snapshot, not a reservation or authority to change a request; pending and invali
 evidence retain the operation. No signature
 count or failure to match known signatures classifies a refund.
 
-Relay close journal v5 stores a `collection_abandoned` policy bit instead of inferred
+Relay close journal v6 stores a `collection_abandoned` policy bit instead of inferred
 refund evidence. After expiry, mixed funding (possible partial refund) or spent
 funding with valid empty restores can stop automatic collection. The channel stays
 `Closing`, preventing further links/payments and excluding it from payout drains.
@@ -1443,7 +1443,7 @@ resume that ID rather than create another drain. Public snapshots, operation res
 and events contain decimal-string aggregate amounts and channel IDs but never output
 proofs, secrets, swap/restore requests, or journal payloads.
 
-Receiver close uses a separate v5 exact-request journal. Storage freezes
+Receiver close uses a separate v6 exact-request journal. Storage freezes
 the accepted payment with Closing and the journal atomically, rejecting later
 payments. The request is authenticated against persisted funding/payment/receiver;
 each submission first records uncertainty. After NUT-07 inspection, spent funding
@@ -1466,7 +1466,16 @@ and valid receiver P2PK witnesses before the atomic Closed/payout commit, allowi
 offline completion. Expiry does not invalidate
 the receiver's signed spending branch. Wallet ownership is retained by derived payment handles,
 with per-channel close singleflight plus durable journal CAS.
-Version 4 close journals reject intact, without automatic migration or reset.
+Version 5 and older close journals reject intact, without automatic migration or reset.
+
+For rerandomized channels, complete spent-input evidence must carry one consistent
+mint R before deriving NUT-09 points. Finalizing binds that R to the winning
+candidate. Offline verification checks that each proof's effective blinding
+reconstructs the expected issued point, as well as checking its DLEQ and receiver
+witness. R is never used to classify a funding spend as a close or refund.
+The wallet exposes authenticated stored mode and explicit mode-taking provisioning
+APIs; normal session admission remains ordinary pending the coordinated protocol
+and offer-policy change described in [the design notes](docs/rerandomized-channels.md).
 
 #### 6. Session Teardown on Control Detach
 

@@ -18,6 +18,7 @@ struct CloseJournal {
     payment: PaymentProof,
     attempts: Vec<CloseAttempt>,
     finalizing: Option<CompletedClose>,
+    finalizing_r: Option<cashu::nuts::nut03::RerandomizationR>,
     winner: Option<usize>,
     completed: bool,
     collection_abandoned: bool,
@@ -77,7 +78,7 @@ fn verify_successor(a: &PreparedClose, b: &PreparedClose) -> Result<(), CloseErr
     for output in outputs {
         output["id"] = a.output_keyset_info["keysetId"].clone();
     }
-    if ar.sig_all_msg_to_sign() != br.sig_all_msg_to_sign()
+    if ar.sig_all_message_hash() != br.sig_all_message_hash()
         || ar.inputs() != br.inputs()
         || serde_json::to_value(a).map_err(|_| error("close encoding"))?
             != serde_json::to_value(normalized).map_err(|_| error("close encoding"))?
@@ -109,6 +110,13 @@ fn verify_payout(
         .secrets_with_blinding
         .as_array()
         .ok_or_else(|| error("invalid close output secrets"))?;
+    let request: SwapRequest = serde_json::from_value(prepared.swap_request.clone())
+        .map_err(|_| error("invalid winning close request"))?;
+    let issued = cdk_spilman::swap_completion::swap_restore_request(&request, journal.finalizing_r)
+        .map_err(|_| error("close finalization mode/randomness mismatch"))?;
+    if slots.len() != issued.outputs.len() {
+        return Err(error("close output binding mismatch"));
+    }
     if payout.channel_id != prepared.channel_id
         || payout.balance != journal.payment.balance
         || payout.expiry_timestamp != expiry
@@ -124,20 +132,22 @@ fn verify_payout(
             serde_json::from_str(json).map_err(|_| error("invalid close finalization proofs"))?;
         let expected = slots
             .iter()
-            .filter(|s| s["is_receiver"].as_bool() == Some(receiver))
+            .zip(&issued.outputs)
+            .filter(|(s, _)| s["is_receiver"].as_bool() == Some(receiver))
             .collect::<Vec<_>>();
         let total = proofs
             .iter()
             .try_fold(0u64, |n, p| n.checked_add(u64::from(p.amount)));
         if proofs.len() != expected.len()
             || total != Some(sum)
-            || proofs.iter().zip(expected).any(|(proof, slot)| {
+            || proofs.iter().zip(expected).any(|(proof, (slot, issued))| {
                 proof.keyset_id != keys.keyset_id
                     || (receiver && proof.verify_p2pk().is_err())
                     || Some(u64::from(proof.amount)) != slot["amount"].as_u64()
                     || Some(proof.secret.to_string().as_str()) != slot["secret"].as_str()
                     || !proof.dleq.as_ref().is_some_and(|d| {
-                        Some(d.r.to_secret_hex().as_str()) == slot["blinding_factor"].as_str()
+                        cashu::dhke::blind_message(&proof.secret.to_bytes(), Some(d.r.clone()))
+                            .is_ok_and(|(point, _)| point == issued.blinded_secret)
                     })
                     || keys
                         .active_keys
@@ -156,6 +166,27 @@ fn verify_payout(
 }
 
 static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+// Called only after upstream has verified exact funding identity coverage.
+fn close_randomness(
+    states: &[cashu::nuts::ProofState],
+    mode: cdk_spilman::CommitmentMode,
+) -> Result<Option<cashu::nuts::nut03::RerandomizationR>, CloseError> {
+    let first = states
+        .first()
+        .ok_or_else(|| error("empty close funding evidence"))?
+        .rerandomization_r;
+    if states
+        .iter()
+        .any(|state| state.state != cashu::nuts::State::Spent || state.rerandomization_r != first)
+        || first.is_some() != (mode == cdk_spilman::CommitmentMode::Rerandomized)
+    {
+        return Err(error(
+            "close funding randomness missing or inconsistent; journal retained",
+        ));
+    }
+    Ok(first)
+}
 struct CloseFlight(String);
 fn error(reason: impl Into<String>) -> CloseError {
     CloseError::storage_failed(reason)
@@ -178,7 +209,7 @@ impl SpilmanRelayPayments {
     pub(crate) fn validate_close_schema(json: &str) -> Result<(), String> {
         let journal: CloseJournal = serde_json::from_str(json)
             .map_err(|_| "incompatible close journal; database retained")?;
-        if journal.version != 5 || journal.attempts.is_empty() || journal.attempts.len() > 2 {
+        if journal.version != 6 || journal.attempts.is_empty() || journal.attempts.len() > 2 {
             return Err("incompatible close journal version; database retained".to_string());
         }
         Ok(())
@@ -231,7 +262,7 @@ impl SpilmanRelayPayments {
                     &self.receiver_secret.public_key(),
                 )?;
                 let journal = CloseJournal {
-                    version: 5,
+                    version: 6,
                     binding: binding.clone(),
                     receiver: self.receiver_secret.public_key().to_hex(),
                     funding,
@@ -242,6 +273,7 @@ impl SpilmanRelayPayments {
                         keyset_rejection: None,
                     }],
                     finalizing: None,
+                    finalizing_r: None,
                     winner: None,
                     completed: false,
                     collection_abandoned: false,
@@ -265,7 +297,7 @@ impl SpilmanRelayPayments {
                 journal
             }
         };
-        if journal.version != 5
+        if journal.version != 6
             || journal.binding != binding
             || journal.receiver != self.receiver_secret.public_key().to_hex()
             || journal.attempts.is_empty()
@@ -307,6 +339,7 @@ impl SpilmanRelayPayments {
             verify_successor(&journal.attempts[0].prepared, &journal.attempts[1].prepared)?;
         }
         if journal.finalizing.is_some() != journal.winner.is_some()
+            || (journal.finalizing.is_none() && journal.finalizing_r.is_some())
             || (journal.completed && journal.finalizing.is_none())
             || (journal.collection_abandoned && journal.finalizing.is_some())
         {
@@ -417,9 +450,10 @@ impl SpilmanRelayPayments {
                 .await?
             {
                 ChannelRecovery::Recovered {
-                    payout: (winner, payout),
+                    payout: (winner, payout, randomness),
                     ..
                 } => {
+                    journal.finalizing_r = randomness;
                     verify_payout(&journal, winner, &payout, channel.params.expiry_timestamp)?;
                     journal.winner = Some(winner);
                     journal.finalizing = Some(payout);
@@ -530,6 +564,9 @@ impl SpilmanRelayPayments {
             {
                 Ok(response) => {
                     let payout = self.bridge.complete_prepared_close(&response, prepared)?;
+                    let response: cashu::nuts::SwapResponse = serde_json::from_str(&response)
+                        .map_err(|_| error("invalid close response"))?;
+                    journal.finalizing_r = response.rerandomization_r;
                     verify_payout(&journal, last, &payout, channel.params.expiry_timestamp)?;
                     journal.winner = Some(last);
                     journal.finalizing = Some(payout);
@@ -573,7 +610,14 @@ impl SpilmanRelayPayments {
         channel: &EstablishedChannel,
         connection: &crate::mint_recovery::ChannelMint<'_, M>,
         mint: &M,
-    ) -> Result<ChannelRecovery<(usize, CompletedClose)>, CloseError> {
+    ) -> Result<
+        ChannelRecovery<(
+            usize,
+            CompletedClose,
+            Option<cashu::nuts::nut03::RerandomizationR>,
+        )>,
+        CloseError,
+    > {
         let funding = channel
             .inspect_funding(connection)
             .await
@@ -585,12 +629,18 @@ impl SpilmanRelayPayments {
             FundingState::Spent => {}
         }
         let mut invalid = false;
+        let randomness =
+            close_randomness(&funding.response().states, channel.params.commitment_mode)?;
         for query in &journal.attempts {
+            let request: SwapRequest = serde_json::from_value(query.prepared.swap_request.clone())
+                .map_err(|_| error("invalid close request"))?;
+            let restore = cdk_spilman::swap_completion::swap_restore_request(&request, randomness)
+                .map_err(|_| error("invalid derived close restore points"))?;
             let response = mint
                 .restore(
                     &channel.params.mint,
-                    &serde_json::json!({"outputs": query.prepared.swap_request["outputs"]})
-                        .to_string(),
+                    &serde_json::to_string(&restore)
+                        .map_err(|_| error("encode close restore query"))?,
                 )
                 .await;
             let Ok(response) = response else {
@@ -618,14 +668,15 @@ impl SpilmanRelayPayments {
             // validates the complete output identities, signatures and split.
             let mut matched_empty = false;
             for (winner, candidate) in journal.attempts.iter().enumerate() {
-                match self
-                    .bridge
-                    .complete_prepared_close_restore(&response, &candidate.prepared)
-                {
+                match self.bridge.complete_prepared_close_restore_with_randomness(
+                    &response,
+                    &candidate.prepared,
+                    randomness,
+                ) {
                     Ok(Some(payout)) => {
                         return Ok(ChannelRecovery::Recovered {
                             funding,
-                            payout: (winner, payout),
+                            payout: (winner, payout, randomness),
                         })
                     }
                     Ok(None) => matched_empty = true,
@@ -640,5 +691,36 @@ impl SpilmanRelayPayments {
             ));
         }
         Ok(ChannelRecovery::SpentNoKnownPayout(funding))
+    }
+}
+#[cfg(test)]
+mod randomness_tests {
+    use super::*;
+    use cashu::nuts::{nut03::RerandomizationR, ProofState, SecretKey, State};
+    use cdk_spilman::CommitmentMode::{Ordinary, Rerandomized};
+
+    #[test]
+    fn every_spent_input_must_bind_the_same_mode_consistent_randomness() {
+        let mut states = vec![
+            ProofState::from((SecretKey::generate().public_key(), State::Spent)),
+            ProofState::from((SecretKey::generate().public_key(), State::Spent)),
+        ];
+        assert!(close_randomness(&[], Rerandomized).is_err());
+        assert_eq!(close_randomness(&states, Ordinary).unwrap(), None);
+        assert!(close_randomness(&states, Rerandomized).is_err());
+        states[0].rerandomization_r = Some(RerandomizationR([1; 32]));
+        assert!(close_randomness(&states, Rerandomized).is_err());
+        states[1].rerandomization_r = Some(RerandomizationR([2; 32]));
+        assert!(close_randomness(&states, Rerandomized).is_err());
+        states[1].rerandomization_r = states[0].rerandomization_r;
+        assert_eq!(
+            close_randomness(&states, Rerandomized).unwrap(),
+            states[0].rerandomization_r
+        );
+        assert!(close_randomness(&states, Ordinary).is_err());
+        for state in [State::Pending, State::Unspent] {
+            states[1].state = state;
+            assert!(close_randomness(&states, Rerandomized).is_err());
+        }
     }
 }

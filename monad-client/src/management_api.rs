@@ -300,6 +300,7 @@ mod tests {
             },
         ];
         let channel = |state| WalletChannel {
+            commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
             channel_id: String::new(),
             state,
             receiver_pubkey: String::new(),

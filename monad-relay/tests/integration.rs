@@ -3418,6 +3418,7 @@ fn mock_wallet_channel(
     keyset_id: String,
 ) -> WalletChannel {
     WalletChannel {
+        commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
         channel_id: fixture_channel_id(channel_id),
         state: WalletChannelState::Open,
         receiver_pubkey,
@@ -12993,7 +12994,7 @@ async fn test_wallet_manager_close_channel_from_closing_state() {
     );
     let saved = storage.get_close_journal(&channel_id).unwrap().unwrap();
     let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
-    assert_eq!(saved["version"], 5);
+    assert_eq!(saved["version"], 6);
     assert_eq!(saved["attempts"][0]["submissions"], 1);
     assert_eq!(saved["payment"]["balance"], funded_balance_raw);
     assert_eq!(

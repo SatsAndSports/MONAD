@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 # Fault-injection builds only. Never enable for a wallet holding real funds.
-funds-lifecycle-test = []
+funds-lifecycle-test = ["monad-common/funds-lifecycle-test"]
 
 [dependencies]
 monad-common = { path = "../monad-common" }

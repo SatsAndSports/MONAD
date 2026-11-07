@@ -207,16 +207,17 @@ and all CDK/Cashu crates to the matching v0.18.1 backport at
 Pins are centralized in the workspace manifest. The fork implementation is
 reviewable in [CDK PR #5](https://github.com/SatsAndSports/cdk/pull/5) and
 [CDK PR #6](https://github.com/SatsAndSports/cdk/pull/6).
-This is an ordinary-channel dependency baseline for the upstream dual-mode library.
-MONAD still provisions ordinary channels and rejects the additional
-`commitment_mode` parameter on channel links; rerandomized admission, recovery,
-and selection policy require a subsequent integration change.
+Normal MONAD sessions still provision ordinary channels and reject the additional
+`commitment_mode` parameter on channel links. Wallet/settlement APIs now support
+explicit rerandomized provisioning and recovery, including restart-safe close
+finalization. Session activation, capability discovery and advertised selection
+policy are the next integration step; see [the agreed design](docs/rerandomized-channels.md).
 
 **Coordinated alpha upgrade:** canonical TLV channel IDs change derived channel
 keys and signatures compared with the earlier library pin. Upgrade clients and
 relays together. Retain matching old binaries, keys and databases to settle/recover
 old channels. No channel migration or automatic database deletion is provided.
-Relay close journal v5 rejects incompatible existing journals, including v4. Use
+Relay close journal v6 rejects incompatible existing journals, including v5. Use
 fresh owned test databases, or explicitly reset disposable data only after deciding
 it is safe.
 The pre-alpha protocol identifier remains `2026-09-14`; it does not promise
@@ -234,7 +235,7 @@ Each candidate has up to two submissions per invocation; B cannot create C.
 Only output keyset IDs and verification keys change: Alice's and Charlie's stored
 signatures remain valid because SIG_ALL does not cover keyset IDs. Recovery checks
 the complete restored payout and records whichever candidate actually won. Close
-journal v5 retains both candidates and that winner; old journals reject intact,
+journal v6 retains both candidates, that winner and its mint randomness; old journals reject intact,
 without automatic migration or reset. Sender refund uses the same bounded A/B
 policy: a validated `12002` on any A execution may authorize B, preserving Alice's
 signature and all output secrets/points while changing only the signing keyset.

@@ -149,6 +149,7 @@ async fn failed_link_preparation_releases_candidate_and_does_not_retry_excluded_
 
 fn channel(id: &str, attached: Option<[u8; 32]>) -> WalletChannel {
     WalletChannel {
+        commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
         channel_id: id.into(),
         state: WalletChannelState::Open,
         receiver_pubkey: "receiver".into(),

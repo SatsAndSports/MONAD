@@ -228,6 +228,7 @@ impl TestSigningWallet {
 
     fn channel_to_wallet_channel(metadata: &ChannelMetadata) -> WalletChannel {
         WalletChannel {
+            commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
             channel_id: metadata.channel_id.clone(),
             state: metadata.state,
             receiver_pubkey: metadata.receiver_pubkey.clone(),

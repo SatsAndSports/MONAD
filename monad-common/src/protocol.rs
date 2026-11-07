@@ -48,6 +48,13 @@ where
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChannelLinkParamsWire {
+    #[cfg(feature = "funds-lifecycle-test")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_test_commitment_mode"
+    )]
+    commitment_mode: Option<cdk_spilman::CommitmentMode>,
     mint: String,
     unit: String,
     capacity: u64,
@@ -61,6 +68,13 @@ struct ChannelLinkParamsWire {
     expiry_timestamp: u64,
 }
 
+#[cfg(feature = "funds-lifecycle-test")]
+fn deserialize_test_commitment_mode<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<cdk_spilman::CommitmentMode>, D::Error> {
+    cdk_spilman::CommitmentMode::deserialize(deserializer).map(Some)
+}
+
 fn deserialize_channel_link_params<'de, D>(
     deserializer: D,
 ) -> Result<serde_json::Map<String, serde_json::Value>, D::Error>
@@ -68,6 +82,16 @@ where
     D: Deserializer<'de>,
 {
     let params = ChannelLinkParamsWire::deserialize(deserializer)?;
+    #[cfg(feature = "funds-lifecycle-test")]
+    if let Some(mode) = params.commitment_mode {
+        if mode != cdk_spilman::CommitmentMode::Rerandomized
+            || std::env::var("MONAD_FUNDS_TEST_COMMITMENT_MODE").as_deref() != Ok("rerandomized")
+        {
+            return Err(serde::de::Error::custom(
+                "commitment mode is not enabled in this protocol",
+            ));
+        }
+    }
     let serde_json::Value::Object(params) =
         serde_json::to_value(params).map_err(serde::de::Error::custom)?
     else {
@@ -646,6 +670,8 @@ mod advertisement_tests {
             ("capacity", json!("100")),
             ("unit", json!(100)),
             ("maximum_amount_for_one_output", json!(null)),
+            ("commitment_mode", json!("rerandomized")),
+            ("commitment_mode", json!(null)),
         ] {
             let mut invalid = valid_link.clone();
             invalid["params"][mutation.0] = mutation.1;

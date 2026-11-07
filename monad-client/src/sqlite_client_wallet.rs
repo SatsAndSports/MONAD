@@ -449,7 +449,8 @@ impl ClientWalletInspection {
                 row.map_err(|e| WalletError::Backend(format!("decode channel row: {e}")))?;
             apply_channel_recovery_state(&conn, &mut meta)?;
             let upstream = checked_upstream_info(&conn, &meta.channel_id)?;
-            wallet_channel_from_meta(meta, Some(upstream))
+            let mode = stored_commitment_mode(&conn, &meta.channel_id)?;
+            wallet_channel_from_meta(meta, Some(upstream), mode)
         })
         .collect()
     }
@@ -586,6 +587,7 @@ enum SubmitOpenAttemptError {
 
 #[derive(Debug, Clone, Copy)]
 struct ClientOpenPlan {
+    commitment_mode: cdk_spilman::CommitmentMode,
     requested_capacity_raw: Option<u64>,
     desired_funding_token_amount_raw: Option<u64>,
     funding_token_target_msats: u64,
@@ -1075,6 +1077,21 @@ impl SqliteClientWallet {
         offer: &RelayPaymentOffer,
         target_capacity_msats: u64,
     ) -> Result<String, WalletError> {
+        self.provision_channel_with_target_capacity_in_mode(
+            offer,
+            target_capacity_msats,
+            cdk_spilman::CommitmentMode::Ordinary,
+        )
+    }
+
+    /// Explicit mode selection before funding; mint capability must be checked by
+    /// the caller. Existing opening preparations are never changed by this choice.
+    pub fn provision_channel_with_target_capacity_in_mode(
+        &self,
+        offer: &RelayPaymentOffer,
+        target_capacity_msats: u64,
+        mode: cdk_spilman::CommitmentMode,
+    ) -> Result<String, WalletError> {
         let target_capacity_raw = msats_to_raw_units(&offer.unit, target_capacity_msats)
             .map_err(|error| preflight_offer_error(offer, error))?;
         if target_capacity_raw == 0 {
@@ -1102,6 +1119,7 @@ impl SqliteClientWallet {
             target_capacity_raw,
             output_keyset,
             expiry_timestamp,
+            mode,
         )?;
         self.execute_open_attempt(offer, attempt, true)
     }
@@ -2751,6 +2769,48 @@ impl SqliteClientWallet {
             .map_err(SubmitOpenAttemptError::Open)
     }
 
+    fn prepare_channel_in_mode(
+        &self,
+        offer: &RelayPaymentOffer,
+        proofs: &str,
+        input_keysets: &str,
+        output_keyset: &str,
+        plan: ClientOpenPlan,
+    ) -> Result<PreparedOpenChannel, WalletError> {
+        let secret = cdk_spilman::compute_channel_secret_from_hex(
+            &self.sender_secret.to_secret_hex(),
+            &offer.receiver_pubkey,
+        )
+        .map_err(WalletError::Backend)?;
+        let computed = cdk_spilman::compute_channel_from_proofs_with_mode(
+            &offer.mint_url,
+            &offer.unit,
+            proofs,
+            input_keysets,
+            &offer.receiver_pubkey,
+            &self.sender_pubkey_hex,
+            &secret,
+            plan.expiry_timestamp,
+            output_keyset,
+            0,
+            plan.requested_capacity_raw,
+            plan.desired_funding_token_amount_raw,
+            plan.commitment_mode,
+        )
+        .map_err(WalletError::Backend)?;
+        self.bridge
+            .lock()
+            .map_err(|_| WalletError::Backend("bridge mutex poisoned".into()))?
+            .prepare_open_channel_from_compute_result(
+                &computed,
+                &secret,
+                output_keyset,
+                proofs,
+                &self.sender_pubkey_hex,
+            )
+            .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))
+    }
+
     fn prepare_open_attempt(
         &self,
         offer: &RelayPaymentOffer,
@@ -2793,29 +2853,15 @@ impl SqliteClientWallet {
                 .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))
                 .map_err(&preflight_error)?;
 
-        let prepared = {
-            let bridge = self
-                .bridge
-                .lock()
-                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))
-                .map_err(&preflight_error)?;
-            bridge
-                .prepare_open_channel_from_proofs_with_input_keysets(
-                    &offer.mint_url,
-                    &offer.unit,
-                    &input_proofs_json,
-                    &input_keysets_json,
-                    &offer.receiver_pubkey,
-                    &self.sender_pubkey_hex,
-                    plan.expiry_timestamp,
-                    &output_keyset.info_json,
-                    0,
-                    plan.requested_capacity_raw,
-                    plan.desired_funding_token_amount_raw,
-                )
-                .map_err(|e| open_channel_error(e, &offer.unit, plan.selected_input_msats))
-                .map_err(&preflight_error)?
-        };
+        let prepared = self
+            .prepare_channel_in_mode(
+                offer,
+                &input_proofs_json,
+                &input_keysets_json,
+                &output_keyset.info_json,
+                plan,
+            )
+            .map_err(&preflight_error)?;
         let prepared_open_json = serde_json::to_string(&prepared)
             .map_err(|e| WalletError::Backend(format!("serialize opening attempt: {e}")))
             .map_err(&preflight_error)?;
@@ -3555,27 +3601,24 @@ impl SqliteClientWallet {
         // an exact capacity: retain nominal funding and derive its new capacity.
         let desired_funding_token_amount_raw =
             Some(predecessor.prepared.opening.funding_token_amount);
-        let prepared = {
-            let bridge = self
-                .bridge
-                .lock()
-                .map_err(|_| WalletError::Backend("bridge mutex poisoned".to_string()))?;
-            bridge
-                .prepare_open_channel_from_proofs_with_input_keysets(
-                    &offer.mint_url,
-                    &offer.unit,
-                    &input_proofs_json,
-                    &input_keysets_json,
-                    &offer.receiver_pubkey,
-                    &self.sender_pubkey_hex,
-                    predecessor.expiry_timestamp,
-                    &output_keyset.info_json,
-                    0,
-                    None,
-                    desired_funding_token_amount_raw,
-                )
-                .map_err(|e| open_channel_error(e, &offer.unit, predecessor.selected_input_msats))?
-        };
+        let predecessor_params: serde_json::Value =
+            serde_json::from_str(&predecessor.prepared.opening.params_json)
+                .map_err(|_| WalletError::Backend("invalid predecessor parameters".into()))?;
+        let mode = commitment_mode_from_params(&predecessor_params)?;
+        let prepared = self.prepare_channel_in_mode(
+            offer,
+            &input_proofs_json,
+            &input_keysets_json,
+            &output_keyset.info_json,
+            ClientOpenPlan {
+                commitment_mode: mode,
+                requested_capacity_raw: None,
+                desired_funding_token_amount_raw,
+                funding_token_target_msats: predecessor.funding_token_target_msats,
+                selected_input_msats: predecessor.selected_input_msats,
+                expiry_timestamp: predecessor.expiry_timestamp,
+            },
+        )?;
         verify_opening_successor(&predecessor.prepared, &prepared)?;
         let journal = NewOpeningAttempt {
             attempt_id: prepared.channel_id.clone(),
@@ -3739,6 +3782,7 @@ impl SqliteClientWallet {
         target_capacity_raw: u64,
         output_keyset: SelectedOutputKeyset,
         expiry_timestamp: u64,
+        commitment_mode: cdk_spilman::CommitmentMode,
     ) -> Result<ClientOpenAttempt, WalletError> {
         let required_post_swap_raw =
             compute_funding_token_amount(target_capacity_raw, &output_keyset.info_json, 0)
@@ -3792,6 +3836,7 @@ impl SqliteClientWallet {
             output_keyset,
             reservation,
             ClientOpenPlan {
+                commitment_mode,
                 requested_capacity_raw: Some(target_capacity_raw),
                 desired_funding_token_amount_raw: Some(required_post_swap_raw),
                 funding_token_target_msats: raw_to_msats(&offer.unit, required_post_swap_raw)
@@ -3997,6 +4042,19 @@ impl MonadWallet for SqliteClientWallet {
         offer: &RelayPaymentOffer,
         funding_token_target_msats: u64,
     ) -> Result<String, WalletError> {
+        self.provision_channel_in_mode(
+            offer,
+            funding_token_target_msats,
+            crate::wallet::baseline_session_mode(),
+        )
+    }
+
+    fn provision_channel_in_mode(
+        &self,
+        offer: &RelayPaymentOffer,
+        funding_token_target_msats: u64,
+        commitment_mode: cdk_spilman::CommitmentMode,
+    ) -> Result<String, WalletError> {
         let funding_token_target_raw = msats_to_raw_units(&offer.unit, funding_token_target_msats)
             .map_err(|error| preflight_offer_error(offer, error))?;
         let expiry_timestamp = Self::expiry_for_offer(offer)?;
@@ -4066,6 +4124,7 @@ impl MonadWallet for SqliteClientWallet {
                 total_amount_raw: selection.input_value_raw,
             },
             ClientOpenPlan {
+                commitment_mode,
                 requested_capacity_raw: None,
                 desired_funding_token_amount_raw: Some(funding_token_target_raw),
                 funding_token_target_msats,
@@ -4171,7 +4230,8 @@ impl SqliteClientWallet {
     ) -> Result<WalletChannel, WalletError> {
         apply_channel_recovery_state(conn, &mut meta)?;
         let upstream = upstream_info(&self.bridge, &meta.channel_id);
-        wallet_channel_from_meta(meta, upstream)
+        let mode = stored_commitment_mode(conn, &meta.channel_id)?;
+        wallet_channel_from_meta(meta, upstream, mode)
     }
 }
 
@@ -4197,9 +4257,52 @@ fn apply_channel_recovery_state(
     Ok(())
 }
 
+fn stored_commitment_mode(
+    conn: &Connection,
+    channel_id: &str,
+) -> Result<cdk_spilman::CommitmentMode, WalletError> {
+    let json: String = conn
+        .query_row(
+            "SELECT funding_json FROM spilman_client_channels WHERE channel_id = ?1",
+            [channel_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| WalletError::Backend("missing stored funding for channel mode".into()))?;
+    let funding: ClientChannelFunding = serde_json::from_str(&json)
+        .map_err(|_| WalletError::Backend("invalid stored funding for channel mode".into()))?;
+    let id = cdk_spilman::channel_parameters_get_channel_id(
+        &funding.params_json,
+        &funding.channel_secret_hex,
+        &funding.keyset_info_json,
+    )
+    .map_err(|_| WalletError::Backend("invalid stored channel identity".into()))?;
+    if id != channel_id {
+        return Err(WalletError::Backend(
+            "stored channel identity mismatch".into(),
+        ));
+    }
+    let params = serde_json::from_str(&funding.params_json)
+        .map_err(|_| WalletError::Backend("invalid stored channel parameters".into()))?;
+    commitment_mode_from_params(&params)
+}
+
+fn commitment_mode_from_params(
+    params: &serde_json::Value,
+) -> Result<cdk_spilman::CommitmentMode, WalletError> {
+    if !params.is_object() {
+        return Err(WalletError::Backend("invalid channel parameters".into()));
+    }
+    match params.get("commitment_mode") {
+        None => Ok(cdk_spilman::CommitmentMode::Ordinary),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| WalletError::Backend("invalid channel commitment mode".into())),
+    }
+}
+
 fn wallet_channel_from_meta(
     meta: ChannelMeta,
     upstream: Option<ClientChannelInfo>,
+    commitment_mode: cdk_spilman::CommitmentMode,
 ) -> Result<WalletChannel, WalletError> {
     let current_balance_raw = upstream.as_ref().map(|i| i.current_balance).unwrap_or(0);
     let current_signed_balance_msats = raw_to_msats(&meta.unit, current_balance_raw)
@@ -4217,6 +4320,7 @@ fn wallet_channel_from_meta(
     };
 
     Ok(WalletChannel {
+        commitment_mode,
         channel_id: meta.channel_id,
         state,
         receiver_pubkey: meta.receiver_pubkey,
@@ -4456,7 +4560,15 @@ fn verify_opening_successor(
         .map_err(|_| WalletError::Backend("invalid opening A request".to_string()))?;
     let br: cashu::nuts::SwapRequest = serde_json::from_str(&b.swap_request_json)
         .map_err(|_| WalletError::Backend("invalid opening B request".to_string()))?;
-    if ar.inputs() != br.inputs()
+    let mode = |opening: &PreparedOpenChannel| {
+        let params = serde_json::from_str(&opening.opening.params_json)
+            .map_err(|_| WalletError::Backend("invalid opening parameters".into()))?;
+        commitment_mode_from_params(&params)
+    };
+    if mode(a)? != mode(b)?
+        || ar.is_rerandomized()
+        || br.is_rerandomized()
+        || ar.inputs() != br.inputs()
         || a.keyset_id == b.keyset_id
         || a.opening.funding_token_amount != b.opening.funding_token_amount
         || a.opening.change_amount_raw != b.opening.change_amount_raw
@@ -6552,6 +6664,41 @@ mod tests {
             mint_url: ctx.mint_url.clone(),
             client: reqwest::Client::new(),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stored_commitment_mode_cannot_be_changed_without_changing_channel_identity() {
+        let ctx = open_short_expiry_test_channel(16, 86_400).await;
+        assert_eq!(
+            ctx.wallet
+                .get_channel(&ctx.channel_id)
+                .unwrap()
+                .commitment_mode,
+            cdk_spilman::CommitmentMode::Ordinary
+        );
+        {
+            let conn = ctx.wallet.conn().unwrap();
+            let json: String = conn
+                .query_row(
+                    "SELECT funding_json FROM spilman_client_channels WHERE channel_id=?1",
+                    [&ctx.channel_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut funding: ClientChannelFunding = serde_json::from_str(&json).unwrap();
+            let mut params: serde_json::Value = serde_json::from_str(&funding.params_json).unwrap();
+            params["commitment_mode"] = serde_json::json!("rerandomized");
+            funding.params_json = params.to_string();
+            conn.execute(
+                "UPDATE spilman_client_channels SET funding_json=?2 WHERE channel_id=?1",
+                params![ctx.channel_id, serde_json::to_string(&funding).unwrap()],
+            )
+            .unwrap();
+        }
+        assert!(ctx.wallet.get_channel(&ctx.channel_id).is_err());
+        assert!(ctx.wallet.list_channels().is_err());
+        let _ = ctx.shutdown_tx.send(());
+        ctx.mint_task.await.unwrap().unwrap();
     }
 
     fn refund_test_locks(ctx: &OpenedTestChannel) -> crate::wallet_lock::ClientWalletLocks {
@@ -10317,6 +10464,7 @@ mod tests {
                         32,
                         output_keyset,
                         SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+                        cdk_spilman::CommitmentMode::Ordinary,
                     )
                     .unwrap();
                 let OpeningSubmissionClaim::Acquired(permit) = wallet
@@ -10539,6 +10687,7 @@ mod tests {
                 31,
                 output_keyset,
                 SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+                cdk_spilman::CommitmentMode::Ordinary,
             )
             .unwrap();
         let prepared = attempt.prepared.clone();
@@ -10925,6 +11074,7 @@ mod tests {
                 32,
                 output_keyset,
                 SqliteClientWallet::now_seconds().unwrap() + CHANNEL_EXPIRY_SECONDS,
+                cdk_spilman::CommitmentMode::Ordinary,
             )
             .unwrap();
         let losing_attempt = attempt.clone();
