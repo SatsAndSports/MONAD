@@ -198,12 +198,20 @@ fn successful_exit_does_not_erase_another_tunnels_last_failure() {
     let error = monad_common::rejection::RejectionCode::DestinationPolicyDenied
         .rejection()
         .into_io();
-    owner.note_exit_result(&[3; 32], "denied.example:443", Some(&error));
+    owner.note_exit_result(
+        &[3; 32],
+        "denied.example:443",
+        Some(&error),
+        Some(&crate::socks_diagnostics::SocksDiagnostic::connect_failure(
+            &error,
+            Some(403),
+        )),
+    );
     let failure = owner
         .runtime_snapshot()
         .last_exit_failure
         .expect("recorded exit failure");
-    owner.note_exit_result(&[4; 32], "allowed.example:443", None);
+    owner.note_exit_result(&[4; 32], "allowed.example:443", None, None);
     assert_eq!(
         owner.runtime_snapshot().last_exit_failure.as_ref(),
         Some(&failure)
@@ -224,9 +232,25 @@ fn stale_exit_failure_cannot_overwrite_replacement_route() {
         .rejection()
         .into_io();
 
-    owner.note_exit_result(&[1; 32], "stale.example:443", Some(&error));
+    owner.note_exit_result(
+        &[1; 32],
+        "stale.example:443",
+        Some(&error),
+        Some(&crate::socks_diagnostics::SocksDiagnostic::connect_failure(
+            &error,
+            Some(403),
+        )),
+    );
     assert!(owner.runtime_snapshot().last_exit_failure.is_none());
-    owner.note_exit_result(&[2; 32], "current.example:443", Some(&error));
+    owner.note_exit_result(
+        &[2; 32],
+        "current.example:443",
+        Some(&error),
+        Some(&crate::socks_diagnostics::SocksDiagnostic::connect_failure(
+            &error,
+            Some(403),
+        )),
+    );
     let failure = owner.runtime_snapshot().last_exit_failure.unwrap();
     assert_eq!(failure.route_generation, 2);
     assert_eq!(failure.destination, "current.example:443");
@@ -242,11 +266,27 @@ fn withdrawn_route_rejects_late_exit_failure() {
     let error = monad_common::rejection::RejectionCode::DestinationPolicyDenied
         .rejection()
         .into_io();
-    owner.note_exit_result(&[1; 32], "old.example:443", Some(&error));
+    owner.note_exit_result(
+        &[1; 32],
+        "old.example:443",
+        Some(&error),
+        Some(&crate::socks_diagnostics::SocksDiagnostic::connect_failure(
+            &error,
+            Some(403),
+        )),
+    );
     assert!(owner.runtime_snapshot().last_exit_failure.is_some());
     owner.withdraw_active_route(generation, || {});
     assert!(owner.runtime_snapshot().last_exit_failure.is_none());
-    owner.note_exit_result(&[1; 32], "stale.example:443", Some(&error));
+    owner.note_exit_result(
+        &[1; 32],
+        "stale.example:443",
+        Some(&error),
+        Some(&crate::socks_diagnostics::SocksDiagnostic::connect_failure(
+            &error,
+            Some(403),
+        )),
+    );
     assert!(owner.runtime_snapshot().last_exit_failure.is_none());
 }
 
@@ -271,6 +311,7 @@ fn recovery_retains_last_failure_while_lifecycle_returns_active() {
     owner.connecting(generation, 0, false);
     owner.publish_active_route(generation, "first".into(), || {});
     let failure = ClientFailure {
+        connection_failure: None,
         stage: ClientFailureStage::Route,
         message: "funded hop failed".into(),
         hop: Some(2),
@@ -290,4 +331,35 @@ fn recovery_retains_last_failure_while_lifecycle_returns_active() {
         .iter()
         .filter(|event| event.kind == "client_lifecycle_changed")
         .any(|event| event.data["lifecycle"]["state"] == "rebuilding_suffix"));
+}
+#[test]
+fn management_retains_unclassified_local_exit_failures_without_inventing_a_rejection() {
+    let owner = Arc::new(ClientManagement::default());
+    let generation = owner.begin_run().unwrap();
+    owner.connecting(generation, 0, false);
+    let _lease = owner.register([3; 32], "hop 1");
+    owner.publish_active_route(generation, hex::encode([3; 32]), || {});
+    let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "secret sentinel");
+    let diagnostic = crate::socks_diagnostics::SocksDiagnostic::connect_failure(&error, None);
+    owner.note_exit_result(&[3; 32], "example.com:443", Some(&error), Some(&diagnostic));
+    let failure = owner.runtime_snapshot().last_exit_failure.unwrap();
+    assert_eq!(failure.rejection, None);
+    assert_eq!(failure.diagnostic.code, None);
+    assert_eq!(failure.diagnostic.context.as_ref().unwrap().origin, "local");
+    assert_eq!(
+        failure.diagnostic.context.as_ref().unwrap().reporting_hop,
+        None
+    );
+    assert!(!serde_json::to_string(&failure)
+        .unwrap()
+        .contains("sentinel"));
+    owner.note_exit_result(&[3; 32], "secret sentinel", Some(&error), Some(&diagnostic));
+    assert_eq!(
+        owner
+            .runtime_snapshot()
+            .last_exit_failure
+            .unwrap()
+            .destination,
+        "[invalid endpoint]"
+    );
 }

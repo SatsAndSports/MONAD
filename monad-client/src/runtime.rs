@@ -413,6 +413,7 @@ fn public_failure(
         message.truncate(boundary);
     }
     ClientFailure {
+        connection_failure: None,
         stage,
         message,
         hop,
@@ -427,6 +428,42 @@ fn unix_ms_after(duration: Duration) -> u64 {
         .as_millis()
         .saturating_add(duration.as_millis())
         .min(u64::MAX as u128) as u64
+}
+
+fn public_connection_failure(
+    stage: ClientFailureStage,
+    error: &std::io::Error,
+    hop: Option<usize>,
+    retryable: bool,
+) -> ClientFailure {
+    let mut failure = public_failure(stage, error, hop, retryable);
+    failure.connection_failure = crate::socks_diagnostics::RouteFailureDetail::from_io(error);
+    if let Some(detail) = &failure.connection_failure {
+        failure.message = detail.message.clone();
+        failure.hop = detail.context.target_hop;
+    }
+    failure
+}
+
+fn unavailable_route_diagnostic(
+    snapshot: Option<crate::management::ClientRuntimeSnapshot>,
+) -> crate::socks_diagnostics::SocksDiagnostic {
+    let mut diagnostic = crate::socks_diagnostics::SocksDiagnostic::simple(
+        "route",
+        "No active MONAD route is available.",
+    );
+    if let Some(snapshot) = snapshot {
+        diagnostic.last_route_failure = snapshot
+            .last_failure
+            .and_then(|failure| failure.connection_failure);
+        if let crate::management::ClientLifecycle::BlockedByPolicy { refusal } = snapshot.lifecycle
+        {
+            diagnostic.last_route_failure = crate::socks_diagnostics::RouteFailureDetail::from_io(
+                &std::io::Error::other(refusal),
+            );
+        }
+    }
+    diagnostic
 }
 
 /// The traffic engine connects back to the client's own SOCKS listener. If the
@@ -654,7 +691,7 @@ where
                 }
                 management.record_failure(
                     run_generation,
-                    public_failure(ClientFailureStage::Connect, &err, None, true),
+                    public_connection_failure(ClientFailureStage::Connect, &err, None, true),
                 );
                 warn!("failed to connect route: {err}");
             }
@@ -836,7 +873,7 @@ where
                             let snapshot = stats.record_suffix_rebuild_failure_with_fallback();
                             management.record_failure(
                                 run_generation,
-                                public_failure(
+                                public_connection_failure(
                                     ClientFailureStage::SuffixRebuild,
                                     &err,
                                     Some(hop_idx + 1),
@@ -869,10 +906,16 @@ where
             let error = anyhow::anyhow!(
                 "route failed before first successful connect: max startup attempts ({MAX_STARTUP_CONNECT_ATTEMPTS}) exceeded"
             );
-            management.failed(
-                run_generation,
-                public_failure(ClientFailureStage::Connect, &error, None, false),
-            );
+            let mut failure = public_failure(ClientFailureStage::Connect, &error, None, false);
+            failure.connection_failure = management
+                .runtime_snapshot()
+                .last_failure
+                .and_then(|failure| failure.connection_failure);
+            failure.hop = failure
+                .connection_failure
+                .as_ref()
+                .and_then(|detail| detail.context.target_hop);
+            management.failed(run_generation, failure);
             return Err(error);
         }
 
@@ -974,8 +1017,9 @@ async fn run_socks_listener_shared(
                         let conn = match wait_for_active_route(conn_rx, shutdown_rx).await {
                             Some(conn) => conn,
                             None => {
+                                let diagnostic = unavailable_route_diagnostic(management.as_deref().map(|management| management.runtime_snapshot()));
                                 socks::send_failure(&mut stream, target.reply_mode, 0x05,
-                                    &crate::socks_diagnostics::SocksDiagnostic::simple("route", "No active MONAD route is available.")).await?;
+                                    &diagnostic).await?;
                                 warn!(
                                     "SOCKS client {peer_addr} rejected: route is reconnecting"
                                 );
@@ -1596,5 +1640,37 @@ mod tests {
                 .unwrap();
             let _rebound = TcpListener::bind(listen).await.unwrap();
         }
+    }
+    #[test]
+    fn unavailable_route_keeps_previous_remote_failure_explicitly_historical() {
+        let error = crate::admission::RouteRefusal::annotate(
+            monad_common::rejection::RejectionCode::QuicAuthenticationFailed
+                .rejection()
+                .into_io(),
+            1,
+            2,
+            "connect",
+            "private endpoint".into(),
+        );
+        let snapshot = crate::management::ClientRuntimeSnapshot {
+            last_failure: Some(public_connection_failure(
+                ClientFailureStage::Connect,
+                &error,
+                None,
+                true,
+            )),
+            ..Default::default()
+        };
+        let diagnostic = unavailable_route_diagnostic(Some(snapshot));
+        assert_eq!(diagnostic.context.as_ref().unwrap().origin, "local");
+        assert_eq!(diagnostic.context.as_ref().unwrap().reporting_hop, None);
+        assert_eq!(diagnostic.code, None);
+        let prior = diagnostic.last_route_failure.as_ref().unwrap();
+        assert_eq!(prior.context.reporting_hop, Some(1));
+        assert_eq!(prior.context.target_hop, Some(2));
+        assert_eq!(prior.code.as_deref(), Some("QUIC_AUTHENTICATION_FAILED"));
+        assert!(!serde_json::to_string(&diagnostic)
+            .unwrap()
+            .contains("private endpoint"));
     }
 }

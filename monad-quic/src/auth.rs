@@ -14,6 +14,16 @@ pub const STREAM_ERROR_BAD_AUTH: u64 = 0x23;
 pub const EXPORTER_LABEL: &[u8] = b"monad-quic-secp256k1-auth-v1";
 pub const EXPORTER_LEN: usize = 32;
 
+/// A complete attestation was received but did not verify for the pinned key.
+#[derive(Debug)]
+pub struct AttestationVerificationFailed;
+impl std::fmt::Display for AttestationVerificationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("secp256k1 attestation verification failed")
+    }
+}
+impl std::error::Error for AttestationVerificationFailed {}
+
 pub fn stream_error_code(code: u64) -> quinn::VarInt {
     quinn::VarInt::from_u64(code).expect("valid QUIC application error code")
 }
@@ -57,7 +67,7 @@ pub async fn authenticate_connection(
     let exporter = export_binding(conn)?;
     let digest = transport_auth_digest(EXPORTER_LABEL, &challenge, &exporter);
     verify_transport_auth_digest(expected_pubkey, &digest, &signature)
-        .map_err(|e| anyhow!("secp256k1 attestation verification failed: {e}"))?;
+        .map_err(|_| AttestationVerificationFailed)?;
     info!(remote = %conn.remote_address(), expected_pubkey = %expected_pubkey, "completed QUIC secp256k1 attestation");
     Ok(())
 }

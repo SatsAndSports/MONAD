@@ -67,6 +67,8 @@ Example diagnostic:
   than raw upstream bodies, URLs, credentials, or arbitrary transport error text.
 - `http_status`: original relay CONNECT status when known, otherwise null/absent;
   an integer in 100–599 when present.
+- Optional `context` and `last_route_failure` provide bounded attribution and
+  explicitly historical route-setup context; see [connection failures](connect-failures.md).
 
 Receivers preserve unknown valid codes/stages and ignore unknown fields for
 forward-compatible diagnostics. Diagnostics are advisory; they do not authorize
@@ -97,13 +99,14 @@ The legacy `socks5_handshake` and `open_tunnel` entry points remain standard-onl
 
 Existing structured MONAD limits, disabled-admission states, initial-payment
 requirements and destination-policy refusals retain their exact code and canonical
-description. An unstructured HTTP 502 stays an HTTP 502: this revision does not
-guess whether it was DNS, TCP refusal, QUIC authentication, or timeout. A missing
-active local route is explicitly identified as a `route`-stage failure.
+description. Typed TCP/QUIC setup failures now retain the categories and attribution
+described in [connection failures](connect-failures.md). An unstructured HTTP 502
+stays an HTTP 502; unknown causes are not inferred. A missing active local route is
+explicitly identified as a `route`-stage failure.
 
-Existing SOCKS mappings remain: destination-policy denial is 0x02, other relay
-CONNECT refusals are 0x05. Local tunnel-setup failures receive 0x01. Richer underlying
-failure categories and hop attribution are a subsequent change.
+Destination-policy denial is 0x02; TCP refusal and existing admission/limit
+refusals are 0x05; typed TCP resolution/unreachability is 0x04; typed TCP timeouts,
+generic TCP errors, QUIC failures and local tunnel-setup failures are 0x01.
 
 ## Testing and issue #171
 

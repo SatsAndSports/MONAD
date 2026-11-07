@@ -112,6 +112,8 @@ pub struct RelayConnection {
     close_lock: tokio::sync::Mutex<()>,
     /// Noise handshake hash — unique session identifier agreed by both sides.
     session_id: [u8; 32],
+    // Local route-constructor context, not a relay-supplied claim.
+    route_hop: Option<usize>,
     /// Session pricing metadata, set by the control task after receiving
     /// `SessionStatus` from the relay.
     session_pricing: Arc<RwLock<Option<SessionPricing>>>,
@@ -134,6 +136,14 @@ pub struct RelayConnection {
 }
 
 impl RelayConnection {
+    pub fn set_route_hop(&mut self, hop: usize) {
+        self.route_hop = (hop > 0).then_some(hop);
+    }
+
+    pub fn route_hop(&self) -> Option<usize> {
+        self.route_hop
+    }
+
     pub async fn from_transport_stream<T>(
         stream: T,
         session_id: [u8; 32],
@@ -164,6 +174,7 @@ impl RelayConnection {
         });
 
         let conn = Self {
+            route_hop: None,
             h2_client: Arc::new(tokio::sync::Mutex::new(h2_client)),
             driver_handles: Mutex::new(Vec::new()),
             task_handles: Mutex::new(Vec::new()),
