@@ -9720,6 +9720,21 @@ impl ConfiguredRouteFixture {
         fixture_config: ConfiguredRouteFixtureConfig,
         payment_observer: Option<Arc<payment_conflict::PaymentObserver>>,
     ) -> Self {
+        Self::start_with_options(fixture_config, payment_observer, None).await
+    }
+
+    async fn start_with_session_setup_limit(
+        fixture_config: ConfiguredRouteFixtureConfig,
+        max_setups_per_session: u32,
+    ) -> Self {
+        Self::start_with_options(fixture_config, None, Some(max_setups_per_session)).await
+    }
+
+    async fn start_with_options(
+        fixture_config: ConfiguredRouteFixtureConfig,
+        payment_observer: Option<Arc<payment_conflict::PaymentObserver>>,
+        max_setups_per_session: Option<u32>,
+    ) -> Self {
         use std::fs;
 
         assert!(
@@ -9889,6 +9904,12 @@ relays:
         drop(socks_listener);
 
         let mut config = MonadConfig::load(&config_path).unwrap();
+        // Apply fixture overrides before constructing the relay's admission limits.
+        if let Some(limit) = max_setups_per_session {
+            for relay in &mut config.relays {
+                relay.connect_limits.max_setups_per_session = limit;
+            }
+        }
         if payment_observer.is_some() {
             for relay in &mut config.relays {
                 relay.pricing.in_bytes_per_millisat = 1;

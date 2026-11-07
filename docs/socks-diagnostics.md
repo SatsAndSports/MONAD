@@ -109,10 +109,12 @@ failure categories and hop attribution are a subsequent change.
 
 Most tests use ordinary SOCKS. Only the 32 concurrent probes of
 `tcp_sse_api_drives_real_manual_funding_disable_and_channel_close` now require
-the extension. Their payloads, concurrency, limits, 15-second batch timeout and
-success assertions are unchanged. No retries are added. Extra negotiation can
-affect scheduling, so a passing run is not evidence that the intermittent issue
-is fixed.
+the extension. Their payloads, concurrency, 15-second batch timeout and success
+assertions are unchanged. No retries are added. Diagnostics confirmed that an
+overlapping burst exceeded the default 16 session setup slots; this fixture now
+explicitly allows 32 setups before starting its relay. Production defaults remain
+16. The test exercises successful concurrent traffic, while the dedicated limit
+tests exercise capacity refusals independently of scheduling.
 
 Separate tests cover framing, version negotiation, strict opt-in, both address
 families and hostnames, unchanged application bytes, ordinary reply compatibility,

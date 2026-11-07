@@ -97,14 +97,19 @@ async fn command(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tcp_sse_api_drives_real_manual_funding_disable_and_channel_close() {
-    let fixture = ConfiguredRouteFixture::start(ConfiguredRouteFixtureConfig {
-        subnet: 80,
-        hop_count: 1,
-        proof_batches: 1,
-        wallet_seed: 80,
-        channel_funding_token_target_msats: 5_000_000,
-        label: "management-api",
-    })
+    // All 32 probes below must succeed even when their setups overlap. The
+    // production default of 16 correctly refuses excess setups (issue #171).
+    let fixture = ConfiguredRouteFixture::start_with_session_setup_limit(
+        ConfiguredRouteFixtureConfig {
+            subnet: 80,
+            hop_count: 1,
+            proof_batches: 1,
+            wallet_seed: 80,
+            channel_funding_token_target_msats: 5_000_000,
+            label: "management-api",
+        },
+        32,
+    )
     .await;
     let socket_dir = tempfile::tempdir().unwrap();
     let client_socket = socket_dir.path().join("client.sock");
