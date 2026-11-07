@@ -272,6 +272,7 @@ The test suite currently covers:
 - mixed-family hop chains
 - hostname resolution at the final hop
 - SOCKS5 IPv6 parsing
+- opt-in local SOCKS diagnostics v1 (private method 0x80, `MONAD\x01` sub-negotiation): default client stays standard, extended client requires negotiation, failures append bounded length-prefixed JSON, success bytes stay untouched. Details in `docs/socks-diagnostics.md`; preserve selected mode through reply generation. Issue #171's concurrent probes require diagnostics without changing concurrency/timeouts or retrying failures.
 - TCP secp single-hop and nested plain-CONNECT secp tunnels
 - QUIC echo with pinned-key authentication
 - QUIC pinned-key rejection (wrong key)

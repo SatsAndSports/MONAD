@@ -1,9 +1,11 @@
 //! Outbound SOCKS5 CONNECT client.
 //!
 //! Supports no-auth CONNECT requests to IPv4, IPv6, and domain destinations.
+//! An explicit alternative entry point requires MONAD diagnostics v1.
 //! Each protocol stage has an explicit timeout, and the whole operation is
 //! cancelable by dropping the future.
 
+use crate::socks_diagnostics::{SocksDiagnostic, ACK, HELLO, MAX_DIAGNOSTIC_BYTES, METHOD};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -72,6 +74,14 @@ impl std::fmt::Display for SocksDestination {
 pub enum SocksClientError {
     /// The proxy rejected the handshake or request with a SOCKS reply code.
     Rejected { code: u8, stage: &'static str },
+    /// A failure reported through the explicitly negotiated diagnostics method.
+    RejectedWithDiagnostic {
+        code: u8,
+        diagnostic: SocksDiagnostic,
+    },
+    /// The SOCKS refusal was received, but its promised diagnostic was invalid,
+    /// missing, truncated or timed out. Preserve the original reply code.
+    DiagnosticFailure { code: u8, reason: String },
     /// The server returned an unsupported address type in its reply.
     UnsupportedReplyAddressType(u8),
     /// A protocol stage timed out.
@@ -87,6 +97,11 @@ pub enum SocksClientError {
 impl std::fmt::Display for SocksClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SocksClientError::RejectedWithDiagnostic { code, diagnostic } => write!(f,
+                "SOCKS CONNECT rejected: 0x{code:02x} {}; stage={}; MONAD code={}; HTTP status={:?}; {}",
+                reply_name(*code), diagnostic.stage, diagnostic.code.as_deref().unwrap_or("unavailable"), diagnostic.http_status, diagnostic.message),
+            SocksClientError::DiagnosticFailure { code, reason } => write!(f,
+                "SOCKS CONNECT rejected: 0x{code:02x} {}; diagnostic unavailable: {reason}", reply_name(*code)),
             SocksClientError::Rejected { code, stage } => {
                 write!(
                     f,
@@ -217,6 +232,25 @@ pub async fn connect(
     target: &str,
     stage_timeout: Duration,
 ) -> Result<SocksConnection, SocksClientError> {
+    connect_impl(proxy, target, stage_timeout, false).await
+}
+
+/// Require MONAD diagnostics v1. Offers only the private method; never silently
+/// falls back to standard SOCKS or retries a CONNECT after negotiation failure.
+pub async fn connect_with_diagnostics(
+    proxy: SocketAddr,
+    target: &str,
+    stage_timeout: Duration,
+) -> Result<SocksConnection, SocksClientError> {
+    connect_impl(proxy, target, stage_timeout, true).await
+}
+
+async fn connect_impl(
+    proxy: SocketAddr,
+    target: &str,
+    stage_timeout: Duration,
+    diagnostics: bool,
+) -> Result<SocksConnection, SocksClientError> {
     let (destination, port) = parse_target(target)?;
 
     let mut stream = with_timeout("tcp_connect", stage_timeout, async {
@@ -224,9 +258,11 @@ pub async fn connect(
     })
     .await?;
 
-    // Greeting: VER=5, NMETHODS=1, METHODS=[NO_AUTH]
+    // Offer exactly the requested method; diagnostics must not silently downgrade.
     with_timeout("greeting_send", stage_timeout, async {
-        stream.write_all(&[0x05, 0x01, 0x00]).await?;
+        stream
+            .write_all(&[0x05, 0x01, if diagnostics { METHOD } else { 0x00 }])
+            .await?;
         Ok::<_, SocksClientError>(())
     })
     .await?;
@@ -243,7 +279,7 @@ pub async fn connect(
                 stage: "method negotiation",
             });
         }
-        if header[1] != 0x00 {
+        if header[1] != if diagnostics { METHOD } else { 0x00 } {
             return Err(SocksClientError::Protocol(
                 "unexpected selected auth method",
             ));
@@ -251,6 +287,21 @@ pub async fn connect(
         Ok::<_, SocksClientError>(())
     })
     .await?;
+
+    if diagnostics {
+        with_timeout("diagnostics_negotiation", stage_timeout, async {
+            stream.write_all(HELLO).await?;
+            let mut ack = [0u8; 2];
+            stream.read_exact(&mut ack).await?;
+            if ack != ACK {
+                return Err(SocksClientError::Protocol(
+                    "MONAD SOCKS diagnostics v1 not accepted",
+                ));
+            }
+            Ok(())
+        })
+        .await?;
+    }
 
     // Request: VER=5, CMD=CONNECT, RSV=0, ATYP, DST.ADDR, DST.PORT
     let mut request = vec![0x05, 0x01, 0x00];
@@ -261,17 +312,26 @@ pub async fn connect(
     })
     .await?;
 
-    with_timeout("request_reply", stage_timeout, async {
+    let mut refusal = None;
+    let result = with_timeout("request_reply", stage_timeout, async {
         let mut header = [0u8; 4];
         stream.read_exact(&mut header).await?;
         if header[0] != 0x05 {
             return Err(SocksClientError::Protocol("unexpected reply version"));
         }
         if header[1] != 0x00 {
-            return Err(SocksClientError::Rejected {
-                code: header[1],
-                stage: "connect request",
-            });
+            refusal = Some(header[1]);
+            if !diagnostics {
+                return Err(SocksClientError::Rejected {
+                    code: header[1],
+                    stage: "connect request",
+                });
+            }
+        }
+        if header[2] != 0 {
+            return Err(SocksClientError::Protocol(
+                "nonzero SOCKS reply reserved byte",
+            ));
         }
         let atyp = header[3];
         let bind_addr = match atyp {
@@ -298,13 +358,43 @@ pub async fn connect(
         let mut port_bytes = [0u8; 2];
         stream.read_exact(&mut port_bytes).await?;
         let bind_port = u16::from_be_bytes(port_bytes);
+        if diagnostics && header[1] != 0 {
+            let length = stream.read_u32().await? as usize;
+            if length == 0 || length > MAX_DIAGNOSTIC_BYTES {
+                return Err(SocksClientError::Protocol(
+                    "invalid SOCKS diagnostic length",
+                ));
+            }
+            let mut bytes = vec![0u8; length];
+            stream.read_exact(&mut bytes).await?;
+            let diagnostic: SocksDiagnostic = serde_json::from_slice(&bytes)
+                .map_err(|_| SocksClientError::Protocol("malformed SOCKS diagnostic JSON"))?;
+            diagnostic
+                .validate()
+                .map_err(|_| SocksClientError::Protocol("invalid SOCKS diagnostic fields"))?;
+            return Err(SocksClientError::RejectedWithDiagnostic {
+                code: header[1],
+                diagnostic,
+            });
+        }
         Ok::<_, SocksClientError>(SocksConnection {
             stream,
             bind_addr,
             bind_port,
         })
     })
-    .await
+    .await;
+    match (diagnostics, refusal, result) {
+        (true, Some(code), Err(error))
+            if !matches!(error, SocksClientError::RejectedWithDiagnostic { .. }) =>
+        {
+            Err(SocksClientError::DiagnosticFailure {
+                code,
+                reason: error.to_string(),
+            })
+        }
+        (_, _, result) => result,
+    }
 }
 
 #[cfg(test)]

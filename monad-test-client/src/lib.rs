@@ -491,14 +491,26 @@ pub async fn run_socks_listener(
         let active_final_conn = active_final_conn.clone();
         tokio::spawn(async move {
             let result = async {
-                let target = socks::socks5_handshake(&mut stream).await?;
+                let target = socks::socks5_handshake_with_diagnostics(&mut stream).await?;
                 let final_conn = active_final_conn.read().await.clone();
                 let Some(final_conn) = final_conn else {
-                    let _ = socks::send_reply(&mut stream, 0x01, "0.0.0.0", 0).await;
+                    let diagnostic = monad_client::socks_diagnostics::SocksDiagnostic {
+                        stage: "route".into(),
+                        code: None,
+                        message: "No active MONAD route is available.".into(),
+                        http_status: None,
+                    };
+                    let _ = socks::send_failure(&mut stream, target.reply_mode, 0x01, &diagnostic)
+                        .await;
                     return Err(io::Error::other("circuit final hop unavailable"));
                 };
-                open_tunnel_via_connection(final_conn.as_ref(), &target.authority, &mut stream)
-                    .await
+                monad_client::tunnel::open_tunnel_with_reply_mode(
+                    final_conn.as_ref(),
+                    &target.authority,
+                    &mut stream,
+                    target.reply_mode,
+                )
+                .await
             }
             .await;
             if let Err(err) = result {
