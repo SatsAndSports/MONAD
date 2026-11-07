@@ -17,6 +17,8 @@ const LIMIT: Duration = Duration::from_secs(2);
 
 fn detail() -> SocksDiagnostic {
     SocksDiagnostic {
+        context: None,
+        last_route_failure: None,
         stage: "connect".into(),
         code: Some("SESSION_CONNECT_SETUP_LIMIT_REACHED".into()),
         message: "This session has reached its concurrent CONNECT setup limit.".into(),
@@ -198,7 +200,7 @@ async fn fragmented_diagnostics_preserve_structured_refusal() {
         receive_failure(payload.len() as u32, payload, true).await,
         SocksClientError::RejectedWithDiagnostic {
             code: 5,
-            diagnostic
+            diagnostic: Box::new(diagnostic)
         }
     );
 }
@@ -397,4 +399,40 @@ async fn negotiated_request_rejection_has_a_complete_diagnostic() {
     assert_eq!(diagnostic.code, None);
     assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     server.await.unwrap();
+}
+#[tokio::test]
+async fn attribution_roundtrips_and_local_failure_cannot_claim_a_reporting_relay() {
+    use monad_client::socks_diagnostics::{FailureContext, RouteFailureDetail};
+    let mut diagnostic = detail();
+    diagnostic.context = Some(FailureContext {
+        origin: "relay".into(),
+        operation: "exit_connect".into(),
+        reporting_hop: Some(3),
+        target_hop: None,
+    });
+    diagnostic.last_route_failure = Some(RouteFailureDetail {
+        http_status: None,
+        context: FailureContext {
+            origin: "local".into(),
+            operation: "relay_connect".into(),
+            reporting_hop: None,
+            target_hop: Some(2),
+        },
+        code: None,
+        message: "An earlier local connection attempt failed.".into(),
+    });
+    let bytes = serde_json::to_vec(&diagnostic).unwrap();
+    assert_eq!(
+        receive_failure(bytes.len() as u32, bytes, false).await,
+        SocksClientError::RejectedWithDiagnostic {
+            code: 5,
+            diagnostic: Box::new(diagnostic.clone())
+        }
+    );
+    diagnostic.context.as_mut().unwrap().origin = "local".into();
+    let bytes = serde_json::to_vec(&diagnostic).unwrap();
+    assert!(matches!(
+        receive_failure(bytes.len() as u32, bytes, false).await,
+        SocksClientError::DiagnosticFailure { code: 5, .. }
+    ));
 }

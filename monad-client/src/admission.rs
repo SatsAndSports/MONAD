@@ -70,6 +70,61 @@ impl fmt::Display for RouteRefusal {
 }
 impl std::error::Error for RouteRefusal {}
 
+/// An observed failure while establishing a known target session. Legacy HTTP
+/// refusals retain their status; local transport collapse never identifies a
+/// culprit among the preceding relays.
+#[derive(Debug)]
+pub struct RouteAttemptFailure {
+    pub target_hop: usize,
+    pub operation: &'static str,
+    pub code: Option<RejectionCode>,
+    pub http_status: Option<u16>,
+    source: io::Error,
+}
+impl RouteAttemptFailure {
+    pub fn from_io(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+    pub(crate) fn annotate(
+        error: io::Error,
+        target_hop: usize,
+        operation: &'static str,
+    ) -> io::Error {
+        if RouteRefusal::from_io(&error).is_some() || Self::from_io(&error).is_some() {
+            return error;
+        }
+        let code = monad_common::connect_failure::ConnectFailure::from_io(&error).map(|e| e.code);
+        let http_status = error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<monad_common::rejection::ConnectRejection>())
+            .map(|e| e.0.as_u16());
+        io::Error::new(
+            error.kind(),
+            Self {
+                target_hop,
+                operation,
+                code,
+                http_status,
+                source: error,
+            },
+        )
+    }
+}
+impl fmt::Display for RouteAttemptFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} attempt for hop {} failed: {}",
+            self.operation, self.target_hop, self.source
+        )
+    }
+}
+impl std::error::Error for RouteAttemptFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdmissionWait {
     pub refusal: RouteRefusal,

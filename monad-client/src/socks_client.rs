@@ -77,7 +77,7 @@ pub enum SocksClientError {
     /// A failure reported through the explicitly negotiated diagnostics method.
     RejectedWithDiagnostic {
         code: u8,
-        diagnostic: SocksDiagnostic,
+        diagnostic: Box<SocksDiagnostic>,
     },
     /// The SOCKS refusal was received, but its promised diagnostic was invalid,
     /// missing, truncated or timed out. Preserve the original reply code.
@@ -97,11 +97,23 @@ pub enum SocksClientError {
 impl std::fmt::Display for SocksClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SocksClientError::RejectedWithDiagnostic { code, diagnostic } => write!(f,
+            SocksClientError::RejectedWithDiagnostic { code, diagnostic } => {
+                write!(f,
                 "SOCKS CONNECT rejected: 0x{code:02x} {}; stage={}; MONAD code={}; HTTP status={:?}; {}",
-                reply_name(*code), diagnostic.stage, diagnostic.code.as_deref().unwrap_or("unavailable"), diagnostic.http_status, diagnostic.message),
-            SocksClientError::DiagnosticFailure { code, reason } => write!(f,
-                "SOCKS CONNECT rejected: 0x{code:02x} {}; diagnostic unavailable: {reason}", reply_name(*code)),
+                reply_name(*code), diagnostic.stage, diagnostic.code.as_deref().unwrap_or("unavailable"), diagnostic.http_status, diagnostic.message)?;
+                if let Some(context) = &diagnostic.context {
+                    write!(f, "; context={context:?}")?;
+                }
+                if let Some(previous) = &diagnostic.last_route_failure {
+                    write!(f, "; last route failure (historical)={previous:?}")?;
+                }
+                Ok(())
+            }
+            SocksClientError::DiagnosticFailure { code, reason } => write!(
+                f,
+                "SOCKS CONNECT rejected: 0x{code:02x} {}; diagnostic unavailable: {reason}",
+                reply_name(*code)
+            ),
             SocksClientError::Rejected { code, stage } => {
                 write!(
                     f,
@@ -374,7 +386,7 @@ async fn connect_impl(
                 .map_err(|_| SocksClientError::Protocol("invalid SOCKS diagnostic fields"))?;
             return Err(SocksClientError::RejectedWithDiagnostic {
                 code: header[1],
-                diagnostic,
+                diagnostic: Box::new(diagnostic),
             });
         }
         Ok::<_, SocksClientError>(SocksConnection {
