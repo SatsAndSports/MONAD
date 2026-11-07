@@ -80,42 +80,46 @@ pub(crate) async fn open_tunnel_observed(
     let (h2_send, response) = match setup {
         Ok(setup) => setup,
         Err(error) => {
-            let _ = socks::send_failure(
-                local_stream,
-                reply_mode,
-                0x01,
-                &SocksDiagnostic::connect_failure(&error, None),
-            )
-            .await;
+            let mut diagnostic = SocksDiagnostic::connect_failure(&error, None);
+            if let Some(context) = &mut diagnostic.context {
+                context.target_hop = conn.route_hop();
+            }
+            if let Some(management) = management {
+                management.note_exit_result(
+                    conn.session_id(),
+                    target_authority,
+                    Some(&error),
+                    Some(&diagnostic),
+                );
+            }
+            let _ = socks::send_failure(local_stream, reply_mode, 0x01, &diagnostic).await;
             return Err(error);
         }
     };
 
     if !response.status().is_success() {
         let error = monad_common::rejection::connect_error(response.status(), response.headers());
-        if let Some(management) = management {
-            management.note_exit_result(conn.session_id(), target_authority, Some(&error));
+        let mut diagnostic =
+            SocksDiagnostic::connect_failure(&error, Some(response.status().as_u16()));
+        if let Some(context) = &mut diagnostic.context {
+            context.reporting_hop = conn.route_hop();
         }
-        let reply = if monad_common::rejection::Rejection::from_io(&error).is_some_and(|r| {
-            r.code == monad_common::rejection::RejectionCode::DestinationPolicyDenied
-        }) {
-            0x02
-        } else {
-            0x05
-        };
-        let _ = socks::send_failure(
-            local_stream,
-            reply_mode,
-            reply,
-            &SocksDiagnostic::connect_failure(&error, Some(response.status().as_u16())),
-        )
-        .await;
+        if let Some(management) = management {
+            management.note_exit_result(
+                conn.session_id(),
+                target_authority,
+                Some(&error),
+                Some(&diagnostic),
+            );
+        }
+        let reply = crate::socks_diagnostics::socks_reply_code(&error);
+        let _ = socks::send_failure(local_stream, reply_mode, reply, &diagnostic).await;
         return Err(error);
     }
 
     info!("tunnel established to {target_authority}");
     if let Some(management) = management {
-        management.note_exit_result(conn.session_id(), target_authority, None);
+        management.note_exit_result(conn.session_id(), target_authority, None, None);
     }
 
     // Send SOCKS5 success reply to local client

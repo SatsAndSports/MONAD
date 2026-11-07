@@ -3,6 +3,7 @@ use crate::client::{build_client_config_for_auth, ClientAuthMode};
 use crate::stream::{open_monad_stream_with_kind, QuicStream, STREAM_KIND_SECP_NOISE};
 use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::secp_identity::Secp256k1Pubkey;
+use monad_common::{connect_failure::ConnectFailure, rejection::RejectionCode};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -156,7 +157,9 @@ impl QuicPool {
                             }
                             let _ = tx.send(Some(Ok(conn)));
                             info!("QUIC connection to {target_addr} established and cached");
-                            return stream_result;
+                            return stream_result.map_err(|e| {
+                                ConnectFailure::wrap(RejectionCode::QuicStreamFailed, e)
+                            });
                         }
                         Err(e) => {
                             {
@@ -179,25 +182,41 @@ impl QuicPool {
     ) -> io::Result<quinn::Connection> {
         let socket_addr: SocketAddr = tokio::net::lookup_host(target_addr)
             .await
-            .map_err(|e| io::Error::other(format!("failed to resolve {target_addr}: {e}")))?
+            .map_err(|e| ConnectFailure::wrap(RejectionCode::QuicResolutionFailed, e))?
             .next()
-            .ok_or_else(|| io::Error::other(format!("no addresses found for {target_addr}")))?;
+            .ok_or_else(|| {
+                ConnectFailure::wrap(
+                    RejectionCode::QuicResolutionFailed,
+                    io::Error::new(io::ErrorKind::NotFound, "no QUIC target addresses"),
+                )
+            })?;
 
-        let client_config = build_client_config_for_auth(auth.clone())
-            .map_err(|e| io::Error::other(format!("failed to build QUIC client config: {e}")))?;
+        let client_config = build_client_config_for_auth(auth.clone()).map_err(|e| {
+            ConnectFailure::wrap(
+                RejectionCode::QuicConnectFailed,
+                io::Error::other(e.to_string()),
+            )
+        })?;
 
         info!("establishing new QUIC connection to {target_addr} ({socket_addr})");
 
         let conn = self
             .endpoint
             .connect_with(client_config, socket_addr, "monad-relay")
-            .map_err(|e| io::Error::other(format!("QUIC connect error to {target_addr}: {e}")))?
+            .map_err(|e| {
+                ConnectFailure::wrap(RejectionCode::QuicConnectFailed, io::Error::other(e))
+            })?
             .await
             .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("QUIC handshake failed with {target_addr}: {e}"),
-                )
+                let (code, kind) = if matches!(e, quinn::ConnectionError::TimedOut) {
+                    (RejectionCode::QuicConnectTimedOut, io::ErrorKind::TimedOut)
+                } else {
+                    (
+                        RejectionCode::QuicConnectFailed,
+                        io::ErrorKind::ConnectionRefused,
+                    )
+                };
+                ConnectFailure::wrap(code, io::Error::new(kind, e))
             })?;
 
         let pubkey = match auth {
@@ -210,9 +229,14 @@ impl QuicPool {
             }
         };
         authenticate_connection(&conn, &pubkey).await.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("QUIC secp256k1 auth failed with {target_addr}: {e}"),
+            let code = if e.is::<crate::auth::AttestationVerificationFailed>() {
+                RejectionCode::QuicAuthenticationFailed
+            } else {
+                RejectionCode::QuicAuthenticationUnavailable
+            };
+            ConnectFailure::wrap(
+                code,
+                io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()),
             )
         })?;
 
@@ -243,6 +267,50 @@ enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_attestation_is_not_reported_as_invalid_identity() {
+        let km = crate::keygen::generate().unwrap();
+        let server = quinn::Endpoint::server(
+            crate::server::build_server_config(&km.cert_pem, &km.key_pem).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let peer = server.clone();
+        let task = tokio::spawn(async move {
+            let conn = peer.accept().await.unwrap().await.unwrap();
+            let (_send, mut recv) = conn.accept_bi().await.unwrap();
+            let mut challenge = [0; 33];
+            recv.read_exact(&mut challenge).await.unwrap();
+            conn.close(
+                quinn::VarInt::from_u32(0),
+                b"test: no attestation available",
+            );
+        });
+        let pool = QuicPool::new().unwrap();
+        let error = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pool.open_stream(
+                &address.to_string(),
+                ClientAuthMode::Secp256k1(
+                    monad_common::secp_identity::SecpTransportKeypair::generate().pubkey(),
+                ),
+            ),
+        )
+        .await
+        .unwrap()
+        {
+            Ok(_) => panic!("missing attestation accepted"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            ConnectFailure::from_io(&error).unwrap().code,
+            RejectionCode::QuicAuthenticationUnavailable
+        );
+        task.await.unwrap();
+        server.close(quinn::VarInt::from_u32(0), b"done");
+    }
 
     #[tokio::test]
     async fn stale_ready_failure_cannot_evict_real_replacement_connection() {

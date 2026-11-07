@@ -22,7 +22,6 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tracing::info;
 
 /// Reuse this runtime (or a clone) across retries to wait for cancelled setup
@@ -715,7 +714,7 @@ trait HopTransport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> HopTransport for T {}
 
 // Retry only an explicit upstream gateway failure, before a Noise session or
-// payment task exists. Authentication, policy, funding and malformed responses
+// payment task exists. Failed authentication verification, policy, funding and malformed responses
 // must not become retryable just because their io::ErrorKind is similar.
 async fn retry_suffix_connect<T, F, Fut>(mut connect: F) -> io::Result<T>
 where
@@ -733,10 +732,12 @@ where
                 ))
             }) {
             Err(error)
-                if error
+                if (error
                     .get_ref()
                     .and_then(|e| e.downcast_ref::<monad_common::rejection::ConnectRejection>())
                     .is_some_and(|e| e.0 == http::StatusCode::BAD_GATEWAY)
+                    || monad_common::rejection::Rejection::from_io(&error)
+                        .is_some_and(|r| r.code.is_transient_connect_failure()))
                     && tokio::time::Instant::now() < deadline =>
             {
                 if tokio::time::timeout_at(
@@ -788,7 +789,9 @@ async fn hop_transport(
                 .await?,
         ))
     } else {
-        Ok(Box::new(TcpStream::connect(addr).await?))
+        Ok(Box::new(
+            monad_common::connect_failure::connect_tcp(addr).await?,
+        ))
     }
 }
 
@@ -847,6 +850,13 @@ fn chain_from_hop(
                             "connect",
                             hop_label.clone(),
                         )
+                    })
+                    .map_err(|e| {
+                        crate::admission::RouteAttemptFailure::annotate(
+                            e,
+                            hop_idx + 1,
+                            "relay_connect",
+                        )
                     })?;
                     let accepted =
                         noise_secp256k1::handshake_initiator_with_pubkey_and_server_accept(
@@ -862,13 +872,20 @@ fn chain_from_hop(
                                 "session",
                                 hop_label.clone(),
                             )
+                        })
+                        .map_err(|e| {
+                            crate::admission::RouteAttemptFailure::annotate(
+                                e,
+                                hop_idx + 1,
+                                "session_handshake",
+                            )
                         })?;
                     Ok::<_, io::Error>((stream, accepted))
                 };
                 let result = tokio::select! {
                     biased;
                     () = setup.prefix_failed() => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "preserved route prefix failed")),
-                    result = tokio::time::timeout(ATTEMPT_TIMEOUT, attempt) => result.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "hop connection attempt timed out"))),
+                    result = tokio::time::timeout(ATTEMPT_TIMEOUT, attempt) => result.unwrap_or_else(|_| Err(crate::admission::RouteAttemptFailure::annotate(io::Error::new(io::ErrorKind::TimedOut, "hop connection attempt timed out"), hop_idx + 1, "session_setup"))),
                 };
                 match result {
                     Ok(accepted) => {
@@ -924,9 +941,13 @@ fn chain_from_hop(
                 hop_label
             ),
         );
-        let (mut conn, driver) =
-            RelayConnection::from_transport_stream(noise_stream, session_id).await?;
+        let (mut conn, driver) = RelayConnection::from_transport_stream(noise_stream, session_id)
+            .await
+            .map_err(|error| {
+                crate::admission::RouteAttemptFailure::annotate(error, hop_idx + 1, "session_setup")
+            })?;
         conn.add_driver(driver);
+        conn.set_route_hop(hop_idx + 1);
         let conn = Arc::new(conn);
         setup.track(conn.clone());
         conn.set_cashu_spilman_protocol_version(
@@ -1460,5 +1481,31 @@ mod tests {
 
         assert_eq!(failed_hop, Some(0));
         route.close().await;
+    }
+    #[tokio::test]
+    async fn structured_suffix_failures_preserve_bounded_transient_retry_without_retrying_bad_auth()
+    {
+        use monad_common::rejection::RejectionCode as C;
+        for (code, retry) in [
+            (C::TcpConnectionRefused, true),
+            (C::QuicConnectTimedOut, true),
+            (C::QuicAuthenticationFailed, false),
+        ] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = retry_suffix_connect(|| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(if call == 0 {
+                    Err(code.rejection().into_io())
+                } else {
+                    Ok(())
+                })
+            })
+            .await;
+            assert_eq!(result.is_ok(), retry);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                if retry { 2 } else { 1 }
+            );
+        }
     }
 }

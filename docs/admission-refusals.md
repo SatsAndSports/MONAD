@@ -51,6 +51,9 @@ and retains the requested destination locally. Unknown/duplicate headers and
 code/status mismatches are invalid metadata, not reasons for indefinite waiting.
 A plain 503 without MONAD metadata remains a generic CONNECT failure.
 
+TCP/QUIC destination-setup failures also carry typed codes using HTTP 502;
+see [the connection-failure registry and attribution rules](connect-failures.md).
+
 Capacity refusals are fail-fast and do not enter the administrative wait path.
 The initial-payment gate precedes CONNECT capacity admission, so a never-funded
 session receives `INITIAL_PAYMENT_REQUIRED` even when open capacity is exhausted.
@@ -82,7 +85,8 @@ It applies equally to TCP and QUIC onward tunnels, including pooled connections.
   The configured runtime stops retrying that route and remains available to
   management. Disable/re-enable requests a fresh attempt; YAML changes need restart.
 - A final-exit denial fails that individual SOCKS request: policy denial maps to
-  SOCKS reply 0x02 (ruleset), other CONNECT rejection to 0x05 (connection refused).
+  SOCKS reply 0x02 (ruleset). Existing admission refusals map to 0x05; typed
+  transport failures use the coarse SOCKS mappings documented in the connection-failure registry.
   It does not invalidate the established route or its other tunnels.
 - Management `set_enabled(false)` cancels sleeping retries and in-flight setup,
   awaiting supervisor cleanup before completion. Browser/SSE disconnect is not

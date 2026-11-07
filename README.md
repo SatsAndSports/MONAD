@@ -1070,6 +1070,14 @@ API stays standard SOCKS. See [SOCKS diagnostics](docs/socks-diagnostics.md) for
 the wire format and bounds. Existing browsers/SSH/curl need no changes and receive
 standard SOCKS reply codes.
 
+Diagnostics distinguish typed TCP resolution/refusal/timeout/unreachable failures,
+QUIC setup and attestation failures, and local observations versus relay-reported
+failures. Known route positions identify the reporting and target hops; an
+unavailable route may include explicitly historical setup context. Management
+snapshots/events retain these details too. See
+[connection failure diagnostics](docs/connect-failures.md) for codes, attribution,
+standard SOCKS mappings and peer-upgrade compatibility.
+
 ### HTTP through the SOCKS proxy
 
 ```bash

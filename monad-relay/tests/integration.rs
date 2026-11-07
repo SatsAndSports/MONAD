@@ -17179,3 +17179,85 @@ async fn test_quic_first_hop_then_tcp() {
 mod admission;
 #[path = "common/management_api.rs"]
 mod management_api;
+#[tokio::test]
+async fn structured_exit_refusal_reaches_socks_with_authenticated_route_context() {
+    let (relay_addr, pubkey) = start_monad_relay().await;
+    let route = connector::connect(&relay_addr.to_string(), pubkey)
+        .await
+        .unwrap();
+    assert_eq!(route.final_connection().route_hop(), Some(1));
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let target = reserved.local_addr().unwrap().to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks = listener.local_addr().unwrap();
+    let (_route_tx, route_rx) = tokio::sync::watch::channel(Some(route.final_connection_arc()));
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(monad_client::runtime::run_socks_listener(
+        listener, route_rx, stop_rx,
+    ));
+    let error = monad_client::socks_client::connect_with_diagnostics(
+        socks,
+        &target,
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err();
+    let monad_client::socks_client::SocksClientError::RejectedWithDiagnostic { code, diagnostic } =
+        error
+    else {
+        panic!("missing diagnostic: {error}");
+    };
+    assert_eq!(code, 5);
+    assert_eq!(diagnostic.code.as_deref(), Some("TCP_CONNECTION_REFUSED"));
+    assert_eq!(diagnostic.http_status, Some(502));
+    let context = diagnostic.context.unwrap();
+    assert_eq!(context.origin, "relay");
+    assert_eq!(context.operation, "exit_connect");
+    assert_eq!(context.reporting_hop, Some(1));
+    assert_eq!(context.target_hop, None);
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    route.close().await;
+}
+
+#[tokio::test]
+async fn quic_attestation_failure_distinguishes_local_first_hop_and_onward_relay() {
+    use monad_common::rejection::RejectionCode;
+    let (first, first_key) = start_monad_relay().await;
+    let (second, _) = start_monad_relay().await;
+    let wrong_key = SecpTransportKeypair::generate().pubkey();
+    let make_hop = |addr: SocketAddr, pubkey| RouteHop::Cleartext {
+        addr: addr.to_string(),
+        pubkey,
+        use_quic: true,
+    };
+    let direct = Route::new(vec![make_hop(second, wrong_key)]).unwrap();
+    let error = match connector::connect_route(&direct).await {
+        Ok(_) => panic!("bad key accepted"),
+        Err(error) => error,
+    };
+    let local = monad_client::admission::RouteAttemptFailure::from_io(&error)
+        .expect("locally observed auth error");
+    assert_eq!(local.target_hop, 1);
+    assert_eq!(local.code, Some(RejectionCode::QuicAuthenticationFailed));
+    assert!(monad_client::admission::RouteRefusal::from_io(&error).is_none());
+    let nested = Route::new(vec![
+        make_hop(first, first_key),
+        make_hop(second, wrong_key),
+    ])
+    .unwrap();
+    let error = match connector::connect_route(&nested).await {
+        Ok(_) => panic!("bad onward key accepted"),
+        Err(error) => error,
+    };
+    let remote =
+        monad_client::admission::RouteRefusal::from_io(&error).expect("relay-reported auth error");
+    assert_eq!(remote.refusing_hop, 1);
+    assert_eq!(remote.target_hop, 2);
+    assert_eq!(
+        remote.rejection.code,
+        RejectionCode::QuicAuthenticationFailed
+    );
+    assert!(monad_client::admission::RouteAttemptFailure::from_io(&error).is_none());
+}

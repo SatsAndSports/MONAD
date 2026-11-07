@@ -541,6 +541,14 @@ unknown upstream causes remain generic. The extension is local, is not
 authentication, and does not change the relay protocol. See
 [SOCKS diagnostics v1](docs/socks-diagnostics.md).
 
+Destination setup now preserves typed resolver, TCP and QUIC failures as canonical
+HTTP 502/code pairs. The client derives attribution from the authenticated session
+and its local route construction, rather than accepting global hop numbers from
+relays. Transport loss has a local observer and a target attempt but no inferred
+culprit hop. SOCKS and management share these bounded diagnostics; retained route
+failure context is explicitly historical. Invalid attestation and unavailable
+attestation are distinct. See [connection failures](docs/connect-failures.md).
+
 Supported SOCKS5 address types:
 - IPv4
 - IPv6

@@ -43,7 +43,6 @@ use std::sync::{Arc, Mutex as BillingMutex};
 use std::task::Poll;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -787,6 +786,23 @@ impl ConnectHandler {
             .unwrap()
     }
 
+    fn connect_failure_response(error: &io::Error, quic: bool) -> Response<()> {
+        let code = monad_common::connect_failure::ConnectFailure::from_io(error)
+            .map(|e| e.code)
+            .unwrap_or_else(|| {
+                if quic {
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        RejectionCode::QuicConnectTimedOut
+                    } else {
+                        RejectionCode::QuicConnectFailed
+                    }
+                } else {
+                    monad_common::connect_failure::tcp_error_code(error.kind())
+                }
+            });
+        Self::rejection_response(code)
+    }
+
     fn acquire_setup_or_reject(
         &self,
         respond: &mut server::SendResponse<Bytes>,
@@ -866,10 +882,7 @@ impl ConnectHandler {
             };
             let Some(pool) = &self.quic_pool else {
                 warn!("CONNECT with quic-secp256k1-pubkey but QUIC pool is not available");
-                let resp = Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(())
-                    .unwrap();
+                let resp = Self::rejection_response(RejectionCode::QuicConnectFailed);
                 let _ = respond.send_response(resp, true);
                 return;
             };
@@ -910,10 +923,7 @@ impl ConnectHandler {
                 }
                 Err(e) => {
                     warn!("failed to connect via QUIC to {authority}: {e}");
-                    let resp = Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(())
-                        .unwrap();
+                    let resp = Self::connect_failure_response(&e, true);
                     let _ = respond.send_response(resp, true);
                 }
             }
@@ -922,15 +932,17 @@ impl ConnectHandler {
                 return;
             };
             info!("CONNECT {authority}");
-            let target =
-                tokio::time::timeout(CONNECT_SETUP_TIMEOUT, TcpStream::connect(&authority))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "CONNECT setup timed out",
-                        ))
-                    });
+            let target = tokio::time::timeout(
+                CONNECT_SETUP_TIMEOUT,
+                monad_common::connect_failure::connect_tcp(&authority),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "CONNECT setup timed out",
+                ))
+            });
             match target {
                 Ok(stream) => {
                     if let Err(e) = self
@@ -949,10 +961,7 @@ impl ConnectHandler {
                 }
                 Err(e) => {
                     warn!("failed to connect to {authority}: {e}");
-                    let resp = Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(())
-                        .unwrap();
+                    let resp = Self::connect_failure_response(&e, false);
                     let _ = respond.send_response(resp, true);
                 }
             }
@@ -1084,10 +1093,7 @@ impl ConnectHandler {
             Some(p) => p.clone(),
             None => {
                 warn!("blinded CONNECT requested but QUIC pool is not available");
-                let resp = Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(())
-                    .unwrap();
+                let resp = Self::rejection_response(RejectionCode::QuicConnectFailed);
                 let _ = respond.send_response(resp, true);
                 return;
             }
@@ -1141,10 +1147,7 @@ impl ConnectHandler {
                     "failed to connect via blinded QUIC to {}: {e}",
                     resolved.next_hop_addr
                 );
-                let resp = Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(())
-                    .unwrap();
+                let resp = Self::connect_failure_response(&e, true);
                 let _ = respond.send_response(resp, true);
             }
         }
@@ -3344,6 +3347,46 @@ mod tests {
             client_driver.abort();
             let _ = server_driver.await;
             let _ = client_driver.await;
+        }
+    }
+}
+#[cfg(test)]
+mod connect_failure_tests {
+    use super::*;
+
+    #[test]
+    fn typed_resolution_and_setup_timeout_responses_preserve_category() {
+        use monad_common::{
+            connect_failure::ConnectFailure,
+            rejection::{Rejection, RejectionCode as C},
+        };
+        for (error, quic, expected) in [
+            (
+                ConnectFailure::wrap(
+                    C::TcpResolutionFailed,
+                    io::Error::new(io::ErrorKind::TimedOut, "DNS resolver timed out"),
+                ),
+                false,
+                C::TcpResolutionFailed,
+            ),
+            (
+                io::Error::new(io::ErrorKind::TimedOut, "outer deadline"),
+                false,
+                C::TcpConnectTimedOut,
+            ),
+            (
+                io::Error::new(io::ErrorKind::TimedOut, "outer deadline"),
+                true,
+                C::QuicConnectTimedOut,
+            ),
+            (io::Error::other("unclassified"), false, C::TcpConnectFailed),
+            (io::Error::other("unclassified"), true, C::QuicConnectFailed),
+        ] {
+            let response = ConnectHandler::connect_failure_response(&error, quic);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let decoded =
+                monad_common::rejection::connect_error(response.status(), response.headers());
+            assert_eq!(Rejection::from_io(&decoded).unwrap().code, expected);
         }
     }
 }

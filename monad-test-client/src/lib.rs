@@ -495,6 +495,13 @@ pub async fn run_socks_listener(
                 let final_conn = active_final_conn.read().await.clone();
                 let Some(final_conn) = final_conn else {
                     let diagnostic = monad_client::socks_diagnostics::SocksDiagnostic {
+                        context: Some(monad_client::socks_diagnostics::FailureContext {
+                            origin: "local".into(),
+                            operation: "route".into(),
+                            reporting_hop: None,
+                            target_hop: None,
+                        }),
+                        last_route_failure: None,
                         stage: "route".into(),
                         code: None,
                         message: "No active MONAD route is available.".into(),

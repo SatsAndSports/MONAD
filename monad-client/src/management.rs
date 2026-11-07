@@ -81,6 +81,7 @@ pub struct ClientFailure {
     pub message: String,
     pub hop: Option<usize>,
     pub retryable: bool,
+    pub connection_failure: Option<crate::socks_diagnostics::RouteFailureDetail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -160,7 +161,8 @@ pub struct ExitFailure {
     pub session_id: String,
     pub route_generation: u64,
     pub destination: String,
-    pub rejection: monad_common::rejection::Rejection,
+    pub rejection: Option<monad_common::rejection::Rejection>,
+    pub diagnostic: crate::socks_diagnostics::SocksDiagnostic,
 }
 
 #[derive(Debug, Default)]
@@ -489,11 +491,12 @@ impl ClientManagement {
         session: &[u8; 32],
         destination: &str,
         error: Option<&std::io::Error>,
+        diagnostic: Option<&crate::socks_diagnostics::SocksDiagnostic>,
     ) {
         let failure = error
             .and_then(monad_common::rejection::Rejection::from_io)
             .cloned();
-        let Some(failure) = failure else {
+        let Some(diagnostic) = diagnostic else {
             return;
         };
         let session_id = hex::encode(session);
@@ -509,8 +512,15 @@ impl ClientManagement {
         let failure = ExitFailure {
             session_id,
             route_generation,
-            destination: destination.to_owned(),
+            destination: if monad_common::network_endpoint::validate_network_endpoint(destination)
+                .is_ok()
+            {
+                destination.to_owned()
+            } else {
+                "[invalid endpoint]".into()
+            },
             rejection: failure,
+            diagnostic: diagnostic.clone(),
         };
         let runtime = self.runtime.lock().unwrap().snapshot.clone();
         if route_generation != runtime.route_generation
@@ -531,7 +541,11 @@ impl ClientManagement {
             true
         }) {
             self.events.record(
-                "exit_refused",
+                if failure.rejection.is_some() {
+                    "exit_refused"
+                } else {
+                    "exit_failed"
+                },
                 serde_json::json!({
                     "revision": snapshot.revision,
                     "run_generation": run_generation,

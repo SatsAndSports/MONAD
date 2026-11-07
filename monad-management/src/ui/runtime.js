@@ -803,7 +803,7 @@ function instanceCard(process, name, state, instance) {
       card.append(el("p", `Latest failure: ${value(runtime.last_failure)}`));
     if (runtime.last_exit_failure)
       card.append(
-        el("p", `Latest exit refusal: ${value(runtime.last_exit_failure)}`),
+        el("p", `Latest exit failure: ${value(runtime.last_exit_failure)}`),
       );
     const hops = [...instance.hops].sort((a, b) =>
       a.label.localeCompare(b.label, undefined, { numeric: true }),

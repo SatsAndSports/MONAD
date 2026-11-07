@@ -18,6 +18,17 @@ pub enum RejectionCode {
     RelayConnectLimitReached,
     RelayConnectSetupLimitReached,
     BootstrapRejected,
+    TcpResolutionFailed,
+    TcpConnectionRefused,
+    TcpConnectTimedOut,
+    TcpDestinationUnreachable,
+    TcpConnectFailed,
+    QuicResolutionFailed,
+    QuicConnectTimedOut,
+    QuicConnectFailed,
+    QuicAuthenticationFailed,
+    QuicAuthenticationUnavailable,
+    QuicStreamFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +60,19 @@ impl RejectionCode {
                 "This relay has reached its concurrent CONNECT setup limit."
             }
             Self::BootstrapRejected => "Bootstrap negotiation was rejected.",
+            Self::TcpResolutionFailed => "TCP target name resolution failed.",
+            Self::TcpConnectionRefused => "The TCP target refused the connection.",
+            Self::TcpConnectTimedOut => "TCP connection setup timed out.",
+            Self::TcpDestinationUnreachable => "The TCP target is unreachable.",
+            Self::TcpConnectFailed => "TCP connection setup failed.",
+            Self::QuicResolutionFailed => "QUIC target name resolution failed.",
+            Self::QuicConnectTimedOut => "QUIC connection setup timed out.",
+            Self::QuicConnectFailed => "QUIC connection setup failed.",
+            Self::QuicAuthenticationFailed => "QUIC peer attestation verification failed.",
+            Self::QuicAuthenticationUnavailable => {
+                "QUIC peer authentication could not be completed."
+            }
+            Self::QuicStreamFailed => "Opening a QUIC session stream failed.",
         };
         Rejection {
             code: self,
@@ -69,6 +93,17 @@ impl RejectionCode {
             Self::RelayConnectLimitReached | Self::RelayConnectSetupLimitReached => {
                 Some(http::StatusCode::SERVICE_UNAVAILABLE)
             }
+            Self::TcpResolutionFailed
+            | Self::TcpConnectionRefused
+            | Self::TcpConnectTimedOut
+            | Self::TcpDestinationUnreachable
+            | Self::TcpConnectFailed
+            | Self::QuicResolutionFailed
+            | Self::QuicConnectTimedOut
+            | Self::QuicConnectFailed
+            | Self::QuicAuthenticationFailed
+            | Self::QuicAuthenticationUnavailable
+            | Self::QuicStreamFailed => Some(http::StatusCode::BAD_GATEWAY),
             _ => None,
         }
     }
@@ -76,6 +111,22 @@ impl RejectionCode {
     pub fn header_value(self) -> http::HeaderValue {
         let value = serde_json::to_value(self).expect("rejection code serialization");
         http::HeaderValue::from_str(value.as_str().unwrap()).expect("ASCII code")
+    }
+
+    pub fn is_transient_connect_failure(self) -> bool {
+        matches!(
+            self,
+            Self::TcpResolutionFailed
+                | Self::TcpConnectionRefused
+                | Self::TcpConnectTimedOut
+                | Self::TcpDestinationUnreachable
+                | Self::TcpConnectFailed
+                | Self::QuicResolutionFailed
+                | Self::QuicConnectTimedOut
+                | Self::QuicConnectFailed
+                | Self::QuicAuthenticationUnavailable
+                | Self::QuicStreamFailed
+        )
     }
 }
 
@@ -148,15 +199,31 @@ mod tests {
             RejectionCode::SessionConnectSetupLimitReached,
             RejectionCode::RelayConnectLimitReached,
             RejectionCode::RelayConnectSetupLimitReached,
+            RejectionCode::TcpResolutionFailed,
+            RejectionCode::TcpConnectionRefused,
+            RejectionCode::TcpConnectTimedOut,
+            RejectionCode::TcpDestinationUnreachable,
+            RejectionCode::TcpConnectFailed,
+            RejectionCode::QuicResolutionFailed,
+            RejectionCode::QuicConnectTimedOut,
+            RejectionCode::QuicConnectFailed,
+            RejectionCode::QuicAuthenticationFailed,
+            RejectionCode::QuicAuthenticationUnavailable,
+            RejectionCode::QuicStreamFailed,
         ] {
             let mut headers = http::HeaderMap::new();
             headers.insert(CONNECT_REJECTION_HEADER, code.header_value());
             let error = connect_error(code.connect_status().unwrap(), &headers);
             assert_eq!(Rejection::from_io(&error).unwrap().code, code);
-            assert!(
-                Rejection::from_io(&connect_error(http::StatusCode::BAD_GATEWAY, &headers))
-                    .is_none()
-            );
+            assert!(Rejection::from_io(&connect_error(
+                if code.connect_status() == Some(http::StatusCode::BAD_GATEWAY) {
+                    http::StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    http::StatusCode::BAD_GATEWAY
+                },
+                &headers
+            ))
+            .is_none());
             headers.append(CONNECT_REJECTION_HEADER, code.header_value());
             assert_eq!(
                 connect_error(http::StatusCode::SERVICE_UNAVAILABLE, &headers).kind(),
