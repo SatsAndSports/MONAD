@@ -1052,6 +1052,24 @@ Blinded routes are currently exposed through the Rust library route model
 
 ## Example Usage
 
+### Detailed SOCKS failures for MONAD-aware clients
+
+Ordinary SOCKS applications use the standard no-auth method. Our Rust SOCKS client
+can explicitly require richer failure reports from MONAD's SOCKS listener:
+
+```rust
+let connection = monad_client::socks_client::connect_with_diagnostics(
+    proxy_addr, "example.com:443", std::time::Duration::from_secs(10),
+).await?;
+```
+
+This negotiates private method 0x80/v1, with no silent fallback. Failure reports
+include existing MONAD rejection codes and HTTP status when known; successful
+connections carry ordinary, untouched application data. The default `connect`
+API stays standard SOCKS. See [SOCKS diagnostics](docs/socks-diagnostics.md) for
+the wire format and bounds. Existing browsers/SSH/curl need no changes and receive
+standard SOCKS reply codes.
+
 ### HTTP through the SOCKS proxy
 
 ```bash

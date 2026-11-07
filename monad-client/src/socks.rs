@@ -5,6 +5,7 @@
 //!
 //! Supports:
 //!   - SOCKS5 with no authentication
+//!   - Opt-in MONAD diagnostics on the mode-aware handshake entry point
 //!   - CONNECT command only
 //!   - IPv4, IPv6, and domain name address types
 
@@ -20,7 +21,8 @@ fn socks_method_name(method: u8) -> &'static str {
         0x01 => "GSSAPI",
         0x02 => "USERNAME_PASSWORD",
         0x03..=0x7f => "IANA_ASSIGNED",
-        0x80..=0xfe => "PRIVATE",
+        0x80 => "MONAD_DIAGNOSTICS",
+        0x81..=0xfe => "PRIVATE",
         0xff => "NO_ACCEPTABLE_METHODS",
     }
 }
@@ -48,13 +50,25 @@ fn socks_atyp_name(atyp: u8) -> &'static str {
 pub struct SocksTarget {
     /// The destination as "host:port" for use in H2 CONNECT authority.
     pub authority: String,
+    pub reply_mode: crate::socks_diagnostics::SocksReplyMode,
 }
 
 /// Perform the SOCKS5 handshake on an incoming local connection.
 ///
-/// After this returns, the `stream` is ready for bidirectional data transfer.
-/// The caller should proxy the stream to the target.
+/// This standard-only entry point returns the requested target. The caller must
+/// establish its tunnel and send a success reply before proxying application data.
 pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget> {
+    handshake(stream, false).await
+}
+
+/// Accept standard SOCKS or explicitly offered MONAD diagnostics. Callers must
+/// carry the returned reply mode through every CONNECT failure response.
+pub async fn socks5_handshake_with_diagnostics(stream: &mut TcpStream) -> io::Result<SocksTarget> {
+    handshake(stream, true).await
+}
+
+async fn handshake(stream: &mut TcpStream, allow_diagnostics: bool) -> io::Result<SocksTarget> {
+    use crate::socks_diagnostics::{SocksReplyMode, ACK, DIAGNOSTIC_TIMEOUT, HELLO, METHOD};
     // --- Greeting phase ---
     // Client sends: VER (1) | NMETHODS (1) | METHODS (1-255)
     let ver = stream.read_u8().await?;
@@ -70,8 +84,8 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
-    // We only support NO AUTH (0x00)
-    if !methods.contains(&0x00) {
+    let diagnostics = allow_diagnostics && methods.contains(&METHOD);
+    if !diagnostics && !methods.contains(&0x00) {
         // Send back "no acceptable methods"
         stream.write_all(&[0x05, 0xFF]).await?;
         let offered_methods = methods
@@ -89,7 +103,53 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
     }
 
     // Send back: VER (0x05) | METHOD (0x00 = no auth)
-    stream.write_all(&[0x05, 0x00]).await?;
+    let reply_mode = if diagnostics {
+        tokio::time::timeout(DIAGNOSTIC_TIMEOUT, async {
+            stream.write_all(&[0x05, METHOD]).await?;
+            let mut hello = [0u8; 6];
+            stream.read_exact(&mut hello).await?;
+            if &hello != HELLO {
+                stream.write_all(&[1, 1]).await?;
+                stream.shutdown().await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported MONAD SOCKS diagnostic protocol",
+                ));
+            }
+            stream.write_all(&ACK).await
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SOCKS diagnostics negotiation timed out",
+            )
+        })??;
+        SocksReplyMode::DiagnosticsV1
+    } else {
+        stream.write_all(&[0x05, 0x00]).await?;
+        SocksReplyMode::Standard
+    };
+
+    if diagnostics {
+        tokio::time::timeout(DIAGNOSTIC_TIMEOUT, read_connect_request(stream, reply_mode))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "SOCKS diagnostics request timed out",
+                )
+            })?
+    } else {
+        read_connect_request(stream, reply_mode).await
+    }
+}
+
+async fn read_connect_request(
+    stream: &mut TcpStream,
+    reply_mode: crate::socks_diagnostics::SocksReplyMode,
+) -> io::Result<SocksTarget> {
+    use crate::socks_diagnostics::SocksDiagnostic;
 
     // --- Request phase ---
     // Client sends: VER (1) | CMD (1) | RSV (1) | ATYP (1) | DST.ADDR (variable) | DST.PORT (2)
@@ -106,7 +166,13 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
     if cmd != 0x01 {
         // Only CONNECT (0x01) is supported
         // Send error reply: command not supported
-        send_reply(stream, 0x07, "0.0.0.0", 0).await?;
+        send_failure(
+            stream,
+            reply_mode,
+            0x07,
+            &SocksDiagnostic::simple("request", "Only SOCKS CONNECT is supported."),
+        )
+        .await?;
         warn!(
             "SOCKS5 request rejected: unsupported_command=0x{cmd:02x}({}), supported_command=0x01(CONNECT)",
             socks_command_name(cmd)
@@ -144,7 +210,13 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
             format!("[{}]", Ipv6Addr::from(addr))
         }
         _ => {
-            send_reply(stream, 0x08, "0.0.0.0", 0).await?;
+            send_failure(
+                stream,
+                reply_mode,
+                0x08,
+                &SocksDiagnostic::simple("request", "Unsupported SOCKS address type."),
+            )
+            .await?;
             warn!(
                 "SOCKS5 request rejected: unsupported_atyp=0x{atyp:02x}({}), supported_atyp=[0x01(IPV4),0x03(DOMAINNAME),0x04(IPV6)]",
                 socks_atyp_name(atyp)
@@ -162,7 +234,50 @@ pub async fn socks5_handshake(stream: &mut TcpStream) -> io::Result<SocksTarget>
     // We don't send the reply yet — the caller will send it after the tunnel
     // is established (or an error occurs).
 
-    Ok(SocksTarget { authority })
+    Ok(SocksTarget {
+        authority,
+        reply_mode,
+    })
+}
+
+/// Send one failure reply, optional negotiated diagnostics, then close the write
+/// side. Serialization and all output are bounded; no raw upstream body is sent.
+pub async fn send_failure(
+    stream: &mut TcpStream,
+    mode: crate::socks_diagnostics::SocksReplyMode,
+    code: u8,
+    diagnostic: &crate::socks_diagnostics::SocksDiagnostic,
+) -> io::Result<()> {
+    use crate::socks_diagnostics::{SocksReplyMode, DIAGNOSTIC_TIMEOUT, MAX_DIAGNOSTIC_BYTES};
+    if code == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "failure reply cannot indicate success",
+        ));
+    }
+    let payload = if mode == SocksReplyMode::DiagnosticsV1 {
+        diagnostic.validate()?;
+        let bytes = serde_json::to_vec(diagnostic).map_err(io::Error::other)?;
+        if bytes.len() > MAX_DIAGNOSTIC_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SOCKS diagnostic too large",
+            ));
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    tokio::time::timeout(DIAGNOSTIC_TIMEOUT, async {
+        send_reply(stream, code, "0.0.0.0", 0).await?;
+        if let Some(payload) = payload {
+            stream.write_u32(payload.len() as u32).await?;
+            stream.write_all(&payload).await?;
+        }
+        stream.shutdown().await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS failure reply timed out"))?
 }
 
 /// Reject a SOCKS5 CONNECT request because the proxy is temporarily

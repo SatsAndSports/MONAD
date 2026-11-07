@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod session_driver;
 pub mod socks;
 pub mod socks_client;
+pub mod socks_diagnostics;
 pub mod sqlite_client_wallet;
 pub mod traffic_engine;
 pub mod tunnel;

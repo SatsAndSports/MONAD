@@ -1,6 +1,27 @@
 use super::*;
 use serde_json::{json, Value};
 
+// Same roundtrip as the standard helper, but require negotiated diagnostics for
+// the concurrent probes in issue #171. Do not retry or hide a refused CONNECT.
+async fn diagnostic_socks_roundtrip(
+    socks: SocketAddr,
+    target: SocketAddr,
+    payload: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut connection = monad_client::socks_client::connect_with_diagnostics(
+        socks,
+        &target.to_string(),
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(io::Error::other)?;
+    connection.stream.write_all(payload).await?;
+    connection.stream.shutdown().await?;
+    let mut response = Vec::new();
+    connection.stream.read_to_end(&mut response).await?;
+    Ok(response)
+}
+
 async fn snapshot(client: &reqwest::Client) -> Value {
     timeout(Duration::from_secs(10), async {
         loop {
@@ -184,7 +205,7 @@ async fn tcp_sse_api_drives_real_manual_funding_disable_and_channel_close() {
         let target = fixture.upper_addr;
         probes.spawn(async move {
             let payload = vec![b'a'; 65_536];
-            let response = configured_client_socks_roundtrip(socks, target, &payload)
+            let response = diagnostic_socks_roundtrip(socks, target, &payload)
                 .await
                 .unwrap();
             assert_eq!(response, vec![b'A'; 65_536]);

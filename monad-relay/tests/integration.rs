@@ -15488,6 +15488,86 @@ async fn test_session_setup_limit_rejects_without_destination_contact() {
 }
 
 #[tokio::test]
+async fn socks_diagnostics_reports_real_setup_limit_while_standard_socks_stays_compatible() {
+    use monad_client::socks_client::{connect, connect_with_diagnostics, SocksClientError};
+    let limits = monad_common::config::RelayConnectLimitsConfig {
+        max_open_per_session: 4,
+        max_setups_per_session: 1,
+        max_open_per_relay: 8,
+        max_setups_per_relay: 2,
+    };
+    let (server_addr, pubkey) = start_monad_relay_with_connect_limits(limits).await;
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (send, recv) = open_funded_control(&conn, TEST_SESSION_PAYMENT).await;
+    let mut control = ControlSessionHarness { send, recv };
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut h2 = conn.clone_send_request().await;
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(blackhole.local_addr().unwrap().to_string())
+        .header(
+            monad_relay::session::QUIC_SECP256K1_PUBKEY_HEADER,
+            SecpTransportKeypair::generate().pubkey().to_hex(),
+        )
+        .body(())
+        .unwrap();
+    let (pending_response, pending_send) = h2.send_request(request, false).unwrap();
+    // Receiving the first QUIC datagram proves the setup permit is held.
+    timeout(Duration::from_secs(2), blackhole.recv_from(&mut [0; 2048]))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_addr = listener.local_addr().unwrap();
+    let (_route_tx, route_rx) = tokio::sync::watch::channel(Some(conn.clone()));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let listener_task = tokio::spawn(monad_client::runtime::run_socks_listener(
+        listener, route_rx, stop_rx,
+    ));
+    let (target, mut accepted) = start_counting_target().await;
+    let plain = connect(socks_addr, &target.to_string(), Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        plain,
+        SocksClientError::Rejected {
+            code: 5,
+            stage: "connect request"
+        }
+    );
+    let detailed =
+        connect_with_diagnostics(socks_addr, &target.to_string(), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+    let SocksClientError::RejectedWithDiagnostic { code, diagnostic } = detailed else {
+        panic!("missing diagnostic: {detailed}");
+    };
+    assert_eq!(code, 5);
+    assert_eq!(diagnostic.stage, "connect");
+    assert_eq!(
+        diagnostic.code.as_deref(),
+        Some("SESSION_CONNECT_SETUP_LIMIT_REACHED")
+    );
+    assert_eq!(diagnostic.http_status, Some(429));
+    assert_eq!(
+        diagnostic.message,
+        "This session has reached its concurrent CONNECT setup limit."
+    );
+    control.wait_for_connect_counts(0, 0, 2).await;
+    assert!(timeout(Duration::from_millis(100), accepted.recv())
+        .await
+        .is_err());
+
+    stop_tx.send(true).unwrap();
+    listener_task.await.unwrap().unwrap();
+    drop(pending_send);
+    drop(pending_response);
+    control.close().await;
+    conn.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_relay_setup_limit_releases_on_cancellation_and_after_publication() {
     let limits = monad_common::config::RelayConnectLimitsConfig {
         max_open_per_session: 4,

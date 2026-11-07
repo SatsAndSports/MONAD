@@ -531,6 +531,16 @@ The traffic inside each hop-to-hop tunnel is another Noise-encrypted MONAD sessi
 
 The client speaks real SOCKS5 to local applications.
 
+Standard no-auth remains the default. MONAD-aware applications can explicitly
+negotiate private SOCKS method 0x80 with a `MONAD`/v1 sub-negotiation to receive
+bounded structured diagnostics after failure replies. Successful CONNECT replies
+and application streams are unchanged. The selected mode is carried from the
+handshake into tunnel setup; only pre-success failures may append diagnostic
+frames. Existing MONAD refusal codes and known HTTP status survive this boundary;
+unknown upstream causes remain generic. The extension is local, is not
+authentication, and does not change the relay protocol. See
+[SOCKS diagnostics v1](docs/socks-diagnostics.md).
+
 Supported SOCKS5 address types:
 - IPv4
 - IPv6

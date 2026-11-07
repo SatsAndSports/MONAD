@@ -2,6 +2,7 @@
 //! between a local TCP socket and the H2 stream.
 
 use crate::socks;
+use crate::socks_diagnostics::{SocksDiagnostic, SocksReplyMode};
 use http::{Method, Request, Uri};
 use monad_common::network_endpoint::validate_network_endpoint;
 use monad_common::proxy::proxy_bidirectional_from_client;
@@ -20,7 +21,23 @@ pub async fn open_tunnel(
     target_authority: &str,
     local_stream: &mut TcpStream,
 ) -> io::Result<()> {
-    open_tunnel_observed(conn, target_authority, local_stream, None).await
+    open_tunnel_with_reply_mode(
+        conn,
+        target_authority,
+        local_stream,
+        SocksReplyMode::Standard,
+    )
+    .await
+}
+
+/// Open a tunnel with the mode returned by SOCKS method negotiation.
+pub async fn open_tunnel_with_reply_mode(
+    conn: &RelayConnection,
+    target_authority: &str,
+    local_stream: &mut TcpStream,
+    reply_mode: SocksReplyMode,
+) -> io::Result<()> {
+    open_tunnel_observed(conn, target_authority, local_stream, None, reply_mode).await
 }
 
 pub(crate) async fn open_tunnel_observed(
@@ -28,31 +45,51 @@ pub(crate) async fn open_tunnel_observed(
     target_authority: &str,
     local_stream: &mut TcpStream,
     management: Option<&crate::management::ClientManagement>,
+    reply_mode: SocksReplyMode,
 ) -> io::Result<()> {
-    validate_network_endpoint(target_authority)?;
-    info!("opening tunnel to {target_authority}");
-    let mut h2_client = conn.clone_send_request().await;
+    let setup = async {
+        validate_network_endpoint(target_authority)?;
+        info!("opening tunnel to {target_authority}");
+        let mut h2_client = conn.clone_send_request().await;
 
-    // Build the CONNECT request
-    let uri: Uri = target_authority
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad URI: {e}")))?;
+        // Build the CONNECT request
+        let uri: Uri = target_authority
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad URI: {e}")))?;
 
-    let request = Request::builder()
-        .method(Method::CONNECT)
-        .uri(uri)
-        .body(())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad request: {e}")))?;
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .uri(uri)
+            .body(())
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("bad request: {e}"))
+            })?;
 
-    // Send the CONNECT request
-    let (response_future, h2_send) = h2_client
-        .send_request(request, false)
-        .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
+        // Send the CONNECT request
+        let (response_future, h2_send) = h2_client
+            .send_request(request, false)
+            .map_err(|e| io::Error::other(format!("h2 send error: {e}")))?;
 
-    // Wait for the relay's response
-    let response = response_future
-        .await
-        .map_err(|e| io::Error::other(format!("h2 response error: {e}")))?;
+        // Wait for the relay's response
+        let response = response_future
+            .await
+            .map_err(|e| io::Error::other(format!("h2 response error: {e}")))?;
+        Ok::<_, io::Error>((h2_send, response))
+    }
+    .await;
+    let (h2_send, response) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            let _ = socks::send_failure(
+                local_stream,
+                reply_mode,
+                0x01,
+                &SocksDiagnostic::connect_failure(&error, None),
+            )
+            .await;
+            return Err(error);
+        }
+    };
 
     if !response.status().is_success() {
         let error = monad_common::rejection::connect_error(response.status(), response.headers());
@@ -66,7 +103,13 @@ pub(crate) async fn open_tunnel_observed(
         } else {
             0x05
         };
-        let _ = socks::send_reply(local_stream, reply, "0.0.0.0", 0).await;
+        let _ = socks::send_failure(
+            local_stream,
+            reply_mode,
+            reply,
+            &SocksDiagnostic::connect_failure(&error, Some(response.status().as_u16())),
+        )
+        .await;
         return Err(error);
     }
 

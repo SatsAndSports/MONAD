@@ -970,18 +970,19 @@ async fn run_socks_listener_shared(
                 connections.push(std::panic::AssertUnwindSafe(async move {
                     let result = async {
                         // A stalled handshake must not pin a route generation.
-                        let target = socks::socks5_handshake(&mut stream).await?;
+                        let target = socks::socks5_handshake_with_diagnostics(&mut stream).await?;
                         let conn = match wait_for_active_route(conn_rx, shutdown_rx).await {
                             Some(conn) => conn,
                             None => {
-                                socks::send_reply(&mut stream, 0x05, "0.0.0.0", 0).await?;
+                                socks::send_failure(&mut stream, target.reply_mode, 0x05,
+                                    &crate::socks_diagnostics::SocksDiagnostic::simple("route", "No active MONAD route is available.")).await?;
                                 warn!(
                                     "SOCKS client {peer_addr} rejected: route is reconnecting"
                                 );
                                 return Ok(());
                             }
                         };
-                        tunnel::open_tunnel_observed(&conn, &target.authority, &mut stream, management.as_deref()).await
+                        tunnel::open_tunnel_observed(&conn, &target.authority, &mut stream, management.as_deref(), target.reply_mode).await
                     }
                     .await;
                     if let Err(err) = result {
