@@ -2196,6 +2196,17 @@ without draining unrelated requests. Pending funding operations still block
 conflicting mutations; release advisories defer unlink until that operation
 resolves. The wire FIFO and its five-request limit remain unchanged.
 
+The separate manual `stress-payment-capacity` experiment uses the production
+client connector/payment driver with test signing wallets and one relay subprocess
+running real Spilman validation and SQLite persistence. Each client has an
+independent QUIC connection and a pre-established channel. Paced echo traffic
+drives refills; provisioning and warmup precede the measured window. Test-only
+backend observers measure accepted payments and processing latency, while
+per-client delivery checks reject loads that merely stay connected without
+keeping up. This measures a shared relay under many sessions, rather than the
+custom buffered harness's pipelined status pressure. See
+[`docs/payment-capacity.md`](docs/payment-capacity.md) for measurement boundaries.
+
 ### Configured Client QUIC Hops
 
 Configured client routes use 32-byte x-only secp256k1 identities from YAML

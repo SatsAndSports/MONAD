@@ -37,6 +37,33 @@ stress-medium:
 stress-custom:
 	cargo test -p monad-relay --test stress -- --ignored stress_three_hop_quic_configurable --nocapture
 
+# Manual only. Measurement excludes provisioning, setup and staggered warmup.
+# Use MONAD_CAPACITY_PROFILE=dev for a quick development smoke test.
+stress-payment-capacity:
+	@sessions="$${MONAD_CAPACITY_SESSIONS-25}"; \
+	case "$$sessions" in ''|*[!0-9]*) \
+		printf '%s\n' 'Error: MONAD_CAPACITY_SESSIONS must be an integer in 1..100000.' >&2; exit 2;; esac; \
+	if ! [ "$$sessions" -ge 1 ] || ! [ "$$sessions" -le 100000 ]; then \
+		printf '%s\n' 'Error: MONAD_CAPACITY_SESSIONS must be in 1..100000.' >&2; exit 2; fi; \
+	required=$$(expr "$$sessions" \* 2 + 512); \
+	limit=$$(ulimit -Sn) || exit 2; \
+	if [ "$$limit" != unlimited ] && [ "$$limit" -lt "$$required" ]; then \
+		printf 'Error: capacity test with %s sessions requires a soft file-descriptor limit of at least %s; current limit is %s.\n' "$$sessions" "$$required" "$$limit" >&2; \
+		printf 'Raise the limit (subject to your hard limit), then rerun the same command:\n  ulimit -Sn %s\n' "$$required" >&2; \
+		exit 2; \
+	fi
+	NO_COLOR=1 RUST_LOG="$${RUST_LOG:-error}" \
+	cargo test -j "$${CARGO_BUILD_JOBS:-2}" --profile "$${MONAD_CAPACITY_PROFILE:-release}" \
+	-p monad-relay --test integration payment_capacity::single_relay_payment_capacity \
+	-- --ignored --exact --nocapture
+
+# One-minute measured trial; provisioning and warmup take additional time.
+stress-payment-capacity-1500:
+	MONAD_CAPACITY_SESSIONS=1500 \
+	MONAD_CAPACITY_SETUP_CONCURRENCY=64 \
+	MONAD_CAPACITY_DURATION_SECS=60 \
+	$(MAKE) stress-payment-capacity
+
 stress-stable-5hop:
 	ulimit -Sn 65536 && \
 	echo "ulimit -n=$$(ulimit -n)" && \
