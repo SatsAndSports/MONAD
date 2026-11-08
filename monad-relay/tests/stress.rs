@@ -39,6 +39,9 @@ const DEFAULT_INITIAL_PAYMENT_MSATS: u64 = 100_000;
 const DEFAULT_PAYMENT_CHUNK_MSATS: u64 = 100_000;
 const DEFAULT_TARGET_BUFFER_MSATS: u64 = 20_000;
 
+#[path = "stress_support/control_regression.rs"]
+mod control_regression;
+
 fn hop_label(hop: &RouteHop) -> &str {
     match hop {
         RouteHop::Cleartext { addr, .. } => addr,
@@ -570,10 +573,64 @@ async fn run_stream_echo(
     Ok((sent, received))
 }
 
+/// Keep the load generator's five-slot FIFO, but serialize only funding
+/// operations. Periodic status requests must not gate payment/readiness work.
+#[derive(Default)]
+struct StressControlExchange {
+    fifo: monad_common::control_exchange::ControlExchange,
+    funding: Option<monad_common::control_exchange::PendingRequest>,
+}
+
+impl StressControlExchange {
+    fn enqueue(
+        &mut self,
+        request: monad_common::control_exchange::PendingRequest,
+    ) -> io::Result<()> {
+        use monad_common::control_exchange::PendingRequest;
+        let funding = !matches!(request, PendingRequest::Status);
+        if funding && self.funding.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "stress funding operation already pending",
+            ));
+        }
+        self.fifo.enqueue(request.clone())?;
+        if funding {
+            self.funding = Some(request);
+        }
+        Ok(())
+    }
+
+    fn observe(
+        &mut self,
+        message: &ServerMessage,
+    ) -> io::Result<monad_common::control_exchange::Attribution> {
+        use monad_common::control_exchange::Attribution;
+        let attribution = self.fifo.observe(message)?;
+        if let Attribution::Response(request) = &attribution {
+            if self.funding.as_ref() == Some(request) {
+                self.funding = None;
+            }
+        }
+        Ok(attribution)
+    }
+
+    fn is_initialized(&self) -> bool {
+        self.fifo.is_initialized()
+    }
+    fn pending_len(&self) -> usize {
+        self.fifo.pending_len()
+    }
+    fn funding_available(&self) -> bool {
+        self.funding.is_none()
+            && self.pending_len() < monad_common::control_exchange::MAX_PENDING_REQUESTS
+    }
+}
+
 async fn send_control_message(
     h2_send: &mut h2::SendStream<bytes::Bytes>,
     message: &ClientMessage,
-    exchange: &mut monad_common::control_exchange::ControlExchange,
+    exchange: &mut StressControlExchange,
     request: monad_common::control_exchange::PendingRequest,
 ) -> io::Result<()> {
     exchange.enqueue(request)?;
@@ -607,7 +664,7 @@ async fn provision_and_send_link(
     offer: &RelayPaymentOffer,
     channel_capacity_msats: u64,
     h2_send: &mut h2::SendStream<bytes::Bytes>,
-    exchange: &mut monad_common::control_exchange::ControlExchange,
+    exchange: &mut StressControlExchange,
 ) -> io::Result<String> {
     let channel_id = wallet
         .provision_channel(offer, channel_capacity_msats)
@@ -656,17 +713,42 @@ async fn start_huge_funding_control(
         let mut offer: Option<RelayPaymentOffer> = None;
         let mut active_channel_id: Option<String> = None;
         let mut link_in_flight: Option<String> = None;
+        let mut release_requested: Option<String> = None;
         let mut channel_states = HashMap::<String, ChannelAttemptState>::new();
         let mut session_became_usable = false;
         let mut last_paused: Option<bool> = None;
         let mut saw_pause_once = false;
         let mut successful_links = 0u64;
         let mut counted_relinked_session = false;
-        let mut exchange = monad_common::control_exchange::ControlExchange::default();
+        let mut exchange = StressControlExchange::default();
         let mut status_interval = tokio::time::interval(payment.status_poll_interval);
         status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            if exchange.funding_available() {
+                if let Some(channel_id) = release_requested.take() {
+                    if let Err(err) = send_control_message(
+                        &mut h2_send,
+                        &ClientMessage::ChannelUnlink {
+                            channel_id: channel_id.clone(),
+                        },
+                        &mut exchange,
+                        monad_common::control_exchange::PendingRequest::Unlink {
+                            channel_id: channel_id.clone(),
+                        },
+                    )
+                    .await
+                    {
+                        payment_stats.control_errors.fetch_add(1, Ordering::Relaxed);
+                        println!("{hop_label}: failed to send channel unlink: {err}");
+                        break;
+                    }
+                    active_channel_id = None;
+                    if let Some(channel_state) = channel_states.get_mut(&channel_id) {
+                        channel_state.last_attempted_balance_raw = None;
+                    }
+                }
+            }
             let maybe_message = tokio::select! {
                 _ = status_interval.tick(), if payment.mode != StressPaymentMode::Transport => {
                     if !exchange.is_initialized() || exchange.pending_len() == monad_common::control_exchange::MAX_PENDING_REQUESTS { continue; }
@@ -686,7 +768,7 @@ async fn start_huge_funding_control(
                 Ok(None) => break,
                 Err(err) => {
                     payment_stats.control_errors.fetch_add(1, Ordering::Relaxed);
-                    println!("{hop_label}: control stream error during stress prefund: {err}");
+                    println!("{hop_label}: stress control stream error: {err}");
                     break;
                 }
             };
@@ -752,7 +834,10 @@ async fn start_huge_funding_control(
                     let Some(current_offer) = offer.as_ref() else {
                         continue;
                     };
-                    if !exchange.is_empty() {
+                    // An ordinary response just freed a slot. Act on funding
+                    // before returning to the timer that can refill that slot.
+                    // Only an actual outstanding funding operation blocks this.
+                    if !exchange.funding_available() || release_requested.is_some() {
                         continue;
                     }
 
@@ -851,6 +936,24 @@ async fn start_huge_funding_control(
                                 .is_some_and(|target| linked.balance_raw >= target)
                             {
                                 channel_state.last_attempted_balance_raw = None;
+                            }
+
+                            // Confirm readiness before considering another refill.
+                            // A sent payment alone is insufficient; require an
+                            // accepted positive channel balance as well.
+                            if channel_state.initial_payment_sent
+                                && channel_state.last_confirmed_balance_raw > 0
+                                && !paused
+                            {
+                                if !session_became_usable {
+                                    session_became_usable = true;
+                                    payment_stats
+                                        .startup_unpauses
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                if let Some(tx) = ready_tx.take() {
+                                    let _ = tx.send(());
+                                }
                             }
 
                             let base_balance_raw = channel_state
@@ -1010,23 +1113,6 @@ async fn start_huge_funding_control(
                             }
                         }
                     }
-
-                    if active_channel_id
-                        .as_ref()
-                        .and_then(|id| channel_states.get(id))
-                        .is_some_and(|state| state.initial_payment_sent)
-                        && !paused
-                    {
-                        if !session_became_usable {
-                            session_became_usable = true;
-                            payment_stats
-                                .startup_unpauses
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        if let Some(tx) = ready_tx.take() {
-                            let _ = tx.send(());
-                        }
-                    }
                 }
                 ServerMessage::ChannelEvicted { channel_id, scope } => {
                     payment_stats.control_errors.fetch_add(1, Ordering::Relaxed);
@@ -1041,26 +1127,7 @@ async fn start_huge_funding_control(
                     );
                     if active_channel_id.as_deref() == Some(channel_id.as_str()) {
                         let _ = wallet.mark_channel_unusable(&channel_id);
-                        if let Err(err) = send_control_message(
-                            &mut h2_send,
-                            &ClientMessage::ChannelUnlink {
-                                channel_id: channel_id.clone(),
-                            },
-                            &mut exchange,
-                            monad_common::control_exchange::PendingRequest::Unlink {
-                                channel_id: channel_id.clone(),
-                            },
-                        )
-                        .await
-                        {
-                            payment_stats.control_errors.fetch_add(1, Ordering::Relaxed);
-                            println!("{hop_label}: failed to send channel unlink: {err}");
-                            break;
-                        }
-                        active_channel_id = None;
-                        if let Some(channel_state) = channel_states.get_mut(&channel_id) {
-                            channel_state.last_attempted_balance_raw = None;
-                        }
+                        release_requested = Some(channel_id);
                         continue;
                     }
                     println!(
@@ -1126,6 +1193,7 @@ fn connect_through_chain_prefunded(
     hop_idx: usize,
     payment: StressPaymentConfig,
     payment_stats: Arc<PaymentStats>,
+    circuit_id: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<RelayConnection>> + Send>> {
     let hops = hops.to_vec();
 
@@ -1159,7 +1227,12 @@ fn connect_through_chain_prefunded(
         };
         conn.add_driver(driver);
 
-        let funding_label = format!("hop {}/{} to {}", hop_idx + 1, hops.len(), hop_label(hop));
+        let funding_label = format!(
+            "circuit {circuit_id} hop {}/{} to {}",
+            hop_idx + 1,
+            hops.len(),
+            hop_label(hop)
+        );
         conn = fund_session_huge(conn, &funding_label, payment, payment_stats.clone()).await?;
 
         if hop_idx < hops.len() - 1 {
@@ -1192,6 +1265,7 @@ fn connect_through_chain_prefunded(
                 hop_idx + 1,
                 payment,
                 payment_stats,
+                circuit_id,
             )
             .await?;
             next_conn.absorb_handles_from(&mut conn);
@@ -1207,6 +1281,7 @@ async fn connect_quic_chain_prefunded(
     hops: &[RouteHop],
     payment: StressPaymentConfig,
     payment_stats: Arc<PaymentStats>,
+    circuit_id: usize,
 ) -> io::Result<RelayConnection> {
     if hops.is_empty() {
         return Err(io::Error::new(
@@ -1237,7 +1312,7 @@ async fn connect_quic_chain_prefunded(
         .open_stream(addr, ClientAuthMode::Secp256k1(*pubkey))
         .await?;
 
-    connect_through_chain_prefunded(stream, hops, 0, payment, payment_stats).await
+    connect_through_chain_prefunded(stream, hops, 0, payment, payment_stats, circuit_id).await
 }
 
 async fn run_circuit(
@@ -1268,6 +1343,7 @@ async fn run_circuit(
         &hops,
         config.payment,
         config.payment_stats.clone(),
+        circuit_id,
     )
     .await?;
     if config.verbose {
@@ -1333,7 +1409,7 @@ async fn run_circuit(
             if verbose {
                 println!("circuit {circuit_id} stream {stream_idx}: open");
             }
-            let tunnel = conn.open_tunnel(&target).await?;
+            let tunnel = conn.open_tunnel(&target).await.map_err(|err| io::Error::new(err.kind(), format!("circuit {circuit_id} stream {stream_idx} target {target} CONNECT failed: {err}")))?;
             let result = run_stream_echo(tunnel, payload_bytes, pattern).await;
             if verbose {
                 match &result {
@@ -1478,12 +1554,17 @@ async fn run_stress_scenario(config: StressConfig) {
             payment: config.payment,
             payment_stats: payment_stats.clone(),
         };
-        handles.push(tokio::spawn(run_circuit(
-            circuit_id,
-            first_hop_pool.clone(),
-            hops,
-            circuit_config,
-        )));
+        let pool = first_hop_pool.clone();
+        handles.push(tokio::spawn(async move {
+            let result = run_circuit(circuit_id, pool, hops, circuit_config).await;
+            if let Err(error) = &result {
+                println!(
+                    "circuit {circuit_id}: failed after {:.3}s: {error}",
+                    total_start.elapsed().as_secs_f64()
+                );
+            }
+            result
+        }));
     }
 
     let mut successes = 0usize;

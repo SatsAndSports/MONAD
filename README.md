@@ -649,6 +649,16 @@ The `Makefile` also includes named manual stress recipes for:
 
 The throughput/payment stress recipes expect a high `ulimit -n` and are intended for developer load testing rather than routine CI. The configurable transport harness accepts explicit `MONAD_STRESS_MAX_OPEN_CONNECTS_PER_SESSION`, `MONAD_STRESS_MAX_CONNECT_SETUPS_PER_SESSION`, `MONAD_STRESS_MAX_OPEN_CONNECTS_PER_RELAY`, and `MONAD_STRESS_MAX_CONNECT_SETUPS_PER_RELAY` overrides; the extreme recipe sets these above production defaults. The chaos rebuild recipes run at a smaller scale and need no special `ulimit`. `MONAD_CHAOS_KILL_MODE=graceful|abrupt|mixed` selects whether chaos restarts use clean shutdown, task-tree cancellation, or alternating modes. The main client now uses timer-driven local counter checks for payment sizing; the stress recipes still use frequent `GetSessionStatus` polling intentionally to exercise relay control-plane behavior under load.
 
+`stress-payment-buffered` is a relay/transport load generator with a custom mock-wallet control loop,
+not a load test of the production client's payment state machine. Its five-slot
+control FIFO retains pipelined status queries, but only one link/payment/unlink
+operation may be outstanding. Each attributed response frees a slot for funding
+work before another periodic poll; unrelated status queries do not block funded
+readiness or refills. Readiness requires confirmed positive channel funding and
+an unpaused status. Delayed-response regression tests exercise the actual harness
+control task with a full FIFO, including stale pre-payment replies and deferred
+channel release.
+
 Ignored but important regression tests can be run explicitly when changing route rebuild or keyset-refresh behavior:
 
 ```bash

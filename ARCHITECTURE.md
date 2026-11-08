@@ -2185,6 +2185,17 @@ A relay that handles CONNECT requests with `quic-secp256k1-pubkey` maintains a c
 
 This is the core scaling benefit: one QUIC handshake to T is amortized across all clients whose routes pass through S to T.
 
+### Payment Stress Harness
+
+The payment stress harness deliberately pipelines ordinary status requests to
+load the relay; it does not use the production client payment driver. Its local
+scheduler serializes link/payment/unlink operations independently of outstanding
+status queries. An attributed response is processed before another timer poll
+can occupy the freed request slot, and confirmed funding can signal readiness
+without draining unrelated requests. Pending funding operations still block
+conflicting mutations; release advisories defer unlink until that operation
+resolves. The wire FIFO and its five-request limit remain unchanged.
+
 ### Configured Client QUIC Hops
 
 Configured client routes use 32-byte x-only secp256k1 identities from YAML
