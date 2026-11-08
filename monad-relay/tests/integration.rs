@@ -17,6 +17,8 @@ mod close_successor;
 mod common;
 #[path = "common/drain_successor.rs"]
 mod drain_successor;
+#[path = "common/payment_capacity.rs"]
+mod payment_capacity;
 #[path = "common/payment_conflict.rs"]
 mod payment_conflict;
 
