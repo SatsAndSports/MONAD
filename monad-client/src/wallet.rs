@@ -241,7 +241,10 @@ pub trait MonadWallet: Send + Sync + 'static {
     }
 
     /// Wallet implementations must independently confirm optional mint support.
-    /// The default implementation only implements baseline ordinary channels.
+    /// Callers ask about an optional mode only when the relay advertises it for
+    /// this mint, so a cached negative answer is a contradiction the wallet may
+    /// refresh (rate limited). The default implementation only implements
+    /// baseline ordinary channels.
     fn supports_commitment_mode(
         &self,
         _mint: &str,
