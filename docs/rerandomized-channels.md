@@ -118,6 +118,9 @@ Instrumented funds-process fixtures explicitly select both `ordinary` and
 override, not an absent preference: it must not follow the production default.
 The custody audit checks the actual stored channel parameters in both fixture
 modes so a default-selection change cannot silently switch refund expectations.
+Because the baseline `make test-funds-lifecycle` uses normal binaries, which
+ignore that override, ordinary fixtures also pin `client_wallet.commitment_mode:
+ordinary` in their real config; rerandomized fixtures remove that pin.
 
 ## Financial invariants
 

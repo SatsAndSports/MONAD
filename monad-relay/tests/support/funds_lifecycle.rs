@@ -472,6 +472,13 @@ pub struct Fixture {
 impl Fixture {
     /// Only instrumented binaries interpret this marker-derived child setting.
     pub fn rerandomized(self) -> Self {
+        // Ordinary fixtures pin the mode in real client config, which normal
+        // binaries honor. A config preference outranks the test override, so
+        // rerandomized fixtures remove it.
+        let yaml = std::fs::read_to_string(&self.config).unwrap();
+        let pinned = "  commitment_mode: ordinary\n";
+        assert!(yaml.contains(pinned), "fixture config lost its mode pin");
+        std::fs::write(&self.config, yaml.replacen(pinned, "", 1)).unwrap();
         std::fs::write(
             self.config.parent().unwrap().join("rerandomized-fixture"),
             b"",
@@ -765,6 +772,7 @@ client_wallet:
   loose_db_path: {root}/loose.db
   channel_db_path: {root}/channel.db
   sender_secret_hex: "{sender}"
+  commitment_mode: ordinary
   channel_funding_token_target_msats: 1024000
   target_topup_buffer_msats: 100000
 relays:
