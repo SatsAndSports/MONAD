@@ -127,8 +127,13 @@ struct Entry {
     refresh: tokio::sync::Mutex<()>,
 }
 
-/// Independent process-local discovery. Positive/negative observations live for
-/// five minutes; failures remain Unknown and retry after 30 seconds. Expired
+/// Relay lifetime of a known supported/unsupported observation.
+pub const RELAY_CAPABILITY_KNOWN_TTL: Duration = Duration::from_secs(60 * 60);
+/// Relay retry delay after a failed or malformed fetch (unknown, not an answer).
+pub const RELAY_CAPABILITY_UNKNOWN_RETRY: Duration = Duration::from_secs(30);
+
+/// Relay-side process-local discovery. Positive/negative observations are
+/// rechecked hourly; failures remain Unknown and retry after 30 seconds. Expired
 /// positives are never used after refresh failure. No keys/proofs are persisted.
 #[derive(Debug, Default)]
 pub struct MintModeCache {
@@ -138,8 +143,12 @@ pub struct MintModeCache {
 fn fresh(entry: &Entry) -> Option<Result<bool, String>> {
     let cached = entry.value.lock().unwrap();
     let (at, value) = cached.as_ref()?;
-    let ttl = if value.is_ok() { 300 } else { 30 };
-    (at.elapsed() < Duration::from_secs(ttl)).then(|| value.clone())
+    let ttl = if value.is_ok() {
+        RELAY_CAPABILITY_KNOWN_TTL
+    } else {
+        RELAY_CAPABILITY_UNKNOWN_RETRY
+    };
+    (at.elapsed() < ttl).then(|| value.clone())
 }
 
 impl MintModeCache {
@@ -504,7 +513,12 @@ mod tests {
             entry.value.lock().unwrap().as_mut().unwrap().0 =
                 Instant::now() - Duration::from_secs(seconds);
         };
-        age(301);
+        // Known answers are rechecked hourly, not every few minutes.
+        age(3599);
+        assert_eq!(cache.supported_mints(), BTreeSet::from([mint.clone()]));
+        assert_eq!(cache.discover(&mint).await, Ok(true));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        age(3601);
         assert!(cache.supported_mints().is_empty());
         assert!(cache.discover(&mint).await.is_err());
         assert!(cache.discover(&mint).await.is_err());
