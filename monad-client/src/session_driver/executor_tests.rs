@@ -17,7 +17,7 @@ use std::sync::{
     Arc,
 };
 
-fn fixture(wallet: Arc<dyn MonadWallet>) -> (SessionDriverConfig, DriverState) {
+pub(super) fn fixture(wallet: Arc<dyn MonadWallet>) -> (SessionDriverConfig, DriverState) {
     let offer = RelayPaymentOffer {
         commitment_modes: Default::default(),
         receiver_pubkey: "receiver".into(),
@@ -34,6 +34,7 @@ fn fixture(wallet: Arc<dyn MonadWallet>) -> (SessionDriverConfig, DriverState) {
         hop_label: "replacement".into(),
         payment_policy: PaymentPolicy::default(),
         management: None,
+        acquisition_gate: Default::default(),
         conn: RelayConnectionHandles {
             session_id: [1; 32],
             pricing_handle: Arc::default(),
@@ -89,7 +90,24 @@ fn fixture(wallet: Arc<dyn MonadWallet>) -> (SessionDriverConfig, DriverState) {
     (config, state)
 }
 
-struct Once(std::cell::Cell<Option<Intent>>);
+/// Await the background worker and apply its report as the executor does.
+pub(super) async fn complete_acquisition(config: &SessionDriverConfig, state: &mut DriverState) {
+    assert!(
+        !state.exchange.is_empty(),
+        "acquisition must hold the ordinary slot"
+    );
+    let report = state
+        .acquisition
+        .take()
+        .expect("acquisition worker started")
+        .await
+        .unwrap();
+    super::funding::apply_acquisition(config, state, report)
+        .await
+        .unwrap();
+}
+
+pub(super) struct Once(pub(super) std::cell::Cell<Option<Intent>>);
 impl FundingStrategy for Once {
     fn decide(&self, _: &View) -> Intent {
         self.0.take().unwrap_or(Intent::Wait)
@@ -149,7 +167,7 @@ async fn failed_link_preparation_releases_candidate_and_does_not_retry_excluded_
     }
 }
 
-fn channel(id: &str, attached: Option<[u8; 32]>) -> WalletChannel {
+pub(super) fn channel(id: &str, attached: Option<[u8; 32]>) -> WalletChannel {
     WalletChannel {
         commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
         channel_id: id.into(),
@@ -194,6 +212,7 @@ async fn acquire_reserves_candidate_without_linking_and_can_release_it() {
     )
     .await
     .unwrap();
+    complete_acquisition(&config, &mut state).await;
     assert_eq!(state.acquired.as_ref().unwrap().0.channel_id, "B");
     assert_eq!(state.intended_channel_id.as_deref(), Some("A"));
     assert!(state.exchange.is_empty());
@@ -382,7 +401,7 @@ async fn mode_rejection_excludes_only_this_session_and_preserves_old_funding() {
 }
 
 #[derive(Default)]
-struct CountingWallet(AtomicUsize);
+pub(super) struct CountingWallet(pub(super) AtomicUsize);
 impl CountingWallet {
     fn called<T>(&self) -> Result<T, WalletError> {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -440,6 +459,7 @@ async fn funded_ticks_and_busy_ticks_never_access_wallet() {
         hop_label: "counting".into(),
         payment_policy: PaymentPolicy::default(),
         management: None,
+        acquisition_gate: Default::default(),
         conn: RelayConnectionHandles {
             session_id: [1; 32],
             pricing_handle: Arc::default(),

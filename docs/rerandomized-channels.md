@@ -118,6 +118,9 @@ Instrumented funds-process fixtures explicitly select both `ordinary` and
 override, not an absent preference: it must not follow the production default.
 The custody audit checks the actual stored channel parameters in both fixture
 modes so a default-selection change cannot silently switch refund expectations.
+Because the baseline `make test-funds-lifecycle` uses normal binaries, which
+ignore that override, ordinary fixtures also pin `client_wallet.commitment_mode:
+ordinary` in their real config; rerandomized fixtures remove that pin.
 
 ## Financial invariants
 
@@ -159,17 +162,16 @@ modes so a default-selection change cannot silently switch refund expectations.
 
 ### Mint metadata coordination and acquisition responsiveness
 
-Capability discovery and keyset refresh currently have separate coordination.
-The client's synchronous wallet acquisition APIs can wait on a capability-cache
-miss, keyset refresh, or provisioning request inside the session-driver task.
-That delays this task's control-response and heartbeat processing while mint I/O
-is pending; independent transport tasks can still run. Relay capability discovery
-waits during startup, then refreshes asynchronously alongside session handling.
+Client: new-channel selection and provisioning (capability discovery, keyset
+refresh, opening swaps) runs in an owned acquisition worker, so a slow mint no
+longer delays the session driver's heartbeats, advisories or shutdown handling.
+Acquisition still holds the single ordinary slot until its report is applied;
+see `ARCHITECTURE.md` (client session driver).
 
-[Issue #179](https://github.com/SatsAndSports/MONAD/issues/179) tracks coordinated
-metadata refresh and explicitly owned responsive client acquisition. That work
-must preserve independent cache/error semantics, serialized funding authority,
-durable opening custody, and cancellation/cleanup guarantees.
+Still open under [issue #179](https://github.com/SatsAndSports/MONAD/issues/179):
+capability discovery and keyset refresh keep separate caches and coordination on
+both sides, and the relay side has not been reviewed. Relay capability discovery
+waits during startup, then refreshes asynchronously alongside session handling.
 
 ### Expiry policy
 

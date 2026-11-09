@@ -21,6 +21,7 @@ pub(super) struct SessionDriverConfig {
         Arc<crate::management::ClientManagement>,
         Arc<crate::management::HopManagement>,
     )>,
+    pub(super) acquisition_gate: Arc<super::acquisition::AcquisitionGate>,
 }
 
 #[derive(Clone)]
@@ -92,6 +93,9 @@ pub(super) struct DriverState {
     pub(super) intended_channel_keyset_id: Option<String>,
     pub(super) intended_offer: Option<RelayPaymentOffer>,
     pub(super) acquired: Option<(WalletChannel, RelayPaymentOffer)>,
+    /// Running acquisition worker. While present, the ordinary slot is
+    /// `Working`; only the executor applies the report.
+    pub(super) acquisition: Option<tokio::task::JoinHandle<super::acquisition::AcquisitionReport>>,
     pub(super) previous_link: Option<PreviousChannel>,
     /// Wallet authority captured when this session reserves a channel. Relay
     /// statuses validate against this task-owned snapshot; they never load or

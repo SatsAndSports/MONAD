@@ -179,10 +179,15 @@ async fn administrative_wait_preserves_prefix_and_outlives_setup_budget() {
         timeout(Duration::from_secs(3), async {
             loop {
                 changes.borrow_and_update();
-                if management.hops().len() == 1 {
+                // Provisioning runs on the acquisition worker, so the prefix
+                // hop can register before its channel exists. Wait for both.
+                if management.hops().len() == 1 && wallet.list_channels().unwrap().len() == 1 {
                     break;
                 }
-                changes.changed().await.unwrap();
+                tokio::select! {
+                    changed = changes.changed() => changed.unwrap(),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
             }
         })
         .await

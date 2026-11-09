@@ -788,6 +788,7 @@ The canonical client funding implementation lives in `monad-client/src/session_d
 - `reducer` owns ordinary-request sequencing and channel replacement transitions
 - `policy` makes in-memory funding decisions on the existing 250 ms opportunities
 - `funding` executes channel acquisition, link, payment, retirement, and recovery effects
+- `acquisition` selects or provisions new channels on an owned worker, so slow mint I/O does not block heartbeats or advisories
 - `payment` holds payment math and relay/client safety checks
 
 Shared protocol helpers used by client, relay, and harness code live in:

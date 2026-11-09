@@ -974,7 +974,7 @@ The client uses one serialized executor in `monad-client/src/session_driver.rs`,
 with a pure ordinary-control/channel reducer and a separate funding policy.
 
 `session_driver.rs` contains the public entrypoints and private `runtime`,
-`state`, `reducer`, `policy`, `funding`, and `payment` modules for executor input ordering, local
+`state`, `reducer`, `policy`, `funding`, `acquisition`, and `payment` modules for executor input ordering, local
 state publishing, channel acquisition/link/payment progression, and payment
 protocol-safety checks.
 
@@ -993,6 +993,24 @@ while the pending replacement retains A. Success releases A's local reservation;
 rejection restores A unless an independent eviction invalidated it. Release
 advisories are retained through the pending operation rather than resolving it.
 Session cleanup covers active, acquired, and previous-channel reservations.
+
+Selecting or provisioning a new channel can wait on mint I/O (capability
+discovery, keyset refresh, opening swaps). That part of acquisition runs on a
+blocking worker (`session_driver/acquisition.rs`) with a snapshot of the
+offers and exclusions. The executor keeps handling heartbeats, advisories and
+control-stream end while it runs, but the ordinary slot stays `Working`: no
+payment, link, unlink or second acquisition can start. The worker never sends
+or mutates driver state; the executor applies its report and discards a
+candidate that was evicted or excluded meanwhile, or that arrives after
+termination. Retrying an unconfirmed intended channel uses only local wallet
+state and stays in the executor.
+
+Wallet work is never detached. Normal cleanup cancels further worker steps,
+awaits the worker, and releases any candidate it attached. If the driver task is
+aborted, its attachment guard sets the same cancellation flag and synchronously
+waits for a running worker before scanning attachments, so a late attach cannot
+escape cleanup. A worker cancelled before it starts touches no wallet state;
+one cancelled after provisioning leaves the new channel open and unattached.
 
 `policy::FundingStrategy` receives only an in-memory view. The existing
 `PaymentPolicy` implements the default strategy. Intents include wait, acquire,

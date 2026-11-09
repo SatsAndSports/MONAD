@@ -10,12 +10,16 @@ use crate::wallet::MonadWallet;
 struct SessionAttachments {
     wallet: Arc<dyn MonadWallet>,
     session_id: [u8; 32],
+    acquisition_gate: Arc<acquisition::AcquisitionGate>,
 }
 
 impl Drop for SessionAttachments {
     fn drop(&mut self) {
-        // The driver is the only writer for this session. Its synchronous wallet
-        // calls have finished before drop, even if abort arrived in block_in_place.
+        // The driver is the only writer for this session. If abort dropped the
+        // driver while its acquisition worker was running, wait for that
+        // worker: it cannot attach after cancellation, and its earlier attach
+        // must be visible to the scan below.
+        self.acquisition_gate.cancel_and_wait_blocking();
         // Scan by owner rather than intended_channel_id: attach precedes sending
         // ChannelLink, which can be cancelled before intended bookkeeping.
         match self.wallet.list_channels() {
@@ -36,6 +40,9 @@ impl Drop for SessionAttachments {
     }
 }
 
+mod acquisition;
+#[cfg(test)]
+mod acquisition_tests;
 #[cfg(test)]
 mod executor_tests;
 mod funding;
@@ -102,11 +109,13 @@ pub async fn start_managed_session_payment_driver(
         hop_label: hop_label.to_string(),
         payment_policy,
         management: lease.as_ref().map(|l| (l.owner.clone(), l.hop.clone())),
+        acquisition_gate: Arc::default(),
     };
 
     let attachments = SessionAttachments {
         wallet: config.wallet.clone(),
         session_id: *conn.session_id(),
+        acquisition_gate: config.acquisition_gate.clone(),
     };
     let handle = tokio::spawn(async move {
         let _lease = lease;
@@ -490,6 +499,7 @@ mod tests {
         drop(super::SessionAttachments {
             wallet: wallet.clone(),
             session_id: [1; 32],
+            acquisition_gate: Default::default(),
         });
         assert_eq!(
             wallet.get_channel("ours").unwrap().attached_session_id,
@@ -503,6 +513,7 @@ mod tests {
         drop(super::SessionAttachments {
             wallet: wallet.clone(),
             session_id: [1; 32],
+            acquisition_gate: Default::default(),
         });
         assert_eq!(
             wallet.get_channel("ours").unwrap().attached_session_id,
@@ -1557,6 +1568,7 @@ mod tests {
                     ..Default::default()
                 },
                 management: None,
+                acquisition_gate: Default::default(),
             };
             let (client, _server) = tokio::io::duplex(64);
             let (mut h2, connection) = h2::client::handshake(client).await.unwrap();
@@ -1631,6 +1643,7 @@ mod tests {
             hop_label: "test".into(),
             payment_policy: PaymentPolicy::default(),
             management: None,
+            acquisition_gate: Default::default(),
         };
         for code in [
             ServerErrorCode::PaymentInvalid,
@@ -1740,6 +1753,7 @@ mod tests {
             hop_label: "test".to_string(),
             payment_policy: PaymentPolicy::default(),
             management: None,
+            acquisition_gate: Default::default(),
         };
 
         let result = rt.block_on(async {

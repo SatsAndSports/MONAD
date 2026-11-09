@@ -36,7 +36,9 @@ Acquisition and linking are distinct: acquisition exclusively reserves a candida
 link selection records the client's active choice before submission, retaining a
 previous channel through replacement. Rejection restores the previous channel
 unless independently evicted. Wallet preparation, signing/persistence, submission,
-and reservation cleanup remain serialized executor operations. Heartbeats and
+and reservation cleanup remain serialized executor operations. New-channel
+selection/provisioning, which may wait on the mint, runs in an owned worker
+while the slot stays busy; its report is applied by the executor. Heartbeats and
 tunnel forwarding are outside the funding reducer.
 
 Successful acquisition captures immutable channel metadata, attachment ownership,
