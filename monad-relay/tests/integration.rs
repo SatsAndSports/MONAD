@@ -1103,6 +1103,24 @@ async fn start_failing_keysets_mint() -> (String, tokio::sync::oneshot::Sender<(
     (mint_url, shutdown_tx)
 }
 
+/// A mint whose keyset listing never answers within the relay refresh timeout.
+async fn start_hanging_keysets_mint() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mint_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let router = axum::Router::new().route(
+        "/v1/keysets",
+        axum::routing::get(|| async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            "too late"
+        }),
+    );
+    // Not awaited on shutdown: the relay's timeout drops its pending request.
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    mint_url
+}
+
 /// Spin up a MONAD relay bound to a specific address and return `(relay_addr, secp256k1 pubkey)`.
 async fn start_monad_relay_at(bind_addr: SocketAddr) -> Option<(SocketAddr, Secp256k1Pubkey)> {
     let identity = QuicCertIdentity::generate().unwrap();
@@ -2893,6 +2911,26 @@ async fn expect_control_stream_closed(h2_recv: &mut h2::RecvStream) {
             Some(Ok(bytes)) if bytes.is_empty() => continue,
             other => panic!("expected control stream EOF, got {other:?}"),
         }
+    }
+}
+
+/// Like `read_control_message`, but keeps bytes after the first line for the
+/// next call, so back-to-back messages in one DATA frame are not lost.
+async fn read_buffered_control_message(
+    h2_recv: &mut h2::RecvStream,
+    buf: &mut Vec<u8>,
+) -> ServerMessage {
+    loop {
+        if let Some(message) = try_decode_json_line::<ServerMessage>(buf).unwrap() {
+            return message;
+        }
+        let chunk = h2_recv
+            .data()
+            .await
+            .expect("control stream closed unexpectedly")
+            .unwrap();
+        let _ = h2_recv.flow_control().release_capacity(chunk.len());
+        buf.extend_from_slice(&chunk);
     }
 }
 
@@ -8230,6 +8268,126 @@ async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
     let _ = shutdown_tx.send(());
     handle.await.unwrap().unwrap();
     let _ = mint_shutdown_tx.send(());
+}
+
+/// A first-time link waits inline for a bounded keyset refresh, so a Ping queued
+/// behind it is answered only after the link response. The refresh timeout must
+/// keep that delay well inside the client heartbeat timeout, and the session
+/// must remain usable afterward.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_slow_link_keyset_refresh_delays_ping_within_heartbeat_budget() {
+    let mint_helper = TestMintHelper::new().await.unwrap();
+    let unknown_keyset_id = mint_helper.keyset_id().to_string();
+    let unknown_keyset_info_json = mint_helper.keyset_info_json().unwrap();
+    let foreign_mint = TestMintHelper::new().await.unwrap();
+    let known_keyset_id = foreign_mint.keyset_id().to_string();
+    let known_keyset_info_json = foreign_mint.keyset_info_json().unwrap();
+    let mint_url = start_hanging_keysets_mint().await;
+    let trusted_mint_units =
+        BTreeMap::from([(mint_url.clone(), BTreeSet::from(["sat".to_string()]))]);
+    let stale_mint_cache = mint_cache_with_keyset(
+        &mint_url,
+        "sat",
+        &known_keyset_id,
+        &known_keyset_info_json,
+        true,
+    );
+    let receiver_secret = cashu::nuts::SecretKey::generate();
+    let receiver_pubkey_hex = receiver_secret.public_key().to_hex();
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let wallet_manager =
+        Arc::new(RelayWalletManager::open(temp_db.path().to_str().unwrap()).unwrap());
+    let transport_key = SecpTransportKeypair::generate();
+    let (server_addr, pubkey, handle, shutdown_tx, _payments) = start_managed_persistent_relay(
+        "127.0.0.1:0".parse().unwrap(),
+        &transport_key,
+        receiver_secret,
+        "slow-link-refresh-relay",
+        wallet_manager,
+        stale_mint_cache,
+        trusted_mint_units,
+    )
+    .await
+    .unwrap();
+
+    let wallet = TestSigningWallet::new(
+        mint_helper.mint(),
+        receiver_pubkey_hex.clone(),
+        mint_url.clone(),
+        unknown_keyset_id,
+        unknown_keyset_info_json,
+    )
+    .await;
+    let offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
+        funding_keyset_recovery_window_secs: 86_400,
+        minimum_channel_lifetime_secs: 3600,
+        receiver_pubkey: receiver_pubkey_hex,
+        mint_url,
+        unit: "sat".to_string(),
+        negotiated_keyset_versions: supported_cashu_spilman_keyset_versions(),
+        in_bytes_per_millisat: 1,
+        out_bytes_per_millisat: 1,
+    };
+    let channel_id = wallet.pre_create_channel(1000).await.unwrap();
+    let conn = connect_client_quic_secp(server_addr, &pubkey).await;
+    let (mut control_send, mut control_recv) = conn.open_control().await.unwrap();
+    let _initial = control_handshake_status(&mut control_send, &mut control_recv).await;
+    wallet
+        .attach_channel_to_session(&channel_id, *conn.session_id())
+        .unwrap();
+
+    let started = tokio::time::Instant::now();
+    send_control_message(
+        &mut control_send,
+        &channel_link_message(wallet.build_link_request(&channel_id, &offer).unwrap()),
+        false,
+    )
+    .await;
+    send_control_message(
+        &mut control_send,
+        &ClientMessage::Ping {
+            nonce: "queued-behind-link".into(),
+        },
+        false,
+    )
+    .await;
+
+    let mut buf = Vec::new();
+    match read_buffered_control_message(&mut control_recv, &mut buf).await {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, ServerErrorCode::LinkKeysetRefreshFailed, "{message}");
+            assert!(message.contains("timed out"), "{message}");
+        }
+        other => panic!("expected bounded refresh failure first, got {other:?}"),
+    }
+    match read_buffered_control_message(&mut control_recv, &mut buf).await {
+        ServerMessage::Pong { nonce } => assert_eq!(nonce, "queued-behind-link"),
+        other => panic!("expected Pong after link response, got {other:?}"),
+    }
+    let refresh_timeout = monad_relay::keyset_refresh::KeysetRefreshConfig::default().timeout;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= refresh_timeout,
+        "refresh was not awaited: {elapsed:?}"
+    );
+    assert!(
+        elapsed * 2 < monad_client::session_driver::CONTROL_HEARTBEAT_TIMEOUT,
+        "queued Ping delayed {elapsed:?}, too close to the client heartbeat timeout"
+    );
+
+    send_control_message(&mut control_send, &ClientMessage::GetSessionStatus, false).await;
+    assert!(matches!(
+        read_buffered_control_message(&mut control_recv, &mut buf).await,
+        ServerMessage::SessionStatus { .. }
+    ));
+
+    let _ = control_send.send_data(Bytes::new(), true);
+    drop(control_send);
+    drop(control_recv);
+    conn.shutdown().await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
 }
 
 /// A client whose keyset cache is fresher than the relay's must keep working

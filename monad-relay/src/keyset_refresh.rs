@@ -475,6 +475,40 @@ mod tests {
         assert_eq!(refresher.calls(), 1);
     }
 
+    /// `ChannelLink` awaits this refresh inline on the relay control loop, so a
+    /// Ping queued behind it waits too. Keep that well inside the client's
+    /// heartbeat timeout.
+    #[test]
+    fn default_refresh_timeout_stays_well_inside_client_heartbeat_timeout() {
+        assert!(
+            KeysetRefreshConfig::default().timeout * 2
+                <= monad_client::session_driver::CONTROL_HEARTBEAT_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_timeout_also_bounds_callers_joining_in_flight_refresh() {
+        let refresher = CountingRefresher::new(Duration::from_secs(60), Ok(()));
+        let mut config = config();
+        config.timeout = Duration::from_millis(20);
+        let coordinator = RelayKeysetRefreshCoordinator::with_refresher(
+            refresher.clone(),
+            trusted(&[("https://mint", &["sat"])]),
+            config,
+        );
+        let (first, joined) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                coordinator.refresh_mint_unit("https://mint", "sat"),
+                coordinator.refresh_mint_unit("https://mint", "sat"),
+            )
+        })
+        .await
+        .expect("joining caller must not outlive the refresh timeout");
+        assert_eq!(first, Err(KeysetRefreshError::Timeout));
+        assert_eq!(joined, Err(KeysetRefreshError::Timeout));
+        assert_eq!(refresher.calls(), 1);
+    }
+
     #[tokio::test]
     async fn coordinator_global_saturation_is_busy_without_starting_cooldown() {
         let refresher = CountingRefresher::new(Duration::from_millis(50), Ok(()));

@@ -78,7 +78,7 @@ Relay and client caches are independent and memory-only. Discovery is
 singleflight per mint, uses a 15-second HTTP timeout and a 64 KiB response limit,
 and never logs response bodies.
 
-The relay polls: known supported and unsupported results have a five-minute TTL,
+The relay polls: known supported and unsupported results are rechecked hourly,
 unknown results retry after 30 seconds, and expired positives are not reused
 after failure. Relay startup primes its cache, and an owned 60-second listener
 refresh cycle refreshes expired entries for future sessions. Each established
@@ -172,7 +172,7 @@ ordinary` in their real config; rerandomized fixtures remove that pin.
   with missing/incorrect/malformed R. The custody and DLEQ oracle uses issued
   restore points for rerandomized transactions.
 
-## Deferred separate topic
+## Follow-up topics
 
 ### Mint metadata coordination and acquisition responsiveness
 
@@ -182,10 +182,23 @@ longer delays the session driver's heartbeats, advisories or shutdown handling.
 Acquisition still holds the single ordinary slot until its report is applied;
 see `ARCHITECTURE.md` (client session driver).
 
-Still open under [issue #179](https://github.com/SatsAndSports/MONAD/issues/179):
-capability discovery and keyset refresh keep separate caches and coordination on
-both sides, and the relay side has not been reviewed. Relay capability discovery
-waits during startup, then refreshes asynchronously alongside session handling.
+Relay: a first-time `ChannelLink` with an unknown trusted keyset awaits a keyset
+refresh inline on the session's control loop, so a Ping or advisory queued behind
+it waits too. This is deliberate: the coordinator bounds every caller, including
+ones joining an in-flight refresh, by its 5-second timeout, singleflights per
+mint, limits concurrency, and applies a 60-second per-mint cooldown. That keeps
+the stall well inside the 15-second client heartbeat timeout, which tests
+enforce. Relinks use stored funding and payments never contact the mint.
+Capability discovery runs off the control loop (startup, then an hourly recheck),
+and sessions freeze their mode policy.
+
+Decided under [issue #179](https://github.com/SatsAndSports/MONAD/issues/179):
+keyset refresh and capability discovery stay separately coordinated, since a
+refreshed capability cannot change a frozen session policy and the client
+already performs both inside its acquisition worker. Capability is not
+invalidated from mint rejection text. Mints are not expected to withdraw
+rerandomization once offered; if one does, retained channel and journal data is
+never deleted, preserving later recovery options.
 
 ### Expiry policy
 

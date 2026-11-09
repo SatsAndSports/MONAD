@@ -53,6 +53,10 @@ mod runtime;
 mod state;
 
 use self::runtime::run_session_driver;
+/// A client ends a session whose correlated Ping is unanswered for this long.
+/// Relay control-loop stalls (for example a link awaiting keyset refresh) must
+/// stay well inside it.
+pub use self::runtime::HEARTBEAT_TIMEOUT as CONTROL_HEARTBEAT_TIMEOUT;
 use self::state::{RelayConnectionHandles, SessionDriverConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -35,7 +35,7 @@ fn funding_disabled_error(code: &ServerErrorCode, hop_label: &str) -> Option<io:
 }
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_TICK: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
