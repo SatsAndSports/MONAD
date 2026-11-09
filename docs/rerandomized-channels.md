@@ -74,10 +74,12 @@ extension. Optional rerandomization requires `GET /v1/info` to contain
 an explicit false flag, is known unsupported. Transport/HTTP failures, malformed
 JSON or incorrectly typed capability fields are **unknown/unavailable**.
 
-Relay and client caches are independent and memory-only. Known supported and
-unsupported results have a five-minute TTL; unknown results retry after 30 seconds.
-Discovery is singleflight per mint, uses a 15-second HTTP timeout and a 64 KiB
-response limit, and never logs response bodies. Expired positives are not reused
+Relay and client caches are independent and memory-only. Discovery is
+singleflight per mint, uses a 15-second HTTP timeout and a 64 KiB response limit,
+and never logs response bodies.
+
+The relay polls: known supported and unsupported results have a five-minute TTL,
+unknown results retry after 30 seconds, and expired positives are not reused
 after failure. Relay startup primes its cache, and an owned 60-second listener
 refresh cycle refreshes expired entries for future sessions. Each established
 session freezes its effective policy; later cache/config changes do not alter it.
@@ -96,6 +98,18 @@ rerandomized provisioning is unknown, that offer is deferred without reserving
 funds or silently treating it as unsupported. Confirmed unsupported mode may fall
 back to accepted ordinary mode when there is no explicit client override.
 Discovery is acquisition work, never part of the 250 ms steady-state credit loop.
+
+The client is event-driven rather than polling, so many clients do not load a
+mint. It asks only when a relay advertises rerandomized funding for that mint.
+It fetches `/v1/info` on first use in the process; a cached "supported" answer
+then never expires, because the relay's own polling withdraws the advertisement
+if the mint drops support. A cached "unsupported" or unknown answer contradicts
+the advertisement and is refetched, at most once per mint per 60 seconds, so a
+misbehaving relay cannot make clients hammer a mint. The advertisement only
+triggers a fetch and is never evidence of support. A failed refetch keeps the
+last known answer; unknown never becomes unsupported. Residual risk: between a
+mint dropping support and the relay's next poll, a client may still provision a
+rerandomized channel.
 
 ### Rejection and visibility
 

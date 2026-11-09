@@ -147,8 +147,11 @@ opening successors retain it. Wallet summaries derive mode from stored parameter
 with channel-ID verification. Normal sessions accept both modes according to fixed
 session admission policy, defaulting to prefer confirmed rerandomized support for
 new provisioning. Existing eligible channels are reused without preference ranking.
-Relay/client mint capability caches are independent (known TTL 5 minutes, unknown
-retry 30 seconds, 15-second HTTP timeout); relay refresh ticks every 60 seconds.
+Relay/client mint capability caches are independent (15-second HTTP timeout). The relay
+polls (known TTL 5 minutes, unknown retry 30 seconds, refresh tick 60 seconds). The client
+is event-driven (`ClientMintModeCache`): it asks only when a relay advertises rerandomized,
+caches "supported" without expiry, and refetches unsupported/unknown at most once per mint
+per 60 seconds.
 `LINK_COMMITMENT_MODE_NOT_ACCEPTED` is nonfatal and preserves prior credit/ownership;
 the client excludes only the session candidate, never globally invalidates it.
 Isolated `funds-lifecycle-test` processes can select rerandomized fixtures

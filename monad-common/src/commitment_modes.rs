@@ -181,6 +181,95 @@ impl MintModeCache {
     }
 }
 
+/// Minimum interval between client capability fetches for one mint, unless the
+/// mint has never been queried in this process.
+pub const CLIENT_CAPABILITY_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct ClientObservation {
+    /// Rerandomization support reported by the last successful fetch.
+    known: Option<bool>,
+    /// Completion of the last fetch attempt, successful or not.
+    attempted_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct ClientEntry {
+    observation: Mutex<ClientObservation>,
+    refresh: tokio::sync::Mutex<()>,
+}
+
+/// Client-side, event-driven capability cache (process memory only).
+///
+/// Callers ask only when a relay advertises rerandomized funding for the mint.
+/// A cached "supported" answer agrees with that advertisement and never
+/// expires: if the mint drops support, the relay's own periodic discovery stops
+/// advertising it. A cached "unsupported" or unknown answer contradicts the
+/// advertisement and is refetched, at most once per
+/// [`CLIENT_CAPABILITY_REFRESH_COOLDOWN`] per mint, so a relay cannot drive
+/// clients to hammer a mint. The advertisement only triggers a fetch; it is
+/// never treated as evidence of support. A failed fetch keeps the last known
+/// answer, and unknown never becomes unsupported.
+#[derive(Debug, Default)]
+pub struct ClientMintModeCache {
+    entries: Mutex<BTreeMap<String, Arc<ClientEntry>>>,
+}
+
+fn unknown_capability() -> String {
+    "mint rerandomization capability is unknown/unavailable".to_string()
+}
+
+/// `None` means a fetch is due.
+fn client_answer(observation: &ClientObservation) -> Option<Result<bool, String>> {
+    if observation.known == Some(true) {
+        return Some(Ok(true));
+    }
+    let attempted = observation.attempted_at?;
+    (attempted.elapsed() < CLIENT_CAPABILITY_REFRESH_COOLDOWN)
+        .then(|| observation.known.ok_or_else(unknown_capability))
+}
+
+impl ClientMintModeCache {
+    fn entry(&self, mint: &str) -> Arc<ClientEntry> {
+        self.entries
+            .lock()
+            .unwrap()
+            .entry(mint.trim_end_matches('/').into())
+            .or_default()
+            .clone()
+    }
+
+    /// Answer without network I/O, or `None` if a fetch is due.
+    pub fn cached(&self, mint: &str) -> Option<Result<bool, String>> {
+        client_answer(&self.entry(mint).observation.lock().unwrap())
+    }
+
+    /// Confirm support for a mint whose rerandomized funding a relay advertises.
+    pub async fn confirm_advertised(&self, mint: &str) -> Result<bool, String> {
+        let mint = mint.trim_end_matches('/');
+        let entry = self.entry(mint);
+        if let Some(answer) = client_answer(&entry.observation.lock().unwrap()) {
+            return answer;
+        }
+        let _refresh = entry.refresh.lock().await;
+        if let Some(answer) = client_answer(&entry.observation.lock().unwrap()) {
+            return answer;
+        }
+        let fetched = fetch(mint).await;
+        // Record the attempt with its result: concurrent callers must wait for
+        // an in-flight fetch rather than read "attempted, nothing known".
+        let mut observation = entry.observation.lock().unwrap();
+        observation.attempted_at = Some(Instant::now());
+        match fetched {
+            Ok(supported) => {
+                observation.known = Some(supported);
+                Ok(supported)
+            }
+            Err(error) => observation.known.ok_or(error),
+        }
+    }
+}
+
 async fn fetch(mint: &str) -> Result<bool, String> {
     let invalid = || "mint rerandomization capability is unknown/unavailable".to_string();
     let client = reqwest::Client::builder()
@@ -263,6 +352,102 @@ mod tests {
             "commitment_modes: {accepted: [ordinary], preferred: rerandomized}",
             "mint_commitment_modes:\n  https://mint: {accepted: [ordinary], preferred: ordinary}\n  https://mint/: {accepted: [ordinary], preferred: ordinary}",
         ] { assert!(serde_yaml::from_str::<crate::config::RelayChannelPolicyConfig>(yaml).is_err()); }
+    }
+
+    /// Serve one `/v1/info` body per connection, counting requests.
+    async fn info_server(
+        bodies: &'static [&'static str],
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let server = tokio::spawn(async move {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                let mut header = Vec::new();
+                while !header.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut buf).await.unwrap();
+                    assert!(read > 0);
+                    header.extend_from_slice(&buf[..read]);
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (mint, requests, server)
+    }
+
+    fn age_client_attempt(cache: &ClientMintModeCache, mint: &str, seconds: u64) {
+        cache.entry(mint).observation.lock().unwrap().attempted_at =
+            Some(Instant::now() - Duration::from_secs(seconds));
+    }
+
+    const SUPPORTED: &str = r#"{"nuts":{"3":{"rerandomize":true}}}"#;
+    const UNSUPPORTED: &str = r#"{"nuts":{}}"#;
+    const MALFORMED: &str = r#"{"nuts":{"3":{"rerandomize":"invalid"}}}"#;
+
+    #[tokio::test]
+    async fn client_capability_supported_is_fetched_once_and_never_expires() {
+        let (mint, requests, server) = info_server(&[SUPPORTED]).await;
+        let cache = Arc::new(ClientMintModeCache::default());
+        assert_eq!(cache.cached(&mint), None, "first use must fetch");
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let mint = mint.clone();
+            tasks.spawn(async move { cache.confirm_advertised(&mint).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(result.unwrap(), Ok(true));
+        }
+        age_client_attempt(&cache, &mint, 30 * 86_400);
+        assert_eq!(cache.cached(&format!("{mint}/")), Some(Ok(true)));
+        assert_eq!(cache.confirm_advertised(&mint).await, Ok(true));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_capability_contradiction_refreshes_after_cooldown_and_keeps_last_known() {
+        let (mint, requests, server) = info_server(&[UNSUPPORTED, MALFORMED, SUPPORTED]).await;
+        let cache = ClientMintModeCache::default();
+        assert_eq!(cache.confirm_advertised(&mint).await, Ok(false));
+        // An advertisement contradicting "unsupported" waits for the cooldown.
+        assert_eq!(cache.confirm_advertised(&mint).await, Ok(false));
+        age_client_attempt(&cache, &mint, 59);
+        assert_eq!(cache.cached(&mint), Some(Ok(false)));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        // A failed refresh keeps the last known answer and restarts the cooldown.
+        age_client_attempt(&cache, &mint, 61);
+        assert_eq!(cache.cached(&mint), None);
+        assert_eq!(cache.confirm_advertised(&mint).await, Ok(false));
+        assert_eq!(cache.confirm_advertised(&mint).await, Ok(false));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        // After the next cooldown the refresh observes newly added support.
+        age_client_attempt(&cache, &mint, 61);
+        assert_eq!(cache.confirm_advertised(&mint).await, Ok(true));
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_capability_unknown_is_rate_limited_and_never_unsupported() {
+        let (mint, requests, server) = info_server(&[MALFORMED, UNSUPPORTED]).await;
+        let cache = ClientMintModeCache::default();
+        assert!(cache.confirm_advertised(&mint).await.is_err());
+        assert!(cache.confirm_advertised(&mint).await.is_err());
+        assert!(matches!(cache.cached(&mint), Some(Err(_))));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        age_client_attempt(&cache, &mint, 61);
+        assert_eq!(cache.confirm_advertised(&mint).await, Ok(false));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
     }
 
     #[tokio::test]

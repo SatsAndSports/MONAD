@@ -379,7 +379,7 @@ const CREATE_CHANNEL_RECOVERIES_SQL: &str = r#"
 /// metadata and payment signing via `cdk-spilman`.
 pub struct SqliteClientWallet {
     commitment_mode_preference: Option<cdk_spilman::CommitmentMode>,
-    mode_cache: monad_common::commitment_modes::MintModeCache,
+    mode_cache: monad_common::commitment_modes::ClientMintModeCache,
     funding_keyset_recovery_window_secs: u64,
     loose_wallet: LooseProofWallet,
     bridge: Mutex<ClientBridge>,
@@ -3913,7 +3913,9 @@ impl MonadWallet for SqliteClientWallet {
         }
         let result = match tokio::runtime::Handle::try_current() {
             Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| handle.block_on(self.mode_cache.discover(mint)))
+                tokio::task::block_in_place(|| {
+                    handle.block_on(self.mode_cache.confirm_advertised(mint))
+                })
             }
             Ok(_) => {
                 return Err(WalletError::Backend(
@@ -3922,7 +3924,7 @@ impl MonadWallet for SqliteClientWallet {
             }
             Err(_) => tokio::runtime::Runtime::new()
                 .map_err(|e| WalletError::Backend(e.to_string()))?
-                .block_on(self.mode_cache.discover(mint)),
+                .block_on(self.mode_cache.confirm_advertised(mint)),
         };
         result.map_err(WalletError::Backend)
     }
