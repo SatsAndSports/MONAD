@@ -3,6 +3,7 @@ pub mod blinded_connect;
 pub mod blinded_hop;
 pub mod bootstrap;
 pub mod cashu_v4;
+pub mod commitment_modes;
 pub mod config;
 pub mod connect_failure;
 pub mod control_codec;

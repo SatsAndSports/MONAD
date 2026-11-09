@@ -24,6 +24,23 @@ pub(super) struct ObservedPayments {
 }
 
 impl RelayPayments for ObservedPayments {
+    fn session_mode_policy(&self) -> monad_common::commitment_modes::SessionModePolicy {
+        self.inner.session_mode_policy()
+    }
+    fn mint_mode_cache(&self) -> Option<Arc<monad_common::commitment_modes::MintModeCache>> {
+        self.inner.mint_mode_cache()
+    }
+    fn retained_mode_mints(&self) -> Result<BTreeSet<String>, String> {
+        self.inner.retained_mode_mints()
+    }
+    fn validate_channel_mode(
+        &self,
+        request: &ChannelLinkRequest,
+        policy: &monad_common::commitment_modes::SessionModePolicy,
+        versions: &BTreeSet<String>,
+    ) -> Result<(), LinkError> {
+        self.inner.validate_channel_mode(request, policy, versions)
+    }
     fn funding_keyset_recovery_window_secs(&self) -> u64 {
         self.inner.funding_keyset_recovery_window_secs()
     }

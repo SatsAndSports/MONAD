@@ -48,11 +48,10 @@ where
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChannelLinkParamsWire {
-    #[cfg(feature = "funds-lifecycle-test")]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_test_commitment_mode"
+        deserialize_with = "deserialize_commitment_mode"
     )]
     commitment_mode: Option<cdk_spilman::CommitmentMode>,
     mint: String,
@@ -68,11 +67,16 @@ struct ChannelLinkParamsWire {
     expiry_timestamp: u64,
 }
 
-#[cfg(feature = "funds-lifecycle-test")]
-fn deserialize_test_commitment_mode<'de, D: Deserializer<'de>>(
+fn deserialize_commitment_mode<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<cdk_spilman::CommitmentMode>, D::Error> {
-    cdk_spilman::CommitmentMode::deserialize(deserializer).map(Some)
+    let mode = cdk_spilman::CommitmentMode::deserialize(deserializer)?;
+    if mode == cdk_spilman::CommitmentMode::Ordinary {
+        return Err(serde::de::Error::custom(
+            "ordinary commitment_mode must be omitted",
+        ));
+    }
+    Ok(Some(mode))
 }
 
 fn deserialize_channel_link_params<'de, D>(
@@ -82,16 +86,6 @@ where
     D: Deserializer<'de>,
 {
     let params = ChannelLinkParamsWire::deserialize(deserializer)?;
-    #[cfg(feature = "funds-lifecycle-test")]
-    if let Some(mode) = params.commitment_mode {
-        if mode != cdk_spilman::CommitmentMode::Rerandomized
-            || std::env::var("MONAD_FUNDS_TEST_COMMITMENT_MODE").as_deref() != Ok("rerandomized")
-        {
-            return Err(serde::de::Error::custom(
-                "commitment mode is not enabled in this protocol",
-            ));
-        }
-    }
     let serde_json::Value::Object(params) =
         serde_json::to_value(params).map_err(serde::de::Error::custom)?
     else {
@@ -155,6 +149,7 @@ pub type MintUnitAdvertisements = BTreeMap<String, BTreeMap<String, MintUnitAdve
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MintUnitAdvertisement {
+    pub commitment_modes: crate::commitment_modes::ModePolicy,
     /// Minimum remaining channel lifetime when a link or relink is accepted.
     pub minimum_channel_lifetime_secs: u64,
     /// Required interval between channel expiry and funding keyset final expiry.
@@ -164,6 +159,7 @@ pub struct MintUnitAdvertisement {
 /// Local flattened payment option. Prices come from the session, not the map.
 #[derive(Debug, Clone)]
 pub struct PaymentOption {
+    pub commitment_modes: crate::commitment_modes::ModePolicy,
     pub minimum_channel_lifetime_secs: u64,
     pub funding_keyset_recovery_window_secs: u64,
     pub mint_url: String,
@@ -182,6 +178,7 @@ pub fn advertisement_options(
         .iter()
         .flat_map(|(mint_url, units)| {
             units.iter().map(move |(unit, window)| PaymentOption {
+                commitment_modes: window.commitment_modes.clone(),
                 minimum_channel_lifetime_secs: window.minimum_channel_lifetime_secs,
                 mint_url: mint_url.clone(),
                 unit: unit.clone(),
@@ -243,6 +240,7 @@ pub enum ServerErrorCode {
     LinkKeysetRefreshBusy,
     LinkKeysetRefreshFailed,
     LinkKeysetVersionNotNegotiated,
+    LinkCommitmentModeNotAccepted,
     LinkUnsupportedUnit,
     LinkChannelRetired,
     ChannelExpired,
@@ -439,12 +437,12 @@ mod advertisement_tests {
     #[test]
     fn advertisement_order_is_local_and_value_fields_are_explicit() {
         let first: MintUnitAdvertisements = serde_json::from_str(r#"{
-            "mint-b":{"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":7}},
-            "mint-a":{"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":9},"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":8}}
+            "mint-b":{"sat":{"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":7}},
+            "mint-a":{"sat":{"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":9},"msat":{"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":8}}
         }"#).unwrap();
         let reordered: MintUnitAdvertisements = serde_json::from_str(r#"{
-            "mint-a":{"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":8},"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":9}},
-            "mint-b":{"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":7}}
+            "mint-a":{"msat":{"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":8},"sat":{"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":9}},
+            "mint-b":{"sat":{"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":7}}
         }"#).unwrap();
         let order = |ads: &MintUnitAdvertisements| {
             advertisement_options(ads, 11, 22)
@@ -461,7 +459,7 @@ mod advertisement_tests {
                 ("mint-b".into(), "sat".into(), 7)
             ]
         );
-        for invalid in [
+        for mut invalid in [
             json!(86400),
             json!({}),
             json!({"minimum_time_to_expiry":86400}),
@@ -470,6 +468,12 @@ mod advertisement_tests {
             json!({"minimum_channel_lifetime_secs":3600, "funding_keyset_recovery_window_secs":86400, "keyset_ids":[]}),
             json!({"minimum_channel_lifetime_secs":3600, "funding_keyset_recovery_window_secs":86400, "bytes_in_per_msat":1}),
         ] {
+            if let Some(fields) = invalid.as_object_mut() {
+                fields.insert(
+                    "commitment_modes".into(),
+                    json!({"accepted":["ordinary"], "preferred":"ordinary"}),
+                );
+            }
             assert!(serde_json::from_value::<MintUnitAdvertisements>(
                 json!({"mint":{"sat":invalid}})
             )
@@ -487,6 +491,7 @@ mod advertisement_tests {
                     BTreeMap::from([(
                         "sat".into(),
                         MintUnitAdvertisement {
+                            commitment_modes: Default::default(),
                             minimum_channel_lifetime_secs: 3600,
                             funding_keyset_recovery_window_secs: 123,
                         },
@@ -498,6 +503,7 @@ mod advertisement_tests {
                         (
                             "sat".into(),
                             MintUnitAdvertisement {
+                                commitment_modes: Default::default(),
                                 minimum_channel_lifetime_secs: 3600,
                                 funding_keyset_recovery_window_secs: 0,
                             },
@@ -505,6 +511,7 @@ mod advertisement_tests {
                         (
                             "msat".into(),
                             MintUnitAdvertisement {
+                                commitment_modes: Default::default(),
                                 minimum_channel_lifetime_secs: 3600,
                                 funding_keyset_recovery_window_secs: 86_400,
                             },
@@ -528,8 +535,8 @@ mod advertisement_tests {
         assert_eq!(
             value["advertisements"],
             json!({
-                "https://mint-a": {"sat": {"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs": 0}, "msat": {"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs": 86400}},
-                "https://mint-b": {"sat": {"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs": 123}}
+                "https://mint-a": {"sat": {"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs": 0}, "msat": {"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs": 86400}},
+                "https://mint-b": {"sat": {"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs": 123}}
             })
         );
         assert_eq!(value["bytes_in_per_msat"], 11);
@@ -666,11 +673,22 @@ mod advertisement_tests {
         });
         assert!(serde_json::from_value::<ClientMessage>(valid_link.clone()).is_ok());
 
+        let mut rerandomized = valid_link.clone();
+        rerandomized["params"]["commitment_mode"] = json!("rerandomized");
+        assert_eq!(
+            serde_json::to_value(
+                serde_json::from_value::<ClientMessage>(rerandomized.clone()).unwrap()
+            )
+            .unwrap(),
+            rerandomized
+        );
+
         for mutation in [
             ("capacity", json!("100")),
             ("unit", json!(100)),
             ("maximum_amount_for_one_output", json!(null)),
-            ("commitment_mode", json!("rerandomized")),
+            ("commitment_mode", json!("ordinary")),
+            ("commitment_mode", json!("unknown")),
             ("commitment_mode", json!(null)),
         ] {
             let mut invalid = valid_link.clone();
@@ -766,6 +784,11 @@ mod advertisement_tests {
     #[test]
     fn server_error_registry_matches_stable_codes_and_fatality() {
         let cases = [
+            (
+                ServerErrorCode::LinkCommitmentModeNotAccepted,
+                "LINK_COMMITMENT_MODE_NOT_ACCEPTED",
+                false,
+            ),
             (
                 ServerErrorCode::ControlInvalidMessage,
                 "CONTROL_INVALID_MESSAGE",

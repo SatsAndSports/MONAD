@@ -311,6 +311,7 @@ pub(super) fn server_error_rejects_intended_channel(code: &ServerErrorCode) -> b
         || matches!(
             code,
             ServerErrorCode::LinkInvalidZeroBalanceSignature
+                | ServerErrorCode::LinkCommitmentModeNotAccepted
                 | ServerErrorCode::ChannelEvictedFromSession
                 | ServerErrorCode::ChannelRetiredAtRelay
                 | ServerErrorCode::LinkChannelRetired

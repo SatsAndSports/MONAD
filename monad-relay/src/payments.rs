@@ -46,6 +46,25 @@ impl CloseOutcome {
 }
 
 pub trait RelayPayments: Send + Sync + 'static {
+    /// Conservative ordinary-only policy for synthetic/custom backends. The
+    /// production backend snapshots configured policy and confirmed capability.
+    fn session_mode_policy(&self) -> monad_common::commitment_modes::SessionModePolicy {
+        Default::default()
+    }
+    fn mint_mode_cache(&self) -> Option<Arc<monad_common::commitment_modes::MintModeCache>> {
+        None
+    }
+    fn retained_mode_mints(&self) -> Result<BTreeSet<String>, String> {
+        Ok(BTreeSet::new())
+    }
+    /// Mandatory: wrappers must delegate this check so stored funding, rather
+    /// than caller-supplied relink parameters, remains authoritative.
+    fn validate_channel_mode(
+        &self,
+        request: &ChannelLinkRequest,
+        policy: &monad_common::commitment_modes::SessionModePolicy,
+        versions: &BTreeSet<String>,
+    ) -> Result<(), LinkError>;
     fn retire_channel(
         &self,
         _channel_id: &str,
@@ -120,12 +139,19 @@ pub enum LinkError {
     InvalidZeroBalanceSignature(String),
     InvalidChannel(String),
     MintOrKeysetNotAcceptable,
-    UnknownTrustedKeyset { mint_url: String, unit: String },
+    UnknownTrustedKeyset {
+        mint_url: String,
+        unit: String,
+    },
     KeysetRefreshRateLimited,
     KeysetRefreshBusy,
     KeysetRefreshFailed(String),
     UnsupportedCashuSpilmanProtocolVersion,
     KeysetVersionNotNegotiated,
+    CommitmentModeNotAccepted {
+        mode: cdk_spilman::CommitmentMode,
+        accepted: Vec<cdk_spilman::CommitmentMode>,
+    },
     ReceiverKeyMismatch,
     UnsupportedUnit(String),
     NonZeroLinkBalance,
@@ -152,6 +178,18 @@ impl fmt::Display for LinkError {
             Self::KeysetRefreshFailed(message) => write!(f, "keyset refresh failed: {message}"),
             Self::KeysetVersionNotNegotiated => {
                 write!(f, "channel funding keyset version was not negotiated")
+            }
+            Self::CommitmentModeNotAccepted { mode, accepted } => {
+                let name = |mode: &cdk_spilman::CommitmentMode| match mode {
+                    cdk_spilman::CommitmentMode::Ordinary => "ordinary",
+                    cdk_spilman::CommitmentMode::Rerandomized => "rerandomized",
+                };
+                let accepted = if accepted.is_empty() {
+                    "none".to_owned()
+                } else {
+                    accepted.iter().map(name).collect::<Vec<_>>().join(", ")
+                };
+                write!(f, "Channel mode '{}' is not accepted for this mint/unit in this session; accepted modes: {}.", name(mode), accepted)
             }
             Self::UnsupportedCashuSpilmanProtocolVersion => {
                 write!(f, "unsupported cashu spilman protocol version")
@@ -186,6 +224,9 @@ impl LinkError {
             Self::KeysetRefreshBusy => ServerErrorCode::LinkKeysetRefreshBusy,
             Self::KeysetRefreshFailed(_) => ServerErrorCode::LinkKeysetRefreshFailed,
             Self::KeysetVersionNotNegotiated => ServerErrorCode::LinkKeysetVersionNotNegotiated,
+            Self::CommitmentModeNotAccepted { .. } => {
+                ServerErrorCode::LinkCommitmentModeNotAccepted
+            }
             Self::UnsupportedCashuSpilmanProtocolVersion => ServerErrorCode::InternalError,
             Self::ReceiverKeyMismatch => ServerErrorCode::LinkReceiverMismatch,
             Self::UnsupportedUnit(_) => ServerErrorCode::LinkUnsupportedUnit,
@@ -312,6 +353,9 @@ struct MonadHost {
 
 #[derive(Debug)]
 pub struct SpilmanRelayPayments {
+    mode_policy: monad_common::commitment_modes::ModePolicy,
+    mint_mode_overrides: BTreeMap<String, monad_common::commitment_modes::ModePolicy>,
+    mode_cache: Arc<monad_common::commitment_modes::MintModeCache>,
     minimum_channel_lifetime_secs: u64,
     funding_keyset_recovery_window_secs: u64,
     bridge: SpilmanBridge<MonadHost, PaymentContext>,
@@ -332,6 +376,8 @@ impl SpilmanRelayPayments {
         let funding_keyset_recovery_window_secs =
             channel_policy.funding_keyset_recovery_window_secs;
         let minimum_channel_lifetime_secs = channel_policy.min_expiry_secs;
+        let mode_policy = channel_policy.commitment_modes.clone();
+        let mint_mode_overrides = channel_policy.mint_commitment_modes.clone();
         let host = MonadHost {
             receiver_secret: receiver_secret.clone(),
             mint_cache: mint_cache.clone(),
@@ -341,6 +387,9 @@ impl SpilmanRelayPayments {
         };
         Self {
             bridge: SpilmanBridge::new(host),
+            mode_policy,
+            mint_mode_overrides,
+            mode_cache: Arc::new(Default::default()),
             minimum_channel_lifetime_secs,
             funding_keyset_recovery_window_secs,
             store,
@@ -659,6 +708,64 @@ impl SpilmanRelayPayments {
 }
 
 impl RelayPayments for SpilmanRelayPayments {
+    fn session_mode_policy(&self) -> monad_common::commitment_modes::SessionModePolicy {
+        monad_common::commitment_modes::SessionModePolicy {
+            default: self.mode_policy.clone(),
+            overrides: self
+                .mint_mode_overrides
+                .iter()
+                .map(|(mint, policy)| (mint.trim_end_matches('/').to_owned(), policy.clone()))
+                .collect(),
+            rerandomized_mints: self.mode_cache.supported_mints(),
+        }
+    }
+    fn mint_mode_cache(&self) -> Option<Arc<monad_common::commitment_modes::MintModeCache>> {
+        let rerandomized = cdk_spilman::CommitmentMode::Rerandomized;
+        (self.mode_policy.accepted.contains(&rerandomized)
+            || self
+                .mint_mode_overrides
+                .values()
+                .any(|p| p.accepted.contains(&rerandomized)))
+        .then(|| self.mode_cache.clone())
+    }
+    fn retained_mode_mints(&self) -> Result<BTreeSet<String>, String> {
+        self.store.rerandomized_open_mints()
+    }
+    fn validate_channel_mode(
+        &self,
+        request: &ChannelLinkRequest,
+        policy: &monad_common::commitment_modes::SessionModePolicy,
+        versions: &BTreeSet<String>,
+    ) -> Result<(), LinkError> {
+        validate_link_params_shape(&request.params)?;
+        monad_common::cashu_v4::validate_channel_funding_token_structure(&request.funding_token)
+            .map_err(LinkError::InvalidPayment)?;
+        let validate = |params: &serde_json::Map<String, serde_json::Value>| {
+            // Preserve the existing protocol-fatal keyset negotiation check.
+            let id: Id = params
+                .get("keyset_id")
+                .and_then(|id| id.as_str())
+                .ok_or_else(|| LinkError::InvalidChannel("missing keyset_id".into()))?
+                .parse()
+                .map_err(|_| LinkError::InvalidChannel("invalid keyset_id".into()))?;
+            if !keyset_version_is_negotiated(&id, versions) {
+                return Err(LinkError::KeysetVersionNotNegotiated);
+            }
+            check_channel_mode(params, policy)
+        };
+        let stored = self
+            .store
+            .get_channel(&request.channel_id)
+            .map_err(LinkError::Internal)?;
+        if let Some(stored) = stored {
+            let params = stored_channel_parameters(&request.channel_id, &stored.funding)
+                .map_err(LinkError::Internal)?;
+            validate_link_params_shape(&params)?;
+            validate(&params)
+        } else {
+            validate(&request.params)
+        }
+    }
     fn funding_keyset_recovery_window_secs(&self) -> u64 {
         self.funding_keyset_recovery_window_secs
     }
@@ -689,7 +796,7 @@ impl RelayPayments for SpilmanRelayPayments {
             serde_json::Value::Object(request.params.clone())
         };
         // Stored funding is authoritative, including mode. A caller cannot
-        // strip the mode from a relink request to bypass ordinary-only admission.
+        // strip the mode from a relink request to bypass admission policy.
         validate_link_params_shape(params.as_object().ok_or_else(|| {
             LinkError::Internal("stored channel parameters are not an object".into())
         })?)?;
@@ -1303,6 +1410,50 @@ mod channel_policy_tests {
     }
 }
 
+pub(crate) fn stored_channel_parameters(
+    channel_id: &str,
+    funding: &cdk_spilman::ChannelFunding,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let id = cdk_spilman::channel_parameters_get_channel_id(
+        &funding.params_json,
+        &funding.channel_secret_hex,
+        &funding.keyset_info_json,
+    )
+    .map_err(|_| "invalid stored channel identity".to_owned())?;
+    if id != channel_id {
+        return Err("stored channel identity mismatch".into());
+    }
+    serde_json::from_str(&funding.params_json)
+        .map_err(|_| "invalid stored channel parameters".into())
+}
+
+fn check_channel_mode(
+    params: &serde_json::Map<String, serde_json::Value>,
+    policy: &monad_common::commitment_modes::SessionModePolicy,
+) -> Result<(), LinkError> {
+    let mode = params
+        .get("commitment_mode")
+        .map(|mode| serde_json::from_value(mode.clone()))
+        .transpose()
+        .map_err(|_| LinkError::InvalidChannel("invalid commitment mode".into()))?
+        .unwrap_or_default();
+    let mint = params
+        .get("mint")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LinkError::InvalidChannel("missing mint".into()))?;
+    if policy.accepts(mint, mode) {
+        Ok(())
+    } else {
+        Err(LinkError::CommitmentModeNotAccepted {
+            mode,
+            accepted: policy
+                .offer(mint)
+                .map(|offer| offer.accepted)
+                .unwrap_or_default(),
+        })
+    }
+}
+
 fn validate_link_params_shape(
     params: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), LinkError> {
@@ -1319,15 +1470,14 @@ fn validate_link_params_shape(
         "setup_timestamp",
         "unit",
     ];
-    let extra_mode = 0;
-    #[cfg(feature = "funds-lifecycle-test")]
-    let extra_mode = if std::env::var("MONAD_FUNDS_TEST_COMMITMENT_MODE").as_deref()
-        == Ok("rerandomized")
-        && params.get("commitment_mode").and_then(|v| v.as_str()) == Some("rerandomized")
-    {
-        1
-    } else {
-        extra_mode
+    let extra_mode = match params.get("commitment_mode") {
+        None => 0,
+        Some(value) if value.as_str() == Some("rerandomized") => 1,
+        _ => {
+            return Err(LinkError::InvalidPayment(
+                "invalid commitment_mode; ordinary mode is omitted".into(),
+            ))
+        }
     };
     if params.len() != REQUIRED.len() + extra_mode {
         return Err(LinkError::InvalidPayment(
@@ -1489,6 +1639,15 @@ pub mod testing {
     }
 
     impl RelayPayments for InMemoryRelayPayments {
+        fn validate_channel_mode(
+            &self,
+            request: &ChannelLinkRequest,
+            policy: &monad_common::commitment_modes::SessionModePolicy,
+            _versions: &std::collections::BTreeSet<String>,
+        ) -> Result<(), LinkError> {
+            // This synthetic backend only implements ordinary channels.
+            super::check_channel_mode(&request.params, policy)
+        }
         fn link_channel(
             &self,
             _negotiated_versions: &std::collections::BTreeSet<String>,
@@ -2081,3 +2240,5 @@ pub mod testing {
         }
     }
 }
+use std::collections::BTreeMap;
+use std::sync::Arc;

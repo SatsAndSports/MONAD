@@ -10,9 +10,9 @@ This document changes no runtime behavior. **MUST**, **MUST NOT**, **SHOULD**, a
 ## 1. Scope and lifecycle
 
 This contract covers messages on an established H2 `POST /control` stream. The
-session-protocol identifier **`h2-2026-10-07`** selects HTTP/2 with this MONAD
+session-protocol identifier **`h2-2026-11-08`** selects HTTP/2 with this MONAD
 control contract. Endpoints implementing this target MUST select only that
-identifier: there is no old `h2` fallback or compatibility path. This is Noise
+identifier: there is no old `h2` or `h2-2026-10-07` fallback or compatibility path. This is Noise
 bootstrap session-protocol selection, not a change to HTTP/2 or QUIC TLS ALPN.
 The bootstrap envelope can remain version 1; no separate control version is
 needed.
@@ -269,8 +269,19 @@ nothing.
 For protocol `2026-09-14`, `params` contains exactly `mint`, `unit`, `capacity`,
 `funding_token_amount`, `keyset_id`, `input_fee_ppk`,
 `maximum_amount_for_one_output`, `setup_timestamp`, `sender_pubkey`,
-`receiver_pubkey`, and `expiry_timestamp`. Legacy aliases and additional fields
-are forbidden.
+`receiver_pubkey`, and `expiry_timestamp`, plus `commitment_mode: "rerandomized"`
+for rerandomized channels. Ordinary channels omit `commitment_mode`; explicit
+ordinary, null, unknown modes, legacy aliases and other additional fields are
+forbidden. Mode is bound by the channel parameters and ID, not a separate link,
+payment, or session mode field. Stored funding is authoritative on relink.
+
+The relay MUST enforce its fixed session commitment-mode policy before recording
+new funding, transferring ownership, or replacing the linked channel. A valid
+known mode outside that policy receives nonfatal `LINK_COMMITMENT_MODE_NOT_ACCEPTED`.
+The message identifies the rejected mode and accepted modes. Existing credit,
+the prior link and ownership remain intact. The client may select another channel
+but MUST NOT infer that this channel is globally unusable or cannot be settled.
+The existing fatal negotiated-keyset-version check retains precedence.
 
 `funding_token` is a standard `cashuB` Cashu V4 token containing exactly the
 channel's funding proofs. Its mint, unit, keyset ID, amounts, proof order, and
@@ -314,7 +325,7 @@ no `ChannelUnlinked` message.
 | Field | Type and meaning |
 | --- | --- |
 | `receiver_pubkey` | Current payment receiver key in the negotiated Spilman encoding; may rotate (§4) |
-| `advertisements` | Map of mint URL to supported unit (`sat` or `msat`) to `{minimum_channel_lifetime_secs: u64, funding_keyset_recovery_window_secs: u64}` |
+| `advertisements` | Map of mint URL to supported unit (`sat` or `msat`) to `{minimum_channel_lifetime_secs: u64, funding_keyset_recovery_window_secs: u64, commitment_modes: {accepted: [mode, ...], preferred: mode}}` |
 | `linked_channel` | Nullable; `null` or `{channel_id, balance_raw: u64, capacity_raw: u64, unit}` |
 | `bytes_in_per_msat` | Positive `u64`, bytes from destination toward client per millisatoshi, fixed session-wide |
 | `bytes_out_per_msat` | Positive `u64`, bytes from client toward destination per millisatoshi, fixed session-wide |
@@ -354,13 +365,24 @@ committed by another session. Linkage may lag an ownership transfer until the
 session processes its eviction advisory. Failure to obtain required linked-channel
 authority is an internal error, not a successful status reporting no channel.
 
-Each advertisement value has two required durations:
+Each advertisement value has two required durations and a required commitment-mode policy:
 
 - `minimum_channel_lifetime_secs`: minimum remaining time from link or relink
   acceptance until the channel expires, reserving time for the relay to close
   before the sender's refund activates.
 - `funding_keyset_recovery_window_secs`: minimum interval from channel expiry
   until the funding keyset's optional final expiry, reserving time for recovery.
+- `commitment_modes.accepted`: nonempty, unique `ordinary`/`rerandomized` values.
+- `commitment_modes.preferred`: one of the accepted modes, used only for NEW
+  provisioning. It does not rank otherwise eligible reusable channels.
+
+Effective modes intersect implementation support, operator policy and confirmed
+mint capabilities. An empty intersection omits the mint/unit offer. Ordinary
+swaps are baseline Cashu functionality; optional rerandomization requires
+`GET /v1/info` to advertise `nuts["3"].rerandomize: true`. Clients independently
+check optional capability before selecting it. Discovery failure is unknown, not
+evidence of unsupported mode. See [dual-mode integration](rerandomized-channels.md)
+for cache lifetimes, refresh rules and configuration.
 
 These are distinct intervals, enforced as described in §4. For example:
 
@@ -368,8 +390,8 @@ These are distinct intervals, enforced as described in §4. For example:
 {
   "advertisements": {
     "https://mint.example": {
-      "sat": {"minimum_channel_lifetime_secs": 3600, "funding_keyset_recovery_window_secs": 86400},
-      "msat": {"minimum_channel_lifetime_secs": 3600, "funding_keyset_recovery_window_secs": 86400}
+      "sat": {"minimum_channel_lifetime_secs": 3600, "funding_keyset_recovery_window_secs": 86400, "commitment_modes": {"accepted": ["ordinary", "rerandomized"], "preferred": "rerandomized"}},
+      "msat": {"minimum_channel_lifetime_secs": 3600, "funding_keyset_recovery_window_secs": 86400, "commitment_modes": {"accepted": ["ordinary", "rerandomized"], "preferred": "rerandomized"}}
     }
   },
   "bytes_in_per_msat": 1000,
@@ -843,6 +865,7 @@ hide a fatal failure already discovered.
 | `LINK_MINT_OR_KEYSET_UNACCEPTABLE`, `LINK_UNSUPPORTED_UNIT` | Link | Nonfatal funding or policy incompatibility; not necessarily transient metadata lag. |
 | `LINK_KEYSET_REFRESH_RATE_LIMITED`, `LINK_KEYSET_REFRESH_BUSY`, `LINK_KEYSET_REFRESH_FAILED` | Link | Nonfatal refresh obstacle; bounded retry of unchanged funding may be appropriate. |
 | `LINK_KEYSET_VERSION_NOT_NEGOTIATED` | Link | Fatal to this session; do not mark an otherwise valid wallet channel globally unusable. |
+| `LINK_COMMITMENT_MODE_NOT_ACCEPTED` | Link/relink | Nonfatal; preserve credit, prior link and ownership. Exclude the candidate only for this session, not globally. |
 | `LINK_CHANNEL_RETIRED` | Link | Nonfatal policy refusing a known channel's relink, including a stored old-receiver channel the relay declines to reuse; preserve its record and recovery path. Distinct from scoped exclusion. |
 | `CHANNEL_CLOSED`, `CHANNEL_EXPIRED` | Link/payment | Nonfatal unusable-channel rejection; `CHANNEL_EXPIRED` also covers insufficient remaining lifetime at link/relink admission (§4.1). Preserve recovery history. |
 | `PAYMENT_WRONG_CHANNEL` | Payment | The session is not linked to the submitted ID; nonfatal. |
@@ -862,7 +885,7 @@ responsibility, not a guarantee supplied by a control error.
 
 ## 7. Stability and implementation tracking
 
-Sections 1-6 are the stable target contract for `h2-2026-10-07`. During pre-alpha
+Sections 1-6 are the stable target contract for `h2-2026-11-08`. During pre-alpha
 development, implementations use this identifier while conformance work proceeds;
 its selection alone is not a claim that all requirements are implemented. Full
 conformance requires the coverage in Appendix B. Coordinated breaking changes

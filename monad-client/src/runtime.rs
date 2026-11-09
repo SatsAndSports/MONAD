@@ -1490,6 +1490,7 @@ mod tests {
         let mut config = test_config_with_clients(&["first", "second"]);
         config.clients[1].socks = occupied_addr.to_string();
         config.client_wallet = Some(monad_common::config::ClientWalletConfig {
+            commitment_mode: None,
             funding_keyset_recovery_window_secs: 86_400,
             loose_db_path: loose_db.display().to_string(),
             channel_db_path: channel_db.display().to_string(),

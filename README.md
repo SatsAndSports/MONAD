@@ -716,9 +716,10 @@ Current coverage includes:
 
 ### Relay Keyset Handling
 
-Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. Advertisements map mint URL to unit to an object containing `minimum_channel_lifetime_secs` and `funding_keyset_recovery_window_secs`, generated from trusted policy even when keyset metadata is absent. They contain no keyset IDs or per-offer prices. Session prices are `bytes_in_per_msat` and `bytes_out_per_msat`. Stored channels may relink after a trust-policy change, but every relink must satisfy the current admission deadlines.
+Each relay wallet manager owns one shared in-memory `SpilmanMintCache` populated from configured mint URLs. The cache stores all keysets returned by those mints, active and inactive, for all units the mint reports. Advertisements map mint URL to unit to an object containing `minimum_channel_lifetime_secs`, `funding_keyset_recovery_window_secs`, and `commitment_modes`. Keyset IDs and per-offer prices are not advertised. Session prices are `bytes_in_per_msat` and `bytes_out_per_msat`. Stored channels may relink after a trust-policy change, but every relink must satisfy the current admission deadlines and session mode policy.
 
-Clients and relays negotiate `h2-2026-10-07`. During pre-alpha development,
+Clients and relays negotiate `h2-2026-11-08`, replacing `h2-2026-10-07` without
+fallback. During pre-alpha development,
 upgrade both ends of every hop together as breaking changes bring the
 implementation into conformance with the control contract. Control framing
 enforces the contract's 1 MiB line limit, duplicate-key and parser-complexity
@@ -726,6 +727,31 @@ rejection, and fatal malformed-input cleanup; the relay attempts one bounded
 generic `CONTROL_INVALID_MESSAGE` before teardown. Remaining work is tracked in
 [issue #125](https://github.com/SatsAndSports/MONAD/issues/125). No database
 migration or reset is needed for this advertisement update.
+
+Relay commitment-mode defaults accept both `ordinary` and `rerandomized`, and
+prefer rerandomized for NEW channels when the mint confirms support. Existing
+eligible ordinary channels remain reusable; preference does not rank reused
+channels. Inside a relay's YAML configuration, policy can be set explicitly:
+
+```yaml
+channel_policy:
+  commitment_modes:
+    accepted: [ordinary, rerandomized]
+    preferred: rerandomized
+  mint_commitment_modes:
+    "https://mint.example":
+      accepted: [ordinary]
+      preferred: ordinary
+```
+
+Clients independently check optional mint support. Omit
+`client_wallet.commitment_mode` to follow relay preference, or set it to
+`ordinary` or `rerandomized` to constrain selection and provisioning. Overrides
+cannot exceed relay acceptance. A mode-rejected link/relink gets nonfatal
+`LINK_COMMITMENT_MODE_NOT_ACCEPTED`, preserving credit and the prior link.
+Mode is authenticated by channel parameters and ID; existing channels are never
+converted. See [dual-mode integration](docs/rerandomized-channels.md) for capability
+discovery, cache rules and recovery invariants.
 
 Every MONAD H2 request and response header list is limited to 32 KiB of
 uncompressed HTTP/2 header-list size. MONAD does not use trailing H2 HEADERS:
@@ -877,7 +903,7 @@ advertised minimum plus a margin (10% of the minimum, bounded to 1–60 seconds)
 Long delays or clock skew can still cause admission rejection; prepared expiries
 are immutable. These checks do not erase accepted payments or block recovery.
 The new lifetime advertisement field is required: update clients and relays
-together under `h2-2026-10-07`; no database reset is needed.
+together under `h2-2026-11-08`; no database reset is needed.
 `min_capacity` and
 `max_amount_per_output` use explicit `sat` or `msat` suffixes and are converted
 to the linked channel's raw unit before validation.

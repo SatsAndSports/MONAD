@@ -392,6 +392,8 @@ pub struct RelayWalletConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientWalletConfig {
+    #[serde(default)]
+    pub commitment_mode: Option<cdk_spilman::CommitmentMode>,
     #[serde(
         default = "default_funding_keyset_recovery_window_secs",
         rename = "funding_keyset_recovery_window",
@@ -637,6 +639,13 @@ pub struct TrustedMintConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RelayChannelPolicyConfig {
+    #[serde(default = "crate::commitment_modes::ModePolicy::dual_mode")]
+    pub commitment_modes: crate::commitment_modes::ModePolicy,
+    #[serde(
+        default,
+        deserialize_with = "crate::commitment_modes::deserialize_mint_policies"
+    )]
+    pub mint_commitment_modes: BTreeMap<String, crate::commitment_modes::ModePolicy>,
     #[serde(
         default = "default_funding_keyset_recovery_window_secs",
         rename = "funding_keyset_recovery_window",
@@ -668,6 +677,8 @@ pub struct RelayChannelPolicyConfig {
 impl Default for RelayChannelPolicyConfig {
     fn default() -> Self {
         Self {
+            commitment_modes: crate::commitment_modes::ModePolicy::dual_mode(),
+            mint_commitment_modes: BTreeMap::new(),
             funding_keyset_recovery_window_secs: default_funding_keyset_recovery_window_secs(),
             min_expiry_secs: default_min_channel_expiry_secs(),
             min_capacity_msats: default_min_channel_capacity_msats(),

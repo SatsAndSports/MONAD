@@ -116,6 +116,7 @@ impl Backend for ClientBackend {
                     "proof_custody": custody,
                     "channels": channels.into_iter().map(|c| json!({
                         "channel_id": c.channel_id, "state": format!("{:?}", c.state),
+                        "commitment_mode": c.commitment_mode,
                         "receiver_pubkey": c.receiver_pubkey, "mint_url": c.mint_url, "unit": c.unit,
                         "capacity_msats": c.capacity_msats, "signed_balance_msats": c.current_signed_balance_msats,
                         "expiry_timestamp": c.expiry_timestamp, "session_id": c.attached_session_id.map(hex::encode),

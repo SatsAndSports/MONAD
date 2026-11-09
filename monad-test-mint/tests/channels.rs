@@ -174,6 +174,7 @@ async fn exercise() {
         offers.insert(
             unit,
             RelayPaymentOffer {
+                commitment_modes: Default::default(),
                 funding_keyset_recovery_window_secs: 86_400,
                 minimum_channel_lifetime_secs: 3600,
                 receiver_pubkey: secret.public_key().to_hex(),

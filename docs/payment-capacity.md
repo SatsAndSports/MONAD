@@ -49,6 +49,8 @@ for channel creation; the mint is not contacted during measured payments.
 - The client wallet is `TestSigningWallet`: real channel creation and payment
   signatures, but in-memory wallet storage. This does not benchmark thousands of
   client SQLite wallets, SOCKS listeners, or full client OS processes.
+- This recipe explicitly retains ordinary-channel policy; optional rerandomized
+  mint discovery is outside its steady-state payment-capacity workload.
 - The generator also runs the local echo target. Both processes compete for the
   laptop's CPU/network resources. A failure to deliver offered load is not alone
   proof that the relay's payment verification or database is saturated.

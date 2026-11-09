@@ -14,6 +14,8 @@
 
 #[path = "common/close_successor.rs"]
 mod close_successor;
+#[path = "common/commitment_modes.rs"]
+mod commitment_modes;
 mod common;
 #[path = "common/drain_successor.rs"]
 mod drain_successor;
@@ -1952,6 +1954,7 @@ async fn assert_auto_close_worker_lifecycle(cancel: Option<bool>) {
     )
     .await;
     let offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex.clone(),
@@ -2592,6 +2595,7 @@ impl DrainTestContext {
         )
         .await;
         let offer = RelayPaymentOffer {
+            commitment_modes: Default::default(),
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: receiver_pubkey_hex,
@@ -4722,6 +4726,7 @@ async fn test_expiring_funding_keyset_discovery_persistence_and_link_admission()
             Err(LinkError::ChannelExpired)
         );
         let offer = RelayPaymentOffer {
+            commitment_modes: Default::default(),
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: receiver.public_key().to_hex(),
@@ -4807,6 +4812,7 @@ async fn test_negotiated_keyset_link_enforcement_is_session_local() {
         .await;
         let channel = wallet.pre_create_channel(1000).await.unwrap();
         let offer = RelayPaymentOffer {
+            commitment_modes: Default::default(),
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: receiver.public_key().to_hex(),
@@ -7188,7 +7194,9 @@ async fn test_relay_restart_preserves_channel_state_with_real_signatures() {
         wallet.clone() as Arc<dyn monad_client::wallet::MonadWallet>,
         "real-crypto hop",
         monad_client::session_driver::PaymentPolicy {
-            target_topup_buffer_msats: 1000,
+            // The minimum still makes the first payment exactly 1000. Leave
+            // room for the echo so this assertion cannot race a refill tick.
+            target_topup_buffer_msats: 500,
             minimum_topup_msats: 1000,
             ..monad_client::session_driver::PaymentPolicy::default()
         },
@@ -7461,6 +7469,7 @@ async fn test_relay_policy_change_stops_advertising_but_existing_channel_still_w
         .unwrap();
 
     let old_offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
@@ -7690,6 +7699,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         .await,
     );
     let old_offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex.clone(),
@@ -7822,6 +7832,7 @@ async fn test_relay_close_reactive_keyset_refresh_enables_new_keyset_link() {
         .await,
     );
     let new_offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
@@ -7946,6 +7957,7 @@ async fn test_channel_link_refreshes_and_accepts_new_keyset() {
     )
     .await;
     let new_offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
@@ -8037,6 +8049,7 @@ async fn test_malformed_unknown_keyset_links_do_not_consume_refresh_budget() {
     )
     .await;
     let offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
@@ -8175,6 +8188,7 @@ async fn test_channel_link_unknown_keyset_reports_refresh_failure() {
     )
     .await;
     let offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
@@ -9881,6 +9895,7 @@ client_wallet:
   loose_db_path: {}
   channel_db_path: {}
   sender_secret_hex: "{}"
+  commitment_mode: ordinary
   # Budget is parameterized per test. The small explicit topup target keeps
   # channels far from capacity: relinked sessions fund from remaining
   # capacity, so channels stay reusable across connect retries and rebuilds.
@@ -9966,6 +9981,9 @@ relays:
             &self.sender_secret_hex,
         )
         .unwrap()
+        .with_commitment_mode_preference(
+            self.config.client_wallet.as_ref().unwrap().commitment_mode,
+        )
     }
 
     async fn shutdown(mut self) {
@@ -12196,6 +12214,7 @@ async fn test_numeric_payment_rejection_preserves_sqlite_balance_and_signature()
     let channel = wallet.pre_create_channel(1000).await.unwrap();
     let session = [42; 32];
     let offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         receiver_pubkey,
         mint_url,
         unit: "sat".into(),
@@ -13123,6 +13142,7 @@ async fn test_wallet_manager_drain_swap_combines_multiple_closed_channels() {
     )
     .await;
     let offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
@@ -13208,6 +13228,7 @@ async fn test_wallet_manager_drain_swap_recovers_after_ambiguous_submission() {
     )
     .await;
     let offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
@@ -14497,6 +14518,7 @@ async fn test_wallet_manager_drain_keyset_rejection_refreshes_reprepares_and_ret
     )
     .await;
     let offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
@@ -14822,6 +14844,7 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
     )
     .await;
     let old_offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex.clone(),
@@ -14873,6 +14896,7 @@ async fn test_wallet_manager_drain_swap_combines_closed_channels_from_different_
     )
     .await;
     let new_offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,
@@ -15003,6 +15027,7 @@ async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_an
     )
     .await;
     let old_offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex.clone(),
@@ -15053,6 +15078,7 @@ async fn test_wallet_manager_drain_mixed_keysets_stale_output_cache_refreshes_an
     )
     .await;
     let new_offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         funding_keyset_recovery_window_secs: 86_400,
         minimum_channel_lifetime_secs: 3600,
         receiver_pubkey: receiver_pubkey_hex,

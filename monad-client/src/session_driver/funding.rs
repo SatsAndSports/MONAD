@@ -76,14 +76,29 @@ fn choose_channel_and_offer(
                     && state.intended_channel_id.as_deref() == Some(channel.channel_id.as_str())))
         })
         .collect::<Vec<_>>();
+    let preference = wallet.commitment_mode_preference();
     for advertisement in &snapshot.advertisements {
         let offer = RelayPaymentOffer::from_advertisement(
             snapshot.receiver_pubkey.clone(),
             advertisement,
             versions,
         );
-        if let Some(channel) = select_channel(&channels, &offer, session_id, now) {
-            return Ok(Some((channel, offer)));
+        let mut eligible = channels
+            .iter()
+            .filter(|channel| preference.is_none_or(|mode| mode == channel.commitment_mode))
+            .cloned()
+            .collect::<Vec<_>>();
+        while let Some(channel) = select_channel(&eligible, &offer, session_id, now) {
+            if wallet
+                .supports_commitment_mode(&offer.mint_url, channel.commitment_mode)
+                .unwrap_or(false)
+            {
+                return Ok(Some((channel, offer)));
+            }
+            // Unknown/unsupported optional capability makes this mode locally
+            // ineligible, not globally unusable. Other accepted modes may reuse
+            // funds. Only eligible candidates trigger capability discovery.
+            eligible.retain(|other| other.commitment_mode != channel.commitment_mode);
         }
     }
     Ok(None)
@@ -412,7 +427,7 @@ pub(super) async fn acquire_channel_candidate(
                             offer.unit,
                             state_summary(state, &config.conn.cleartext_byte_counters)
                         );
-                        config.wallet.provision_channel(
+                        config.wallet.provision_session_channel(
                             offer,
                             config.payment_policy.channel_funding_token_target_msats,
                         )
@@ -1045,6 +1060,7 @@ pub(super) async fn apply_server_error(
             let exclude_for_session = matches!(
                 code,
                 ServerErrorCode::LinkInvalidZeroBalanceSignature
+                    | ServerErrorCode::LinkCommitmentModeNotAccepted
                     | ServerErrorCode::ChannelEvictedFromSession
                     | ServerErrorCode::ChannelRetiredAtRelay
                     | ServerErrorCode::LinkChannelRetired
@@ -1091,6 +1107,7 @@ mod tests {
 
     fn advertisement(mint_url: &str) -> PaymentOption {
         PaymentOption {
+            commitment_modes: Default::default(),
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
             mint_url: mint_url.to_string(),
