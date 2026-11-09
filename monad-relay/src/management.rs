@@ -437,6 +437,7 @@ mod tests {
     #[test]
     fn wallet_summary_counts_completed_drains_and_every_channel_state() {
         let channel = |state| ChannelSummary {
+            commitment_mode: cdk_spilman::CommitmentMode::Ordinary,
             channel_id: String::new(),
             relay_name: "relay".into(),
             receiver_pubkey_hex: String::new(),

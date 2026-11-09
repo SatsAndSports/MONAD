@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayPaymentOffer {
+    pub commitment_modes: monad_common::commitment_modes::ModePolicy,
     pub minimum_channel_lifetime_secs: u64,
     pub funding_keyset_recovery_window_secs: u64,
     pub receiver_pubkey: String,
@@ -30,6 +31,7 @@ impl RelayPaymentOffer {
     ) -> Self {
         Self {
             receiver_pubkey,
+            commitment_modes: advertisement.commitment_modes.clone(),
             minimum_channel_lifetime_secs: advertisement.minimum_channel_lifetime_secs,
             funding_keyset_recovery_window_secs: advertisement.funding_keyset_recovery_window_secs,
             mint_url: advertisement.mint_url.clone(),
@@ -234,6 +236,58 @@ impl fmt::Display for WalletError {
 impl std::error::Error for WalletError {}
 
 pub trait MonadWallet: Send + Sync + 'static {
+    fn commitment_mode_preference(&self) -> Option<cdk_spilman::CommitmentMode> {
+        test_session_mode_preference()
+    }
+
+    /// Wallet implementations must independently confirm optional mint support.
+    /// The default implementation only implements baseline ordinary channels.
+    fn supports_commitment_mode(
+        &self,
+        _mint: &str,
+        mode: cdk_spilman::CommitmentMode,
+    ) -> Result<bool, WalletError> {
+        Ok(mode == cdk_spilman::CommitmentMode::Ordinary)
+    }
+
+    fn provision_session_channel(
+        &self,
+        offer: &RelayPaymentOffer,
+        target: u64,
+    ) -> Result<String, WalletError> {
+        let unavailable = |reason: &str| WalletError::ProvisioningOfferUnavailable {
+            mint_url: offer.mint_url.clone(),
+            unit: offer.unit.clone(),
+            reason: reason.into(),
+        };
+        let preference = self.commitment_mode_preference();
+        let mut mode = preference.unwrap_or(offer.commitment_modes.preferred);
+        if !offer.commitment_modes.accepted.contains(&mode) {
+            return Err(unavailable(
+                "requested commitment mode is not accepted by relay",
+            ));
+        }
+        let supports = |mode| {
+            self.supports_commitment_mode(&offer.mint_url, mode)
+                .map_err(|_| WalletError::ProvisioningPreflight {
+                    mint_url: offer.mint_url.clone(),
+                    unit: offer.unit.clone(),
+                    reason: "mint commitment-mode capability is unknown/unavailable".into(),
+                })
+        };
+        if !supports(mode)? {
+            mode = cdk_spilman::CommitmentMode::Ordinary;
+            if preference.is_some()
+                || !offer.commitment_modes.accepted.contains(&mode)
+                || !supports(mode)?
+            {
+                return Err(unavailable(
+                    "requested commitment mode is unsupported by mint or wallet",
+                ));
+            }
+        }
+        self.provision_channel_in_mode(offer, target, mode)
+    }
     fn list_channels(&self) -> Result<Vec<WalletChannel>, WalletError>;
 
     fn get_channel(&self, channel_id: &str) -> Result<WalletChannel, WalletError>;
@@ -390,7 +444,10 @@ pub fn select_channel(
 
     for channel in channels {
         if channel.state != WalletChannelState::Open
-            || channel.commitment_mode != baseline_session_mode()
+            || !offer
+                .commitment_modes
+                .accepted
+                .contains(&channel.commitment_mode)
             || channel.is_expired(now)
             || !monad_common::keyset_expiry::channel_covers_minimum_lifetime(
                 now,
@@ -431,14 +488,23 @@ pub struct MockWallet {
     inner: std::sync::Arc<Mutex<MockWalletInner>>,
 }
 
-/// Production admission remains ordinary until the coordinated protocol change.
-/// Isolated process-test binaries can exercise the financial path before then.
-pub(crate) fn baseline_session_mode() -> cdk_spilman::CommitmentMode {
+pub(crate) fn test_session_mode_preference() -> Option<cdk_spilman::CommitmentMode> {
     #[cfg(feature = "funds-lifecycle-test")]
-    if std::env::var("MONAD_FUNDS_TEST_COMMITMENT_MODE").as_deref() == Ok("rerandomized") {
-        return cdk_spilman::CommitmentMode::Rerandomized;
+    {
+        // An explicit ordinary fixture must not fall through to the production
+        // relay preference, which can now select rerandomized provisioning.
+        match std::env::var("MONAD_FUNDS_TEST_COMMITMENT_MODE").as_deref() {
+            Ok("ordinary") => return Some(cdk_spilman::CommitmentMode::Ordinary),
+            Ok("rerandomized") => return Some(cdk_spilman::CommitmentMode::Rerandomized),
+            _ => {}
+        }
     }
-    cdk_spilman::CommitmentMode::Ordinary
+    None
+}
+
+/// Default for low-level callers; normal sessions select via advertised policy.
+pub(crate) fn baseline_session_mode() -> cdk_spilman::CommitmentMode {
+    test_session_mode_preference().unwrap_or(cdk_spilman::CommitmentMode::Ordinary)
 }
 
 #[derive(Debug, Default)]
@@ -1009,6 +1075,7 @@ mod tests {
 
     fn offer(unit: &str) -> RelayPaymentOffer {
         RelayPaymentOffer {
+            commitment_modes: Default::default(),
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: "receiver".to_string(),
@@ -1053,7 +1120,7 @@ mod tests {
     fn mint_unit_advertisements_need_no_keysets_for_selection_or_mock_provisioning() {
         let versions = BTreeSet::from(["v1".to_string()]);
         let advertisements =
-            serde_json::from_str(r#"{"https://mint":{"sat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400},"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400}}}"#).unwrap();
+            serde_json::from_str(r#"{"https://mint":{"sat":{"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400},"msat":{"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400}}}"#).unwrap();
         for advertisement in monad_common::protocol::advertisement_options(&advertisements, 11, 22)
         {
             let candidate =
@@ -1073,6 +1140,34 @@ mod tests {
                 "0000000000000001"
             );
         }
+    }
+
+    #[test]
+    fn existing_channel_order_is_independent_of_mode_preference() {
+        let mut candidate = offer("msat");
+        candidate.commitment_modes = monad_common::commitment_modes::ModePolicy::dual_mode();
+        let ordinary = channel("a");
+        let mut rerandomized = channel("z");
+        rerandomized.commitment_mode = cdk_spilman::CommitmentMode::Rerandomized;
+        assert_eq!(
+            select_channel(
+                &[rerandomized.clone(), ordinary.clone()],
+                &candidate,
+                session(1),
+                0
+            )
+            .unwrap()
+            .channel_id,
+            "a"
+        );
+        candidate.commitment_modes.preferred = cdk_spilman::CommitmentMode::Ordinary;
+        rerandomized.channel_id = "0".into();
+        assert_eq!(
+            select_channel(&[ordinary, rerandomized], &candidate, session(1), 0)
+                .unwrap()
+                .channel_id,
+            "0"
+        );
     }
 
     #[test]

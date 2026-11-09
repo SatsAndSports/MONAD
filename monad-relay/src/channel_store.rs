@@ -64,6 +64,44 @@ impl fmt::Debug for ChannelStore {
 }
 
 impl ChannelStore {
+    /// Previously admitted rerandomized channels remain candidates for relink
+    /// after a trusted-mint policy change. Discover their mint capabilities at
+    /// listener startup too, without advertising them as new funding offers.
+    pub(crate) fn rerandomized_open_mints(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        let mut mints = std::collections::BTreeSet::new();
+        let Some(metadata) = &self.metadata else {
+            return Ok(mints);
+        };
+        for (id, _, _) in metadata
+            .list_channels(self.relay_name.as_deref())
+            .map_err(|e| e.to_string())?
+        {
+            let Some(channel) = self.get_channel(&id)? else {
+                continue;
+            };
+            if channel.state != ChannelState::Open {
+                continue;
+            }
+            let params = crate::payments::stored_channel_parameters(&id, &channel.funding)?;
+            let mode: cdk_spilman::CommitmentMode = params
+                .get("commitment_mode")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()
+                .map_err(|_| "invalid stored commitment mode".to_owned())?
+                .unwrap_or_default();
+            if mode == cdk_spilman::CommitmentMode::Rerandomized {
+                let mint = params
+                    .get("mint")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing stored mint")?;
+                mints.insert(mint.trim_end_matches('/').to_owned());
+            }
+        }
+        Ok(mints)
+    }
+
     pub(crate) fn storage(&self) -> &dyn SpilmanStorage {
         self.storage.as_ref()
     }

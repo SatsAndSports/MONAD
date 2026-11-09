@@ -80,7 +80,7 @@ cargo run -p monad-quic -- ...
 
 - Wire format: JSON newline-delimited messages on the H2 control stream (`POST /control`)
 - Control framing enforces a 1 MiB line limit inbound and outbound, duplicate-key rejection, depth/member parser bounds, and a 4 KiB `Error.message` bound. Malformed or oversized input poisons the decoder; the relay attempts one bounded generic `CONTROL_INVALID_MESSAGE`, then terminates and cleans up the session. A final partial line never executes.
-- Bootstrap: the two Noise handshake payloads negotiate the session version/capabilities and post-Noise session protocol (`h2-2026-10-07`), plus one Cashu Spilman protocol and the full mutual keyset-version set; today `2026-09-14` supports `v1` and `v2` and requires a nonempty intersection. Pre-alpha implementations use this identifier while conformance work continues, allowing coordinated breaking changes; issue #125 tracks remaining work.
+- Bootstrap: the two Noise handshake payloads negotiate the session version/capabilities and post-Noise session protocol (`h2-2026-11-08`), plus one Cashu Spilman protocol and the full mutual keyset-version set; today `2026-09-14` supports `v1` and `v2` and requires a nonempty intersection. The prior `h2-2026-10-07` identifier has no fallback; upgrade all hop endpoints together. The bootstrap envelope remains version 1. Issue #125 tracks remaining conformance work.
 - Initial state: once the H2 control stream is established, the relay immediately sends a unified `SessionStatus` containing advertisements and initial state
 - Sessions start paused-by-default with zero balance; control stream is always free while paused
 - Billing formula: `ceil(in_bytes / in_rate + out_bytes / out_rate)` in millisats, exact integer quotient/remainder arithmetic in `monad-common/src/billing.rs`; rates must be positive and unsupported numeric ranges reject with `NUMERIC_LIMIT_EXCEEDED` before mutation
@@ -132,7 +132,7 @@ with a 1–60 second margin over the relay minimum while preserving their normal
 
 - `SqliteClientWallet::recover_channel_funds(access, channel_id, mint_connection)` requires matching exclusive maintenance authority and per-channel singleflight; it is separate from startup/manual opening recovery.
 - Refund journal v3 binds normalized loose DB, `wallet_name`, and sender. It retains A/B preparations and execution history through `prepared`, `submitting`, `finalizing`, and `completed`. Validated HTTP 400 `12002` on any A execution can authorize keyset-only B; two submissions per candidate per invocation, never C. `winning_refund_json` binds the actual verified winner before import; receiver-close fallback retains its source and no refund winner. A prepared B keeps uncertainty `submitting`. Incompatible v2 journals reject intact. Pending recovery exposes `Closing` and excludes reuse.
-- Spilman/CDK pins are centralized in workspace dependencies: Spilman 0.3.0 at `78f71cba8476d0235dc4b317b729b059a5931126`, CDK v0.18.1 rerandomization backport at `5b762529fc93746f06477670b7a830685d0336a4`. This is a dependency-only baseline for the upstream dual-mode library: MONAD channels remain ordinary and the exact public-parameter shape still rejects `commitment_mode` on links. Upstream refund `with_output_keyset` retains original `derivation_keyset`, context, input witnesses and all output points/secrets; only signing keys change. Missing derivation metadata rejects. Obsolete spend classifiers, first-proof checks and inferred receiver refund terminal states are removed.
+- Spilman/CDK pins are centralized in workspace dependencies: Spilman 0.3.0 at `78f71cba8476d0235dc4b317b729b059a5931126`, CDK v0.18.1 rerandomization backport at `5b762529fc93746f06477670b7a830685d0336a4`. Mode is authenticated in channel parameters/ID: ordinary omits `commitment_mode`, rerandomized includes it. Upstream refund `with_output_keyset` retains original `derivation_keyset`, context, input witnesses and all output points/secrets; only signing keys change. Missing derivation metadata rejects. Obsolete spend classifiers, first-proof checks and inferred receiver refund terminal states are removed.
 - Use upstream NUT-07-first inspection and verified completion primitives for refunds/closes. Alice restores retained refunds before close discovery; Charlie routes restored signatures against all retained close candidates. Opening uses exact restore plus full-input NUT-07 replay gates. Opening journal v4 permits one A/B pair after validated HTTP 400 `12002` on any A execution, preserving earlier uncertainty. Each opening candidate retains its existing initial/replay claims and clock gate; startup/manual recovery remains restore-only. B keeps exact inputs, funding-token value and change value; capacity is recomputed for its keyset. Finalizing binds one winner and retires the peer as cancelled without releasing custody. Shared-input exports deduplicate proofs and transition all active candidates atomically. Old nonempty opening journals reject intact.
 - Refund output keys are independent of funding keys, selected cache-first for active same-mint/unit keys without relay/session filters. Upstream derivation version 1 includes sender-private material; prepared records and finalization payloads contain secrets. Never log them or derivation preimages. CLI mint requests use a 15-second timeout and body-redacted typed rejections.
 - Funding inspection validates all input identities. Pending/mixed/invalid evidence retains recovery state; witness count does not route recovery. Empty close discovery is not success. Relay close journal v6 may record `collection_abandoned` after expiry with spent/mixed funding and no known payout; it stays `Closing`, autosweep skips it, and explicit close can retry restoration. Missing/inconsistent R for a rerandomized close remains unresolved. This is not an inferred sender refund. Incompatible journals reject without deletion.
@@ -144,11 +144,17 @@ with a 1–60 second margin over the relay minimum while preserving their normal
 Dual-mode financial groundwork: explicit `provision_channel_in_mode` and
 `provision_channel_with_target_capacity_in_mode` bind mode before funding;
 opening successors retain it. Wallet summaries derive mode from stored parameters
-with channel-ID verification. Normal sessions still use/reuse only ordinary
-channels. Isolated `funds-lifecycle-test` processes can enable rerandomized fixtures
+with channel-ID verification. Normal sessions accept both modes according to fixed
+session admission policy, defaulting to prefer confirmed rerandomized support for
+new provisioning. Existing eligible channels are reused without preference ranking.
+Relay/client mint capability caches are independent (known TTL 5 minutes, unknown
+retry 30 seconds, 15-second HTTP timeout); relay refresh ticks every 60 seconds.
+`LINK_COMMITMENT_MODE_NOT_ACCEPTED` is nonfatal and preserves prior credit/ownership;
+the client excludes only the session candidate, never globally invalidates it.
+Isolated `funds-lifecycle-test` processes can select rerandomized fixtures
 through `MONAD_FUNDS_TEST_COMMITMENT_MODE`; normal binaries ignore it. Two additional
 process tests cover rerandomized lifecycle/finalization and candidate crashes.
-The next protocol/policy PR follows `docs/rerandomized-channels.md`.
+Policy, discovery and configuration rules live in `docs/rerandomized-channels.md`.
 
 ### QUIC Transport
 

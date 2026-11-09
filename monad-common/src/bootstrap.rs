@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 pub const BOOTSTRAP_VERSION: u8 = 1;
-pub const SESSION_PROTOCOL_H2: &str = "h2-2026-10-07";
+pub const SESSION_PROTOCOL_H2: &str = "h2-2026-11-08";
 pub const CASHU_SPILMAN_PROTOCOL_VERSION_2026_09_14: &str = "2026-09-14";
 pub const CASHU_SPILMAN_KEYSET_VERSION_V1: &str = "v1";
 pub const CASHU_SPILMAN_KEYSET_VERSION_V2: &str = "v2";
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn session_protocol_selection_requires_the_current_identifier() {
-        for protocol in ["h2", "h2-2026-10-06"] {
+        for protocol in ["h2", "h2-2026-10-06", "h2-2026-10-07"] {
             let mut hello = decode_v1_client_hello(&initial_client_hello()).unwrap();
             hello.session_protocols = vec![protocol.to_string()];
             assert!(validate_v1_client_hello(&hello).is_err());

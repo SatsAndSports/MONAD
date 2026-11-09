@@ -25,6 +25,7 @@ fn status(
             BTreeMap::from([(
                 "msat".into(),
                 MintUnitAdvertisement {
+                    commitment_modes: Default::default(),
                     minimum_channel_lifetime_secs: 3600,
                     funding_keyset_recovery_window_secs: 0,
                 },

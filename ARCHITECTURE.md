@@ -844,7 +844,20 @@ Refresh does not invalidate old keysets by itself. The relay cache stores all ke
 
 Here, "bootstrap" means the MONAD-specific negotiation carried inside the two Noise handshake payloads before the post-handshake session begins.
 
-MONAD currently uses the Noise `NK` pattern instantiated with secp256k1 DH, ChaCha20-Poly1305 for transport encryption, BLAKE2s for hashing, and the fixed prologue `monad-noise-secp256k1-v1`. The client sends a bootstrap request in the first Noise handshake payload and the relay replies with an accept-or-reject payload in the second. The session protocol is `h2-2026-10-07`. During pre-alpha development it is used while the remaining control-contract requirements are implemented, with coordinated breaking changes as needed. Cashu Spilman `2026-09-14` supports keyset versions `v1` and `v2`, requiring a nonempty intersection. The supported pricing policy remains `session_constant`. Keyset versions are negotiated capability identifiers; concrete mint keyset IDs are selected from client-owned metadata and are not advertised.
+MONAD currently uses the Noise `NK` pattern instantiated with secp256k1 DH, ChaCha20-Poly1305 for transport encryption, BLAKE2s for hashing, and the fixed prologue `monad-noise-secp256k1-v1`. The client sends a bootstrap request in the first Noise handshake payload and the relay replies with an accept-or-reject payload in the second. The session protocol is `h2-2026-11-08`, replacing `h2-2026-10-07` without fallback; the bootstrap envelope remains version 1. During pre-alpha development it is used while the remaining control-contract requirements are implemented, with coordinated breaking changes as needed. Cashu Spilman `2026-09-14` supports keyset versions `v1` and `v2`, requiring a nonempty intersection. The supported pricing policy remains `session_constant`. Keyset versions are negotiated capability identifiers; concrete mint keyset IDs are selected from client-owned metadata and are not advertised.
+
+Commitment mode belongs to authenticated channel parameters and is bound by the
+channel ID. Ordinary mode is omitted from canonical link parameters;
+rerandomized mode appears as `commitment_mode: "rerandomized"`. Payments do not
+repeat mode. Per-mint/unit advertisements carry an effective accepted/preferred
+policy, frozen for each session. Defaults accept both modes and prefer confirmed
+rerandomized support for new provisioning; reusable channels are not ranked by
+mode preference. Relay and client independently discover optional NUT-03 support,
+with unknown availability distinct from unsupported capability. A disallowed
+link/relink receives nonfatal `LINK_COMMITMENT_MODE_NOT_ACCEPTED` before funding
+or ownership mutation; recovery and settlement remain independent of admission.
+See [`docs/rerandomized-channels.md`](docs/rerandomized-channels.md) for policy and
+cache details.
 
 The `2026-09-14` Spilman version retains canonical deterministic P2PK secret serialization. Relay-side refresh during `ChannelLink` handles unknown funding keysets without an explicit client refresh request. The session-protocol identifier separately protects peers against incompatible advertisement wire shapes.
 

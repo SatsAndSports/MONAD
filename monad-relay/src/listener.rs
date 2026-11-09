@@ -700,6 +700,38 @@ where
         )
     })?;
     let local_addr = listener.local_addr()?;
+    let mode_cache = payments.mint_mode_cache();
+    let mode_mints = if mode_cache.is_some() {
+        let policy = payments.session_mode_policy();
+        payments
+            .retained_mode_mints()
+            .map_err(io::Error::other)?
+            .into_iter()
+            .chain(config.trusted_mint_units.keys().cloned())
+            .filter(|mint| policy.requires_discovery(mint))
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let mut mode_refreshes: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
+    if let Some(cache) = &mode_cache {
+        for mint in &mode_mints {
+            let cache = cache.clone();
+            let mint = mint.clone();
+            mode_refreshes.push(
+                async move {
+                    let _ = cache.discover(&mint).await;
+                }
+                .boxed(),
+            );
+        }
+        tokio::select! {
+            _ = async { while mode_refreshes.next().await.is_some() {} } => {},
+            _ = &mut shutdown => return Ok(()),
+        }
+    }
+    let mut mode_refresh_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    mode_refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     info!("listening on {local_addr}");
 
     let mut sessions: FuturesUnordered<BoxFuture<'static, std::thread::Result<()>>> =
@@ -712,6 +744,14 @@ where
     // Accept loop — runs until shutdown signal
     let result = loop {
         tokio::select! {
+            _ = mode_refresh_tick.tick(), if mode_cache.is_some() && mode_refreshes.is_empty() => {
+                for mint in &mode_mints {
+                    let cache = mode_cache.as_ref().unwrap().clone();
+                    let mint = mint.clone();
+                    mode_refreshes.push(async move { let _ = cache.discover(&mint).await; }.boxed());
+                }
+            }
+            Some(()) = mode_refreshes.next(), if !mode_refreshes.is_empty() => {}
             result = listener.accept() => {
                 let (mut tcp_stream, peer_addr) = match result {
                     Ok(accepted) => accepted,
@@ -994,6 +1034,7 @@ where
         }
     };
 
+    drop(mode_refreshes);
     // Graceful shutdown: wait for active sessions to finish.
     let active = sessions.len();
     if active > 0 {

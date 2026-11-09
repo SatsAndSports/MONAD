@@ -36,6 +36,89 @@ Keep ordinary tests and vectors as the baseline. Add rerandomized variants and
 negative cases without weakening ordinary assertions. Any required journal format
 break rejects incompatible records intact; never automatically delete wallet data.
 
+## Session activation (`h2-2026-11-08`)
+
+This replaces `h2-2026-10-07` in client and relay together, without fallback. The
+bootstrap envelope stays version 1; Cashu Spilman remains `2026-09-14` with keyset
+versions `v1` and `v2`. Existing ordinary channel identities are unchanged. This
+activation adds no storage migration or reset requirement beyond the financial
+groundwork's already established journal versions.
+Common wire framing is no longer feature-gated. The client/relay
+`funds-lifecycle-test` features remain isolated fault-injection tooling; the
+obsolete common-crate feature has been removed.
+
+Channel mode lives only in authenticated upstream parameters: ordinary omits
+`commitment_mode`, rerandomized includes `"rerandomized"`. Payments still carry
+only channel ID, cumulative balance and signature. A session may accept both
+channel modes; there is no redundant session-mode bit or persisted mode column.
+
+Relay defaults accept both modes and prefer rerandomized for new provisioning.
+`channel_policy.commitment_modes` sets `{accepted: [...], preferred: ...}`;
+`channel_policy.mint_commitment_modes` maps mint URLs to complete overrides.
+Accepted modes must be nonempty and unique, and preferred must be accepted.
+Mint keys normalize trailing slashes and duplicate normalized overrides reject.
+Advertisements carry the effective policy as `commitment_modes` for each unit.
+
+The client follows the relay preference unless `client_wallet.commitment_mode`
+explicitly selects `ordinary` or `rerandomized`. An override constrains both reuse
+and new provisioning and cannot exceed relay acceptance. Reuse keeps existing
+channel ordering and does not rank preferred modes ahead of other accepted modes.
+Only new provisioning chooses a concrete mode; low-level explicit-mode wallet
+APIs remain caller-policy-controlled and recovery never consults admission policy.
+
+### Independent capability discovery
+
+Ordinary swaps are mandatory baseline Cashu functionality, not an optional NUT-03
+extension. Optional rerandomization requires `GET /v1/info` to contain
+`nuts["3"].rerandomize: true`. A valid `nuts` object with missing NUT-03/flag, or
+an explicit false flag, is known unsupported. Transport/HTTP failures, malformed
+JSON or incorrectly typed capability fields are **unknown/unavailable**.
+
+Relay and client caches are independent and memory-only. Known supported and
+unsupported results have a five-minute TTL; unknown results retry after 30 seconds.
+Discovery is singleflight per mint, uses a 15-second HTTP timeout and a 64 KiB
+response limit, and never logs response bodies. Expired positives are not reused
+after failure. Relay startup primes its cache, and an owned 60-second listener
+refresh cycle refreshes expired entries for future sessions. Each established
+session freezes its effective policy; later cache/config changes do not alter it.
+Startup discovery also includes mints of retained Open rerandomized channels,
+even if they are no longer trusted for NEW funding. This preserves stored relinks
+after trust changes without advertising removed offers. Ordinary-only operator
+policy needs no optional-capability lookup. Refresh targets are captured at
+listener startup, keeping wallet scans out of the accept/forwarding loop.
+
+The relay omits unconfirmed rerandomization from offers; ordinary remains usable
+if accepted by the operator. Rerandomized-only policy with unknown/unsupported
+mint capability produces no offer. Clients independently confirm optional mode
+support for eligible stored candidates and new provisioning. An unknown candidate
+is temporarily ineligible, not globally invalid. If discovery for NEW preferred
+rerandomized provisioning is unknown, that offer is deferred without reserving
+funds or silently treating it as unsupported. Confirmed unsupported mode may fall
+back to accepted ordinary mode when there is no explicit client override.
+Discovery is acquisition work, never part of the 250 ms steady-state credit loop.
+
+### Rejection and visibility
+
+`LINK_COMMITMENT_MODE_NOT_ACCEPTED` is nonfatal and explains the rejected/accepted
+modes. Link/relink checks stored funding where present before ownership or link
+changes. Rejection preserves prior credit and funding; the production client
+excludes the candidate only within the session and preserves wallet usability.
+The fatal keyset-version check retains precedence. Client and relay management
+wallet channel summaries expose mode derived from stored parameters after
+channel-ID verification; corrupt or missing metadata never invents ordinary mode.
+
+Ordinary fixtures retain explicit ordinary policy where their assertions depend
+on it. Additional real-mint tests cover both rejection directions, forged relink
+mode fields, prior ownership/credit preservation, accepted non-preferred reuse,
+new rerandomized provisioning, client overrides, and independent capability
+discovery (including unknown versus unsupported).
+
+Instrumented funds-process fixtures explicitly select both `ordinary` and
+`rerandomized` through their test-only environment override. Ordinary is an
+override, not an absent preference: it must not follow the production default.
+The custody audit checks the actual stored channel parameters in both fixture
+modes so a default-selection change cannot silently switch refund expectations.
+
 ## Financial invariants
 
 - Stored channel parameters are authoritative for mode; summaries must not invent
@@ -50,7 +133,7 @@ break rejects incompatible records intact; never automatically delete wallet dat
   Persist verified recovered proofs before importing and marking completion.
 - Funding reservations and opening A/B authority rules remain unchanged.
 
-## First-PR implementation and checks
+## First-PR groundwork (before session activation)
 
 - Explicit mode-taking APIs cover funding-value and target-capacity provisioning.
   Mode is persisted in upstream parameters before reservation/submission; A/B
@@ -61,7 +144,7 @@ break rejects incompatible records intact; never automatically delete wallet dat
   points using effective proof blindings offline. v5 and older journals reject
   intact. There is no automatic migration or reset; use matching older binaries
   for existing old journals, or explicitly reset owned disposable fixtures.
-- Normal session selection and wire admission remain ordinary. The existing
+- At that stage normal session selection and wire admission remained ordinary. The existing
   `funds-lifecycle-test` feature propagates to common framing solely for isolated
   child-process fixtures; their explicit test environment selects rerandomized
   channels. Production builds ignore that environment variable.
@@ -73,6 +156,22 @@ break rejects incompatible records intact; never automatically delete wallet dat
   restore points for rerandomized transactions.
 
 ## Deferred separate topic
+
+### Mint metadata coordination and acquisition responsiveness
+
+Capability discovery and keyset refresh currently have separate coordination.
+The client's synchronous wallet acquisition APIs can wait on a capability-cache
+miss, keyset refresh, or provisioning request inside the session-driver task.
+That delays this task's control-response and heartbeat processing while mint I/O
+is pending; independent transport tasks can still run. Relay capability discovery
+waits during startup, then refreshes asynchronously alongside session handling.
+
+[Issue #179](https://github.com/SatsAndSports/MONAD/issues/179) tracks coordinated
+metadata refresh and explicitly owned responsive client acquisition. That work
+must preserve independent cache/error semantics, serialized funding authority,
+durable opening custody, and cancellation/cleanup guarantees.
+
+### Expiry policy
 
 Review admission lifetime versus the relay close-ahead threshold, and distinguish
 funding-keyset recovery time from the expiry of independently selected payout keys.

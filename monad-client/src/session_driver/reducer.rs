@@ -204,6 +204,7 @@ mod tests {
 
     fn offer() -> RelayPaymentOffer {
         RelayPaymentOffer {
+            commitment_modes: Default::default(),
             receiver_pubkey: "receiver".into(),
             mint_url: "https://mint".into(),
             unit: "msat".into(),

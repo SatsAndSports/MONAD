@@ -378,6 +378,8 @@ const CREATE_CHANNEL_RECOVERIES_SQL: &str = r#"
 /// `LooseProofWallet` holds bearer proofs; this layer manages Spilman channel
 /// metadata and payment signing via `cdk-spilman`.
 pub struct SqliteClientWallet {
+    commitment_mode_preference: Option<cdk_spilman::CommitmentMode>,
+    mode_cache: monad_common::commitment_modes::MintModeCache,
     funding_keyset_recovery_window_secs: u64,
     loose_wallet: LooseProofWallet,
     bridge: Mutex<ClientBridge>,
@@ -722,6 +724,8 @@ impl SqliteClientWallet {
 
         Ok(Self {
             loose_wallet,
+            commitment_mode_preference: None,
+            mode_cache: Default::default(),
             funding_keyset_recovery_window_secs: FUNDING_KEYSET_RECOVERY_WINDOW_SECONDS,
             bridge: Mutex::new(bridge),
             sender_secret,
@@ -733,6 +737,15 @@ impl SqliteClientWallet {
             fail_next_recovered_proof_import: AtomicBool::new(false),
             runtime_locks: None,
         })
+    }
+
+    /// Optional session selection override; it cannot alter a prepared channel.
+    pub fn with_commitment_mode_preference(
+        mut self,
+        mode: Option<cdk_spilman::CommitmentMode>,
+    ) -> Self {
+        self.commitment_mode_preference = mode;
+        self
     }
 
     /// Retain runtime authority for the lifetime of all shared wallet handles.
@@ -3883,6 +3896,36 @@ impl SqliteClientWallet {
 }
 
 impl MonadWallet for SqliteClientWallet {
+    fn commitment_mode_preference(&self) -> Option<cdk_spilman::CommitmentMode> {
+        self.commitment_mode_preference
+            .or_else(crate::wallet::test_session_mode_preference)
+    }
+    fn supports_commitment_mode(
+        &self,
+        mint: &str,
+        mode: cdk_spilman::CommitmentMode,
+    ) -> Result<bool, WalletError> {
+        if mode == cdk_spilman::CommitmentMode::Ordinary {
+            return Ok(true);
+        }
+        if let Some(result) = self.mode_cache.cached(mint) {
+            return result.map_err(WalletError::Backend);
+        }
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(self.mode_cache.discover(mint)))
+            }
+            Ok(_) => {
+                return Err(WalletError::Backend(
+                    "mint capability discovery requires a multi-thread runtime".into(),
+                ))
+            }
+            Err(_) => tokio::runtime::Runtime::new()
+                .map_err(|e| WalletError::Backend(e.to_string()))?
+                .block_on(self.mode_cache.discover(mint)),
+        };
+        result.map_err(WalletError::Backend)
+    }
     fn list_channels(&self) -> Result<Vec<WalletChannel>, WalletError> {
         let conn = self.conn()?;
         let mut stmt = conn
@@ -6332,6 +6375,7 @@ mod tests {
 
     fn offer(mint_url: &str, receiver_pubkey: &str, _fixture_keyset_id: &str) -> RelayPaymentOffer {
         RelayPaymentOffer {
+            commitment_modes: Default::default(),
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: receiver_pubkey.to_string(),
@@ -9390,6 +9434,7 @@ mod tests {
             expiry_timestamp: 123_456,
         };
         let offer = RelayPaymentOffer {
+            commitment_modes: Default::default(),
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: "receiver".to_string(),
@@ -11404,6 +11449,7 @@ mod tests {
         let new =
             test_keyset_id("0202020202020202020202020202020202020202020202020202020202020202");
         let offer = RelayPaymentOffer {
+            commitment_modes: Default::default(),
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: "receiver".to_string(),
@@ -11451,6 +11497,7 @@ mod tests {
             }).unwrap();
             let bridge = SpilmanClientBridge::new(host, NoopClientNetworking);
             let offer = RelayPaymentOffer {
+                commitment_modes: Default::default(),
                 funding_keyset_recovery_window_secs: 86_400,
                 minimum_channel_lifetime_secs: 3600,
                 receiver_pubkey: "receiver".to_string(),
@@ -11483,6 +11530,7 @@ mod tests {
         let other_unit =
             test_keyset_id("0202020202020202020202020202020202020202020202020202020202020202");
         let offer = RelayPaymentOffer {
+            commitment_modes: Default::default(),
             funding_keyset_recovery_window_secs: 86_400,
             minimum_channel_lifetime_secs: 3600,
             receiver_pubkey: "receiver".to_string(),

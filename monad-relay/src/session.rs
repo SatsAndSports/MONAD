@@ -183,6 +183,7 @@ pub(crate) struct SessionState {
     transport_key: SecpTransportKeypair,
     receiver_pubkey_hex: String,
     trusted_mint_units: TrustedMintUnits,
+    mode_policy: monad_common::commitment_modes::SessionModePolicy,
     keyset_refresh: Option<Arc<RelayKeysetRefreshCoordinator>>,
     cashu_spilman_protocol_version: Option<String>,
     cashu_spilman_keyset_versions: Option<BTreeSet<String>>,
@@ -335,6 +336,7 @@ impl SessionState {
             transport_key: config.transport_key.clone(),
             receiver_pubkey_hex: config.receiver_pubkey_hex.clone(),
             trusted_mint_units: config.trusted_mint_units.clone(),
+            mode_policy: config.payments.session_mode_policy(),
             keyset_refresh: config.keyset_refresh.clone(),
             cashu_spilman_protocol_version: config.cashu_spilman_protocol_version.clone(),
             cashu_spilman_keyset_versions: config.cashu_spilman_keyset_versions.clone(),
@@ -405,6 +407,13 @@ impl SessionState {
             {
                 return Err(crate::payments::LinkError::AdmissionDisabled);
             }
+            self.payments.validate_channel_mode(
+                request,
+                &self.mode_policy,
+                self.cashu_spilman_keyset_versions
+                    .as_ref()
+                    .expect("checked above"),
+            )?;
             self.payments.link_channel(
                 self.cashu_spilman_keyset_versions
                     .as_ref()
@@ -542,10 +551,14 @@ impl SessionState {
     ) -> Option<ServerMessage> {
         let mut advertisements = MintUnitAdvertisements::new();
         for (mint_url, trusted_units) in &self.trusted_mint_units {
+            let Some(commitment_modes) = self.mode_policy.offer(mint_url) else {
+                continue;
+            };
             for unit in trusted_units {
                 advertisements.entry(mint_url.clone()).or_default().insert(
                     unit.clone(),
                     MintUnitAdvertisement {
+                        commitment_modes: commitment_modes.clone(),
                         minimum_channel_lifetime_secs: self
                             .payments
                             .minimum_channel_lifetime_secs(),

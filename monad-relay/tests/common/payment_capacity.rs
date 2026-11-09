@@ -223,6 +223,23 @@ struct MeteredPayments {
 }
 
 impl RelayPayments for MeteredPayments {
+    fn session_mode_policy(&self) -> monad_common::commitment_modes::SessionModePolicy {
+        self.real.session_mode_policy()
+    }
+    fn mint_mode_cache(&self) -> Option<Arc<monad_common::commitment_modes::MintModeCache>> {
+        self.real.mint_mode_cache()
+    }
+    fn retained_mode_mints(&self) -> Result<BTreeSet<String>, String> {
+        self.real.retained_mode_mints()
+    }
+    fn validate_channel_mode(
+        &self,
+        request: &ChannelLinkRequest,
+        policy: &monad_common::commitment_modes::SessionModePolicy,
+        versions: &BTreeSet<String>,
+    ) -> Result<(), LinkError> {
+        self.real.validate_channel_mode(request, policy, versions)
+    }
     fn retire_channel(&self, id: &str, require_unowned: bool) -> Result<Option<[u8; 32]>, String> {
         self.real.retire_channel(id, require_unowned)
     }
@@ -380,8 +397,17 @@ fn payment_capacity_relay_worker() -> anyhow::Result<()> {
             ));
             let trusted = BTreeMap::from([(MINT.to_owned(), BTreeSet::from(["sat".into()]))]);
             manager.set_trusted_mint_units(trusted.clone());
+            // This capacity recipe uses pre-created ordinary signing-wallet
+            // fixtures; optional mint discovery is not part of its workload.
+            let channel_policy = monad_common::config::RelayChannelPolicyConfig {
+                commitment_modes: Default::default(),
+                ..Default::default()
+            };
             let payments = Arc::new(MeteredPayments {
-                real: manager.spilman_payments_for_live("capacity-relay")?,
+                real: manager.spilman_payments_for_live_with_policy(
+                    "capacity-relay",
+                    channel_policy.clone(),
+                )?,
                 measurement: Mutex::new(Measurement::default()),
             });
             let identity = QuicCertIdentity::generate()?;
@@ -409,7 +435,7 @@ fn payment_capacity_relay_worker() -> anyhow::Result<()> {
                 bootstrap_capabilities: None,
                 relay_wallet_name: "capacity-relay".into(),
                 spilman_storage_path: init.db,
-                channel_policy: Default::default(),
+                channel_policy,
                 connect_limits: limits,
             });
             let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();

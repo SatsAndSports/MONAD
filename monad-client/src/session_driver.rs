@@ -155,6 +155,7 @@ mod tests {
         RelaySnapshot {
             receiver_pubkey: "receiver".to_string(),
             advertisements: vec![PaymentOption {
+                commitment_modes: Default::default(),
                 funding_keyset_recovery_window_secs: 86_400,
                 minimum_channel_lifetime_secs: 3600,
                 mint_url: "https://mint".to_string(),
@@ -214,6 +215,7 @@ mod tests {
                             std::collections::BTreeMap::from([(
                                 "msat".into(),
                                 monad_common::protocol::MintUnitAdvertisement {
+                                    commitment_modes: Default::default(),
                                     funding_keyset_recovery_window_secs: 86_400,
                                     minimum_channel_lifetime_secs: 3600,
                                 },
@@ -317,6 +319,7 @@ mod tests {
                     std::collections::BTreeMap::from([(
                         "msat".into(),
                         MintUnitAdvertisement {
+                            commitment_modes: Default::default(),
                             funding_keyset_recovery_window_secs: 86_400,
                             minimum_channel_lifetime_secs: 3600,
                         },
@@ -515,7 +518,7 @@ mod tests {
         fn status(paid: u64, linked: bool, balance: u64, paused: bool) -> ServerMessage {
             serde_json::from_value(serde_json::json!({
                 "type":"SessionStatus", "receiver_pubkey":"receiver",
-                "advertisements":{"https://mint":{"msat":{"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400}}},
+                "advertisements":{"https://mint":{"msat":{"commitment_modes":{"accepted":["ordinary"],"preferred":"ordinary"},"minimum_channel_lifetime_secs":3600,"funding_keyset_recovery_window_secs":86400}}},
                 "linked_channel":if linked { serde_json::json!({"channel_id":"c".repeat(64),"balance_raw":balance,"capacity_raw":1000,"unit":"msat"}) } else { serde_json::Value::Null },
                 "bytes_in_per_msat":1,"bytes_out_per_msat":1,"session_total_bytes_in":0,"session_total_bytes_out":0,
                 "total_paid_millisats":paid,"remaining_milli_sats":paid,"paused":paused,
@@ -777,6 +780,7 @@ mod tests {
             "channel".to_string(),
             "0000000000000002".to_string(),
             crate::wallet::RelayPaymentOffer {
+                commitment_modes: Default::default(),
                 funding_keyset_recovery_window_secs: 86_400,
                 minimum_channel_lifetime_secs: 3600,
                 receiver_pubkey: "receiver".to_string(),
@@ -1504,6 +1508,7 @@ mod tests {
             let mut state = DriverState {
                 intended_channel_id: Some("channel".into()),
                 intended_offer: Some(RelayPaymentOffer {
+                    commitment_modes: Default::default(),
                     funding_keyset_recovery_window_secs: 86_400,
                     minimum_channel_lifetime_secs: 3600,
                     receiver_pubkey: "receiver".into(),
@@ -1683,6 +1688,7 @@ mod tests {
         let mut state = DriverState {
             intended_channel_id: Some("exhausted".to_string()),
             intended_offer: Some(crate::wallet::RelayPaymentOffer {
+                commitment_modes: Default::default(),
                 funding_keyset_recovery_window_secs: 86_400,
                 minimum_channel_lifetime_secs: 3600,
                 receiver_pubkey: "receiver".to_string(),
@@ -1695,6 +1701,7 @@ mod tests {
             relay_snapshot: Some(RelaySnapshot {
                 receiver_pubkey: "receiver".to_string(),
                 advertisements: vec![PaymentOption {
+                    commitment_modes: Default::default(),
                     funding_keyset_recovery_window_secs: 86_400,
                     minimum_channel_lifetime_secs: 3600,
                     mint_url: "https://mint".to_string(),

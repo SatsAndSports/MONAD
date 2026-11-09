@@ -24,7 +24,8 @@ impl ClientWalletManager {
             &config.channel_db_path,
             &config.sender_secret_hex,
         )?
-        .with_funding_keyset_recovery_window(config.funding_keyset_recovery_window_secs);
+        .with_funding_keyset_recovery_window(config.funding_keyset_recovery_window_secs)
+        .with_commitment_mode_preference(config.commitment_mode);
         let recovery = wallet.recover_pending_openings(&locks.exclusive_access()?)?;
         locks.enter_steady_state()?;
         Ok((
@@ -52,6 +53,7 @@ mod tests {
     async fn manager_owns_one_wallet_and_recovery_pass() {
         let dir = tempfile::tempdir().unwrap();
         let config = ClientWalletConfig {
+            commitment_mode: None,
             funding_keyset_recovery_window_secs: 86_400,
             loose_db_path: dir.path().join("loose.db").display().to_string(),
             channel_db_path: dir.path().join("channels.db").display().to_string(),

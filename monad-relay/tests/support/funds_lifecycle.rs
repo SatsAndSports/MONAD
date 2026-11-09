@@ -2392,12 +2392,12 @@ clients:
 
     async fn audit_custody(&self, include_reserved: bool) {
         self.assert_proxy_checks();
-        if self
+        let rerandomized_fixture = self
             .config
             .parent()
             .unwrap()
             .join("rerandomized-fixture")
-            .exists()
+            .exists();
         {
             let conn = self.db("channel.db");
             let mut stmt = conn.prepare("SELECT funding_json FROM spilman_client_channels WHERE funding_json IS NOT NULL").unwrap();
@@ -2405,10 +2405,17 @@ clients:
                 let funding: cdk_spilman::ClientChannelFunding =
                     serde_json::from_str(&row.unwrap()).unwrap();
                 let params: Value = serde_json::from_str(&funding.params_json).unwrap();
-                assert_eq!(
-                    params["commitment_mode"], "rerandomized",
-                    "instrumented fixture did not create rerandomized funding"
-                );
+                if rerandomized_fixture {
+                    assert_eq!(
+                        params["commitment_mode"], "rerandomized",
+                        "instrumented fixture did not create rerandomized funding"
+                    );
+                } else {
+                    assert!(
+                        params.get("commitment_mode").is_none(),
+                        "ordinary fixture unexpectedly created non-ordinary funding"
+                    );
+                }
             }
         }
         let wallet = LooseProofWallet::open(

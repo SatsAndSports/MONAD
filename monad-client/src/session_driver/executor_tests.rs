@@ -19,6 +19,7 @@ use std::sync::{
 
 fn fixture(wallet: Arc<dyn MonadWallet>) -> (SessionDriverConfig, DriverState) {
     let offer = RelayPaymentOffer {
+        commitment_modes: Default::default(),
         receiver_pubkey: "receiver".into(),
         mint_url: "https://mint".into(),
         unit: "msat".into(),
@@ -52,6 +53,7 @@ fn fixture(wallet: Arc<dyn MonadWallet>) -> (SessionDriverConfig, DriverState) {
         relay_snapshot: Some(RelaySnapshot {
             receiver_pubkey: "receiver".into(),
             advertisements: vec![monad_common::protocol::PaymentOption {
+                commitment_modes: Default::default(),
                 mint_url: "https://mint".into(),
                 unit: "msat".into(),
                 funding_keyset_recovery_window_secs: 86400,
@@ -314,6 +316,69 @@ async fn replacement_executor_preserves_old_owner_on_rejection_and_releases_on_s
             100
         );
     }
+}
+
+#[tokio::test]
+async fn mode_rejection_excludes_only_this_session_and_preserves_old_funding() {
+    use super::funding::{apply_server_error, finish_replacement};
+    use super::reducer::{channel_step, ChannelEvent};
+    use monad_common::protocol::{ServerErrorCode, ServerMessage};
+    let wallet = Arc::new(MockWallet::new());
+    wallet.insert_channel(channel("A", Some([1; 32]))).unwrap();
+    wallet.insert_channel(channel("B", Some([1; 32]))).unwrap();
+    let (config, mut state) = fixture(wallet.clone());
+    let offer = state.intended_offer.clone().unwrap();
+    state
+        .channel_authority
+        .insert("B".into(), wallet.get_channel_accounting("B").unwrap());
+    channel_step(
+        &mut state,
+        ChannelEvent::Acquired(wallet.get_channel("B").unwrap(), offer.clone()),
+    );
+    state.acquired.take();
+    channel_step(
+        &mut state,
+        ChannelEvent::LinkSelected {
+            channel_id: "B".into(),
+            keyset_id: "0000000000000001".into(),
+            offer,
+        },
+    );
+    state
+        .exchange
+        .step(Event::Submit(PendingRequest::Link {
+            channel_id: "B".into(),
+        }))
+        .unwrap();
+    state.exchange.step(Event::Submitted).unwrap();
+    state
+        .exchange
+        .step(Event::Accept(ServerMessage::Error {
+            code: ServerErrorCode::LinkCommitmentModeNotAccepted,
+            message: "mode not accepted".into(),
+        }))
+        .unwrap();
+    apply_server_error(
+        &config,
+        &mut state,
+        ServerErrorCode::LinkCommitmentModeNotAccepted,
+    )
+    .await
+    .unwrap();
+    finish_replacement(&config, &mut state, false)
+        .await
+        .unwrap();
+    assert!(state.session_excluded_channels.contains("B"));
+    assert_eq!(state.intended_channel_id.as_deref(), Some("A"));
+    assert_eq!(state.local_session_paid_msats, 100);
+    assert_eq!(wallet.attachment("A").unwrap(), Some([1; 32]));
+    assert_eq!(
+        wallet.get_channel("B").unwrap().state,
+        WalletChannelState::Open
+    );
+    assert_eq!(wallet.attachment("B").unwrap(), None);
+    assert!(!state.terminated);
+    terminate_session(&config, &mut state).await;
 }
 
 #[derive(Default)]

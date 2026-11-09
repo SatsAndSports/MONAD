@@ -603,20 +603,27 @@ struct InspectionChannel {
 }
 
 impl InspectionChannel {
+    fn funding_record(&self) -> io::Result<ChannelFunding> {
+        serde_json::from_str(&self.funding_json).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("decode funding for channel '{}': {error}", self.channel_id),
+            )
+        })
+    }
+
     fn funding(&self) -> io::Result<ChannelSummaryMetadata> {
-        let funding: ChannelFunding =
-            serde_json::from_str(&self.funding_json).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("decode funding for channel '{}': {error}", self.channel_id),
-                )
-            })?;
+        let funding = self.funding_record()?;
         parse_channel_summary_metadata(&self.channel_id, &funding.params_json)
     }
 
     fn summary(self) -> io::Result<ChannelSummary> {
-        let funding = self.funding()?;
+        let raw = self.funding_record()?;
+        crate::payments::stored_channel_parameters(&self.channel_id, &raw)
+            .map_err(io::Error::other)?;
+        let funding = parse_channel_summary_metadata(&self.channel_id, &raw.params_json)?;
         Ok(ChannelSummary {
+            commitment_mode: funding.commitment_mode,
             channel_id: self.channel_id,
             relay_name: self.relay_name,
             receiver_pubkey_hex: self.receiver_pubkey_hex,
@@ -1078,15 +1085,17 @@ impl RelayWalletManager {
                 Some(c) => c,
                 None => continue,
             };
-            let funding_json: serde_json::Value =
-                serde_json::from_str(&channel.funding.params_json).map_err(|e| {
-                    io::Error::other(format!("corrupt funding JSON for {channel_id}: {e}"))
-                })?;
+            let funding_json = serde_json::Value::Object(
+                crate::payments::stored_channel_parameters(&channel_id, &channel.funding)
+                    .map_err(io::Error::other)?,
+            );
+            let commitment_mode = summary_commitment_mode(&funding_json)?;
             let mint_url = funding_json["mint"]
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string();
             summaries.push(ChannelSummary {
+                commitment_mode,
                 channel_id,
                 relay_name: chan_relay_name,
                 receiver_pubkey_hex,
@@ -2151,6 +2160,7 @@ pub struct RelayWalletIdentitySummary {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChannelSummary {
+    pub commitment_mode: cdk_spilman::CommitmentMode,
     pub channel_id: String,
     pub relay_name: String,
     pub receiver_pubkey_hex: String,
@@ -2225,10 +2235,23 @@ pub struct CloseExpiringChannelFailure {
 }
 
 struct ChannelSummaryMetadata {
+    commitment_mode: cdk_spilman::CommitmentMode,
     mint_url: String,
     unit: String,
     capacity_raw: u64,
     expiry_timestamp: u64,
+}
+
+fn summary_commitment_mode(params: &serde_json::Value) -> io::Result<cdk_spilman::CommitmentMode> {
+    match params
+        .as_object()
+        .ok_or_else(|| io::Error::other("stored funding parameters are not an object"))?
+        .get("commitment_mode")
+    {
+        None => Ok(cdk_spilman::CommitmentMode::Ordinary),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| io::Error::other("invalid stored commitment mode")),
+    }
 }
 
 fn parse_channel_summary_metadata(
@@ -2250,6 +2273,7 @@ fn parse_channel_summary_metadata(
         ))
     })?;
     Ok(ChannelSummaryMetadata {
+        commitment_mode: summary_commitment_mode(&value)?,
         mint_url,
         unit,
         capacity_raw,
@@ -2520,30 +2544,41 @@ mod tests {
             "r1".to_string(),
             pubkey_hex.clone(),
         );
-        let channel_id = "chan-abc".to_string();
         let funding = ChannelFunding {
             params_json: serde_json::json!({
-                "channel_id": &channel_id,
                 "mint": "https://test.mint",
                 "unit": "sat",
                 "capacity": 1000u64,
+                "funding_token_amount": 1000u64,
+                "input_fee_ppk": 0,
+                "maximum_amount_for_one_output": 1024,
+                "setup_timestamp": 1_700_000_000u64,
                 "expiry_timestamp": 4_000_000_000u64,
-                "keyset_id": "00testkeyset0000",
+                "keyset_id": "0000000000000001",
                 "receiver_pubkey": &pubkey_hex,
-                "sender_pubkey": "0000000000000000000000000000000000000000000000000000000000000002",
+                "sender_pubkey": SecretKey::generate().public_key().to_hex(),
             })
             .to_string(),
             funding_proofs_json: "[]".to_string(),
             channel_secret_hex: "0000000000000000000000000000000000000000000000000000000000000001"
                 .to_string(),
-            keyset_info_json: "{}".to_string(),
+            keyset_info_json: serde_json::json!({
+                "keysetId": "0000000000000001", "unit": "sat", "inputFeePpk": 0,
+                "keys": (0..=10).map(|power| ((1u64 << power).to_string(), pubkey_hex.clone())).collect::<BTreeMap<_,_>>(),
+            }).to_string(),
         };
+        let channel_id = cdk_spilman::channel_parameters_get_channel_id(
+            &funding.params_json,
+            &funding.channel_secret_hex,
+            &funding.keyset_info_json,
+        )
+        .unwrap();
         let initial_payment = PaymentProof {
             balance: 250,
             signature: "sig".to_string(),
         };
         store
-            .save_funding(&channel_id, funding, initial_payment)
+            .save_funding(&channel_id, funding.clone(), initial_payment)
             .unwrap();
 
         let channels = manager.list_channels(Some("r1")).unwrap();
@@ -2553,6 +2588,10 @@ mod tests {
         assert_eq!(channels[0].mint_url, "https://test.mint");
         assert_eq!(channels[0].unit, "sat");
         assert_eq!(channels[0].capacity_raw, 1000);
+        assert_eq!(
+            channels[0].commitment_mode,
+            cdk_spilman::CommitmentMode::Ordinary
+        );
 
         let inspection = RelayWalletInspection::open(&db_path).unwrap();
         let inspected = inspection.list_channels(Some("r1")).unwrap();
@@ -2564,6 +2603,59 @@ mod tests {
 
         let all_channels = manager.list_channels(None).unwrap();
         assert_eq!(all_channels.len(), 1);
+
+        // A valid rerandomized record reports its authenticated mode. Removing
+        // that field must not turn a corrupt record into an ordinary summary.
+        let mut rerandomized = funding.clone();
+        let mut parameters: serde_json::Value = serde_json::from_str(&funding.params_json).unwrap();
+        parameters["commitment_mode"] = serde_json::json!("rerandomized");
+        rerandomized.params_json = parameters.to_string();
+        let rerandomized_id = cdk_spilman::channel_parameters_get_channel_id(
+            &rerandomized.params_json,
+            &rerandomized.channel_secret_hex,
+            &rerandomized.keyset_info_json,
+        )
+        .unwrap();
+        store
+            .save_funding(
+                &rerandomized_id,
+                rerandomized.clone(),
+                PaymentProof {
+                    balance: 0,
+                    signature: "sig".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .list_channels(None)
+                .unwrap()
+                .iter()
+                .find(|c| c.channel_id == rerandomized_id)
+                .unwrap()
+                .commitment_mode,
+            cdk_spilman::CommitmentMode::Rerandomized
+        );
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        let mut forged = rerandomized.clone();
+        forged.params_json = funding.params_json.clone();
+        db.execute(
+            "UPDATE spilman_channels SET funding_json=?1 WHERE channel_id=?2",
+            params![serde_json::to_string(&forged).unwrap(), rerandomized_id],
+        )
+        .unwrap();
+        // The live upstream store caches immutable funding. Validate the forged
+        // record directly and through uncached read-only inspection.
+        assert!(crate::payments::stored_channel_parameters(&rerandomized_id, &forged).is_err());
+        assert!(inspection.list_channels(None).is_err());
+        db.execute(
+            "UPDATE spilman_channels SET funding_json=?1 WHERE channel_id=?2",
+            params![
+                serde_json::to_string(&rerandomized).unwrap(),
+                rerandomized_id
+            ],
+        )
+        .unwrap();
 
         // Read-only inspection must reject old/unknown state labels, not silently
         // count them as Open or reinterpret them as collection abandonment.
