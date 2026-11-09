@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 use tokio::time::{self, Duration, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
+use super::funding::{apply_acquisition, finish_acquisition_for_cleanup};
 use super::funding::{apply_channel_evicted, apply_channel_unlinked, apply_server_error};
 use super::funding::{handle_control_detached, run_funding_cycle};
 use super::payment::{
@@ -381,6 +382,19 @@ pub(super) async fn run_session_driver(
                     run_funding_cycle(&config, &mut state, &mut h2_send, resolved_payment).await?;
                 }
             }
+            report = async {
+                state.acquisition.as_mut().expect("guarded by select precondition").await
+            }, if state.acquisition.is_some() => {
+                state.acquisition = None;
+                let report = report.map_err(|error| {
+                    io::Error::other(format!("{} channel acquisition worker failed: {error}", config.hop_label))
+                })?;
+                apply_acquisition(&config, &mut state, report).await?;
+                if state.terminated {
+                    return Ok(());
+                }
+                run_funding_cycle(&config, &mut state, &mut h2_send, false).await?;
+            }
             _ = payment_tick.tick() => {
                 if state.terminated {
                     return Ok(());
@@ -411,6 +425,7 @@ pub(super) async fn run_session_driver(
     }
     .await;
 
+    finish_acquisition_for_cleanup(&config, &mut state).await;
     handle_control_detached(&config, &mut state).await;
     state
         .exchange

@@ -2,16 +2,15 @@ use super::reducer::{channel_step, ChannelEffect, ChannelEvent};
 use bytes::Bytes;
 use monad_common::control_codec::send_json_line;
 use monad_common::control_exchange::PendingRequest;
-use monad_common::protocol::{ClientMessage, PaymentOption, ServerErrorCode};
-use std::collections::BTreeSet;
+use monad_common::protocol::{ClientMessage, ServerErrorCode};
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::wallet::{
-    select_channel, RelayPaymentOffer, WalletChannel, WalletChannelState, WalletError,
+use super::acquisition::{
+    run_acquisition, AcquiredChannel, AcquisitionOutcome, AcquisitionReport, AcquisitionRequest,
 };
+use crate::wallet::{RelayPaymentOffer, WalletChannel, WalletChannelState, WalletError};
 
 pub(super) const LINK_REFRESH_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 pub(super) const LINK_REFRESH_BUSY_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -44,107 +43,6 @@ pub(super) async fn send_control_message(
             "control send exceeded heartbeat timeout",
         )
     })?
-}
-
-fn choose_channel_and_offer(
-    wallet: &dyn crate::wallet::MonadWallet,
-    state: &DriverState,
-    session_id: [u8; 32],
-) -> Result<Option<(WalletChannel, RelayPaymentOffer)>, WalletError> {
-    let Some(snapshot) = state.relay_snapshot.as_ref() else {
-        return Ok(None);
-    };
-    let Some(versions) = state
-        .cashu_spilman_keyset_versions
-        .as_ref()
-        .filter(|versions| !versions.is_empty())
-    else {
-        return Ok(None);
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let channels = wallet
-        .list_channels()?
-        .into_iter()
-        .filter(|channel| {
-            !(state
-                .session_excluded_channels
-                .contains(&channel.channel_id)
-                || (relay_confirms_intended_channel(state)
-                    && state.intended_channel_id.as_deref() == Some(channel.channel_id.as_str())))
-        })
-        .collect::<Vec<_>>();
-    let preference = wallet.commitment_mode_preference();
-    for advertisement in &snapshot.advertisements {
-        let offer = RelayPaymentOffer::from_advertisement(
-            snapshot.receiver_pubkey.clone(),
-            advertisement,
-            versions,
-        );
-        let mut eligible = channels
-            .iter()
-            .filter(|channel| preference.is_none_or(|mode| mode == channel.commitment_mode))
-            .cloned()
-            .collect::<Vec<_>>();
-        while let Some(channel) = select_channel(&eligible, &offer, session_id, now) {
-            if wallet
-                .supports_commitment_mode(&offer.mint_url, channel.commitment_mode)
-                .unwrap_or(false)
-            {
-                return Ok(Some((channel, offer)));
-            }
-            // Unknown/unsupported optional capability makes this mode locally
-            // ineligible, not globally unusable. Other accepted modes may reuse
-            // funds. Only eligible candidates trigger capability discovery.
-            eligible.retain(|other| other.commitment_mode != channel.commitment_mode);
-        }
-    }
-    Ok(None)
-}
-
-fn provisioning_offer_is_unavailable(error: &WalletError) -> bool {
-    // These are the wallet's explicitly safe offer-local outcomes. Generic
-    // backend failures can follow a reservation or ambiguous submission, so they
-    // must stop traversal rather than funding a different offer.
-    matches!(
-        error,
-        WalletError::NoCompatibleActiveKeyset { .. }
-            | WalletError::InsufficientLooseProofFunds { .. }
-            | WalletError::InputKeysetMetadataUnavailable { .. }
-            | WalletError::TooManyInputProofs { .. }
-            | WalletError::ProvisioningOfferUnavailable { .. }
-            | WalletError::ProvisioningPreflight { .. }
-    )
-}
-
-fn provision_from_advertisements<F>(
-    receiver_pubkey: &str,
-    advertisements: &[PaymentOption],
-    versions: &BTreeSet<String>,
-    mut provision: F,
-) -> Result<Option<(String, RelayPaymentOffer)>, WalletError>
-where
-    F: FnMut(&RelayPaymentOffer) -> Result<String, WalletError>,
-{
-    let mut unavailable = None;
-    for advertisement in advertisements {
-        let offer = RelayPaymentOffer::from_advertisement(
-            receiver_pubkey.to_string(),
-            advertisement,
-            versions,
-        );
-        match provision(&offer) {
-            Ok(channel_id) => return Ok(Some((channel_id, offer))),
-            Err(error) if provisioning_offer_is_unavailable(&error) => unavailable = Some(error),
-            Err(error) => return Err(error),
-        }
-    }
-    match unavailable {
-        Some(error) => Err(error),
-        None => Ok(None),
-    }
 }
 
 async fn send_channel_link(
@@ -301,13 +199,21 @@ async fn link_acquired(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum AcquireStart {
+    /// Finished synchronously; the caller releases the ordinary slot.
+    NotStarted,
+    /// A worker holds the ordinary slot until `apply_acquisition`.
+    Started,
+}
+
 pub(super) async fn acquire_channel_candidate(
     config: &SessionDriverConfig,
     state: &mut DriverState,
     h2_send: &mut h2::SendStream<Bytes>,
-) -> io::Result<()> {
+) -> io::Result<AcquireStart> {
     if state.terminated || state.funding_blocked_reason.is_some() {
-        return Ok(());
+        return Ok(AcquireStart::NotStarted);
     }
     let Some(versions) = state
         .cashu_spilman_keyset_versions
@@ -315,16 +221,16 @@ pub(super) async fn acquire_channel_candidate(
         .filter(|versions| !versions.is_empty())
         .cloned()
     else {
-        return Ok(());
+        return Ok(AcquireStart::NotStarted);
     };
     if state.exchange.pending().is_some() {
-        return Ok(());
+        return Ok(AcquireStart::NotStarted);
     }
     if state
         .funding_retry_not_before
         .is_some_and(|deadline| Instant::now() < deadline)
     {
-        return Ok(());
+        return Ok(AcquireStart::NotStarted);
     }
     state.funding_retry_not_before = None;
 
@@ -348,6 +254,7 @@ pub(super) async fn acquire_channel_candidate(
         }
     }
 
+    // Retrying an unconfirmed intended channel uses only local wallet state.
     loop {
         let retry = if relay_confirms_intended_channel(state) {
             None
@@ -357,151 +264,11 @@ pub(super) async fn acquire_channel_candidate(
                 .clone()
                 .zip(state.intended_offer.clone())
         };
-        if let Some((channel_id, offer)) = retry {
-            let channel = match config.wallet.get_channel(&channel_id) {
-                Ok(channel) => channel,
-                Err(error) => {
-                    if matches!(error, WalletError::Backend(_)) {
-                        set_blocked_reason(
-                            config,
-                            state,
-                            FundingBlockedReason::ChannelAcquire,
-                            &error.to_string(),
-                        )?;
-                        return Ok(());
-                    }
-                    abandon_intended_channel(config, state, channel_id, true).await;
-                    continue;
-                }
-            };
-            info!(
-                "{} retrying ChannelLink for intended channel {} | {}",
-                config.hop_label,
-                channel.channel_id,
-                state_summary(state, &config.conn.cleartext_byte_counters)
-            );
-            if !acquire_existing_channel(config, state, h2_send, channel, offer).await? {
-                return Ok(());
-            }
-            abandon_intended_channel(config, state, channel_id, false).await;
-            continue;
-        }
-
-        match choose_channel_and_offer(config.wallet.as_ref(), state, config.conn.session_id) {
-            Ok(Some((channel, offer))) => {
-                info!(
-                    "{} selected existing channel {} | {}",
-                    config.hop_label,
-                    channel.channel_id,
-                    state_summary(state, &config.conn.cleartext_byte_counters)
-                );
-                if !acquire_existing_channel(config, state, h2_send, channel, offer).await? {
-                    return Ok(());
-                }
-            }
-            Ok(None) => {
-                let Some((receiver_pubkey, advertisements)) =
-                    state.relay_snapshot.as_ref().map(|snapshot| {
-                        (
-                            snapshot.receiver_pubkey.clone(),
-                            snapshot.advertisements.clone(),
-                        )
-                    })
-                else {
-                    return Ok(());
-                };
-                if let Some((owner, hop)) = &config.management {
-                    if !hop.begin_provisioning(owner) {
-                        return Ok(());
-                    }
-                }
-                let selected = provision_from_advertisements(
-                    &receiver_pubkey,
-                    &advertisements,
-                    &versions,
-                    |offer| {
-                        info!(
-                            "{} provisioning new channel for mint={} unit={} | {}",
-                            config.hop_label,
-                            offer.mint_url,
-                            offer.unit,
-                            state_summary(state, &config.conn.cleartext_byte_counters)
-                        );
-                        config.wallet.provision_session_channel(
-                            offer,
-                            config.payment_policy.channel_funding_token_target_msats,
-                        )
-                    },
-                );
-                if let Some((owner, hop)) = &config.management {
-                    hop.provisioning_finished(owner);
-                }
-                let (channel_id, offer) = match selected {
-                    Ok(Some(selected)) => selected,
-                    Ok(None) => {
-                        if let Some((owner, hop)) = &config.management {
-                            if !owner.controls().automatic_provisioning {
-                                hop.safe_provisioning_failure(owner);
-                            }
-                        }
-                        return Ok(());
-                    }
-                    Err(error) if provisioning_offer_is_unavailable(&error) => {
-                        if let Some((owner, hop)) = &config.management {
-                            if !owner.controls().automatic_provisioning {
-                                hop.safe_provisioning_failure(owner);
-                                return Ok(());
-                            }
-                        }
-                        if state.ready_signaled {
-                            warn!(
-                                "{} deferring funding after advertised offers were unavailable: {} | {}",
-                                config.hop_label,
-                                error,
-                                state_summary(state, &config.conn.cleartext_byte_counters)
-                            );
-                            state.funding_retry_not_before =
-                                Some(Instant::now() + LOCAL_KEYSET_RETRY_COOLDOWN);
-                        } else {
-                            set_blocked_reason(
-                                config,
-                                state,
-                                FundingBlockedReason::ChannelAcquire,
-                                &error.to_string(),
-                            )?;
-                        }
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        if matches!(error, WalletError::Backend(_)) {
-                            set_blocked_reason(
-                                config,
-                                state,
-                                FundingBlockedReason::ChannelAcquire,
-                                &error.to_string(),
-                            )?;
-                        }
-                        return Ok(());
-                    }
-                };
-                let channel = match config.wallet.get_channel(&channel_id) {
-                    Ok(channel) => channel,
-                    Err(error) => {
-                        if matches!(error, WalletError::Backend(_)) {
-                            set_blocked_reason(
-                                config,
-                                state,
-                                FundingBlockedReason::ChannelAcquire,
-                                &error.to_string(),
-                            )?;
-                        }
-                        return Ok(());
-                    }
-                };
-                if !acquire_existing_channel(config, state, h2_send, channel, offer).await? {
-                    return Ok(());
-                }
-            }
+        let Some((channel_id, offer)) = retry else {
+            break;
+        };
+        let channel = match config.wallet.get_channel(&channel_id) {
+            Ok(channel) => channel,
             Err(error) => {
                 if matches!(error, WalletError::Backend(_)) {
                     set_blocked_reason(
@@ -510,10 +277,145 @@ pub(super) async fn acquire_channel_candidate(
                         FundingBlockedReason::ChannelAcquire,
                         &error.to_string(),
                     )?;
+                    return Ok(AcquireStart::NotStarted);
                 }
-                return Ok(());
+                abandon_intended_channel(config, state, channel_id, true).await;
+                continue;
+            }
+        };
+        info!(
+            "{} retrying ChannelLink for intended channel {} | {}",
+            config.hop_label,
+            channel.channel_id,
+            state_summary(state, &config.conn.cleartext_byte_counters)
+        );
+        if !acquire_existing_channel(config, state, h2_send, channel, offer).await? {
+            return Ok(AcquireStart::NotStarted);
+        }
+        abandon_intended_channel(config, state, channel_id, false).await;
+    }
+    if state.acquired.is_some() || state.funding_blocked_reason.is_some() {
+        return Ok(AcquireStart::NotStarted);
+    }
+
+    let Some(snapshot) = state.relay_snapshot.as_ref() else {
+        return Ok(AcquireStart::NotStarted);
+    };
+    let mut excluded = state.session_excluded_channels.clone();
+    if relay_confirms_intended_channel(state) {
+        excluded.extend(state.intended_channel_id.clone());
+    }
+    let request = AcquisitionRequest {
+        wallet: config.wallet.clone(),
+        gate: config.acquisition_gate.clone(),
+        session_id: config.conn.session_id,
+        hop_label: config.hop_label.clone(),
+        receiver_pubkey: snapshot.receiver_pubkey.clone(),
+        advertisements: snapshot.advertisements.clone(),
+        versions,
+        excluded,
+        funding_token_target_msats: config.payment_policy.channel_funding_token_target_msats,
+        management: config.management.clone(),
+    };
+    // Unfunded sessions retry on each eligible tick; keep this below info.
+    debug!(
+        "{} acquiring channel in background | {}",
+        config.hop_label,
+        state_summary(state, &config.conn.cleartext_byte_counters)
+    );
+    state.acquisition = Some(tokio::task::spawn_blocking(move || {
+        run_acquisition(request)
+    }));
+    Ok(AcquireStart::Started)
+}
+
+/// Apply a finished acquisition report on the executor. The ordinary slot was
+/// held as `Working` for the worker's whole duration; this releases it.
+pub(super) async fn apply_acquisition(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+    report: AcquisitionReport,
+) -> io::Result<()> {
+    for channel_id in &report.excluded {
+        exclude_channel(state, channel_id);
+    }
+    let result = match report.outcome {
+        AcquisitionOutcome::Acquired(acquired) => {
+            let AcquiredChannel {
+                channel,
+                offer,
+                authority,
+            } = *acquired;
+            // Events processed while the worker ran (eviction, termination)
+            // take precedence over its stale candidate.
+            if state.terminated
+                || state
+                    .session_excluded_channels
+                    .contains(&channel.channel_id)
+            {
+                info!(
+                    "{} discarding stale acquisition of channel {} | {}",
+                    config.hop_label,
+                    channel.channel_id,
+                    state_summary(state, &config.conn.cleartext_byte_counters)
+                );
+                let _ = config
+                    .wallet
+                    .detach_channel_from_session(&channel.channel_id, config.conn.session_id);
+            } else {
+                state
+                    .channel_authority
+                    .insert(channel.channel_id.clone(), authority);
+                channel_step(state, ChannelEvent::Acquired(channel, offer));
+            }
+            Ok(())
+        }
+        AcquisitionOutcome::Blocked(detail) => {
+            set_blocked_reason(config, state, FundingBlockedReason::ChannelAcquire, &detail)
+        }
+        AcquisitionOutcome::OffersUnavailable(error) => {
+            if state.ready_signaled {
+                warn!(
+                    "{} deferring funding after advertised offers were unavailable: {} | {}",
+                    config.hop_label,
+                    error,
+                    state_summary(state, &config.conn.cleartext_byte_counters)
+                );
+                state.funding_retry_not_before = Some(Instant::now() + LOCAL_KEYSET_RETRY_COOLDOWN);
+                Ok(())
+            } else {
+                set_blocked_reason(
+                    config,
+                    state,
+                    FundingBlockedReason::ChannelAcquire,
+                    &error.to_string(),
+                )
             }
         }
+        AcquisitionOutcome::Idle | AcquisitionOutcome::Cancelled => Ok(()),
+    };
+    state.exchange.step(super::reducer::Event::WorkFinished)?;
+    result
+}
+
+/// Await a running acquisition during session cleanup. Wallet work is never
+/// detached: cleanup cancels further steps, waits, and releases any candidate.
+pub(super) async fn finish_acquisition_for_cleanup(
+    config: &SessionDriverConfig,
+    state: &mut DriverState,
+) {
+    let Some(handle) = state.acquisition.take() else {
+        return;
+    };
+    config.acquisition_gate.cancel();
+    if let Ok(AcquisitionReport {
+        outcome: AcquisitionOutcome::Acquired(acquired),
+        ..
+    }) = handle.await
+    {
+        let _ = config
+            .wallet
+            .detach_channel_from_session(&acquired.channel.channel_id, config.conn.session_id);
     }
 }
 
@@ -898,7 +800,12 @@ pub(super) async fn run_policy_cycle(
         };
         match effect {
             FundingEffect::AcquireChannel => {
-                acquire_channel_candidate(config, state, h2_send).await?
+                if acquire_channel_candidate(config, state, h2_send).await? == AcquireStart::Started
+                {
+                    // The worker keeps the ordinary slot busy until its report
+                    // is applied; the executor keeps handling other events.
+                    return Ok(());
+                }
             }
             FundingEffect::PrepareLink => link_acquired(config, state, h2_send).await?,
             FundingEffect::PreparePayment {
@@ -1103,7 +1010,10 @@ pub(super) async fn handle_control_detached(config: &SessionDriverConfig, state:
 
 #[cfg(test)]
 mod tests {
+    use super::super::acquisition::provision_from_advertisements;
     use super::*;
+    use monad_common::protocol::PaymentOption;
+    use std::collections::BTreeSet;
 
     fn advertisement(mint_url: &str) -> PaymentOption {
         PaymentOption {
